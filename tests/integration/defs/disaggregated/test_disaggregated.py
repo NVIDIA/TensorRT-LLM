@@ -646,12 +646,17 @@ def run_client_tests(example_dir,
         for output_file in output_files:
             with open(output_path(output_file), 'r') as f:
                 content = f.read()
-                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                if ("deepseek_v3_lite" in test_desc
+                        or "qwen3_32b_fp8" in test_desc
+                        or output_file == "output_chat.json"):
                     # Different models (and endpoints) phrase the continuation
                     # of the raw asyncio prompt differently, and repeated
                     # attempts to pin down the exact wording have proven
-                    # fragile across CI runs. Match case-insensitively on the
-                    # prompt's own keywords instead of an exact phrase.
+                    # fragile across CI runs: e.g. qwen3_32b_fp8's near-tied
+                    # greedy tokens flip with the GPU type and with the ctx/gen
+                    # TP sizes (https://nvbugs/6770977). Match
+                    # case-insensitively on the prompt's own keywords instead
+                    # of an exact phrase.
                     lowered_content = content.lower()
                     assert "berlin" in lowered_content, (
                         f"Expected 'Berlin' not found in {output_file}")
@@ -666,17 +671,6 @@ def run_client_tests(example_dir,
                     expected_strings = [
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
-                    ]
-                elif "qwen3_32b_fp8" in test_desc:
-                    # https://nvbugs/6566734: the greedy completion of the raw
-                    # asyncio prompt is near-tied between answering the question
-                    # and continuing it; both are valid non-garbage outputs.
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        [
-                            "Asyncio in Python is a library",
-                            "I have read that it is used for asynchronous programming"
-                        ]
                     ]
                 else:
                     # Qwen3-0.6B (migrated from TinyLlama onto this default
@@ -3061,11 +3055,14 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
+    # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
