@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+from types import SimpleNamespace
 from typing import get_args
 from unittest import mock
 
+import pynvml
 import pytest
 
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.bench.tuning import utils as tuning_utils
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
@@ -236,3 +239,80 @@ def test_acceptance_length_weighted_by_iterations():
     # (= sum(output_tokens) / total_decoding_iterations). This would fail under
     # output-token weighting.
     assert stats.acceptance_length_percentiles.average == pytest.approx(stats.acceptance_length)
+
+
+def _patch_nvml(monkeypatch, get_memory_info):
+    """Replace the NVML calls and logger used by get_device_memory; record init/shutdown."""
+    calls = []
+    nvml = tuning_utils.pynvml
+    monkeypatch.setattr(nvml, "nvmlInit", lambda: calls.append("init"))
+    monkeypatch.setattr(nvml, "nvmlShutdown", lambda: calls.append("shutdown"))
+    monkeypatch.setattr(nvml, "nvmlDeviceGetHandleByIndex", lambda index: f"handle{index}")
+    monkeypatch.setattr(nvml, "nvmlDeviceGetMemoryInfo", get_memory_info)
+    bench_logger = mock.Mock()
+    monkeypatch.setattr(tuning_utils, "logger", bench_logger, raising=False)
+    # Ignore the cgroup of the machine running the tests.
+    monkeypatch.setattr(tuning_utils, "_CGROUP_MEMORY_LIMIT_FILES", ())
+    return calls, bench_logger
+
+
+def _raise_nvml(error_code):
+    def get_memory_info(handle):
+        # NVMLError.__new__ returns the matching subclass, e.g. NVMLError_NotSupported.
+        raise pynvml.NVMLError(error_code)
+
+    return get_memory_info
+
+
+def test_get_device_memory_reports_nvml_total(monkeypatch):
+    calls, bench_logger = _patch_nvml(
+        monkeypatch, lambda handle: SimpleNamespace(total=80 * 1024**3, free=0, used=0)
+    )
+    with mock.patch("psutil.virtual_memory") as virtual_memory:
+        assert tuning_utils.get_device_memory() == pytest.approx(80.0)
+    virtual_memory.assert_not_called()
+    bench_logger.warning.assert_not_called()
+    assert calls == ["init", "shutdown"]
+
+
+def test_get_device_memory_falls_back_when_nvml_memory_not_supported(monkeypatch):
+    """Unified-memory GPUs such as DGX Spark (GB10) do not report memory through NVML."""
+    calls, bench_logger = _patch_nvml(monkeypatch, _raise_nvml(pynvml.NVML_ERROR_NOT_SUPPORTED))
+    with mock.patch(
+        "psutil.virtual_memory", return_value=SimpleNamespace(total=128 * 1024**3)
+    ) as virtual_memory:
+        assert tuning_utils.get_device_memory() == pytest.approx(128.0)
+    virtual_memory.assert_called_once_with()
+    bench_logger.warning.assert_called_once()
+    assert "128.00 GiB" in bench_logger.warning.call_args.args[0]
+    assert calls == ["init", "shutdown"]
+
+
+def test_get_device_memory_shuts_down_nvml_on_other_errors(monkeypatch):
+    calls, bench_logger = _patch_nvml(monkeypatch, _raise_nvml(pynvml.NVML_ERROR_UNKNOWN))
+    with pytest.raises(pynvml.NVMLError_Unknown):
+        tuning_utils.get_device_memory()
+    bench_logger.warning.assert_not_called()
+    assert calls == ["init", "shutdown"]
+
+
+@pytest.mark.parametrize(
+    ("cgroup_value", "expected_gib"),
+    [
+        ("34359738368\n", 32.0),  # cgroup v2 limit below system memory
+        ("max\n", 128.0),  # cgroup v2 without a limit
+        ("9223372036854771712\n", 128.0),  # cgroup v1 "unlimited" sentinel
+    ],
+)
+def test_get_device_memory_fallback_respects_cgroup_limit(
+    monkeypatch, tmp_path, cgroup_value, expected_gib
+):
+    """Inside a container, the fallback must not report more than the container may use."""
+    _patch_nvml(monkeypatch, _raise_nvml(pynvml.NVML_ERROR_NOT_SUPPORTED))
+    limit_file = tmp_path / "memory.max"
+    limit_file.write_text(cgroup_value)
+    monkeypatch.setattr(
+        tuning_utils, "_CGROUP_MEMORY_LIMIT_FILES", (str(tmp_path / "missing"), str(limit_file))
+    )
+    with mock.patch("psutil.virtual_memory", return_value=SimpleNamespace(total=128 * 1024**3)):
+        assert tuning_utils.get_device_memory() == pytest.approx(expected_gib)
