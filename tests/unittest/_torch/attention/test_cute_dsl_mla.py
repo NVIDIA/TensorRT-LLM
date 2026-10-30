@@ -391,6 +391,7 @@ def test_mixed_batch_gate_admits_only_page_sizes_exclusive_to_cute_dsl(
         (100, 128, DataType.FP8, (), False),
         (103, 128, DataType.BF16, (), False),
         (107, 128, DataType.FP8, (), True),
+        (107, 128, DataType.BF16, (), True),
         # An NVFP4 manager's FP8 fallback layers on the FP4 MLA pages.
         (100, 128, DataType.NVFP4, (), True),
         (103, 128, DataType.NVFP4, (), True),
