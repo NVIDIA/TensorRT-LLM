@@ -44,8 +44,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
         assert torch.equal(out, flashinfer_silu_and_mul(x[:, : 2 * INTER].contiguous()))
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    x = _build(dict(rows=128), 8)
+@pytest.mark.parametrize("rows", [1, 32, 128])
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    """The decode call sites run captured: one request, a dep4 rank's 32, a 128-request batch."""
+    x = _build(dict(rows=rows), 8)
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup):
@@ -54,7 +56,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = op(x, INTER)
-    x.copy_(_build(dict(rows=128), 9))
+    x.copy_(_build(dict(rows=rows), 9))
     graph.replay()
     torch.cuda.synchronize()
     assert torch.equal(out, op(x, INTER))

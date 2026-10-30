@@ -3,7 +3,8 @@
 """SiLU-and-mul over the leading `2 * inter` columns of each row, read through the row stride:
 the shared expert's activation taken out of its fused gate|up|gate-logit GEMM output.
 
-Tier 5 (Triton written for this target). `flashinfer_silu_and_mul` addresses row `t` at
+Tier 5: a Triton kernel, written for the tp1 target (`qwen3_8_flash_next_nvfp4__sm_103__tp1`,
+`ops/activation/silu_and_mul_rows`) and kept unchanged here. `flashinfer_silu_and_mul` addresses row `t` at
 `t * 2 * inter`, so its input must be exactly the gate|up columns, contiguous; here they are
 the head of a wider row (the same GEMM also forms the per-token gate logit) and are read in
 place.
@@ -50,24 +51,44 @@ class SiluAndMulRows(OpWrapper):
         Cell(why="prefill chunk 16384 rows of the fused 1288-wide output", spec=dict(rows=16384)),
         Cell(why="short prefill step, 128 rows of the fused output", spec=dict(rows=128)),
         Cell(why="zero rows: no launch", spec=dict(rows=0)),
+        Cell(why="decode, one request: the shared expert's single row", spec=dict(rows=1)),
+        Cell(
+            why="decode, 32 rows: a dep4 rank's local share of a 128-request batch",
+            spec=dict(rows=32),
+        ),
+        Cell(why="MTP-7 verify: 128 requests x 8 rows", spec=dict(rows=1024)),
+        Cell(why="prefill chunk at max_num_tokens 8192", spec=dict(rows=8192)),
     )
 
     note = """
-    Metadata consumed: none; every row independent. Call site: the prefill target's MoE
-    block, on the shared expert's fused `[gate | up | gate logit | pad]` GEMM output.
+    Metadata consumed: none; every row independent. Call sites: the decode and prefill
+    targets' MoE block, on the replicated shared expert's fused
+    `[gate | up | gate logit | pad]` GEMM output, so inter 640 and the 1288-wide row at
+    every member (tp4, tep4, dep4). Decode rows: 1..128 per rank at tp4/tep4, 1..32 local
+    at dep4, 1024 at an MTP-7 verify of 128 requests; prefill chunks of up to
+    max_num_tokens.
 
     Preconditions: 2-D `x` with unit column stride, `x.shape[1] >= 2 * inter`; bf16 or fp16.
 
-    Launch: `(rows, cdiv(inter, 1024))` programs of 4 warps. GB300, 16384 rows of the
-    1288-wide output: 16.4 us (`flashinfer_silu_and_mul` on a contiguous copy of the gate|up
-    columns: 20.5 us for the kernel, 62.1 with the copy).
+    Source: Triton, JIT-compiled at first call for the running device; the cells ran that
+    path on sm_103 (GB300). Launch: `(rows, cdiv(inter, 1024))` programs of 4 warps, the
+    same kernel at every row count (no path switch). Row offsets are int64, so no index
+    product overflows inside the envelope (2^31 elements of the 1288-wide input is 1.67M
+    rows).
+
+    Time per call on GB300, 100 calls captured in one CUDA graph: 1.17 / 1.40 / 1.43 /
+    2.17 / 7.50 / 13.50 us at 1 / 32 / 128 / 1024 / 8192 / 16384 rows.
+    `flashinfer_silu_and_mul` on already-contiguous gate|up columns: 1.11 / 1.17 / 1.21 /
+    2.19 / 9.45 / 17.64 us; with the copy the fused layout needs: 1.11 (one row is
+    contiguous) / 3.83 / 4.02 / 5.61 / 23.87 / 60.00 us.
 
     Numerics: `g / (1 + exp(-g)) * u` in fp32 (Triton's `exp` and division), rounded once;
-    bitwise `flashinfer_silu_and_mul` on the same values (16384 x 640 random bf16 values,
-    the test's cells).
+    bitwise `flashinfer_silu_and_mul` on the same values at every non-empty cell (random
+    bf16 values scaled by 3, with 0, -0, 88 and -100 in row 0).
 
-    Certified: bf16 at inter 640 on the 1288-wide fused output, 0, 128 and 16384 rows;
-    CUDA-graph replay at 128 rows. Not certified: fp16, other widths or row counts.
+    Certified: bf16 at inter 640 on the 1288-wide fused output, 0, 1, 32, 128, 1024, 8192
+    and 16384 rows; CUDA-graph replay at 1, 32 and 128 rows. Not certified: fp16, other
+    widths; row counts between the cells run the same kernel but were not driven.
     """
 
     def __call__(self, x: torch.Tensor, inter: int) -> torch.Tensor:
