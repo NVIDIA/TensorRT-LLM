@@ -41,6 +41,7 @@ namespace kvc = tensorrt_llm::executor::kv_cache;
 
 using bounce_test::freeXferBufs;
 using bounce_test::hasCuda;
+using bounce_test::makeAgentConfig;
 using bounce_test::makeXferBufs;
 using bounce_test::verifyXferBufs;
 using bounce_test::XferBufs;
@@ -108,7 +109,7 @@ int runConcurrentFlows(
 kvc::BaseAgentConfig makeBounceConfig(
     std::string name, std::size_t arenaSizeMb = 2, char const* granularityBytes = "256")
 {
-    kvc::BaseAgentConfig cfg{std::move(name), true, false, true};
+    auto cfg = makeAgentConfig(std::move(name));
     cfg.agentBufferSizeMb = arenaSizeMb;
     if (arenaSizeMb > 0)
     {
@@ -193,10 +194,57 @@ TEST(BounceAgentE2E, SubmitTransferRequestsUsesBounce)
     ASSERT_NE(status, nullptr);
     EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kSUCCESS)
         << "bounce transfer via submitTransferRequests did not succeed";
+    EXPECT_TRUE(status->isCompleted()) << "a SUCCESS must report the destination quiesced";
     EXPECT_TRUE(verifyXferBufs(bufs));
 
     a->shutdown();
     b->shutdown();
+    freeXferBufs(bufs);
+}
+
+// A bounce FAILURE that sent no DATA (the peer never grants) is proven not to write the destination,
+// so the agent's status reports it completed (isCompleted) while wait() still reports FAILURE.
+TEST(BounceAgentE2E, FailureWithNothingSentIsCompleted)
+{
+    if (!hasCuda())
+    {
+        GTEST_SKIP() << "no CUDA device";
+    }
+    auto makeShortTimeoutConfig = [](char const* name)
+    {
+        auto cfg = makeBounceConfig(name);
+        cfg.bounceParams["request_timeout_ms"] = "500"; // on both sides: the handshake requires equal values
+        return cfg;
+    };
+    std::string skipMsg;
+    auto a = tryMakeAgent(makeShortTimeoutConfig("nsAgentA"), skipMsg);
+    auto b = a ? tryMakeAgent(makeShortTimeoutConfig("nsAgentB"), skipMsg) : nullptr;
+    if (!a || !b)
+    {
+        GTEST_SKIP() << "NIXL agent/backend unavailable: " << skipMsg;
+    }
+    a->loadRemoteAgent("nsAgentB", b->getLocalAgentDesc());
+    b->shutdown(); // A keeps B's validated handshake, but nothing will ever GRANT its WANT
+
+    auto bufs = makeXferBufs(/*nDescs=*/24, /*descBytes=*/600, /*seed=*/9);
+    auto req = makeReq(bufs, "nsAgentB");
+    auto status = a->submitTransferRequests(req);
+    ASSERT_NE(status, nullptr);
+    EXPECT_EQ(a->getBounceSubmitCount(), 1u) << "the request must take the bounce path";
+    EXPECT_EQ(waitTerminal(status, 30), kvc::TransferState::kFAILURE);
+    // An eager gather the failure orphaned may still be reading the source; it ends shortly after.
+    auto const completeBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!status->isCompleted() && std::chrono::steady_clock::now() < completeBy)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(status->isCompleted())
+        << "nothing was sent, so the request stops accessing memory once its gathers end";
+    auto const detail = status->getLastStatusStr();
+    EXPECT_NE(detail.find("no GRANT/ACK progress"), std::string::npos) << detail;
+    EXPECT_EQ(detail.find("not proven quiescent"), std::string::npos) << detail;
+
+    a->shutdown();
     freeXferBufs(bufs);
 }
 
@@ -212,7 +260,7 @@ TEST(BounceAgentE2E, EffectiveChunkCapFallsBackToStandardNixl)
     // cap. The descriptor below sits between the two limits.
     auto makeCapConfig = [](char const* name)
     {
-        kvc::BaseAgentConfig cfg{name, true, false, true};
+        auto cfg = makeAgentConfig(name);
         cfg.agentBufferSizeMb = 3;
         cfg.bounceParams = {
             {"min_descriptor_count", "1"},
