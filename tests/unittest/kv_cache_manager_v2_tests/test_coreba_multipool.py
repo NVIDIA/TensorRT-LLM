@@ -17,11 +17,16 @@ After each rebalance the test checks that
   pool's window, and every buffer still holds its data,
 * cached (reusable) prefixes are still matched with intact data in every buffer.
 
+With a host tier (test_host_tier_*), blocks are offloaded to the host and onboarded again through
+the cold-page codec, which then gets one page-index array per pool: a bound pool's hot index is its
+own id, not the group's.
+
 Run (the repo root must be first on PYTHONPATH, or a stale installed wheel is imported):
     PYTHONPATH=$REPO_ROOT python test_coreba_multipool.py -v
 """
 
 import importlib
+import os
 import random
 import unittest
 
@@ -70,7 +75,7 @@ def _pattern(seed: int, ordinal: int, layer: int, role: str) -> int:
 class _Arena:
     """A manager plus the bookkeeping needed to check its arena."""
 
-    def __init__(self, ratio: list[float], in_place: bool = False):
+    def __init__(self, ratio: list[float], in_place: bool = False, host_quota: int = 0):
         torch.zeros(1, device="cuda")  # the manager needs a current CUDA context
         self.in_place = in_place
         layers = [
@@ -83,7 +88,8 @@ class _Arena:
         ]
         config = kvm.KVCacheManagerConfig(
             tokens_per_block=TOKENS_PER_BLOCK,
-            cache_tiers=[kvm.GpuCacheTierConfig(quota=QUOTA)],
+            cache_tiers=[kvm.GpuCacheTierConfig(quota=QUOTA)]
+            + ([kvm.HostCacheTierConfig(quota=host_quota)] if host_quota else []),
             layers=layers,
             initial_pool_ratio=ratio,
             enable_partial_reuse=False,
@@ -301,6 +307,65 @@ class TestCopyBasedRebalancingMultiPool(unittest.TestCase):
 
     def test_rebalance_in_place(self):
         self._run(in_place=True)
+
+    def _run_host_tier(self, in_place: bool):
+        # 2 MiB host arena units: the cold pages (36 KiB and 92 KiB) straddle unit boundaries too.
+        os.environ["TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES"] = str(2 << 20)
+        arena = _Arena(ratio=[0.4, 0.6], in_place=in_place, host_quota=96 << 20)
+        try:
+            # Far more cached prefixes than the GPU holds: the oldest are offloaded to the host.
+            for seed in range(1000, 1300):
+                arena.add_request(seed, commit=True).close()
+                arena.cached.append(seed)
+            for seed in range(3000, 3020):
+                arena.live[seed] = (arena.add_request(seed, commit=True), _tokens(seed))
+            torch.cuda.synchronize()
+            host_used = sum(s.total - s.free for s in arena.mgr.get_storage_statistics(kvm.CACHE_LEVEL1))
+            self.assertGreater(host_used, 0, "nothing was offloaded to the host tier")
+
+            # GPU rebalances move the bound pools (their bindings change), then one host rebalance.
+            pg_full = arena.pg_of_lc[arena.lcs[FULL_LAYER]]
+            for full_share in (0.7, 0.3):
+                target = [0.0, 0.0]
+                target[pg_full] = full_share
+                target[1 - pg_full] = 1.0 - full_share
+                before = intro.gpu_pool_windows(arena.mgr)
+                arena.rebalance(target)
+                self.assertNotEqual(before, intro.gpu_pool_windows(arena.mgr))
+                arena.check_layout(self)
+                arena.check_live(self)
+            host_before = intro.slot_windows(arena.mgr, 1)
+            torch.cuda.synchronize()
+            if not in_place:
+                for kv, _ in arena.live.values():
+                    kv.suspend()
+            intro.set_last_adjustment_time(arena.mgr, 0.0)
+            intro.set_target_ratio_list_cold(arena.mgr, [0.8, 0.2])
+            arena.mgr.adjust()
+            torch.cuda.synchronize()
+            if not in_place:
+                for seed, (kv, _) in arena.live.items():
+                    assert kv.resume(arena.stream)
+                    arena.bind_bufs(seed, kv)
+            self.assertNotEqual(host_before, intro.slot_windows(arena.mgr, 1), "host windows did not move")
+            arena.check_live(self)
+
+            # Onboarding the offloaded prefixes decodes into every pool, bound pools at their own ids.
+            arena.mgr.get_and_reset_iteration_stats()
+            matched = arena.check_cached(self)
+            onboarded = sum(d.iter_onboard_blocks for d in arena.mgr.get_and_reset_iteration_stats().values())
+            print(f"  host used {host_used}, matched {matched}, read back {arena.verified_cached_blocks}, "
+                  f"onboarded {onboarded}, not admitted {arena.unverified_cached_blocks}")
+            self.assertGreater(onboarded, 0, "no block was onboarded from the host tier")
+            self.assertGreater(arena.verified_cached_blocks, 0)
+        finally:
+            arena.close()
+
+    def test_host_tier_suspended(self):
+        self._run_host_tier(in_place=False)
+
+    def test_host_tier_in_place(self):
+        self._run_host_tier(in_place=True)
 
 
 if __name__ == "__main__":
