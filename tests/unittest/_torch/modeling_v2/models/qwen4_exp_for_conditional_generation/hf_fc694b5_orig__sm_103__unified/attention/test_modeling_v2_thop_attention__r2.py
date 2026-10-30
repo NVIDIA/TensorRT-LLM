@@ -200,7 +200,8 @@ exercised:
    at the engines' max_seq_len -- the packed and paged context paths, the
    8192-row max_num_tokens prefill, decode and MTP verify at 128 requests,
    a 9215-token history, a mixed step, and bf16 / fp8 / NVFP4 pools; over
-   NVFP4 the manager's block-scale pool is checked bitwise per layer.
+   NVFP4 the manager's block-scale pool is checked bitwise per layer. Three
+   decodes read pages past 2^31 pool elements from the base, and assert so.
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -7489,6 +7490,8 @@ def _cell_layered(cell, arm) -> None:
         for _ in range(p):
             env.add_decode_token(rid)
     env.refresh_offsets(rids, num_contexts=nc)
+    if spec.get("past_int32_elements"):
+        _assert_pages_past_int32_elements(env, layer, rids, cell.why)
     qkv = env.random_qkv(sum(new))
     snapshot = [v.clone() for v in env.layer_views]
     scale_snapshot = [v.clone() for v in env.scale_views]
@@ -7515,6 +7518,23 @@ def _cell_layered(cell, arm) -> None:
         )
     for before, after in zip(other_before, [] if other is None else other.layer_views):
         assert _bitwise_equal(before, after), "a pool-0 row wrote the second pool"
+
+
+def _assert_pages_past_int32_elements(
+    env: _MultiLayerPagedAttnEnv, layer: int, request_ids: List[int], label: str
+) -> None:
+    """The cell's reason to exist: some page this call reads starts 2^31 or
+    more pool elements past the pool base, where an int32 element index no
+    longer reaches."""
+    tpb, slabs_per_page = env.tokens_per_block, env.num_layers * 2
+    last = 0
+    for s, rid in enumerate(request_ids):
+        n = -(-(env.cached_len(layer, rid) + 1) // tpb)
+        last = max(last, int(env.block_offsets[0, s, 0, :n].max().item()) // slabs_per_page)
+    view = env.layer_views[layer]
+    base = int(env.mgr.kv_cache_pool_pointers.view(-1)[0])
+    elements = (view[last].data_ptr() - base) // view.element_size()
+    assert elements >= 2**31, f"{label}: the last page read starts at element {elements} < 2^31"
 
 
 def _cell_encoder(cell, arm) -> None:
@@ -8084,13 +8104,17 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 max_seq_len=_CORE_MAX_SEQ_LEN,
             ),
         ),
+        # Histories long enough to put the last pages read past 2^31 pool elements from
+        # the base: a page of the 48-layer pool is 96 slabs of Hkv x 32 x 256 elements,
+        # so page 2731 at 6/1 and page 1366 at 24/2, well inside a serving pool.
         Cell(
             why="unified tp4 decode at 128 requests, the captured-batch ceiling: 6q/1kv "
-            "over histories 1..1000",
+            "over histories 1..1500, pages past 2^31 pool elements",
             spec=dict(
                 _QWEN4_TP4,
                 **_IDENTITY_ROW_47,
-                cached=_spread(128, 1000),
+                past_int32_elements=True,
+                cached=_spread(128, 1500),
                 new=(1,) * 128,
                 num_contexts=0,
                 predicted_tokens_per_seq=1,
@@ -8153,14 +8177,31 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                     max_seq_len=_MTP_MAX_SEQ_LEN,
                 ),
             )
-            for p in (2, 4, 8)
+            for p in (2, 4)
         ),
         Cell(
-            why="unified dep4 decode at 32 requests: 24q/2kv over histories 1..1000",
+            why="unified tep4 MTP verify P=8 at 128 requests: 6q/1kv over histories 1..1500, "
+            "1024 q rows, pages past 2^31 pool elements",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                past_int32_elements=True,
+                cached=_spread(128, 1500),
+                new=(8,) * 128,
+                num_contexts=0,
+                predicted_tokens_per_seq=8,
+                max_num_requests=128,
+                max_seq_len=_MTP_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified dep4 decode at 32 requests: 24q/2kv over histories 1..4000, "
+            "pages past 2^31 pool elements",
             spec=dict(
                 QWEN4_DENSE,
                 **_IDENTITY_ROW_47,
-                cached=_spread(32, 1000),
+                past_int32_elements=True,
+                cached=_spread(32, 4000),
                 new=(1,) * 32,
                 num_contexts=0,
                 predicted_tokens_per_seq=1,

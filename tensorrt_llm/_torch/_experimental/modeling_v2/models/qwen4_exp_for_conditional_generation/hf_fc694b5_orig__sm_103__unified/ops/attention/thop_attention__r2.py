@@ -357,12 +357,14 @@ class ThopAttention(OpWrapper):
     the two-pool hybrid mapping), at max_seq_len 9216 (16384 for MTP): 6/1
     packed and paged context up to 8192 fresh rows, a mixed step, decode of one
     request over 9215 keys (the multi-CTA KV path) and of 128 requests over
-    histories 1..1000, MTP verify P 2, 4 and 8 at 128 requests; 24/2 decode
-    at 32 requests, a 512-row chunk over a 512-token prefix, an 8192-row packed
-    prefill, and paged context over an NVFP4 pool -- the manager's
-    `[pools, 2, 2]` pointers, its block-scale pool checked bitwise per layer.
-    Measured on sm_103 against `reference`: at most 2.0 bf16 ulp of the row
-    scale per element and 0.78 of relative RMS. 6/1 decodes on a VarSeqQ8
+    histories 1..1500, MTP verify P 2 and 4 at 128 requests over 1..1000 and
+    P 8 over 1..1500; 24/2 decode at 32 requests over 1..4000, a 512-row chunk
+    over a 512-token prefix, an 8192-row packed prefill, and paged context
+    over an NVFP4 pool -- the manager's `[pools, 2, 2]` pointers, its
+    block-scale pool checked bitwise per layer. The 1..1500 and 1..4000 decodes
+    read pages starting 1.12-1.48 x 2^31 pool elements from the base, past an
+    int32 element index. Measured on sm_103 against `reference`: at most 2.0
+    bf16 ulp of the row scale per element and 0.78 of relative RMS. 6/1 decodes on a VarSeqQ8
     kernel, like 24/4. P = 3 is driven at 6/1 only by the one-hot mask
     read-out and the full-block rival, at two requests; P 5..7 not at all.
 
