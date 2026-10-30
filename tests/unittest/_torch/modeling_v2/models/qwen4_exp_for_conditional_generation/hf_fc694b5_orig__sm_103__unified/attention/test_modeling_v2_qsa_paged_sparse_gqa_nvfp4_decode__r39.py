@@ -7,7 +7,7 @@ and QSA's bf16 kernel over the dequantized pool, inside the NVFP4 op's band (4 u
 determinism and graph replay against eager.
 
 The dep4 cells run at one rank's pool as the engine allocates it under `kv_nvfp4`: the
-requests' pages scattered over all 213295 pages, both planes' byte offsets on both sides of
+requests' pages scattered over all 211797 pages, both planes' byte offsets on both sides of
 2^31 and 2^32 (asserted), every scale outside the mapped pages NaN, and each captured and
 replayed at its own compile variant. The bf16 twin dequantizes only the mapped pages."""
 
