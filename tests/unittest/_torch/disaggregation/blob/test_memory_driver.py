@@ -1501,6 +1501,41 @@ def test_the_zero_budget_drain_check_closes_a_staged_driver_that_signals_nothing
     assert closed == staged and len(staged) == 1
 
 
+class _TakesStraySpansAndNeverProvesItsEnd(MemoryDriver):
+    """Takes a row with a span in no registration, then can never prove that operation's access
+    ended: the worst a driver can do with memory the suite does not otherwise retain. Rows inside
+    the registrations move as usual."""
+
+    def _check_registered(self, rows: Sequence[RowIO]) -> None:
+        pass
+
+    def _check_extents(self, rows: Sequence[RowIO]) -> None:
+        pass
+
+    def _execute(self, op: MemoryOp) -> None:
+        if all(self._registered(span) for row in op.rows for span in row.io.spans):
+            super()._execute(op)
+        else:
+            self.mark_unprovable(op)
+
+
+@pytest.mark.parametrize(
+    "check",
+    [
+        "test_a_row_outside_every_registration_is_rejected_before_any_effect",
+        "test_every_span_of_a_row_is_checked_against_the_registrations",
+    ],
+)
+def test_a_stray_span_a_driver_took_is_retained_when_its_rejection_check_fails(check: str) -> None:
+    """The check fails, and the stray memory the operation may still touch is kept alive, as the
+    endpoints of an unprovable operation are."""
+    suite = _conformance(_TakesStraySpansAndNeverProvesItsEnd, DEFAULT_CAPABILITIES)
+    retained = len(UNRELEASED_MEMORY)
+    with pytest.raises(CHECK_FAILED):
+        _run_check(suite, check)
+    assert len(UNRELEASED_MEMORY) == retained + 1
+
+
 def test_a_drain_that_never_returns_fails_the_zero_budget_check_and_is_not_called_again() -> None:
     """The check fails at the harness timeout, and the harness then asks nothing more of the
     driver: its usual cleanup would drain again and hang the run. The stuck call is released

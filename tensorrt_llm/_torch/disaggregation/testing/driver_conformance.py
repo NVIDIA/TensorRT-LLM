@@ -209,6 +209,20 @@ def _access_settled(driver: StoreDriver, op: OpHandle, timeout: float) -> bool:
     return driver.access_ended(op)
 
 
+def _refuses_stray(
+    h: Harness, direction: str, start: Callable[[], OpHandle], stray: Memory
+) -> None:
+    """``start`` submits a row with a span in no registration; the driver must refuse it. One that
+    takes it may touch the stray span for as long as the operation runs, and no endpoint retains
+    that memory, so it is kept alive before the check fails."""
+    try:
+        start()
+    except DriverRejected:
+        return
+    UNRELEASED_MEMORY.append(stray)
+    pytest.fail(f"{direction} took a row with a span in no registration")
+
+
 def _skip_unprovable(index: int) -> NoReturn:
     """The contract allows a store to leave a row's access unprovable, and a batch with such a row
     cannot be revoked: the check ends here, and its ``finally`` retains the memory."""
@@ -742,11 +756,9 @@ class DriverConformance:
             h.needs(put=True, get=True)
             h.publish({"A": b"aaaaaaaa"})
             stray = HostBuffer(SLOT, fill=0x2D)
-            with pytest.raises(DriverRejected):
-                h.get([RowIO(h.key("A"), (stray.span(),))])
+            _refuses_stray(h, "get", lambda: h.get([RowIO(h.key("A"), (stray.span(),))]), stray)
             assert stray.read() == b"-" * SLOT and stray.canaries_intact()
-            with pytest.raises(DriverRejected):
-                h.put([RowIO(h.key("S"), (stray.span(),))])
+            _refuses_stray(h, "put", lambda: h.put([RowIO(h.key("S"), (stray.span(),))]), stray)
             reader = h.endpoint(["S"], fill=0x2D)
             (result,) = h.wait_for_results(h.get(reader.rows()))
             h.assert_absent(result, reader, 0)
@@ -795,10 +807,8 @@ class DriverConformance:
             inside.fill_row(0, b"aaaaaaaa")
             stray = HostBuffer(SLOT, fill=0x2D)  # the second span of the row, in no registration
             row = RowIO(h.key("M"), (inside.span(0), stray.span()))
-            with pytest.raises(DriverRejected):
-                h.put([row])
-            with pytest.raises(DriverRejected):
-                h.get([row])
+            _refuses_stray(h, "put", lambda: h.put([row]), stray)
+            _refuses_stray(h, "get", lambda: h.get([row]), stray)
             assert stray.read() == b"-" * SLOT and stray.canaries_intact()
             assert inside.read_row(0) == b"aaaaaaaa"
 
@@ -997,7 +1007,8 @@ class DriverConformance:
                     assert blocked.wait(h.timeout), "the put never reached the store"
                 op = seen["op"]
                 assert statuses(h.driver, op) == [RowStatus.PENDING]  # still inside the store
-                assert h.driver.access_ended(op) is False
+                # Whether its access has ended is the driver's to say: one that staged the
+                # payload in memory of its own may truthfully have ended it already.
             finally:
                 unblock()
                 putter.join(h.timeout)
@@ -1426,12 +1437,15 @@ class DriverConformance:
             assert isinstance(refusal[0], DriverRejected), (
                 f"a busy batch was revoked: {refusal[0]!r}"
             )
-            for index, region in enumerate(memory[:-1]):  # the idle regions stayed registered
-                if not _prove_registered(driver, region, index, self.timeout):
-                    _skip_unprovable(index)
             unblock()
             getter.join(self.timeout)
             assert not getter.is_alive(), "the stalled get never returned"
+            # Proven only now: a driver that runs its operations one after another would queue
+            # these rows behind the stalled get. A region the refused revocation let go stays
+            # gone, so the proof is as good after the get returned.
+            for index, region in enumerate(memory[:-1]):  # the idle regions stayed registered
+                if not _prove_registered(driver, region, index, self.timeout):
+                    _skip_unprovable(index)
             if not _access_settled(driver, slow["op"], self.timeout):
                 _skip_unprovable(len(memory) - 1)
             driver.unregister_regions(handle)
