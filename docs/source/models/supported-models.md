@@ -77,6 +77,15 @@ following its [Docker guide](https://github.com/NVIDIA/TensorRT-LLM/blob/main/do
 | MiniMax-M3.1-Flash | [`feat/minimax-m3.1-flash`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/minimax-m3.1-flash) | [Serving MiniMax-M3.1-Flash](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/minimax-m3.1-flash/docs/source/deployment-guide/deployment-guide-for-minimax-m3-on-trtllm.md#serving-minimax-m31-flash) in the MiniMax-M3 deployment guide | `nvcr.io/nvidia/tensorrt-llm/release:1.4.0a0.dev202610230958` |
 | Beam (Reflection AI) | [`feat/reflection-beam`](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/reflection-beam) | [Beam deployment guide](https://github.com/NVIDIA/TensorRT-LLM/blob/feat/reflection-beam/docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md) | No container published yet — build from the branch sources per the guide |
 
+## Experimental StairCase components
+
+`BeamForCausalLM` has an experimental ModelingV2/StairCase implementation for the
+52-layer NVFP4-expert configuration on four GB300 GPUs (attention TP4, MoE TP4/EP1,
+BF16 KV cache, eager execution). This implementation provides the model components
+and explicit checkpoint loader; standard serving registration, recipes and optimized
+execution modes are separate integration work. It is not an entry in the general
+feature-support matrix below.
+
 ## Model-Feature Support Matrix (Key Models)
 
 Note: Support for other models may vary. Features marked "N/A" are not applicable to the model architecture.

@@ -11,6 +11,7 @@ Importing this package imports every family's ``routing`` module, and each one
 registers its ``route`` through ``@routes``. A new family adds one line here.
 """
 
+from .beam import routing as beam_routing  # noqa: F401
 from .deepseek_v3 import routing as deepseek_v3_routing  # noqa: F401
 from .glm_moe_dsa import routing as glm_moe_dsa_routing  # noqa: F401
 from .gpt_oss import routing as gpt_oss_routing  # noqa: F401
