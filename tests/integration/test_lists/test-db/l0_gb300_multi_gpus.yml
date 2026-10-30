@@ -28,6 +28,13 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
+  # Qwen3.8-Flash-Next-NVFP4 / sm_103 / unified: each layout, MTP3, and the long pass-key
+  # acceptance against stock.
+  - accuracy/modeling_v2/test_qwen4_exp_for_conditional_generation.py::TestModelingV2HfFc694b5OrigSm103Unified::test_gsm8k[tep4] TIMEOUT (90)
+  - accuracy/modeling_v2/test_qwen4_exp_for_conditional_generation.py::TestModelingV2HfFc694b5OrigSm103Unified::test_gsm8k[tp4] TIMEOUT (90)
+  - accuracy/modeling_v2/test_qwen4_exp_for_conditional_generation.py::TestModelingV2HfFc694b5OrigSm103Unified::test_gsm8k[dep4] TIMEOUT (90)
+  - accuracy/modeling_v2/test_qwen4_exp_for_conditional_generation.py::TestModelingV2HfFc694b5OrigSm103Unified::test_mtp3_gsm8k TIMEOUT (90)
+  - accuracy/modeling_v2/test_qwen4_exp_for_conditional_generation.py::TestModelingV2HfFc694b5OrigSm103Unified::test_mtp3_long_context_passkey TIMEOUT (60)
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
