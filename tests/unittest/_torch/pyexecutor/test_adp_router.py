@@ -460,7 +460,7 @@ class TestRankState:
         for invalid in (wire[:-1], [*wire, 0]):
             with pytest.raises(ValueError, match="four trailing fields"):
                 RankState.deserialize(invalid)
-        wire[5] = 2  # The routing-load presence flag must be 0 or 1.
+        wire[6] = 2  # The routing-load presence flag must be 0 or 1.
         with pytest.raises(ValueError, match="header"):
             RankState.deserialize(wire)
         with pytest.raises(ValueError, match="requires"):
