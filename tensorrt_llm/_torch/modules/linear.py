@@ -733,13 +733,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             group = (module.mapping.tp_group
                      if output_buffer_kind == int(BufferKind.NCCL_WINDOW)
                      and module.mapping is not None else None)
-            output = torch.ops.trtllm.cublas_mm(
-                input,
-                weight.t(),
-                bias,
-                out_dtype=None,
-                output_buffer_kind=output_buffer_kind,
-                group=group)
+            cublas_mm_op = (torch.ops.trtllm.cublas_mm_tuned
+                            if get_sm_version() == 121 else
+                            torch.ops.trtllm.cublas_mm)
+            output = cublas_mm_op(input,
+                                  weight.t(),
+                                  bias,
+                                  out_dtype=None,
+                                  output_buffer_kind=output_buffer_kind,
+                                  group=group)
         else:
             output = F.linear(input, weight, bias)
         return output
