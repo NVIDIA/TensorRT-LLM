@@ -312,8 +312,13 @@ Result run(std::string description, Options& options, Buffers& buffers)
 /// Program entrypoint
 int main(int argc, char const** argv)
 {
+#ifndef COMPILE_HOPPER_TMA_GEMMS
+    std::cout << "Skipping: Hopper support was not compiled. Rebuild with 90 as an arch to build_wheel.py."
+              << std::endl;
+    return 77;
+#else
 
-    // Current device must must have compute capability at least 80
+    // Current device must have compute capability at least 90.
     cudaDeviceProp props;
     int current_device_id;
     cudaGetDevice(&current_device_id);
@@ -323,8 +328,7 @@ int main(int argc, char const** argv)
         std::cerr << "Hopper Tensor Core operations must be run on a machine with compute capability at least 90."
                   << std::endl;
 
-        // Returning zero so this test passes on older Toolkits. Its actions are no-op.
-        exit(0);
+        return 77;
     }
 
     Buffers buffers;
@@ -478,13 +482,7 @@ int main(int argc, char const** argv)
     //
     // Evaluate CUTLASS kernels
     //
-#ifdef COMPILE_HOPPER_TMA_GEMMS
-    Result hopperFp8 = run<Gemm>(std::string("Hopper fp8 swiglu"), options, buffers);
-#else  // COMPILE_HOPPER_TMA_GEMMS
-    std::cout << "[TensorRT LLM Error][GemmSwigluKernelTestSm90Fp8] Please recompile with support for hopper by "
-                 "passing 90 as an arch to build_wheel.py."
-              << std::endl;
-#endif // COMPILE_HOPPER_TMA_GEMMS
+    Result const hopperFp8 = run<Gemm>(std::string("Hopper fp8 swiglu"), options, buffers);
     // for (int i = 0; i < options.problem_size_out.m(); i++)
     // {
     //     for (int j = 0; j < options.problem_size_out.n(); j++)
@@ -495,5 +493,6 @@ int main(int argc, char const** argv)
     //     }
     // }
 
-    return 0;
+    return (options.no_check || hopperFp8.passed) ? EXIT_SUCCESS : EXIT_FAILURE;
+#endif // COMPILE_HOPPER_TMA_GEMMS
 }

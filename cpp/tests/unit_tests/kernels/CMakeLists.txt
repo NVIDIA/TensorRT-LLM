@@ -194,8 +194,9 @@ target_link_libraries(gemmSwigluKernelTestSm90Fp8
 target_compile_features(gemmSwigluKernelTestSm90Fp8 PRIVATE cxx_std_20)
 add_test(NAME gemmSwigluKernelTestSm90Fp8 COMMAND gemmSwigluKernelTestSm90Fp8)
 set_tests_properties(
-  gemmSwigluKernelTestSm90Fp8 PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY"
-                                         LABELS "unit;kernels;gated-gemm;gpu")
+  gemmSwigluKernelTestSm90Fp8
+  PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" SKIP_RETURN_CODE 77 LABELS
+             "unit;kernels;gated-gemm;gpu")
 add_dependencies(kernel-tests gemmSwigluKernelTestSm90Fp8)
 add_dependencies(google-tests gemmSwigluKernelTestSm90Fp8)
 
