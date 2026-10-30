@@ -979,8 +979,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        prompt_lens_source = self.prompt_lens_cpu[:self.num_seqs]
+        if self.kv_cache_manager is None:
+            # Encoder work can outlive the caller's next CPU preparation.
+            # Keep its H2D source independent of the reusable host snapshot.
+            prompt_lens_source = maybe_pin_memory(prompt_lens.clone())
+        self.prompt_lens_cuda[:self.num_seqs].copy_(prompt_lens_source,
+                                                    non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
