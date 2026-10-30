@@ -30,6 +30,7 @@ import com.nvidia.bloom.ContainerRuntime
 import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException
 import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 import trtllm.FailureClassifier
