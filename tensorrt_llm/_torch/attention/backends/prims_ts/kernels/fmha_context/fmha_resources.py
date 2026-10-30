@@ -89,6 +89,11 @@ from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
 from ..placeholder_helpers import _placeholder_smem_array, _placeholder_tmem_ptr
 from ..tcgen05_compat import tcgen05_ld_32x32b_max
+from .helpers_paged import (
+    _load_block_table_row_bounds,
+    _load_runtime_seq_len_kv,
+    _resolve_kv_tile_idx_context,
+)
 from .helpers import (
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
@@ -1224,7 +1229,7 @@ class GmemQKVResource(MemoryResource):
                 else:
                     kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                         Int32(self.block_table_row_stride),
-                        self.cfg,
+                        self.cfg.num_tokens_per_page,
                         seqlen_k,
                         batch_coord,
                     )
@@ -1302,7 +1307,7 @@ class GmemQKVResource(MemoryResource):
             )
             kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                 Int32(self.block_table_row_stride),
-                self.cfg,
+                self.cfg.num_tokens_per_page,
                 cached_seqlen_kv,
                 batch_coord,
             )
@@ -5759,14 +5764,3 @@ class GmemOResource(MemoryResource):
                 prims.cp_async_bulk_commit_group()
                 if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                     prims.cp_async_bulk_wait_group(0, read=True)
-
-
-# helpers_paged imports FmhaConfig from this module, so it is imported here,
-# after FmhaConfig is defined. The methods above call these helpers while being
-# traced inside the kernel's runtime loops, where the CuTe DSL rejects a first
-# import of a module; importing at module scope keeps those calls import-free.
-from .helpers_paged import (
-    _load_block_table_row_bounds,
-    _load_runtime_seq_len_kv,
-    _resolve_kv_tile_idx_context,
-)
