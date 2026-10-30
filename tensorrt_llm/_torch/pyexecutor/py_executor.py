@@ -10203,14 +10203,20 @@ class PyExecutor:
         scheduled_requests.added_inflight_req_ids = []
 
     def reset_prefix_cache(self):
-        self.kv_cache_manager.reset_reuse_state()
-        if self.enable_joint_kv_cache_reuse:
-            self.draft_kv_cache_manager.reset_reuse_state()
-        # R3: invalidate cached routes together with the KV reuse state. Guard the
-        # engine lookup too -- minimal executors (unit tests) may have no engine.
+        # Invalidate routes after the native V2 clear returns, even when a
+        # later reset step fails. A precondition rejection keeps them intact.
         route_capture = getattr(getattr(self, "model_engine", None),
                                 "route_capture", None)
-        if route_capture is not None:
+        clear_routes_in_manager = (route_capture is not None and isinstance(
+            self.kv_cache_manager, KVCacheManagerV2))
+        if clear_routes_in_manager:
+            self.kv_cache_manager.reset_reuse_state(
+                on_cleared=route_capture.clear_shared)
+        else:
+            self.kv_cache_manager.reset_reuse_state()
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.reset_reuse_state()
+        if route_capture is not None and not clear_routes_in_manager:
             route_capture.clear_shared()
 
     def validate_sleep_tags(self, tags: List[ExecutorMemoryType]) -> None:
@@ -10326,11 +10332,9 @@ class PyExecutor:
         Must run at a control-action boundary: ``_handle_control_request``
         retires the overlap loop's in-flight batch on every rank before the
         action fires (see ``_retire_inflight_batch_for_control``), so
-        request teardown here is rank-local. The final prefix-cache reset
-        flushes events; with buffered attention-DP events, that flush gathers
-        across ranks, so every rank must call this method in the same order.
-        Consuming an in-flight batch here instead would gather on some
-        attention-DP ranks only and deadlock the engine.
+        everything here is rank-local and issues no TP collectives. Consuming
+        an in-flight batch here instead would gather on some attention-DP
+        ranks only and deadlock the engine.
 
         Not supported with pipeline parallelism (``pp_size > 1``): the PP
         microbatch ring keeps batches in flight across the control action, and

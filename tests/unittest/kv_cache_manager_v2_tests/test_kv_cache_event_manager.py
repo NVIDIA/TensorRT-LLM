@@ -350,8 +350,10 @@ def test_native_streaming_sink_to_python_wire_structs(real_block_factory, lora_i
         manager.shutdown()
 
 
-@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear", "sharing_reset"])
-def test_cache_reset_failure_still_participates_in_buffered_gather(failure_stage):
+@pytest.mark.parametrize(
+    "failure_stage", [None, "native_clear", "conversation_clear", "sharing_reset"]
+)
+def test_buffered_cache_reset_does_not_start_event_gather(failure_stage):
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 
     gather = Mock(return_value=[[], []])
@@ -371,15 +373,109 @@ def test_cache_reset_failure_still_participates_in_buffered_gather(failure_stage
         "sharing_reset": wrapper._sharing._on_reset,
     }
     error = RuntimeError("reset failed on this rank")
-    stages[failure_stage].side_effect = error
-
-    with pytest.raises(RuntimeError) as exc_info:
+    if failure_stage is not None:
+        stages[failure_stage].side_effect = error
+        with pytest.raises(RuntimeError) as exc_info:
+            wrapper.reset_reuse_state()
+        assert exc_info.value is error
+    else:
         wrapper.reset_reuse_state()
 
-    assert exc_info.value is error
-    # Even a failed rank with no events must enter the native gather callback.
-    gather.assert_called_once_with([])
+    # Buffered ADP publication must not introduce a reset-time collective.
+    gather.assert_not_called()
     assert wrapper.event_manager.get_latest_events(0) == []
+    wrapper.flush_iteration_events()
+    gather.assert_called_once()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_reset_route_state_follows_native_cache_clear(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.route_capture import RouteCapture
+
+    init_cuda_once()
+    native = _create_test_manager(None)
+    stream_holder = CachedCudaStream()
+    tokens = _token_ids(1, 9)
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), tokens)
+    assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = None
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    route_capture = RouteCapture(rank=0)
+    route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
+    executor = object.__new__(PyExecutor)
+    executor.kv_cache_manager = wrapper
+    executor.enable_joint_kv_cache_reuse = False
+    executor.model_engine = SimpleNamespace(route_capture=route_capture)
+
+    try:
+        expected_error = (
+            r"KV cache\(s\) still open"
+            if failure_stage == "native_clear"
+            else "conversation clear failed"
+        )
+        with pytest.raises(RuntimeError, match=expected_error):
+            PyExecutor.reset_prefix_cache(executor)
+        if failure_stage == "native_clear":
+            assert native.probe_reuse(input_tokens=tokens) == len(tokens)
+            assert 1 in route_capture._shared
+        else:
+            assert native.probe_reuse(input_tokens=tokens) == 0
+            assert not route_capture._shared
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+
+
+@pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear"])
+def test_streaming_reset_failure_flushes_pending_events(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
+    init_cuda_once()
+    events = StreamingKVCacheEventManager(
+        KVEventsConfig(enable_kv_cache_events=True, publisher="null"),
+        data_parallel_rank=0,
+        block_size=4,
+        max_window_size=128,
+    )
+    events.set_layer_group_window_sizes({0: 128})
+    published = []
+    events._publisher.publish = lambda batch: published.append(batch) or True
+    native = _create_test_manager(events.event_sink)
+    wrapper = KVCacheManagerV2.__new__(KVCacheManagerV2)
+    wrapper.impl = native
+    wrapper.event_manager = events
+    wrapper.conversation_manager = Mock()
+    wrapper._sharing = None
+    stream_holder = CachedCudaStream()
+    _commit_and_close(native, cast(CudaStream, stream_holder.handle), _token_ids(1, 5))
+    held = native.create_kv_cache() if failure_stage == "native_clear" else None
+    if failure_stage == "conversation_clear":
+        wrapper.conversation_manager.clear.side_effect = RuntimeError("conversation clear failed")
+    try:
+        with pytest.raises(RuntimeError):
+            wrapper.reset_reuse_state()
+        assert len(published) == 1
+        wire_events = msgspec.msgpack.decode(msgspec.msgpack.encode(published[0]))[1]
+        assert wire_events[0]["type"] == "BlockStored"
+        assert (wire_events[-1]["type"] == "AllBlocksCleared") == (
+            failure_stage == "conversation_clear"
+        )
+    finally:
+        if held is not None:
+            held.close()
+        native.shutdown()
+        events.shutdown()
 
 
 @pytest.mark.skipif(torch is None or not torch.cuda.is_available(), reason="requires CUDA")

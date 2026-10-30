@@ -400,14 +400,16 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`, or over the
 `/kv_cache_events` endpoint of `trtllm-serve`.
 
+Reset does not flush buffered events; they are published at a subsequent iteration boundary.
+
 #### Streaming path (prototype)
 
 Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
 LLM API. Each emitting rank drains its local native event source, converts the events to wire
-structs and enqueues a batch at iteration boundaries and when a prefix-cache reset completes.
-A background thread performs msgpack encoding and socket I/O.
+structs and attempts to enqueue a batch at iteration boundaries and when a prefix-cache reset
+completes. A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -429,10 +431,13 @@ events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or
 removed events. A populated reset also emits `BlockRemoved` for previously published resident
 blocks before `AllBlocksCleared`; consumers should accept both even though the reset marker
-already invalidates the whole index. Reset flushes events without waiting for another
-inference iteration, including while inference is idle or paused. The marker is retained in
-bounded replay history and does not change the engine lifetime ID. Orderly engine shutdown
-also clears the reuse tree and queues a final `AllBlocksCleared` before publisher teardown.
+already invalidates the whole index. Each rank attempts to enqueue its reset events without
+waiting for another inference iteration, including while inference is idle or paused, and
+without a cross-rank event gather. Publishing happens asynchronously. A successfully
+published marker is retained in bounded replay history and does not change the engine
+lifetime ID.
+Orderly engine shutdown also clears the reuse tree and queues a final `AllBlocksCleared`
+before publisher teardown.
 The best-effort delivery guarantees below apply to reset and shutdown events too.
 
 Streaming exposes only the full-block residency information external routers need, using the
@@ -474,7 +479,11 @@ batch reserves a sequence number up front, so a batch dropped by a full publishe
 (```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
 treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
 producer-side safety-cap drop is reported in the producer's logs and counters but does not
-create a sequence gap.
+create a sequence gap. If the last batch is dropped while the engine remains idle, a
+subscriber cannot detect its sequence gap until a later batch arrives. The
+[Dynamo TensorRT-LLM sidecar](https://github.com/ai-dynamo/dynamo/blob/e5a2ef3fcc2cc6e12a9185e39c98141a983eaeab/lib/llm/src/kv_router/publisher/zmq_listener.rs#L183-L208)
+currently logs source sequence gaps without automatically resynchronizing, so a lost reset
+marker can leave its routing index stale even after later events arrive.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and

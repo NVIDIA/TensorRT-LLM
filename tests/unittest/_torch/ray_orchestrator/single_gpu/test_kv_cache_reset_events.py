@@ -8,4 +8,4 @@ from _torch.ray_orchestrator.cache_reset_utils import check_cache_reset_events_t
 @pytest.mark.ray
 @pytest.mark.timeout(240)
 def test_streaming_reset_is_published_before_control_rpc_resumes(tmp_path):
-    check_cache_reset_events_through_control_rpc(True, tmp_path)
+    check_cache_reset_events_through_control_rpc(tmp_path)

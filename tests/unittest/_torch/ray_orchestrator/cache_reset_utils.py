@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import json
 import time
+from contextlib import ExitStack
 
 import msgspec
 import pytest
@@ -19,6 +19,15 @@ from tensorrt_llm.scheduling_params import SchedulingParams
 
 
 class ResetEventsWorkerExtension(WorkerExtension):
+    @control_action_decorator
+    def reset_for_subscription_probe(self):
+        publisher = self.engine.kv_cache_manager.event_manager._publisher
+        previous = publisher.enqueued_batches
+        WorkerExtension.reset_prefix_cache.__wrapped__(self)
+        assert publisher.enqueued_batches == previous + 1
+        assert publisher.dropped_batches == 0
+        return self.engine.dist.rank, publisher.enqueued_batches - 1
+
     @control_action_decorator
     def reset_and_wait_for_observer(self, endpoint):
         """Reset reuse state and hold every executor until its events are observed."""
@@ -55,14 +64,8 @@ def _replay_until(replay, start_seq, event_type):
     pytest.fail(f"No {event_type} event published while the executor was parked")
 
 
-def _buffered_events(llm):
-    events = llm._executor.rpc_client.fetch_kv_cache_events_wait_async(timeout=1).remote()
-    return [json.loads(event) if isinstance(event, str) else event for event in events]
-
-
-def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
+def check_cache_reset_events_through_control_rpc(tmp_path, ranks=1):
     """Observe reset events through public transports while the control RPC is parked."""
-    ranks = 1 if streaming else 2
     endpoint = f"ipc://{tmp_path}/events"
     replay_endpoint = f"ipc://{tmp_path}/replay"
     observer_endpoint = f"ipc://{tmp_path}/observer"
@@ -71,29 +74,31 @@ def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
         use_kv_cache_manager_v2=True,
         max_tokens=1024,
         tokens_per_block=32,
-        event_buffer_max_size=0 if streaming else 1024,
-        kv_events_config=(
-            KVEventsConfig(
-                enable_kv_cache_events=True,
-                publisher="zmq",
-                endpoint=endpoint,
-                replay_endpoint=replay_endpoint,
-            )
-            if streaming
-            else None
+        kv_events_config=KVEventsConfig(
+            enable_kv_cache_events=True,
+            publisher="zmq",
+            endpoint=endpoint,
+            replay_endpoint=replay_endpoint,
         ),
     )
-    with (
-        zmq.Context.instance().socket(zmq.ROUTER) as observer,
-        zmq.Context.instance().socket(zmq.DEALER) as replay,
-    ):
-        for socket in (observer, replay):
+    with ExitStack() as stack:
+        observer = stack.enter_context(zmq.Context.instance().socket(zmq.ROUTER))
+        replays = [
+            stack.enter_context(zmq.Context.instance().socket(zmq.DEALER)) for _ in range(ranks)
+        ]
+        subscribers = [
+            stack.enter_context(zmq.Context.instance().socket(zmq.SUB)) for _ in range(ranks)
+        ]
+        for socket in (observer, *replays, *subscribers):
             socket.setsockopt(zmq.LINGER, 0)
             socket.setsockopt(zmq.RCVTIMEO, 30_000)
             socket.setsockopt(zmq.SNDTIMEO, 30_000)
         observer.bind(observer_endpoint)
-        if streaming:
-            replay.connect(replay_endpoint)
+        for rank, replay in enumerate(replays):
+            replay.connect(replay_endpoint if rank == 0 else f"{replay_endpoint}_dp{rank}")
+        for rank, subscriber in enumerate(subscribers):
+            subscriber.setsockopt(zmq.SUBSCRIBE, b"")
+            subscriber.connect(endpoint if rank == 0 else f"{endpoint}_dp{rank}")
         with LLM(
             model=llm_models_root() / "Qwen3/Qwen3-0.6B",
             orchestrator_type="ray",
@@ -101,7 +106,7 @@ def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
                 "_torch.ray_orchestrator.cache_reset_utils.ResetEventsWorkerExtension"
             ),
             tensor_parallel_size=ranks,
-            enable_attention_dp=not streaming,
+            enable_attention_dp=ranks > 1,
             kv_cache_config=config,
             load_format="dummy",
             model_kwargs={"num_hidden_layers": 1},
@@ -110,38 +115,44 @@ def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
             max_num_tokens=256,
             enable_autotuner=False,
         ) as llm:
-            # Leave rank 1 empty: it must still participate in the buffered
-            # reset gather while rank 0 has removal events to publish.
+            # A PUB socket does not acknowledge subscriptions. Use idle resets
+            # to establish that every rank's live subscriber is receiving.
+            ready = set()
+            last_seen = [-1] * ranks
+            deadline = time.monotonic() + 30
+            while len(ready) < ranks and time.monotonic() < deadline:
+                refs = llm._collective_rpc("reset_for_subscription_probe", non_block=True)
+                cursors = dict(ray.get(refs, timeout=40))
+                assert set(cursors) == set(range(ranks))
+                for rank, subscriber in enumerate(subscribers):
+                    if subscriber.poll(250):
+                        _, frame, payload = subscriber.recv_multipart()
+                        last_seen[rank] = int.from_bytes(frame, "big")
+                        batch = msgspec.msgpack.decode(payload)
+                        if batch[2] == rank and batch[1][-1] == {"type": "AllBlocksCleared"}:
+                            ready.add(rank)
+            assert len(ready) == ranks, "Not all live event subscriptions became ready"
+
             output = llm.generate(
                 [1] * 65,
                 SamplingParams(max_tokens=1, ignore_eos=True),
                 scheduling_params=(
                     SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)
-                    if not streaming
+                    if ranks > 1
                     else None
                 ),
             )
             assert output.outputs[0].token_ids
+            before = _replay_until(replays[0], 0, "BlockStored")
+            start_seqs = [before[-1][0] + 1]
+            start_seqs.extend(cursors[rank] + 1 for rank in range(1, ranks))
 
-            stored = {rank: set() for rank in range(ranks)}
-            if streaming:
-                before = _replay_until(replay, 0, "BlockStored")
-                start_seq = before[-1][0] + 1
-            else:
-                # The 65-token prompt stores two full blocks and one partial
-                # tail, which can arrive in separate publisher batches.
-                expected_blocks = 3
-                deadline = time.monotonic() + 10
-                while time.monotonic() < deadline and len(stored[0]) < expected_blocks:
-                    for event in _buffered_events(llm):
-                        if event and event["data"]["type"] == "stored":
-                            stored[event["attention_dp_rank"]].update(
-                                block["block_hash"] for block in event["data"]["blocks"]
-                            )
-                assert len(stored[0]) == expected_blocks, (
-                    "Rank 0 must publish all three cached blocks"
-                )
-                assert not stored[1], "Rank 1 must exercise the empty-cache gather path"
+            # Consume all earlier batches so the next observed marker must be
+            # the reset performed while the control request is parked.
+            for subscriber, start_seq, sequence in zip(subscribers, start_seqs, last_seen):
+                while sequence < start_seq - 1:
+                    _, frame, _ = subscriber.recv_multipart()
+                    sequence = int.from_bytes(frame, "big")
 
             refs = llm._collective_rpc(
                 "reset_and_wait_for_observer", args=(observer_endpoint,), non_block=True
@@ -153,20 +164,22 @@ def check_cache_reset_events_through_control_rpc(streaming, tmp_path):
                     parked.append(identity)
                     assert message == b"reset"
                 assert set(parked) == {str(rank).encode() for rank in range(ranks)}
-                if streaming:
+                for rank, (replay, subscriber, start_seq) in enumerate(
+                    zip(replays, subscribers, start_seqs)
+                ):
+                    sequence = start_seq
+                    while True:
+                        _, frame, payload = subscriber.recv_multipart()
+                        assert int.from_bytes(frame, "big") == sequence
+                        sequence += 1
+                        live = msgspec.msgpack.decode(payload)
+                        assert live[2] == rank
+                        if live[1][-1] == {"type": "AllBlocksCleared"}:
+                            break
                     after = _replay_until(replay, start_seq, "AllBlocksCleared")
                     assert after[0][0] == start_seq
+                    assert all(batch[2] == rank for _, batch in after)
                     assert after[-1][1][1][-1] == {"type": "AllBlocksCleared"}
-                else:
-                    removed = {rank: set() for rank in range(ranks)}
-                    deadline = time.monotonic() + 10
-                    while time.monotonic() < deadline and removed != stored:
-                        for event in _buffered_events(llm):
-                            if event and event["data"]["type"] == "removed":
-                                removed[event["attention_dp_rank"]].update(
-                                    event["data"]["block_hashes"]
-                                )
-                    assert removed == stored
             finally:
                 for identity in parked:
                     observer.send_multipart([identity, b"observed"])
