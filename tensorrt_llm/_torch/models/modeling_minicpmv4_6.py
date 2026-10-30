@@ -541,6 +541,10 @@ class MiniCPMV4_6VisionModel(nn.Module):
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        # Per-segment capacity required by the shared encoder metadata helper.
+        # Like the Qwen-VL and Cosmos3 vision towers, default to the model's
+        # token budget rather than the live grid length.
+        self._attn_max_seq_len = model_config.max_num_tokens
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
         num_segments = len(seq_lens)
@@ -549,7 +553,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
             max_num_tokens=sum(seq_lens) + 1,
             kv_cache_manager=None,
         )
-        return _prepare_qwen_vl_vision_attn_metadata(seq_lens, attn_metadata)
+        return _prepare_qwen_vl_vision_attn_metadata(
+            seq_lens, attn_metadata, max_seq_len=self._attn_max_seq_len
+        )
 
     @staticmethod
     def _grid_seq_lens(target_sizes: torch.Tensor) -> List[int]:
