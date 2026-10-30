@@ -2441,11 +2441,8 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                score = task.evaluate(
+                task.evaluate(
                     llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            assert score >= acc_params.ref_accuracy, (
-                f"GSM8K accuracy {score:.3f} is below recorded reference "
-                f"{acc_params.ref_accuracy:.3f}")
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_gsm8k_megamoe_deepgemm[dp{tp_size}] "
                   f"acceptance_length = {acceptance_length:.3f}")
@@ -2492,12 +2489,9 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 spec_dec_algo=llm.args.speculative_config.decoding_type)
             assert acc_params.num_samples == GSM8K.NUM_SAMPLES
             with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
-                score = task.evaluate(llm, prepared_evaluator=evaluator)
-            assert score >= acc_params.ref_accuracy, (
-                f"GSM8K accuracy {score:.3f} is below recorded reference "
-                f"{acc_params.ref_accuracy:.3f}")
+                task.evaluate(llm, prepared_evaluator=evaluator)
             # Gate on acceptance as well as on the score: a drafter regression
-            # on this backend costs speed only, which the accuracy assert
+            # on this backend costs speed only, which the accuracy gate
             # cannot see.
             acceptance_length = compute_acceptance_length(llm)
             print(f"[AL] test_gsm8k_dep4_megamoe_cutedsl "

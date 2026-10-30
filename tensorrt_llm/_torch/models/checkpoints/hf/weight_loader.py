@@ -206,6 +206,32 @@ class HfWeightLoader(BaseWeightLoader):
             return 0
 
     @staticmethod
+    def _can_cache_weights(weight_files: List[str]) -> bool:
+        """Whether host memory can keep these checkpoint files resident.
+
+        SafeTensors weights are read from the file pages when a tensor is
+        first accessed, so a cache entry does not keep a copy of them in RAM.
+        Storing an entry and checking it on a hit both sample every tensor,
+        which reads any page that is not resident from storage. For a
+        checkpoint that does not fit in host memory, each store and each hit
+        therefore reads most of the checkpoint from storage.
+
+        Each rank applies the rank-striped read-ahead's ``memory_admission``
+        to its own available host memory. Ranks near the limit may decide
+        differently; they stay in step because a load that skips the cache
+        runs the same collectives as a miss.
+        """
+        checkpoint_bytes = sum(os.path.getsize(f) for f in weight_files)
+        available_bytes = effective_available_host_memory()
+        admitted, headroom = memory_admission(checkpoint_bytes, available_bytes)
+        if not admitted:
+            logger.warning(
+                "Not using the raw HF weight cache for this load: checkpoint "
+                f"bytes ({checkpoint_bytes}) exceed available host memory "
+                f"({available_bytes}) after startup headroom ({headroom}).")
+        return admitted
+
+    @staticmethod
     def _weight_files_cache_key(weight_files: List[str],
                                 use_consolidated: bool) -> tuple:
         file_fingerprint = []
@@ -332,10 +358,16 @@ class HfWeightLoader(BaseWeightLoader):
         Key -> hit (optionally joining the local barrier the miss path is
         about to enter) -> evict-before-load (so CPU never holds the old
         cached and the new loading weights at once) -> load -> store.
+        A checkpoint that host memory cannot keep resident is loaded like a
+        miss, without the lookup and the store.
         """
-        cache_key = self._weight_files_cache_key(
-            weight_files,
-            use_consolidated) if self._is_weight_cache_enabled() else None
+        cache_key = None
+        if self._is_weight_cache_enabled():
+            if self._can_cache_weights(weight_files):
+                cache_key = self._weight_files_cache_key(
+                    weight_files, use_consolidated)
+            else:
+                self._evict_to_make_room()
         if cache_key is not None:
             cached_weights = self._get_cached_weights(cache_key)
             if cached_weights is not None:

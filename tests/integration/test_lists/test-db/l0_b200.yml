@@ -272,6 +272,13 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_runner_cache_identity_includes_swiglu_constants
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_minimax_m3_swiglu_bias_numerics
   - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_nvfp4_awq_matches_cutlass
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_rank0_hosts_store_on_bound_port
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_store_failure_raises_on_every_rank
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_loopback_on_single_host
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_rank
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_mpi_bootstrap_resolved_loopback_across_hosts_raises
+  - unittest/_torch/moe/test_moe_backend.py::test_megamoe_cutedsl_init_raises_bootstrap_failure
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_bf16_unquantized_moe
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fused_shared_experts
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
