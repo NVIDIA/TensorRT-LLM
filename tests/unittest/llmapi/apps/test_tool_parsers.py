@@ -5260,6 +5260,29 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         result2 = parser.parse_streaming_increment(tc, sample_tools)
         assert len(result2.calls) >= 1
 
+    @pytest.mark.parametrize("chunk_size", [1, 3, 8])
+    def test_streamed_arguments_match_whole_parse(self, sample_tools, parser,
+                                                  chunk_size):
+        """Streamed argument deltas concatenate to the JSON detect_and_parse returns."""
+        text = (_g4_tc("get_weather", (f'location:{_g4_s("San Francisco, CA")},'
+                                       f'unit:{_g4_s("fahrenheit")}')) +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+        expected = Gemma4ToolParser().detect_and_parse(text, sample_tools)
+
+        names, arguments = {}, {}
+        for i in range(0, len(text), chunk_size):
+            result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                      sample_tools)
+            for call in result.calls:
+                if call.name:
+                    names[call.tool_index] = call.name
+                arguments[call.tool_index] = (
+                    arguments.get(call.tool_index, "") + call.parameters)
+
+        streamed = [(names[i], json.loads(arguments[i])) for i in sorted(names)]
+        assert streamed == [(c.name, json.loads(c.parameters))
+                            for c in expected.calls]
+
     def test_real_world_weather_query(self, sample_tools, parser):
         """Simulate real model output: text + tool call."""
         text = ("I'll check. " +
