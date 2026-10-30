@@ -134,6 +134,7 @@ l0_cpu:
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/test_custom_config_registration.py
+  - unittest/_torch/test_gpt_oss_config.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py

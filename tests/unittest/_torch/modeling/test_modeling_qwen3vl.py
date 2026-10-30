@@ -1381,9 +1381,7 @@ def test_rot_pos_emb_cos_sin_matches_old_repeat_chain():
 
 
 def test_rope_cos_sin_buffers_match_hf_rotary():
-    """The cos/sin cache exposed via `rotary_pos_emb.rotary_cos_sin` must
-    bit-match HF's `Qwen3VLVisionRotaryEmbedding(dim=36)(max_hw).cos()`
-    / `.sin()` output."""
+    """The cos/sin cache must match HF vision RoPE at positions `[0, max_hw)`."""
     from transformers.models.qwen3_vl.modeling_qwen3_vl import (
         Qwen3VLVisionRotaryEmbedding as HFQwen3VLVisionRotaryEmbedding,
     )
@@ -1396,7 +1394,8 @@ def test_rope_cos_sin_buffers_match_hf_rotary():
     cos_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 0, :]
     sin_cache = vm.rotary_pos_emb.rotary_cos_sin[:, 1, :]
     for max_hw in [16, 32, 48, 64, 100, 128]:
-        ref_freqs = hf(max_hw)
+        position_ids = torch.arange(max_hw, device=hf.inv_freq.device, dtype=hf.inv_freq.dtype)
+        ref_freqs = hf(position_ids)
         torch.testing.assert_close(cos_cache[:max_hw], ref_freqs.cos(), atol=atol, rtol=rtol)
         torch.testing.assert_close(sin_cache[:max_hw], ref_freqs.sin(), atol=atol, rtol=rtol)
 
