@@ -1188,9 +1188,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # Inputs for on_update_kv_lens: each query token's (request row, offset
         # in request). Pinned and non-blocking so the copies do not synchronize
         # the stream. The slots themselves come from msa_block_table above.
-        # Host arithmetic on a batch-sized vector: numpy, not torch. Each CPU
-        # torch op here (repeat_interleave above all) costs 100-200 us of
-        # dispatch and OpenMP fork/join per call, and this runs every step.
+        # Host arithmetic on a batch-sized vector runs in numpy: torch CPU ops
+        # (repeat_interleave above all) cost far more in dispatch and OpenMP
+        # fork/join than the arithmetic itself, and this runs every step.
         qo_np = qo_lens_cpu.numpy().astype(np.int64, copy=False)
         batch_row_np = np.repeat(np.arange(batch_size, dtype=np.int32), qo_np)
         starts_np = np.cumsum(qo_np) - qo_np

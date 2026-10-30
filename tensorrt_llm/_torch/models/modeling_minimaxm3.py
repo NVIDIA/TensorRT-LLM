@@ -348,6 +348,15 @@ def get_text_model_config(
     return cfg
 
 
+def _tensor_view_key(
+    tensor: Optional[torch.Tensor],
+) -> Optional[Tuple[int, Tuple[int, ...], Tuple[int, ...], torch.dtype, torch.device]]:
+    """Address and layout of a tensor view, for caching what was validated on it."""
+    if tensor is None:
+        return None
+    return (tensor.data_ptr(), tuple(tensor.shape), tensor.stride(), tensor.dtype, tensor.device)
+
+
 def _nvfp4_cache_supports_fused_write(
     data: torch.Tensor, scales: torch.Tensor, num_heads: int
 ) -> bool:
@@ -1625,24 +1634,24 @@ class MiniMaxM3Attention(Attention):
         geometry and strides of the paged caches, the RoPE table, the norm
         weights and epsilons) is fixed for a given set of cache views and
         parameters, so the checks run once per distinct set and the resolved
-        arguments are reused. The key is the storage identity of every tensor
-        involved: a reloaded parameter or a new cache manager starts a fresh
-        entry. The plan holds the kernel's static arguments only; the cache
-        views themselves are passed per call. Returns ``None`` when the fused
-        producer does not apply.
+        arguments are reused. The key is the address and layout (shape, strides,
+        dtype, device) of every tensor involved: a reloaded parameter or a new
+        cache manager starts a fresh entry, even when it reuses freed memory.
+        The plan holds the kernel's static arguments only; the cache views
+        themselves are passed per call. Returns ``None`` when the fused producer
+        does not apply.
         """
         rotary_cos_sin = self.rotary_emb.rotary_cos_sin if self.rotary_emb is not None else None
         kv_quant_scale = (
             getattr(self.qkv_proj, "inv_kv_scales", None) if scale_buffers is not None else None
         )
         key = (
-            None if buffers is None else (buffers.data_ptr(), buffers.shape[0]),
-            (index_k_cache.data_ptr(), index_k_cache.shape[0]),
-            None if scale_buffers is None else scale_buffers.data_ptr(),
-            None if kv_quant_scale is None else kv_quant_scale.data_ptr(),
-            out_cache_loc.data_ptr(),
-            out_cache_loc.dtype,
-            None if rotary_cos_sin is None else rotary_cos_sin.data_ptr(),
+            _tensor_view_key(buffers),
+            _tensor_view_key(index_k_cache),
+            _tensor_view_key(scale_buffers),
+            _tensor_view_key(kv_quant_scale),
+            _tensor_view_key(out_cache_loc),
+            _tensor_view_key(rotary_cos_sin),
             tuple(
                 module.weight.data_ptr()
                 for module in (self.q_norm, self.k_norm, self.index_q_norm, self.index_k_norm)

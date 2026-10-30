@@ -22,6 +22,7 @@ module-scope import here would close a cycle.
 from __future__ import annotations
 
 import functools
+from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -157,7 +158,7 @@ def _aligned_nvfp4_dequant_scales(
 
 
 @functools.lru_cache(maxsize=1)
-def _msa_sparse_api():
+def _msa_sparse_api() -> ModuleType:
     """Resolve fmha_sm100's sparse API once; the package cannot change under a run."""
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         require_msa_module,

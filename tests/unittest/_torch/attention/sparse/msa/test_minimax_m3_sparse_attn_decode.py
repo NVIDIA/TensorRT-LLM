@@ -14,6 +14,7 @@ import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -531,7 +532,7 @@ def test_sparse_decode_cuda_graph_replay_tracks_inputs(num_topk_chunks):
     torch.testing.assert_close(out.float(), expected, rtol=3e-2, atol=3e-2)
 
 
-def test_sparse_decode_bf16_cache_zero_length_rows_are_zero_not_nan():
+def test_sparse_decode_bf16_cache_zero_length_rows_are_zero_not_nan() -> None:
     """CUDA-graph padding rows of a BF16 cache emit zeros, not NaN."""
     seq_lens = [1024, 0, 512, 0]
     inputs = _make_inputs(seq_lens, kv_dtype=torch.bfloat16, seed=75)
@@ -547,7 +548,9 @@ def test_sparse_decode_bf16_cache_zero_length_rows_are_zero_not_nan():
 @pytest.mark.parametrize(
     "num_topk_chunks", [None, 1, 4], ids=["default", "direct-output", "split-merge"]
 )
-def test_sparse_decode_bf16_cache_cuda_graph_replay_equals_eager(num_topk_chunks):
+def test_sparse_decode_bf16_cache_cuda_graph_replay_equals_eager(
+    num_topk_chunks: Optional[int],
+) -> None:
     """A captured BF16-cache decode replays bit-identically to eager on new inputs."""
     seq_lens = [174, 4097, 900]
     q, k_paged, v_paged, topk_idx, block_table, seq_lens_dev = _make_inputs(
@@ -558,7 +561,7 @@ def test_sparse_decode_bf16_cache_cuda_graph_replay_equals_eager(num_topk_chunks
         kwargs["num_topk_chunks"] = num_topk_chunks
     out = torch.empty_like(q)
 
-    def run(target):
+    def run(target: torch.Tensor) -> None:
         minimax_m3_sparse_attn_decode(
             q,
             k_paged,

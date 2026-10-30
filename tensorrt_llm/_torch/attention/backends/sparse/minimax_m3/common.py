@@ -286,9 +286,9 @@ def build_paged_kv_slot_mapping(
     # Expanding the per-request lengths on the host reproduces the same slot
     # ids as indexing req_to_token, without copying that [batch, max_kv_len]
     # grid back from the device.
-    # Host arithmetic on batch-sized vectors in numpy: the torch CPU ops this
-    # replaced (repeat_interleave, cumsum, gather) each cost 100-200 us of
-    # dispatch and OpenMP fork/join, every step, for a few dozen elements.
+    # Host arithmetic on batch-sized vectors runs in numpy: on a few dozen
+    # elements, torch CPU ops cost far more in dispatch and OpenMP fork/join
+    # than the arithmetic itself, and this runs every step.
     qo = qo_lens_cpu.numpy().astype(np.int64, copy=False)
     total_q = int(qo.sum())
     if total_q == 0:
