@@ -162,8 +162,10 @@ def test_health_refresh_detects_fatal_failure_during_shutdown() -> None:
                 assert response.status == health_pb2.HealthCheckResponse.NOT_SERVING
         finally:
             release.set()
-            await refresh
-            await server.stop(grace=0)
+            try:
+                await refresh
+            finally:
+                await server.stop(grace=0)
 
     asyncio.run(exercise())
 
