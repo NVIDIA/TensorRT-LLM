@@ -2156,7 +2156,8 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
-        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        # Packed decode pads the rows of each request to a whole scale row group.
+        torch.testing.assert_close(state.prequantized_q[: expected_q_fp4.shape[0]], expected_q_fp4)
         q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
         valid_q_sf_offsets = torch.tensor(
             [
