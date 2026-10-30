@@ -326,6 +326,7 @@ l0_b200:
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_lilicorr_loading.py
   - unittest/_torch/speculative/test_dspark_slot_reset_no_sync.py
+  - unittest/_torch/speculative/test_metadata_restore.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
   # Fused strict acceptance and DFlash paged-latent drafter bookkeeping vs

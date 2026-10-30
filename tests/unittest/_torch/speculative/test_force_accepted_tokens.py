@@ -374,7 +374,7 @@ class _FailingSpecWorker(_StubSpecWorker):
 
     def _forward_impl(self, *args: object, **kwargs: object) -> None:
         attn_metadata = kwargs["attn_metadata"]
-        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
         raise RuntimeError("simulated draft failure")
 
 
