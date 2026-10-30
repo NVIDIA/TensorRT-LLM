@@ -1424,7 +1424,9 @@ def stage_placed(pp_layers):
 def test_a_cache_attached_by_stage_is_refused_under_other_pipeline_splits():
     """A cache attached to whichever model layer a stage holds first lies on another model layer
     of each split: a generation stage of PP2 holding it on model layer 2, which the context
-    instance of PP1 holds without it, would never receive it, and is refused. Splits alike pair."""
+    instance of PP1 holds without it, would never receive it, and is refused. So are stages of
+    another split with as many stages, wherever a model layer one holds the cache on is held by
+    the other without it. Stages starting at the same model layer pair."""
     from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
 
     whole = stage_placed([0, 1, 2, 3])
@@ -1433,6 +1435,13 @@ def test_a_cache_attached_by_stage_is_refused_under_other_pipeline_splits():
     with pytest.raises(ValueError, match="model layer 2's req_pos buffers are transferred by one"):
         check_compatible(whole, last)
     check_compatible(stage_placed([2, 3]), last)
+    # PP2 split 3 + 1 against 2 + 2.
+    with pytest.raises(ValueError, match="model layer 2's req_pos buffers are transferred by one"):
+        check_compatible(stage_placed([0, 1, 2]), last)
+    with pytest.raises(ValueError, match="model layer 3's req_pos buffers are transferred by one"):
+        check_compatible(stage_placed([3]), last)
+    check_compatible(stage_placed([0, 1, 2]), first)
+    check_compatible(first, stage_placed([0, 1, 2]))
 
 
 @pytest.mark.cpu_only
