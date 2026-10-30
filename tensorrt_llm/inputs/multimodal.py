@@ -638,9 +638,9 @@ class MultimodalInput:
     multimodal_uuids: Optional[List[Optional[str]]] = None
     """Optional user-provided UUIDs for multimodal data items.
 
-    When provided, these UUIDs will be returned in KV cache events instead of the
-    computed hash hex string. This enables deterministic cache identification across
-    sessions using user-defined stable identifiers.
+    When provided, these UUIDs are preserved in KV cache events. V1 reports the UUID
+    through the legacy ``hash`` field; V2 keeps the derived digest in ``hash`` and
+    reports the UUID through the optional ``uuid`` field.
 
     Each element can be:
     - A string UUID: Used as the cache identifier (returned in events)
@@ -1043,14 +1043,17 @@ class MultimodalParams:
 
         # Handle dictionary case
         if isinstance(input_data, dict):
-            if operation == "to_tensor" and self._is_shared_tensor_dict(
-                    input_data):
+            if operation in ("to_tensor", "release_handles"
+                             ) and self._is_shared_tensor_dict(input_data):
                 # Convert shared tensor dict back to tensor
                 try:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
 
+                    if operation == "release_handles":
+                        SharedTensorContainer.release_dict(input_data)
+                        return None
                     return SharedTensorContainer.from_dict(
                         input_data).get_local_view()
                 except Exception as e:
@@ -1103,6 +1106,11 @@ class MultimodalParams:
 
         # For any other type, return as-is
         return input_data
+
+    def release_handles(self) -> None:
+        """Reclaim exports when preprocessed inputs will not be submitted."""
+        self.multimodal_data = self._apply_tensor_operation(
+            self.multimodal_data, "release_handles")
 
     def to_handle(self, element: str) -> None:
         """Move specified multimodal data element to shared tensor.

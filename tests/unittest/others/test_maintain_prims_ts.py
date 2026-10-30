@@ -139,6 +139,13 @@ class World(m.GitHub):
         _git(root, "clone", "-q", "--bare", str(self.source), str(self.canonical))
         _git(root, "clone", "-q", "--bare", str(self.consumer), str(self.fork))
         _git(self.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", self.previous)
+        # By default the source forks share objects; tests can isolate their histories.
+        self.compare_repositories = {
+            _CONSUMER: self.consumer,
+            "maintainer/flashinfer": self.source,
+            "dev/flashinfer": self.source,
+            _UPSTREAM: self.source,
+        }
         _git(
             self.consumer, "remote", "add", "fork", "https://github.com/maintainer/TensorRT-LLM.git"
         )
@@ -191,7 +198,12 @@ class World(m.GitHub):
         }
 
     def compare(self, repo: str, base: str, head: str, *, all_commits: bool = False) -> dict:
-        source = self.consumer if repo == _CONSUMER else self.source
+        source = self.compare_repositories[repo]
+        for sha in (base, head):
+            if not _git(
+                source, "rev-parse", "--verify", f"{sha}^{{commit}}", allowed_returncodes=(0, 128)
+            ):
+                raise RuntimeError(f"HTTP 404: commit {sha} is unavailable in {repo}")
         commits = _git(source, "rev-list", "--reverse", f"{base}..{head}").splitlines()
         return {
             "merge_base_commit": {"sha": _git(source, "merge-base", base, head)},
@@ -708,14 +720,644 @@ def test_unmerged_or_wrong_base_rejected(world: World, field: str, value: object
         m._make_plan(world.args(), world)
 
 
+def _advance_canonical(world: World) -> str:
+    _write(world.source, "prims_ts/kernel.py", "VALUE = 4\n")
+    tip = _commit(world.source, "new canonical update")
+    _git(world.canonical, "fetch", "-q", str(world.source), tip)
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", tip)
+    return tip
+
+
+@pytest.mark.parametrize("tip_kind", ["previous", "intermediate", "reviewed"])
+def test_promotion_accepts_live_tip_contained_in_reviewed_pin(world: World, tip_kind: str) -> None:
+    tip = {"previous": world.previous, "intermediate": world.first, "reviewed": world.reviewed}[
+        tip_kind
+    ]
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", tip)
+    args = world.args(publish=True)
+    plan = m._make_plan(args, world)
+    m._publish(args, world, plan)
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    assert world.prs[99]["base"]["ref"] == "main"
+
+
+def test_plan_rejects_tip_newer_than_pinned_source(world: World) -> None:
+    tip = _advance_canonical(world)
+    with pytest.raises(m.Diagnostic, match="latest canonical branch tip") as failure:
+        m._make_plan(world.args(), world)
+    assert tip in failure.value.problem
+    assert world.reviewed in failure.value.problem
+    assert "consumer lock" in failure.value.action
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+def test_plan_checks_live_tip_before_and_after_attribution(world: World) -> None:
+    m._make_plan(world.args(), world)
+    endpoint = "repos/maintainer/flashinfer/git/ref/heads/trtllm-prims-ts-dev"
+    checks = [index for index, (_, route, _) in enumerate(world.calls) if route == endpoint]
+    attribution = next(
+        index
+        for index, (_, route, _) in enumerate(world.calls)
+        if route == f"repos/{_UPSTREAM}/pulls/4829"
+    )
+    assert len(checks) == 2
+    assert checks[0] < attribution < checks[1]
+
+
+def test_canonical_rewind_is_operator_error(world: World) -> None:
+    _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.upstream)
+    with pytest.raises(RuntimeError, match="Canonical branch no longer contains"):
+        m._make_plan(world.args(), world)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+def test_tip_advance_during_preparation_blocks_all_remote_writes(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    args = world.args(publish=True)
+    plan = m._make_plan(args, world)
+    prepare = m._prepare_commit
+
+    def advance(*arguments):
+        result = prepare(*arguments)
+        _advance_canonical(world)
+        return result
+
+    monkeypatch.setattr(m, "_prepare_commit", advance)
+    with pytest.raises(m.Diagnostic, match="latest canonical branch tip"):
+        m._publish(args, world, plan)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+def test_manual_promotion_rejects_pin_not_on_upstream_branch(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = m._plan_identity(world.args(), world)
+    plan.reviewed = dataclasses.replace(
+        plan.reviewed, url=f"https://github.com/{_UPSTREAM}.git", branch="main"
+    )
+    monkeypatch.setattr(m, "_plan_identity", lambda *args: plan)
+    with pytest.raises(m.Diagnostic, match="not reachable"):
+        m._make_plan(world.args(), world)
+    assert not any(method != "GET" for method, _, _ in world.calls)
+
+
+def _pin_upstream(world: World, *, branch: str = "main") -> None:
+    """Make the source update pin upstream directly, preserving the canonical parent."""
+    _write(
+        world.consumer,
+        "vendored/prims_ts/kernel.py",
+        _git(world.source, "show", f"{world.reviewed}:prims_ts/kernel.py") + "\n",
+    )
+    assert (
+        m.vendor.main(
+            [
+                "--lock",
+                str(world.consumer / m._LOCK),
+                "pin",
+                _VENDOR,
+                "--url",
+                f"https://github.com/{_UPSTREAM}.git",
+                "--branch",
+                branch,
+                "--commit",
+                world.reviewed,
+                "--repo",
+                str(world.source),
+            ]
+        )
+        == 0
+    )
+    _git(world.consumer, "add", "-A")
+    _git(world.consumer, "commit", "--amend", "-q", "-s", "--no-edit")
+    world.merged = world.main = _git(world.consumer, "rev-parse", "HEAD")
+    world.upstream = world.reviewed
+    world.source_body = "No contributor metadata is necessary for this upstream pin."
+
+
+def _bot_args(world: World, **kwargs: object) -> argparse.Namespace:
+    return world.args(
+        workdir=world.root,
+        since=None,
+        refresh_branch=[],
+        migrate_canonical_branch_from=None,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("merge_commit", [False, True])
+def test_upstream_main_promotes_exact_pin_without_pr_list(world: World, merge_commit: bool) -> None:
+    if merge_commit:
+        _git(world.source, "switch", "-q", "-c", "side", world.first)
+        _write(world.source, "side.txt", "upstream side branch\n")
+        _commit(world.source, "side change")
+        _git(world.source, "switch", "-q", "main")
+        _git(world.source, "merge", "--no-ff", "-q", "-m", "merge upstream side", "side")
+        world.reviewed = _git(world.source, "rev-parse", "HEAD")
+    _pin_upstream(world)
+    _write(world.source, "later.txt", "not in the reviewed pin\n")
+    world.upstream = _commit(world.source, "later upstream update")
+    args = world.args(upstream_pr=[], publish=True)
+    plan = m._make_plan(args, world)
+    assert plan.record["version"] == 2
+    assert plan.record["source_mode"] == "upstream-main"
+    assert plan.record["checked_canonical_tip"] == world.previous
+    assert plan.record["upstream_observed_main"] == world.upstream
+    assert "changes" not in plan.record
+    assert "unpaired_reason" not in plan.record
+    m._validate_snapshot(plan.record, _UPSTREAM)
+    m._verify_upstream_snapshot(world, plan.record)
+    pr = m._publish(args, world, plan)
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    assert (
+        _git(world.consumer, "diff", "--name-only", f"{pr['head']['sha']}^", pr["head"]["sha"])
+        == m._LOCK
+    )
+    assert m._lock_at(world, _CONSUMER, pr["head"]["sha"]).to_mapping() == plan.promoted
+    assert (
+        m._record_from_message(_git(world.consumer, "show", "-s", "--format=%B", pr["head"]["sha"]))
+        == plan.record
+    )
+    assert "Version 2 provenance" in pr["body"]
+    assert not any(route.startswith(f"repos/{_UPSTREAM}/pulls/") for _, route, _ in world.calls)
+
+
+def test_upstream_exception_uses_configured_branch(world: World) -> None:
+    world.upstream_branch = "stable"
+    _pin_upstream(world, branch="stable")
+    plan = m._make_plan(world.args(upstream_pr=[]), world)
+    assert plan.record["source_mode"] == "upstream-main"
+    assert plan.record["source_branch"] == plan.record["upstream_branch"] == "stable"
+
+
+def test_temporary_fork_still_requires_linear_history(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compare = world.compare
+
+    def merged_range(repo, base, head, **kwargs):
+        result = compare(repo, base, head, **kwargs)
+        if kwargs.get("all_commits"):
+            result["commits"][-1]["parents"].append({"sha": world.previous})
+        return result
+
+    monkeypatch.setattr(world, "compare", merged_range)
+    with pytest.raises(ValueError, match="linear source commit range"):
+        m._make_plan(world.args(), world)
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+@pytest.mark.parametrize("description_flag", [False, True])
+def test_upstream_main_cli_does_not_require_metadata(
+    world: World, capfd: pytest.CaptureFixture, description_flag: bool
+) -> None:
+    _pin_upstream(world)
+    world.source_body = "<!-- vendor-promotion:start --> malformed"
+    options = ["--from-pr-description"] if description_flag else []
+    assert (
+        m.main(
+            [
+                "promote",
+                "--vendor",
+                _VENDOR,
+                "--upstream-repo",
+                _UPSTREAM,
+                "--source-pr",
+                "17",
+                "--canonical-repo",
+                "maintainer/flashinfer",
+                "--canonical-branch",
+                "trtllm-prims-ts-dev",
+                "--repo",
+                str(world.consumer),
+                *options,
+            ]
+        )
+        == 0
+    )
+    assert '"source_mode": "upstream-main"' in capfd.readouterr().out
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("upstream_pr", ["4829"]),
+        ("unpaired_reason", "downstream-only change"),
+        ("unpaired_reason", ""),
+        ("map_upstream", ["COMMIT=4829"]),
+    ],
+)
+def test_upstream_main_rejects_explicit_attribution(
+    world: World, option: str, value: object
+) -> None:
+    _pin_upstream(world)
+    options = {"upstream_pr": [], option: value}
+    with pytest.raises(
+        ValueError, match="Remove --upstream-pr, --unpaired-reason, and --map-upstream"
+    ):
+        m._make_plan(world.args(**options), world)
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+@pytest.mark.parametrize(
+    "failure", ["wrong-branch", "not-reachable", "diverged", "selection", "missing-previous"]
+)
+def test_upstream_main_exception_is_narrow(world: World, failure: str) -> None:
+    if failure == "missing-previous":
+        world.reviewed = world.upstream
+    _pin_upstream(world, branch="release" if failure == "wrong-branch" else "main")
+    if failure == "missing-previous":
+        # Even if dev equals the reviewed pin, it must retain the previous lock revision.
+        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.reviewed)
+    elif failure == "not-reachable":
+        world.upstream = world.previous
+    elif failure == "diverged":
+        _git(world.source, "switch", "-q", "--detach", world.previous)
+        _advance_canonical(world)
+    elif failure == "selection":
+        data = m._local_lock_document(world.consumer)
+        data["vendors"][_VENDOR]["include"] = ["kernel.py"]
+        _write(world.consumer, m._LOCK, m.yaml.safe_dump(data))
+        _git(world.consumer, "add", "-A")
+        _git(world.consumer, "commit", "--amend", "-q", "-s", "--no-edit")
+        world.merged = world.main = _git(world.consumer, "rev-parse", "HEAD")
+    messages = {
+        "wrong-branch": "configured branch",
+        "not-reachable": "not reachable",
+        "diverged": "latest canonical branch tip",
+        "selection": "unchanged lock source/include",
+        "missing-previous": "does not contain.*latest canonical branch tip and its history",
+    }
+    with pytest.raises(m.Diagnostic, match=messages[failure]):
+        m._make_plan(world.args(upstream_pr=[]), world)
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+def test_upstream_source_reports_all_failed_checks(world: World) -> None:
+    _pin_upstream(world, branch="pull/5434/head")
+    world.upstream = world.previous
+    _git(world.source, "switch", "-q", "--detach", world.previous)
+    tip = _advance_canonical(world)
+    with pytest.raises(m.Diagnostic) as failure:
+        m._make_plan(world.args(upstream_pr=[]), world)
+    text = str(failure.value)
+    assert text.count("- FAIL") == 3
+    assert "- PASS" not in text
+    assert "pull/5434/head" in text and "configured branch" in text
+    assert "latest canonical branch tip" in text and tip in text
+    assert "not reachable" in text and world.upstream in text
+    assert f"/compare/{world.reviewed}...{tip}" in text
+    assert f"/compare/{world.reviewed}...{world.upstream}" in text
+    assert "Temporary fork branch" in text and "rebase" in text
+    assert "Changing only the branch field" in text
+    assert "vendor-promotion block" in text and "vendor-sources.md" in text
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+def test_upstream_source_wrong_branch_does_not_invent_ancestry_failures(world: World) -> None:
+    _pin_upstream(world, branch="pull/<script>/head")
+    with pytest.raises(m.Diagnostic) as failure:
+        m._make_plan(world.args(upstream_pr=[]), world)
+    text = str(failure.value)
+    assert text.count("- FAIL") == 1 and text.count("- PASS") == 2
+    assert "<script>" not in text and "&lt;script&gt;" in text
+
+
+@pytest.mark.parametrize("contains_dev", [False, True])
+def test_upstream_source_compares_dev_history_in_canonical_repository(
+    world: World, contains_dev: bool
+) -> None:
+    if not contains_dev:
+        world.reviewed = world.upstream
+    _pin_upstream(world)
+    upstream = _init(world.root / "upstream-only")
+    _git(upstream, "fetch", "-q", str(world.source), world.reviewed)
+    world.compare_repositories[_UPSTREAM] = upstream
+    world.compare_repositories["maintainer/flashinfer"] = world.canonical
+    args = world.args(upstream_pr=[])
+    if contains_dev:
+        plan = m._make_plan(args, world)
+        assert plan.record["checked_canonical_tip"] == world.previous
+        assert plan.record["upstream_observed_main"] == world.reviewed
+    else:
+        with pytest.raises(RuntimeError, match="HTTP 404.*unavailable in flashinfer-ai/flashinfer"):
+            world.compare(_UPSTREAM, world.previous, world.reviewed)
+        with pytest.raises(m.Diagnostic) as failure:
+            m._make_plan(args, world)
+        assert "does not contain" in failure.value.problem
+        assert failure.value.problem.count("- FAIL") == 1
+        assert failure.value.problem.count("- PASS") == 2
+        assert "Temporary fork branch" in failure.value.action
+    assert all(method == "GET" for method, _, _ in world.calls)
+
+
+@pytest.mark.parametrize("upstream", [False, True])
+def test_merged_bot_reuses_source_check_before_attribution(
+    world: World, monkeypatch: pytest.MonkeyPatch, upstream: bool
+) -> None:
+    if upstream:
+        _pin_upstream(world)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(_bot_args(world), world, store)
+        feedback = monitor._feedback
+        feedback_checks = []
+
+        def checked_feedback(*args, **kwargs):
+            endpoint = "repos/maintainer/flashinfer/git/ref/heads/trtllm-prims-ts-dev"
+            checks = [index for index, (_, route, _) in enumerate(world.calls) if route == endpoint]
+            feedback_checks.append(len(checks))
+            if not upstream:
+                attribution = next(
+                    index
+                    for index, (_, route, _) in enumerate(world.calls)
+                    if route == f"repos/{_UPSTREAM}/pulls/4829"
+                )
+                assert checks[0] < attribution < checks[1]
+            assert (kwargs["upstream_proof"] is not None) == upstream
+            return feedback(*args, **kwargs)
+
+        monkeypatch.setattr(monitor, "_feedback", checked_feedback)
+        monitor.inspect(17)
+        assert store.get("observation:17")["state"] == "promotion_ready"
+    assert feedback_checks == [2]
+    assert not world.prs
+
+
+@pytest.mark.parametrize("movement", ["dev", "upstream"])
+def test_upstream_main_rechecks_refs_before_publication(
+    world: World, monkeypatch: pytest.MonkeyPatch, movement: str
+) -> None:
+    _pin_upstream(world)
+    args = world.args(upstream_pr=[], publish=True)
+    plan = m._make_plan(args, world)
+    prepare = m._prepare_commit
+
+    def move_ref(*arguments):
+        result = prepare(*arguments)
+        if movement == "dev":
+            _advance_canonical(world)
+        else:
+            world.upstream = world.previous
+        return result
+
+    monkeypatch.setattr(m, "_prepare_commit", move_ref)
+    with pytest.raises(m.Diagnostic):
+        m._publish(args, world, plan)
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+@pytest.mark.parametrize("body", ["", "<!-- vendor-promotion:start --> malformed"])
+@pytest.mark.parametrize("consumer_base", ["main", "release/1.3"])
+def test_open_upstream_main_needs_no_block(
+    world: World, monkeypatch: pytest.MonkeyPatch, body: str, consumer_base: str
+) -> None:
+    _pin_upstream(world)
+    world.base_branch = consumer_base
+    previous = m._lock_at(world, _CONSUMER, world.base)
+    reviewed = m._lock_at(world, _CONSUMER, world.merged)
+    endpoint = f"repos/{_CONSUMER}/pulls/17"
+    pr = world.get(endpoint)
+    pr.update(
+        merged=False,
+        state="open",
+        body=body,
+        base={"ref": consumer_base},
+        user={"login": "maintainer"},
+    )
+    world.overrides[endpoint] = pr
+
+    def no_matching(*unused):
+        raise AssertionError("Upstream ancestry must not invoke patch/PR matching")
+
+    monkeypatch.setattr(b.metadata, "resolve", no_matching)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(_bot_args(world, publish=True), world, store)
+        monkeypatch.setattr(monitor, "_inputs", lambda source_pr: (previous, reviewed))
+        monitor.inspect(17)
+        assert store.get("observation:17")["state"] == "metadata_valid"
+    assert "Upstream-main source ancestry is valid" in world.source_comments[0]["body"]
+    assert "No vendor-promotion metadata" in world.source_comments[0]["body"]
+    assert not world.prs
+
+
+def test_upstream_main_rechecks_dev_before_valid_feedback(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _pin_upstream(world)
+    previous = m._lock_at(world, _CONSUMER, world.base)
+    reviewed = m._lock_at(world, _CONSUMER, world.merged)
+    endpoint = f"repos/{_CONSUMER}/pulls/17"
+    pr = world.get(endpoint)
+    pr.update(merged=False, state="open", user={"login": "maintainer"})
+    world.overrides[endpoint] = pr
+    api = world.api
+    advanced = False
+
+    def advance(endpoint, **kwargs):
+        nonlocal advanced
+        result = api(endpoint, **kwargs)
+        if endpoint == f"repos/{_UPSTREAM}/git/ref/heads/main" and not advanced:
+            _advance_canonical(world)
+            advanced = True
+        return result
+
+    monkeypatch.setattr(world, "api", advance)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(_bot_args(world, publish=True), world, store)
+        monkeypatch.setattr(monitor, "_inputs", lambda source_pr: (previous, reviewed))
+        monitor.inspect(17)
+        assert store.get("observation:17")["state"] == "blocked"
+    assert "latest canonical branch tip" in world.source_comments[0]["body"]
+    assert "ancestry is valid" not in world.source_comments[0]["body"]
+    assert not world.prs
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_upstream_main_recovers_without_sqlite_and_preserves_proof(
+    world: World, completed: bool
+) -> None:
+    _pin_upstream(world)
+    args = world.args(upstream_pr=[], publish=True, auto_merge=True)
+    if completed:
+        world.state = "CLEAN"
+    plan = m._make_plan(args, world)
+    m._publish(args, world, plan)
+    original_record = copy.deepcopy(plan.record)
+    _write(world.source, "later.txt", "upstream advances after promotion\n")
+    world.upstream = _commit(world.source, "new upstream tip")
+    world.source_body = "<!-- vendor-promotion:start --> invalid edited metadata"
+    world.calls.clear()
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(_bot_args(world, publish=True), world, store).inspect(17)
+        if completed:
+            assert store.get("complete:17")
+    resumed = m._make_plan(args, world)
+    m._publish(args, world, resumed)
+    assert resumed.record == original_record
+    assert len(world.prs) == len(world.comments) == 1
+    assert not world.source_comments
+    assert not any(route.startswith(f"repos/{_UPSTREAM}/pulls/") for _, route, _ in world.calls)
+
+
+def test_bot_promotes_merged_upstream_pin_without_metadata(world: World) -> None:
+    _pin_upstream(world)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        b.Monitor(_bot_args(world, publish=True), world, store).inspect(17)
+    pr = world.prs[99]
+    record = m._record_from_message(pr["auto_merge"]["commit_message"])
+    assert record["version"] == 2
+    assert record["promoted"] == world.reviewed
+    assert "contributor_metadata" not in record
+    assert "changes" not in record
+    assert _git(world.canonical, "rev-parse", "trtllm-prims-ts-dev") == world.reviewed
+    assert [item["body"] for item in world.comments] == [m._CI_SKIP_COMMAND]
+    assert "No vendor-promotion metadata" in world.source_comments[0]["body"]
+
+
+@pytest.mark.parametrize("tamper", ["mode", "source", "tip", "upstream", "mixed-version"])
+def test_upstream_main_recovery_rejects_tampered_proof(world: World, tamper: str) -> None:
+    _pin_upstream(world)
+    args = world.args(upstream_pr=[], publish=True)
+    plan = m._make_plan(args, world)
+    pr = m._publish(args, world, plan)
+    record = copy.deepcopy(plan.record)
+    if tamper == "mode":
+        record["source_mode"] = "temporary-fork"
+    elif tamper == "source":
+        record["source_url"] = "https://github.com/dev/flashinfer.git"
+    elif tamper == "tip":
+        record["checked_canonical_tip"] = _advance_canonical(world)
+    elif tamper == "upstream":
+        record["upstream_observed_main"] = world.previous
+    message = m._record_text(record)
+    if tamper == "mixed-version":
+        message += m._record_text({"version": 1})
+    endpoint = f"repos/{_CONSUMER}/commits/{pr['head']['sha']}"
+    commit = world.get(endpoint)
+    commit["commit"]["message"] = (
+        message + "\nSigned-off-by: Promotion Test <promotion@example.invalid>\n"
+    )
+    world.overrides[endpoint] = commit
+    world.calls.clear()
+    world.git_calls.clear()
+    expected = {
+        "mode": "does not describe this source update",
+        "source": "does not describe this source update",
+        "tip": "ancestry is invalid",
+        "upstream": "ancestry is invalid",
+        "mixed-version": "Missing or ambiguous",
+    }
+    with pytest.raises(ValueError, match=expected[tamper]):
+        m._recover_plan(args, world, m._plan_identity(args, world))
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+def test_upstream_main_still_checks_materialization(world: World) -> None:
+    _pin_upstream(world)
+    _write(world.consumer, "vendored/prims_ts/kernel.py", "VALUE = 'not in upstream'\n")
+    _git(world.consumer, "add", "-A")
+    _git(world.consumer, "commit", "--amend", "-q", "-s", "--no-edit")
+    world.merged = world.main = _git(world.consumer, "rev-parse", "HEAD")
+    args = world.args(upstream_pr=[], publish=True)
+    with pytest.raises(m.vendor.VendorError):
+        m._publish(args, world, m._make_plan(args, world))
+    assert all(method == "GET" for method, _, _ in world.calls)
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
+@pytest.mark.parametrize("version", ["0", "02", "3"])
+def test_promotion_record_rejects_unsupported_marker_version(version: str) -> None:
+    message = m._record_text({"version": 2}).replace("V2", f"V{version}")
+    with pytest.raises(ValueError, match="Unsupported"):
+        m._record_from_message(message)
+
+
+def test_promotion_record_rejects_reversed_markers() -> None:
+    with pytest.raises(ValueError, match="precedes"):
+        m._record_from_message(m._END + "\n" + m._BEGIN + '\n{"version": 1}')
+
+
+@pytest.mark.parametrize("consumer_base", ["main", "release/1.3"])
+@pytest.mark.parametrize(
+    "case", ["stale", "diverged", "advance-during-attribution", "contained", "upstream"]
+)
+def test_open_pr_checks_live_dev_tip_before_valid_feedback(
+    world: World, monkeypatch: pytest.MonkeyPatch, consumer_base: str, case: str
+) -> None:
+    world.base_branch = consumer_base
+    args = world.args(publish=True)
+    args.workdir = world.root
+    args.since = None
+    args.refresh_branch = []
+    args.migrate_canonical_branch_from = None
+    previous = m._lock_at(world, _CONSUMER, world.base)
+    reviewed = m._lock_at(world, _CONSUMER, world.merged)
+    if case == "upstream":
+        reviewed = dataclasses.replace(
+            reviewed, url=f"https://github.com/{_UPSTREAM}.git", branch="main"
+        )
+    endpoint = f"repos/{_CONSUMER}/pulls/17"
+    pr = world.get(endpoint)
+    pr.update(
+        merged=False,
+        state="open",
+        base={"ref": consumer_base},
+        head={"sha": world.merged},
+        user={"login": "maintainer"},
+    )
+    world.overrides[endpoint] = pr
+    world.main = world.base
+    if case == "diverged":
+        _git(world.source, "checkout", "-q", "--detach", world.previous)
+    if case in ("stale", "diverged"):
+        tip = _advance_canonical(world)
+    elif case == "contained":
+        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
+    matches = []
+
+    def resolve(*arguments):
+        matches.append(True)
+        if case == "advance-during-attribution":
+            _advance_canonical(world)
+        return {}, {}
+
+    monkeypatch.setattr(b.metadata, "resolve", resolve)
+    with contextlib.closing(b.Store(":memory:")) as store:
+        monitor = b.Monitor(args, world, store)
+        monkeypatch.setattr(monitor, "_inputs", lambda source_pr: (previous, reviewed))
+        monitor.inspect(17)
+        message = world.source_comments[0]["body"]
+        if case == "contained":
+            assert store.get("observation:17")["state"] == "metadata_valid"
+            assert "metadata and source attribution are valid" in message
+        else:
+            assert store.get("observation:17")["state"] == "blocked"
+            assert "metadata and source attribution are valid" not in message
+            if case == "upstream":
+                assert "not reachable" in message
+            else:
+                assert "latest canonical branch tip" in message
+                assert "rebase" in message and "scripts/vendor/manage.py" in message
+            if case in ("stale", "diverged"):
+                assert tip in message
+    assert bool(matches) == (case in ("contained", "advance-during-attribution"))
+    assert not any(call[0] == "push" for call in world.git_calls)
+
+
 @pytest.mark.parametrize("target", ["main", "canonical"])
 def test_concurrent_updates_block_before_publication(world: World, target: str) -> None:
     plan = m._make_plan(world.args(), world)
     if target == "main":
         world.main = world.base
     else:
-        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
-    with pytest.raises(ValueError, match="superseded|moved unexpectedly"):
+        _advance_canonical(world)
+    with pytest.raises(ValueError, match="superseded|latest canonical branch tip"):
         m._publish(world.args(publish=True), world, plan)
     assert not any(method != "GET" for method, _, _ in world.calls)
     assert not any(args[0] == "push" for args in world.git_calls)
@@ -1011,7 +1653,8 @@ def test_unpaired_promotion_publishes_and_resumes(world: World) -> None:
 def test_unpaired_options_require_explicit_unambiguous_reason(world: World, options: dict) -> None:
     with pytest.raises(ValueError, match="unpaired-reason"):
         m._make_plan(world.args(**options), world)
-    assert not world.calls
+    # Repository identity must be read to determine whether attribution is required.
+    assert all(method == "GET" for method, _, _ in world.calls)
 
 
 @pytest.mark.parametrize("same_fork", [False, True])
@@ -1478,7 +2121,7 @@ def test_recovery_rejects_changed_artifacts_without_writes(world: World, tamper:
     elif tamper == "dco":
         commit["commit"]["message"] = m._record_text(original.record)
     elif tamper == "canonical":
-        _git(world.canonical, "update-ref", "refs/heads/trtllm-prims-ts-dev", world.first)
+        _advance_canonical(world)
     else:
         pr["state"] = "closed"
     world.overrides[endpoint] = commit

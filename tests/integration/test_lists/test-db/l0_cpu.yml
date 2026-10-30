@@ -12,6 +12,11 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
+  - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_rejects_unsupported_projection_before_forward
+  - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_dispatches_to_linear_method
+  - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_block_scale_low_m_dispatch_uses_full_weight_only
+  - unittest/_torch/modules/test_linear_output_slice.py::test_kimi_fp8_low_m_dispatch_uses_full_weight_only
   - disaggregated/test_aiperf_gate.py::test_fires_on_error_storm
   - disaggregated/test_aiperf_gate.py::test_passes_healthy_run_with_cancellations
   - disaggregated/test_aiperf_gate.py::test_missing_export_raises
@@ -31,26 +36,24 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
-  - unittest/scripts/test_perf_client_readiness.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
-  # On this CPU-only list, pytest_ignore_collect in tests/unittest/conftest.py drops every
-  # file without a pytest.mark.cpu_only when the stage runs -m cpu_only, so this entry
-  # contributes only the marked files under attention/, in these sub-trees or elsewhere.
+  # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
+  # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
+  # pytest.mark.cpu_only when the stage runs -m cpu_only, so this entry runs only the
+  # marked cases under attention/, such as all of hw_agnostic/ and a few in
+  # kernels/parallel_hw_agnostic/test_fused_qk_norm_rope.py.
+  # The GPU lists' attention/ entries run -m "not cpu_only", so hw_agnostic/ runs only here.
   - unittest/_torch/attention
+  # Kimi K3 MLA decode view from the attention metadata: every test is cpu_only (CPU tensors).
+  - unittest/_torch/kernels/kimi_k3/test_k3_mla_decode_view.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_mla_launch.py
+  - unittest/_torch/kernels/kimi_k3/test_k3_kda_pool_layout.py
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
   - unittest/_torch/executor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
@@ -69,7 +72,15 @@ l0_cpu:
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
+  - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
+  # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
+  - unittest/_torch/modeling_v2/test_modeling_v2_kimi_k3_decode_step.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_mnnvl_workspace.py::test_k3_workspace_threshold_is_inclusive_and_two_shot_pads
   - unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
@@ -110,18 +121,28 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
+  # what runs it.
+  - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
   - unittest/_torch/speculative/hw_agnostic
+  - unittest/_torch/speculative/test_device_window_sampling_layout.py
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
+  - unittest/_torch/test_connector.py
+  - unittest/_torch/test_connector_adp.py
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_parallel_layout
+  - unittest/_torch/models/test_modeling_utils.py::test_tied_embedding_rejects_incompatible_layout
+  - unittest/_torch/test_connector_shared_pool.py
   - unittest/_torch/test_model_config.py
+  - unittest/_torch/test_moe_deterministic_config.py
   - unittest/_torch/test_nccl_window_graph.py
   - unittest/_torch/test_route_capture.py
   - unittest/_torch/test_tensor_lru_cache.py
@@ -146,6 +167,9 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
   - unittest/_torch/visual_gen/test_ltx2_pipeline.py
+  - unittest/_torch/visual_gen/test_ltx23_registry.py
+  - unittest/_torch/visual_gen/test_ltx23_pipeline_config.py
+  - unittest/_torch/visual_gen/test_ltx23_retake_initialization.py
   - unittest/_torch/visual_gen/test_minimax_h3_pipeline.py
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
@@ -173,6 +197,7 @@ l0_cpu:
   - unittest/docs/test_llmapi_reference_docs.py
   - unittest/dynamo
   - unittest/evaluate/test_image_generation_eval_cli.py
+  - unittest/evaluate/test_json_mode_eval.py
   - unittest/executor/test_base_worker.py ISOLATION
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_ipc.py
@@ -188,10 +213,13 @@ l0_cpu:
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
   - unittest/grpc/openengine/test_coordinator.py
+  - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py
   - unittest/grpc/openengine/test_control.py
+  - unittest/grpc/openengine/test_multimodal.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
+  - unittest/grpc/openengine/test_metrics.py
   - unittest/grpc/openengine/test_servicer.py
   - unittest/grpc/smg/test_smg.py::test_streaming_deltas_preserve_sequences_logprobs_and_final_tokens
   - unittest/grpc/smg/test_smg.py::test_streaming_empty_token_history
@@ -202,6 +230,9 @@ l0_cpu:
   - unittest/grpc/test_grpc_optional.py::test_smg_server_startup_failure_cleans_up
   - unittest/inputs
   - unittest/kv_cache_manager_v2_tests
+  - unittest/llmapi/test_deepseek_v32_encoding.py
+  - unittest/llmapi/test_deepseek_v32_tokenizer.py
+  - unittest/llmapi/test_deepseek_v41_tokenizer.py
   - unittest/llmapi/apps/test_anthropic_adapter.py
   - unittest/llmapi/apps/test_anthropic_batches.py
   - unittest/llmapi/apps/test_anthropic_gateway.py
@@ -258,6 +289,8 @@ l0_cpu:
   - unittest/llmapi/test_mpi_launcher_shutdown.py
   - unittest/llmapi/test_disagg_leader_lifecycle.py
   - unittest/llmapi/test_mpi_lifecycle.py -k "all_failure-2 or worker_system_exit-2 or mixed_collective-4 or all_hang-2 or reuse-2 or sync_recovery-2 or async_drain-2" ISOLATION
+  - unittest/llmapi/test_mpi_stop.py
+  - unittest/llmapi/test_mpi_stop_launcher.py
   - unittest/llmapi/test_reasoning_parser.py
   - unittest/llmapi/test_request_priority.py
   - unittest/llmapi/test_rl_control_auth.py
@@ -265,6 +298,9 @@ l0_cpu:
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_multi_frontend_helpers.py
+  - unittest/llmapi/test_serve_multi_frontend_route_gate.py
+  - unittest/llmapi/test_serve_num_frontends_default.py
   - unittest/llmapi/test_serve_report_addr.py
   - unittest/llmapi/test_serve_sleep_mode.py
   - unittest/llmapi/test_session_prefetcher.py

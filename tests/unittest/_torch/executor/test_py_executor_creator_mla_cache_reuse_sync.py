@@ -24,6 +24,8 @@ from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
     _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
     _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
+    _fp4_mla_block_reuse_blocker,
+    _validate_fp4_mla_chunk_unit,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import (
@@ -110,6 +112,13 @@ class _DummyPyExecutor:
         self.peft_cache_config = peft_cache_config
         self.execution_stream = execution_stream
         self.started = False
+        self.closed = False
+
+    def shutdown(self):
+        self.closed = True
+
+    def rebind_resources(self, resources):
+        self.resource_manager = resources
 
     def start_worker(self):
         """Mark executor as started."""
@@ -304,6 +313,7 @@ def _run_create_py_executor(
         tp_size=1,
         pp_size=1,
         has_pp=lambda: False,
+        has_cp_helix=lambda: False,
         enable_attention_dp=False,
         is_last_pp_rank=lambda: True,
     )
@@ -316,9 +326,6 @@ def _run_create_py_executor(
     monkeypatch.setattr(py_executor_creator, "_get_mapping", lambda _: fake_mapping)
     monkeypatch.setattr(
         py_executor_creator.Distributed, "get", staticmethod(lambda mapping: SimpleNamespace())
-    )
-    monkeypatch.setattr(
-        py_executor_creator, "validate_feature_combination", lambda *args, **kwargs: None
     )
     monkeypatch.setattr(py_executor_creator, "get_calibrator", lambda: _DummyCalibrator())
     monkeypatch.setattr(
@@ -359,26 +366,39 @@ def _run_create_py_executor(
             max_seq_len=model_max_seq_len,
         )
 
-    monkeypatch.setattr(py_executor_creator, "PyTorchModelEngine", _create_model_engine)
+    monkeypatch.setattr(py_executor_creator, "ModelEngine", _create_model_engine)
+
+    created_executors = []
 
     def _create_py_executor_instance(**kwargs):
         if ctx_chunk_configs is not None:
             ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
-        return _DummyPyExecutor(
+        executor = _DummyPyExecutor(
             resources=kwargs["resources"],
             model_engine=kwargs["model_engine"],
             peft_cache_config=kwargs["peft_cache_config"],
             execution_stream=kwargs["execution_stream"],
         )
+        created_executors.append(executor)
+        return executor
+
+    def _create_py_executor_resources(**kwargs):
+        if ctx_chunk_configs is not None:
+            ctx_chunk_configs.append(kwargs["ctx_chunk_config"])
+        return _DummyResourceManager(kwargs["resources"])
 
     monkeypatch.setattr(
         py_executor_creator, "create_py_executor_instance", _create_py_executor_instance
+    )
+    monkeypatch.setattr(
+        py_executor_creator, "create_py_executor_resources", _create_py_executor_resources
     )
 
     py_executor = py_executor_creator.create_py_executor(
         llm_args=llm_args,
         checkpoint_dir=None,
     )
+    assert created_executors == [py_executor]
     kv_cache_manager = py_executor.resource_manager.get_resource_manager(
         ResourceManagerType.KV_CACHE_MANAGER
     )
@@ -494,6 +514,108 @@ def test_total_py_executor_creation_metric_finishes_on_success_and_error(monkeyp
         "model_engine_creation_seconds": 1.0,
         "total_py_executor_creation_seconds": 1.5,
     }
+
+
+def _dense_fp4_mla_model_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
+        attn_backend="TRTLLM",
+        sparse_attention_config=None,
+        quant_config=SimpleNamespace(quant_mode=SimpleNamespace(has_fp4_kv_cache=lambda: True)),
+    )
+
+
+@pytest.mark.parametrize(
+    "ctx_chunk_config",
+    [
+        None,
+        (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 128),
+        (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 256),
+        (ContextChunkingPolicy.FORCE_CHUNK, 128),
+    ],
+    ids=["disabled", "fcfs_128", "swa_256", "force_128"],
+)
+def test_fp4_mla_accepts_tile_aligned_or_disabled_chunk_unit(ctx_chunk_config) -> None:
+    _validate_fp4_mla_chunk_unit(_dense_fp4_mla_model_config(), ctx_chunk_config)
+
+
+def test_fp4_mla_rejects_unaligned_chunk_unit() -> None:
+    # The schedulers round truncated non-final chunks to the chunk unit, so
+    # the unit must cover whole FP4 quantization tiles.
+    with pytest.raises(ValueError, match="multiple of 16"):
+        _validate_fp4_mla_chunk_unit(
+            _dense_fp4_mla_model_config(),
+            (ContextChunkingPolicy.FIRST_COME_FIRST_SERVED, 72),
+        )
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "enable_chunked_prefill", "supported"),
+    [(True, True, True), (True, False, False), (False, True, False), (False, False, False)],
+)
+def test_fp4_mla_block_reuse_blocker(
+    monkeypatch: pytest.MonkeyPatch,
+    is_hybrid: bool,
+    enable_chunked_prefill: bool,
+    supported: bool,
+) -> None:
+    monkeypatch.setattr(py_executor_creator, "is_hybrid_linear", lambda _: is_hybrid)
+
+    blocker = _fp4_mla_block_reuse_blocker(
+        SimpleNamespace(), enable_chunked_prefill=enable_chunked_prefill
+    )
+
+    assert (blocker is None) == supported
+    if not is_hybrid:
+        assert "hybrid linear-attention" in blocker
+    elif not enable_chunked_prefill:
+        assert "enable_chunked_prefill" in blocker
+
+
+@pytest.mark.parametrize("sm_version", [100, 107])
+def test_hybrid_fp4_mla_keeps_block_reuse_with_chunked_prefill(monkeypatch, sm_version):
+    ctx_chunk_configs = []
+    kv_cache_reuse, runtime_cache_reuse, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=sm_version,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        enable_chunked_prefill=True,
+        is_hybrid_linear_model=True,
+        ctx_chunk_configs=ctx_chunk_configs,
+    )
+
+    # The cached prefix is attended through the FP4 chunked-prefill
+    # partitions, and snapshot-bounded chunks use the 128-token FP4 block.
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+    assert runtime_chunked_prefill is True
+    assert ctx_chunk_configs == [(ContextChunkingPolicy.FORCE_CHUNK, 128)]
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "enable_chunked_prefill"),
+    [(True, False), (False, True), (False, False)],
+    ids=["hybrid_without_chunked_prefill", "dense", "dense_without_chunked_prefill"],
+)
+def test_fp4_mla_disables_unsupported_block_reuse(
+    monkeypatch, is_hybrid: bool, enable_chunked_prefill: bool
+):
+    ctx_chunk_configs = []
+    kv_cache_reuse, runtime_cache_reuse, _ = _run_create_py_executor(
+        monkeypatch,
+        sm_version=107,
+        kv_cache_quant_algo=QuantAlgo.NVFP4,
+        enable_chunked_prefill=enable_chunked_prefill,
+        is_hybrid_linear_model=is_hybrid,
+        ctx_chunk_configs=ctx_chunk_configs,
+    )
+
+    assert kv_cache_reuse is False
+    assert runtime_cache_reuse is False
+    # Without reuse, the hybrid model does not force snapshot chunking.
+    assert ctx_chunk_configs[0] is None or ctx_chunk_configs[0][0] != (
+        ContextChunkingPolicy.FORCE_CHUNK
+    )
 
 
 def test_mla_unsupported_sm_fallback_syncs_cache_reuse(monkeypatch):
@@ -727,3 +849,43 @@ def test_startup_allocation_phases(monkeypatch, estimate):
         assert allocation_phases == ["final_kv_cache_allocation", "final_executor_creation"]
     assert phases[-1] == "executor_start_worker"
     assert timers[0].depth == 0
+
+
+@pytest.mark.parametrize("failure_stage", ["profiling", "allocation", "rebind"])
+def test_failed_resource_transition_closes_executor(monkeypatch, failure_stage):
+    executors = []
+
+    class FailingCacheCreator(_DummyKvCacheCreator):
+        def try_prepare_estimation(self):
+            return True
+
+        def configure_kv_cache_capacity(self, executor):
+            executors.append(executor)
+            if failure_stage == "profiling":
+                raise RuntimeError("startup failure")
+
+        def teardown_managers(self, resources):
+            resources.pop(ResourceManagerType.KV_CACHE_MANAGER)
+
+        def build_managers(self, resources, estimating_kv_cache):
+            if not estimating_kv_cache and failure_stage == "allocation":
+                raise RuntimeError("startup failure")
+            super().build_managers(resources, estimating_kv_cache)
+
+    if failure_stage == "rebind":
+
+        def fail_rebind(self, resources):
+            raise RuntimeError("startup failure")
+
+        monkeypatch.setattr(_DummyPyExecutor, "rebind_resources", fail_rebind)
+
+    with pytest.raises(RuntimeError, match="startup failure"):
+        _run_create_py_executor(
+            monkeypatch,
+            sm_version=100,
+            kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+            kv_cache_creator_cls=FailingCacheCreator,
+        )
+    assert len(executors) == 1
+    assert executors[0].closed
+    assert not executors[0].started

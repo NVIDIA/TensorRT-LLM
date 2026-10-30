@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+
+from __future__ import annotations
+
+import unittest
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
@@ -12,10 +17,12 @@ from _torch.executor.multimodal_utils import (
     make_mm_request,
 )
 
+import tensorrt_llm
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalEncoderContractError,
     MultimodalModelMixin,
+    _build_request_multimodal_input,
 )
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
     MultimodalItemScheduler,
@@ -44,12 +51,17 @@ from tensorrt_llm.llmapi.llm_args import (
     MultimodalEncoderCudaGraphConfig,
     MultimodalEncoderSchedulingPolicy,
 )
+from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from types import TracebackType
 
 # The item-scheduling surface is pure logic: no kernels, no device transfers.
 pytestmark = pytest.mark.cpu_only
 
 
-def test_disabled_encoder_does_not_initialize_processor():
+def test_disabled_encoder_does_not_initialize_processor() -> None:
     processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
     processor.get_mm_max_tokens_per_item.side_effect = AssertionError("encoder is disabled")
     model = torch.nn.Module()
@@ -224,7 +236,6 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     item_scheduling: bool,
 ) -> None:
     from tensorrt_llm._torch.pyexecutor import _util, model_engine
-    from tensorrt_llm.mapping import Mapping
 
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         encoder_cuda_graph_modality = "vision"
@@ -299,7 +310,7 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     monkeypatch.setattr(
         model_engine.MultimodalItemScheduler, "maybe_create", Mock(return_value=scheduler)
     )
-    engine_cls = model_engine.PyTorchModelEngine
+    engine_cls = model_engine.ModelEngine
     monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
     monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
     monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
@@ -332,7 +343,9 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
 
 @pytest.mark.parametrize("enable_padding", [False, True])
 @pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
-def test_encoder_graphs_preserve_eager_metadata_capacity(enable_padding, automatic) -> None:
+def test_encoder_graphs_preserve_eager_metadata_capacity(
+    enable_padding: bool, automatic: bool
+) -> None:
     class Encoder(torch.nn.Module, MultimodalEncoderMixin):
         def __init__(self) -> None:
             super().__init__()
@@ -368,7 +381,9 @@ def test_encoder_graph_modality_validation_allows_delegated_encoders() -> None:
     )
 
 
-def _bind_items(mm_item_scheduler: MultimodalItemScheduler, request, *, row_bytes: int = 8) -> None:
+def _bind_items(
+    mm_item_scheduler: MultimodalItemScheduler, request: LlmRequest, *, row_bytes: int = 8
+) -> None:
     state = request.py_mm_encoder_state
     for item_idx, rows in enumerate(
         request.py_multimodal_params.item_metadata.output_embedding_lengths
@@ -504,11 +519,15 @@ def test_item_encoder_classifies_request_state_contract_errors() -> None:
 
 def test_item_encoder_classifies_output_count_contract_error() -> None:
     class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
             encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
             return [(encoder_input, [1], "image")]
 
-        def forward_multimodal_encoder_items(self, _):
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
             return []
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
@@ -522,13 +541,17 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
 def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> None:
     class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
             if failure_stage == "prepare":
                 raise MultimodalEncoderContractError("bad request metadata")
             encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
             return [(encoder_input, [1], "image")]
 
-        def forward_multimodal_encoder_items(self, _):
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
             raise MultimodalEncoderContractError("bad encoder output rows")
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
@@ -550,13 +573,17 @@ def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> No
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
 def test_item_encoder_does_not_translate_system_errors(failure_stage: str) -> None:
     class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
             if failure_stage == "prepare":
                 raise torch.cuda.OutOfMemoryError("encoder OOM")
             encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
             return [(encoder_input, [1], "image")]
 
-        def forward_multimodal_encoder_items(self, _):
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
             raise torch.cuda.OutOfMemoryError("encoder OOM")
 
     mm_item_scheduler = bare_mm_item_scheduler(_Model())
@@ -579,11 +606,15 @@ def test_item_encoder_closes_window_scope_before_request_errors(
     forward_failure: str, expected_error: type, scope_failed: bool
 ) -> None:
     class _Model(MultimodalModelMixin):
-        def prepare_multimodal_encoder_inputs(self, _):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
             encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
             return [(encoder_input, [1], "image")]
 
-        def forward_multimodal_encoder_items(self, _):
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
             if forward_failure == "contract":
                 raise MultimodalEncoderContractError("bad encoder output rows")
             if forward_failure == "system":
@@ -593,13 +624,18 @@ def test_item_encoder_closes_window_scope_before_request_errors(
     class _RecordingScope:
         exits = []
 
-        def __init__(self, _inputs):
+        def __init__(self, _inputs: object) -> None:
             pass
 
-        def __enter__(self):
+        def __enter__(self) -> _RecordingScope:
             return self
 
-        def __exit__(self, exc_type, _exc, _tb):
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            _exc: BaseException | None,
+            _tb: TracebackType | None,
+        ) -> bool:
             self.exits.append(exc_type is not None)
             return False
 
@@ -624,10 +660,14 @@ def test_item_encoder_validates_all_outputs_before_commit(invalid_output: str) -
     class _Model(MultimodalModelMixin):
         embedding_dtype = torch.bfloat16
 
-        def prepare_multimodal_encoder_inputs(self, _):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
             return []
 
-        def forward_multimodal_encoder_items(self, _):
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor | None]:
             return outputs
 
     outputs = [torch.ones(1, 4, dtype=torch.bfloat16) for _ in range(3)]
@@ -686,7 +726,9 @@ def test_item_outputs_commit_to_prompt_ordered_cache_keys(
     class _Model(MultimodalModelMixin):
         embedding_dtype = torch.float32
 
-        def forward_multimodal_encoder_items(self, encoder_inputs):
+        def forward_multimodal_encoder_items(
+            self, encoder_inputs: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
                 for _, embedding_lengths, _ in encoder_inputs
@@ -819,3 +861,59 @@ def test_cache_hit_only_request_omits_raw_inputs_from_llm_payload() -> None:
     torch.testing.assert_close(multimodal_data["multimodal_embedding"], torch.ones(2, 2))
     # Only the per-forward payload drops the raw inputs.
     assert "image" in request.py_multimodal_data
+
+
+class MultimodalSetupTestCase(unittest.TestCase):
+    def test_build_request_multimodal_input_skips_when_cache_disabled(self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
+        )
+
+        # With the encoder cache disabled, nothing consumes `multimodal_input`,
+        # so it should not be built at all.
+        self.assertIsNone(_build_request_multimodal_input(request, cache_enabled=False))
+
+    def test_multimodal_encoder_max_seq_len(self) -> None:
+        class CapturingEncoder(torch.nn.Module, MultimodalEncoderMixin):
+            def __init__(self) -> None:
+                super().__init__()
+                self.setup_args = None
+                self.max_seq_len = None
+
+            def setup_attn_metadata(self, max_num_tokens: int) -> None:
+                self.setup_args = max_num_tokens
+
+            def set_attn_max_seq_len(self, max_seq_len: int) -> None:
+                self.max_seq_len = max_seq_len
+
+        encoder_max_num_tokens = 16384
+        processor_max_num_tokens = 65536
+        cases = [
+            ({"image": processor_max_num_tokens}, processor_max_num_tokens),
+            ({"image": 4096}, encoder_max_num_tokens),
+            ({}, encoder_max_num_tokens),
+            (None, encoder_max_num_tokens),
+        ]
+        for max_tokens_per_item, expected_max_seq_len in cases:
+            with self.subTest(max_tokens_per_item=max_tokens_per_item):
+                encoder = CapturingEncoder()
+                if max_tokens_per_item is None:
+                    input_processor = Mock()
+                else:
+                    input_processor = Mock(spec=BaseMultimodalDummyInputsBuilder)
+                    input_processor.get_mm_max_tokens_per_item.return_value = max_tokens_per_item
+
+                setup_mm_encoder_attn_metadata(
+                    torch.nn.Sequential(encoder), input_processor, encoder_max_num_tokens, None
+                )
+
+                self.assertEqual(encoder.setup_args, encoder_max_num_tokens)
+                self.assertEqual(encoder.max_seq_len, expected_max_seq_len)

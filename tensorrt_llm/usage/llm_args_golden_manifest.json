@@ -29,6 +29,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "attention_dp_config.enable_kv_balanced_admission"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "attention_dp_config.enable_kv_cache_aware_routing"
     },
     {
@@ -309,6 +314,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.num_prefetch_experts"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "dwdp_config.num_prefetch_slots"
     },
     {
       "capture_policy": "bool",
@@ -879,6 +889,11 @@
       "path": "kv_connector_config.connector"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.control_grace_sec"
+    },
+    {
       "allowed_values": [
         "both",
         "producer",
@@ -893,6 +908,11 @@
       "capture_policy": "int",
       "kind": "value",
       "path": "kv_connector_config.mooncake_store.segment_size"
+    },
+    {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "kv_connector_config.transfer_timeout_sec"
     },
     {
       "capture_policy": "list[int]|none",
