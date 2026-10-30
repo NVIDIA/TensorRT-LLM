@@ -1303,8 +1303,15 @@ class TestRequestTimeout:
             return response
 
         async with self._worker(generate, timeout_secs=timeout_secs) as (client, router):
-            response = await client.send_request(self._request(stream=True))
-            received = b"".join([chunk async for chunk in response])
+            with patch.object(client._session, "post", wraps=client._session.post) as post:
+                response = await client.send_request(self._request(stream=True))
+                received = b"".join([chunk async for chunk in response])
+
+            post.assert_called_once()
+            timeout = post.call_args.kwargs["timeout"]
+            assert timeout.total is None
+            assert timeout.connect is None
+            assert timeout.sock_read is None
 
         assert received == b"data: hello\n\ndata: [DONE]\n\n"
         router.finish_request.assert_awaited_once()
