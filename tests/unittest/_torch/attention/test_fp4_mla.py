@@ -1830,6 +1830,7 @@ def _create_fp4_mla_v2_manager(
     max_batch_size: int,
     spec_config: DecodingBaseConfig | None = None,
     enable_block_reuse: bool = False,
+    is_disagg: bool = False,
 ) -> Fp4MlaKVCacheManagerV2:
     return Fp4MlaKVCacheManagerV2(
         LlmKvCacheConfig(
@@ -1850,17 +1851,22 @@ def _create_fp4_mla_v2_manager(
         spec_config=spec_config,
         max_num_tokens=max_tokens,
         pretrained_config=SimpleNamespace(kv_lora_rank=512),
+        is_disagg=is_disagg,
     )
 
 
 def _build_multi_seq_metadata(
-    kv_cache_manager: Fp4MlaKVCacheManagerV2, *, seq_lens: list[int], page_size: int
+    kv_cache_manager: Fp4MlaKVCacheManagerV2,
+    *,
+    seq_lens: list[int],
+    page_size: int,
+    layer_idx: int = 0,
 ) -> SimpleNamespace:
     device = torch.device("cuda")
     num_seqs = len(seq_lens)
     request_ids = list(range(num_seqs))
-    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=0)
-    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(0)
+    block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(request_ids, layer_idx=layer_idx)
+    page_spec = kv_cache_manager.get_fp4_mla_page_table_spec(layer_idx)
     hp_block_ids_per_seq = kv_cache_manager._get_batch_cache_indices_by_pool_id(
         request_ids,
         pool_id=page_spec.hp_pool_id,
@@ -1935,6 +1941,7 @@ def _build_multi_seq_metadata(
             num_blocks=None,
             hp_pool=hp_pool,
             v_scale_pool=kv_cache_manager.get_mla_v_scale_pool(),
+            v_layer_base=kv_cache_manager.fp4_mla_v_layer_base,
             generation_kv_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_append_lens=torch.empty(num_seqs, dtype=torch.int32, device=device),
             generation_lengths_num_tokens=-1,
@@ -2149,7 +2156,8 @@ def test_fp4_mla_helix_scatter_uses_global_rope_and_local_cache_position(
             FP4_MLA_Q_RESIDUAL_DIM,
             is_act=True,
         )
-        torch.testing.assert_close(state.prequantized_q, expected_q_fp4)
+        # Packed decode pads the rows of each request to a whole scale row group.
+        torch.testing.assert_close(state.prequantized_q[: expected_q_fp4.shape[0]], expected_q_fp4)
         q_sf_per_token = (head_dim + FP4_MLA_Q_RESIDUAL_DIM) // FP4_BLOCK_SIZE
         valid_q_sf_offsets = torch.tensor(
             [
@@ -2412,6 +2420,9 @@ def _build_fp4_mla_attention_decode_case(
     query_len_per_seq: int = 1,
     enable_helix: bool = False,
     enable_block_reuse: bool = False,
+    layer_idx: int = 0,
+    is_disagg: bool = False,
+    spec_config: DecodingBaseConfig | None = None,
 ) -> tuple[Fp4MlaKVCacheManagerV2, SimpleNamespace, torch.Tensor, int, int]:
     torch.manual_seed(seed)
     device = torch.device("cuda")
@@ -2432,9 +2443,8 @@ def _build_fp4_mla_attention_decode_case(
     context_seq_lens = [seq_len - query_len_per_seq for seq_len in seq_lens]
     if min(context_seq_lens) <= 0:
         raise ValueError("FP4 MLA decode cases require a non-empty context for every sequence.")
-    spec_config = (
-        MTPDecodingConfig(max_draft_len=query_len_per_seq - 1) if query_len_per_seq > 1 else None
-    )
+    if spec_config is None and query_len_per_seq > 1:
+        spec_config = MTPDecodingConfig(max_draft_len=query_len_per_seq - 1)
 
     kv_cache_manager = _create_fp4_mla_v2_manager(
         max_tokens=max_tokens,
@@ -2442,12 +2452,16 @@ def _build_fp4_mla_attention_decode_case(
         max_batch_size=len(seq_lens),
         spec_config=spec_config,
         enable_block_reuse=enable_block_reuse,
+        is_disagg=is_disagg,
+    )
+    local_layer = kv_cache_manager._fp4_mla_compact_layer_idx(
+        kv_cache_manager.layer_offsets[layer_idx]
     )
     kv_cache_manager.add_dummy_requests(list(range(len(seq_lens))), seq_lens)
     expected_storage_head_dim = head_dim + (
         FP4_MLA_K_RESIDUAL_DIM if _fp4_mla_attention_backend() in ("triton", "cutedsl") else 0
     )
-    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(0)
+    kv_cache, sf_cache = kv_cache_manager.get_fp4_mla_cache_buffers(layer_idx)
     kv_cache.zero_()
     sf_cache.zero_()
     assert kv_cache.shape[-1] * 2 == expected_storage_head_dim
@@ -2457,6 +2471,7 @@ def _build_fp4_mla_attention_decode_case(
         kv_cache_manager,
         seq_lens=seq_lens,
         page_size=page_size,
+        layer_idx=layer_idx,
     )
     assert metadata.fp4_mla_state.v_scale_pool is not None
     persistent_pool_base = kv_cache_manager.get_mla_v_packed_pool_base()
@@ -2486,10 +2501,10 @@ def _build_fp4_mla_attention_decode_case(
     scatter_fp4_mla_kv_cache(
         metadata,
         context_latent,
-        layer_idx=0,
+        layer_idx=layer_idx,
         token_offset=0,
         phase="context",
-        local_layer=0,
+        local_layer=local_layer,
         v_head_dim=kv_lora_rank,
     )
     torch.cuda.synchronize()
@@ -2567,10 +2582,10 @@ def _build_fp4_mla_attention_decode_case(
     assert scatter_fp4_mla_kv_cache(
         metadata,
         generation_latent,
-        layer_idx=0,
+        layer_idx=layer_idx,
         token_offset=0,
         phase="generation",
-        local_layer=0,
+        local_layer=local_layer,
         v_head_dim=kv_lora_rank,
         rotary_cos_sin=rotary_cos_sin,
         q_pe=q_pe,
@@ -2587,7 +2602,7 @@ def _build_fp4_mla_attention_decode_case(
 
     canonical_generation = _materialize_reference_cache_tokens(
         metadata,
-        layer_idx=0,
+        layer_idx=layer_idx,
         batch_indices=metadata.fp4_mla_state.batch_indices,
         positions=metadata.fp4_mla_state.positions,
         head_dim=head_dim,
@@ -2615,9 +2630,10 @@ def _fp4_mla_attention_decode_reference(
     sm_scale: float,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    layer_idx: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = kv_lora_rank + qk_rope_head_dim
-    storage = _materialize_reference_cache_storage(metadata, 0, head_dim)
+    storage = _materialize_reference_cache_storage(metadata, layer_idx, head_dim)
     dequant_cache = storage[..., :head_dim]
     dequant_k_residual = None
     if _fp4_mla_attention_backend() in ("triton", "cutedsl"):
@@ -2729,6 +2745,9 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
+    layer_idx: int = 0,
+    is_disagg: bool = False,
+    spec_config: DecodingBaseConfig | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
@@ -2753,9 +2772,15 @@ def _assert_fp4_mla_attention_decode_accuracy(
         query_len_per_seq=query_len_per_seq,
         enable_helix=enable_helix,
         enable_block_reuse=enable_block_reuse,
+        layer_idx=layer_idx,
+        is_disagg=is_disagg,
+        spec_config=spec_config,
     )
     try:
-        v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, 0)
+        local_layer = kv_cache_manager._fp4_mla_compact_layer_idx(
+            kv_cache_manager.layer_offsets[layer_idx]
+        )
+        v_packed_pool = fp4_mla_backend._get_fp4_mla_v_packed_pool(metadata, local_layer)
         assert (v_packed_pool is None) is fused_v_transpose
 
         output = torch.empty_like(q[..., :kv_lora_rank])
@@ -2765,8 +2790,8 @@ def _assert_fp4_mla_attention_decode_accuracy(
         sm_scale = 0.1
         run_fp4_mla_attention_decode(
             metadata,
-            layer_idx=0,
-            local_layer=0,
+            layer_idx=layer_idx,
+            local_layer=local_layer,
             q=q,
             output=output,
             sm_scale=sm_scale,
@@ -2786,6 +2811,7 @@ def _assert_fp4_mla_attention_decode_accuracy(
             sm_scale=sm_scale,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
+            layer_idx=layer_idx,
         )
         output_float = output.float()
         error = output_float - ref_output
@@ -2951,6 +2977,35 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
         enable_helix=enable_helix,
         packed_queries=True,
         split_kv=split_kv,
+    )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize("query_len_per_seq", [1, 4], ids=["draft-step", "verify"])
+def test_fp4_mla_attention_decode_on_context_only_draft_layer(
+    monkeypatch, query_len_per_seq: int
+) -> None:
+    """The MTP draft layer of a single-copy context cache decodes like a decoding cache.
+
+    The drafter runs its later draft steps as one-token generation steps on
+    its draft layer inside every context step. That layer keeps the decode
+    views in a lifecycle of its own, with a page table of its own.
+    """
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=[FP4_MLA_TOKENS_PER_BLOCK + 37, 51],
+        seed=29,
+        query_len_per_seq=query_len_per_seq,
+        layer_idx=1,
+        is_disagg=True,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
     )
 
 
@@ -3380,3 +3435,490 @@ def test_fp4_mla_v_repack_generation_csr_crosses_page_boundary() -> None:
     assert torch.equal(actual, expected)
     assert torch.all(actual[_V_REPACK_HEAD_DIM : 2 * _V_REPACK_HEAD_DIM] == sentinel)
     assert torch.all(actual[3 * _V_REPACK_HEAD_DIM : 4 * _V_REPACK_HEAD_DIM] == sentinel)
+
+
+# Cached-context prefill: block reuse and chunked prefill.
+
+_CACHED_CONTEXT_NUM_HEADS = 16
+_CACHED_CONTEXT_KV_LORA_RANK = 512
+_CACHED_CONTEXT_QK_NOPE_HEAD_DIM = 128
+_CACHED_CONTEXT_QK_ROPE_HEAD_DIM = 64
+_CACHED_CONTEXT_V_HEAD_DIM = 128
+
+
+class _MlaContextStub:
+    """The MLA module state that the FP4 MLA cached-context path reads."""
+
+    forward_context_with_chunked_prefill_fp4 = MLA.forward_context_with_chunked_prefill_fp4
+
+    def __init__(self, mha, kv_b_weight: torch.Tensor) -> None:
+        self.mha = mha
+        self.num_heads_tp = _CACHED_CONTEXT_NUM_HEADS
+        self.num_context_heads = _CACHED_CONTEXT_NUM_HEADS
+        self.kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+        self.qk_nope_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+        self.qk_rope_head_dim = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+        self.v_head_dim = _CACHED_CONTEXT_V_HEAD_DIM
+        self.out_scale = None
+        self.kv_b_weight = kv_b_weight
+
+    def _project_context_kv(self, compressed_kv: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(compressed_kv, self.kv_b_weight)
+
+
+def _fp4_mla_rope_table(max_positions: int) -> torch.Tensor:
+    """RoPE table in the FP4 MLA kernel layout with a distinct angle per position."""
+    pairs = _CACHED_CONTEXT_QK_ROPE_HEAD_DIM // 2
+    positions = torch.arange(max_positions, dtype=torch.float64)[:, None]
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(pairs, dtype=torch.float64) / pairs))
+    angles = positions * inv_freq[None, :]
+    table = torch.zeros(max_positions, _CACHED_CONTEXT_QK_ROPE_HEAD_DIM, 2, dtype=torch.float64)
+    table[:, :pairs, 0] = torch.cos(angles)
+    table[:, :pairs, 1] = torch.sin(angles)
+    return table.to(device="cuda", dtype=torch.float32).contiguous()
+
+
+def _apply_fp4_mla_rope_reference(
+    values: torch.Tensor, positions: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Rotate interleaved RoPE pairs of ``values[..., rope_dim]`` at ``positions``."""
+    pairs = values.shape[-1] // 2
+    rows = table[positions.long()][:, :pairs]
+    while rows.ndim < values.ndim + 1:
+        rows = rows.unsqueeze(1)
+    cos = rows[..., 0]
+    sin = rows[..., 1]
+    even = values[..., 0::2].float()
+    odd = values[..., 1::2].float()
+    return torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(-2)
+
+
+def _make_fp4_mla_context_attention(max_positions: int):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        MLAParams,
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+    from tensorrt_llm.functional import PositionEmbeddingType
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+    from tensorrt_llm.quantization.mode import QuantAlgo
+
+    attention = TrtllmAttention(
+        layer_idx=0,
+        num_heads=_CACHED_CONTEXT_NUM_HEADS,
+        head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+        num_kv_heads=_CACHED_CONTEXT_NUM_HEADS,
+        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
+        q_scaling=1.0,
+        pos_embd_params=PositionalEmbeddingParams(
+            type=PositionEmbeddingType.rope_gptj,
+            rope=RopeParams(
+                dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+                max_positions=max_positions,
+                duplicate_data=True,
+            ),
+            is_neox=False,
+        ),
+        mla_params=MLAParams(
+            q_lora_rank=1536,
+            kv_lora_rank=_CACHED_CONTEXT_KV_LORA_RANK,
+            qk_rope_head_dim=_CACHED_CONTEXT_QK_ROPE_HEAD_DIM,
+            qk_nope_head_dim=_CACHED_CONTEXT_QK_NOPE_HEAD_DIM,
+            v_head_dim=_CACHED_CONTEXT_V_HEAD_DIM,
+            predicted_tokens_per_seq=1,
+        ),
+    )
+    assert attention.uses_fp4_mla_attention
+    # A distinct angle per position makes a wrong token offset visible.
+    attention.rotary_cos_sin = _fp4_mla_rope_table(max_positions)
+    return attention
+
+
+def _make_fp4_mla_context_metadata(
+    kv_cache_manager: Fp4MlaKVCacheManagerV2,
+    *,
+    request_ids: list[int],
+    cached_lens: list[int],
+    new_lens: list[int],
+    max_num_tokens: int,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+):
+    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=len(request_ids),
+        max_num_tokens=max_num_tokens,
+        kv_cache_manager=kv_cache_manager,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        enable_context_mla_with_cached_kv=True,
+        runtime_features=AttentionRuntimeFeatures(
+            chunked_prefill=chunked_prefill,
+            cache_reuse=enable_block_reuse,
+            chunk_size=max_num_tokens,
+            # One buffer per partition keeps the cached prefix split across loops.
+            chunked_prefill_buffer_batch_size=1,
+        ),
+        seq_lens=torch.tensor(new_lens, dtype=torch.int),
+        num_contexts=len(request_ids),
+        request_ids=request_ids,
+        prompt_lens=[cached + new for cached, new in zip(cached_lens, new_lens)],
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached_lens),
+    )
+    metadata.prepare()
+    return metadata
+
+
+def _fp4_mla_cached_context_reference(
+    metadata,
+    *,
+    q: torch.Tensor,
+    compressed_kv: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_b_weight: torch.Tensor,
+    cached_lens: list[int],
+    new_lens: list[int],
+) -> torch.Tensor:
+    """Attend rotated context queries over the dequantized FP4 prefix and the BF16 tokens."""
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    qk_nope = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM
+    qk_head_dim = qk_nope + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = _CACHED_CONTEXT_KV_LORA_RANK + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    weight = kv_b_weight.float()
+    outputs = []
+    token_start = 0
+    for seq_idx, (cached_len, new_len) in enumerate(zip(cached_lens, new_lens)):
+        rows = slice(token_start, token_start + new_len)
+        token_start += new_len
+        latent_rows = [torch.cat((compressed_kv[rows].float(), k_pe[rows].float()), dim=-1)]
+        if cached_len > 0:
+            prefix = _materialize_reference_cache_tokens(
+                metadata,
+                layer_idx=0,
+                batch_indices=torch.full((cached_len,), seq_idx, dtype=torch.int32),
+                positions=torch.arange(cached_len, dtype=torch.int32),
+                head_dim=head_dim,
+                include_k_residual=True,
+            )
+            latent_rows.insert(0, prefix.float())
+        latent = torch.cat(latent_rows, dim=0)
+        # kv_b_proj rows hold every head's K-nope block, then every head's V block.
+        kv = latent[:, :_CACHED_CONTEXT_KV_LORA_RANK] @ weight.t()
+        k = torch.cat(
+            (
+                kv[:, : num_heads * qk_nope].view(-1, num_heads, qk_nope),
+                latent[:, None, _CACHED_CONTEXT_KV_LORA_RANK:].expand(-1, num_heads, -1),
+            ),
+            dim=-1,
+        )
+        v = kv[:, num_heads * qk_nope :].view(-1, num_heads, _CACHED_CONTEXT_V_HEAD_DIM)
+        query = q[rows].float().view(new_len, num_heads, qk_head_dim)
+        scores = torch.einsum("qhd,khd->hqk", query, k) / qk_head_dim**0.5
+        key_positions = torch.arange(cached_len + new_len, device=q.device)
+        query_positions = cached_len + torch.arange(new_len, device=q.device)
+        mask = key_positions[None, :] > query_positions[:, None]
+        scores = scores.masked_fill(mask[None], float("-inf"))
+        probs = torch.softmax(scores, dim=-1)
+        outputs.append(torch.einsum("hqk,khd->qhd", probs, v).reshape(new_len, -1))
+    return torch.cat(outputs, dim=0)
+
+
+def _assert_rows_close(actual: torch.Tensor, expected: torch.Tensor, *, what: str) -> None:
+    actual = actual.float().reshape(actual.shape[0], -1)
+    expected = expected.float().reshape(expected.shape[0], -1)
+    expected_norms = torch.linalg.vector_norm(expected, dim=1)
+    relative_l2 = torch.linalg.vector_norm(actual - expected, dim=1) / expected_norms
+    cosine = torch.sum(actual * expected, dim=1) / (
+        torch.linalg.vector_norm(actual, dim=1) * expected_norms
+    )
+    assert bool(torch.all(expected_norms > 1e-3).item())
+    max_relative_l2 = float(relative_l2.max().item())
+    min_cosine = float(cosine.min().item())
+    assert max_relative_l2 < 0.1, f"{what}: relative L2 error {max_relative_l2} is too large"
+    assert min_cosine > 0.995, f"{what}: cosine similarity {min_cosine} is too small"
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    ("enable_block_reuse", "chunked_prefill"),
+    [(True, False), (False, True), (True, True)],
+    ids=["reuse", "chunked-prefill", "reuse-chunked-prefill"],
+)
+def test_fp4_mla_cached_context_matches_reference(
+    monkeypatch,
+    enable_block_reuse: bool,
+    chunked_prefill: bool,
+) -> None:
+    """A context step over a cached FP4 prefix matches a dequantized reference.
+
+    The prefix is written by an earlier context step. The cached step attends
+    it in several partitions, with or without chunked prefill, appends its own
+    tokens at their absolute positions, and leaves the decode sidecars that
+    its K payload implies.
+    """
+    import tensorrt_llm._torch.attention.mla as mla_module
+
+    _reset_triton_allocator()
+    monkeypatch.setattr(mla_module, "maybe_compiled_cat", torch.cat)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    torch.manual_seed(2026)
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    num_heads = _CACHED_CONTEXT_NUM_HEADS
+    kv_lora_rank = _CACHED_CONTEXT_KV_LORA_RANK
+    qk_head_dim = _CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    head_dim = kv_lora_rank + _CACHED_CONTEXT_QK_ROPE_HEAD_DIM
+    # Request 0 has a prefix read back in two partitions and new tokens that
+    # end mid-tile, request 1 has no cached prefix, and request 2's new tokens
+    # end on a block boundary.
+    cached_lens = [384, 0, 256]
+    new_lens = [100, 50, 128]
+    total_lens = [cached + new for cached, new in zip(cached_lens, new_lens)]
+    request_ids = list(range(len(cached_lens)))
+    max_num_tokens = 320
+    max_seq_len = 4 * page_size
+    num_pages = sum((total + page_size) // page_size + 1 for total in total_lens)
+    kv_cache_manager = _create_fp4_mla_v2_manager(
+        max_tokens=num_pages * page_size,
+        max_seq_len=max_seq_len,
+        max_batch_size=len(cached_lens),
+        enable_block_reuse=enable_block_reuse,
+    )
+    try:
+        kv_cache_manager.add_dummy_requests(request_ids, total_lens)
+        for pool in kv_cache_manager._iter_fp4_mla_physical_pool_views():
+            pool.view(torch.uint8).zero_()
+        attention = _make_fp4_mla_context_attention(max_seq_len)
+        kv_b_weight = (
+            torch.randn(
+                num_heads * (_CACHED_CONTEXT_QK_NOPE_HEAD_DIM + _CACHED_CONTEXT_V_HEAD_DIM),
+                kv_lora_rank,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            * kv_lora_rank**-0.5
+        )
+        mla = _MlaContextStub(attention, kv_b_weight)
+
+        # An earlier context step writes the prefixes.
+        prefix_ids = [idx for idx, cached in enumerate(cached_lens) if cached > 0]
+        prefix_lens = [cached_lens[idx] for idx in prefix_ids]
+        prefix_metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=prefix_ids,
+            cached_lens=[0] * len(prefix_ids),
+            new_lens=prefix_lens,
+            max_num_tokens=sum(prefix_lens),
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        prefix_latent = (
+            torch.randn(sum(prefix_lens), head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        prefix_q = torch.randn(
+            sum(prefix_lens), num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda"
+        )
+        attention.append_fp4_mla_context_cache(prefix_q, prefix_latent, prefix_metadata)
+        torch.cuda.synchronize()
+
+        metadata = _make_fp4_mla_context_metadata(
+            kv_cache_manager,
+            request_ids=request_ids,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+            max_num_tokens=max_num_tokens,
+            enable_block_reuse=enable_block_reuse,
+            chunked_prefill=chunked_prefill,
+        )
+        assert attention.has_cached_kv_for_mla_context(metadata)
+        # Both features split the 640 cached tokens into partitions of at
+        # most max_num_tokens, the FP8 context scratch of one buffer.
+        assert metadata.chunked_loop_num == 2
+
+        num_tokens = sum(new_lens)
+        latent = (
+            torch.randn(num_tokens, head_dim, dtype=torch.bfloat16, device="cuda") * 0.25
+        ).clamp_(-1.0, 1.0)
+        compressed_kv = latent[:, :kv_lora_rank].clone()
+        q = torch.randn(num_tokens, num_heads * qk_head_dim, dtype=torch.bfloat16, device="cuda")
+        original_q = q.clone()
+        original_k_pe = latent[:, kv_lora_rank:].clone()
+        output = torch.empty(
+            num_tokens, num_heads * _CACHED_CONTEXT_V_HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+        )
+        mla.forward_context_with_chunked_prefill_fp4(q, compressed_kv, latent, metadata, output)
+        torch.cuda.synchronize()
+
+        # Q and the current K rotate at their absolute positions.
+        positions = torch.cat(
+            [
+                torch.arange(cached, cached + new, dtype=torch.int32, device="cuda")
+                for cached, new in zip(cached_lens, new_lens)
+            ]
+        )
+        table = attention.rotary_cos_sin
+        q_view = q.view(num_tokens, num_heads, qk_head_dim)
+        expected_q_pe = _apply_fp4_mla_rope_reference(
+            original_q.view(num_tokens, num_heads, qk_head_dim)[
+                ..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:
+            ],
+            positions,
+            table,
+        )
+        torch.testing.assert_close(
+            q_view[..., _CACHED_CONTEXT_QK_NOPE_HEAD_DIM:].float(),
+            expected_q_pe,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        expected_k_pe = _apply_fp4_mla_rope_reference(original_k_pe, positions, table)
+        torch.testing.assert_close(
+            latent[:, kv_lora_rank:].float(), expected_k_pe, atol=2e-2, rtol=2e-2
+        )
+
+        # The current tokens are appended after their cached prefix.
+        batch_indices = torch.cat(
+            [
+                torch.full((new,), seq_idx, dtype=torch.int32, device="cuda")
+                for seq_idx, new in enumerate(new_lens)
+            ]
+        )
+        appended = _materialize_reference_cache_tokens(
+            metadata,
+            layer_idx=0,
+            batch_indices=batch_indices,
+            positions=positions,
+            head_dim=head_dim,
+            include_k_residual=True,
+        )
+        torch.testing.assert_close(appended, latent.float(), rtol=0.25, atol=0.2)
+
+        reference = _fp4_mla_cached_context_reference(
+            metadata,
+            q=q,
+            compressed_kv=compressed_kv,
+            k_pe=latent[:, kv_lora_rank:],
+            kv_b_weight=kv_b_weight,
+            cached_lens=cached_lens,
+            new_lens=new_lens,
+        )
+        _assert_rows_close(output, reference, what="FP4 MLA cached-context output")
+
+        # Every page, the prefix pages written by the earlier step included,
+        # carries the V scales and packed V that its K payload implies.
+        v_scale = kv_cache_manager.get_mla_v_scale_pool_base()
+        v_packed = kv_cache_manager.get_mla_v_packed_pool_base()
+        assert v_packed is not None
+        expected_v_scale = v_scale.clone()
+        expected_v_packed = v_packed.clone()
+        v_scale.zero_()
+        v_packed.zero_()
+        kv_cache_manager.rebuild_disagg_imported_cache(
+            [
+                SimpleNamespace(py_request_id=request_id, prompt_len=total)
+                for request_id, total in zip(request_ids, total_lens)
+            ]
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(v_scale, expected_v_scale)
+        assert torch.equal(v_packed, expected_v_packed)
+    finally:
+        torch.cuda.synchronize()
+        _reset_triton_allocator()
+        kv_cache_manager.shutdown()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
+)
+@pytest.mark.parametrize("context_only", [False, True], ids=["decoding", "context-only"])
+def test_fp4_mla_block_reuse_claims_whole_blocks(monkeypatch, context_only) -> None:
+    """Reuse claims only whole blocks, even for one-model draft lookahead.
+
+    On the single-copy cache of a disaggregated context worker the draft layer
+    lives in a lifecycle of its own, which reuses the same prefix blocks as
+    the target layers.
+    """
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    page_size = FP4_MLA_TOKENS_PER_BLOCK
+    manager = _create_fp4_mla_v2_manager(
+        max_tokens=16 * page_size,
+        max_seq_len=4 * page_size,
+        max_batch_size=2,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
+        enable_block_reuse=True,
+        is_disagg=context_only,
+    )
+
+    def make_request(request_id: int, tokens: list[int]) -> LlmRequest:
+        request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=tokens,
+            sampling_config=SamplingParams()._get_sampling_config(),
+            is_streaming=False,
+        )
+        request.paged_kv_block_ids = []
+        return request
+
+    def run_context(request: LlmRequest) -> int:
+        assert manager.prepare_context(request)
+        reused = request.context_current_position
+        assert manager.resize_context(request, request.prompt_len - reused)
+        request.context_current_position = request.prompt_len
+        manager.try_commit_blocks(request)
+        return reused
+
+    try:
+        # The HP ring is request-private, so it never cuts a prefix match short.
+        hp_layers = [
+            layer
+            for layer in manager.kv_cache_manager_py_config.layers
+            if layer.layer_id in manager._hp_manager_layer_ids
+        ]
+        assert hp_layers
+        assert all(layer.reuse_policy == AttentionReusePolicy.PRIVATE for layer in hp_layers)
+        assert manager.reuse_match_backoff == 0
+
+        draft_layer = manager.pp_layers[-1]
+        assert (manager.fp4_mla_draft_lifecycle_layer_ids() == [draft_layer]) == context_only
+
+        prompt = list(range(1000, 1000 + 3 * page_size + 40))
+        first = make_request(1, prompt)
+        assert run_context(first) == 0
+        first_pages = manager.get_batch_cache_indices([1], layer_idx=0)[0]
+        first_draft_pages = manager.get_batch_cache_indices([1], layer_idx=draft_layer)[0]
+        manager.free_resources(first)
+
+        # The shared prefix ends inside the fourth block. Only whole blocks
+        # are claimed, so the context restarts on a fresh FP4 tile.
+        second = make_request(2, prompt[: 3 * page_size + 20] + [7] * 30)
+        assert run_context(second) == 3 * page_size
+        second_pages = manager.get_batch_cache_indices([2], layer_idx=0)[0]
+        second_draft_pages = manager.get_batch_cache_indices([2], layer_idx=draft_layer)[0]
+        assert second_pages[:3] == first_pages[:3]
+        assert second_draft_pages[:3] == first_draft_pages[:3]
+        manager.free_resources(second)
+
+        # The final prompt token is always recomputed, so an exact block
+        # multiple reuses one block less.
+        third = make_request(3, prompt[: 2 * page_size])
+        assert run_context(third) == page_size
+        manager.free_resources(third)
+    finally:
+        manager.shutdown()

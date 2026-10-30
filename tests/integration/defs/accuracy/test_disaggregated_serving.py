@@ -808,7 +808,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     def test_nvfp4_kv_cache_nixl(self):
-        """FP4 MLA: the generation worker decodes from an imported NVFP4 cache."""
+        """FP4 MLA: the generation worker decodes from an imported NVFP4 cache.
+
+        The context worker keeps a single-copy cache on its target layers; its
+        MTP draft layer keeps the decode views for the draft steps of every
+        context step.
+        """
         kv_cache_config = {
             "dtype": "nvfp4",
             "use_kv_cache_manager_v2": True,
@@ -847,9 +852,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             },
         }
         with launch_disaggregated_llm(
-                disaggregated_server_config, ctx_server_config,
+                disaggregated_server_config,
+                ctx_server_config,
                 gen_server_config,
-                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp"
+                f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
+                assert_worker_log_contains="the draft layers keep them",
         ) as llm:
             # The DuckLLM args do not carry the served quantization, so set
             # the specs the accuracy reference lookup matches on.

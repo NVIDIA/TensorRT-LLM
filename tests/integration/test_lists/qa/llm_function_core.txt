@@ -779,6 +779,10 @@ test_e2e.py::test_trtllm_multimodal_benchmark_serving
 
 # Dense FP4 MLA accuracy (SM107 only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla_cached_context[enable_block_reuse=True-enable_chunked_prefill=False-mtp_nextn=0]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla_cached_context[enable_block_reuse=False-enable_chunked_prefill=True-mtp_nextn=0]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla_cached_context[enable_block_reuse=True-enable_chunked_prefill=True-mtp_nextn=0]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla_cached_context[enable_block_reuse=True-enable_chunked_prefill=True-mtp_nextn=3]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nvfp4_kv_cache_nixl
 
 # fine-grained sync tests (SM107+ only)

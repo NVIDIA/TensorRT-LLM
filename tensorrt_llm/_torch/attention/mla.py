@@ -1004,7 +1004,14 @@ class MLA(nn.Module):
             staging = nullcontext()
         else:
             staging = attn_metadata.mixed_precision_kv_staging(self.layer_idx)
-        with staging:
+        # FP4 MLA draft layers with a lifecycle of their own use its page table.
+        draft_state = None
+        if getattr(attn_metadata, "fp4_mla_draft_state", None) is not None:
+            draft_state = attn_metadata.fp4_mla_state_for_layer(self.layer_idx)
+        fp4_mla_state = (
+            nullcontext() if draft_state is None else attn_metadata.use_fp4_mla_state(draft_state)
+        )
+        with staging, fp4_mla_state:
             self._forward_impl(
                 position_ids,
                 hidden_states,
@@ -1357,12 +1364,14 @@ class MLA(nn.Module):
         attn_metadata: TrtllmAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Run dense FP4 MLA chunked prefill through FP8 context partitions.
+        """Run dense FP4 MLA context over a cached prefix through FP8 context partitions.
 
-        The current chunk is appended to the FP4 cache first. Each cached
-        prefix partition is then gathered from the FP4 cache, expanded, and
-        attended with a full mask; the current chunk is attended causally
-        last, and the partial outputs are merged with their softmax stats.
+        The prefix comes from earlier chunks of a chunked prefill or from
+        block reuse. The current chunk is appended to the FP4 cache first.
+        Each cached prefix partition is then gathered from the FP4 cache,
+        expanded, and attended with a full mask; the current chunk is
+        attended causally last, and the partial outputs are merged with their
+        softmax stats.
         """
         trtllm_attention = cast(TrtllmAttention, self.mha)
         if latent_cache is None:
@@ -1753,10 +1762,16 @@ class MLA(nn.Module):
                     q.dtype,
                     q.device,
                 )
+            # FP4 MLA reads a cached prefix back from FP4 storage in partitions,
+            # whether block reuse or earlier chunked-prefill chunks wrote it.
+            fp4_mla_cached_context = (
+                trtllm_attention.uses_fp4_mla_attention
+                and trtllm_attention.has_cached_kv_for_mla_context(attn_metadata)
+            )
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
-                and get_sm_version() >= 100
-            ):
+                or fp4_mla_cached_context
+            ) and get_sm_version() >= 100:
                 if trtllm_attention.uses_fp4_mla_attention:
                     return self.forward_context_with_chunked_prefill_fp4(
                         q, compressed_kv, latent_cache, attn_metadata, output
@@ -1770,8 +1785,7 @@ class MLA(nn.Module):
                 if trtllm_attention.uses_fp4_mla_attention:
                     # The cached-KV path writes and reads a dense paged cache.
                     raise RuntimeError(
-                        "FP4 MLA attends a cached prefix only through chunked-prefill "
-                        "partitions on SM100+; enable chunked prefill."
+                        "FP4 MLA attends a cached prefix only through context partitions on SM100+."
                     )
                 return self.forward_context_with_cached_kv(q, latent_cache, attn_metadata, output)
         return self.forward_context_default(

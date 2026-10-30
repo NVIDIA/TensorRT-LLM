@@ -101,21 +101,18 @@ def _fp4_mla_block_reuse_blocker(pretrained_config, *,
                                  enable_chunked_prefill: bool) -> Optional[str]:
     """Why FP4 MLA cannot reuse KV cache blocks, or ``None`` if it can.
 
-    A reused prefix must end on a full 16-token FP4 quantization tile. On
-    hybrid linear-attention models (Kimi K3) it ends on a recurrent-state
-    snapshot, which the cache manager places on a cache block. A dense FP4
-    MLA prefix can end mid-tile: the reuse match backs off by the
-    one-model draft's prompt lookahead. The cached prefix is attended
-    through the MLA chunked-prefill partitions, which read it back from the
-    FP4 pages.
+    A reused prefix must end on a full 16-token FP4 quantization tile. A
+    dense FP4 MLA cache claims whole cache blocks only. On hybrid
+    linear-attention models (Kimi K3) the prefix ends on a recurrent-state
+    snapshot, which the cache manager places on a cache block. The cached
+    prefix is attended through MLA context partitions read back from the
+    FP4 pages, with or without chunked prefill. Hybrid models keep block
+    reuse tied to chunked prefill, the only combination validated with
+    their recurrent-state snapshots.
     """
-    if not is_hybrid_linear(pretrained_config):
-        return ("only hybrid linear-attention models, whose reused prefix "
-                "ends on a recurrent-state snapshot at a cache block, resume "
-                "on a full FP4 quantization tile")
-    if not enable_chunked_prefill:
-        return ("the cached prefix is attended through MLA chunked-prefill "
-                "partitions; set enable_chunked_prefill=True")
+    if is_hybrid_linear(pretrained_config) and not enable_chunked_prefill:
+        return ("hybrid linear-attention models reuse FP4 MLA cache blocks "
+                "only with chunked prefill; set enable_chunked_prefill=True")
     return None
 
 

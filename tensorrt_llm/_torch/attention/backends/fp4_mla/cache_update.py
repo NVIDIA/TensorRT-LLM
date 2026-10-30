@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA context/generation cache scatter and fused Q/RoPE quantization."""
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
@@ -61,6 +62,7 @@ from .v_cache import (
     _get_fp4_mla_v_packed_pool_base,
     _maybe_update_triton_v_packed_cache,
     _repack_cutedsl_v_packed_cache,
+    _triton_prepack_v_enabled,
 )
 
 
@@ -250,28 +252,136 @@ def _validate_fp4_mla_context_start_alignment(
         )
 
 
-def _scatter_fp4_mla_kv_cache_2d_context(
+@dataclass(slots=True)
+class _Fp4MlaContextScatterPlan:
+    """Context cache-update inputs that every layer of one forward step shares.
+
+    The first context scatter of a step validates the batch and resolves the
+    shared pools, page tables and launch geometry. The remaining layers only
+    look up their own cache views and launch the update kernel.
+    ``Fp4MlaState`` drops the plan whenever the step's lengths change, and
+    ``matches`` rejects a plan built for other runtime length tensors or for a
+    layer with another cache layout.
+    """
+
+    num_contexts: int
+    num_tokens: int
+    token_offset: int
+    head_dim: int
+    v_head_dim: int
+    has_decode_views: bool
+    kv_lens_cuda: Optional[torch.Tensor]
+    prompt_lens_cuda: Optional[torch.Tensor]
+    prompt_lens_cpu: Optional[torch.Tensor]
+    storage_head_dim: int
+    sf_per_token: int
+    sf_per_page: int
+    num_dim_blocks: int
+    global_scale: torch.Tensor
+    v_sf: Optional[torch.Tensor]
+    v_layer_base: int
+    hp_pool: torch.Tensor
+    hp_pool_size: int
+    pool_head_dim: int
+    hp_page_ids: torch.Tensor
+    batch_indices: torch.Tensor
+    positions: torch.Tensor
+    paged_kv_indices: torch.Tensor
+    paged_kv_indptr: torch.Tensor
+    store_k_residual: bool
+    cutedsl_v_packed: bool
+    v_packed_base: Optional[torch.Tensor]
+    cutedsl_repack: Optional[tuple]
+    triton_v_pack: bool
+    rope_table: Optional[torch.Tensor] = None
+    rope_dim: int = 0
+
+    def matches(
+        self,
+        metadata: Any,
+        kv_cache: torch.Tensor,
+        sf_cache: torch.Tensor,
+        *,
+        num_tokens: int,
+        head_dim: int,
+        token_offset: int,
+        v_head_dim: int,
+        has_decode_views: bool,
+    ) -> bool:
+        return (
+            self.num_tokens == num_tokens
+            and self.head_dim == head_dim
+            and self.token_offset == token_offset
+            and self.v_head_dim == v_head_dim
+            and self.has_decode_views == has_decode_views
+            and self.num_contexts == metadata.num_contexts
+            and self.storage_head_dim == kv_cache.shape[-1] * 2
+            and self.sf_per_token == sf_cache.shape[-1]
+            and self.kv_lens_cuda is getattr(metadata, "kv_lens_cuda_runtime", None)
+            and self.prompt_lens_cuda is getattr(metadata, "prompt_lens_cuda_runtime", None)
+            and self.prompt_lens_cpu is getattr(metadata, "prompt_lens_cpu_runtime", None)
+        )
+
+
+def _build_fp4_mla_context_scatter_plan(
     metadata: Any,
     latent_cache: torch.Tensor,
     kv_cache: torch.Tensor,
     sf_cache: torch.Tensor,
-    v_sf: Optional[torch.Tensor],
-    global_scale: torch.Tensor,
-    rotary_cos_sin: Optional[torch.Tensor],
-    q_context: Optional[torch.Tensor],
-    q_nope_head_dim: Optional[int],
     *,
     token_offset: int,
-    local_layer: int,
     v_head_dim: int,
-    head_dim: int,
-    num_tokens: int,
-    num_dim_blocks: int,
-    sf_per_token: int,
-    sf_per_page: int,
-    v_packed_base: Optional[torch.Tensor] = None,
-    v_page_offset: int = 0,
-) -> bool:
+    has_decode_views: bool,
+) -> _Fp4MlaContextScatterPlan:
+    """Validate one step's context cache update and resolve its shared inputs."""
+    state = metadata.fp4_mla_state
+    num_tokens, head_dim = latent_cache.shape
+    if head_dim % FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP4 MLA KV head_dim must be divisible by {FP4_BLOCK_SIZE}, got {head_dim}."
+        )
+    indices_len = state.batch_indices.shape[0]
+    positions_len = state.positions.shape[0]
+    if token_offset + num_tokens > indices_len or token_offset + num_tokens > positions_len:
+        raise RuntimeError(
+            f"FP4 MLA scatter would read batch_indices[{token_offset}:"
+            f"{token_offset + num_tokens}] / positions[{token_offset}:"
+            f"{token_offset + num_tokens}], but only {indices_len} / "
+            f"{positions_len} entries are available. This indicates "
+            "latent_cache was not pre-sliced to the current phase's token "
+            "range (see MLA.forward_impl)."
+        )
+
+    _validate_fp4_mla_cache_shape(metadata.page_size, head_dim)
+
+    backend = _fp4_mla_attention_backend()
+    global_scale = _get_fp4_mla_global_scale(metadata, latent_cache.device)
+    storage_head_dim = _validate_fp4_mla_kv_storage_shape(
+        kv_cache,
+        sf_cache,
+        head_dim=head_dim,
+        backend=backend,
+    )
+    if has_decode_views and getattr(state, "v_scale_pool", None) is None:
+        raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
+    if metadata.page_size % FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP4 MLA scatter requires page_size divisible by "
+            f"{FP4_BLOCK_SIZE}, got {metadata.page_size}."
+        )
+    if v_head_dim > head_dim:
+        raise ValueError(f"FP4 MLA v_head_dim={v_head_dim} cannot exceed head_dim={head_dim}.")
+    if head_dim - v_head_dim != FP4_MLA_K_RESIDUAL_DIM:
+        raise ValueError(
+            "FP4 MLA K residual quantization requires the K-only tail to match "
+            f"the {FP4_MLA_K_RESIDUAL_DIM}-channel residual, got "
+            f"head_dim={head_dim} v_head_dim={v_head_dim}."
+        )
+    if v_head_dim % FP4_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"FP4 MLA v_head_dim must be divisible by {FP4_BLOCK_SIZE}, got {v_head_dim}."
+        )
+
     num_contexts = metadata.num_contexts
     if num_contexts > 0:
         prompt_lens_cpu = metadata.prompt_lens_cpu_runtime[:num_contexts]
@@ -283,13 +393,127 @@ def _scatter_fp4_mla_kv_cache_2d_context(
             )
         _validate_fp4_mla_context_start_alignment(metadata, num_contexts, alignment=FP4_BLOCK_SIZE)
 
-    apply_k_rope = rotary_cos_sin is not None
-    rope_dim = (
-        _validate_fp4_mla_context_rope(latent_cache, rotary_cos_sin, v_head_dim)
-        if rotary_cos_sin is not None
-        else 0
+    hp_pool = getattr(state, "hp_pool", None)
+    if not isinstance(hp_pool, torch.Tensor):
+        raise TypeError("FP4 MLA high-precision KV pool must be a tensor.")
+    if hp_pool.device != latent_cache.device:
+        raise ValueError("FP4 MLA latent cache and high-precision pool must share a device.")
+    if hp_pool.dtype != torch.bfloat16:
+        raise TypeError(f"FP4 MLA high-precision KV pool must use BF16, got {hp_pool.dtype}.")
+    hp_pool_size, pool_head_dim = _get_fp4_mla_hp_pool_layout(metadata, hp_pool)
+    if pool_head_dim < head_dim:
+        raise RuntimeError(
+            f"FP4 MLA HP pool head dimension is too small: got "
+            f"{pool_head_dim}, need at least {head_dim}."
+        )
+    if hp_pool.stride(-1) != 1:
+        raise ValueError("FP4 MLA high-precision KV pool must be contiguous in head_dim.")
+    hp_page_ids = state.hp_page_indices
+    if not isinstance(hp_page_ids, torch.Tensor):
+        raise RuntimeError("FP4 MLA context cache update requires HP page metadata.")
+
+    cutedsl_backend = backend == _FP4_MLA_CUTEDSL_BACKEND
+    fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()
+    cutedsl_v_packed = cutedsl_backend and not fused_v_transpose and has_decode_views
+    v_packed_base = None
+    cutedsl_repack = None
+    if cutedsl_v_packed:
+        # Reused/imported pages may not carry this process-local sidecar. Write
+        # packed V directly only when the cache pages are exclusively owned;
+        # otherwise repack the pages the step touched.
+        kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+        block_reuse = getattr(kv_cache_manager, "enable_block_reuse", True)
+        if num_contexts > 0 and block_reuse is False:
+            v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
+            row_width = metadata.page_size // 2
+            if (
+                not isinstance(v_packed_base, torch.Tensor)
+                or v_packed_base.dtype != torch.uint8
+                or v_packed_base.device != kv_cache.device
+                or v_packed_base.ndim != 2
+                or v_packed_base.shape[1] != row_width
+                or not v_packed_base.is_contiguous()
+            ):
+                raise RuntimeError(
+                    "FP4 MLA direct V-packed cache update requires the "
+                    "stable full-pool base to be a contiguous uint8 tensor "
+                    f"with {row_width} columns on {kv_cache.device}."
+                )
+        else:
+            cutedsl_repack = (
+                state.paged_kv_indices[: state.num_context_blocks],
+                state.paged_kv_indptr[: num_contexts + 1],
+                metadata.kv_lens_cuda_runtime[:num_contexts],
+                metadata.prompt_lens_cuda_runtime[:num_contexts],
+                int(state.context_repack_max_touched_pages),
+            )
+
+    return _Fp4MlaContextScatterPlan(
+        num_contexts=num_contexts,
+        num_tokens=num_tokens,
+        token_offset=token_offset,
+        head_dim=head_dim,
+        v_head_dim=v_head_dim,
+        has_decode_views=has_decode_views,
+        kv_lens_cuda=getattr(metadata, "kv_lens_cuda_runtime", None),
+        prompt_lens_cuda=getattr(metadata, "prompt_lens_cuda_runtime", None),
+        prompt_lens_cpu=getattr(metadata, "prompt_lens_cpu_runtime", None),
+        storage_head_dim=storage_head_dim,
+        sf_per_token=storage_head_dim // FP4_BLOCK_SIZE,
+        sf_per_page=metadata.page_size // FP4_BLOCK_SIZE,
+        num_dim_blocks=triton.cdiv(head_dim, FP4_BLOCK_SIZE),
+        global_scale=global_scale,
+        v_sf=(
+            get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+            if has_decode_views
+            else None
+        ),
+        v_layer_base=int(getattr(state, "v_layer_base", 0)),
+        hp_pool=hp_pool,
+        hp_pool_size=hp_pool_size,
+        pool_head_dim=pool_head_dim,
+        hp_page_ids=hp_page_ids,
+        batch_indices=state.batch_indices,
+        positions=state.positions,
+        paged_kv_indices=state.paged_kv_indices,
+        paged_kv_indptr=state.paged_kv_indptr,
+        store_k_residual=backend in _FP4_MLA_K_RESIDUAL_BACKENDS,
+        cutedsl_v_packed=cutedsl_v_packed,
+        v_packed_base=v_packed_base,
+        cutedsl_repack=cutedsl_repack,
+        triton_v_pack=has_decode_views and _triton_prepack_v_enabled(),
     )
-    rotary_cos_sin_ptr = rotary_cos_sin if rotary_cos_sin is not None else latent_cache
+
+
+def _scatter_fp4_mla_kv_cache_2d_context(
+    metadata: Any,
+    plan: _Fp4MlaContextScatterPlan,
+    latent_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    sf_cache: torch.Tensor,
+    v_sf: Optional[torch.Tensor],
+    rotary_cos_sin: Optional[torch.Tensor],
+    q_context: Optional[torch.Tensor],
+    q_nope_head_dim: Optional[int],
+    *,
+    local_layer: int,
+    v_packed_base: Optional[torch.Tensor] = None,
+    v_page_offset: int = 0,
+) -> bool:
+    """Launch one layer's context cache update with the step's shared plan."""
+    num_tokens = plan.num_tokens
+    apply_k_rope = rotary_cos_sin is not None
+    if rotary_cos_sin is None:
+        rope_dim = 0
+        rotary_cos_sin_ptr = latent_cache
+    else:
+        if rotary_cos_sin is not plan.rope_table:
+            plan.rope_dim = _validate_fp4_mla_context_rope(
+                latent_cache, rotary_cos_sin, plan.v_head_dim
+            )
+            plan.rope_table = rotary_cos_sin
+        rope_dim = plan.rope_dim
+        rotary_cos_sin_ptr = rotary_cos_sin
 
     apply_q_rope = q_context is not None
     block_q_heads = 16
@@ -319,32 +543,12 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         q_context_view = latent_cache
         q_head_blocks = 0
 
-    hp_pool = getattr(metadata.fp4_mla_state, "hp_pool", None)
-    if not isinstance(hp_pool, torch.Tensor):
-        raise TypeError("FP4 MLA high-precision KV pool must be a tensor.")
-    if hp_pool.device != latent_cache.device:
-        raise ValueError("FP4 MLA latent cache and high-precision pool must share a device.")
-    if hp_pool.dtype != torch.bfloat16:
-        raise TypeError(f"FP4 MLA high-precision KV pool must use BF16, got {hp_pool.dtype}.")
-    hp_pool_size, pool_head_dim = _get_fp4_mla_hp_pool_layout(metadata, hp_pool)
-    if pool_head_dim < head_dim:
-        raise RuntimeError(
-            f"FP4 MLA HP pool head dimension is too small: got "
-            f"{pool_head_dim}, need at least {head_dim}."
-        )
+    hp_pool = plan.hp_pool
     if local_layer < 0 or local_layer >= hp_pool.shape[1]:
         raise ValueError(
             f"FP4 MLA local layer {local_layer} is outside the HP pool's {hp_pool.shape[1]} layers."
         )
-    if hp_pool.stride(-1) != 1:
-        raise ValueError("FP4 MLA high-precision KV pool must be contiguous in head_dim.")
-    hp_page_ids = metadata.fp4_mla_state.hp_page_indices
-    if not isinstance(hp_page_ids, torch.Tensor):
-        raise RuntimeError("FP4 MLA context cache update requires HP page metadata.")
-    store_hp_tail = num_contexts > 0
-    num_hp_pages = hp_pool.shape[0]
-    pool_s0 = hp_pool.stride(0)
-    pool_s1 = hp_pool.stride(1)
+    store_hp_tail = plan.num_contexts > 0
 
     write_v_packed = v_packed_base is not None
     v_packed_output = v_packed_base if write_v_packed else kv_cache
@@ -359,7 +563,7 @@ def _scatter_fp4_mla_kv_cache_2d_context(
     _fp4_mla_context_cache_update_kernel[
         (
             num_tokens,
-            num_dim_blocks + q_head_blocks,
+            plan.num_dim_blocks + q_head_blocks,
         )
     ](
         kv_cache,
@@ -368,22 +572,22 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         v_packed_output,
         latent_cache,
         q_context_view,
-        global_scale,
+        plan.global_scale,
         rotary_cos_sin_ptr,
         hp_pool,
-        hp_page_ids,
-        metadata.fp4_mla_state.batch_indices,
-        metadata.fp4_mla_state.positions,
-        metadata.fp4_mla_state.paged_kv_indices,
-        metadata.fp4_mla_state.paged_kv_indptr,
-        metadata.fp4_mla_state.paged_kv_indices.shape[0],
-        metadata.fp4_mla_state.paged_kv_indptr.shape[0],
-        metadata.fp4_mla_state.batch_indices.shape[0],
+        plan.hp_page_ids,
+        plan.batch_indices,
+        plan.positions,
+        plan.paged_kv_indices,
+        plan.paged_kv_indptr,
+        plan.paged_kv_indices.shape[0],
+        plan.paged_kv_indptr.shape[0],
+        plan.batch_indices.shape[0],
         num_pages,
         num_layers,
-        num_contexts,
-        num_hp_pages,
-        token_offset,
+        plan.num_contexts,
+        hp_pool.shape[0],
+        plan.token_offset,
         num_tokens,
         local_layer,
         v_page_offset if write_v_packed else 0,
@@ -401,30 +605,172 @@ def _scatter_fp4_mla_kv_cache_2d_context(
         v_sf.stride(1) if store_v_scale else 0,
         v_packed_s0,
         v_packed_s1,
-        pool_s0,
-        pool_s1,
-        HEAD_D=head_dim,
-        V_HEAD_D=v_head_dim,
+        hp_pool.stride(0),
+        hp_pool.stride(1),
+        HEAD_D=plan.head_dim,
+        V_HEAD_D=plan.v_head_dim,
         HP_BLOCK=FP4_BLOCK_SIZE,
-        HP_POOL_SIZE=hp_pool_size,
+        HP_POOL_SIZE=plan.hp_pool_size,
         FP4_BLOCK=FP4_BLOCK_SIZE,
-        SF_PER_TOKEN=sf_per_token,
-        SF_PER_PAGE=sf_per_page,
+        SF_PER_TOKEN=plan.sf_per_token,
+        SF_PER_PAGE=plan.sf_per_page,
         K_RESIDUAL_D=FP4_MLA_K_RESIDUAL_DIM,
-        STORE_K_RESIDUAL=(_fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS),
+        STORE_K_RESIDUAL=plan.store_k_residual,
         ROPE_DIM=rope_dim,
         APPLY_K_ROPE=apply_k_rope,
         APPLY_Q_ROPE=apply_q_rope,
-        NUM_DIM_BLOCKS=num_dim_blocks,
+        NUM_DIM_BLOCKS=plan.num_dim_blocks,
         NUM_Q_HEADS=num_q_heads,
         Q_NOPE_DIM=q_nope_head_dim if q_nope_head_dim is not None else 0,
         BLOCK_Q_HEADS=block_q_heads,
-        POOL_HEAD_D=pool_head_dim,
+        POOL_HEAD_D=plan.pool_head_dim,
         STORE_HP_TAIL=store_hp_tail,
         WRITE_V_PACKED=write_v_packed,
         STORE_V_SCALE=store_v_scale,
     )
     return store_hp_tail
+
+
+def _scatter_fp4_mla_context(
+    metadata: Any,
+    latent_cache: torch.Tensor,
+    layer_idx: int,
+    *,
+    token_offset: int,
+    local_layer: int,
+    v_head_dim: int,
+    rotary_cos_sin: Optional[torch.Tensor],
+    q_context: Optional[torch.Tensor],
+    q_nope_head_dim: Optional[int],
+) -> bool:
+    """Context phase of ``scatter_fp4_mla_kv_cache``.
+
+    Everything the layers of a step share is validated and resolved once, in
+    ``_build_fp4_mla_context_scatter_plan``; each layer then looks up its own
+    cache views and launches the update kernel.
+    """
+    if latent_cache.numel() == 0:
+        raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
+    if q_context is not None and not latent_cache.is_contiguous():
+        raise ValueError(
+            "FP4 MLA fused context Q/K RoPE requires contiguous latent_cache "
+            "storage for in-place current-K update."
+        )
+    if (q_context is None) != (q_nope_head_dim is None):
+        raise ValueError("FP4 MLA context Q and q_nope_head_dim must be provided together.")
+    latent_cache = latent_cache.reshape(latent_cache.shape[0], -1).contiguous()
+    num_tokens, head_dim = latent_cache.shape
+
+    state = metadata.fp4_mla_state
+    kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
+    has_decode_views = _fp4_mla_layer_has_decode_views(kv_cache_manager, local_layer)
+    kv_cache, sf_cache = _get_fp4_mla_kv_cache_tensors(metadata, layer_idx)
+    plan = getattr(state, "context_scatter_plan", None)
+    if plan is None or not plan.matches(
+        metadata,
+        kv_cache,
+        sf_cache,
+        num_tokens=num_tokens,
+        head_dim=head_dim,
+        token_offset=token_offset,
+        v_head_dim=v_head_dim,
+        has_decode_views=has_decode_views,
+    ):
+        plan = _build_fp4_mla_context_scatter_plan(
+            metadata,
+            latent_cache,
+            kv_cache,
+            sf_cache,
+            token_offset=token_offset,
+            v_head_dim=v_head_dim,
+            has_decode_views=has_decode_views,
+        )
+        state.context_scatter_plan = plan
+    sf_cache = sf_cache.view(torch.float8_e4m3fn)
+    v_sf = plan.v_sf
+    if v_sf is not None and plan.v_layer_base != 0:
+        v_sf = _fp4_mla_v_scale_pool_for_layer(metadata, local_layer, v_head_dim)
+
+    persistent_v_packed = None
+    v_page_offset = 0
+    if plan.cutedsl_v_packed:
+        persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
+            metadata,
+            local_layer,
+            kv_cache,
+            v_head_dim=v_head_dim,
+            page_size=metadata.page_size,
+            block_v=FP4_MLA_SCALE_ROW_GROUP,
+        )
+        v_packed_base = plan.v_packed_base
+        if v_packed_base is not None:
+            get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
+            v_page_offset = (
+                int(get_v_page_offset(local_layer))
+                if callable(get_v_page_offset)
+                else local_layer * kv_cache.shape[0]
+            )
+            row_width = metadata.page_size // 2
+            required_base_rows = (v_page_offset + kv_cache.shape[0]) * v_head_dim
+            if v_packed_base.shape[0] < required_base_rows:
+                raise RuntimeError(
+                    "FP4 MLA direct V-packed cache update requires the "
+                    "stable full-pool base to be a contiguous uint8 tensor "
+                    f"with at least {required_base_rows} rows and "
+                    f"{row_width} columns on {kv_cache.device}."
+                )
+            if (
+                v_packed_base.data_ptr() + v_page_offset * v_head_dim * row_width
+                != persistent_v_packed.data_ptr()
+            ):
+                raise RuntimeError(
+                    "FP4 MLA V-packed layer view does not match its stable "
+                    "full-pool base and page offset."
+                )
+
+    _materialize_fp4_mla_device_page_table_for_forward(metadata)
+    hp_pool_updated = _scatter_fp4_mla_kv_cache_2d_context(
+        metadata,
+        plan,
+        latent_cache,
+        kv_cache,
+        sf_cache,
+        v_sf,
+        rotary_cos_sin,
+        q_context,
+        q_nope_head_dim,
+        local_layer=local_layer,
+        v_packed_base=plan.v_packed_base,
+        v_page_offset=v_page_offset,
+    )
+    if plan.cutedsl_repack is not None:
+        page_ids, page_indptr, kv_lens, generation_lens, max_touched_pages = plan.cutedsl_repack
+        _repack_cutedsl_v_packed_cache(
+            persistent_v_packed,
+            kv_cache,
+            page_ids,
+            v_head_dim=v_head_dim,
+            page_size=metadata.page_size,
+            block_v=FP4_MLA_SCALE_ROW_GROUP,
+            page_indptr=page_indptr,
+            kv_lens=kv_lens,
+            generation_lens=generation_lens,
+            max_touched_pages=max_touched_pages,
+        )
+    if plan.triton_v_pack:
+        _maybe_update_triton_v_packed_cache(
+            metadata,
+            layer_idx,
+            kv_cache,
+            plan.paged_kv_indices,
+            num_queries=num_tokens,
+            v_head_dim=v_head_dim,
+            page_size=metadata.page_size,
+            local_layer=local_layer,
+            v_sf=v_sf[local_layer],
+            num_valid_pages=None,
+        )
+    return hp_pool_updated
 
 
 def _scatter_fp4_mla_kv_cache_2d_generation(
@@ -759,6 +1105,35 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     return kv_lens_gen, gen_lens_gen, page_ids
 
 
+def _fp4_mla_layer_has_decode_views(kv_cache_manager: Any, local_layer: int) -> bool:
+    """Whether a compact FP4 MLA layer keeps V scales and packed V.
+
+    A disaggregated context worker keeps a single-copy cache without them,
+    except on one-model draft layers.
+    """
+    if getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is not True:
+        return True
+    has_views = getattr(kv_cache_manager, "fp4_mla_compact_layer_has_decode_views", None)
+    return callable(has_views) and bool(has_views(local_layer))
+
+
+def _fp4_mla_v_scale_pool_for_layer(
+    metadata: Any, local_layer: int, v_head_dim: int
+) -> torch.Tensor:
+    """V-scale pool view that the cache-update kernels index by compact layer.
+
+    The pool covers the compact layers from the state's ``v_layer_base`` on.
+    For a nonzero base, present this layer's scales at every layer index with
+    a zero layer stride, so that ``local_layer`` still addresses them.
+    """
+    pool = get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
+    v_layer_base = int(getattr(metadata.fp4_mla_state, "v_layer_base", 0))
+    if v_layer_base == 0:
+        return pool
+    num_layers = metadata.fp4_mla_state.hp_pool.shape[1]
+    return pool[local_layer - v_layer_base].unsqueeze(0).expand(num_layers, *pool.shape[1:])
+
+
 # Public cache update and decode entry points
 
 
@@ -810,19 +1185,30 @@ def scatter_fp4_mla_kv_cache(
     backend-ready residual FP4 Q. The return value reports whether the current
     phase updated the HP pool.
     """
-    if phase == "generation":
-        metadata.fp4_mla_state.generation_cache_scattered = False
-        metadata.fp4_mla_state.prequantized_q = None
-        metadata.fp4_mla_state.prequantized_q_sf = None
-        metadata.fp4_mla_state.q_batch_capacity = None
-        metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
+    if phase == "context":
+        if any(arg is not None for arg in (q_pe, q_rope_out, q_quant_input)):
+            raise ValueError("FP4 MLA context cache update does not accept generation Q tensors.")
+        return _scatter_fp4_mla_context(
+            metadata,
+            latent_cache,
+            layer_idx,
+            token_offset=token_offset,
+            local_layer=local_layer,
+            v_head_dim=v_head_dim,
+            rotary_cos_sin=rotary_cos_sin,
+            q_context=q_context,
+            q_nope_head_dim=q_nope_head_dim,
+        )
+    if phase != "generation":
+        raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
+
+    metadata.fp4_mla_state.generation_cache_scattered = False
+    metadata.fp4_mla_state.prequantized_q = None
+    metadata.fp4_mla_state.prequantized_q_sf = None
+    metadata.fp4_mla_state.q_batch_capacity = None
+    metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
     if latent_cache.numel() == 0:
         raise ValueError("FP4 MLA cache scatter requires at least one latent token.")
-    if q_context is not None and not latent_cache.is_contiguous():
-        raise ValueError(
-            "FP4 MLA fused context Q/K RoPE requires contiguous latent_cache "
-            "storage for in-place current-K update."
-        )
 
     latent_cache = latent_cache.reshape(latent_cache.shape[0], -1).contiguous()
     num_tokens = latent_cache.shape[0]
@@ -856,15 +1242,10 @@ def scatter_fp4_mla_kv_cache(
     )
     sf_per_token = storage_head_dim // FP4_BLOCK_SIZE
 
-    if phase not in ("context", "generation"):
-        raise ValueError("FP4 MLA scatter requires phase='context' or 'generation'.")
     kv_cache_manager = getattr(metadata, "kv_cache_manager", None)
-    # A disaggregated context worker keeps a single-copy cache without the
-    # generation-only V scales and packed V.
-    context_only_cache = getattr(kv_cache_manager, "fp4_mla_context_only_cache", False) is True
-    if context_only_cache and phase != "context":
+    if not _fp4_mla_layer_has_decode_views(kv_cache_manager, local_layer):
         raise RuntimeError("FP4 MLA context-only cache cannot execute generation.")
-    if not context_only_cache and getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
+    if getattr(metadata.fp4_mla_state, "v_scale_pool", None) is None:
         raise RuntimeError("FP4 MLA scatter requires the auxiliary V scale pool.")
     if metadata.page_size % FP4_BLOCK_SIZE != 0:
         raise ValueError(
@@ -885,67 +1266,50 @@ def scatter_fp4_mla_kv_cache(
         )
 
     sf_cache = sf_cache.view(torch.float8_e4m3fn)
-    v_sf = (
-        None
-        if context_only_cache
-        else get_fp4_mla_v_scale_pool_view(metadata, v_head_dim=v_head_dim)
-    )
+    v_sf = _fp4_mla_v_scale_pool_for_layer(metadata, local_layer, v_head_dim)
     num_dim_blocks = triton.cdiv(head_dim, FP4_BLOCK_SIZE)
     sf_per_page = metadata.page_size // FP4_BLOCK_SIZE
 
-    generation_state = None
-    generation_inputs = (rotary_cos_sin, q_pe, q_rope_out, q_quant_input)
-    q_fp4_out = None
-    q_sf_out = None
-    if phase == "context":
-        if any(arg is not None for arg in (q_pe, q_rope_out, q_quant_input)):
-            raise ValueError("FP4 MLA context cache update does not accept generation Q tensors.")
-        if (q_context is None) != (q_nope_head_dim is None):
-            raise ValueError("FP4 MLA context Q and q_nope_head_dim must be provided together.")
-        hp_pool_updated = False
-    else:
-        if q_context is not None or q_nope_head_dim is not None:
-            raise ValueError("FP4 MLA generation cache update does not accept context Q tensors.")
-        if (helix_position_offsets is None) != (helix_is_inactive_rank is None):
-            raise ValueError(
-                "FP4 MLA Helix position-offset and inactive-rank metadata "
-                "must be provided together."
-            )
-        if not all(arg is not None for arg in generation_inputs):
-            raise ValueError(
-                "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
-                "and q_quant_input for fused RoPE, cache update, and Q quantization."
-            )
-        if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
-            raise ValueError(
-                "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
-                "scale mode, or backend."
-            )
-        num_gen_for_q = metadata.num_seqs - metadata.num_contexts
-        q_rows_per_seq = 0
-        if num_gen_for_q > 0 and num_tokens % num_gen_for_q == 0:
-            q_rows_per_seq = _fp4_mla_packed_rows_per_seq(
-                q_quant_input.shape[1], num_tokens // num_gen_for_q
-            )
-        q_fp4_out, q_sf_out, q_batch_capacity = _prepare_fp4_mla_q_buffers(
-            metadata,
-            num_tokens,
-            q_quant_input.shape[1],
-            q_quant_input.device,
-            rows_per_seq=q_rows_per_seq,
+    if q_context is not None or q_nope_head_dim is not None:
+        raise ValueError("FP4 MLA generation cache update does not accept context Q tensors.")
+    if (helix_position_offsets is None) != (helix_is_inactive_rank is None):
+        raise ValueError(
+            "FP4 MLA Helix position-offset and inactive-rank metadata must be provided together."
         )
-        metadata.fp4_mla_state.prequantized_q = q_fp4_out
-        metadata.fp4_mla_state.prequantized_q_sf = q_sf_out
-        metadata.fp4_mla_state.q_batch_capacity = q_batch_capacity
-        metadata.fp4_mla_state.prequantized_q_rows_per_seq = q_rows_per_seq
-        hp_pool_updated = True
+    if any(arg is None for arg in (rotary_cos_sin, q_pe, q_rope_out, q_quant_input)):
+        raise ValueError(
+            "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
+            "and q_quant_input for fused RoPE, cache update, and Q quantization."
+        )
+    if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
+        raise ValueError(
+            "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
+            "scale mode, or backend."
+        )
+    num_gen_for_q = metadata.num_seqs - metadata.num_contexts
+    q_rows_per_seq = 0
+    if num_gen_for_q > 0 and num_tokens % num_gen_for_q == 0:
+        q_rows_per_seq = _fp4_mla_packed_rows_per_seq(
+            q_quant_input.shape[1], num_tokens // num_gen_for_q
+        )
+    q_fp4_out, q_sf_out, q_batch_capacity = _prepare_fp4_mla_q_buffers(
+        metadata,
+        num_tokens,
+        q_quant_input.shape[1],
+        q_quant_input.device,
+        rows_per_seq=q_rows_per_seq,
+    )
+    metadata.fp4_mla_state.prequantized_q = q_fp4_out
+    metadata.fp4_mla_state.prequantized_q_sf = q_sf_out
+    metadata.fp4_mla_state.q_batch_capacity = q_batch_capacity
+    metadata.fp4_mla_state.prequantized_q_rows_per_seq = q_rows_per_seq
     cutedsl_backend = _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
     fused_v_transpose = cutedsl_backend and _fp4_mla_cutedsl_fused_v_transpose_enabled()
     persistent_v_packed = None
     v_packed_base = None
     v_page_offset = 0
     direct_v_packed_write = False
-    if cutedsl_backend and not fused_v_transpose and not context_only_cache:
+    if cutedsl_backend and not fused_v_transpose:
         persistent_v_packed = _get_cutedsl_persistent_v_packed_cache(
             metadata,
             local_layer,
@@ -960,20 +1324,12 @@ def scatter_fp4_mla_kv_cache(
         # updates every 16-token tile touched by the verification window.
         num_gen = metadata.num_seqs - metadata.num_contexts
         block_reuse = getattr(kv_cache_manager, "enable_block_reuse", True)
-        direct_context_v_packed_write = (
-            phase == "context"
-            and metadata.num_contexts > 0
-            and num_tokens > 0
-            and block_reuse is False
-        )
-        direct_generation_v_packed_write = (
-            phase == "generation"
-            and num_gen > 0
+        direct_v_packed_write = (
+            num_gen > 0
             and num_tokens >= num_gen
             and num_tokens % num_gen == 0
             and block_reuse is False
         )
-        direct_v_packed_write = direct_context_v_packed_write or direct_generation_v_packed_write
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
             get_v_page_offset = getattr(kv_cache_manager, "get_mla_v_packed_page_offset", None)
@@ -1007,87 +1363,46 @@ def scatter_fp4_mla_kv_cache(
                     "FP4 MLA V-packed layer view does not match its stable "
                     "full-pool base and page offset."
                 )
+    generation_state = _scatter_fp4_mla_kv_cache_2d_generation(
+        metadata,
+        latent_cache,
+        kv_cache,
+        sf_cache,
+        v_sf,
+        global_scale,
+        token_offset=token_offset,
+        local_layer=local_layer,
+        v_head_dim=v_head_dim,
+        head_dim=head_dim,
+        num_tokens=num_tokens,
+        num_dim_blocks=num_dim_blocks,
+        sf_per_token=sf_per_token,
+        sf_per_page=sf_per_page,
+        rotary_cos_sin=rotary_cos_sin,
+        q_pe=q_pe,
+        q_rope_out=q_rope_out,
+        q_quant_input=q_quant_input,
+        q_fp4_out=q_fp4_out,
+        q_sf_out=q_sf_out,
+        v_packed_base=v_packed_base,
+        v_page_offset=v_page_offset,
+        helix_position_offsets=helix_position_offsets,
+        helix_is_inactive_rank=helix_is_inactive_rank,
+    )
+    v_pack_page_ids = _fp4_mla_generation_page_ids(
+        metadata, metadata.num_seqs - metadata.num_contexts
+    )
     v_pack_num_valid = None
-    if phase == "context":
-        _materialize_fp4_mla_device_page_table_for_forward(metadata)
-        hp_pool_updated = _scatter_fp4_mla_kv_cache_2d_context(
-            metadata,
-            latent_cache,
-            kv_cache,
-            sf_cache,
-            v_sf,
-            global_scale,
-            rotary_cos_sin,
-            q_context,
-            q_nope_head_dim,
-            token_offset=token_offset,
-            local_layer=local_layer,
-            v_head_dim=v_head_dim,
-            head_dim=head_dim,
-            num_tokens=num_tokens,
-            num_dim_blocks=num_dim_blocks,
-            sf_per_token=sf_per_token,
-            sf_per_page=sf_per_page,
-            v_packed_base=v_packed_base,
-            v_page_offset=v_page_offset,
-        )
-        v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices
-    else:
-        generation_state = _scatter_fp4_mla_kv_cache_2d_generation(
-            metadata,
-            latent_cache,
-            kv_cache,
-            sf_cache,
-            v_sf,
-            global_scale,
-            token_offset=token_offset,
-            local_layer=local_layer,
-            v_head_dim=v_head_dim,
-            head_dim=head_dim,
-            num_tokens=num_tokens,
-            num_dim_blocks=num_dim_blocks,
-            sf_per_token=sf_per_token,
-            sf_per_page=sf_per_page,
-            rotary_cos_sin=rotary_cos_sin,
-            q_pe=q_pe,
-            q_rope_out=q_rope_out,
-            q_quant_input=q_quant_input,
-            q_fp4_out=q_fp4_out,
-            q_sf_out=q_sf_out,
-            v_packed_base=v_packed_base,
-            v_page_offset=v_page_offset,
-            helix_position_offsets=helix_position_offsets,
-            helix_is_inactive_rank=helix_is_inactive_rank,
-        )
-        v_pack_page_ids = _fp4_mla_generation_page_ids(
-            metadata, metadata.num_seqs - metadata.num_contexts
-        )
-        if getattr(metadata, "is_cuda_graph", False):
-            # Frozen launch grids cannot follow the per-replay page count;
-            # the repack kernels stride over this device-side count instead.
-            v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
+    if getattr(metadata, "is_cuda_graph", False):
+        # Frozen launch grids cannot follow the per-replay page count;
+        # the repack kernels stride over this device-side count instead.
+        v_pack_num_valid = _fp4_mla_generation_num_blocks_device(metadata)
     cutedsl_repack_page_indptr = None
     cutedsl_repack_kv_lens = None
     cutedsl_repack_generation_lens = None
     cutedsl_repack_max_touched_pages = 1
-    if (
-        cutedsl_backend
-        and not fused_v_transpose
-        and not direct_v_packed_write
-        and not context_only_cache
-    ):
-        if phase == "context":
-            num_contexts = metadata.num_contexts
-            cutedsl_v_pack_page_ids = metadata.fp4_mla_state.paged_kv_indices[
-                : metadata.fp4_mla_state.num_context_blocks
-            ]
-            cutedsl_repack_page_indptr = metadata.fp4_mla_state.paged_kv_indptr[: num_contexts + 1]
-            cutedsl_repack_kv_lens = metadata.kv_lens_cuda_runtime[:num_contexts]
-            cutedsl_repack_generation_lens = metadata.prompt_lens_cuda_runtime[:num_contexts]
-            cutedsl_repack_max_touched_pages = int(
-                metadata.fp4_mla_state.context_repack_max_touched_pages
-            )
-        elif generation_state is not None:
+    if cutedsl_backend and not fused_v_transpose and not direct_v_packed_write:
+        if generation_state is not None:
             kv_lens_gen, gen_lens_gen, generation_page_ids = generation_state
             num_gen = kv_lens_gen.numel()
             cutedsl_v_pack_page_ids = generation_page_ids
@@ -1112,8 +1427,6 @@ def scatter_fp4_mla_kv_cache(
             generation_lens=cutedsl_repack_generation_lens,
             max_touched_pages=cutedsl_repack_max_touched_pages,
         )
-    if context_only_cache:
-        return hp_pool_updated
     _maybe_update_triton_v_packed_cache(
         metadata,
         layer_idx,
@@ -1126,6 +1439,5 @@ def scatter_fp4_mla_kv_cache(
         v_sf=v_sf[local_layer],
         num_valid_pages=v_pack_num_valid,
     )
-    if phase == "generation":
-        metadata.fp4_mla_state.generation_cache_scattered = hp_pool_updated
-    return hp_pool_updated
+    metadata.fp4_mla_state.generation_cache_scattered = True
+    return True
