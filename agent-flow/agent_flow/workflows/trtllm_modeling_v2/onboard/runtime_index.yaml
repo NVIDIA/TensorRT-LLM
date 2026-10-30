@@ -1,0 +1,677 @@
+# The runtime map: concept -> where the current code and tests live.
+#
+# WHAT THIS FILE IS, AND WHAT IT DELIBERATELY IS NOT
+#
+# It is a *map*, not a description. Each entry says what an area is at the
+# level a plan needs, then names where to read the real thing. It carries no
+# code, no signatures, no argument lists and no line numbers.
+#
+# That restraint is the whole design. Prose about engine internals rots: this
+# tree already demonstrated 7 line citations that were all wrong within days
+# of being written, while every path and symbol beside them still resolved.
+# A map made of paths and symbols survives a refactor; a map made of copied
+# detail is wrong shortly after it is written and is believed anyway, because
+# it reads like knowledge.
+#
+# So an agent onboarding a model does not learn the engine from here. It
+# learns *where the engine is* from here, and reads the current source.
+#
+# SCHEMA (enforced by tests/workflows/trtllm_modeling_v2/test_runtime_index.py)
+#
+#   <area>:
+#     summary:  one or two sentences. What it is and why a target cares.
+#     code:     repo-relative paths. Directories preferred over files --- a
+#               directory survives a file split, a file does not.
+#     symbols:  names to grep for. A class, a function, a config field.
+#     tests:    repo-relative paths to the tests that exercise it. This is
+#               half the value: a target's own test should look like the
+#               tests already there.
+#     doc:      the developer guide or feature doc, when one exists.
+#     demands:  which `survey.py` checkpoint demands make this area relevant.
+#               This is what lets the plan phase surface only the areas the
+#               checkpoint in hand actually needs.
+#     gating:   how a run PROVES this area works. Required, because the
+#               alternative is what already happened once: three of seven
+#               features shipped "configured" and none of them "verified".
+#                 gate    -- which existing gate covers it, or `none`
+#                 signal  -- the observable that proves it actually RAN,
+#                            named so a witness can be built against it
+#                 blind   -- what stays green while this is broken. The most
+#                            valuable line in the entry: a gate that cannot
+#                            see a defect is a gate that certifies it.
+#
+# Every path here is resolved against the checkout by a test. A pointer that
+# has moved is a test failure, not a stale sentence nobody notices.
+
+# ---------------------------------------------------------------------------
+# `_overview` is not an area. It is the shape of the engine a target sits
+# inside, and it exists because the most common planning error is not getting
+# an area wrong --- it is not knowing which of them are somebody else's job.
+#
+# A modeling_v2 target is ONE function in the middle of a long pipeline. It
+# does not schedule, does not allocate, does not sample, does not launch. Most
+# of what follows is context for reading a log, not work a target does.
+# ---------------------------------------------------------------------------
+_overview:
+  summary: >-
+    A request enters through the LLM API, is admitted and batched by the
+    executor, runs one forward through the model engine, and leaves through
+    the decoder and sampler. A modeling_v2 target replaces exactly one link
+    in that chain --- the forward --- and inherits every other link unchanged.
+    Knowing which link owns a symptom is most of debugging one.
+  flow:
+    - stage: LLM API
+      does: >-
+        Resolves args, loads the checkpoint, builds the executor. Where
+        `TorchLlmArgs` fields such as `enable_autotuner` and the runtime
+        sizing take effect, and where `TRTLLM_MODELING_V2` decides whether a
+        target is used at all.
+      areas: [quantization, weight_loading, host_offload]
+    - stage: executor loop
+      does: >-
+        Admits requests, forms batches, decides what runs this iteration.
+        Owns in-flight batching, the overlap scheduler, chunked prefill and
+        the KV cache. A target must tolerate all of it and controls none.
+      areas: [scheduling, kv_cache, disaggregation]
+    - stage: model engine
+      does: >-
+        Prepares the per-iteration metadata --- attention metadata, spec
+        metadata, cache pointers --- captures CUDA graphs, and calls the
+        forward. This is the layer immediately above a target and the one
+        whose contract a target must match exactly.
+      areas: [cuda_graph, jit_autotune, parallelism]
+    - stage: the forward
+      does: >-
+        THE TARGET. One flat function assembled only from catalog entries:
+        embedding, the decoder stack, the norm and the output projection.
+        Everything it calls is vocabulary; nothing it calls is invented here.
+      areas: [attention, mla, sparse_attention, mamba, gated_deltanet, kda, hyper_connection, moe, eplb, mlp, lm_head, embedding, normalization, multimodal, dwdp]
+    - stage: decode and sample
+      does: >-
+        Turns logits into tokens --- sampling, speculative verification and
+        acceptance. A target emits logits and draft state; it does not decide
+        what is accepted.
+      areas: [speculation, sampling]
+
+attention:
+  summary: >-
+    Paged attention and its backend families. A target does not implement
+    attention; it calls into a backend and fills a metadata object, so what a
+    target must get right is which metadata fields its variant reads and what
+    the KV pool layout is.
+  code:
+    - tensorrt_llm/_torch/attention
+  symbols: [AttentionMetadata, TrtllmAttentionMetadata, RopeParams, PositionalEmbeddingParams]
+  tests:
+    - tests/unittest/_torch/attention
+  doc: tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md
+  demands: [attention.shape, attention.head_dim, attention.qk_norm, attention.softcap, rope.plain, rope.scaling, rope.partial, rope.mrope]
+  gating:
+    gate: accuracy
+    signal: >-
+      The accuracy gate moves immediately: a wrong metadata field or KV layout does not degrade, it collapses.
+    blind: >-
+      More than it looks. A wrong RoPE scaling factor is near-invisible on
+      short benchmark prompts; which backend actually ran is only a warning
+      line on an unrecognized name; and over an fp8 pool the paged-context
+      path diverges from the bf16 one. Gate at a length that exercises
+      position, and record the backend.
+
+mla:
+  summary: >-
+    Multi-head latent attention. A different cache layout and a different op
+    family from ordinary paged attention --- compressed latent KV, with its
+    own RoPE and append path --- so a checkpoint with lora ranks is not a
+    small variation on the attention area, it is a separate one.
+  code:
+    - tensorrt_llm/_torch/attention/mla.py
+  symbols: [MLA, kv_lora_rank, q_lora_rank]
+  tests:
+    - tests/unittest/_torch/attention
+  doc: tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md
+  demands: [attention.mla]
+  gating:
+    gate: accuracy
+    signal: >-
+      Same as attention, plus the latent cache shape asserts at construction.
+    blind: >-
+      A wrong RoPE split can still score near-anchor on short prompts; gate at a length that exercises position.
+
+sparse_attention:
+  summary: >-
+    Windows, sinks and sparse backends. A window and a sink are MASKS --- the
+    certified contract states cache addressing is unchanged --- so they do not
+    change which kernel runs. `attention_chunk_size` is the one that constrains
+    the backend, and it raises rather than silently switching.
+  code:
+    - tensorrt_llm/_torch/attention/backends
+  symbols: [AttentionMetadata, attention_window_size, attention_sinks]
+  tests:
+    - tests/unittest/_torch/attention
+  doc: docs/source/features/sparse-attention.md
+  demands: [attention.windowing, attention.sinks, attention.sink, attention.hybrid, attention.indexer]
+  gating:
+    gate: accuracy
+    signal: >-
+      A window or sink that is silently dropped shows as a slow accuracy drift at long context, not at short.
+    blind: >-
+      Short-prompt accuracy. A dropped window is invisible until the sequence is longer than the window.
+
+mamba:
+  summary: >-
+    State-space layers and their caches. On the default path the recurrent
+    state lives INSIDE the unified KV pool and participates in block reuse;
+    what is genuinely its own is the slot indexing and the reset path. A
+    separate-pool manager exists but is opt-in and does not support reuse.
+  code:
+    - tensorrt_llm/_torch/modules/mamba
+    - tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py
+  symbols: [Mamba2Mixer, Mamba2Metadata, CppMambaHybridCacheManager, causal_conv1d_update]
+  tests:
+    - tests/unittest/_torch/modules/mamba
+    - tests/unittest/_torch/executor/kv_cache/test_mamba_cache_manager.py
+  demands: [recurrent.state, stack.hybrid]
+  gating:
+    gate: accuracy
+    signal: >-
+      State-cache misuse corrupts across requests, so accuracy drops once batching is on.
+    blind: >-
+      Single-request runs. A state that is never reset looks correct until a second request reuses the slot.
+
+gated_deltanet:
+  summary: >-
+    Gated DeltaNet, the linear-attention layer that interleaves with full
+    attention in hybrid stacks. Two prefill backends --- FlashInfer and a
+    vendored Triton --- chosen once per process by env and architecture, so a
+    receipt has to say which one it certifies.
+  code:
+    - tensorrt_llm/_torch/modules/mamba/gdn_mixer.py
+    - tensorrt_llm/_torch/modules/fla
+  symbols: [fused_gdn_gating, chunk_gated_delta_rule]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: [recurrent.state, stack.hybrid]
+  gating:
+    gate: accuracy
+    signal: >-
+      The accuracy gate moves once state is reused across requests. The
+      backend choice is forceable by env, so the two can be compared --- but
+      they are different kernels and the in-tree parity test uses a
+      tolerance, not bit-equality.
+    blind: >-
+      Which branch ran. A receipt that does not name the branch certifies an implementation nobody can identify later.
+
+kda:
+  summary: >-
+    Kimi Delta Attention: a linear-attention family with its own metadata and
+    decode path, including a CuTe DSL op set. Distinct from GDN despite the
+    family resemblance.
+  code:
+    - tensorrt_llm/_torch/modules/kimi_kda
+    - tensorrt_llm/_torch/custom_ops/cute_dsl_kimi_k3_kda_mtp_ops.py
+  symbols: [KimiKDALinearAttention, KimiK3MambaMetadata]
+  tests:
+    - tests/unittest/_torch/modules/kimi_kda
+  demands: [recurrent.state]
+  gating:
+    gate: accuracy
+    signal: >-
+      The accuracy gate moves once state is reused across requests, same as
+      the other recurrent areas.
+    blind: >-
+      Which linear-attention family actually ran. GDN and KDA both answer
+      `recurrent.state`, so the wrong one can be wired in and still produce
+      plausible text --- name the family in the receipt.
+
+hyper_connection:
+  summary: >-
+    Hyper-connections (HC) and multi-head hyper-connections (mHC) --- a
+    residual-topology change rather than a layer. A target that misses it
+    wires the residual stream wrongly while every individual op stays correct.
+  code:
+    - tensorrt_llm/_torch/modules/mhc
+  symbols: [mHC, HCState, HCHead]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: [residual.hyper_connection]
+  gating:
+    gate: accuracy
+    signal: >-
+      A mis-wired residual topology moves accuracy hard.
+    blind: >-
+      Per-op tests. Every individual op passes while the stream between them is wired wrongly.
+
+moe:
+  summary: >-
+    Mixture of experts: routing, the fused runners, expert parallelism and
+    load balancing. The routing function and the shared-expert shape are what
+    a target must match; the runner is a backend choice.
+  code:
+    - tensorrt_llm/_torch/moe
+  symbols: [BaseMoeRoutingMethod, RoutingMethodType, ConfigurableMoE, create_moe]
+  tests:
+    - tests/unittest/_torch/moe
+  doc: tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md
+  demands: [moe.routing, moe.interleave]
+  gating:
+    gate: accuracy
+    signal: >-
+      Routing errors move accuracy. `ExpertStatistic` (`EXPERT_STATISTIC_PATH`, `EXPERT_STATISTIC_ITER_RANGE`) dumps the realised expert distribution.
+    blind: >-
+      Whether the intended experts ran. A uniform-ish distribution from wrong routing scores close to a correct one.
+
+mlp:
+  summary: >-
+    The dense feed-forward path and its activation. The smallest area here,
+    and the one most likely to be a single catalog entry.
+  code:
+    - tensorrt_llm/_torch/modules/mlp.py
+    - tensorrt_llm/_torch/modules/gated_mlp.py
+  symbols: [GatedMLP, MLP]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: [mlp.activation]
+  gating:
+    gate: accuracy
+    signal: >-
+      A wrong activation or gate/up split collapses accuracy immediately.
+    blind: >-
+      Little. This is one of the few areas an accuracy gate sees fully ---
+      which is why it is usually a single catalog entry and not a project.
+
+lm_head:
+  summary: >-
+    The output projection and logits handling, including how logits are
+    gathered before the head. Matters to a target mainly through what it must
+    NOT do --- gathering logits for every token is a performance cliff.
+  code:
+    - tensorrt_llm/_torch/modules/logits_processor.py
+    - tensorrt_llm/_torch/modules/embedding.py
+  symbols: [LogitsProcessor, LMHead, Embedding]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: []
+  gating:
+    gate: accuracy
+    signal: >-
+      A wrong projection collapses accuracy; a wrong gather is a throughput cliff with identical output.
+    blind: >-
+      The gather. Logits gathered for every token instead of the last is correct and slow, and no accuracy gate sees it.
+
+speculation:
+  summary: >-
+    Speculative decoding --- MTP, Eagle3, dFlash, DSpark. The trap is that rejection
+    sampling preserves the target model's output distribution, so a
+    miscomputed draft path produces CORRECT text more slowly. Boot and
+    accuracy gates are blind to it; acceptance length is the signal.
+  code:
+    - tensorrt_llm/_torch/speculative
+  symbols: [SpecMetadata, accept_stats]
+  tests:
+    - tests/unittest/_torch/speculative
+  doc: docs/source/features/speculative-decoding.md
+  demands: [speculation.heads]
+  gating:
+    gate: acceptance
+    signal: >-
+      `acceptance_length` under `=require` versus `=off`. This is why the acceptance gate exists.
+    blind: >-
+      Boot and accuracy BOTH. Rejection sampling preserves the target distribution, so a miscomputed draft path produces correct text more slowly. Only acceptance length moves.
+
+cuda_graph:
+  summary: >-
+    Graph capture and piecewise compilation. A target becomes capture-hostile
+    through host-device syncs and shape-dependent control flow, so this is an
+    area a target must be written to respect rather than one it calls.
+  code:
+    - tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py
+    - tensorrt_llm/_torch/compilation
+  symbols: [CUDAGraphRunner, piecewise_optimizer]
+  tests:
+    - tests/unittest/_torch/executor/test_breakable_cuda_graph.py
+    - tests/unittest/_torch/compilation
+  doc: docs/source/features/torch_compile_and_piecewise_cuda_graph.md
+  demands: []
+  gating:
+    gate: none
+    signal: >-
+      Capture emits warmup lines at startup; count them. Absence means
+      capture never ran.
+    blind: >-
+      The dangerous case is not a skipped capture, it is a SUCCESSFUL one
+      that replays wrongly --- host-computed values frozen into the graph.
+      Measured in tree: 88.2 on GSM8K with graphs against 96.2 eager. An
+      accuracy gate run eager is green while the graph path is corrupt, so a
+      claim about graphs must be measured WITH graphs on.
+
+scheduling:
+  summary: >-
+    The executor loop: in-flight batching, the overlap scheduler and chunked
+    prefill. A target does not call these; it has to tolerate them --- chunked
+    prefill in particular means a context call may run over a cached prefix.
+  code:
+    - tensorrt_llm/_torch/pyexecutor
+  symbols: [enable_chunked_prefill, PyTorchModelEngine]
+  tests:
+    - tests/unittest/_torch/executor
+  doc: docs/source/features/overlap-scheduler.md
+  demands: []
+  gating:
+    gate: none
+    signal: >-
+      Chunked prefill is observable per-request through the context-chunk fields the executor tracks; the overlap scheduler shows in iteration timing.
+    blind: >-
+      Both gates, but narrow the claim: chunked prefill does change which
+      path runs --- it forces the paged-context route --- so it is not purely
+      a matter of timing. What the gates cannot see is
+      configured-but-never-triggered, which needs a prompt long enough to
+      chunk before anything is proven.
+
+kv_cache:
+  summary: >-
+    The paged KV cache manager and block reuse. Reuse changes which context
+    path runs --- a context call over a cached prefix --- which is why it can
+    move numbers that look like a modeling defect.
+  code:
+    - tensorrt_llm/_torch/pyexecutor/resource_manager.py
+  symbols: [KVCacheManager, enable_block_reuse]
+  tests:
+    - tests/unittest/_torch/executor
+  doc: docs/source/features/kvcache.md
+  # `attention.hybrid` is here as well as under sparse_attention: a stack whose
+  # two layer kinds declare different KV head counts asks the manager for two
+  # per-layer geometries, which is a pool question rather than a mask one.
+  demands: [attention.hybrid]
+  gating:
+    gate: none
+    signal: >-
+      `iterReusedBlocks`, `iterCacheHitRate`, `iterMissedBlocks` -- a second request sharing a prefix must move them.
+    blind: >-
+      Not what you would guess. Over a bf16 pool with nothing cached the
+      paged-context flag is bitwise inert --- but over an fp8-e4m3 pool it is
+      NOT inert even then, and with a cached prefix it is load-bearing and its
+      absence is silent. So an fp8 target's accuracy gate does see this; a
+      bf16 one does not. What stays blind either way is whether reuse ever
+      actually triggered --- which is what left it 'configured, unverified'.
+
+parallelism:
+  summary: >-
+    Tensor, pipeline, expert and data parallelism, and the collectives under
+    them. The parallel segment is part of a target's identity, so this area is
+    never optional --- even a tp1 target declares where it sits.
+  code:
+    - tensorrt_llm/_torch/distributed
+    - tensorrt_llm/mapping.py
+  symbols: [Mapping, allgather, reducescatter, enable_attention_dp]
+  tests:
+    - tests/unittest/_torch/multi_gpu
+    - tests/unittest/_torch/modeling_v2/comm
+  doc: docs/source/features/parallel-strategy.md
+  demands: []
+  gating:
+    gate: boot
+    signal: >-
+      Rank count in the launch, and the collectives' own catalog receipts at that world size.
+    blind: >-
+      A run that silently fell back to one rank. Boot succeeds; it is just not the topology you asked for.
+
+quantization:
+  summary: >-
+    Quantized weight and activation formats, and the per-module exclusions a
+    checkpoint declares. What a target must get right is which modules are
+    held out and what scale layout each format expects.
+  code:
+    - tensorrt_llm/_torch/modules/linear.py
+    - tensorrt_llm/_torch/model_config.py
+    - tensorrt_llm/models/modeling_utils.py
+  symbols: [LinearMethodBase, QuantConfig, exclude_modules, kv_cache_quant_algo]
+  tests:
+    - tests/unittest/_torch/modules
+  doc: docs/source/features/quantization.md
+  demands: [quantization]
+  gating:
+    gate: accuracy
+    signal: >-
+      A wrong scale layout or a missed exclusion moves accuracy hard.
+    blind: >-
+      Which modules were actually held out. Quantizing a module the checkpoint excluded degrades gradually, not visibly.
+
+disaggregation:
+  summary: >-
+    Prefill and decode on SEPARATE engines, with per-sequence state moved
+    between them by the cache transceiver. Reads as a serving topology and is
+    a modeling property: only state the transceiver enumerates survives the
+    hop, so a forward that keeps state anywhere else is correct in every
+    single-engine measurement and wrong across it.
+  code:
+    - tensorrt_llm/_torch/disaggregation
+    - tensorrt_llm/_torch/pyexecutor/resource_manager.py
+  symbols: [KvCacheTransceiver, create_kv_cache_transceiver, CtxTransferStatus]
+  tests:
+    - tests/unittest/_torch/disaggregation
+  doc: docs/source/features/disagg-serving.md
+  demands: []
+  gating:
+    gate: acceptance
+    signal: >-
+      Token-identical greedy output between one aggregated engine and a
+      context+generation pair, same session, prompts long enough to put every
+      state plane away from its initial value. Identity, not similarity ---
+      dropped recurrent state yields text that is fluent and wrong.
+    blind: >-
+      Both standing gates. A single-engine boot and a single-engine accuracy
+      run never cross the hop, so neither can observe state that fails to
+      travel. For a hybrid checkpoint the exposure is the recurrent conv/SSM
+      state and any sparse-attention indexer state, not the attention pages
+      everyone remembers to check.
+
+multimodal:
+  summary: >-
+    Vision and audio towers in front of a language model. For a `text_only`
+    scope the relevant part is the opposite of the feature --- how the text
+    tower loads and routes when the vision path is deliberately absent.
+  code:
+    - tensorrt_llm/_torch/models/modeling_multimodal_mixin.py
+    - tensorrt_llm/_torch/models/modeling_multimodal_utils.py
+    - tensorrt_llm/inputs
+  symbols: [MultimodalParams, InputProcessor, register_input_processor]
+  tests:
+    - tests/unittest/_torch/multimodal
+  doc: docs/source/features/multi-modality.md
+  demands: [multimodal.tower]
+  gating:
+    gate: accuracy
+    signal: >-
+      For a `text_only` scope the gate is that the text tower loads and routes with the vision path deliberately absent.
+    blind: >-
+      Whether the vision path was absent by design or absent by accident -- both look the same from a text benchmark.
+
+normalization:
+  summary: >-
+    Normalization layers and their fused residual-add variants. Small, but the
+    single most common source of a silently wrong target, because the fused
+    and unfused forms differ in what they write back in place.
+  code:
+    - tensorrt_llm/_torch/modules/rms_norm.py
+    - tensorrt_llm/_torch/modules/layer_norm.py
+  symbols: [RMSNorm, LayerNorm]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: [norm.style]
+  gating:
+    gate: accuracy
+    signal: >-
+      Epsilon and the fused/unfused choice both move accuracy.
+    blind: >-
+      In-place write-back. A fused residual-add that does not write back where the caller expects is correct for one layer.
+
+eplb:
+  summary: >-
+    Expert-parallel load balancing. Redistributes experts across ranks so a
+    hot expert does not stall its whole rank. It changes occupancy and
+    throughput, never output --- which is exactly what makes it hard to prove.
+  code:
+    - tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py
+    - tensorrt_llm/_torch/moe/expert_statistic.py
+  symbols: [MoeLoadBalancer, MoeLoadBalancerIterContext, ExpertStatistic]
+  tests:
+    - tests/unittest/_torch/moe
+  doc: tensorrt_llm/_torch/moe/fused_moe/MOE_DEVELOPER_GUIDE.md
+  demands: []
+  gating:
+    gate: none
+    signal: >-
+      `ExpertStatistic` is the witness: dump the per-expert token counts and
+      assert the spread narrows with balancing on versus off.
+    blind: >-
+      Everything. Load balancing changes throughput and expert occupancy, not
+      output --- accuracy is identical either way, so only the distribution
+      dump can tell you it ran.
+
+dwdp:
+  summary: >-
+    Distributed Weight Data Parallelism: MoE EXPERT weights shard across
+    ranks while every other module stays a full replica, with remote regions
+    reached through a page pool of fabric handles. Not reachable from a
+    modeling_v2 target today --- it hooks in through the configurable MoE
+    layer, which a flat target does not have.
+  code:
+    - tensorrt_llm/_torch/modules/dwdp
+    - tensorrt_llm/_torch/pyexecutor/dwdp.py
+  symbols: [DwdpManager, DWDPWeightManager]
+  tests:
+    - tests/integration/defs/accuracy/test_dwdp_aggregated.py
+    - tests/integration/defs/accuracy/test_dwdp_disaggregated_serving.py
+  demands: []
+  gating:
+    gate: accuracy
+    signal: >-
+      Correctness is covered by the aggregated accuracy gate; the page-pool
+      split is observable through `DwdpManager` and its own integration tests.
+    blind: >-
+      Narrower than it sounds: every misconfiguration RAISES, and setup
+      emits its own log lines. The one silent path is omitting the config
+      entirely, which simply runs the ordinary MoE. Do not assume bitwise
+      equality with it --- the expert reduction order differs.
+
+jit_autotune:
+  summary: >-
+    Four separate things compile or choose at RUN time, not build time: the
+    tactic autotuner, NVRTC-compiled kernels, Triton, and FlashInfer's JIT
+    workspace. None of them is a target's code, and all of them can change
+    what a target's numbers mean.
+  code:
+    - tensorrt_llm/_torch/autotuner.py
+  symbols: [AutoTuner, autotune, TunableRunner, AutoTunerProfilingCache]
+  tests:
+    - tests/unittest/_torch/misc/test_autotuner.py
+  doc: docs/source/torch/adding_custom_kernels.md
+  demands: []
+  gating:
+    gate: none
+    signal: >-
+      Whether the autotuner was warm. `enable_autotuner` is a `TorchLlmArgs`
+      field defaulting to True, and warmup calls `_run_autotuner_warmup`,
+      which runs a real forward inside `autotune()`. A cold process and a
+      warm one select different tactics.
+    blind: >-
+      Every gate, and this one is subtle enough to be worth the sentence: a
+      catalog receipt taken in a cold process certifies a DIFFERENT numeric
+      path from the one serving takes. Measured on a fused MoE runner ---
+      over one shape's tactic space, two distinct outputs from one GEMM and
+      101 from the other, all within tolerance, none bit-identical. The
+      entry is not wrong; the receipt just does not describe the warm path
+      unless it says it does.
+
+weight_loading:
+  summary: >-
+    How a checkpoint's tensors reach the modules: the loader, the config
+    loader and the name mapper. Every modeling_v2 target ships a `weights.py`
+    and the boot gate checks manifest coverage, so this is the surface an
+    onboard touches most and the one least visible from the forward.
+  code:
+    - tensorrt_llm/_torch/models/checkpoints
+  symbols: [BaseCheckpointLoader, BaseWeightLoader, BaseWeightMapper, BaseConfigLoader]
+  tests:
+    - tests/unittest/_torch/executor/test_model_loader_checkpoint_io.py
+  doc: docs/source/features/checkpoint-loading.md
+  demands: [quantization]
+  gating:
+    gate: boot
+    signal: >-
+      Manifest coverage: every tensor in the checkpoint is claimed by exactly
+      one module, and nothing is claimed twice. The boot gate fails loudly on
+      a missing tensor.
+    blind: >-
+      A tensor loaded into the WRONG module of the right shape. Coverage is
+      complete, boot succeeds, and only accuracy moves --- which is why a
+      transposed or mis-permuted projection reads as a modeling defect.
+
+host_offload:
+  summary: >-
+    Weights that do not stay resident. A tensor whose size is comparable to
+    the rest of the model lives in pinned host memory and the forward gathers
+    the rows a step needs. Output-identical by construction, which is the
+    whole difficulty: nothing in the emitted text distinguishes an offloaded
+    table from a resident one.
+  code:
+    - tensorrt_llm/_torch/pinned_weight_staging.py
+    - tensorrt_llm/_torch/modules/embedding.py
+    - tensorrt_llm/_torch/modules/qwen4_exp/ple.py
+  symbols: [staging_scope, Embedding, Qwen4ExpPinnedHostEmbedding]
+  tests:
+    - tests/unittest/_torch/misc/test_pinned_weight_staging.py
+  demands: [embedding.huge_table]
+  gating:
+    gate: acceptance
+    signal: >-
+      Device memory after weight load, measured with and without the feature
+      in the same session, against a delta predicted from the checkpoint's own
+      shapes --- plus token-identical greedy output between the two.
+    blind: >-
+      Boot and accuracy, completely. A target that quietly loaded the table
+      onto the device passes both and reports a green feature unit. Also blind
+      to WHERE the copy runs: a gather on the compute stream serializes the
+      step and costs nothing in correctness.
+
+embedding:
+  summary: >-
+    Token embedding and the output head, including tied weights and vocab
+    padding. First and last link of the forward, and the place where a
+    parallel target decides whether the vocab is sharded.
+  code:
+    - tensorrt_llm/_torch/modules/embedding.py
+  symbols: [Embedding, LMHead]
+  tests:
+    - tests/unittest/_torch/modules
+  demands: [embedding.huge_table]
+  gating:
+    gate: accuracy
+    signal: >-
+      A wrong embedding or an untied head collapses accuracy immediately.
+    blind: >-
+      Vocab padding. Padded rows that are never masked contribute logits for
+      tokens the tokenizer cannot emit --- rare enough to survive a short
+      benchmark and wrong everywhere.
+
+sampling:
+  summary: >-
+    Turning logits into tokens: greedy, top-k/top-p, and the seeding that
+    makes a run reproducible. A target emits logits and never samples, but
+    the sample type is pinned into a captured CUDA graph.
+  code:
+    - tensorrt_llm/_torch/pyexecutor/sampler
+  symbols: [Sampler, TorchSampler]
+  tests:
+    - tests/unittest/_torch/sampler
+  doc: docs/source/features/sampling.md
+  demands: []
+  gating:
+    gate: boot
+    signal: >-
+      The boot gate is literally a set of greedy continuations, so a broken
+      sampler fails it outright.
+    blind: >-
+      Anything other than greedy. The boot gate exercises one sampling path
+      and the accuracy gate usually exercises the same one, so top-p and
+      seeding go untested by both.
