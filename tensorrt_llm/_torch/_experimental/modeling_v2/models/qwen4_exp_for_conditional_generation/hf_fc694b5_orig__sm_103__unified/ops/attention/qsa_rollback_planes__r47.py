@@ -4,12 +4,13 @@
 gather the verify rows' slots of all planes before the trunk writes them, and after the
 draft loop write the gathered values back into the slots of the rows the sampler rejected.
 
-Tier 5 (Triton written for this target). The planes are separate buffers of the cache
-manager (one per attention layer, each `[pages, tokens_per_block, heads, dim]` with a free
-page stride and a contiguous tail); the kernels reach them through a table of their base
-addresses and page strides, one program per (plane, row). The composition this replaces ran
-one gather per layer during the trunk and a gather, a `torch.where` and an indexed write per
-layer after the draft loop.
+Tier 5 (Triton written for the tp1 target, `qwen3_8_flash_next_nvfp4__sm_103__tp1`'s
+`ops/attention/qsa_rollback_planes`, of which this is the 4-GPU target's local variant). The
+planes are separate buffers of the cache manager (one per attention layer, each
+`[pages, tokens_per_block, heads, dim]` with a free page stride and a contiguous tail); the
+kernels reach them through a table of their base addresses and page strides, one program per
+(plane, row). The composition this replaces ran one gather per layer during the trunk and a
+gather, a `torch.where` and an indexed write per layer after the draft loop.
 """
 
 from __future__ import annotations
@@ -22,6 +23,35 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 #: This checkpoint's index plane row: one index KV head of 128 bf16.
 ROW = 128
+
+#: The index planes of core's bf16 K/V pool on every member of the 4-GPU target, as the stock
+#: `Qwen4ExpHybridCacheManager` (KV cache manager V2) allocates them: the 12 attention layers'
+#: `[32, 1, 128]` INDEX_KEY buffers coalesce into one pool, layer k's buffer at element 4096 k of
+#: a 49152-element page, so every plane is a `[pages, 32, 1, 128]` view at page stride 49152.
+#: 258983 pages is a tep4 rank's pool at core's configuration (the stock engine's `maxNumBlocks`,
+#: the largest measured per member; `qsa_paged_index_scores__r20` records both measurements).
+_TEP4_POOL = dict(planes=12, layout="coalesced", pool_pages=258983)
+
+
+def _verify(requests: int, p: int) -> dict:
+    """A verify step's rows: `requests` generation requests of `p` rows (`max_draft_len + 1`)."""
+    return dict(_TEP4_POOL, rows=requests * p, requests=requests, p=p, rejected="bool")
+
+
+#: The cells both halves are certified at: the tp1 target's own, and this target's MTP verify
+#: rows at `max_batch_size` 128 over a tep4 rank's pool.
+_CELLS: tuple[Cell, ...] = (
+    Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
+    Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
+    Cell(
+        why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 258983-page coalesced pool",
+        spec=_verify(128, 2),
+    ),
+    Cell(
+        why="tep4 MTP7 verify: 128 requests x 8 rows (1024, the envelope's largest), same pool",
+        spec=_verify(128, 8),
+    ),
+)
 
 
 @triton.jit
@@ -75,14 +105,30 @@ class QsaRollbackGather(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
-        Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
-    )
+    CELLS: tuple[Cell, ...] = _CELLS
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.begin`, before the verify step's
-    trunk writes any plane. One program per (plane, row), one 256-byte row each.
-    Preconditions: `pages` / `within` int64 `[R]`; the planes as `plane_table` accepts them.
+    trunk writes any plane; `pages` / `within` are the generation rows' QSA page and offset
+    (`block_table[req, pos // 32]`, `pos % 32`), int64 `[R]`, R = requests x (max_draft_len + 1).
+    One program per (plane, row), one 256-byte row each. Preconditions: the planes as
+    `plane_table` accepts them (bf16 NHD views, any page stride); every (page, within) inside
+    the pool.
+
+    Triton, JIT-compiled at first call for the running device (sm_103 here).
+
+    Addressing is 64-bit: `pages` and the page strides are int64, so a slot past 2^31 elements
+    from a plane's base is reached. The tep4 cells read the pool's last page (layer 11's plane
+    there starts ~1.27e10 elements past the pool base) and its first.
+
+    Layouts certified: separate contiguous planes and the packed side-plane page of an FP8 /
+    NVFP4 pool (page stride 12 x 4096 + 192) at the tp1 cells' 4 and 512 rows over 600 pages;
+    core's coalesced bf16 pool (page stride 49152) at 256 and 1024 rows over 258983 pages.
+    `test_cuda_graph_replay` captures the 1024-row call and replays it at new slots.
+
+    Hard limits (not probed): rows is the launch grid's y extent, at most 65535; out-of-pool or
+    duplicated slots are the caller's. Not certified: a pool page count measured under the MTP
+    unit's own engine (`max_seq_len` 16384; the cells use core's tep4 count), and the
+    side-plane layout at 256 / 1024 rows.
     """
 
     def __call__(self, ptrs, page_strides, pages, within, num_planes: int) -> torch.Tensor:
@@ -94,14 +140,30 @@ class QsaRollbackGather(OpWrapper):
             )
         return out
 
-    def reference(self, ptrs, page_strides, pages, within, num_planes: int) -> torch.Tensor:
-        raise NotImplementedError("the cell harness builds planes and compares against torch")
+    def reference(self, planes, pages, within, num_planes: int) -> torch.Tensor:
+        """Every row's slot of the first `num_planes` planes, by torch's advanced indexing.
+
+        Takes the planes themselves where `__call__` takes `plane_table(planes)`: torch
+        cannot dereference the raw base addresses the kernel is handed, so the reference reads
+        the tensors the table was built from. A copy, exact.
+        """
+        return torch.stack([t[pages, within].reshape(-1, ROW) for t in planes[:num_planes]])
 
     def is_valid(self, ptrs, page_strides, pages, within, num_planes: int) -> None:
-        assert ptrs.dtype == torch.int64 and ptrs.numel() == num_planes
-        assert page_strides.dtype == torch.int64 and page_strides.numel() == num_planes
-        assert pages.dtype == torch.int64 and within.dtype == torch.int64
-        assert pages.shape == within.shape and pages.dim() == 1
+        assert ptrs.dtype == torch.int64 and ptrs.numel() == num_planes, (
+            "ptrs must be plane_table's int64 table of exactly num_planes addresses; a "
+            "num_planes past it reads addresses beyond the table"
+        )
+        assert page_strides.dtype == torch.int64 and page_strides.numel() == num_planes, (
+            "page_strides must be plane_table's int64 table of num_planes strides"
+        )
+        assert pages.dtype == torch.int64 and within.dtype == torch.int64, (
+            "pages and within must be int64"
+        )
+        assert pages.shape == within.shape and pages.dim() == 1, (
+            "pages and within must be one [R] pair: rows are counted off pages, so a shorter "
+            "within is read past its end"
+        )
 
 
 class QsaRollbackRestore(OpWrapper):
@@ -113,13 +175,22 @@ class QsaRollbackRestore(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = (
-        Cell(why="12 planes, 4 verify rows, two rejected", spec=dict(planes=12, rows=4)),
-        Cell(why="12 planes, 512 verify rows", spec=dict(planes=12, rows=512)),
-    )
+    CELLS: tuple[Cell, ...] = _CELLS
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.commit_speculative_states`,
-    after the draft loop. `rejected` int32/int8/bool `[R]` (nonzero = restore).
+    after the draft loop: `old` is the begin step's `qsa_rollback_gather` output, `rejected`
+    the bool `[R]` mask `ordinal >= accepted` (int32 / int8 / bool, nonzero = restore; the tp1
+    cells drive int32, the tep4 cells the call site's bool).
+
+    Returns nothing: it writes the planes, which it holds only as `plane_table` addresses.
+    Triton, JIT-compiled at first call for the running device (sm_103 here).
+
+    Every cell checks that the rejected rows' slots hold `old`, the others the step's values,
+    and that nothing else in the pool was written. Addressing, layouts and the CUDA-graph
+    replay as `qsa_rollback_gather`'s note states; the same limits.
+
+    Silent, refused by `is_valid`: a non-contiguous `old` (read as dense `[L, R, 128]`;
+    measured wrong in `test_guard_refuses_a_strided_old`).
     """
 
     def __call__(self, ptrs, page_strides, pages, within, rejected, old) -> None:
@@ -129,15 +200,32 @@ class QsaRollbackRestore(OpWrapper):
                 ptrs, page_strides, pages, within, rejected, old, rows, ROW=ROW, num_warps=1
             )
 
-    def reference(self, ptrs, page_strides, pages, within, rejected, old) -> None:
-        raise NotImplementedError("the cell harness builds planes and compares against torch")
+    def reference(self, planes, pages, within, rejected, old) -> torch.Tensor:
+        """What each row's slot of each plane holds after the call, `[L, R, 128]`: `old` where
+        `rejected`, else the slot's value now. Read before the call, as the planes stand.
+
+        Takes the planes where `__call__` takes `plane_table(planes)`, for the reason
+        `QsaRollbackGather.reference` states. Every location outside these slots is unchanged,
+        which the test checks over the whole pool.
+        """
+        now = torch.stack([t[pages, within].reshape(-1, ROW) for t in planes[: old.shape[0]]])
+        return torch.where(rejected.bool()[None, :, None], old, now)
 
     def is_valid(self, ptrs, page_strides, pages, within, rejected, old) -> None:
-        assert old.dtype == torch.bfloat16 and old.dim() == 3 and old.shape[2] == ROW
-        assert old.is_contiguous()
-        assert ptrs.numel() == old.shape[0] and page_strides.numel() == old.shape[0]
-        assert pages.shape == (old.shape[1],) and within.shape == (old.shape[1],)
-        assert rejected.shape == (old.shape[1],)
+        assert old.dtype == torch.bfloat16 and old.dim() == 3 and old.shape[2] == ROW, (
+            "old must be qsa_rollback_gather's [L, R, 128] bf16 output"
+        )
+        assert old.is_contiguous(), (
+            "old must be contiguous; the kernel reads it as dense [L, R, 128] and a strided "
+            "view restores the wrong values"
+        )
+        assert ptrs.numel() == old.shape[0] and page_strides.numel() == old.shape[0], (
+            "plane_table must hold one address and one stride per plane of old"
+        )
+        assert pages.shape == (old.shape[1],) and within.shape == (old.shape[1],), (
+            "pages and within must hold one slot per row of old"
+        )
+        assert rejected.shape == (old.shape[1],), "rejected must hold one flag per row of old"
 
 
 qsa_rollback_gather = QsaRollbackGather()
