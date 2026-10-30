@@ -57,6 +57,15 @@ The following is a table of supported models for the PyTorch backend:
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
+## Experimental StairCase components
+
+`BeamForCausalLM` has an experimental ModelingV2/StairCase implementation for the
+52-layer NVFP4-expert configuration on four GB300 GPUs (attention TP4, MoE TP4/EP1,
+BF16 KV cache, eager execution). This implementation provides the model components
+and explicit checkpoint loader; standard serving registration, recipes and optimized
+execution modes are separate integration work. It is not an entry in the general
+feature-support matrix below.
+
 ## Model-Feature Support Matrix (Key Models)
 
 Note: Support for other models may vary. Features marked "N/A" are not applicable to the model architecture.
