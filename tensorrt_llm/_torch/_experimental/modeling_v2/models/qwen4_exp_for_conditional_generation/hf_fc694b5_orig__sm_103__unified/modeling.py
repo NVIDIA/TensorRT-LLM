@@ -18,14 +18,20 @@ cut per rank. What the layout settles is settled once, at construction:
   `[q | k | v | gate | index q, k | v slot]`, 4352 wide; the QSA indexer is replicated.
 * **The mixer output is a partial sum** under attention TP: o_proj and out_proj read this
   rank's heads. One plain sum (`comm/allreduce`, op `NONE`) completes it before the
-  hyper-connection inject, which every rank runs on the same reduced rows.
+  hyper-connection inject, which every rank runs on the same reduced rows. Under attention DP
+  a rank holds every head and serves its own requests, so there is nothing to sum.
 * **Routed experts** are an EP window of `num_experts / moe_ep_size` experts per rank on the
-  trtllm-gen NVFP4 runner, pre-routed by `renorm_moe_routing_op` over the whole routing space;
-  the window's partial output is summed the same way. The router and the bf16 shared expert
-  are replicated, so the block output `routed + sigmoid(gate) * shared` is formed by the next
+  trtllm-gen NVFP4 runner, pre-routed by `renorm_moe_routing_op` over the whole routing space.
+  Under attention TP every rank holds every row and the window's partial output is summed the
+  same way. Under attention DP each rank holds its own rows: they are padded to the group's
+  largest row count, gathered (`comm/allgather`), routed and run through the window, and
+  reduce-scattered back (`comm/reducescatter`), each row's window partials summed once
+  (`_expert_sum_op`). The router and the bf16 shared expert are replicated and run on this
+  rank's rows, so the block output `routed + sigmoid(gate) * shared` is formed by the next
   hyper-connection site on the reduced routed rows.
 * **Hyper-connections, PLE, the embedding** run replicated on every rank's rows;
-  `lm_head` is the shell's (vocab-parallel under attention TP, gathered by the shell's head).
+  `lm_head` is the shell's (vocab-parallel under attention TP, gathered by the shell's head;
+  whole under attention DP, over this rank's own rows).
 
 Each hyper-connection site is `qwen4_exp_hc_inject_norm` (the previous block's injection
 fused with this site's grouped norm; after a MoE block it also forms that block's output)
@@ -62,8 +68,8 @@ makes it device-resident. Output is identical.
 
 Not assembled here: the one-model MTP draft layer and its verify-step recurrence (the
 target refuses a `speculative_config` at construction), the vision tower (a request carrying
-media is refused at admission), the attention-DP MoE round trip (dep4) and the
-intermediate-split experts (tp4). Each refusal names what is missing.
+media is refused at admission) and the intermediate-split experts (tp4). Each refusal names
+what is missing.
 
 Integration facts this file depends on:
 
@@ -98,6 +104,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
@@ -120,8 +127,10 @@ from .ops.attention.qsa_prefill_compress__r19 import qsa_prefill_compress
 from .ops.attention.qsa_topk_expand_decode__r22 import qsa_topk_expand_decode
 from .ops.attention.qsa_topk_expand_decode__r22 import supports as _topk_expand_supports
 from .ops.attention.thop_attention__r2 import QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE, thop_attention
+from .ops.comm.allgather__r6 import allgather
 from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
 from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
+from .ops.comm.reducescatter__r7 import reducescatter
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.hc.qwen4_exp_hc_inject_norm__r8 import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_lowrank_act__r9 import qwen4_exp_hc_lowrank_act
@@ -313,11 +322,12 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # The ranks attention heads and the recurrent heads are split over: the TP group,
         # or one rank under attention DP.
         self.attn_tp_size = _pool.attention_tp_size(mapping)
-        if mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "attention DP (dep4): the routed experts' allgather / reduce-scatter round "
-                "trip is not assembled in this target yet"
-            )
+        # Under attention DP each rank serves its own requests and the MoE blocks run over the
+        # rows the whole group holds (`_expert_sum_op`). The group is the TP group, which spans
+        # the DP ranks; its size is the world's, never a constant.
+        self.dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
+        self.dp_rank = mapping.tp_rank
+        self.dp_group = list(mapping.tp_group)
         if mapping.moe_tp_size != 1:
             raise NotImplementedError(
                 f"routed experts split by intermediate (moe_tp_size {mapping.moe_tp_size}, "
@@ -500,8 +510,10 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # The shared expert's stream (see `_moe_block`); made after load, because a stream
         # created inside a graph capture is not capturable.
         self._side_stream: torch.cuda.Stream | None = None
-        # The tensor-parallel sum of a block's partial output (`_tp_sum_op`).
+        # The tensor-parallel sum of a block's partial output (`_tp_sum_op`), and the routed
+        # experts' completion over this rank's rows (`_expert_sum_op`).
         self.tp_sum = None
+        self.expert_sum = None
         self._prefill: "PrefillTarget | None" = None
         self._decode: "DecodeTarget | None" = None
         # Everything derived from the KV cache manager (`_bind_cache_manager`).
@@ -580,6 +592,7 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             self._report_ple_residency()
             self._side_stream = torch.cuda.Stream(device=device)
             self.tp_sum = self._tp_sum_op()
+            self.expert_sum = self._expert_sum_op()
         self._prefill = PrefillTarget(self)
         self._decode = DecodeTarget(self)
 
@@ -605,6 +618,58 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
             )
 
         return tp_sum
+
+    def _expert_sum_op(self):
+        """How a MoE block's routed experts become the rows this rank owns, settled once.
+        The op is `expert_sum(run, x, pad_rows)`, where `run(rows)` is this rank's expert
+        window over `rows` and `pad_rows` is `_dp_pad_rows`'s count.
+
+        Under attention TP (or at one rank) every rank holds every row: the window's partial
+        over `x`, completed by `tp_sum`. Under attention DP each rank holds its own rows, as
+        gpt-oss's and deepseek's default targets run it: pad them to the group's largest row
+        count, gather the group's rows (`comm/allgather`, in rank order), run the window over
+        all of them, reduce-scatter (`comm/reducescatter`), which sums each row's window
+        partials once and hands this rank its slice, and drop the padding. Routing on the
+        gathered rows makes every rank's routing of a row the same, so each of its top-k
+        experts falls in exactly one window."""
+        if self.dp_size == 1:
+            tp_sum = self.tp_sum
+
+            def window_sum(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
+                return tp_sum(run(x))
+
+            return window_sum
+        group = self.dp_group
+        # Under MPI the plain symbols; with MPI disabled the `_pg` ones over the TP process
+        # group, as `allreduce_group_args` routes them.
+        process_group = self.mapping.tp_group_pg.boxed() if mpi_disabled() else None
+
+        def round_trip(run, x: torch.Tensor, pad_rows: int) -> torch.Tensor:
+            rows = x.shape[0]
+            padded = x if not pad_rows else nn.functional.pad(x, [0, 0, 0, pad_rows])
+            gathered = allgather(padded, None, group, process_group)
+            mine = reducescatter(run(gathered), None, group, process_group)
+            return mine if not pad_rows else mine[:rows]
+
+        return round_trip
+
+    def _dp_pad_rows(self, md, num_tokens: int) -> int:
+        """Rows this rank pads its MoE input with before the attention-DP round trip: up to
+        the group's largest per-rank token count, so both collectives run in their uniform
+        form. Zero without attention DP.
+
+        A decode CUDA graph pads every rank to the captured batch, and a prefill CUDA graph
+        every rank to one bucket (the engine then reports the bucket for every rank), so a
+        captured step's counts are equal and its padding is zero rows."""
+        if self.dp_size == 1:
+            return 0
+        counts = [int(n) for n in md.all_rank_num_tokens]
+        assert len(counts) == self.dp_size, (counts, self.dp_size)
+        assert counts[self.dp_rank] == num_tokens, (
+            f"rank {self.dp_rank} holds {num_tokens} rows but all_rank_num_tokens says "
+            f"{counts[self.dp_rank]} ({counts}); the collectives would gather the wrong split"
+        )
+        return max(counts) - num_tokens
 
     def _index_rope_table(self, theta: float, device) -> torch.Tensor:
         """The index compression's rope table at `theta` in the QSA kernels' layout:
@@ -1004,11 +1069,13 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
     return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
 
 
-def _moe_block(core, x, L: _LayerWeights) -> tuple:
+def _moe_block(core, x, L: _LayerWeights, pad_rows: int) -> tuple:
     """One MoE layer: NVFP4 routed experts plus the replicated bf16 shared expert, left
     uncombined. Returns `(routed, gate_logits, shared)`: the next `qwen4_exp_hc_inject_norm`
-    forms `routed + sigmoid(gate_logits) * shared` inside its kernel. `routed` is the
-    window partials' sum over the TP group, the same bits on every rank.
+    forms `routed + sigmoid(gate_logits) * shared` inside its kernel. `routed` is every
+    window's contribution to this rank's rows (`core.expert_sum`): under attention TP the
+    window partials' sum over the TP group, the same bits on every rank; under attention DP
+    the round trip over the group's gathered rows, `pad_rows` padding this rank's.
 
     The shared expert and its per-token gate logit run on the core's side stream,
     concurrently with the routed path, and join it before this returns. `x` is the bf16
@@ -1023,7 +1090,7 @@ def _moe_block(core, x, L: _LayerWeights) -> tuple:
         gug = cublas_mm(x, L.sh_gug)
         shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), L.sh_dn)
         gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
-    routed = core.tp_sum(_routed_experts(core, x, L))
+    routed = core.expert_sum(lambda rows: _routed_experts(core, rows, L), x, pad_rows)
     main.wait_stream(side)
     return routed, gate_logits, shared
 
@@ -1335,11 +1402,14 @@ def _step_args(md: TrtllmAttentionMetadata, num_contexts, num_ctx_tokens) -> dic
 class _PrefillStep(NamedTuple):
     """One step's host-side state, built by `PrefillTarget.prepare` and read by the forward's
     breaks. `num_tokens` is the batch's row count `n` and `physical_tokens` the `T` the
-    forward runs over (`n`, or the prefill CUDA graph bucket it was padded to). A new one
-    replaces it every step, so no break reads a previous step's."""
+    forward runs over (`n`, or the prefill CUDA graph bucket it was padded to), and
+    `dp_pad_rows` the rows the MoE blocks pad them with under attention DP (zero otherwise,
+    and on every step a prefill CUDA graph runs). A new one replaces it every step, so no
+    break reads a previous step's."""
 
     num_tokens: int
     physical_tokens: int
+    dp_pad_rows: int
     input_ids: torch.Tensor
     attn: dict
     gdn: tuple
@@ -1750,6 +1820,14 @@ class PrefillTarget:
             f"describes as {md.num_tokens} tokens (padded_num_tokens={md.padded_num_tokens})"
         )
         num_tokens = md.num_tokens
+        # Under attention DP the MoE blocks pad the `T` rows to the group's largest count. A
+        # prefill CUDA graph pads every rank to one bucket, so the body it captures pads
+        # nothing; that zero is what makes the count a per-capture constant.
+        dp_pad_rows = core._dp_pad_rows(md, physical_tokens)
+        assert physical_tokens == num_tokens or dp_pad_rows == 0, (
+            f"a prefill CUDA graph bucket of {physical_tokens} rows with {dp_pad_rows} attention-DP "
+            "padding rows: the graph would freeze the group's row counts"
+        )
         batch = md.num_seqs
         num_prefills = md.num_contexts
         num_decodes = batch - num_prefills
@@ -1817,6 +1895,7 @@ class PrefillTarget:
         self._step = _PrefillStep(
             num_tokens=num_tokens,
             physical_tokens=physical_tokens,
+            dp_pad_rows=dp_pad_rows,
             input_ids=input_ids[:num_tokens],
             attn=attn_args,
             gdn=gdn_state,
@@ -1841,7 +1920,8 @@ class PrefillTarget:
         the step's batch runs in one of the four breaks (`_splice`, `_ple_block`,
         `_attention_core`, `_gdn_core`), each writing rows `[:n]` of a fixed output allocated
         here and zeroing rows `[n:]`. The tensor-parallel sums run on all `T` rows, which
-        every rank holds alike."""
+        every rank holds alike; under attention DP the MoE round trip pads them by the step's
+        `dp_pad_rows`, zero whenever a graph captures this body."""
         core = self.core
         num_tokens = input_ids.shape[0]
         assert num_tokens == self._step.physical_tokens, (
@@ -1871,6 +1951,7 @@ class PrefillTarget:
         hc_count = core.hc_count
         hc = torch.cat([h] * hc_count, -1)
         layers, S = self._layers, self._stack
+        pad_rows = self._step.dp_pad_rows
         _, normed = qwen4_exp_hc_inject_norm(hc, None, None, layers[0].ahc_norm, core.eps, hc_count)
         for i, L in enumerate(layers):
             if i == core.ple_layer:
@@ -1890,7 +1971,7 @@ class PrefillTarget:
             next_norm = layers[i + 1].ahc_norm if i + 1 < len(layers) else S.fhc_norm
             # The MoE block output is formed inside the injection: routed + sigmoid(gate) *
             # shared, rounded once.
-            routed, gate_logits, shared = _moe_block(core, mixed, L)
+            routed, gate_logits, shared = _moe_block(core, mixed, L, pad_rows)
             hc, normed = qwen4_exp_hc_inject_norm(
                 hc, routed, inject, next_norm, core.eps, hc_count, shared, gate_logits
             )
@@ -2133,6 +2214,9 @@ class DecodeTarget:
             "path implements one query token per generation sequence"
         )
         step["predicted_tokens_per_seq"] = 1
+        # Zero rows under a decode CUDA graph, which pads every attention-DP rank to the
+        # captured batch.
+        pad_rows = core._dp_pad_rows(md, num_tokens)
         si_all = mm.state_indices[:batch]
         pools = core._bound.pools
         ple_state = (pools.ple_state[0], pools.ple_state[1], si_all, mm.query_start_loc_long)
@@ -2181,7 +2265,7 @@ class DecodeTarget:
             )
             mixed, inject = _hc_mixer(core, normed, L.mhc_first, L.mhc_up, True)
             next_norm = layers[i + 1].ahc_norm if i + 1 < len(layers) else S.fhc_norm
-            routed, gate_logits, shared = _moe_block(core, mixed, L)
+            routed, gate_logits, shared = _moe_block(core, mixed, L, pad_rows)
             hc, normed = qwen4_exp_hc_inject_norm(
                 hc, routed, inject, next_norm, core.eps, hc_count, shared, gate_logits
             )

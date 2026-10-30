@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The unified target's core at tep4: each rank's forward widths and the expert window.
+"""The unified target's core at tep4 and dep4: each rank's forward widths and the expert window.
 
 The core is built on the meta device from the checkpoint's text and vision config values at
-every rank of a tep4 mapping, so nothing here touches a device. What is pinned is what the
-forward addresses: the fused attention row and the split the norm + rope reads it through,
+every rank of a tep4 or dep4 mapping, so nothing here touches a device. What is pinned is what
+the forward addresses: the fused attention row and the split the norm + rope reads it through,
 the Gated-DeltaNet projection's column split, the routed experts' window and the
-per-expert scalars cut to it, and the layouts this core does not assemble.
+per-expert scalars cut to it, the attention-DP round trip's padding and slicing, and the
+layouts this core does not assemble.
 """
 
 from __future__ import annotations
@@ -234,14 +235,102 @@ def test_a_spread_fc1_input_scale_is_refused() -> None:
 @pytest.mark.parametrize(
     "layout, spec_config, missing",
     [
-        (_DEP4, None, "attention DP"),
         (_TP4, None, "split by intermediate"),
         (_TEP4, MTPDecodingConfig(max_draft_len=3), "MTP draft layer"),
     ],
-    ids=["dep4", "tp4", "mtp"],
+    ids=["tp4", "mtp"],
 )
 def test_what_this_core_does_not_assemble_is_refused_at_construction(
     layout, spec_config, missing
 ) -> None:
     with pytest.raises(NotImplementedError, match=missing):
         _core(0, layout, spec_config)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_dep4_rank_runs_every_head(rank) -> None:
+    """Attention DP keeps the single-rank geometry: 24 q and both KV heads over the 14080-wide
+    fused row (55 heads of 256: 24 q, 2 k, 29 "v"), and all 16 / 48 GDN heads over 10240 conv
+    channels. Nothing is summed after the mixers."""
+    core = _core(rank, _DEP4)
+    assert (core.heads_q, core.heads_kv, core.kv_head_start) == (24, 2, 0)
+    assert (core.q_width, core.kv_width, core.qkv_width) == (6144, 512, 7168)
+    assert core.attn_in_width == 14080
+    assert core.attn_in_tail_heads == 29
+    assert core.index_col == 13312
+    assert tuple(core.w["l3_attn_in_w"].shape) == (14080, 2560)
+    assert tuple(core.w["l3_o_w"].shape) == (2560, 6144)
+    assert (core.num_k_heads, core.num_v_heads, core.conv_dim) == (16, 48, 10240)
+    assert tuple(core.in_proj_split) == (10240, 6144, 48, 48)
+    assert core.attn_tp_size == 1
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_dep4_rank_runs_one_128_expert_window_for_the_group(rank) -> None:
+    """The MoE group is the TP group, which spans the DP ranks: rank `r` is DP rank `r` and
+    holds the window `[128r, 128r + 128)`, over the rows the whole group gathers."""
+    core = _core(rank, _DEP4)
+    assert (core.dp_size, core.dp_rank, core.dp_group) == (WORLD, rank, list(range(WORLD)))
+    assert (core.local_experts, core.expert_offset) == (128, 128 * rank)
+    assert core.w["l0_fc1_w"].shape[0] == 128
+    assert _core(rank, _TEP4).dp_size == 1
+
+
+def test_attention_dp_pads_to_the_groups_largest_row_count() -> None:
+    """Each rank pads to the largest of `all_rank_num_tokens`; a count that disagrees with
+    the rows this rank holds would gather the wrong split, and is refused."""
+    core = SimpleNamespace(dp_size=WORLD, dp_rank=2)
+    md = SimpleNamespace(all_rank_num_tokens=[5, 17, 9, 1])
+    assert M.Qwen4ExpUnifiedModelingV2._dp_pad_rows(core, md, 9) == 8
+    with pytest.raises(AssertionError, match="wrong split"):
+        M.Qwen4ExpUnifiedModelingV2._dp_pad_rows(core, md, 10)
+    # Without attention DP the metadata is not read.
+    assert M.Qwen4ExpUnifiedModelingV2._dp_pad_rows(SimpleNamespace(dp_size=1), None, 3) == 0
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_the_attention_dp_round_trip_returns_this_ranks_rows_through_every_window(
+    rank, monkeypatch
+) -> None:
+    """The round trip pads this rank's rows, gathers the group's in rank order, runs this
+    rank's window over all of them, reduce-scatters and drops the padding: with each window
+    a function of the gathered rows, this rank gets back the sum over windows of its own rows.
+    The collectives are stood in for by the group's arithmetic."""
+    counts = [3, 7, 1, 4]
+    hidden = 8
+    gen = torch.Generator().manual_seed(rank)
+    xs = [torch.randn(n, hidden, generator=gen) for n in counts]
+    rows = max(counts)
+    gathered = torch.cat([nn_pad(x, rows) for x in xs], 0)
+
+    def window(w):
+        return lambda t: t * (w + 1) + w
+
+    full = sum(window(w)(gathered) for w in range(WORLD))
+    seen = {}
+
+    def fake_allgather(t, sizes, group, process_group):
+        assert sizes is None and group == list(range(WORLD)) and process_group is None
+        assert tuple(t.shape) == (rows, hidden)
+        torch.testing.assert_close(t, nn_pad(xs[rank], rows), rtol=0, atol=0)
+        return gathered
+
+    def fake_reducescatter(t, sizes, group, process_group):
+        assert sizes is None and group == list(range(WORLD)) and process_group is None
+        seen["partial"] = t
+        return full[rank * rows : (rank + 1) * rows]
+
+    monkeypatch.setattr(M, "allgather", fake_allgather)
+    monkeypatch.setattr(M, "reducescatter", fake_reducescatter)
+    monkeypatch.setattr(M, "mpi_disabled", lambda: False)
+    core = SimpleNamespace(dp_size=WORLD, dp_group=list(range(WORLD)), mapping=None)
+    expert_sum = M.Qwen4ExpUnifiedModelingV2._expert_sum_op(core)
+    out = expert_sum(window(rank), xs[rank], rows - counts[rank])
+    torch.testing.assert_close(seen["partial"], window(rank)(gathered), rtol=0, atol=0)
+    torch.testing.assert_close(out, sum(window(w)(xs[rank]) for w in range(WORLD)))
+    assert tuple(out.shape) == (counts[rank], hidden)
+
+
+def nn_pad(x: torch.Tensor, rows: int) -> torch.Tensor:
+    """`x` with zero rows appended up to `rows`."""
+    return torch.cat([x, x.new_zeros(rows - x.shape[0], x.shape[1])], 0)
