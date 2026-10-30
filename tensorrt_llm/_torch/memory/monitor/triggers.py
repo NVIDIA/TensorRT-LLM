@@ -38,6 +38,11 @@ handler also passes its message through :func:`notify_error`, which reports
 when the message describes an out-of-memory condition. Both paths share one
 rate limit, so a torch OOM that the executor then handles is reported once.
 
+With ``TLLM_MEM_MONITOR_DIR`` set, every report is also written to its own
+file there, named by rank, process and time. Logs from several ranks
+interleave and are often cut short when a job dies; a file per report is
+what survives to be read.
+
 The handler runs while an allocation is failing, so it allocates no device
 memory and swallows every exception. Reports are limited by time rather
 than by count: a retry loop that OOMs repeatedly collapses to one report
@@ -60,6 +65,9 @@ __all__ = [
     "report_now",
     "uninstall_oom_reporter",
 ]
+
+#: Directory every report is also written to, one file each.
+DIR_VAR = "TLLM_MEM_MONITOR_DIR"
 
 #: Minimum seconds between two OOM reports. ``0`` reports every one.
 _INTERVAL_VAR = "TLLM_MEM_MONITOR_OOM_INTERVAL"
@@ -106,7 +114,8 @@ def report_now(
     """Render the monitor for this process, or ``None`` if it is disabled.
 
     Returns the text without logging it; the caller decides where it goes
-    (the log, an exception message, a crash dump).
+    (the log, an exception message, a crash dump). It is also written to
+    ``TLLM_MEM_MONITOR_DIR`` when that is set.
     ``record_baseline`` makes this reading the one later reports compare
     against.
     """
@@ -129,10 +138,30 @@ def report_now(
         return None
 
     try:
-        return render_capture(snapshot)
+        text = render_capture(snapshot)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"memory monitor: rendering {tag!r} failed ({type(exc).__name__}: {exc})")
         return None
+    _save(text, tag, snapshot.rank)
+    return text
+
+
+def _save(text: str, tag: str, rank: int | None) -> str | None:
+    """Write a report to ``TLLM_MEM_MONITOR_DIR``; the path, or ``None``."""
+    directory = os.environ.get(DIR_VAR, "")
+    if not directory:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000_000:09d}"
+    rank_part = "x" if rank is None else str(rank)
+    path = os.path.join(directory, f"memory_rank{rank_part}_pid{os.getpid()}_{stamp}_{tag}.txt")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write(text + "\n")
+    except OSError as exc:
+        logger.warning(f"memory monitor: could not write {path} ({exc})")
+        return None
+    return path
 
 
 def _report_oom(headline: str) -> None:
@@ -158,9 +187,11 @@ def _report_oom(headline: str) -> None:
 
 
 def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserved: int) -> None:
+    # Fires before anyone has had a chance to catch the error, and some
+    # callers do catch it and fall back; the wording leaves room for that.
     _report_oom(
         f"OUT OF MEMORY: PyTorch could not allocate {allocation_bytes / (1 << 30):.2f} GiB "
-        f"on device {device}."
+        f"on device {device} (the caller may still recover)."
     )
 
 

@@ -44,7 +44,6 @@ __all__ = [
     "MemoryPlan",
     "Reading",
     "RegionSample",
-    "first_use",
     "region",
     "residual_breakdown",
     "begin_stage",
@@ -111,6 +110,8 @@ class RegionSample:
     name: str
     stage: str | None
     residual_taken: int
+    #: Recorded before the first step's reading, which therefore includes it.
+    before_first: bool = False
 
 
 _stages: list[StageSample] = []
@@ -118,8 +119,6 @@ _regions: list[RegionSample] = []
 #: Residual taken by regions nested in each open region, innermost last, so
 #: a region inside another is not counted twice.
 _open_regions: list[int] = []
-#: Names passed to :func:`first_use` so far.
-_used: set[str] = set()
 _first: Reading | None = None
 _active_stage: str | None = None
 _failed: StageSample | None = None
@@ -205,25 +204,11 @@ def region(name: str):
         after = _reading() if before is not None else None
         if after is not None:
             taken = after.residual - before.residual
-            _regions.append(RegionSample(name, _active_stage, taken - nested))
+            _regions.append(
+                RegionSample(name, _active_stage, taken - nested, before_first=_first is None)
+            )
             if _open_regions:
                 _open_regions[-1] += taken
-
-
-@contextlib.contextmanager
-def first_use(name: str):
-    """:func:`region`, for the first time this process enters ``name`` only.
-
-    For code whose library allocates lazily on first call -- NCCL connecting
-    a communicator's peers, for instance -- and is called too often to
-    measure every time.
-    """
-    if name in _used or not _on():
-        yield
-        return
-    _used.add(name)
-    with region(name):
-        yield
 
 
 def set_stage_advice(names: dict[str, str], advice: dict[str, str]) -> None:
@@ -293,7 +278,6 @@ def clear() -> None:
     _stages.clear()
     _regions.clear()
     _open_regions.clear()
-    _used.clear()
     _failed = None
     _plan = None
     _first = None
@@ -376,7 +360,10 @@ def residual_breakdown(current_residual: int) -> list[tuple[str, int]]:
     """
     if _first is None:
         return []
-    parts = [("before the first startup step", _first.residual)]
+    # A region that ran before the first step is inside that first reading;
+    # it is listed under its own name and taken out of the first part.
+    early = sum(r.residual_taken for r in _regions if r.before_first)
+    parts = [("before the first startup step", _first.residual - early)]
     for region_sample in _regions:
         parts.append((region_sample.name, region_sample.residual_taken))
     for sample in _stages:

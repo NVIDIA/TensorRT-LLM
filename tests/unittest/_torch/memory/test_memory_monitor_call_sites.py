@@ -79,21 +79,6 @@ class TestRegions:
         assert sum(size for _, size in parts) == 64 * MB
         assert len(parts) == len(dict(parts))
 
-    def test_first_use_measures_only_the_first_entry(self, fake_memory):
-        for size in (64 * MB, 8 * MB):
-            with startup.first_use("first allreduce"):
-                fake_memory(size)
-        samples = _region("first allreduce")
-        assert [s.residual_taken for s in samples] == [64 * MB]
-
-    def test_first_use_is_free_when_the_monitor_is_off(self, monkeypatch):
-        monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
-        startup.clear()
-        with startup.first_use("x"):
-            pass
-        # Not consumed: turning the monitor on later still measures it.
-        assert "x" not in startup._used
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_lora_device_cache_is_named(fake_memory, monkeypatch):

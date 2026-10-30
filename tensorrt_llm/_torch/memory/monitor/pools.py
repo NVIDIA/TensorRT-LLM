@@ -30,6 +30,12 @@ MemPool if a live ``MemPool`` object has its id, and as a graph pool
 otherwise. That holds for MemPools created by code that never registers
 here, such as the external library behind GMS weight sharing. Registration
 only supplies a readable name.
+
+Looking for live ``MemPool`` objects walks the garbage collector's heap, so
+each pool is classified once, when first seen, and remembered. Pool ids are
+never reused and a ``MemPool`` exists before any of its segments, so the
+first answer stays right -- even after the ``MemPool`` object is collected
+while its blocks are still in use.
 """
 
 from __future__ import annotations
@@ -43,6 +49,7 @@ __all__ = [
     "classify_all",
     "clear_registered_pools",
     "is_released",
+    "is_tag_released",
     "mark_materialized",
     "mark_released",
     "pool_usage",
@@ -60,6 +67,8 @@ _sleep_tags: dict[tuple[int, int], str] = {}
 #: got 512 MiB back while memory_reserved() did not move -- so without this
 #: a sleeping process looks larger than it is and the residual goes negative.
 _released_tags: set[str] = set()
+#: Pools already classified as graph or unregistered MemPool.
+_seen: dict[tuple[int, int], tuple[str, str]] = {}
 
 
 def register_pool(pool_id, label: str, sleep_tag: str | None = None) -> None:
@@ -86,6 +95,11 @@ def mark_materialized(tags) -> None:
     _released_tags.difference_update(tags)
 
 
+def is_tag_released(tag: str) -> bool:
+    """Whether sleep mode has released the memory allocated under ``tag``."""
+    return tag in _released_tags
+
+
 def is_released(pool_id) -> bool:
     tag = _sleep_tags.get(tuple(pool_id))
     return tag is not None and tag in _released_tags
@@ -96,14 +110,14 @@ def clear_registered_pools() -> None:
     _mem_pools.clear()
     _sleep_tags.clear()
     _released_tags.clear()
+    _seen.clear()
 
 
 def _live_mempool_ids() -> set[tuple[int, int]]:
     """Ids of every live ``torch.cuda.MemPool``.
 
     Walks the garbage collector's objects, which costs on the order of
-    100 ms per million objects, so it runs only when a report finds a pool
-    it cannot name otherwise.
+    100 ms per million objects, so it runs only for a pool not seen before.
     """
     import gc
 
@@ -132,11 +146,14 @@ def classify(pool_id, live_mempools: set | frozenset = frozenset()) -> tuple[str
 
 
 def classify_all(pool_ids) -> dict[tuple[int, int], tuple[str, str]]:
-    """Classify several pools, discovering live MemPools only if needed."""
+    """Classify several pools, looking for live MemPools only for new ones."""
     keys = {tuple(p) for p in pool_ids}
-    unknown = [k for k in keys if k != DEFAULT_POOL and k not in _mem_pools]
-    live = _live_mempool_ids() if unknown else frozenset()
-    return {k: classify(k, live) for k in keys}
+    new = [k for k in keys if k != DEFAULT_POOL and k not in _mem_pools and k not in _seen]
+    if new:
+        live = _live_mempool_ids()
+        for key in new:
+            _seen[key] = classify(key, live)
+    return {k: _seen.get(k) or classify(k) for k in keys}
 
 
 @dataclass(frozen=True)

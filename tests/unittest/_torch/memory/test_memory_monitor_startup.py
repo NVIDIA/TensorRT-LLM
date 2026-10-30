@@ -117,8 +117,6 @@ class TestFailedStartup:
     def test_headline_names_the_step_and_its_advice(self, monkeypatch):
         from tensorrt_llm._torch.memory.monitor import tagging, triggers
 
-        startup.set_stage_advice({"kv_cache": "KV cache"}, {"kv_cache": "reduce the fraction"})
-        startup.record_failed_stage("kv_cache", 3 * GIB)
         monkeypatch.setattr(tagging, "tagging_supported", lambda: False)
         texts = []
         real = triggers.report_now
@@ -128,6 +126,12 @@ class TestFailedStartup:
 
         with pytest.raises(RuntimeError):
             with tagging.startup_window():
+                # As in the executor: its memory monitor is built, and the
+                # failing step recorded, inside the window.
+                startup.set_stage_advice(
+                    {"kv_cache": "KV cache"}, {"kv_cache": "reduce the fraction"}
+                )
+                startup.record_failed_stage("kv_cache", 3 * GIB)
                 raise RuntimeError("Executor creation failed due to insufficient GPU memory.")
 
         text = texts[0]

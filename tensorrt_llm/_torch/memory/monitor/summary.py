@@ -232,7 +232,11 @@ def render_summary(
     if headline:
         out.append(f"  {headline}")
 
-    bound = " (upper bound: NVML unavailable)" if totals.process_total_is_upper_bound else ""
+    bound = (
+        f" (upper bound: {frame.device.process_missing_reason})"
+        if totals.process_total_is_upper_bound
+        else ""
+    )
     other = (
         f"other processes {_size(device.other_process).strip()}, "
         if device.other_process is not None
