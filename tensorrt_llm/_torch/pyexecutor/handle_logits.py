@@ -1,8 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from itertools import chain
 from typing import List
 
 import torch
 
+from tensorrt_llm._torch.modules.context_logits import store_context_logits
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
 from tensorrt_llm._utils import nvtx_range
@@ -21,6 +25,7 @@ class HandleLogits:
         beam_width: int,
         num_context_logits_prefix_sum: list[int],
         is_generation_model: bool,
+        context_logits_handled: bool = False,
     ):
         """Handles context and generation logits for a batch of requests.
 
@@ -51,14 +56,13 @@ class HandleLogits:
             logits_begin = num_context_logits_prefix_sum[batch_index]
             logits_end = num_context_logits_prefix_sum[batch_index + 1]
 
-            if llm_req.py_return_context_logits:
+            if llm_req.py_return_context_logits and not context_logits_handled:
                 if llm_req.prepopulated_prompt_len > 0:
                     logger.warning(
                         f"Because of KV cache reuse, not all context logits could be produced for request {llm_req.request_id}."
                     )
                 context_logits_device_view = logits[logits_begin:logits_end]
-                llm_req.py_result.append_context_logits(
-                    context_logits_device_view)
+                store_context_logits(llm_req, context_logits_device_view)
 
             if llm_req.py_return_generation_logits and llm_req.is_last_context_chunk:
                 # Get the logits from the last context token and draft tokens

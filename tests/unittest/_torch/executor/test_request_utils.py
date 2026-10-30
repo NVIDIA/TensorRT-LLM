@@ -132,11 +132,27 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     return mock_request
 
 
-def test_request_broadcaster_collects_conversation_params_with_none():
+def test_request_broadcaster_preserves_conversation_and_logits_params():
     conversation_params = ConversationParams(conversation_id="conv")
     source_items = [
-        RequestQueueItem(1, SimpleNamespace(py_conversation_params=conversation_params)),
-        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
+        RequestQueueItem(
+            1,
+            SimpleNamespace(
+                py_conversation_params=conversation_params,
+                py_context_logits_explicit=False,
+                py_prompt_logprobs=0,
+                py_prompt_logprobs_simple_format=False,
+            ),
+        ),
+        RequestQueueItem(
+            2,
+            SimpleNamespace(
+                py_conversation_params=None,
+                py_context_logits_explicit=True,
+                py_prompt_logprobs=3,
+                py_prompt_logprobs_simple_format=True,
+            ),
+        ),
     ]
 
     py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
@@ -156,6 +172,10 @@ def test_request_broadcaster_collects_conversation_params_with_none():
     assert target_items[0].request.py_conversation_params is conversation_params
     assert hasattr(target_items[1].request, "py_conversation_params")
     assert target_items[1].request.py_conversation_params is None
+    for item, enabled, count in zip(target_items, [False, True], [0, 3]):
+        assert item.request.py_context_logits_explicit is enabled
+        assert item.request.py_prompt_logprobs == count
+        assert item.request.py_prompt_logprobs_simple_format is enabled
 
 
 def test_request_broadcaster_requires_conversation_params_attr():
