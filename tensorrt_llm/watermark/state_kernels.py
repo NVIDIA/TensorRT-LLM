@@ -70,6 +70,7 @@ def _plan_kernel(
     drafts_ptr,
     count_ptr,
     ring_ptr,
+    skip_ptr,
     seeds_ptr,
     seeds2_ptr,
     active_ptr,
@@ -82,6 +83,7 @@ def _plan_kernel(
     K: tl.constexpr,
     DEDUPE: tl.constexpr,
     DUAL: tl.constexpr,
+    SKIP: tl.constexpr,
     BLOCK_RING: tl.constexpr,
 ):
     request = tl.program_id(0)
@@ -100,6 +102,9 @@ def _plan_kernel(
         seed2 = _context_seed(tail_row, drafts_row, position, key2, WIDTH, K)
         tl.store(seeds2_ptr + out, seed2.to(tl.int64, bitcast=True))
     active = tl.load(enabled_ptr + request) != 0
+    if SKIP:
+        # The first generated tokens of a request stay unwatermarked.
+        active = active & (position >= tl.load(skip_ptr + slot))
     if DEDUPE:
         filled = tl.minimum(tl.load(count_ptr + slot), ring_size)
         ring_row = ring_ptr + slot * stride_ring
@@ -127,6 +132,7 @@ def plan_windows(
     keys: torch.Tensor,
     dual: bool,
     drafts: torch.Tensor | None,
+    skip: torch.Tensor | None = None,
 ):
     """Seeds and activity of ``B`` windows of ``K + 1`` positions.
 
@@ -140,6 +146,7 @@ def plan_windows(
             values in ``[0, 2**64)``); the second is used only when ``dual``.
         dual: whether to also return the seeds of the second key.
         drafts: optional ``[B, K]`` draft tokens the window verifies.
+        skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
 
     Returns:
         ``(seeds [B, K+1] int64, seeds2 [B, K+1] int64 or None, active [B, K+1] bool)``.
@@ -159,6 +166,7 @@ def plan_windows(
         drafts if drafts is not None else tail,
         count,
         ring if ring is not None else tail,
+        skip if skip is not None else count,
         seeds,
         seeds2,
         active,
@@ -171,6 +179,7 @@ def plan_windows(
         K=num_drafts,
         DEDUPE=ring is not None,
         DUAL=dual,
+        SKIP=skip is not None,
         BLOCK_RING=1024,
     )
     return seeds, (seeds2 if dual else None), active.to(torch.bool)
@@ -186,6 +195,7 @@ def _commit_kernel(
     tail_ptr,
     count_ptr,
     ring_ptr,
+    skip_ptr,
     stride_accepted,
     stride_tail,
     stride_ring,
@@ -194,6 +204,7 @@ def _commit_kernel(
     BLOCK_WIDTH: tl.constexpr,
     K1: tl.constexpr,
     DEDUPE: tl.constexpr,
+    SKIP: tl.constexpr,
 ):
     request = tl.program_id(0)
     slot = tl.load(slots_ptr + request).to(tl.int64)
@@ -222,6 +233,9 @@ def _commit_kernel(
             target = (count + position) % ring_size
             tl.store(ring_row + target, seed, mask=position < committed)
     tl.store(count_ptr + slot, count + committed)
+    if SKIP:
+        remaining = tl.load(skip_ptr + slot)
+        tl.store(skip_ptr + slot, tl.maximum(remaining - committed, 0))
 
 
 def commit_windows(
@@ -234,13 +248,15 @@ def commit_windows(
     count: torch.Tensor,
     ring: torch.Tensor | None,
     ring_size: int,
+    skip: torch.Tensor | None = None,
 ) -> None:
     """Advance the per-slot state by the committed tokens of ``B`` windows.
 
     ``accepted_tokens`` is ``[B, K1]`` (the tokens of each window), ``num_accepted`` ``[B]`` how
     many of them were committed and ``seeds`` the ``[B, K1]`` seeds :func:`plan_windows`
     returned. Requests that are not ``enabled`` leave their slot untouched. Slots must be
-    distinct among the enabled requests.
+    distinct among the enabled requests. ``skip`` (``[rows]``, optional) counts down the generated
+    tokens a slot still leaves unwatermarked.
     """
     batch, num_positions = seeds.shape
     accepted_tokens = accepted_tokens.contiguous()
@@ -254,6 +270,7 @@ def commit_windows(
         tail,
         count,
         ring if ring is not None else tail,
+        skip if skip is not None else count,
         accepted_tokens.stride(0),
         tail.stride(0),
         ring.stride(0) if ring is not None else 0,
@@ -262,4 +279,5 @@ def commit_windows(
         BLOCK_WIDTH=triton.next_power_of_2(width),
         K1=num_positions,
         DEDUPE=ring is not None,
+        SKIP=skip is not None,
     )

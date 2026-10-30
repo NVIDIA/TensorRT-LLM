@@ -25,7 +25,7 @@ out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperatur
 | `algorithm` | `"gumbel"` | `"gumbel"` or `"gumbel_dual_key"`. Dual-key additionally supports speculative decoding with rejection sampling (see below). |
 | `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
 | `context_width` | 4 | Number of preceding tokens that seed each decision. Larger values are less robust to edits. |
-| `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this. |
+| `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
 | `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. |
 | `allow_request_opt_out` | `True` | Whether a request may set `SamplingParams.watermarking=False`. Set to `False` to enforce the watermark on every request that can carry one. |
 | `prf` | `"philox"` | Pseudo-random function. Fast but not cryptographic: it does not protect against key recovery or forgery. |
@@ -86,6 +86,11 @@ Helix parallelism are untested. See the
 - Sampling becomes deterministic given the context. Requests with `n > 1` and the same prompt produce
   the same text until their contexts diverge, and repeated contexts are not watermarked.
 - Low-entropy output (code, short answers) and heavily edited text carry little signal.
+- A fixed key applies the same random values wherever a context recurs across requests. For answers
+  of one token from a small set (multiple choice, labels) many requests share their context, so the key
+  can move accuracy up or down by several points; the average over keys is unbiased.
+  `deduplicate_contexts="all"` leaves the first `context_width` generated tokens unwatermarked and
+  avoids this, at the price of no mark on very short outputs.
 - Guided decoding with the watermark is untested. The grammar mask is applied before the watermark draw, so
   the mark can only steer among the tokens the grammar allows.
 - Not supported: NGram and user-provided drafts (verified in the sampler), tree (dynamic tree)
