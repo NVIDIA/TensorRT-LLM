@@ -5,7 +5,8 @@ epilogue: the up projection `low @ up^T` accumulates in tensor memory and the
 epilogue applies the sigmoid gate to the normed stream and averages the
 streams, so the `[T, C*H]` gate logits never reach global memory.
 
-Tier 6 (CuTe DSL written for this target). A persistent warp-specialized
+A CuTe DSL kernel from the tp1 target's `ops/hc/qwen4_exp_hc_up_gate_mean`,
+reused here as this target's local variant. A persistent warp-specialized
 kernel: one TMA warp loads `low` and the up weight, one MMA warp issues
 `tcgen05.mma` into a double-buffered TMEM accumulator, four epilogue warps
 read the accumulator, load the matching normed elements straight from global
@@ -832,20 +833,39 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows, hc_count (4), hidden (2560), rank (320); bf16 only.
-    CELLS: tuple[Cell, ...] = tuple(
-        Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
-        for t, why in (
-            (128, "decode 128 rows, one full tile"),
-            (16384, "prefill chunk 16384 (max_num_tokens)"),
+    CELLS: tuple[Cell, ...] = (
+        tuple(
+            Cell(why=f"checkpoint 4x2560, rank 320, {why}", spec=dict(rows=t))
+            for t, why in (
+                (128, "decode 128 rows, one full tile"),
+                (16384, "prefill chunk 16384 (max_num_tokens)"),
+            )
         )
-    ) + (Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),)
+        + (Cell(why="ragged tail, 16320 + 70 rows (mixed step)", spec=dict(rows=16390)),)
+        # The tp4 / tep4 / dep4 target: the mixer runs on the full 4 x 2560
+        # residual on every rank, so only the row count moves per member.
+        + tuple(
+            Cell(why=why, spec=dict(rows=t))
+            for t, why in (
+                (1, "1 row: one decode token, the smallest captured batch; 1 of a tile's 128 rows"),
+                (32, "32 rows: dep4's per-rank decode cap (128 / 4), a quarter of one tile"),
+                (1024, "1024 rows: mtp7 verify at tep4, 128 requests x 8 rows"),
+                (8192, "8192 rows: one prefill chunk at max_num_tokens, the envelope's largest"),
+            )
+        )
+    )
 
     note = """
-    Tier 6 (CuTe DSL written for this target): a persistent tcgen05 GEMM whose
-    epilogue applies the gate, so the `[T, C*H]` gate logits never reach HBM;
-    tiers 1-5 have no GEMM with a custom multi-input epilogue (cuBLAS writes
-    the logits). Metadata consumed: none. Call sites:
-    the trunk's hyper-connection mixers (`_hc_mixer`). Preconditions (bf16):
+    Source: the tp1 target's CuTe DSL kernel, reused in tree (no trtllm op or
+    FlashInfer call fuses this multi-input epilogue; cuBLAS writes the logits).
+    It is JIT-compiled by `cute.compile` on the first call per
+    `(block_h, C, H, R)` for the running device: sm_103 (GB300) in the cells,
+    with no `CUTE_DSL_ARCH` override. The cells assert that the compiled entry
+    answered. A persistent tcgen05 GEMM whose epilogue applies the gate, so the
+    `[T, C*H]` gate logits never reach HBM. Metadata consumed: none. Call sites:
+    the hyper-connection mixers at decode, MTP verify (4 rows per request) and
+    prefill. Under tp4, tep4 and dep4 every rank mixes the full 4 x 2560
+    residual, so only the row count moves per member. Preconditions (bf16):
     `low` `[T, R]` contiguous, `up` the transposed view of a contiguous
     `[C*H, R]` weight, `normed` `[T, C*H]` contiguous, 16-byte aligned
     pointers, `R % 64 == 0`, `H % 32 == 0`, `C * 32 <= 256`. Compiles once per
@@ -857,12 +877,29 @@ class Qwen4ExpHcUpGateMean(OpWrapper):
     that releases dependents early (`qwen4_exp_hc_decode_tc_first`) the weight
     read overlaps the producer.
 
-    Certified: bf16 at the checkpoint's 4 x 2560, rank 320: 128 rows (one full
-    tile), 16384 rows, 16390 rows (a partial last tile); graph replay.
+    Certified: bf16 at the checkpoint's 4 x 2560, rank 320, at 1 and 32 rows
+    (part of one tile), 128 (one full tile), 1024, 8192, 16384 and 16390 rows
+    (a partial last tile); graph replay.
 
-    Not certified: zero rows, fewer rows than a tile, hc_count other than 4,
-    hidden other than 2560, rank other than 320 (the kernel compiles for them;
-    no cell drives them).
+    Measured on GB300 against the float64 reference. The band is `rtol = eps`,
+    `atol = eps * max|ref|`, with `eps` the bf16 epsilon:
+    - worst element: 0.0035 (1 row) to 0.40 (8192 rows) of the band;
+    - relative L2: 2.9e-6 to 8.1e-5;
+    - cosine: >= 0.999999997;
+    - 99.9th-percentile error: <= 3.5e-6 of max|ref|.
+    Two wrong mixes land 49.6x to 93.9x the band: the gates rolled by one
+    stream, and the last stream dropped. The band does not separate a
+    bf16-rounded gate logit (0.28x to 0.46x), which is a legitimate
+    two-launch result. Time per call, eager: 11 us at 1-1024 rows, 55 us at
+    8192, 106 us at 16384.
+
+    Not certified:
+    - rows that no cell drives: zero, 2-31, 33-127 (the same one-tile path
+      as 1 and 32), between the full-tile cells, and above 16390;
+    - hc_count other than 4, hidden other than 2560, rank other than 320 (the
+      kernel compiles for them);
+    - `hc_up_gate_mean_fp4`, which this module also defines: no cell here
+      drives it.
     """
 
     def __call__(
