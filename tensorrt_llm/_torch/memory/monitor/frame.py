@@ -72,6 +72,8 @@ class DeviceReading:
     total: int
     free: int
     process_used: int | None = None
+    #: Why ``process_used`` is missing, in the reader's terms.
+    process_missing_reason: str = "NVML unavailable"
 
     @property
     def device_used(self) -> int:

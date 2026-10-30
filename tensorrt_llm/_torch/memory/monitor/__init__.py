@@ -131,28 +131,45 @@ def enabled(rank: int | None = None) -> bool:
 
 def _read_device(device_index: int) -> DeviceReading:
     free, total = torch.cuda.mem_get_info(device_index)
-    return DeviceReading(total=total, free=free, process_used=_nvml_process_used(device_index))
+    used, reason = _nvml_process_lookup(device_index)
+    return DeviceReading(
+        total=total, free=free, process_used=used, process_missing_reason=reason or ""
+    )
 
 
 def _nvml_process_used(device_index: int) -> int | None:
-    """This process's device memory according to NVML.
+    """This process's device memory according to NVML, or ``None``."""
+    return _nvml_process_lookup(device_index)[0]
+
+
+#: NVML answered, but not for this process.
+_NOT_LISTED = (
+    "this process is not in NVML's process list -- in a container without the "
+    "host PID namespace NVML reports host PIDs"
+)
+
+
+def _nvml_process_lookup(device_index: int) -> tuple[int | None, str]:
+    """This process's device memory according to NVML, and why not if not.
 
     ``None`` when NVML cannot answer. Falling back to ``total - free`` would
     silently attribute colocated processes' memory to us; TensorRT-LLM
     supports several colocated configurations, so that is a real hazard
-    rather than a theoretical one.
+    rather than a theoretical one. The reason says which of the different
+    failures it was, since they call for different fixes.
     """
+    unavailable = (None, "NVML unavailable")
     try:
         from tensorrt_llm import profiler
     except ImportError:
-        return None
+        return unavailable
     pynvml_context = getattr(profiler, "pynvml_context", None)
     if pynvml_context is None:
-        return None
+        return unavailable
     try:
         import pynvml
     except ImportError:
-        return None
+        return unavailable
     try:
         # By UUID, not by index: torch numbers only the devices
         # CUDA_VISIBLE_DEVICES exposes, NVML numbers every device on the
@@ -161,7 +178,7 @@ def _nvml_process_used(device_index: int) -> int | None:
         # torch device 0 is NVML device 2, and index 0 is another GPU.
         uuid = f"GPU-{torch.cuda.get_device_properties(device_index).uuid}"
     except Exception:  # noqa: BLE001
-        return None
+        return unavailable
     try:
         with pynvml_context():
             handle = pynvml.nvmlDeviceGetHandleByUUID(uuid)
@@ -171,13 +188,15 @@ def _nvml_process_used(device_index: int) -> int | None:
                     used = proc.usedGpuMemory
                     # NVML reports None/0 for this field on some platforms;
                     # treat that as "unknown" rather than "nothing".
-                    return int(used) if used else None
+                    if used:
+                        return int(used), ""
+                    return None, "NVML reports no per-process usage on this platform"
     except Exception:  # noqa: BLE001 - NVML raises many unrelated types
-        return None
-    return None
+        return unavailable
+    return None, _NOT_LISTED
 
 
-def _read_torch(device_index: int) -> TorchReading:
+def _read_torch(device_index: int, segments: list | None = None) -> TorchReading:
     """Read the caching allocator, refusing a reserved figure it cannot mean.
 
     Whether ``reserved`` is populated depends on the backend *and* the torch
@@ -185,6 +204,11 @@ def _read_torch(device_index: int) -> TorchReading:
     it at zero -- so it is judged from the data rather than from the backend
     name. Reserved below live is impossible for a populated reading, and is
     taken to mean "not reported".
+
+    With ``segments`` (this device's allocator snapshot), ``reserved`` and
+    ``live`` are taken from it as well: the same snapshot splits memory by
+    pool and by tag, and figures read at a different moment would drift from
+    those splits, so the groups would no longer add up.
     """
     stats = torch.cuda.memory_stats(device_index)
     live = stats.get("allocated_bytes.all.current")
@@ -193,17 +217,25 @@ def _read_torch(device_index: int) -> TorchReading:
     reserved = torch.cuda.memory_reserved(device_index)
     if reserved < live:
         return TorchReading(reserved=None, live=live)
-    return TorchReading(reserved=reserved, live=live, pools=_pools())
-
-
-def _pools() -> tuple | None:
+    if segments is None:
+        return TorchReading(reserved=reserved, live=live)
     from .pools import pool_usage
 
+    pools = tuple(pool_usage(segments))
+    return TorchReading(
+        reserved=sum(p.reserved for p in pools),
+        live=sum(p.allocated for p in pools),
+        pools=pools,
+    )
+
+
+def _segments(device_index: int) -> list | None:
+    """This device's allocator segments, or ``None`` if they cannot be read."""
     try:
         segments = torch.cuda.memory._snapshot()["segments"]
     except Exception:  # noqa: BLE001
         return None
-    return tuple(pool_usage(segments))
+    return [s for s in segments if s.get("device", device_index) == device_index]
 
 
 #: Labels attached during startup, by the category they report under.
@@ -338,7 +370,10 @@ def capture(
     if device_index is None:
         device_index = torch.cuda.current_device()
 
-    torch_reading = _read_torch(device_index)
+    # One allocator snapshot serves the torch reading, the pool split and the
+    # tags: a snapshot costs milliseconds, and two would disagree.
+    segments = _segments(device_index)
+    torch_reading = _read_torch(device_index, segments)
     checks: tuple = ()
     sites: dict = {}
     if entries is None:
@@ -347,7 +382,7 @@ def capture(
 
         # One tag reading feeds the entries, check B and the stack breakdown;
         # reading twice would let the allocator move between them.
-        by_tag, sites = live_attribution(get_frozen_map())
+        by_tag, sites = live_attribution(get_frozen_map(), segments)
         entries = collect_all() + _tag_entries(by_tag)
         checks = _run_checks(by_tag, torch_reading.live)
 

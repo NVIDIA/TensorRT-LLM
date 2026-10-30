@@ -81,6 +81,11 @@ def kv_pool_group_stats(manager) -> list[dict]:
     return rows
 
 
+#: Sleep-mode tag of the step that creates the KV cache pools
+#: (``ExecutorMemoryType.KV_CACHE``).
+KV_CACHE_SLEEP_TAG = "kv_cache"
+
+
 class KvCacheProvider:
     """One KV cache pool: the target model's, a draft model's, or the
     cross-attention pool.
@@ -164,7 +169,37 @@ class KvCacheProvider:
         manager = self._manager
         if manager is None:
             return []
+        return self._with_sleep_release(self._collect(manager))
 
+    @staticmethod
+    def _with_sleep_release(entries: list[Entry]) -> list[Entry]:
+        """Take a pool that sleep mode has released back out of the totals.
+
+        The pool is allocated inside the ``kv_cache`` sleep scope. Once that
+        tag is released the GPU no longer backs it, while the manager still
+        reports it; the row is kept, so the reader sees what is asleep, and
+        a matching negative entry takes it out, as for released PyTorch pools.
+        """
+        from ..pools import is_tag_released
+
+        if not is_tag_released(KV_CACHE_SLEEP_TAG):
+            return entries
+        held = sum(e.size_bytes or 0 for e in entries if e.counts_toward_total)
+        if not held:
+            return entries
+        return entries + [
+            Entry(
+                category=Category.SLEEP_RELEASED,
+                size_bytes=-held,
+                source=Source.COMPONENT,
+                placement=Placement.NON_TORCH,
+                basis=Basis.PHYSICAL_BACKING,
+                owner=f"{entries[0].owner}, released",
+                note="KV cache released by sleep mode",
+            )
+        ]
+
+    def _collect(self, manager) -> list[Entry]:
         if not hasattr(manager, "_get_storage_statistics"):
             return [self._v1_entry(manager)]
 
