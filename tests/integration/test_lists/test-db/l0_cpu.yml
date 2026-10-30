@@ -55,6 +55,9 @@ l0_cpu:
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The unified qwen4_exp target's cpu_only tests (its routing among them); this stage runs
+  # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
+  - unittest/_torch/modeling_v2/models/qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified
   - unittest/_torch/executor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
