@@ -1247,6 +1247,8 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, num_heads, 192)
     assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
+    assert wrapper.plan.call_args.kwargs["max_seq_len_q"] == 256
+    assert wrapper.plan.call_args.kwargs["max_kv_len"] == 128
     processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
     for name in ("q_dtype", "k_dtype", "v_dtype"):
         assert wrapper.plan.call_args.kwargs[name] == processed_dtype

@@ -63,6 +63,41 @@ _MIN_CUTLASS_COMPILER_VERSION = "13.3"
 _WORKSPACE_ALIGNMENT = 32
 
 
+def _mla_context_capacities(
+    query_length: int,
+    kv_length: int,
+    *,
+    head_dim: int,
+    head_dim_vo: int | None,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    packed: bool,
+    uniform_packed_lengths: bool,
+    mask_type: str,
+    window_left: int,
+) -> tuple[int, int]:
+    """Bucket expanded MLA capacities without changing its live packed lengths."""
+    query_capacity = 1 << (max(query_length, 1) - 1).bit_length()
+    kv_capacity = 1 << (max(kv_length, 1) - 1).bit_length()
+    if (
+        (head_dim, head_dim_vo) == (192, 128)
+        and packed
+        and not uniform_packed_lengths
+        and mask_type in ("causal", "dense")
+        and window_left == -1
+        and qk_dtype == pv_dtype
+        and qk_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
+        and output_dtype in (torch.float16, torch.bfloat16)
+    ):
+        # This query-paired kernel has two M128 peers and N128 KV tiles.
+        # Raising sub-tile capacities preserves the work domain; indptrs
+        # continue to supply the actual ragged lengths and causal offsets.
+        query_capacity = max(query_capacity, 256)
+        kv_capacity = max(kv_capacity, 128)
+    return query_capacity, kv_capacity
+
+
 def get_paged_kv_storage_unsupported_reason(
     attn: "TrtllmAttention",
     metadata: "TrtllmAttentionMetadata",
@@ -1353,8 +1388,19 @@ class PrimsTSFmha(PhasedFmha):
         stats = fwd.softmax_stats_tensor
         # Dense cached chunks traverse the planned KV domain. Bucket current
         # capacities instead of traversing max_seq_len for every small chunk.
-        q_capacity = 1 << (max(params.input_seq_length, 1) - 1).bit_length()
-        kv_capacity = 1 << (max(params.max_past_kv_length, 1) - 1).bit_length()
+        q_capacity, kv_capacity = _mla_context_capacities(
+            params.input_seq_length,
+            params.max_past_kv_length,
+            head_dim=192,
+            head_dim_vo=128,
+            qk_dtype=q_processed.dtype,
+            pv_dtype=v_processed.dtype,
+            output_dtype=params.output.dtype,
+            packed=True,
+            uniform_packed_lengths=False,
+            mask_type=mask,
+            window_left=-1,
+        )
         key = (params.batch_size, q_capacity, kv_capacity, mask, stats is not None)
         wrapper = self._mla_context_wrappers.get(key)
         if wrapper is None:
