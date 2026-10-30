@@ -131,19 +131,30 @@ def _chunked(token_ids, size):
     return [token_ids[i : i + size] for i in range(0, len(token_ids), size)]
 
 
+# The last field is the joined text_diff values. For "</answer>" they still end in
+# "</answer": earlier responses already streamed the decoded stop-word prefix, and
+# deltas cannot take text back (#21318). Change it here once streaming holds back a
+# possible stop-word prefix.
 CASES = [
-    pytest.param("๒", THAI_DIGIT_TWO, THAI_GENERATED, "ข้อ ๑ ข้อ ", id="thai_digit"),
-    pytest.param("</answer>", ANSWER_CLOSE, ANSWER_GENERATED, "<answer>42", id="answer_tag"),
+    pytest.param("๒", THAI_DIGIT_TWO, THAI_GENERATED, "ข้อ ๑ ข้อ ", "ข้อ ๑ ข้อ ", id="thai_digit"),
+    pytest.param(
+        "</answer>",
+        ANSWER_CLOSE,
+        ANSWER_GENERATED,
+        "<answer>42",
+        "<answer>42</answer",
+        id="answer_tag",
+    ),
 ]
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2])
-@pytest.mark.parametrize("stop, stop_ids, generated, expected", CASES)
+@pytest.mark.parametrize("stop, stop_ids, generated, expected, expected_joined", CASES)
 def test_streamed_text_drops_stop_word_ids_streamed_earlier(
-    tokenizer, stop, stop_ids, generated, expected, chunk_size
+    tokenizer, stop, stop_ids, generated, expected, expected_joined, chunk_size
 ):
     sampling_params = _sampling_params(stop, stop_ids)
-    output, _ = _run(
+    output, joined = _run(
         tokenizer, sampling_params, _chunked(generated, chunk_size), tllm.FinishReason.STOP_WORDS
     )
     reference, _ = _run(
@@ -159,6 +170,7 @@ def test_streamed_text_drops_stop_word_ids_streamed_earlier(
     assert output.token_ids == reference.token_ids
     assert output.finish_reason == "stop"
     assert output.stop_reason == stop
+    assert joined == expected_joined
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2])
