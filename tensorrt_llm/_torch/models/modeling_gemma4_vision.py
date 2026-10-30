@@ -279,8 +279,9 @@ class Gemma4VisionAttention(Attention):
     """Bidirectional attention with q/k/v RMSNorms and 2D RoPE.
 
     Inherits ``Attention`` to participate in the TRT-LLM backend dispatch.
-    Vision sub_config is forced to ``attn_backend="TRTLLM"`` in
-    ``modeling_gemma4mm.get_sub_model_config`` (same pattern Qwen2.5-VL uses).
+    Vision defaults to ``attn_backend="TRTLLM"``; an explicit
+    ``multimodal_config.encoder_attention_backend['vision']`` selects another
+    supported backend in ``modeling_gemma4mm.get_sub_model_config``.
     Vision is context-only and runs through ``forward_impl`` with
     ``PredefinedAttentionMask.FULL`` and a tower-local ``attn_metadata``
     (``kv_cache_manager=None``).
