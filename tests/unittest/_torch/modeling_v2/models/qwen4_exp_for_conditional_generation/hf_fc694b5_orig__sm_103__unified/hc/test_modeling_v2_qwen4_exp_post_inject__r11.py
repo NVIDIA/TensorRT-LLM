@@ -54,11 +54,14 @@ def _build(spec, seed):
     layout = spec.get("layout", "contiguous")
     width = hc_count * hidden
     if layout == "col_slice":
-        buf = torch.randn(hyper_input.shape[0], 2 * width, device=DEV).to(dtype)
+        g = torch.Generator(device=DEV).manual_seed(seed + 1)
+        buf = torch.randn(hyper_input.shape[0], 2 * width, generator=g, device=DEV).to(dtype)
         buf[:, :width] = hyper_input
         hyper_input = buf[:, :width]
-    if layout != "contiguous":
-        assert not hyper_input.is_contiguous() and hyper_input.stride(-1) == 1
+        # Strides rather than is_contiguous(): at one row torch ignores the
+        # size-1 dim's stride and calls the slice contiguous.
+        assert hyper_input.stride() == (2 * width, 1), hyper_input.stride()
+        assert hyper_input.shape[0] == 1 or not hyper_input.is_contiguous()
     return hyper_input, block_out, inject
 
 

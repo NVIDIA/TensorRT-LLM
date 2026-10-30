@@ -3,12 +3,15 @@
 """Hyper-connection post-block injection: a per-stream gated accumulate of one
 block output into the multi-stream residual.
 
-Tier-3 composed from native torch: one kernel-launching call
-(``torch.addcmul``) plus view glue. No ``torch.ops.trtllm.*`` op computes this
-accumulate with an *identity* cross-stream mix: ``mhc_post_mapping`` applies a
+Native torch (sourcing tier 4): one kernel-launching call (``torch.addcmul``)
+plus view glue. No ``torch.ops.trtllm.*`` op computes this accumulate from the
+gates with an *identity* cross-stream mix: ``mhc_post_mapping`` applies a
 Sinkhorn doubly-stochastic mix across streams, fixes the stream count at 4 and
-instantiates its MMA paths for hidden sizes this checkpoint does not use. The
-built-in Qwen4-Exp implementation has its own fused op for it, not wrapped here.
+instantiates its MMA paths for hidden sizes this checkpoint does not use; the
+built-in Qwen4-Exp's ``trtllm::qwen4_exp_hc_combine``
+(``_torch/modules/qwen4_exp/hyper_connection_kernels.py``) takes the injection
+*logits* and applies ``2 * sigmoid(logits / hc_count)`` itself, a different
+fusion boundary from the gates ``qwen4_exp_gated_residual`` hands this op.
 """
 
 from __future__ import annotations
@@ -59,6 +62,23 @@ class Qwen4ExpPostInject(OpWrapper):
             spec=dict(leading=(8,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, layout="col_slice"),
         ),
     )
+    # The unified tp4/tep4/dep4 target's sites, each with `hyper_input` a column
+    # slice of a wider row buffer (row stride twice the packed width). The op
+    # sees a rank's full 4 x 2560 residual at every member; only the row count
+    # moves: one decode request, max_batch_size, a verify step's trunk and a
+    # max_num_tokens prefill chunk.
+    CELLS += tuple(
+        Cell(
+            why=f"col_slice {t} rows: {why}",
+            spec=dict(leading=(t,), hc_count=CKPT_HC_COUNT, hidden=CKPT_HIDDEN, layout="col_slice"),
+        )
+        for t, why in (
+            (1, "one decode request; the slice reads as contiguous at one row"),
+            (128, "a max_batch_size decode step"),
+            (1024, "a verify step's trunk, 128 requests x verify width 8"),
+            (8192, "a max_num_tokens prefill chunk, the envelope's largest row"),
+        )
+    )
 
     note = """
     Metadata consumed: none. Call sites: twice per decoder layer (after the
@@ -86,15 +106,25 @@ class Qwen4ExpPostInject(OpWrapper):
     capture it comes from the graph's private pool. Cost, not gated: 17 us at
     64 tokens, 53 us at 2048, 213 us at 8192 (~1.78 TB/s) -- the stride-0
     broadcast operands take a non-vectorized path. An in-place form was not
-    measured.
+    measured. Column-slice `hyper_input` on GB300, per call replayed in a CUDA
+    graph (operands L2-warm): 2.3 us at 1 row, 4.8 at 128, 25.4 at 1024, 213 at
+    8192. Stock `trtllm::qwen4_exp_hc_combine` (Triton, logits in) on the same
+    shapes: 1.6, 2.1, 5.0 and 63.7 us -- faster at every row count, behind a
+    different fusion boundary (see the module docstring).
 
     Certified: bf16 2-D operands at the checkpoint's 4 x 2560, 64 and 8192
-    rows contiguous, 8 rows with `hyper_input` a column slice; graph replay.
+    rows contiguous; `hyper_input` a column slice (`buf[:, :width]` of a
+    2 x width row buffer) at 1, 8, 128, 1024 and 8192 rows; graph replay. At
+    one row the slice is contiguous by torch's definition (a size-1 dim's
+    stride is ignored), so that cell is the call site's layout, not a strided
+    read.
 
     Not certified: other row counts, a row-slice `hyper_input`, hc_count other
     than 4, hidden other than 2560, float16, float32 and float8 operands,
-    leading dims beyond one. Hard limits: not
-    probed (the largest measured operand is 8192 x 10240 = 2^26.3 elements).
+    leading dims beyond one. Hard limits: not probed. The largest measured
+    `hyper_input` is 8192 x 10240 = 2^26.3 elements (its column-slice buffer
+    2^27.3); 2^31 elements of the packed residual is 209,715 rows, past every
+    row count the target's envelope (max_num_tokens 8192) issues.
     """
 
     def __call__(
