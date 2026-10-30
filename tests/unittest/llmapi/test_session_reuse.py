@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pure-logic tests for automatic MPI session reuse — no MPI, no GPU."""
 
+import contextlib
+import multiprocessing
+import subprocess
+import sys
+
 import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
@@ -595,6 +600,66 @@ def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
 
     s2 = reuse_cache.acquire(_FakePool, 2)
     assert s2._real is real  # pool survived and was reused
+
+
+class _PlainItem:
+    nodeid = "test_e2e.py::test_ptp_quickstart_advanced"
+
+    @staticmethod
+    def get_closest_marker(name):
+        return None
+
+
+@pytest.fixture
+def cached_pool_hooks(reuse_cache, monkeypatch):
+    """The hooks bound to ``reuse_cache``, which holds one idle 4-worker pool."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+    monkeypatch.setattr(reuse_cache, "install_pool_factory_if_loaded", lambda: None)
+    s = reuse_cache.acquire(_FakePool, 4)
+    s.shutdown()
+    yield hooks, s._real
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_child_process_drains_cached_pools(cached_pool_hooks, capfd):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert pool.shut
+    assert "draining before child process" in capfd.readouterr().out
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_multiprocessing_child_drains_cached_pools(cached_pool_hooks):
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    process = multiprocessing.get_context("spawn").Process(target=int)
+    process.start()
+    process.join()
+    assert pool.shut
+    hooks.pytest_runtest_teardown(_PlainItem())
+
+
+def test_device_query_keeps_cached_pools(cached_pool_hooks):
+    # The skip-marker fixtures run nvidia-smi before most multi-GPU tests.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    subprocess.run("nvidia-smi -L", shell=True, capture_output=True)
+    with contextlib.suppress(FileNotFoundError):  # no driver on this host
+        subprocess.run(["nvidia-smi", "-L"], capture_output=True)
+    hooks.pytest_runtest_teardown(_PlainItem())
+    assert not pool.shut
+
+
+def test_spawn_after_teardown_keeps_cached_pools(cached_pool_hooks):
+    # Finalizer cleanup commands must not cost the next test its pool.
+    hooks, pool = cached_pool_hooks
+    hooks.pytest_runtest_setup(_PlainItem())
+    hooks.pytest_runtest_teardown(_PlainItem())
+    subprocess.run([sys.executable, "-c", "pass"], check=True)
+    assert not pool.shut
 
 
 def test_seam_shim_is_isinstance_transparent():

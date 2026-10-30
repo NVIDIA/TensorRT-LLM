@@ -65,6 +65,10 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     use_cute_dsl_paged_mqa_logits as resolve_cute_dsl_paged_mqa_logits,
 )
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
+from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import (
+    DSAVanillaAttention,
+    DSAVanillaIndexer,
+)
 from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -92,6 +96,8 @@ from tensorrt_llm.quantization.utils import fp8_utils
 __extra_import_path__ = ["..", "~/tests/unittest"]
 
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
+
+from ._indexer_reference import mqa_logits, paged_mqa_logits
 
 
 def has_deep_gemm():
@@ -133,6 +139,489 @@ def _set_torch_top_k(indexer: Indexer) -> None:
         decode_implementation=TopKImplementation.TORCH,
         compress_ratio=indexer.compress_ratio,
     )
+
+
+def test_vanilla_indexer_q_projection_supports_fp8_qdq_weight():
+    qr = torch.tensor([[0.25, -0.5, 0.75, -1.0]], dtype=torch.float32)
+    input_scale = torch.tensor(0.125)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor([[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]], dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8(qr, input_scale)
+    expected = torch.nn.functional.linear(qdq_qr, weight.float() * weight_scale)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_uses_linear_dtype_for_prequantized_input():
+    input_scale = torch.tensor(0.125)
+    qr = torch.tensor([[2.0, -4.0, 6.0, -8.0]], dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor(
+        [[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]],
+        dtype=torch.float8_e4m3fn,
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    expected = torch.nn.functional.linear(
+        (qr.float() * input_scale).to(torch.bfloat16),
+        (weight.float() * weight_scale).to(torch.bfloat16),
+    )
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "sm_version,use_cute_dsl,disable_deep_gemm,rubin_available,int32_scale,expected_ue8m0",
+    [
+        (90, False, False, True, False, False),
+        (100, False, False, True, False, True),
+        (100, True, False, True, False, False),
+        (100, False, True, True, False, False),
+        (103, False, False, True, False, True),
+        (103, True, False, True, False, False),
+        (107, False, False, True, False, True),
+        (107, True, False, True, False, True),
+        (107, False, True, True, False, True),
+        (107, True, False, False, False, False),
+        (120, False, False, True, False, True),
+        (90, False, False, True, True, True),
+    ],
+)
+def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
+    monkeypatch,
+    sm_version,
+    use_cute_dsl,
+    disable_deep_gemm,
+    rubin_available,
+    int32_scale,
+    expected_ue8m0,
+):
+    import tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend as vanilla_mod
+    import tensorrt_llm._torch.modules.linear as linear_mod
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+    monkeypatch.setattr(vanilla_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
+    # Pick an amax where amax / 448.0 is not a power of two so UE8M0 vs
+    # float32 activation scales produce distinct QDQ values. The range is
+    # asymmetric so quantization errors do not cancel in the all-ones projection.
+    qr = torch.linspace(-120.0, 300.0, 128, dtype=torch.bfloat16).reshape(1, 128)
+    weight = torch.ones(129, 128, dtype=torch.float8_e4m3fn)
+    raw_weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
+    weight_scale = (
+        transform_sf_into_required_layout(
+            raw_weight_scale,
+            mn=129,
+            k=128,
+            recipe=(1, 128, 128),
+            is_sfa=False,
+        )
+        if int32_scale
+        else raw_weight_scale
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=128,
+        out_features=129,
+        dtype=torch.bfloat16,
+        use_cute_dsl_blockscaling_mm=use_cute_dsl,
+        disable_deep_gemm=disable_deep_gemm,
+    )
+
+    assert DSAVanillaIndexer._fp8_block_scales_uses_ue8m0(linear) is expected_ue8m0
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=expected_ue8m0)
+    other_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=not expected_ue8m0)
+    assert not torch.equal(qdq_qr, other_qdq_qr)
+    expanded_scale = raw_weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        qdq_qr.to(torch.bfloat16),
+        (weight.float() * expanded_scale[:129, :128]).to(torch.bfloat16),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_vanilla_indexer_fp8_block_qdq_matches_native_quantizer(monkeypatch, use_ue8m0):
+    num_tokens = 4
+    in_features = 256
+    out_features = 129
+    num_blocks = in_features // 128
+    torch.manual_seed(0)
+    # Rows span several magnitudes so block scales cover small, unit, and
+    # large amax values in both scale formats.
+    row_scales = torch.tensor([[1e-3], [1.0], [30.0], [300.0]])
+    qr = (torch.randn(num_tokens, in_features) * row_scales).to(torch.bfloat16)
+
+    q_fp8, activation_scales = torch.ops.trtllm.fp8_quantize_1x128(qr.cuda(), use_ue8m0=use_ue8m0)
+    # fp8_quantize_1x128 stores scales block-major as [num_blocks, M padded to
+    # 4]; M == 4 keeps that layout identical on SM90 and SM100.
+    native_scales = activation_scales.reshape(-1)[: num_blocks * num_tokens]
+    native_scales = native_scales.view(num_blocks, num_tokens).T
+    native_qdq_qr = (
+        (q_fp8.float().view(num_tokens, num_blocks, 128) * native_scales.unsqueeze(-1))
+        .reshape(num_tokens, in_features)
+        .to(qr.dtype)
+        .cpu()
+    )
+
+    # Compare QDQ values directly so the projection cannot hide a mismatch.
+    vanilla_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=use_ue8m0)
+    if use_ue8m0:
+        torch.testing.assert_close(vanilla_qdq_qr, native_qdq_qr, atol=0, rtol=0)
+    else:
+        # The kernel is built with --use_fast_math, so its float32 448 / amax
+        # and reciprocal can differ from IEEE division by one ulp. Compare E4M3
+        # codes and allow only rare moves to an adjacent code.
+        vanilla_codes = (
+            (
+                vanilla_qdq_qr.float().view(num_tokens, num_blocks, 128)
+                / native_scales.cpu().unsqueeze(-1)
+            )
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .int()
+        )
+        native_codes = q_fp8.cpu().view(num_tokens, num_blocks, 128).view(torch.uint8).int()
+        code_diff = (vanilla_codes - native_codes).abs()
+        assert code_diff.max().item() <= 1
+        assert (code_diff != 0).float().mean().item() <= 0.01
+
+    monkeypatch.setattr(
+        DSAVanillaIndexer,
+        "_fp8_block_scales_uses_ue8m0",
+        staticmethod(lambda linear: use_ue8m0),
+    )
+    weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
+    weight_scale = torch.tensor([[0.25, 0.125], [0.5, 1.0]], dtype=torch.float32)
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=in_features,
+        out_features=out_features,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The QDQ input is pinned to the native quantizer above, so the projection
+    # check covers how _wq_projection_reference applies it and the weight scales.
+    expanded_scale = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        vanilla_qdq_qr,
+        (weight.float() * expanded_scale[:out_features, :in_features]).to(torch.bfloat16),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_weighted_relu_scores_query_tiling_matches_single_pass():
+    torch.manual_seed(0)
+    num_queries = DSAVanillaIndexer._SCORE_QUERY_TILE * 2 + 17
+    num_keys = 37
+    num_heads = 4
+    head_dim = 8
+    q = torch.randn(num_queries, num_heads, head_dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(num_keys, head_dim, dtype=torch.float32)
+    weights = torch.randn(num_queries, num_heads, dtype=torch.float32)
+    mask = torch.tril(torch.ones(num_queries, num_keys, dtype=torch.bool), diagonal=3)
+
+    actual = DSAVanillaIndexer.weighted_relu_scores(q, k, weights, mask)
+
+    scores = torch.matmul(q.float().transpose(0, 1), k.float().T)
+    scores = torch.where(mask.unsqueeze(0), scores, scores.new_zeros(())).relu()
+    expected = (weights.T.unsqueeze(-1) * scores).sum(dim=0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_weight():
+    in_features = 16
+    out_features = 2
+    packed_weight = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * out_features,
+        dtype=torch.uint8,
+    )
+    linear_scales = torch.tensor([[1.0], [2.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scales[0, 0]
+    interleaved_scales[16] = linear_scales[1, 0]
+    weight_scale_2 = torch.tensor(0.5)
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=weight_scale_2,
+        input_scale=None,
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=False),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=out_features,
+    )
+    qr = torch.arange(in_features, dtype=torch.float32).reshape(1, -1) / in_features
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    real_scales = linear_scales.view(torch.float8_e4m3fn).float() * weight_scale_2
+    dequant_weight = DSAVanillaIndexer.dequantize_fp4(packed_weight, real_scales, gran_k=16)
+    expected = torch.nn.functional.linear(qr, dequant_weight)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_nvfp4_activation_qdq_matches_rne_and_satfinite():
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    actual_codes = DSAVanillaIndexer._to_e2m1_rne(midpoints)
+    expected_codes = torch.tensor([0, 2, 2, 4, 4, 6, 6], dtype=torch.int8)
+    torch.testing.assert_close(actual_codes, expected_codes)
+
+    e4m3_values = torch.tensor([1.0625, 1.1875, 448.0, 449.0, 500.0])
+    actual_scales = DSAVanillaIndexer._round_to_e4m3_rne_satfinite(e4m3_values)
+    torch.testing.assert_close(actual_scales, torch.tensor([1.0, 1.25, 448.0, 448.0, 448.0]))
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_activation_qdq():
+    in_features = 16
+    packed_weight = torch.full((1, in_features // 2), 0x22, dtype=torch.uint8)
+    linear_scale = torch.tensor([[1.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scale[0, 0]
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=torch.tensor(1.0),
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=True),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=1,
+    )
+    qr = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2], dtype=torch.float32)
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The RNE E2M1 values sum to 20 per eight inputs; the dequantized weight
+    # is all ones, so two repetitions produce 40.
+    torch.testing.assert_close(actual, torch.tensor([[40.0]]))
+
+
+@pytest.mark.parametrize(
+    "use_fp8_ds_mla,skip_rope,expected_rope_calls,expected_append",
+    [
+        pytest.param(False, False, 0, False, id="regular-rope-already-appended"),
+        pytest.param(False, True, 0, True, id="regular-pre-rotated"),
+        pytest.param(True, False, 1, True, id="fp8-ds-mla-deferred-rope"),
+        pytest.param(True, True, 0, True, id="fp8-ds-mla-pre-rotated"),
+    ],
+)
+def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
+    use_fp8_ds_mla,
+    skip_rope,
+    expected_rope_calls,
+    expected_append,
+):
+    attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
+    attention.layer_idx = 0
+
+    q = torch.empty(1, 1)
+    latent_cache = torch.empty(1, 1)
+    q_pe = torch.empty(1, 1)
+    topk = torch.tensor([[0]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        multi_item_part_lens=None,
+        kv_cache_manager=SimpleNamespace(
+            use_fp8_ds_mla=use_fp8_ds_mla,
+            layer_offsets={0: 0},
+        ),
+        num_contexts=0,
+        num_seqs=1,
+        num_ctx_tokens=0,
+        num_tokens=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([4], dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        latent_cache=latent_cache,
+        q_pe=q_pe,
+        skip_mla_rope_generation=skip_rope,
+        sparse_backend_args=DSABackendForwardArgs(topk_indices=topk),
+    )
+    expected = torch.empty(1, 1)
+
+    with (
+        patch.object(attention, "_apply_mla_rope") as apply_rope,
+        patch.object(attention, "_select_local_topk", return_value=topk) as select_local_topk,
+        patch.object(attention, "_local_topk_to_global", return_value=topk) as local_topk_to_global,
+        patch.object(attention, "_forward_sparse", return_value=expected) as forward_sparse,
+    ):
+        actual = attention.forward(q, None, None, metadata, forward_args=forward_args)
+
+    assert actual is expected
+    assert apply_rope.call_count == expected_rope_calls
+    if expected_rope_calls:
+        # The single generation token follows three cached tokens.
+        torch.testing.assert_close(
+            apply_rope.call_args.args[3], torch.tensor([3], dtype=torch.int32)
+        )
+    assert forward_sparse.call_args.kwargs["append_cache"] is expected_append
+    select_local_topk.assert_called_once_with(q, None, metadata, forward_args)
+    local_topk_to_global.assert_called_once_with(topk, metadata, 0, True)
+
+
+def test_vanilla_fp4_cache_write_preserves_packed_scale_bytes():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_idx = 0
+    indexer.head_dim = 4
+    indexer.use_fp4 = True
+    cache = torch.zeros(32, dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_indexer_k_cache_buffers=lambda layer_idx: cache),
+        slot_mapping_fp8=torch.tensor([0, 2], dtype=torch.int64),
+        slot_mapping_scale=torch.tensor([8, 12], dtype=torch.int64),
+    )
+    packed_k = torch.tensor([[0x21, 0x43], [0x65, 0x07]], dtype=torch.uint8)
+    packed_scale = torch.tensor([[0x04030201], [0x08070605]], dtype=torch.int32)
+
+    indexer._update_k_cache(packed_k, packed_scale, metadata)
+
+    torch.testing.assert_close(cache[:4], packed_k.flatten())
+    torch.testing.assert_close(cache[8:16], packed_scale.view(torch.uint8).flatten())
+
+
+def test_vanilla_local_topk_uses_trtllm_pool_coordinates():
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_primary_pool_page_index_params=lambda layer_idx: (2, layer_idx)
+        ),
+        _ensure_pool_view_cached=Mock(),
+        _cached_tokens_per_block=64,
+        _cached_block_table_ctx=torch.tensor([[3, 7], [5, 9]], dtype=torch.int32),
+        _cached_block_table_gen=None,
+        _cached_req_idx_ctx=torch.tensor([0, 1], dtype=torch.int32),
+        _cached_req_idx_gen=None,
+    )
+    local_topk = torch.tensor([[0, 65, -1], [63, 64, 130]], dtype=torch.int32)
+
+    actual = DSAVanillaAttention._local_topk_to_global(
+        local_topk, metadata, layer_idx=1, is_generation=False
+    )
+
+    expected = torch.tensor([[448, 961, -1], [767, 1216, -1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+    metadata._ensure_pool_view_cached.assert_called_once_with()
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_vanilla_inline_scale_latent_round_trip(kv_layout):
+    latent = torch.randn(3, 576, dtype=torch.bfloat16)
+
+    packed = DSAVanillaAttention._pack_inline_scale_latent(latent, torch.bfloat16)
+    # Logical pages are physically reordered, with padding between valid IDs
+    # and only one live token in the final two-token page.
+    kv_cache = torch.zeros(3, 1, 2, 1, packed.shape[-1], dtype=packed.dtype)
+    kv_cache[2, 0, :, 0, :] = packed[:2]
+    kv_cache[0, 0, 0, 0, :] = packed[2]
+    if kv_layout == "HND":
+        kv_cache = kv_cache.transpose(2, 3)
+    actual = DSAVanillaAttention._load_latent_cache(
+        kv_cache, [2, -1, 0], latent.shape[0], kv_layout, use_fp8_ds_mla=True
+    )
+
+    assert packed.shape == (3, 328)
+    torch.testing.assert_close(actual[:, 512:], latent[:, 512:].float())
+    torch.testing.assert_close(actual[:, :512], latent[:, :512].float(), atol=0.05, rtol=0.05)
+
+
+def _make_vanilla_scoring_metadata(*, skip_context=False):
+    dense_topk = torch.tensor([[0, -1], [0, 1], [0, 1]], dtype=torch.int32)
+    return SimpleNamespace(
+        num_contexts=1,
+        num_generations=1,
+        num_seqs=2,
+        num_ctx_tokens=2,
+        num_tokens=3,
+        seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([2, 1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([3, 3], dtype=torch.int32),
+        compress_ratios=[1],
+        skip_indexer_for_ctx_reqs=skip_context,
+        skip_indexer_for_gen_reqs=False,
+        topk_indices_buffer=dense_topk,
+        in_mtp_draft_loop=False,
+        indexer_skip_topk=False,
+        shared_topk_indices=None,
+        mtp_num_accepted=None,
+        cuda_graph_buffers={},
+        is_cuda_graph=False,
+        get_empty=Mock(
+            side_effect=lambda _, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"])
+        ),
+    )
+
+
+def _make_vanilla_scoring_indexer():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_topk = 2
+    indexer.use_fp4 = False
+    indexer.mtp_index_share = False
+    indexer._gather_keys = MethodType(
+        lambda _self, metadata, seq_idx, kv_len: torch.tensor(
+            [[1.0], [3.0], [2.0]] if seq_idx == 0 else [[4.0], [1.0], [2.0]]
+        )[:kv_len],
+        indexer,
+    )
+    return indexer
+
+
+def test_vanilla_indexer_uses_dense_topk_when_context_scoring_is_skipped():
+    indexer = _make_vanilla_scoring_indexer()
+    metadata = _make_vanilla_scoring_metadata(skip_context=True)
+    indexer._gather_keys = Mock(side_effect=AssertionError("indexer scoring was not skipped"))
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(2, 1),
+        q_fp8=torch.ones(2, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(2, 1),
+        is_generation=False,
+    )
+
+    torch.testing.assert_close(actual, metadata.topk_indices_buffer[:2])
 
 
 @pytest.mark.parametrize("use_self_sampling", [True, False])
@@ -878,22 +1367,6 @@ def test_metadata_spec_update_resizes_radix_workspace(
     metadata._create_radix_aux_buffers.assert_called_once_with(True)
 
 
-def _ceil_to_ue8m0(x: torch.Tensor):
-    """Round tensor values up to the nearest power of two (UE8M0 format)."""
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division."""
-    return (a + b - 1) // b
-
-
-def _load_cast_back_from_fp4():
-    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
-
-    return cast_back_from_fp4
-
-
 def create_dsa_cache_manager(
     batch_size: int,
     head_dim: int,
@@ -1610,146 +2083,6 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
-def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims, use_ue8m0=False):
-    """
-    Cast tensor to FP8 per custom dimensions.
-    For kv, we quantize along dimension 0 (sequence dimension).
-    """
-    excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
-    x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
-    sf = x_amax / 448.0
-    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled, sf.squeeze()
-
-
-def _ref_fp8_paged_mqa_logits(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    num_tokens: torch.Tensor,
-    num_kv_tokens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-    compress_ratio: int = 1,
-):
-    """
-    Reference implementation of fp8_paged_mqa_logits (optimized version).
-
-    Args:
-        q: [batch_size, next_n, num_heads, head_dim]
-        kv_cache: [num_blocks, block_size, 1, head_dim]
-        weights: [batch_size * next_n, num_heads]
-        num_tokens: [batch_size]
-        num_kv_tokens: [batch_size]
-        block_tables: [batch_size, max_num_blocks]
-        max_model_len: Maximum sequence length
-        compress_ratio: Compression ratio for the KV cache
-
-    Returns:
-        logits: [batch_size * next_n, max_model_len]
-    """
-    batch_size, next_n, _, _ = q.size()
-    _, block_size, _, _ = kv_cache.size()
-
-    logits = torch.full(
-        [batch_size * next_n, max_model_len],
-        float("-inf"),
-        device=q.device,
-        dtype=torch.float32,
-    )
-
-    num_tokens_list = num_tokens.tolist()
-    num_kv_tokens_list = num_kv_tokens.tolist()
-
-    for i in range(batch_size):
-        num_token = num_tokens_list[i]
-        num_kv_token = num_kv_tokens_list[i]
-
-        # Query positions: [num_token - next_n, ..., num_token - 1]
-        q_offsets = torch.arange(num_token - next_n, num_token, device="cuda")
-
-        # Transpose weights for this sequence: [num_heads, next_n]
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
-
-        # Process each block in the sequence
-        for block_rk in range(cdiv(num_kv_token, block_size)):
-            block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
-
-            # Key positions in this block
-            k_offsets = torch.arange(
-                block_rk * block_size,
-                (block_rk + 1) * block_size,
-                device="cuda",
-            )
-
-            # Causal mask: k_pos < num_token AND k_pos < (q_pos + 1) // compress_ratio
-            k_mask = k_offsets[None, :] < num_kv_token
-            causal_mask = k_offsets[None, :] < (q_offsets[:, None] + 1) // compress_ratio
-            mask = k_mask & causal_mask
-
-            # Compute attention scores: [num_heads, next_n, block_size]
-            s = torch.where(
-                mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype),
-                float("-inf"),
-            )
-
-            # Apply ReLU, multiply by weights, and sum over heads
-            s = torch.relu(s) * weight_slice[..., None]
-            s = s.sum(dim=0)  # [next_n, block_size]
-
-            # Write to output with additional causal mask
-            logits[
-                i * next_n : (i + 1) * next_n,
-                block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(causal_mask, s, float("-inf"))
-
-    return logits
-
-
-def _ref_fp8_mqa_logits(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-):
-    """
-    Reference implementation of fp8_mqa_logits.
-    out_ij = q[i, :, :] @ kv[j, :] # [num_heads]
-    out_ij = out_ij.relu() * weights[i, :]
-    out_ij = out_ij.sum()  # Scalar
-
-    Args:
-        q: [seq_len, num_heads, head_dim]
-        kv: [seq_len_kv, head_dim]
-        weights: [seq_len, num_heads]
-        cu_seqlen_ks: [seq_len]
-        cu_seqlen_ke: [seq_len]
-
-    Returns:
-        logits: [seq_len, seq_len_kv]
-    """
-
-    seq_len_kv = kv.shape[0]
-
-    k = kv
-    q = q.float()
-    k = k.float()
-
-    mask_lo = torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
-    mask_hi = torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
-    mask = mask_lo & mask_hi
-
-    score = torch.einsum("mhd,nd->hmn", q, k)
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
-
-    return logits
-
-
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("compress_ratio", [1, 4])
@@ -1798,7 +2131,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,))
     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
@@ -1807,7 +2140,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     )
     assert logits.dtype == torch.float32, f"Expected dtype torch.float32, got {logits.dtype}"
 
-    ref_logits = _ref_fp8_mqa_logits(
+    ref_logits = mqa_logits(
         q=q,
         kv=kv,
         weights=weights,
@@ -1843,7 +2176,7 @@ def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
 
     logits = deep_gemm.fp8_mqa_logits(
         q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
@@ -2763,7 +3096,7 @@ def test_indexer_decode_with_paged_kv_cache(
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_kv_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q,
         kv_cache_bf16,
         weights,
@@ -2841,14 +3174,12 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend, dsa
       bytes the kernel sees) so FP4 quantization noise cancels in the
       diff check.
     """
-    # Lazy import: cast_back_from_fp4 is a pure-Python helper in the
-    # kernel-layer FP4 test file. Pulling it in here avoids duplicating
-    # the ~50-line FP4 quant/dequant family. byte-for-byte equivalence
-    # between fused_cat_fp4 and per_token_cast_to_fp4(use_ue8m0=True,
-    # gran_k=32, use_packed_ue8m0=True) is asserted by
-    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
-    # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
-    cast_back_from_fp4 = _load_cast_back_from_fp4()
+    # The golden reference owns the FP4 quant/dequant family. fused_cat_fp4
+    # is byte-for-byte equal to DeepGEMM's per_token_cast_to_fp4(use_ue8m0=True,
+    # gran_k=32, use_packed_ue8m0=True) -- asserted by
+    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm -- so the
+    # reference dequantizer decodes fused_cat_fp4's output directly.
+    cast_back_from_fp4 = DSAVanillaIndexer.dequantize_fp4
     from tensorrt_llm._torch.attention.backends.sparse.dsa import _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
@@ -3172,7 +3503,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend, dsa
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q_simulated.float(),
         kv_cache_sim,
         weights,
@@ -5327,3 +5658,103 @@ def test_topk_indices_buffer_cuda_graph(dsa_cache_manager):
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+# --- The subclass seams of Indexer.sparse_attn_indexer ----------------------------------------
+
+
+def _seam_indexer():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    return indexer
+
+
+def test_reused_topk_copy_is_the_row_copy():
+    gen = torch.Generator().manual_seed(0)
+    shared = torch.randint(0, 1000, (4, 16), generator=gen, dtype=torch.int32)
+    buffer = torch.full((12, 16), -1, dtype=torch.int32)
+    expected = buffer.clone()
+    expected[2:5, :] = shared[:3, :]
+
+    _seam_indexer()._copy_reused_topk(
+        SimpleNamespace(shared_topk_indices=shared), buffer, 2, 3, 3, False, None
+    )
+
+    assert torch.equal(buffer, expected)
+
+
+def test_fill_decode_topk_leaves_the_rows_to_the_decode_branch():
+    buffer = torch.full((6, 8), -1, dtype=torch.int32)
+
+    filled = _seam_indexer()._fill_decode_topk(SimpleNamespace(), None, None, buffer, 0, 6)
+
+    assert filled is False
+    assert bool((buffer == -1).all())
+
+
+def _stored_rows_inline(
+    indexer,
+    topk_indices_buffer,
+    metadata,
+    num_contexts,
+    num_generations,
+    num_gen_tokens,
+    token_offset,
+    has_prefill,
+    has_decode,
+    is_generation,
+):
+    """The statements ``sparse_attn_indexer`` ran in place of ``_store_mtp_shared_rows``."""
+    rows = None
+    if has_decode:
+        next_n = num_gen_tokens // num_generations
+        gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+        rows = indexer._mtp_last_accepted_rows(
+            gen_topk, metadata, num_contexts, num_generations, next_n
+        )
+    if has_prefill:
+        ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+        ctx_rows = topk_indices_buffer[ctx_last]
+        rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+    if rows is not None:
+        shared_topk_indices = metadata.shared_topk_indices
+        if shared_topk_indices is None:
+            metadata.shared_topk_indices = rows.contiguous()
+        else:
+            row_start = num_contexts if is_generation else 0
+            shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(rows)
+
+
+@pytest.mark.parametrize("has_prefill, has_decode", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("is_generation", [True, False])
+@pytest.mark.parametrize("preset", [False, True], ids=["unset", "preset"])
+@pytest.mark.parametrize("accepted", [None, (0, 0, 1, 4, 2)], ids=["no_counts", "counts"])
+def test_mtp_shared_rows_are_the_inline_statements(
+    has_prefill, has_decode, is_generation, preset, accepted
+):
+    num_contexts, num_generations, next_n = 2, 3, 4
+    seq_lens = torch.tensor([5, 3] + [next_n] * num_generations, dtype=torch.int32)
+    token_offset = int(seq_lens[:num_contexts].sum())
+    num_gen_tokens = num_generations * next_n
+    gen = torch.Generator().manual_seed(1)
+    buffer = torch.randint(
+        0, 1000, (token_offset + num_gen_tokens, 6), generator=gen, dtype=torch.int32
+    )
+
+    def metadata():
+        return SimpleNamespace(
+            seq_lens_cuda=seq_lens.clone(),
+            mtp_num_accepted=None if accepted is None else torch.tensor(accepted),
+            shared_topk_indices=(torch.full((8, 8), -7, dtype=torch.int32) if preset else None),
+        )
+
+    args = (num_contexts, num_generations, num_gen_tokens, token_offset)
+    flags = (has_prefill, has_decode, is_generation)
+    expected, got = metadata(), metadata()
+    indexer = _seam_indexer()
+    _stored_rows_inline(indexer, buffer.clone(), expected, *args, *flags)
+    seam_buffer = buffer.clone()
+    indexer._store_mtp_shared_rows(seam_buffer, got, *args, *flags)
+
+    assert torch.equal(seam_buffer, buffer)
+    assert torch.equal(got.shared_topk_indices, expected.shared_topk_indices)

@@ -344,8 +344,8 @@ commands:
         - "--num_postprocess_workers"
       num_serve_frontends:
         type: int
-        default: 1
-        status: prototype
+        default: 8
+        status: beta
         required: false
         multiple: false
         is_flag: false
@@ -378,6 +378,24 @@ commands:
         is_flag: true
         flags:
         - "--openengine-enable-load-metrics"
+      openengine_metrics_host:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-host"
+      openengine_metrics_port:
+        type: int
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-metrics-port"
       otlp_traces_endpoint:
         type: str
         default: null

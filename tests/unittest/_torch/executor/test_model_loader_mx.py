@@ -22,6 +22,7 @@ from utils.post_transform_qualification import (
     assert_post_transform_lifecycle_equivalent,
 )
 
+import tensorrt_llm._torch.weight_sharing as weight_sharing_mod
 import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
 from tensorrt_llm._torch.attention import mla as mla_mod
@@ -34,6 +35,7 @@ from tensorrt_llm._torch.models import modeling_phi3 as modeling_phi3_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
@@ -733,7 +735,29 @@ def _format_documented_values(
     return " or ".join(labels.get(value, str(value)) for value in sorted(values, key=str))
 
 
-def _documented_dense_constraints(profile: PostTransformProfile) -> str:
+# Constraint phrases of the public support table, keyed by registry values.
+# A profile that needs a new phrase adds it here rather than special-casing
+# its model type.
+_DOCUMENTED_SCOPES = {
+    PostTransformTransferScope.TARGET_MODEL: "dense {dtypes}",
+    PostTransformTransferScope.COMPLETE_MODEL: (
+        "dense {dtypes} vision-language model with its vision encoder"
+    ),
+}
+# Keyed by the profile's (`rope_types`, `rope_fusion`) constraints.
+_DOCUMENTED_ROPE = {
+    (frozenset({"default"}), frozenset({True})): "default fused RoPE",
+    (frozenset({"default"}), frozenset({False})): "default fused QK-norm/RoPE",
+    (frozenset({"mrope"}), frozenset({False})): "fused QK-norm/M-RoPE",
+}
+_DOCUMENTED_SLIDING_WINDOWS = {
+    None: "",
+    frozenset({"none"}): ", no sliding window",
+}
+
+
+def _documented_constraints(profile: PostTransformProfile) -> str:
+    """Render the support-table constraint text that a registry profile implies."""
     constraints = profile.runtime_constraints
     assert constraints.quant_algorithms == frozenset({"none"})
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
@@ -744,11 +768,6 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     assert constraints.tied_word_embeddings == frozenset({False})
-    assert constraints.rope_types == frozenset({"default"})
-    qwen3_profile = profile.model_type == "qwen3"
-    assert constraints.rope_fusion == frozenset({not qwen3_profile})
-    mistral_profile = profile.model_type == "mistral"
-    assert constraints.sliding_windows == (frozenset({"none"}) if mistral_profile else None)
     assert constraints.moe_backends is None
     assert constraints.moe_tp_sizes is None
     assert constraints.moe_ep_sizes is None
@@ -765,10 +784,11 @@ def _documented_dense_constraints(profile: PostTransformProfile) -> str:
     attention_backends = _format_documented_values(constraints.attention_backends)
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
-    rope_description = "default fused QK-norm/RoPE" if qwen3_profile else "default fused RoPE"
-    sliding_window_description = ", no sliding window" if mistral_profile else ""
+    model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(dtypes=dtypes)
+    rope_description = _DOCUMENTED_ROPE[(constraints.rope_types, constraints.rope_fusion)]
+    sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
     return (
-        f"Single-node dense {dtypes}, unquantized weights and KV cache, "
+        f"Single-node {model_description}, unquantized weights and KV cache, "
         f"{attention_backends} attention, {rope_description}{sliding_window_description}, "
         f"untied embeddings, TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
         "attention DP, speculative mode, or separately loaded draft model"
@@ -800,7 +820,7 @@ def test_public_support_table_matches_qualified_profile_registry() -> None:
             f"| `{profile.profile_id}` | `{profile.root_model_class.class_name}` | "
             f"`{profile.architecture}` / `{profile.model_type}` | {scope} | "
             f"{profile.protocol_version} | `{profile.transform_abi_id}` | "
-            f"{_documented_dense_constraints(profile)} |"
+            f"{_documented_constraints(profile)} |"
         )
         assert expected_row in table_rows
 
@@ -870,7 +890,21 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     if begin < 0:
         pytest.fail(f"{doc} has no anchor {start!r} before {end!r}; update this test's anchors")
     enumeration = text[begin + len(start) : stop]
-    return {re.match(r"\w+", item).group() for item in re.split(r",? and |, ", enumeration)}
+    return {re.match(r"[\w.]+", item).group() for item in re.split(r",? and |, ", enumeration)}
+
+
+def _profile_family(profile: PostTransformProfile) -> str:
+    """Return the family that names a profile's donor/receiver rows, such as `qwen3_5`.
+
+    A profile ID names its family before `-for-`.
+    """
+    return profile.profile_id.split("-for-")[0]
+
+
+def _documented_family(profile: PostTransformProfile) -> str:
+    """Return the family name by which the doc refers to a profile, such as `Qwen3.5`."""
+    family = re.sub(r"For(?:CausalLM|ConditionalGeneration)$", "", profile.architecture)
+    return family.replace("_", ".")
 
 
 @pytest.mark.cpu_only
@@ -885,11 +919,11 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
     for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = profile.profile_id.split("-for-causal-lm-")[0]
+        family = _profile_family(profile)
         for tp_size in (1, 2):
             case_id = f"{family}-bf16-tp{tp_size}"
             expected_case_ids.add(case_id)
-            assert cases[case_id] == {
+            expected_row = {
                 "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
                 "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
                 "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
@@ -897,6 +931,10 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
             }
+            if profile.transfer_scope is PostTransformTransferScope.COMPLETE_MODEL:
+                # A complete-model profile carries a vision encoder, so its rows probe with images.
+                expected_row["probe"] = "image"
+            assert cases[case_id] == expected_row
             assert case_id in ci_case_ids[2 * tp_size]
 
     assert set(cases) == expected_case_ids
@@ -913,16 +951,21 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
     in the "Qualification Test" section.
     """
     profiles = ModelLoader._post_transform_profile_registry().profiles
-    families = {profile.architecture.removesuffix("ForCausalLM") for profile in profiles}
+    families = {_documented_family(profile) for profile in profiles}
+    text_only_families = {
+        _documented_family(profile)
+        for profile in profiles
+        if profile.transfer_scope is PostTransformTransferScope.TARGET_MODEL
+    }
     fused_rope_families = {
-        profile.architecture.removesuffix("ForCausalLM")
+        _documented_family(profile)
         for profile in profiles
         if profile.runtime_constraints.rope_fusion == frozenset({True})
     }
     documentation = _repository_text("docs/source/features/model-express.md")
     text = " ".join(documentation.split())
 
-    assert _documented_names(text, "The ", " profiles are text-only") == families
+    assert _documented_names(text, "The ", " profiles are text-only") == text_only_families
     assert (
         _documented_names(
             text,
@@ -939,8 +982,8 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9]*-bf16-tp\d+\b", qualification_test)) == set(cases)
-    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9]+_MODEL\b", qualification_test)) == {
+    assert set(re.findall(r"\b[a-z][a-z0-9_]*-bf16-tp\d+\b", qualification_test)) == set(cases)
+    assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
 
@@ -1192,6 +1235,167 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(
     assert model.linear._weights_transformed is True
     assert model.draft_model.linear._weights_transformed is True
     assert events == ["setup_aliases", "setup_aliases", "cache_derived_state"]
+
+
+class _TinyParameterModule(nn.Module):
+    """One-parameter module standing in for a language model or an encoder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(2))
+
+
+class _TinyMultimodalModel(MultimodalModelMixin, _TinyModel):
+    """`_TinyModel` with a language model and an optional local encoder."""
+
+    def __init__(self, events: list[str], *, with_encoder: bool) -> None:
+        super().__init__(events)
+        self.llm = _TinyParameterModule()
+        self.mm_encoder = _TinyParameterModule() if with_encoder else None
+
+    @property
+    def language_model(self) -> nn.Module:
+        """Return the inner language model."""
+        return self.llm
+
+
+class _UnknownLanguageModelMultimodalModel(_TinyMultimodalModel):
+    """Registered multimodal root that keeps the mixin's raising `language_model`."""
+
+    language_model = MultimodalModelMixin.language_model
+
+
+class _UnregisteredMultimodalModel(_TinyMultimodalModel):
+    """Multimodal root without a profile; its language model must not be queried."""
+
+    @property
+    def language_model(self) -> nn.Module:
+        """Fail if scope derivation inspects an unregistered root."""
+        raise AssertionError("language_model queried for an unregistered root")
+
+
+def _tiny_multimodal_profile(
+    root_model_class: type[nn.Module],
+) -> PostTransformProfile:
+    """Return a complete-model test profile for `root_model_class`."""
+    return PostTransformProfile(
+        profile_id=f"{root_model_class.__name__}-complete-v1",
+        root_model_class=root_model_class,
+        architecture="TinyForCausalLM",
+        model_type="tiny",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+        transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+        runtime_constraints=PostTransformRuntimeConstraints(),
+    )
+
+
+@pytest.mark.cpu_only
+def test_post_transform_transfer_scope_is_derived_from_the_root(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registered multimodal root is the complete model only with a local encoder.
+
+    Text-only and unregistered roots keep the target-model scope without
+    querying `language_model`, and a registered root whose language model is
+    unknown keeps it too instead of raising, so qualification never breaks a
+    plain load.
+    """
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(
+            profiles=(
+                _tiny_multimodal_profile(_TinyMultimodalModel),
+                _tiny_multimodal_profile(_UnknownLanguageModelMultimodalModel),
+            )
+        ),
+    )
+    derive_scope = ModelLoader._post_transform_transfer_scope
+
+    assert derive_scope(_TinyModel([])) is PostTransformTransferScope.TARGET_MODEL
+    assert (
+        derive_scope(_TinyMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.COMPLETE_MODEL
+    )
+    assert (
+        derive_scope(_TinyMultimodalModel([], with_encoder=False))
+        is PostTransformTransferScope.LANGUAGE_MODEL
+    )
+    assert (
+        derive_scope(_UnknownLanguageModelMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.TARGET_MODEL
+    )
+    assert (
+        derive_scope(_UnregisteredMultimodalModel([], with_encoder=True))
+        is PostTransformTransferScope.TARGET_MODEL
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "with_encoder",
+    [True, False],
+    ids=["complete-model", "language-model"],
+)
+def test_mx_load_offers_post_transform_weights_only_for_the_registered_scope(
+    monkeypatch: pytest.MonkeyPatch,
+    with_encoder: bool,
+) -> None:
+    """An MX load accepts post-transform weights only when the derived scope matches.
+
+    The profile registers the complete model, so a multimodal root without a
+    local encoder falls back to native loading before any transfer.
+    """
+    events: list[str] = []
+    loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        PostTransformProfileRegistry(profiles=(_tiny_multimodal_profile(_TinyMultimodalModel),)),
+    )
+    monkeypatch.setattr(
+        model_loader_mod.AutoModelForCausalLM,
+        "from_config",
+        MagicMock(return_value=_TinyMultimodalModel(events, with_encoder=with_encoder)),
+    )
+    checkpoint_loader = _PostTransformMxLoader(post_transform=True)
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is with_encoder
+    if with_encoder:
+        assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+        loader._call_load_weights.assert_not_called()
+        checkpoint_loader.post_load_publish.assert_called_once_with(
+            model,
+            checkpoint_dir="/ckpt",
+            weights_preloaded=True,
+            source_identity=loader._source_identity,
+        )
+    else:
+        assert loader._source_identity.transform_abi_id is None
+        assert loader._call_load_weights.call_count == 1
+        checkpoint_loader.post_load_publish.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_qualified_profiles_bind_published_transform_abis() -> None:
+    """Every ABI that a registered profile binds is exported by `weight_sharing`.
+
+    The `SourceIdentity` ABI tests iterate the exported constants, so an ABI
+    missing from `__all__` would otherwise escape them.
+    """
+    published = {
+        getattr(weight_sharing_mod, name)
+        for name in weight_sharing_mod.__all__
+        if re.fullmatch(r".*_POST_TRANSFORM_LAYOUT_ABI_V\d+", name)
+    }
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+
+    assert {profile.transform_abi_id for profile in profiles} <= published
 
 
 def test_default_profile_qualifies_real_tiny_llama_lifecycle(
@@ -2559,7 +2763,7 @@ def test_linear_transform_weights_is_idempotent():
 
 @pytest.mark.cpu_only
 def test_mla_transform_weights_is_idempotent(monkeypatch):
-    monkeypatch.setattr(mla_mod, "get_sm_version", lambda: 120)
+    monkeypatch.setattr(mla_mod, "is_sm_120f", lambda: True)
     quant_mode = SimpleNamespace(has_fp8_block_scales=lambda: True)
     mla = MLA.__new__(MLA)
     mla.mapping = mapping_mod.Mapping()
