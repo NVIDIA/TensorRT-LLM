@@ -8315,6 +8315,7 @@ class PyExecutor:
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    max_beam_width=self.max_beam_width,
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -8350,6 +8351,7 @@ class PyExecutor:
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                max_beam_width=self.max_beam_width,
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -8450,6 +8452,7 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
+                max_beam_width=self.max_beam_width,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None

@@ -2695,6 +2695,7 @@ class _StubADPExecutor:
         max_num_tokens=8192,
         max_seq_len=8192,
         kv_manager_max_seq_len=None,
+        max_beam_width=1,
         is_warmup=False,
         benchmark_req_queues_size=0,
         enable_adp_dummy_fixes=True,
@@ -2714,6 +2715,7 @@ class _StubADPExecutor:
         self.expected_num_active_requests = 1
         self.max_num_active_requests = 8
         self.max_total_draft_tokens = 0
+        self.max_beam_width = max_beam_width
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
         self._pending_adp_dummy_request = None
@@ -3278,6 +3280,15 @@ def test_pad_dummy_allocation_failure_skips_padding():
     assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
+def test_adp_pad_dummy_uses_engine_beam_width() -> None:
+    stub = _StubADPExecutor(max_beam_width=4)
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["max_beam_width"] == 4
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -3692,6 +3703,15 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
     # and an owner left empty by cancellation.
     assert stub.add_dummy_calls[0]["is_gen"] is True
     assert stub.add_dummy_calls[0]["token_nums"] is None
+
+
+def test_pad_empty_batch_dummy_uses_engine_beam_width() -> None:
+    stub, scheduled_batch = _unfittable_rank(max_beam_width=4)
+
+    _run_pad_empty(stub, scheduled_batch)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert stub.add_dummy_calls[0]["max_beam_width"] == 4
 
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
