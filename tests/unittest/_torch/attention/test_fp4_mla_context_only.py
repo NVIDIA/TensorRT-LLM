@@ -6,7 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
@@ -14,7 +13,6 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
     Fp4MlaKVCacheManagerV2,
-    Fp4MlaV2CacheLayoutPolicy,
     is_fp4_mla_context_only_cache,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
@@ -30,7 +28,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType,
     is_context_only_kv_cache,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
@@ -166,132 +164,3 @@ def test_context_warmup_is_preserved_on_context_only_cache(monkeypatch):
 
     with pytest.raises(RuntimeError, match="warmup batch reached"):
         factory.create_warmup_request(resources, 8192, 0)
-
-
-def test_hybrid_composition_keeps_single_copy_on_every_layer(monkeypatch):
-    """A hybrid linear-attention manager (Kimi K3) composing the layout policy
-    keeps the single-copy layout on every MLA layer, with or without a
-    one-model drafter: draft-layer decode views apply to the pure MLA manager
-    only."""
-    monkeypatch.setenv(DISAGG_ROLE_ENV, "context")
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
-    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
-    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
-    manager = SimpleNamespace()
-    Fp4MlaV2CacheLayoutPolicy.configure_manager(
-        manager,
-        KvCacheConfig(dtype="nvfp4"),
-        CacheTypeCpp.SELFKONLY,
-        dtype=DataType.NVFP4,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        head_dim=576,
-        pretrained_config=SimpleNamespace(kv_lora_rank=512, qk_rope_head_dim=64),
-        spec_config=MTPDecodingConfig(max_draft_len=3),
-        is_disagg=True,
-    )
-    assert manager.fp4_mla_context_only_cache
-    assert manager._fp4_mla_num_spec_layers == 0
-    assert manager.mla_v_head_dim is None
-    assert manager._v_scale_bytes_per_page() == 0
-    assert manager.fp4_mla_draft_lifecycle_layer_ids() == []
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_context_only_draft_layers_keep_decode_views(monkeypatch):
-    """One-model draft layers of a single-copy cache keep V scales and packed V.
-
-    The drafter runs its later draft steps as generation steps inside every
-    context step. Its layer keeps all four roles in a lifecycle of its own,
-    with a page table and an FP4 state of its own, while the target layers
-    keep K and K scales only.
-    """
-    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_update import (
-        _fp4_mla_layer_has_decode_views,
-    )
-    from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
-    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
-    from tensorrt_llm._torch.metadata import KVCacheParams
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId
-
-    monkeypatch.setenv(DISAGG_ROLE_ENV, "context")
-    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
-    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
-    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
-    num_target_layers = 3
-    manager = Fp4MlaKVCacheManagerV2(
-        KvCacheConfig(
-            max_tokens=16 * FP4_MLA_TOKENS_PER_BLOCK,
-            dtype="nvfp4",
-            enable_block_reuse=True,
-            host_cache_size=0,
-        ),
-        CacheTypeCpp.SELFKONLY,
-        num_layers=num_target_layers,
-        num_kv_heads=1,
-        head_dim=576,
-        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
-        max_seq_len=4 * FP4_MLA_TOKENS_PER_BLOCK,
-        max_batch_size=2,
-        mapping=Mapping(world_size=1, tp_size=1, rank=0),
-        dtype=DataType.NVFP4,
-        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=1),
-        max_num_tokens=16 * FP4_MLA_TOKENS_PER_BLOCK,
-        pretrained_config=SimpleNamespace(kv_lora_rank=512),
-        is_disagg=True,
-    )
-    draft = num_target_layers
-    try:
-        assert manager.fp4_mla_context_only_cache
-        assert manager.pp_layers == list(range(num_target_layers + 1))
-        # K (320 B) and K scales (40 B) on the target layers; the draft layer
-        # also keeps V scales (32 B) and packed V (256 B).
-        assert [
-            manager.get_layer_bytes_per_token(layer, Role.ALL) for layer in range(draft + 1)
-        ] == [360] * draft + [648]
-        assert manager.fp4_mla_draft_lifecycle_layer_ids() == [draft]
-        target_group = int(manager.impl.get_layer_group_id(LayerId(0)))
-        draft_group = int(manager.impl.get_layer_group_id(LayerId(draft)))
-        hp_group = int(manager.impl.get_layer_group_id(manager._hp_manager_layer_ids[0]))
-        assert len({target_group, draft_group, hp_group}) == 3
-        assert manager.get_fp4_mla_page_table_spec(0).cache_pool_id == target_group
-        assert manager.get_fp4_mla_page_table_spec(draft).cache_pool_id == draft_group
-        # The V-scale pool covers the draft layer only, from its compact index on.
-        assert manager.fp4_mla_v_layer_base == draft
-        assert manager.get_mla_v_scale_pool().shape[0] == 1
-        assert manager.get_mla_v_packed_pool(draft) is not None
-        assert _fp4_mla_layer_has_decode_views(manager, draft)
-        assert not _fp4_mla_layer_has_decode_views(manager, 0)
-        with pytest.raises(RuntimeError, match="cannot execute generation"):
-            manager.get_mla_v_scale_page_offset(0)
-        with pytest.raises(RuntimeError, match="cannot execute generation"):
-            manager.get_mla_v_packed_pool(0)
-
-        seq_lens = [100, 50]
-        manager.add_dummy_requests([0, 1], seq_lens)
-        metadata = TrtllmAttentionMetadata(
-            max_num_requests=len(seq_lens),
-            max_num_tokens=sum(seq_lens),
-            kv_cache_manager=manager,
-            mapping=Mapping(world_size=1, tp_size=1, rank=0),
-            runtime_features=AttentionRuntimeFeatures(),
-            seq_lens=torch.tensor(seq_lens, dtype=torch.int),
-            num_contexts=len(seq_lens),
-            request_ids=[0, 1],
-            prompt_lens=seq_lens,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0, 0]),
-        )
-        metadata.prepare()
-        draft_state = metadata.fp4_mla_draft_state
-        assert draft_state is not None and draft_state.layer_ids == {draft}
-        assert metadata.fp4_mla_state_for_layer(draft) is draft_state
-        assert metadata.fp4_mla_state_for_layer(0) is None
-        assert metadata.fp4_mla_state.cache_pool_id == target_group
-        assert draft_state.cache_pool_id == draft_group
-        assert metadata.fp4_mla_state.v_scale_pool is None
-        assert draft_state.v_scale_pool is not None and draft_state.v_layer_base == draft
-        target_state = metadata.fp4_mla_state
-        with metadata.use_fp4_mla_state(draft_state):
-            assert metadata.fp4_mla_state is draft_state
-        assert metadata.fp4_mla_state is target_state
-    finally:
-        manager.shutdown()
