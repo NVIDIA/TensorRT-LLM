@@ -39,6 +39,16 @@ from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, reg
 # merge expects. One constant, so a flashinfer convention change is fixed once.
 TRTLLM_GEN_LSE_LN2 = math.log(2.0)
 
+# Largest draft batch whose non-causal, unwindowed TRTLLM block attention runs
+# as B * block_size single-query decode rows instead of one context-FMHA call.
+# Every row reads its request's whole KV, so the row form reads block_size
+# times the KV in exchange for split-KV parallelism, which pays off while the
+# context kernel launches few CTAs, i.e. at small batch. The value is not tuned
+# per architecture: every SM100-family GPU that runs the TRTLLM path takes this
+# same gate. It also bounds the workspace and multi-CTA counter buffers, which
+# are sized for up to this many times block_size requests.
+_NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE = 32
+
 
 def dspark_layer_window_size(
     use_swa: bool, swa_window: int, layer_types, layer_idx: int
@@ -1540,6 +1550,10 @@ class DFlashForCausalLM(nn.Module):
         head_dim: int,
     ) -> None:
         trtllm_gen_ops = self._dflash_trtllm_gen_ops
+        max_num_requests = max(
+            max_batch_size,
+            min(max_batch_size, _NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE) * block_size,
+        )
         workspace_bytes = trtllm_gen_ops.get_workspace_size(
             dtype=dtype,
             num_tokens=max_batch_size * block_size,
@@ -1547,7 +1561,7 @@ class DFlashForCausalLM(nn.Module):
             num_heads=num_heads,
             num_kv_heads=num_kv_heads,
             head_size=head_dim,
-            max_num_requests=max_batch_size,
+            max_num_requests=max_num_requests,
             rotary_embedding_dim=0,
             fp8_context_fmha=False,
         )
@@ -1582,7 +1596,7 @@ class DFlashForCausalLM(nn.Module):
 
         sm_count = self._dflash_trtllm_gen_sm_count
         counter_bytes = trtllm_gen_ops.get_multi_ctas_kv_counter_size(
-            num_heads, max_batch_size, sm_count
+            num_heads, max_num_requests, sm_count
         )
         counters = self._dflash_trtllm_gen_counters
         counters_need_allocation = (
@@ -1784,6 +1798,8 @@ class DFlashForCausalLM(nn.Module):
 
         residual = None
         has_block_conv = self.has_block_conv
+        noncausal_as_decode_rows = B <= _NONCAUSAL_DECODE_ROWS_MAX_BATCH_SIZE
+        row_block_tables = row_seq_lens = None
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn_mod = layer.self_attn
@@ -1916,6 +1932,36 @@ class DFlashForCausalLM(nn.Module):
                         self._dflash_trtllm_gen_workspace,
                         self._dflash_trtllm_gen_counters,
                         out_flat,
+                    )
+                elif noncausal_as_decode_rows and window_left < 0:
+                    # Without a mask every block query attends all
+                    # seq_lens_after keys, so each query can be its own
+                    # single-token decode request over the same pages.
+                    if row_block_tables is None:
+                        row_block_tables = block_tables.repeat_interleave(block_size, dim=0)
+                        row_seq_lens = seq_lens_after.repeat_interleave(block_size)
+                    trtllm_gen_ops.batch_decode_with_kv_cache(
+                        query=q_flat,
+                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+                        workspace_buffer=self._dflash_trtllm_gen_workspace,
+                        block_tables=row_block_tables,
+                        seq_lens=row_seq_lens,
+                        max_seq_len=pages_per_slot * page_size,
+                        bmm1_scale=head_dim**-0.5,
+                        bmm2_scale=1.0,
+                        window_left=window_left,
+                        out=out_flat,
+                        sinks=None,
+                        enable_pdl=False,
+                        kv_layout="HND",
+                        backend="trtllm-gen",
+                        q_len_per_req=1,
+                        max_q_len=None,
+                        cum_seq_lens_q=None,
+                        kv_cache_sf=None,
+                        uses_shared_paged_kv_idx=True,
+                        bmm1_scale_log2=None,
+                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
                     )
                 else:
                     cum_seq_lens_q = torch.arange(

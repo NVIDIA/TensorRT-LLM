@@ -291,6 +291,9 @@ l0_b200:
   - unittest/_torch/speculative/test_dspark_slot_reset_no_sync.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_attention.py
   - unittest/_torch/speculative/test_dspark_cute_dsl_rmsnorm_rope.py
+  # The DFlash TRTLLM block attention runs on trtllm-gen, which is SM100-only;
+  # the rest of the file runs on the Hopper hw_agnostic stage.
+  - unittest/_torch/speculative/hw_agnostic/test_kimi_k3_dspark_semantics.py -k "trtllm_block_decode"
   # Fused strict acceptance and DFlash paged-latent drafter bookkeeping vs
   # their eager paths.
   - unittest/_torch/speculative/test_spec_tail_kernels.py
