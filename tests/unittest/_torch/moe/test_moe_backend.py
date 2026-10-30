@@ -2262,6 +2262,30 @@ def test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_ran
     peer_init.assert_not_called()
 
 
+def test_megamoe_cutedsl_mpi_bootstrap_resolved_loopback_across_hosts_raises(monkeypatch):
+    """A hostname that resolves to loopback is treated like an unresolvable one.
+
+    Debian and Ubuntu map the hostname to 127.0.1.1 in /etc/hosts, so
+    resolution succeeds, but a rank on another host still cannot reach it.
+    """
+    hostnames = ["node0", "node0", "node1", "node1"]
+    monkeypatch.setattr(socket, "gethostbyname", lambda name: "127.0.1.1")
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(dist, "TCPStore", MagicMock(return_value=MagicMock(port=41234)))
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch,
+        rank=0,
+        world=4,
+        bcast=lambda obj, root: obj,
+        allgather=lambda obj: hostnames,
+    )
+    with pytest.raises(RuntimeError, match=r"got loopback 127\.0\.1\.1.*span several hosts"):
+        moe._maybe_init_torch_dist_under_mpi()
+    mpi_comm.bcast.assert_called_once_with(("127.0.1.1", 41234, True, None), root=0)
+    mpi_comm.allgather.assert_called_once_with("node0")
+    init_process_group.assert_not_called()
+
+
 def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
     """A failed bootstrap must fail construction, not fall back to single rank.
 

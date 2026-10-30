@@ -68,6 +68,7 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 import time
@@ -878,11 +879,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                     addr = socket.gethostbyname(socket.gethostname())
                 except OSError:
                     # Unresolvable hostname (minimal containers / broken
-                    # DNS). Loopback reaches rank 0 only from its own host;
-                    # that is checked below on every rank, after the bcast,
-                    # so no rank skips a collective its peers wait in.
+                    # DNS).
                     addr = "127.0.0.1"
-                    loopback = True
+                # A resolvable hostname can also be loopback: Debian and
+                # Ubuntu map it to 127.0.1.1 in /etc/hosts. Loopback reaches
+                # rank 0 only from its own host; that is checked below on
+                # every rank, after the bcast, so no rank skips a collective
+                # its peers wait in.
+                loopback = ipaddress.ip_address(addr).is_loopback
                 store = dist.TCPStore(
                     addr,
                     0,
@@ -907,11 +911,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             hostnames = comm.allgather(socket.gethostname())
             if any(h != hostnames[0] for h in hostnames):
                 raise RuntimeError(
-                    f"[MegaMoECuteDsl] rank 0 could not resolve its hostname "
-                    f"{hostnames[0]!r}, so it can only serve the "
+                    f"[MegaMoECuteDsl] rank 0's hostname {hostnames[0]!r} "
+                    f"does not resolve to an address other hosts can reach "
+                    f"(got loopback {host}), so it can only serve the "
                     f"torch.distributed rendezvous on loopback, but the MPI "
                     f"ranks span several hosts ({sorted(set(hostnames))}). "
-                    f"Fix hostname resolution on rank 0's host."
+                    f"Map rank 0's hostname to a routable address."
                 )
         if store is None:
             store = dist.TCPStore(host, port, world, is_master=False, timeout=default_pg_timeout)
