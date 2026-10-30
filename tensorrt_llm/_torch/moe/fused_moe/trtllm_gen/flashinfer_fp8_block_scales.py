@@ -16,7 +16,12 @@
 
 from ..impl_contract import MoEDeployment, MoEEligibility, MoEProblem
 from ..impl_identity import register_moe_impl
-from .eligibility import check_flashinfer_provider, check_no_expert_bias, check_trtllm_gen_leaf
+from .eligibility import (
+    check_flashinfer_provider,
+    check_gated_activation,
+    check_no_expert_bias,
+    check_trtllm_gen_leaf,
+)
 from .fp8_block_scale import TRTLLMGenFp8BlockScalesBase
 from .identity import PROVIDER_FLASHINFER, trtllm_gen_descriptor
 
@@ -38,5 +43,10 @@ class FlashinferTrtllmGenFp8BlockScalesImpl(TRTLLMGenFp8BlockScalesBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         return check_trtllm_gen_leaf(
-            cls, p, d, check_flashinfer_provider(cls, p, d), check_no_expert_bias(cls, p)
+            cls,
+            p,
+            d,
+            check_flashinfer_provider(cls, p, d),
+            check_no_expert_bias(cls, p),
+            check_gated_activation(cls, p),
         )
