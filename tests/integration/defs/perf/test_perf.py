@@ -95,7 +95,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
     "nemotron_3_super_120b_nvfp4",
     "nemotron_3_super_120b_nvfp4_mtp",
     "nemotron_3_ultra_550b_nvfp4",
-    "glm_5_fp8",
+    "glm_5.3_fp8",
+    "glm_5.3_flash_fp8",
     "minimax_m3_mxfp8",
     "qwen3.6_35b_a3b_fp4",
     "qwen3.6_35b_a3b_fp4_mtp",
@@ -1512,6 +1513,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                           num_requests)
 
     def get_commands(self):
+        """Build performance commands with per-case server log storage."""
         num_gpus = self._config.num_gpus
 
         if is_windows() and num_gpus > 1:
@@ -1583,14 +1585,23 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
                 server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_flash_fp8":
+                # Weight loading and executor warmup can exceed 10 minutes.
+                server_timeout = 3600
             else:
                 server_timeout = 600
+            server_log_dir = None
+            if self._output_dir is not None:
+                server_log_dir = os.path.abspath(
+                    os.path.join(self._output_dir, "detailed_results",
+                                 os.path.basename(engine_dir)))
             return PerfServeScriptTestCmds(server_cmd=server_cmd,
                                            client_cmds=client_cmds,
                                            data_cmds=data_cmds,
                                            server_env=server_env,
                                            server_timeout=server_timeout,
-                                           warmup_passes=warmup_passes)
+                                           warmup_passes=warmup_passes,
+                                           server_log_dir=server_log_dir)
 
         # PyTorch loads model checkpoints directly.
         build_cmd = []

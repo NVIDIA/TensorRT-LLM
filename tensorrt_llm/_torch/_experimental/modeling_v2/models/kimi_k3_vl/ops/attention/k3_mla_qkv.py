@@ -21,7 +21,7 @@ class K3MlaQkv(OpWrapper):
     """Return ``fused_q`` [M, heads * 576] bf16 of the M <= 64 rows of ``ag``, and store each token's cache row
     ``[bf16(rmsnorm(ag[t, 1536:2048]) * w_kv) | ag[t, 2048:2112]]`` into ``pool`` at its request's position."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     CELLS: tuple[Cell, ...] = (
         Cell(
@@ -58,7 +58,7 @@ class K3MlaQkv(OpWrapper):
     k3_mla_q returns the same fused_q bits without storing rows; k3_mla_qkv_out
     stores the same rows densely in bf16 [M, 576]. Query rows are computed in
     chunks of 8, 16 or 32; every eight-token chunk is bit-identical to its own
-    call. The op-level test tests/unittest/_torch/kernels/kimi_k3/test_k3_mla_q.py
+    call. The op-level test tests/unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_q.py
     covers M 1..64 against the unfused RMSNorm/GEMM/bmm chain, 640-element
     interleaved rows, short lengths, refusals, and optional K3_BASE_TRTLLM
     single-request identity. The catalog tests retain the 2e-2 query bound

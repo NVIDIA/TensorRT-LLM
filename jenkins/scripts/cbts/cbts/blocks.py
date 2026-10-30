@@ -445,7 +445,6 @@ _BACKEND_PATTERNS = [
     ("-Triton-", "triton"),
     ("-FMHA-", "fmha"),
     ("-Generic-", "generic"),
-    ("-Verl-", "verl"),
 ]
 
 # Regex mirror of parseTaskConfigFromStageName (jenkins/L0_Test.groovy:2066):
