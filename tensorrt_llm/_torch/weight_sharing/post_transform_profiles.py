@@ -56,6 +56,13 @@ MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-mistral-dense-target-layout
 # tensors plus target-only receiver finalization. Phi3 checkpoints store both
 # projections pre-fused and the root splits them per TP rank while loading.
 PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-phi3-dense-target-layout-v1"
+# Stable contract for the unquantized Qwen3.5 dense vision-language root: the
+# vision tower's fused-QKV tensors, the gated-delta-net input projections in
+# their dense per-rank `[Q|K|V|Z]` and `[b|a]` row order, rank-interleaved
+# `conv1d` weights and fp32 `A_log`/`dt_bias`, gated fused-QKV attention with
+# Q/K norm state, fused gate-up MLP tensors, and complete-model receiver
+# finalization.
+QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1 = "trtllm-qwen3_5-dense-vl-complete-layout-v1"
 _MISSING = object()
 
 
@@ -344,7 +351,16 @@ class PostTransformRuntimeConstraints:
 
 
 class PostTransformTransferScope(str, Enum):
-    """The model component represented by a post-transform transfer."""
+    """The model component represented by a post-transform transfer.
+
+    `TARGET_MODEL` is a text-only root. `ModelLoader` also derives it for a
+    multimodal root that no profile registers, or whose language model it
+    cannot determine, so such a root never matches a multimodal profile.
+    `COMPLETE_MODEL` is a registered multimodal root together with its local
+    multimodal encoder. `LANGUAGE_MODEL` is a registered multimodal root
+    without a local encoder, for example when the encoder is disabled or runs
+    in a separate disaggregated worker.
+    """
 
     TARGET_MODEL = "target_model"
     LANGUAGE_MODEL = "language_model"

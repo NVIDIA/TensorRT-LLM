@@ -20,10 +20,10 @@ from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
     run_triton_fp8_block_scale_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 
 skip_unsupported = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() != 120,
+    not torch.cuda.is_available() or not is_sm_120f(),
     reason="Requires CUDA SM120 for the Triton FP8 block-scale MoE path",
 )
 

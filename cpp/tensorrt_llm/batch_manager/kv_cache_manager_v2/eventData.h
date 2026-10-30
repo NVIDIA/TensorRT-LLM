@@ -32,17 +32,24 @@ struct Block;
 
 using EventTokenId = std::variant<int64_t, std::string>;
 
+enum class MmKeyUuidMode : uint8_t
+{
+    kNone,
+    kReplacesHash,
+    kAdditive,
+};
+
 struct MmKey
 {
     std::string hash;
     int startOffset = 0;
     std::optional<std::string> uuid;
-    bool hasUuidField = false;
+    MmKeyUuidMode uuidMode = MmKeyUuidMode::kNone;
 
     bool operator==(MmKey const& other) const
     {
         return hash == other.hash && startOffset == other.startOffset && uuid == other.uuid
-            && hasUuidField == other.hasUuidField;
+            && uuidMode == other.uuidMode;
     }
 };
 
