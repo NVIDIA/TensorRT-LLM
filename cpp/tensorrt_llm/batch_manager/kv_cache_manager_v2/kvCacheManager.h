@@ -731,6 +731,12 @@ private:
 
     TypedVec<PoolGroupIndex, float> mTargetRatioListHot;
     TypedVec<PoolGroupIndex, float> mTargetRatioListCold;
+    // Bumped whenever the target ratios are recomputed or set. adjust() records the generation it acted
+    // on and needAdjustment() waits for a newer one, so a target the pools cannot reach within the
+    // tolerance (min slots, granularity, the arena's clamping) is attempted once per recompute instead of
+    // on every check.
+    std::uint64_t mTargetRatioGeneration{0};
+    std::optional<std::uint64_t> mAdjustedTargetRatioGeneration;
 
     int mNumCreatedKvCaches{0};
     int mNumSampledKvCaches{0};
