@@ -229,3 +229,65 @@ def test_modelopt_fp8_excluded_linear_attention_falls_back_to_bf16() -> None:
         f"{_ATTN_PREFIX}.in_proj_z.input_scale",
     ):
         assert name not in out
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_modelopt_fp8_per_channel_linear_attention(tp_size: int) -> None:
+    # Per-channel FP8 in_proj_qkv / in_proj_z: 1-D per-row weight scales, no input scales.
+    checkpoint_prefix = "model.language_model.layers.0.linear_attn"
+    qkv_rows = _Q_ROWS * 2 + _V_ROWS
+    # Each row's scale equals its value, so packed rows and scales must stay paired.
+    row_values = torch.arange(1, _PACKED_QKVZ_ROWS + 1, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    weights = {}
+    for name, rows in (
+        ("in_proj_qkv", row_values[:qkv_rows]),
+        ("in_proj_z", row_values[qkv_rows:]),
+    ):
+        weights[f"{checkpoint_prefix}.{name}.weight"] = (
+            rows[:, None].expand(-1, _HIDDEN).contiguous()
+        )
+        weights[f"{checkpoint_prefix}.{name}.weight_scale"] = rows.float()
+    # Per-channel FP8 b/a have no fused entry and dequantize to bf16.
+    for name in ("in_proj_b", "in_proj_a"):
+        weights[f"{checkpoint_prefix}.{name}.weight"] = torch.ones(
+            _BA_ROWS, _HIDDEN, dtype=torch.float8_e4m3fn
+        )
+        weights[f"{checkpoint_prefix}.{name}.weight_scale"] = torch.arange(1.0, _BA_ROWS + 1)
+
+    mapper = _make_mapper(QuantAlgo.MIXED_PRECISION)
+    mapper._config.mapping.tp_size = tp_size
+    mapper._config.quant_config_dict = {
+        f"{_ATTN_PREFIX}.in_proj_qkvz": QuantConfig(quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+    }
+    out = mapper.preprocess_weights(weights)
+
+    # Checkpoint rows in the dense layout: each TP rank's chunk is [Q_r | K_r | V_r | Z_r].
+    q_chunk, v_chunk = _Q_ROWS // tp_size, _V_ROWS // tp_size
+    expected_rows = []
+    for rank in range(tp_size):
+        for start, chunk in (
+            (0, q_chunk),
+            (_Q_ROWS, q_chunk),
+            (2 * _Q_ROWS, v_chunk),
+            (qkv_rows, v_chunk),
+        ):
+            expected_rows += range(start + rank * chunk, start + (rank + 1) * chunk)
+    expected_values = row_values[expected_rows]
+
+    packed_weight = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight"]
+    packed_scale = out[f"{_ATTN_PREFIX}.in_proj_qkvz.weight_scale"]
+    assert packed_weight.dtype == torch.float8_e4m3fn
+    assert packed_weight.shape == (_PACKED_QKVZ_ROWS, _HIDDEN)
+    assert packed_scale.shape == (_PACKED_QKVZ_ROWS,)
+    assert torch.equal(
+        packed_weight.view(torch.uint8),
+        expected_values.view(torch.uint8)[:, None].expand(-1, _HIDDEN),
+    )
+    assert torch.equal(packed_scale, expected_values.float())
+    assert f"{_ATTN_PREFIX}.in_proj_qkvz.input_scale" not in out
+    packed_ba = out[f"{_ATTN_PREFIX}.in_proj_ba.weight"]
+    assert packed_ba.dtype == torch.bfloat16
+    # Each b/a row dequantizes to its own scale.
+    assert sorted(packed_ba[:, 0].tolist()) == sorted(2 * list(range(1, _BA_ROWS + 1)))
+    assert torch.equal(packed_ba, packed_ba[:, :1].expand(-1, _HIDDEN))
+    assert f"{_ATTN_PREFIX}.in_proj_ba.weight_scale" not in out

@@ -137,6 +137,10 @@ def test_setup_aliases_does_not_read_meta_weights() -> None:
 @torch.no_grad()
 def test_cache_derived_state_refreshes_gemma_norm_weight() -> None:
     model = _new_causal_lm()
+    # No decoder layers: only the norm weight precompute runs.
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList()
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=0))
     model.gemma_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
     model.standard_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16)
     model.gemma_norm.weight.copy_(torch.tensor([-0.5, 0.0, 0.5, 1.0], dtype=torch.bfloat16))
