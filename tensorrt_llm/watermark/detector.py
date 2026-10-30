@@ -126,6 +126,8 @@ class GumbelWatermarkDetector:
 
         With ``prompt_token_ids`` the first positions are scored too, since their contexts
         reach into the prompt. Without it the first ``context_width`` positions are skipped.
+        With ``deduplicate_contexts="all"`` the first ``context_width`` generated tokens are never
+        scored, and the prompt is searched for repeated contexts, which needs the prompt.
         """
         config = self.config
         width = config.context_width
@@ -146,7 +148,7 @@ class GumbelWatermarkDetector:
             return WatermarkDetection(0.0, 1.0, 0, num_tokens, False)
 
         contexts = np.stack([history[offset + positions - width + j] for j in range(width)], axis=1)
-        scored = self._scored_mask(contexts, first)
+        scored = self._scored_mask(contexts, first, prompt_token_ids)
         num_scored = int(scored.sum())
         per_key = []
         keys = [config.key]
@@ -173,14 +175,35 @@ class GumbelWatermarkDetector:
             is_watermarked=num_scored > 0 and p_value < self.p_value_threshold,
         )
 
-    def _scored_mask(self, contexts: np.ndarray, first_position: int) -> np.ndarray:
-        """Positions whose context is not a repeat within the deduplication window."""
+    def _scored_mask(
+        self,
+        contexts: np.ndarray,
+        first_position: int,
+        prompt_token_ids: Optional[Sequence[int]] = None,
+    ) -> np.ndarray:
+        """Positions whose context is not a repeat within the deduplication window.
+
+        The ``"all"`` scope also searches the contexts inside the prompt and never scores the
+        first ``context_width`` generated tokens, which the sampler leaves unwatermarked.
+        """
         config = self.config
         mask = np.ones(contexts.shape[0], dtype=bool)
         if config.deduplicate_contexts == "none":
             return mask
         window = config.deduplicate_contexts_max_history
         last_seen: dict[bytes, int] = {}
+        if config.deduplicate_contexts == "all":
+            width = config.context_width
+            mask[: max(width - first_position, 0)] = False
+            if prompt_token_ids is not None:
+                prompt = np.asarray(prompt_token_ids, dtype=np.int64)
+                if window is not None:
+                    prompt = prompt[-(window + width) :]
+                if prompt.shape[0] > width:
+                    inside = np.lib.stride_tricks.sliding_window_view(prompt, width)[:-1]
+                    # Virtual positions before the first generated one: -len(inside) .. -1.
+                    for offset, context in enumerate(inside):
+                        last_seen[context.tobytes()] = offset - inside.shape[0]
         for i in range(contexts.shape[0]):
             key = contexts[i].tobytes()
             previous = last_seen.get(key)

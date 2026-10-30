@@ -64,12 +64,15 @@ class WatermarkConfig(StrictBaseModel):
         description="Number of preceding tokens that seed each sampling decision. "
         "Larger values make the mark less robust to edits.",
     )
-    deduplicate_contexts: Literal["none", "single_turn"] = Field(
+    deduplicate_contexts: Literal["none", "single_turn", "all"] = Field(
         default="single_turn",
         description="How repeated contexts are treated. A repeated context would "
         "repeat its token and be counted as independent evidence, so it falls back "
         "to ordinary sampling. 'none' disables this; 'single_turn' deduplicates "
-        "within one generation.",
+        "within the tokens this request generates; 'all' also searches the prompt (for "
+        "instance earlier turns of a conversation) and leaves the first context_width "
+        "generated tokens unwatermarked, so short answers do not share a random "
+        "context across requests.",
     )
     deduplicate_contexts_max_history: Optional[int] = Field(
         default=8192,
