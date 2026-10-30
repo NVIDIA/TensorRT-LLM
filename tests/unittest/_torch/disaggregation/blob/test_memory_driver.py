@@ -43,6 +43,7 @@ from tensorrt_llm._torch.disaggregation.testing.broken_drivers import (
     BROKEN_TOGETHER_CONFORMANCE,
 )
 from tensorrt_llm._torch.disaggregation.testing.driver_conformance import (
+    OFF_THREAD_NAME,
     SLOT,
     UNRELEASED_ENDPOINTS,
     UNRELEASED_MEMORY,
@@ -1498,6 +1499,44 @@ def test_the_zero_budget_drain_check_closes_a_staged_driver_that_signals_nothing
 
     Suite().test_drain_polled_without_a_budget_turns_true_once_nothing_runs()
     assert closed == staged and len(staged) == 1
+
+
+def test_a_drain_that_never_returns_fails_the_zero_budget_check_and_is_not_called_again() -> None:
+    """The check fails at the harness timeout, and the harness then asks nothing more of the
+    driver: its usual cleanup would drain again and hang the run. The stuck call is released
+    only once the check is over, so no thread is left behind."""
+    release = threading.Event()
+    budgets: list[float] = []
+
+    class DrainNeverReturns(MemoryDriver):
+        def drain(self, budget_s: float) -> bool:
+            budgets.append(budget_s)
+            release.wait(TIMEOUT)
+            return super().drain(budget_s)
+
+    suite = _conformance(DrainNeverReturns, DEFAULT_CAPABILITIES)
+    failures: list[BaseException] = []
+
+    def check() -> None:
+        try:
+            suite.test_drain_polled_without_a_budget_turns_true_once_nothing_runs()
+        except BaseException as error:  # noqa: BLE001 - judged below
+            failures.append(error)
+
+    checker = threading.Thread(target=check, daemon=True)
+    checker.start()
+    checker.join(TIMEOUT)
+    finished = not checker.is_alive()
+    release.set()  # lets the stuck drain and, if cleanup drained again, the check return
+    checker.join(TIMEOUT)
+    wait_until(
+        lambda: not any(t.name == OFF_THREAD_NAME for t in threading.enumerate()),
+        "the released drain call to return",
+        TIMEOUT,
+    )
+    assert finished, "the check hung in its own cleanup"
+    assert failures and "did not return" in str(failures[0]), failures
+    assert budgets == [0.0], "cleanup drained a driver whose drain had not returned"
 
 
 class TestMemoryDriverOnChange:

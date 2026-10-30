@@ -55,6 +55,7 @@ from .host_memory import HostBuffer, Memory
 
 SLOT = 8
 ROW_LIMIT_CHECKED = 64  # a row limit this high is taken on trust, so the check stays small
+OFF_THREAD_NAME = "driver-conformance-call"  # the threads a check runs a driver call on
 
 # Lender names are 54 bytes and start with a 16-byte scope digest shared by every name of a
 # deployment. A key built from a truncated name collides across these.
@@ -234,6 +235,9 @@ class Harness:
         self.prefix = "t" + secrets.token_hex(4)  # keys of one check never meet another's
         self.endpoints: list[Endpoint] = []
         self.ops: list[OpHandle] = []
+        # Threads whose driver call did not return in time; cleanup asks nothing more of a
+        # driver while one of them is still inside it.
+        self.hung: list[threading.Thread] = []
         self.done = False
 
     # Creating things the harness will clean up.
@@ -355,10 +359,18 @@ class Harness:
         Whenever cleanup stops short of shutting the driver down, every endpoint is retained for
         good: memory the driver may still touch is never freed. An operation whose end the driver
         declares unprovable is allowed by the contract and reported as no problem; one that
-        neither ends nor says so is. A cleanup that did not finish may be called again.
+        neither ends nor says so is. A driver call a check left hanging is given the timeout to
+        return once the check released what it waited on; if it still has not, the driver is
+        asked nothing more, since a second call would hang the run too. A cleanup that did not
+        finish may be called again.
         """
         if self.done:
             return []
+        for worker in self.hung:
+            worker.join(self.timeout)
+        if any(worker.is_alive() for worker in self.hung):
+            self._retain()
+            return ["a driver call never returned; the driver and its memory were left alone"]
         problems: list[str] = []
         unprovable = False
         for op in self.ops:
@@ -1520,7 +1532,9 @@ class DriverConformance:
             getter.start()
             try:
                 assert blocked.wait(h.timeout), "the slow get never reached the store"
-                assert h.driver.drain(0.0) is False, "drain answered True with a get in the store"
+                assert self._drain_without_a_budget(h) is False, (
+                    "drain answered True with a get in the store"
+                )
                 if "op" in started:  # the handle came back before the store answered
                     assert not h.driver.access_ended(started["op"]), "drain forced an access end"
             finally:
@@ -1544,13 +1558,54 @@ class DriverConformance:
             h.publish({"A": b"aaaaaaaa"})
         self._poll_drain_without_a_budget(h)
 
+    def _drain_without_a_budget(self, h: Harness) -> bool:
+        """One ``drain(0.0)``, off this thread: a drain that waits in spite of its budget, for a
+        get this thread holds in the store, fails the check instead of hanging it."""
+        return bool(self._off_thread(h, lambda: h.driver.drain(0.0), "a drain with no budget"))
+
     def _poll_drain_without_a_budget(self, h: Harness) -> None:
         """Polls ``drain(0.0)`` as the backend does until it answers True; fails at the timeout.
         No call in between has a budget, so a driver that can turn True only inside a wait of
-        its own never does here."""
-        wait_until(
-            lambda: h.driver.drain(0.0) is True, "a drain with no budget to answer True", h.timeout
-        )
+        its own never does here. Off this thread too, so one call that never returns is a
+        failure rather than a hang."""
+
+        def poll() -> None:
+            wait_until(
+                lambda: h.driver.drain(0.0) is True,
+                "a drain with no budget to answer True",
+                h.timeout,
+            )
+
+        self._off_thread(h, poll, "the drain polling", h.timeout + 1.0)
+
+    @staticmethod
+    def _off_thread(
+        h: Harness, call: Callable[[], object], what: str, within: float | None = None
+    ) -> object:
+        """Runs ``call`` on a thread of its own and returns what it returned, or raises what it
+        raised; fails once it has not returned within ``within`` seconds (the harness timeout
+        by default), so a call that waits on something this thread holds cannot hang the
+        check. The harness is told of a call that did not return, so its cleanup does not walk
+        into the same driver again."""
+        outcome: list[tuple[bool, object]] = []
+
+        def run() -> None:
+            try:
+                outcome.append((True, call()))
+            except BaseException as error:  # noqa: BLE001 - re-raised on the calling thread
+                outcome.append((False, error))
+
+        worker = threading.Thread(target=run, name=OFF_THREAD_NAME, daemon=True)
+        worker.start()
+        worker.join(h.timeout if within is None else within)
+        if worker.is_alive():
+            h.hung.append(worker)
+            pytest.fail(f"{what} did not return")
+        returned, value = outcome[0]
+        if not returned:
+            assert isinstance(value, BaseException)
+            raise value
+        return value
 
     def test_close_needs_a_true_drain_and_no_live_registrations(self) -> None:
         """For a driver whose memory was registered up front, the suite's shutdown hook does

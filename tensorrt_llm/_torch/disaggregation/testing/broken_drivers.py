@@ -282,6 +282,15 @@ class DrainNeedsABudget(MemoryDriver):
         return super().drain(budget_s) and budget_s > 0
 
 
+class DrainWaitsForTheRunningGet(MemoryDriver):
+    """Waits for every operation to end whatever its budget says: a drain with no budget blocks
+    for as long as a get sits in the store. The check fails it from a thread of its own instead
+    of hanging behind it."""
+
+    def drain(self, budget_s: float) -> bool:
+        return super().drain(threading.TIMEOUT_MAX)
+
+
 class DrainForcesAnEnd(MemoryDriver):
     """Once its budget ran out, declares the access of every operation still running ended."""
 
@@ -690,6 +699,11 @@ BROKEN_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities, str]
     ),
     "drain turns true without a budget": (
         DrainNeedsABudget,
+        DEFAULT_CAPABILITIES,
+        "test_drain_polled_without_a_budget_turns_true_once_nothing_runs",
+    ),
+    "drain returns with no budget while a get is in the store": (
+        DrainWaitsForTheRunningGet,
         DEFAULT_CAPABILITIES,
         "test_drain_polled_without_a_budget_turns_true_once_nothing_runs",
     ),
