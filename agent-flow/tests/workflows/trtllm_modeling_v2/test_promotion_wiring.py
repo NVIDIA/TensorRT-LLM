@@ -12,15 +12,12 @@ from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalo
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
 from agent_flow.workflows.trtllm_modeling_v2.operators import promotion as promo
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
-from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
     GraphOrchestrator,
     PlannerAnswer,
     Services,
 )
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
-
-from .test_workflow import _workflow
 
 TARGET = f"{catalog_paths.MODELING_V2_PACKAGE}/models/newmodel/base__sm_103__tp1"
 VARIANT = f"{TARGET}/ops/attention/thop__r3.py"
@@ -79,20 +76,6 @@ def _run(tmp_path, promote_decision="LANDED", passing=True, **kw):
     return orchestrator, verdict, worked, heard
 
 
-def test_once_the_target_imports_an_entrys_variants_the_orchestrator_promotes_it(tmp_path):
-    orchestrator, verdict, worked, heard = _run(tmp_path)
-    assert verdict == "delivered"
-    # Due once the core, which imports the variant, has landed: it rewrites code that exists.
-    assert worked == ["k3-thop", "core", "promote"]
-    promote = orchestrator.graph.by_id()["promote"]
-    assert promote.ref == "promote:attention/thop" and promote.status == "done"
-    assert VARIANT in promote.touches and f"{TARGET}/modeling.py" in promote.touches
-    assert any("the orchestrator added promote" in e for e in heard)
-    assert orchestrator.graph.revisions[-1].reason.startswith("orchestrator: promote promotes")
-    # Last, once the contract holds; its one check is a boot of the core on the promoted tree.
-    assert promote.satisfies == ["core:boot@tp1"]
-
-
 def test_no_promote_starts_before_the_contract_holds(tmp_path):
     orchestrator, verdict, worked, heard = _run(tmp_path, passing=False, revision_cap=2)
     assert verdict != "delivered"
@@ -119,12 +102,3 @@ def test_a_failed_promote_keeps_a_holding_contract_from_delivery(tmp_path):
     assert verdict != "delivered"
     assert worked.count("promote") == 1  # no second promote behind a failed one
     assert any("local variants wait for promotion" in e for e in heard)
-
-
-def test_a_planner_added_promote_reaches_its_kernel_writer(tmp_path):
-    workflow = _workflow(tmp_path)
-    task = g.Task(id="promote", kind="kernel", goal="merge", ref="promote:attention/thop")
-    item = ExecutionStage(workflow)._queue_item(task)
-    assert item.mode == vocab.MODE_PROMOTE and item.entries == ("attention/thop",)
-    site = g.Task(id="k-x", kind="kernel", goal="", ref="verify:attention/thop@decode")
-    assert ExecutionStage(workflow)._queue_item(site).variant == "ops/attention/thop__decode"

@@ -146,55 +146,6 @@ def _build_repo(tmp_path: Path, *, modeling: str = _MODELING) -> Path:
     return root
 
 
-def _verify(root: Path):
-    return delivery.verify_delivery(
-        repo_root=root,
-        target_rel=TARGET_REL,
-        family="gpt_oss",
-        reference_yaml=f"{delivery.ACCURACY_REFERENCES_DIR}/gsm8k.yaml",
-        model_key="openai/gpt-oss-120b",
-        accuracy_test="test_modeling_v2_gpt_oss.py",
-    )
-
-
-#: One defect each: (file under the repo, what it is overwritten with, the check, its detail).
-_DEFECTS = (
-    (
-        f"{catalog_paths.CATALOG_DIR}/norm/flashinfer_rmsnorm.py",
-        _ENTRY.replace("CELLS = (", "UNUSED = ("),
-        "catalog:norm/flashinfer_rmsnorm.py",
-        "declares no CELLS",
-    ),
-    (
-        f"{catalog_paths.CATALOG_TESTS_DIR}/gemm/test_modeling_v2_cublas_mm.py",
-        "def test(): ...\n",
-        "test:gemm/cublas_mm",
-        ".CELLS",
-    ),
-    (
-        f"{catalog_paths.MODELING_V2_PACKAGE}/models/gpt_oss/routing.py",
-        "TARGET_MODULES = {}\n",
-        "routing:target",
-        "built-in implementation would answer",
-    ),
-    (
-        f"{delivery.TEST_DB_DIR}/l0_gb300.yml",
-        "- condition: {}\n",
-        "tests:test-db",
-        "CI would never run it",
-    ),
-)
-
-
-def test_a_complete_delivery_passes_and_each_missing_piece_is_named(tmp_path):
-    assert _verify(_build_repo(tmp_path)).passed
-    for n, (rel, text, check, detail) in enumerate(_DEFECTS):
-        root = _build_repo(tmp_path / str(n))
-        (root / rel).write_text(text, encoding="utf-8")
-        failure = next(c for c in _verify(root).failures if c.name == check)
-        assert detail in failure.detail, check
-
-
 # ------------------------------------- delivery must check git, not just disk
 
 

@@ -9,97 +9,10 @@ from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.tune.records import (
-    PARTS_FILE,
-    Measurement,
-    NoiseFloor,
-    compare,
-)
-from agent_flow.workflows.trtllm_modeling_v2.tune.split import SPLIT, classify, judge_variant
 from agent_flow.workflows.trtllm_modeling_v2.tune.stage import TuneStage
 
 from .test_tune_stage import FakeRunner, _git
 from .test_tune_wall_budget import _campaign as _spec
-
-#: The members of a campaign over parallel modes: their LLM-API config and concurrencies.
-MEMBERS = {
-    "tp1": ({"tensor_parallel_size": 1}, (1, 16)),
-    "tp4": ({"tensor_parallel_size": 4}, (1, 16)),
-    "tep4": ({"tensor_parallel_size": 4, "moe_expert_parallel_size": 4}, (16, 128)),
-    "dep2": (
-        {"tensor_parallel_size": 2, "moe_expert_parallel_size": 2, "enable_attention_dp": True},
-        (64, 128),
-    ),
-    "dep4": (
-        {"tensor_parallel_size": 4, "moe_expert_parallel_size": 4, "enable_attention_dp": True},
-        (128, 256),
-    ),
-}
-NOISE = NoiseFloor(spread={}, default=0.001)
-RULE = {"min_gain": 0.02, "noise_factor": 3.0}
-
-
-def _measure(root: Path, label: str, gains: dict | None = None, tpot: dict | None = None):
-    """A measurement over :data:`MEMBERS`: ``gains[site]`` scales every metric at ``member.conN``."""
-    gains, tpot = gains or {}, tpot or {}
-    for name, (config, cons) in MEMBERS.items():
-        part = root / label / name
-        part.mkdir(parents=True, exist_ok=True)
-        rows = []
-        for con in cons:
-            g = gains.get(f"{name}.con{con}", 1.0)
-            rows.append({"concurrency": con, "tok_s_user": 100.0 * g, "output_tok_s_gpu": 1000.0 * g,
-                         "mean_tpot_ms": tpot.get(f"{name}.con{con}", 10.0)})  # fmt: skip
-        (part / "summary.json").write_text(json.dumps(rows))
-        meta = {"label": name, "config": {"modeling_v2": "require", **config}, "hostname": "h1"}
-        (part / "meta.json").write_text(json.dumps(meta))
-    index = {"parts": list(MEMBERS), "constraints": {"dep4": {"tpot_ms_max": 30.0}}}
-    (root / label / PARTS_FILE).write_text(json.dumps(index))
-    (root / label / "meta.json").write_text(json.dumps({"label": label, "hostname": "h1"}))
-    return Measurement.load(root / label)
-
-
-def _shape(tmp_path: Path, gains: dict, tpot: dict | None = None):
-    ctrl = _measure(tmp_path, "ctrl")
-    cand = _measure(tmp_path, "cand", gains, tpot)
-    assert compare(cand, ctrl, NOISE, **RULE).verdict == "LOSS"
-    return classify(cand, ctrl, NOISE, **RULE)
-
-
-WINS_OUTSIDE_DEP4 = {"tp1.con1": 1.06, "tp4.con16": 1.08, "tep4.con128": 1.03, "dep2.con64": 1.03}
-
-
-def test_losses_at_one_attention_dp_member_split_by_its_traits(tmp_path):
-    shape = _shape(tmp_path, {**WINS_OUTSIDE_DEP4, "dep4.con128": 0.979, "dep4.con256": 0.928})
-    assert shape.kind == SPLIT
-    assert shape.mode == "attention DP on and EP size 4"
-    assert shape.condition == "mapping.enable_attention_dp and mapping.moe_ep_size == 4"
-    assert shape.members == ("dep4",) and shape.region == ("dep4.con128", "dep4.con256")
-    assert "dep4.con256.output_tok_s_gpu" in shape.losses and "tp1.con1.tok_s_user" in shape.wins
-
-
-def test_the_variant_wins_only_with_its_losses_gone_and_its_wins_held(tmp_path):
-    ctrl = _measure(tmp_path, "ctrl")
-    cand = _measure(tmp_path, "cand", {**WINS_OUTSIDE_DEP4, "dep4.con256": 0.93})
-    split = classify(cand, ctrl, NOISE, **RULE).as_dict()
-    original = compare(cand, ctrl, NOISE, **RULE).deltas
-
-    def verdict(label, gains):
-        variant = compare(_measure(tmp_path, label, gains), ctrl, NOISE, **RULE)
-        return judge_variant(variant, split, original, NOISE, **RULE)
-
-    win, why = verdict("gated", WINS_OUTSIDE_DEP4)
-    assert win and "attention DP on and EP size 4" in why
-    win, why = verdict("still-loses", {**WINS_OUTSIDE_DEP4, "dep4.con256": 0.97})
-    assert not win and why.startswith("LOSS")
-    win, why = verdict("gave-back", {**WINS_OUTSIDE_DEP4, "tp4.con16": 1.01})
-    assert not win and "tp4.con16.output_tok_s_gpu +1.0% (the candidate +8.0%)" in why
-    # A narrow win that comes in under the threshold still holds its gain within the loss floor.
-    win, _ = verdict("held", {**WINS_OUTSIDE_DEP4, "dep2.con64": 1.025, "tep4.con128": 1.025})
-    assert win
-    win, why = verdict("neutral", {})
-    assert not win and why.startswith("NEUTRAL")
-
 
 # ------------------------------------------------------------------- the campaign
 

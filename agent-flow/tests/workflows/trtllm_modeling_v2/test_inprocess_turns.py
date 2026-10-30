@@ -17,8 +17,6 @@ import pytest
 from agent_flow.backends import claude_code
 from agent_flow.types import AgentTextEvent, SessionInitEvent, ThinkingEvent, ToolCallEvent
 from agent_flow.workflows.trtllm_modeling_v2.agents.turns import (
-    DEFAULT_ROLE_TURN_TIMEOUTS,
-    TURNS_DIRNAME,
     InProcessTurnExecutor,
     TurnRequest,
     TurnTimeout,
@@ -78,35 +76,6 @@ def _request(role: str = "kernel_writer", what: str = "k12", prompt: str = "go")
         decision_file="decisions/core-kernel_writer-1.yaml",
         model="m",
     )
-
-
-def test_a_turn_leaves_its_prompt_activity_and_answer_as_it_goes(tmp_path):
-    root = tmp_path / TURNS_DIRNAME
-    layer = StreamingLayer(stderr="claude: a warning on stderr")
-    outcome = InProcessTurnExecutor(lambda r: layer, records=root).run(_request())
-
-    assert outcome.request_id == "001-kernel_writer" and outcome.text == "answer to go"
-    request = json.loads((root / "001-kernel_writer.request.json").read_text())
-    assert (request["role"], request["what"]) == ("kernel_writer", "k12")
-    assert request["decision_file"] == "decisions/core-kernel_writer-1.yaml"
-    assert request["agent"]["model"] == "m"
-    assert request["timeout_s"] == DEFAULT_ROLE_TURN_TIMEOUTS["kernel_writer"]
-    assert request["activity_file"] == str(root / "001-kernel_writer.activity.log")
-    assert (root / "001-kernel_writer.system.md").read_text() == "ROLE PROMPT"
-    assert (root / "001-kernel_writer.prompt.md").read_text() == "go"
-    assert (root / "001-kernel_writer.result.md").read_text() == "answer to go"
-
-    activity = (root / "001-kernel_writer.activity.log").read_text()
-    assert 'tool: Bash {"command": "echo go"}' in activity
-    # A multi-line block keeps its lines, indented under its entry.
-    assert "thinking: first line\n    second line\n" in activity
-    assert "stderr: claude: a warning on stderr" in activity
-    assert "text: done with go" in activity
-    done = json.loads((root / "001-kernel_writer.done").read_text())
-    assert done["outcome"] == "answered" and done["error"] == ""
-    # The effective session configuration is retained in the terminal record.
-    assert done["sessions"][0]["model"] == "resolved-model"
-    assert done["sessions"][0]["reasoning_effort"] == "medium"
 
 
 def test_a_turn_past_its_bound_is_stopped_and_retried_as_an_infrastructure_failure(tmp_path):

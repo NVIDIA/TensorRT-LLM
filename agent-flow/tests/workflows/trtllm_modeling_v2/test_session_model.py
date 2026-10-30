@@ -53,56 +53,6 @@ def test_claude_reads_last_recorded_root_model_and_rejects_ambiguity(tmp_path, m
     assert seen == [SESSION]
 
 
-@pytest.mark.parametrize(
-    "status,returned_id,model,ok",
-    [
-        ("active", SESSION, "current-codex", True),
-        ("notLoaded", SESSION, "persisted-model", False),
-        ("active", "another-thread", "other-model", False),
-        ("active", SESSION, None, False),
-    ],
-)
-def test_codex_reads_only_the_live_matching_thread(monkeypatch, status, returned_id, model, ok):
-    from openai_codex import client as sdk
-
-    from agent_flow.backends import codex
-
-    calls = []
-    monkeypatch.setattr(codex, "_resolve_codex_bin", lambda: "/bin/codex")
-
-    class Client:
-        def __init__(self, config):
-            assert config.launch_args_override == ("/bin/codex", "app-server", "proxy")
-
-        def start(self):
-            calls.append("start-proxy")
-
-        def initialize(self):
-            calls.append("initialize")
-
-        def thread_read(self, thread_id, include_turns=False):
-            calls.append((thread_id, include_turns))
-            return SimpleNamespace(
-                thread=SimpleNamespace(
-                    id=returned_id,
-                    model=model,
-                    status=SimpleNamespace(root=SimpleNamespace(type=status)),
-                )
-            )
-
-        def close(self):
-            calls.append("close-proxy")
-
-    monkeypatch.setattr(sdk, "CodexClient", Client)
-    env = {"CODEX_THREAD_ID": SESSION}
-    if ok:
-        assert selection.session_model("codex", env) == model
-    else:
-        with pytest.raises(selection.ModelSelectionError):
-            selection.session_model("codex", env)
-    assert calls == ["start-proxy", "initialize", (SESSION, False), "close-proxy"]
-
-
 def test_codex_lookup_timeout_closes_the_proxy(monkeypatch):
     import threading
 

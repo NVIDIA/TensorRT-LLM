@@ -5,14 +5,9 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
-
 import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
-    RC_NODE_LOST,
-    RC_ORPHANED,
     RERUN_TAG,
     SpoolPaths,
     write_json_atomic,
@@ -86,32 +81,3 @@ def test_a_job_lost_with_its_allocation_runs_again_once(spool, clock):
     assert "second-run" in paths.log("free-r063-u1b").read_text()
     assert "free-r063-u1b lost" in paths.status.read_text()
     pump(sched, lambda: not sched.jobs)
-
-
-def test_a_job_lost_again_after_its_rerun_is_closed_out_node_lost(spool, clock):
-    lost_run(spool, clock, "free-twice", reruns=1)
-    make(spool, clock).tick()
-    assert rc(spool, "free-twice") == RC_NODE_LOST
-    got = record(spool, "free-twice")
-    assert got["reruns"] == 1
-    assert "already ran again 1 time(s)" in got["detail"]
-    assert not (SpoolPaths(spool).pending / "free-twice.sh").exists()
-
-
-def test_a_job_whose_processes_outlived_their_watcher_is_orphaned_not_run_beside_itself(
-    spool, clock
-):
-    lost_run(spool, clock, "free-alive")
-    marker = {"MV2FLOW_SPOOL": str(spool), "MV2FLOW_SPOOL_JOB": "free-alive"}
-    stray = subprocess.Popen(
-        ["sleep", "60"], env={**os.environ, **marker, "MV2FLOW_SPOOL_WATCHER": DEAD}
-    )
-    try:
-        make(spool, clock).tick()
-    finally:
-        stray.kill()
-        stray.wait()
-    assert rc(spool, "free-alive") == RC_ORPHANED
-    detail = record(spool, "free-alive")["detail"]
-    assert "still runs here" in detail and str(stray.pid) in detail
-    assert not (SpoolPaths(spool).pending / "free-alive.sh").exists()

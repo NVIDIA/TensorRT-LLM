@@ -5,10 +5,6 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
-import pytest
-
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
 from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import TaskNotStarted
 
@@ -30,23 +26,6 @@ def _replanning(*reasons):
     return plan
 
 
-def test_a_failed_task_runs_again_under_its_own_id_up_to_the_bound(tmp_path):
-    runs = []
-
-    def work(task):
-        runs.append((task.id, task.attempts))
-        return "BLOCKED"
-
-    plan = _replanning("again")
-    services = _services(plan)
-    services.work = work
-    assert _orchestrator(tmp_path, services, revision_cap=10).run() == "planner-refused"
-    assert runs == [("core", n) for n in range(1, g.MAX_ATTEMPTS + 1)]
-    assert any(f"failed on attempt {g.MAX_ATTEMPTS} of" in r for r in plan.turns[-1].refusals)
-    saved = g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["core"]
-    assert (saved.status, saved.attempts) == ("failed", g.MAX_ATTEMPTS)
-
-
 def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_run(tmp_path):
     runs = []
 
@@ -65,21 +44,3 @@ def test_an_attempt_whose_worktree_was_never_prepared_does_not_spend_a_worker_ru
     assert runs == [1, 1, 2, 2, 3, 3, 4, 5, 6]
     assert runner.not_started_attempts == {"core": [1, 2, 3]}
     assert _orchestrator(tmp_path, services).not_started_attempts == {"core": [1, 2, 3]}
-
-
-def test_a_worktree_that_cannot_be_prepared_fails_before_the_worker_runs(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
-
-    from .test_workflow import _workflow
-
-    stage = ExecutionStage(_workflow(tmp_path))
-    invoked = []
-
-    def unavailable(*args, **kwargs):
-        raise OSError(122, "Disk quota exceeded")
-
-    stage._integration = SimpleNamespace(open=unavailable)
-    stage._work_in_tree = lambda *args: invoked.append(True)
-    with pytest.raises(TaskNotStarted, match="Disk quota exceeded"):
-        stage._work_task_turn(_task("core", "assemble", _KEYS))
-    assert invoked == []

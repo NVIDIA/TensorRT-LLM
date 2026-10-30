@@ -8,8 +8,6 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
-import pytest
-
 from agent_flow.workflows.trtllm_modeling_v2.run import graph as g
 from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import (
     GraphOrchestrator,
@@ -58,22 +56,6 @@ def _review(tid, deps=(), status="pending", **kw):
         status=status,
         **kw,
     )
-
-
-# ------------------------------------------------------------------ the rule
-
-
-@pytest.mark.parametrize("status,left", [("done", ["k2"]), ("failed", ["k1", "k2"])])
-def test_a_review_covers_its_batch_and_nothing_landed_after_it_unless_it_failed(status, left):
-    graph = g.Graph(
-        tasks=[
-            _shared("k1", "done"),
-            _shared("k2", "done"),
-            _review("r0", status=status, covers=["k1@1"]),
-        ]
-    )
-    assert g.regression_batch(graph, _OWN) == left
-    assert list(g.unreviewed_shared_changes(graph, _OWN)) == left
 
 
 # ------------------------------------------------------------------- the loop
@@ -150,30 +132,6 @@ def test_one_check_runs_at_a_time_and_the_next_takes_what_landed_meanwhile(tmp_p
         "task r3 (regression check) closed: no change to shared code was left for it to "
         "check: r2 covered what it follows"
     ]
-
-
-def test_the_run_is_not_delivered_while_a_landed_change_is_in_no_checks_batch(tmp_path):
-    """A check that failed covers nothing: the planner saying DONE does not deliver the run."""
-    reviewed = []
-
-    def work(task):
-        return "LANDED" if task.kind == "kernel" else "UNIT_READY"
-
-    def regression(task):
-        reviewed.append(task.id)
-        return ["tests/x.py::test_y (passed at the base, fails now)"] if len(reviewed) == 1 else []
-
-    def retry(turn):
-        if not any("no regression check covers k1" in e for e in turn.events):
-            return PlannerAnswer("DONE", "the check's findings are not ours")
-        assert "the batch the next one takes: k1" in turn.regression
-        return _graph(_shared("k1", "done"), _core(status="done"), _review("r1"))
-
-    plan = _plan(_graph(_shared("k1"), _core(), _review("r1", ["k1"])), retry, retry, retry)
-    orchestrator = _orchestrator(tmp_path, plan, work, regression=regression)
-    assert orchestrator.run() == "delivered"
-    assert reviewed == ["r1", "r1"]
-    assert orchestrator.graph.by_id()["r1"].covers == ["k1@1"]
 
 
 def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):

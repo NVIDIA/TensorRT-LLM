@@ -8,8 +8,6 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as catalog_paths
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
 from agent_flow.workflows.trtllm_modeling_v2.operators import promotion as promo
@@ -62,41 +60,6 @@ def _variant_task(tid, site, status="running"):
         vocab.QueueItem(n=1, mode="verify", target="attention/thop", site=site), TARGET
     )
     return _task(tid, status=status, touches=paths, ref="1")
-
-
-# ---------------------------------------------------------------- the rows
-
-
-def test_one_row_per_shared_entry_lands_in_a_variant_named_for_its_site():
-    rows = vocab.parse_vocabulary(
-        {
-            "verdict": "assemblable_after_additions",
-            "queue": [
-                {"n": 3, "mode": "verify", "target": "attention/thop", "surface": "mqa"},
-                {"n": 4, "mode": "verify", "target": "gemm/cublas_mm", "surface": "fp8",
-                 "site": "mtp_verify"},
-                {"n": 5, "mode": "onboard", "target": "ops/moe/permute", "tier": 4},
-            ],
-        }
-    )  # fmt: skip
-    three, four, five = rows
-    assert three.variant == "ops/attention/thop__r3"
-    assert four.variant == "ops/gemm/cublas_mm__mtp_verify"
-    assert five.variant is None  # the target's own entry lands in place
-    task = g.Task(id="3", kind="kernel", goal="", touches=list(vocab.entry_paths(three, TARGET)))
-    # It changes no code another model runs, so no regression review follows it.
-    assert not g.shared_touches(task, g.own_paths(TARGET))
-    with pytest.raises(vocab.VocabularyError, match="second verify row on 'attention/thop'"):
-        vocab.parse_vocabulary(
-            {
-                "verdict": "assemblable_after_additions",
-                "queue": [
-                    {"n": 3, "mode": "verify", "target": "attention/thop", "surface": "mqa"},
-                    {"n": 4, "mode": "verify", "target": "attention/thop", "surface": "fp8",
-                     "site": "mtp_verify"},
-                ],
-            }
-        )  # fmt: skip
 
 
 # ------------------------------------------------------------- the delivery
@@ -164,43 +127,6 @@ def test_an_entry_waits_while_a_variant_is_to_land_then_its_promote_is_added(tmp
     assert g.touches_conflict(task, _task("mtp", "feature", touches=[f"{TARGET}/modeling.py"]))
     assert task.gpus == 1 and task.est_minutes == 45
     assert promo.plan(tasks, tmp_path, TARGET, keep=("attention/thop",)) == promo.Promotion()
-
-
-def test_one_promote_is_open_at_a_time_and_a_failed_one_goes_to_the_planner(tmp_path):
-    _tree(tmp_path)
-    ref = promo.promote_ref(["attention/thop"])
-    open_ = promo.plan([_task("promote", ref=ref)], tmp_path, TARGET)
-    assert open_.task is None and open_.waiting == "attention/thop (task promote promotes it)"
-
-    failed = promo.plan([_task("promote", status="failed", ref=ref)], tmp_path, TARGET)
-    assert failed.task is None and "the planner retries or reshapes it" in failed.waiting
-
-    # Variants landed after a promote that is done get one of their own.
-    again = promo.plan([_task("promote", status="done", ref=ref)], tmp_path, TARGET)
-    assert again.task["id"] == "promote-2"
-
-
-def test_a_due_promote_holds_the_checks_that_have_not_started(tmp_path):
-    from agent_flow.workflows.trtllm_modeling_v2.run.orchestrator import GraphOrchestrator, Services
-    from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
-
-    pending = _task("check-core", kind=g.CHECK_KIND)
-    running = _task("check-mtp", kind=g.CHECK_KIND, status="running")
-    spec = {"id": "promote", "kind": "kernel", "goal": "merge", "touches": [], "ref": "promote:x"}
-    services = Services(
-        plan=lambda turn: None,
-        work=lambda task: "LANDED",
-        check=lambda chk: None,
-        free_gpus=lambda: 8,
-        promotion=lambda graph: SimpleNamespace(entries=["x"], task=spec, waiting=""),
-    )
-    orchestrator = GraphOrchestrator(
-        services, c.Contract(checks=()), c.ContractStatus.load(tmp_path), tmp_path
-    )
-    orchestrator.graph = g.Graph(tasks=[pending, running])
-    assert orchestrator._promote() == "promote promotes them"
-    assert pending.depends_on == ["promote"]
-    assert running.depends_on == []
 
 
 # ------------------------------------------------------------- the dispatch

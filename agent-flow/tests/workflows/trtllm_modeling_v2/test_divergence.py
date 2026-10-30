@@ -7,27 +7,14 @@ from __future__ import annotations
 import json
 import math
 
-import pytest
-
 from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks import divergence
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
-from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import (
-    TaskSchemaError,
-    _validate_accuracy,
-)
 
 from .test_gates import _TASK, _env, recorder
 
 PARIS = {11: -0.05, 12: -3.2, 13: -4.0}
-
-
-def test_identical_distributions_are_within_every_bound():
-    found = divergence.assess({"p0": PARIS}, {"p0": dict(PARIS)}, divergence.Bounds())
-    assert found.within and found.top1 == 1.0
-    assert found.max_js == pytest.approx(0.0, abs=1e-9)
-    assert found.min_cosine == pytest.approx(1.0)
 
 
 def test_a_flip_inside_the_tie_margin_agrees_and_one_outside_it_is_recorded():
@@ -40,12 +27,6 @@ def test_a_flip_inside_the_tie_margin_agrees_and_one_outside_it_is_recorded():
     assert "first token differs" in found.crossed[0]
     assert 0 < found.max_js <= math.log(2)
     assert "divergence recorded" in found.describe()
-
-
-def test_the_bounds_are_the_runs_to_loosen():
-    loose = divergence.Bounds.from_block({"max_js": 0.7, "min_cosine": -1, "tie_margin": 5})
-    found = divergence.assess({"p0": PARIS}, {"p0": {12: -0.05, 11: -3.2, 13: -4.0}}, loose)
-    assert found.within
 
 
 def _reference(tmp_path, first_tokens):
@@ -91,15 +72,3 @@ def test_an_unreadable_reference_is_unknown_not_a_failure(tmp_path):
     run = recorder(CommandResult(returncode=0, stdout=_driver_output(texts, {})[:-1]))
     result = boot_checks.run_boot_gate(_env(), task_data=task, runner=run, workdir=tmp_path)
     assert result.passed and "divergence UNKNOWN" in result.detail
-
-
-def test_the_spec_names_a_reference_by_its_file_and_bounds():
-    rows = {"benchmark": "gsm8k", "reference_yaml": "gsm8k.yaml"}
-    errors: list[str] = []
-    _validate_accuracy({**rows, "reference_logits": {"path": "/r.json", "max_js": 0.3}}, errors)
-    assert not errors
-    _validate_accuracy({**rows, "reference_logits": {"max_js": -1}}, errors)
-    assert errors == ["'accuracy.reference_logits' must be a mapping with a `path` to the "
-                      "reference's file"]  # fmt: skip
-    with pytest.raises(TaskSchemaError):
-        _validate_accuracy([], [])

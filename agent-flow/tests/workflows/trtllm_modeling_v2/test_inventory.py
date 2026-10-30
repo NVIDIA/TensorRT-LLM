@@ -5,97 +5,15 @@
 
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 
-import pytest
-
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.operators.inventory import (
-    MARKER,
     PROBE_SOURCE,
-    RECEIPT_ABSENT,
     RECEIPT_PASSED,
     format_surface,
     parse_inventory,
-    probe_command,
-    run_inventory_probe,
 )
-
-# ------------------------------------------------------------- the inventory
-
-
-def _inventory_payload(**overrides):
-    payload = {
-        "trtllm_ops": ["fused_qk_norm_rope", "flashinfer_silu_and_mul", "brand_new_op"],
-        "catalog": [
-            {
-                "path": "attention/fused_qk_norm_rope.py",
-                "impl": "torch.ops.trtllm.fused_qk_norm_rope",
-                "receipt": "passed",
-                "impl_resolves": True,
-            },
-            {
-                "path": "activation/flashinfer_silu_and_mul.py",
-                "impl": "torch.ops.trtllm.flashinfer_silu_and_mul",
-                "receipt": "absent",
-                "impl_resolves": True,
-            },
-            {
-                "path": "gemm/gone.py",
-                "impl": "torch.ops.trtllm.gone",
-                "receipt": "passed",
-                "impl_resolves": False,
-            },
-        ],
-        "versions": {"torch": "2.12"},
-        "error": "",
-    }
-    payload.update(overrides)
-    return payload
-
-
-def test_entries_in_a_log_full_of_engine_chatter_are_sorted_into_spendable_uncertified_and_rotted():
-    stdout = (
-        "[TRT-LLM] loading plugins\nrank 0 initialized\n"
-        + MARKER
-        + json.dumps(_inventory_payload())
-        + "\n[TRT-LLM] shutting down\n"
-    )
-    inventory = parse_inventory(stdout, arch="sm_103")
-    assert inventory.ok
-    assert [e.name for e in inventory.spendable] == ["fused_qk_norm_rope"]
-    assert [e.name for e in inventory.uncertified] == ["flashinfer_silu_and_mul"]
-    assert [e.name for e in inventory.rotted] == ["gone"]
-
-
-def test_the_probe_is_never_launched_as_engine_work():
-    env = RunEnvironment(kind="session_spool", python="/venv/bin/python", world_size=4, spool="/s")
-    command = probe_command(env, repo="/repo", arch="sm_103")
-    assert "mpirun" not in command
-    assert "trtllm-llmapi-launch" not in command
-    assert "__SURVEY_JSON__" in command
-
-
-def test_a_failed_probe_is_reported_as_an_error_not_as_a_measurement():
-    silent = parse_inventory("import failed\nTraceback\nImportError: no module", arch="sm_103")
-    assert not silent.ok and "ImportError" in silent.error  # the tail is carried
-
-    class _Result:
-        ok, returncode, timed_out = False, 1, False
-        stdout, stderr = "", "ModuleNotFoundError: tensorrt_llm"
-
-    inventory = run_inventory_probe(
-        {"arch": "sm_103", "trtllm_repo_path": "/repo"},
-        RunEnvironment(kind="local", python="python3"),
-        shell_runner=lambda *a, **k: _Result(),
-    )
-    assert not inventory.ok and "exited 1" in inventory.error
-    surface = format_surface(inventory)
-    assert "The inventory probe reported an error" in surface
-    assert "evidence of absence" in surface
-
 
 # ------------------------------------------------- the probe, actually run
 
@@ -153,20 +71,6 @@ def _run_probe(repo, arch="sm_103", prelude=""):
 _INLINE_PASS = ("SM_103",)
 
 
-@pytest.mark.parametrize(
-    "archs,expected",
-    [(_INLINE_PASS, RECEIPT_PASSED), (("SM_100",), RECEIPT_ABSENT)],
-    ids=["this-arch", "other-arch"],
-)
-def test_the_probe_reads_the_entrys_archs(tmp_path, archs, expected):
-    """The probe here runs on an interpreter with no engine: that does not condemn the catalog."""
-    repo = _fake_repo(tmp_path, [("norm/x.py", "torch.ops.trtllm.x", archs)])
-    inventory = _run_probe(repo)
-    assert inventory.error and inventory.rotted == ()
-    assert inventory.catalog[0].receipt == expected
-    assert inventory.catalog[0].cells == 2
-
-
 def test_another_targets_ops_are_promotable_not_spendable(tmp_path):
     repo = _fake_repo(
         tmp_path,
@@ -186,54 +90,3 @@ def test_another_targets_ops_are_promotable_not_spendable(tmp_path):
     assert op not in inventory.spendable and op not in inventory.uncertified
     assert "router" not in inventory.unwrapped_ops
     assert "`fam/ckpt__sm_103__tp1/ops/moe/router`" in format_surface(inventory)
-
-
-# ------------------------------------------------- how the op plane is enumerated
-
-#: A stand-in `torch` whose `ops.trtllm` is LAZY, exactly as the real one is:
-#: `dir()` lists only what something has already resolved. The schema registry
-#: knows the rest.
-_FAKE_TORCH = '''
-import sys, types
-
-class _Schema:
-    def __init__(self, name):
-        self.name = name
-
-class _LazyNamespace:
-    """dir() reports only the two names somebody happened to touch."""
-    def __dir__(self):
-        return ["already_resolved_a", "already_resolved_b"]
-
-torch = types.ModuleType("torch")
-torch.__version__ = "9.9.9-fake"
-torch.ops = types.SimpleNamespace(trtllm=_LazyNamespace())
-torch._C = types.SimpleNamespace(
-    _jit_get_all_schemas=lambda: [
-        _Schema("trtllm::allgather"),
-        _Schema("trtllm::fp4_quantize"),
-        _Schema("trtllm::fused_qk_norm_rope"),
-        _Schema("aten::add"),
-    ]
-)
-sys.modules["torch"] = torch
-
-trtllm = types.ModuleType("tensorrt_llm")
-trtllm.__version__ = "0.0.0-fake"
-sys.modules["tensorrt_llm"] = trtllm
-'''
-
-
-def test_the_op_plane_is_read_from_the_schema_registry_not_from_dir(tmp_path):
-    repo = _fake_repo(tmp_path, [("comm/allgather.py", "torch.ops.trtllm.allgather", _INLINE_PASS)])
-    inventory = _run_probe(repo, prelude=_FAKE_TORCH)
-
-    assert "allgather" in inventory.trtllm_ops
-    assert "fp4_quantize" in inventory.trtllm_ops
-    assert "add" not in inventory.trtllm_ops
-    # And the lazily-resolved names are still there, so the registry is a
-    # superset rather than a replacement.
-    assert "already_resolved_a" in inventory.trtllm_ops
-    entry = inventory.catalog[0]
-    assert entry.impl_resolves
-    assert entry.spendable

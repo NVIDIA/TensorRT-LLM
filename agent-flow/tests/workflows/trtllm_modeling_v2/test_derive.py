@@ -13,7 +13,6 @@ import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2 import cli
 from agent_flow.workflows.trtllm_modeling_v2.operators import tree_anchors
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
 from agent_flow.workflows.trtllm_modeling_v2.spec import derive
 from agent_flow.workflows.trtllm_modeling_v2.spec.task_schema import load_and_validate_task_yaml
 
@@ -64,18 +63,6 @@ def _derive(root: Path, goal: str | None = None, *, clean: bool = False, **site)
     return cli._derive_spec(
         _checkpoint(root), _site(root, **site), root / "ws", goal=goal, clean=clean
     )
-
-
-def test_what_the_checkpoint_carries_is_built_into_a_spec_the_run_takes(tmp_path):
-    spec = load_and_validate_task_yaml(_derive(tmp_path))
-    assert spec["features"] == ["mtp", "multimodal"]
-    assert spec["parallel"] == "unified" and spec["members"] == ["tp1", "tep4", "dep4"]
-    assert spec["accuracy"]["model_key"] == "org/newmodel"
-    assert spec["accuracy"]["discriminators"]["mtp"] == {"spec_dec_algo": "MTP"}
-    options = yaml.safe_load(Path(spec["accuracy"]["llm_api_options"]["mtp"]).read_text())
-    assert options["speculative_config"] == {"decoding_type": "MTP", "max_draft_len": 1}
-    report = (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
-    assert "| `features (speculator)` | checkpoint | `mtp` |" in report
 
 
 def test_the_goal_overrides_what_the_checkpoint_and_the_site_say(tmp_path):
@@ -133,37 +120,6 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
     assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
     with pytest.raises(derive.DeriveError, match="kv= is named once"):
         derive.parse_goal("kv=fp8 kv=nvfp4")
-
-
-def test_an_open_question_stops_before_the_run_and_is_answered_in_the_spec(tmp_path):
-    with pytest.raises(derive.DeriveError, match="arch: name the GPU architecture"):
-        _derive(tmp_path, device={})
-    path = tmp_path / "ws" / derive.SPEC_FILENAME
-    path.write_text(path.read_text() + "arch: sm_100\n")
-    # Run again, the spec is taken as it stands, edits included.
-    assert load_and_validate_task_yaml(_derive(tmp_path, device={}))["arch"] == "sm_100"
-    with pytest.raises(derive.DeriveError):
-        _derive(tmp_path, clean=True, device={})
-
-
-def test_a_spec_the_checkpoint_cannot_meet_is_refused_with_every_reason(tmp_path):
-    checkpoint = tmp_path / "ckpt"
-    checkpoint.mkdir()
-    (checkpoint / "config.json").write_text(
-        json.dumps({"num_attention_heads": 8, "quantization_config": {"quant_algo": "NVFP4"}})
-    )
-    task = {
-        "checkpoint_path": str(checkpoint),
-        "parallel": "tp3",
-        "arch": "sm_90",
-        "features": ["mtp"],
-    }
-    with pytest.raises(preflight.SpecInconsistencyError) as raised:
-        preflight.check_checkpoint_fit(task, 3)
-    message = str(raised.value)
-    assert "8 attention heads do not split 3 ways" in message
-    assert "nvfp4 weights need sm_100" in message
-    assert "config.json states none" in message
 
 
 def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):

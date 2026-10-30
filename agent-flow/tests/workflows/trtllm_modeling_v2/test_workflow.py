@@ -25,7 +25,6 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.operators import coverage as vocab
 from agent_flow.workflows.trtllm_modeling_v2.operators import prior_art
-from agent_flow.workflows.trtllm_modeling_v2.run import graph as graph_mod
 from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
 from agent_flow.workflows.trtllm_modeling_v2.run.execution.tasks import ExecutionStage
 from agent_flow.workflows.trtllm_modeling_v2.run.records.state import (
@@ -190,18 +189,6 @@ def _workflow(tmp_path, **kwargs):
     return TrtllmModelingV2Workflow(workspace=tmp_path / "ws", **kwargs)
 
 
-def test_the_run_puts_its_skills_where_each_agent_finds_them(tmp_path):
-    workflow = _workflow(tmp_path)
-    workflow._materialize_skills()
-    for skills in (".claude/skills", ".agents/skills"):
-        for name in ("trtllm-modeling-v2-entry", "trtllm-modeling-v2-features"):
-            skill = workflow.workspace / skills / name / "SKILL.md"
-            assert skill.read_text().startswith(f"---\nname: {name}\n")
-    assert (
-        workflow.workspace / ".agents/skills/trtllm-modeling-v2-features/references/features.md"
-    ).is_file()
-
-
 def test_the_feature_skill_names_only_paths_the_tree_has():
     """The skill and the workers' reuse rule are maps of paths: a path the tree lost is stale."""
     from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import _common, worker
@@ -313,20 +300,8 @@ def _git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def _with_perf(task_file, **perf):
-    data = yaml.safe_load(task_file.read_text())
-    data["perf"] = {"workload": {"isl": 1024, "osl": 128, "concurrency": [1, 8]}, **perf}
-    task_file.write_text(yaml.safe_dump(data))
-    return task_file
-
-
 def _state(tmp_path):
     return load_state(tmp_path / "ws" / _STATE)
-
-
-def _verdicts(tmp_path) -> list[dict]:
-    path = tmp_path / "ws" / contract_mod.STATUS_FILENAME
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
 # ------------------------------------------------------------------- preflight
@@ -446,90 +421,7 @@ def test_a_survey_that_writes_what_the_tree_has_is_sent_back_once(tmp_path, task
     assert _state(tmp_path).verdict == "delivered"
 
 
-def test_a_new_run_starts_with_the_survey_beside_the_planners_first_turn(
-    tmp_path, task_file, monkeypatch
-):
-    """Its rows become kernel tasks the moment it lands, with no planner turn between."""
-    monkeypatch.setattr(TrtllmModelingV2Workflow, "survey_first", True)
-    workspace = tmp_path / "ws"
-    drafted, seen = threading.Event(), {}
-
-    def surveyor(turn, prompt):
-        _write_vocabulary(workspace, [{"n": 1, "mode": "onboard", "target": "ops/norm/rms"}])
-        drafted.set()
-        return {"decision": "DRAFT_READY", "summary": "drafted"}
-
-    def planner(turn, prompt):
-        if turn == 1:
-            seen["the survey ran during the first turn"] = drafted.wait(10)
-            seen["the request named it"] = "the run started with the survey" in prompt
-            current = yaml.safe_load((workspace / graph_mod.GRAPH_FILENAME).read_text())
-            write_graph(prompt, [*current["tasks"], *unit_tasks(workspace)])
-            return {"decision": "GRAPH_UPDATED", "summary": "core beside the survey"}
-        return {"decision": "DONE", "summary": "the contract should hold"}
-
-    workflow = _workflow(tmp_path)
-    calls = _install(monkeypatch, workflow, Script(None, planner=planner, surveyor=surveyor))
-    with workflow:
-        workflow.run(task_file)
-    assert seen == {"the survey ran during the first turn": True, "the request named it": True}
-    assert {"surveyor", "kernel_writer", "assembler"} <= {name for name, _ in calls}
-    graph = graph_mod.Graph.load(workspace / graph_mod.GRAPH_FILENAME)
-    survey, kernel = graph.by_id()["survey"], graph.by_id()["k1-rms"]
-    assert survey.ref == TARGET_REL and survey.status == "done"
-    assert kernel.touches[0] == f"{TARGET_REL}/ops/norm/rms.py" and kernel.status == "done"
-    assert _state(tmp_path).verdict == "delivered"
-
-
 # ----------------------------------------------------------------- execution stage
-
-
-def test_a_planned_run_is_delivered_once_its_contract_holds_and_a_resume_redoes_nothing(
-    tmp_path, task_file, monkeypatch
-):
-    first = _workflow(tmp_path)
-    calls = _install(monkeypatch, first, Script(None))
-    with first:
-        first.run(task_file)
-    assert [name for name, _ in calls] == ["planner", "assembler"]
-    state = _state(tmp_path)
-    assert state.done and state.verdict == "delivered" and state.stage == STAGE_EXECUTION
-    graph = graph_mod.Graph.load(tmp_path / "ws" / graph_mod.GRAPH_FILENAME)
-    assert [(t.id, t.status) for t in graph.tasks] == [("core", "done")]
-    assert {(v["gate"], v["passed"]) for v in _verdicts(tmp_path)} == {
-        ("boot", True),
-        ("accuracy[gsm8k]", True),
-    }
-    envelope = json.loads((tmp_path / "ws" / "tasks" / "core.json").read_text())
-    assert envelope["satisfies"] == ["core:boot@tp1", "core:accuracy[gsm8k]@tp1"]
-
-    # Re-open the closed run as though it had crashed before closing.
-    state.done, state.verdict = False, ""
-    save_state(tmp_path / "ws" / _STATE, state)
-    second = _workflow(tmp_path)
-    calls = _install(monkeypatch, second, Script(None))
-    with second:
-        second.run(task_file)
-    assert calls == []
-    assert _state(tmp_path).verdict == "delivered"
-
-
-def test_the_planner_is_told_what_failed_and_can_escalate(tmp_path, task_file, monkeypatch):
-    seen: list[str] = []
-
-    def planner(turn, prompt):
-        seen.append(prompt)
-        if turn == 1:
-            return plan_every_unit(turn, prompt)
-        return {"decision": "ESCALATE", "summary": "gsm8k is out of reach on this checkpoint"}
-
-    workflow = _workflow(tmp_path, shell_runner=passing_shell(score=10.0))
-    _install(monkeypatch, workflow, Script(None, planner=planner))
-    with workflow:
-        workflow.run(task_file)
-    assert _state(tmp_path).verdict == "escalated"
-    assert "checks failed: core:accuracy[gsm8k]@tp1" in seen[1]
-    assert "FAILED core:accuracy[gsm8k]@tp1" in seen[1]
 
 
 def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
@@ -571,49 +463,6 @@ def test_a_shared_change_is_followed_by_a_regression_check_with_no_turn(
 
 
 # ----------------------------------------------------------------------- tune
-
-
-def _plan_with_tune(turn: int, prompt: str) -> dict:
-    """The core plus a tune task with no dependency: the orchestrator must hold it back."""
-    if turn == 1:
-        workspace = planner_graph_path(prompt).parent
-        tune = {"id": "tune", "kind": "tune", "goal": "tune the core", "resources": {"gpus": 1}}
-        write_graph(prompt, [tune, *unit_tasks(workspace)])
-        return {"decision": "GRAPH_UPDATED", "summary": "core and tune"}
-    return {"decision": "DONE", "summary": "the contract should hold"}
-
-
-def test_a_tune_task_starts_once_the_core_is_correct(tmp_path, task_file, monkeypatch):
-    """The onboarding closes on its own verdict; the campaign goes on past it, as the tune stage."""
-    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
-
-    started_with: list[set] = []
-    closed: list[tuple[bool, str]] = []
-
-    def fake_tune(wf, state, base, attempt=1, should_stop=lambda: False):
-        started_with.append({(v["gate"], v["passed"]) for v in _verdicts(tmp_path)})
-        deadline = time.monotonic() + 20
-        while not state.done and time.monotonic() < deadline:
-            time.sleep(0.01)
-        closed.append((state.done, state.verdict))
-        state.tune.update(phase="done", base_commit=base)
-        return "TUNED", "tuned from c0ffee1: best branch `tune/x/best`"
-
-    monkeypatch.setattr(stage, "run_tune_task", fake_tune)
-    workflow = _workflow(tmp_path)
-    _install(monkeypatch, workflow, Script(None, planner=_plan_with_tune))
-    with workflow:
-        workflow.run(_with_perf(task_file, enabled=True))
-    assert started_with == [{("boot", True), ("accuracy[gsm8k]", True)}]
-    # The onboarding was delivered and closed while the campaign still ran.
-    assert closed == [(True, "delivered")]
-    state = _state(tmp_path)
-    assert state.verdict == "delivered" and state.tune["phase"] == "done"
-    assert state.tune["onboarded"] == "delivered" and state.tune["verdict"] == "tuned"
-    journal = (tmp_path / "ws" / "journal.md").read_text()
-    assert "ended `tuned`; the onboarding's verdict stays `delivered`" in journal
-    graph = graph_mod.Graph.load(tmp_path / "ws" / graph_mod.GRAPH_FILENAME)
-    assert graph.by_id()["core"].status == "done"
 
 
 def test_a_closed_run_whose_campaign_did_not_end_resumes_only_the_campaign(

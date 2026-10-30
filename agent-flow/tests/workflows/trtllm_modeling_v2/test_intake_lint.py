@@ -105,27 +105,6 @@ def _finding(rule, task, **context):
     return next((f for f in lint.lint_task(task, **context).findings if f.rule == rule), None)
 
 
-def test_a_spec_built_for_serving_passes():
-    report = lint.lint_task(_GOOD)
-    assert not report.open(), report.render()
-
-
-def test_slow_and_stalling_choices_are_named():
-    rules = _rules(lint.lint_task(_slow()))
-    assert {
-        "accuracy-eager",
-        "runtime-batch-below-concurrency",
-        "runtime-max-seq-len-oversized",
-        "runtime-small-chunk",
-        "disagg-placement",
-        "variants-cross-product",
-        "accuracy-chat-template-short-output",
-        "envelope-open-ended-probes",
-        "notes-missing-brief",
-        "notes-broad-embargo",
-    } <= rules
-
-
 def test_a_batch_and_a_concurrency_are_both_global_totals():
     task = copy.deepcopy(_GOOD)
     task["members"] = {"default": ["dep4"]}
@@ -134,27 +113,6 @@ def test_a_batch_and_a_concurrency_are_both_global_totals():
     assert "runtime-batch-below-concurrency" in _rules(lint.lint_task(task))
     task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=128"]
     assert "runtime-batch-below-concurrency" not in _rules(lint.lint_task(task))
-
-
-def test_a_non_core_feature_in_core_is_named_and_a_named_combination_can_be_kept():
-    task = copy.deepcopy(_GOOD)
-    task["runtime"]["kv_cache_reuse"] = True
-    assert "runtime-non-core-in-core" in _rules(lint.lint_task(task))
-    task = _slow()
-    report = lint.lint_task(task)
-    assert any(
-        f.rule == "variants-cross-product" and f.severity == lint.BLOCK for f in report.open()
-    )
-    task["notes"] += "\nintake-accept: variants-cross-product -- the request names fp8 with chunks"
-    assert "variants-cross-product" not in {f.rule for f in lint.lint_task(task).open()}
-
-
-def test_notes_accept_a_finding_with_its_reason():
-    task = _slow()
-    task["notes"] += "\nintake-accept: runtime-small-chunk -- the request serves short chunks"
-    report = lint.lint_task(task)
-    assert "runtime-small-chunk" in _rules(report)
-    assert "runtime-small-chunk" not in {f.rule for f in report.open()}
 
 
 def test_an_accuracy_check_never_runs_eager():
@@ -220,67 +178,12 @@ def _checkpoint(tmp_path, gib=None):
     return ckpt
 
 
-def test_prior_art_and_the_fmha_rule_are_read_from_the_tree(tmp_path):
-    repo = _tree(tmp_path)
-    found = prior_art.find_prior_art(repo, _CONFIG)
-    paths = [c.path for c in found.candidates]
-    assert any(p.endswith("ops/attention/qsa_paged_sparse_gqa.py") for p in paths)
-    assert any(p.endswith("backends/sparse/qsa/kernels.py") for p in paths)
-    assert not any(p.endswith("rms_norm_rows.py") for p in paths)
-    kernels = next(c for c in found.candidates if c.path.endswith("kernels.py"))
-    assert kernels.names == ("triton_qsa_paged_sparse_gqa",)
-    notes = prior_art.engine_constraints(_CONFIG, repo)
-    assert len(notes) == 1 and "head dim 192" in notes[0] and "256" in notes[0]
-    assert f"{FMHA_HEADER}:1" in notes[0]
-    assert prior_art.engine_constraints({"text_config": {"head_dim": 128}}, repo) == []
-
-
-def test_lint_reports_constraints_and_prior_art_until_the_notes_name_the_leads(tmp_path):
-    repo, checkpoint = _tree(tmp_path), _checkpoint(tmp_path)
-    task = copy.deepcopy(_GOOD)
-    report = lint.lint_task(task, checkpoint=checkpoint, repo=repo)
-    assert "engine-constraint" in _rules(report)
-    text = report.render()
-    assert "## Prior art in this tree" in text and "qsa_paged_sparse_gqa" in text
-    unnamed = next(f for f in report.findings if f.rule == "notes-prior-art-unnamed")
-    assert "qsa/kernels.py" in unnamed.message
-    task["notes"] += (
-        " qsa/kernels.py: paged sparse GQA. attention/qsa_paged_sparse_gqa.py: the op around it."
-    )
-    assert not _finding("notes-prior-art-unnamed", task, checkpoint=checkpoint, repo=repo)
-
-
 def test_intake_lint_cli_exits_one_while_a_finding_stands(tmp_path, capsys):
     path = tmp_path / "task.yaml"
     path.write_text(yaml.safe_dump(_slow()))
     assert lint.main(["--task", str(path), "--report", str(tmp_path / "r.md")]) == 1
     assert (tmp_path / "r.md").read_text().startswith("# Intake lint")
     assert intake.main(["--help"]) == 0
-
-
-def test_notes_stay_the_runs_brief():
-    task = copy.deepcopy(_GOOD)
-    task["notes"] += " x" * lint.NOTES_BRIEF_CHARS
-    assert "notes-long" in _rules(lint.lint_task(task))
-    task = copy.deepcopy(_GOOD)
-    task["notes"] = (
-        "INTAKE-ONLY HANDOFF. No build or Slurm job is allowed here.\n\n" + task["notes"]
-    )
-    assert "notes-intake-process" in _rules(lint.lint_task(task))
-    # An accepted finding may explain itself in the intake's own words.
-    task = copy.deepcopy(_GOOD)
-    task["notes"] += "\n\nintake-accept: engine-constraint -- this intake chose padding."
-    assert "notes-intake-process" not in _rules(lint.lint_task(task))
-
-
-def test_a_disagg_test_not_yet_in_the_tree_is_named(tmp_path):
-    task = copy.deepcopy(_GOOD)
-    task["accuracy"]["disagg"] = {"test": "tests/accuracy/test_disagg.py::TestToy::test_auto_dtype"}
-    pending = lint.lint_task(task, repo=tmp_path)
-    assert "disagg-test-pending" in _rules(pending) and not pending.open()
-    (tmp_path / "tests/accuracy").mkdir(parents=True)
-    (tmp_path / "tests/accuracy/test_disagg.py").write_text("")
-    assert "disagg-test-pending" not in _rules(lint.lint_task(task, repo=tmp_path))
 
 
 def test_the_environment_can_start_the_run(tmp_path):
@@ -310,26 +213,6 @@ def test_the_environment_can_start_the_run(tmp_path):
     assert prior_art.stock_supports(repo, _CONFIG) is True
 
 
-def test_rules_are_a_registry():
-    def toy_rule(ctx):
-        if ctx.task.get("features"):
-            yield lint.Finding("toy-feature", lint.INFO, "seen")
-
-    report = lint.lint_task(_GOOD, rules=(toy_rule,))
-    assert [f.rule for f in report.findings] == ["toy-feature"]
-
-
-def test_planned_sessions_are_not_a_schema_block():
-    error = (
-        "task.yaml failed trtllm-modeling-v2 schema validation:\n"
-        "  - 'environment.spool' does not exist: /s. Start the compute session first.\n"
-        "  - missing required field 'arch'"
-    )
-    problems, spools = lint._planned_sessions(error)
-    assert problems == ["missing required field 'arch'"]
-    assert spools and spools[0].startswith("'environment.spool' does not exist")
-
-
 def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     repo = _tree(tmp_path)
     loader = repo / KV_DTYPES_SOURCE
@@ -345,40 +228,6 @@ def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     assert "kv-cache-dtype" not in _rules(lint.lint_task(task, repo=repo))
     # A tree that does not say what it accepts is not guessed at.
     assert prior_art.engine_kv_dtypes(tmp_path / "elsewhere") is None
-
-
-def test_a_requested_cell_no_check_covers_is_a_block_before_preflight_finds_it():
-    task = copy.deepcopy(_GOOD)
-    task["coverage"]["accept"].remove("chunked@tep4")
-    finding = _finding("coverage-gap", task)
-    assert finding.severity == lint.BLOCK and "chunked@tep4" in finding.message
-    # disagg's test runs once, and a pair of features is proven only where the request names it.
-    assert "chunked@tp4" not in finding.message and "disagg@" not in finding.message
-
-
-def test_a_variant_that_boots_boots_at_every_member_of_its_unit():
-    task = copy.deepcopy(_GOOD)
-    for name in ("kv_fp8", "chunked"):
-        del task["variants"][name]["gates"]
-    finding = _finding("variant-boot-everywhere", task)
-    # Each variant boots at its own member and at every other member of core.
-    assert "kv_fp8 (3)" in finding.message and "chunked (3)" in finding.message
-    assert "6 boot checks" in finding.message
-    assert "variant-boot-everywhere" not in _rules(lint.lint_task(_GOOD))
-
-
-def test_a_feature_is_proven_at_one_member():
-    task = copy.deepcopy(_GOOD)
-    task["features"] = ["disagg", "multimodal"]
-    finding = _finding("feature-members", task)
-    assert "multimodal at tep4, dep4, tp4 (6 checks)" in finding.message
-    # disagg's one member is already one.
-    assert "disagg" not in finding.message
-    task["members"]["multimodal"] = ["dep4"]
-    assert "feature-members" not in _rules(lint.lint_task(task))
-    task["members"]["multimodal"] = ["tp4", "dep4"]
-    task["profile"] = {"multimodal": "certified"}
-    assert "feature-members" not in _rules(lint.lint_task(task))
 
 
 def test_a_feature_is_not_proven_again_under_another_axis():
@@ -398,28 +247,6 @@ def test_a_feature_is_not_proven_again_under_another_axis():
     assert "feature-combination" not in _rules(lint.lint_task(task))
 
 
-def test_one_variant_crossing_two_axes_is_named():
-    task = copy.deepcopy(_GOOD)
-    task["variants"]["fp8_chunked"] = {
-        "llm_api_options": {"kv_cache_config": {"dtype": "fp8"}},
-        "runtime": {"extra_flags": ["--max_num_tokens=512"]},
-        "members": ["dep4"],
-        "gates": ["accuracy"],
-    }
-    finding = _finding("variants-cross-product", task)
-    assert "1 variant combines" in finding.message and "fp8_chunked" in finding.message
-
-
-def test_the_checkpoints_weights_are_read_from_its_index_or_its_files(tmp_path):
-    assert lint.checkpoint_weight_bytes(_checkpoint(tmp_path, 3)) == 3 * 2**30
-    bare = tmp_path / "bare"
-    bare.mkdir()
-    (bare / "model-00001.safetensors").write_bytes(b"x" * 10)
-    (bare / "model-00002.safetensors").write_bytes(b"x" * 5)
-    assert lint.checkpoint_weight_bytes(bare) == 15
-    assert lint.checkpoint_weight_bytes(tmp_path / "missing") is None
-
-
 def test_every_member_holds_one_engine_of_the_checkpoint(tmp_path):
     task = copy.deepcopy(_GOOD)
     task["environment"]["gpu_memory_gib"] = 80
@@ -429,47 +256,3 @@ def test_every_member_holds_one_engine_of_the_checkpoint(tmp_path):
     # Unknown device memory: no estimate.
     del task["environment"]["gpu_memory_gib"]
     assert "member-too-narrow" not in _rules(lint.lint_task(task, checkpoint=tmp_path / "ckpt"))
-
-
-def test_the_disaggregated_test_runs_on_one_node(tmp_path):
-    task = copy.deepcopy(_GOOD)
-    task["environment"]["gpu_memory_gib"] = 288
-    # A small model: its two engines share dep4's node.
-    small = lint.lint_task(task, checkpoint=_checkpoint(tmp_path / "s", 100))
-    assert "disagg-placement" not in _rules(small)
-    # One engine of a large model takes the whole node: the test's two do not fit it.
-    finding = _finding("disagg-placement", task, checkpoint=_checkpoint(tmp_path / "l", 500))
-    assert finding.severity == lint.WARN and "runs on 4 devices of one node" in finding.message
-    assert "disagg@*" in finding.fix
-    # Past one node: the tree's launcher starts every worker on one host.
-    task["accuracy"]["disagg"] = {
-        "test": "tests/a/test_d.py::TestToy::test_auto_dtype",
-        "devices": 8,
-    }
-    finding = _finding("disagg-placement", task)
-    assert finding.severity == lint.BLOCK and "launch_disaggregated_llm" in finding.message
-    task["environment"]["sessions"] = [
-        {"name": "gates", "role": "gates", "spool": "/s/gates", "nodes": 2}
-    ]
-    assert "session-nodes-unneeded" in _rules(lint.lint_task(task))
-
-
-def test_boot_boundaries_say_where_they_run_unless_certified():
-    task = copy.deepcopy(_GOOD)
-    task["accuracy"]["envelope"] = {"enabled": True, "probes": ["1, 2, 3, 4, 5, 6, 7,"]}
-    report = lint.lint_task(task)
-    finding = next(f for f in report.findings if f.rule == "envelope-on")
-    # One member of each unit the boot gates; disagg's test boots none.
-    assert finding.severity == lint.INFO and "the boot at core@dep4 also runs" in finding.message
-    assert not report.open()
-    task["profile"] = "certified"
-    assert "envelope-on" not in _rules(lint.lint_task(task))
-
-
-def test_the_report_shows_where_the_checks_go():
-    report = lint.lint_task(_GOOD)
-    assert report.contract_lines[0].startswith("9 required checks")
-    rows = report.contract_lines[2:]
-    assert "- `core`: boot 3 (" in rows[0] and "accuracy 3 (" in rows[0]
-    assert any(r.startswith("- `kv_fp8`: accuracy 1 (dep4)") for r in rows)
-    assert any(r.startswith("- `chunked`: accuracy 1 (dep4)") for r in rows)

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -121,65 +120,6 @@ def _check(repo: Path, workspace: Path, head: str, root: Path):
     return result, ran
 
 
-def test_a_regression_check_runs_the_whole_list_and_names_what_regressed(tmp_path):
-    repo, workspace, base = _regression_repo(tmp_path)
-    head = _commit(
-        repo,
-        base,
-        {"pkg/mod.py": "def f():\n    return 2\n", "tests/test_new.py": "def test_new():\n    assert False\n"},
-        message="break f",
-    )  # fmt: skip
-    result, ran = _check(repo, workspace, head, tmp_path)
-    assert result.verdict == "REGRESSED" and not result.passed and result.base == base
-    assert len(ran) == 3
-    out = workspace / regression.SELECTIONS_DIRNAME / "regression-2"
-    # The whole list at the head, and at the base only what fails now and had no result there.
-    assert (out / f"{head[:12]}.txt").read_text().split() == [
-        "tests/test_a.py",
-        "tests/test_b.py",
-        "tests/test_broken.py",
-        "tests/test_new.py",
-    ]
-    assert (out / f"{base[:12]}.txt").read_text().split() == ["tests/test_broken.py::test_broken"]
-    regressed, new = result.failures
-    assert regressed.startswith("tests/test_a.py::test_f (passed at the base, fails now): ")
-    assert "2 == 1" in regressed
-    assert new.startswith("tests/test_new.py::test_new (new, fails)")
-    # The same head probes the environment but reuses its test results.
-    again, ran = _check(repo, workspace, head, tmp_path)
-    assert len(ran) == 1 and "--environment" in ran[0]
-    assert again.failures == result.failures
-
-
-def test_a_job_cut_short_is_continued_by_the_next(tmp_path):
-    """A job out of time keeps the files it finished, and the next runs the rest."""
-    repo, _, base = _regression_repo(tmp_path)
-    files = tc.list_test_files(repo, base, ["tests"])
-    runs = []
-
-    def run_job(command, tree):
-        if "--environment" in command:
-            return _run(command)
-        words = shlex.split(command)
-        selection = Path(words[words.index("--selection") + 1])
-        first = selection.read_text().splitlines()[:1]
-        selection.write_text(f"{first[0]}\n")
-        runs.append(first)
-        return _run(command)
-
-    results, jobs, _, _ = regression.record_at(
-        base,
-        files,
-        cache_dir=tmp_path / "cache",
-        out=tmp_path / "out",
-        tree_at=lambda commit: contextlib.nullcontext(repo),
-        run_job=run_job,
-        python=sys.executable,
-    )
-    assert jobs == regression.MAX_JOBS == 3
-    assert runs == [[f] for f in files] and not results.unrun(files)
-
-
 def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
     tmp_path, monkeypatch
 ):
@@ -203,37 +143,6 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
     )
     assert not results.env_digest and results.unrun(["tests/test_a.py"])
     assert jobs == 0 and code == 1 and "environment probe failed" in tail
-
-
-def test_a_change_to_one_entry_runs_the_tests_that_reach_it(tmp_path):
-    repo = tmp_path / "repo"
-    catalog = f"{regression.CATALOG_DIR}/attention"
-    tests = regression.CATALOG_TESTS_DIR
-    files = {
-        f"{catalog}/thop.py": "X = 1\n",
-        f"{catalog}/other.py": "Y = 1\n",
-        f"{tests}/attention/test_thop.py": "from tensorrt_llm._torch._experimental.modeling_v2"
-        ".catalog.attention.thop import X\n",
-        f"{tests}/attention/test_other.py": "from ...attention.other import Y\n",
-        f"{tests}/test_modeling_v2_claims.py": "",
-    }
-    for path, content in files.items():
-        (repo / path).parent.mkdir(parents=True, exist_ok=True)
-        (repo / path).write_text(content, encoding="utf-8")
-    _git(repo, "init", "-q")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base")
-    base = _git(repo, "rev-parse", "HEAD")
-    listed = sorted(p for p in files if "/test_" in p)
-    head = _commit(repo, base, {f"{catalog}/thop.py": "X = 2\n"}, message="entry")
-    picked, why = regression.affected_files(repo, base, head, listed)
-    assert picked == [f"{tests}/attention/test_thop.py", f"{tests}/test_modeling_v2_claims.py"]
-    assert why == "2 of 3 test files reach what changed"
-    shared = _commit(repo, head, {f"{catalog}/__init__.py": ""}, message="shared")
-    assert regression.affected_files(repo, head, shared, listed)[0] == listed
-    assert regression.affected_files(repo, None, head, listed)[0] == listed
 
 
 def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):

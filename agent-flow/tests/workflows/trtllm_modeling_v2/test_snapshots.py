@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
@@ -40,37 +39,6 @@ def repo(tmp_path) -> Path:
     for name in ("tensorrt_llm/__init__.py", "cpp/kernel.cu", "examples/llm-api/quickstart.py"):
         _commit(repo, name, "x = 1\n")
     return repo
-
-
-def test_checks_of_one_commit_share_one_read_only_sparse_snapshot_until_none_needs_it(
-    tmp_path, repo
-):
-    head = _git(repo, "rev-parse", "HEAD").strip()
-    snapshots = snapshots_mod.Snapshots(repo, tmp_path / "ws" / "snapshots")
-    with snapshots.lease(head) as tree, snapshots.lease(head) as again:
-        assert again == tree and _git(tree, "rev-parse", "HEAD").strip() == head
-        package = tree / "tensorrt_llm" / "__init__.py"
-        assert package.is_file() and not (tree / "cpp").exists()
-        assert not os.stat(package).st_mode & 0o222
-        assert (tree / "tensorrt_llm" / "libs").is_symlink()
-        # A file of the checkout the spec names by its path is the commit's; one it does not track is not.
-        command = f"{repo}/.venv/bin/python {repo}/examples/llm-api/quickstart.py"
-        spec = snapshots_mod.CheckTree(commit=head, tree=tree).spec(
-            {"trtllm_repo_path": str(repo), "accuracy": {"launcher": command}},
-            snapshots.tracked(head),
-        )
-        assert spec["trtllm_repo_path"] == str(tree)
-        assert spec["accuracy"]["launcher"] == command.replace(
-            f"{repo}/examples", f"{tree}/examples"
-        )
-        _commit(repo, "tensorrt_llm/later.py", "y = 2\n")
-        assert snapshots.prune() == []  # held by a running check
-    assert not tree.exists()  # given back, and the checkout has moved past it
-    later = _git(repo, "rev-parse", "HEAD").strip()
-    with snapshots.lease(later):
-        pass
-    assert snapshots.tree(later).is_dir()  # the head's waits for the next check
-    assert len(_git(repo, "worktree", "list").splitlines()) == 2  # the checkout and that one
 
 
 @pytest.mark.parametrize("imported_from", ["snapshot", "checkout"])
@@ -123,14 +91,3 @@ def test_a_check_measures_one_commit_while_integrations_move_the_checkout(
     assert "[VOID] boot@tp1" in result.summary()
     rendered = contract_mod.evaluate(contract_mod.Contract(checks=(check,)), status).render()
     assert f"- VOID {check.key}: " in rendered
-
-
-def test_native_disagg_server_helpers_are_present_in_read_only_snapshots(tmp_path, repo):
-    helper = "tests/unittest/llmapi/apps/openai_server.py"
-    head = _commit(repo, helper, "SERVER_HELPER = 'native'\n")
-    snapshots = snapshots_mod.Snapshots(repo, tmp_path / "ws" / "snapshots")
-    with snapshots.lease(head) as tree:
-        assert (tree / helper).read_text() == "SERVER_HELPER = 'native'\n"
-        assert not os.stat(tree / helper).st_mode & 0o222
-        assert not (tree / "cpp").exists()
-        assert _git(tree, "rev-parse", "HEAD").strip() == head

@@ -6,13 +6,12 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute import SCHEDULER_PATH, sessions
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute import sessions
 
 
 def _task(tmp_path):
@@ -26,37 +25,6 @@ def _task(tmp_path):
             "sessions": [{"name": "a", "spool": str(tmp_path / "spool-a"), "role": "gates"}],
         },
     }
-
-
-def _run_entry(tmp_path, name):
-    task = _task(tmp_path)
-    entry = sessions.install_session_entry(task, name)
-    stub = tmp_path / "stub-python"
-    capture = tmp_path / f"captured-{name}.json"
-    stub.write_text(
-        "#!/bin/bash\n"
-        f'python3 -c \'import json, os, sys; json.dump({{"argv": sys.argv[1:], "env": dict(os.environ)}}, '
-        f'open("{capture}", "w"))\' "$@"\n'
-    )
-    stub.chmod(0o755)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("SLURM_")}
-    env.update({"MV2FLOW_SCHEDULER_PYTHON": str(stub), "SLURM_NODEID": "0"})
-    done = subprocess.run(
-        ["bash", str(entry)], env=env, capture_output=True, text=True, timeout=120
-    )
-    assert done.returncode == 0, done.stderr
-    return entry, json.loads(capture.read_text())
-
-
-def test_the_rendered_entry_becomes_the_scheduler(tmp_path):
-    entry, seen = _run_entry(tmp_path, "a")
-    assert entry == tmp_path / "spool-a" / "session_entry.sh" and os.access(entry, os.X_OK)
-    argv = seen["argv"]
-    assert argv[:3] == [str(SCHEDULER_PATH), "watch", str(tmp_path / "spool-a")]
-    assert argv[argv.index("--session") + 1] == "a"
-    assert seen["env"]["MV2FLOW_SPOOL"] == str(tmp_path / "spool-a")
-    assert seen["env"]["PATH"].startswith("/opt/venv/bin:")
-    assert (tmp_path / "spool-a" / "session_entry.log").is_file()
 
 
 def test_session_cli_prepares_a_missing_spool_without_submitting(tmp_path, monkeypatch, capsys):

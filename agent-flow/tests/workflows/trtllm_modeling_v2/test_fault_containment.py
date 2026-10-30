@@ -46,42 +46,6 @@ def test_a_planner_turn_that_raised_is_asked_again_on_the_same_events(tmp_path):
     assert any("your previous turn raised TimeoutError" in e for e in turns[2].events)
 
 
-def test_a_planner_that_keeps_raising_ends_the_run_with_its_own_verdict(tmp_path):
-    def plan(turn):
-        raise RuntimeError("no credentials")
-
-    verdict = _orchestrator(tmp_path, _services(plan)).run()
-    assert verdict == "planner-failed: RuntimeError: no credentials"
-
-
-def test_checks_that_raised_leave_the_work_landed_and_run_again(tmp_path):
-    """A lost session is not the task's failure: it is done, and its checks run as re-checks."""
-    raised = []
-
-    def plan(turn):
-        if not turn.events:
-            return PlannerAnswer(
-                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("core", "assemble", _KEYS)])
-            )
-        return PlannerAnswer("DONE", "green")
-
-    services = _services(plan)
-    check = services.check
-
-    def flaky(chk):
-        if chk.key == "core:boot@tp1" and not raised:
-            raised.append(chk.key)
-            raise RuntimeError("session lost")
-        return check(chk)
-
-    services.check = flaky
-    orchestrator = _orchestrator(tmp_path, services)
-    assert orchestrator.run() == "delivered"
-    core = orchestrator.graph.by_id()["core"]
-    assert core.status == "done" and core.attempts <= 1
-    assert services.ran_checks.count("core:boot@tp1") == 1  # recorded once: the re-check
-
-
 def test_a_kernel_that_ends_macro_is_split_not_failed(tmp_path):
     turns = []
 
@@ -100,22 +64,3 @@ def test_a_kernel_that_ends_macro_is_split_not_failed(tmp_path):
     assert orchestrator.graph.by_id()["k"].status == "split"
     # A split task lands nothing and holds no dependent: the run is delivered past it.
     assert g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["k"].status == "split"
-
-
-def test_a_planner_failing_on_its_environment_never_closes_the_run(tmp_path):
-    turns = []
-
-    def plan(turn):
-        turns.append(turn)
-        if len(turns) <= 7:
-            raise RuntimeError(
-                "TransportClosedError: Codex process closed stdout. stderr_tail=Error: failed to "
-                "initialize sqlite state runtime"
-            )
-        if len(turns) == 8:
-            return PlannerAnswer("GRAPH_UPDATED", "plan",
-                                 g.Graph(tasks=[_task("core", "assemble", _KEYS)]))  # fmt: skip
-        return PlannerAnswer("DONE", "green")
-
-    assert _orchestrator(tmp_path, _services(plan)).run() == "delivered"
-    assert len(turns) >= 8

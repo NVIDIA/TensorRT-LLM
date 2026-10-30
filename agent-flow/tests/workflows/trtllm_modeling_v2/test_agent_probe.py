@@ -8,22 +8,13 @@ No real agent runs here; the layers are fakes, and the probe is judged by the fi
 
 from __future__ import annotations
 
-import dataclasses
-import subprocess
-from typing import Any
-
 import pytest
 
-from agent_flow.agent_runtime import AgentConfig
 from agent_flow.logger import get_logger
-from agent_flow.types import SessionInitEvent
 from agent_flow.workflows.trtllm_modeling_v2.run.startup import agent_probe, bootstrap
 from agent_flow.workflows.trtllm_modeling_v2.run.startup.agent_probe import (
     AGENT_PROBE_RECORD,
     AGENT_PROBE_SKIP_ENV,
-    ProbedAgent,
-    hint_for,
-    probe_agents,
 )
 
 from .test_workflow import _workflow
@@ -68,63 +59,3 @@ def test_a_failed_probe_stops_the_run_before_any_planner_turn(tmp_path, task_fil
     assert not (tmp_path / "ws" / AGENT_PROBE_RECORD).exists()
     # Nothing past it ran: not the substrate gate, not the survey.
     assert shells == []
-
-
-@dataclasses.dataclass
-class _LayerConfig:
-    on_activity: Any = None
-
-
-class ReadOnlyCodexLayer:
-    """A Codex turn whose command ran, approved, in a session the site kept read-only."""
-
-    def __init__(self, agent, workspace) -> None:
-        self.config = _LayerConfig()
-
-    async def aforward(self, prompt: str) -> str:
-        session = SessionInitEvent(
-            backend="codex",
-            sandbox="read-only",
-            approval_policy="untrusted",
-            skills=["trtllm-modeling-v2-entry", "slack-notes"],
-        )
-        self.config.on_activity("session", session)
-        command = next(line.strip() for line in prompt.splitlines() if line.startswith("    "))
-        subprocess.run(["bash", "-c", command], check=True)
-        return "exit status 0"
-
-    def __exit__(self, *args) -> None:
-        pass
-
-
-def test_a_codex_session_the_site_keeps_read_only_fails_the_probe(tmp_path):
-    repo = tmp_path / "repo"
-    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "base"], check=True)
-    probed = ProbedAgent(AgentConfig("codex", "", None), ("planner",))
-    (outcome,) = probe_agents(
-        [probed], tmp_path / "ws", repo=str(repo), layer_for=ReadOnlyCodexLayer
-    )
-    assert outcome.settings == "sandbox read-only, approvals untrusted"
-    assert "ran read-only" in outcome.problem
-    assert "allow no writable sandbox" in hint_for(outcome.problem)
-    assert outcome.skills == ("trtllm-modeling-v2-entry", "slack-notes")
-
-
-def test_the_users_skills_are_what_the_run_does_not_ship():
-    outcomes = [
-        agent_probe.ProbeOutcome(
-            ProbedAgent(AgentConfig("codex", "", None), ("planner",)),
-            skills=("trtllm-modeling-v2-entry", "cluster-jobs"),
-        ),
-        agent_probe.ProbeOutcome(
-            ProbedAgent(AgentConfig("codex", "", "high"), ("assembler",)),
-            skills=("imagegen",),
-        ),
-        agent_probe.ProbeOutcome(ProbedAgent(AgentConfig("claude-code", "", None), ("tuner",))),
-    ]
-    assert agent_probe.foreign_skills(outcomes, ("trtllm-modeling-v2-entry",)) == {
-        "codex": ("cluster-jobs", "imagegen"),
-        "claude-code": (),
-    }

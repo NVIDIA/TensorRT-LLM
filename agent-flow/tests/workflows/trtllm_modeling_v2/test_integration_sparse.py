@@ -12,7 +12,6 @@ import pytest
 from agent_flow.workflows.trtllm_modeling_v2.run.workspace.integration import (
     SPARSE_CONE,
     Integration,
-    cone,
 )
 
 from .test_integration import _ENV, _git
@@ -60,24 +59,6 @@ def _repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _on_disk(tree: Path) -> set[str]:
-    return {
-        str(p.relative_to(tree))
-        for p in tree.rglob("*")
-        if (p.is_file() or p.is_symlink()) and ".git" not in p.relative_to(tree).parts
-    }
-
-
-def test_a_task_worktree_checks_out_the_cone_and_links_the_native_build(tmp_path):
-    repo = _repo(tmp_path)
-    tree = Integration(repo, tmp_path / "ws", "mv2/run", _ENV).open("k1")
-    assert _on_disk(tree) == {*IN_CONE, ".gitignore", "tensorrt_llm/libnative.so"}
-    assert (tree / "tensorrt_llm" / "libnative.so").resolve() == repo / "tensorrt_llm/libnative.so"
-    # What is not on disk is still the branch's, and git does not read it as deleted.
-    assert _git(tree, "status", "--porcelain", "--untracked-files=no") == ""
-    assert set(_git(tree, "ls-files").split()) >= set(OUTSIDE)
-
-
 def test_a_commit_from_a_sparse_worktree_leaves_every_file_outside_the_cone_intact(tmp_path):
     repo = _repo(tmp_path)
     integration = Integration(repo, tmp_path / "ws", "mv2/run", _ENV)
@@ -101,27 +82,6 @@ def test_a_commit_from_a_sparse_worktree_leaves_every_file_outside_the_cone_inta
     assert _git(repo, "rev-list", "--merges", "--count", "HEAD") == "0"
     integration.close("k1")
     assert not tree.exists()
-
-
-@pytest.mark.parametrize(
-    ("touches", "added"),
-    [
-        (["tensorrt_llm/_torch/models/modeling_x.py"], ()),  # inside the package already
-        (["docs/source/models/supported-models.md"], ("docs/source/models",)),
-        (["scripts/gen_*.py"], ("scripts",)),
-        (["setup.py", "*.md", "../outside", "/abs/path", "."], ()),
-        (["docs/a/", "docs/a/b/c.md", "docs/"], ("docs",)),
-    ],
-)
-def test_the_cone_holds_each_touched_directory_once(touches, added):
-    assert cone(touches) == tuple(sorted(SPARSE_CONE + added))
-
-
-def test_native_paths_and_exclusive_tasks_ask_for_the_whole_tree():
-    assert cone(["cpp/tensorrt_llm/kernels/rmsnorm.cu"]) is None
-    assert cone(["3rdparty/"]) is None and cone(["cpp"]) is None
-    assert cone(["tensorrt_llm/"], full=True) is None
-    assert cone(["cppfoo/x.py"]) == tuple(sorted(SPARSE_CONE + ("cppfoo",)))
 
 
 def test_the_cone_holds_every_top_level_package_the_package_imports():

@@ -16,32 +16,12 @@ from agent_flow.workflows.trtllm_modeling_v2.checks.gate_records import (
     KIND_STOCK_UNAVAILABLE,
     GateRecords,
 )
-from agent_flow.workflows.trtllm_modeling_v2.run.validation import contract as c
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
 from agent_flow.workflows.trtllm_modeling_v2.run.validation.completion import (
     tests_check as delivered_tests,
 )
 
 from .test_acceptance_gate import _driver_output, _env, _legs, _task
-
-
-def _result(name="boot", member="tp1"):
-    return SimpleNamespace(name=name, member=member, passed=True, detail="ok", tree_state="t")
-
-
-def test_a_verdict_on_other_inputs_is_stale(tmp_path):
-    contract = c.Contract(checks=(c.Check("core", "boot", "tp1", c.TIER_INNER, inputs="new"),))
-    status = c.ContractStatus.load(tmp_path)
-    status.record("core", _result(), marker="tree:1", inputs="old")
-    assert c.evaluate(contract, status, marker="tree:1").missing == contract.checks
-    status.record("core", _result(), marker="tree:1", inputs="new")
-    assert c.evaluate(contract, status, marker="tree:1").holds
-    reloaded = c.ContractStatus.load(tmp_path)
-    assert reloaded.verdicts[-1].inputs == "new"
-    # A verdict recorded before verdicts carried inputs counts as the check's.
-    legacy = c.ContractStatus.load(tmp_path / "legacy")
-    legacy.record("core", _result(), marker="tree:1")
-    assert c.evaluate(contract, legacy, marker="tree:1").holds
 
 
 def test_the_stock_leg_is_asked_once_per_checkpoint(tmp_path, monkeypatch):

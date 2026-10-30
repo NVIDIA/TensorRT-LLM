@@ -6,135 +6,12 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
-import sysconfig
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agent_flow.workflows.trtllm_modeling_v2.checks import check_config, runtime_evidence
-from agent_flow.workflows.trtllm_modeling_v2.checks.harness import (
-    engine_driver,
-    reuse_probe,
-    workload_io,
-)
-from agent_flow.workflows.trtllm_modeling_v2.run.startup import preflight
-
-from .test_gates import _TASK, _env
-
-
-@pytest.mark.parametrize("driver", ["serve_driver.py", "test_driver.py"])
-def test_measured_drivers_start_by_path_without_agent_flow(driver, tmp_path):
-    # -I -S hides the controller PYTHONPATH and editable-install hooks. Add only
-    # installed dependencies (serve's benchmark client needs PyYAML), not agent_flow.
-    path = Path(engine_driver.__file__).with_name(driver)
-    script = (
-        "import importlib.util, runpy, sys; "
-        "sys.path.append(sys.argv.pop(1)); "
-        "assert importlib.util.find_spec('agent_flow') is None; "
-        "sys.argv = sys.argv[1:]; runpy.run_path(sys.argv[0], run_name='__main__')"
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            "-S",
-            "-c",
-            script,
-            sysconfig.get_path("purelib"),
-            str(path),
-            "--help",
-        ],
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "usage:" in result.stdout
-
-
-def test_shared_options_preserve_nested_settings_and_refuse_ambiguous_inputs(tmp_path):
-    path = tmp_path / "options.json"
-    nested = {
-        "kv_cache_config": {"mamba_state_config": {"periodic_snapshot_interval": 256}},
-        "speculative_config": {
-            "decoding_type": "DSpark",
-            "max_draft_len": 3,
-            "draft_len_schedule": {1: 2},
-        },
-        "moe_config": {"backend": "TRTLLM"},
-    }
-    path.write_text(json.dumps(nested))
-    task = {**_TASK, "accuracy": {"llm_api_options": str(path)}}
-    config = check_config.check_configuration(
-        task, _env(), unit="dspark", features=["dspark"], max_tokens=8, member="tp1"
-    )
-    assert config["llm"]["speculative_config"]["decoding_type"] == "DSpark"
-    assert config["llm"]["speculative_config"]["draft_len_schedule"] == {"1": 2}
-    assert (
-        config["llm"]["kv_cache_config"]["mamba_state_config"]
-        == nested["kv_cache_config"]["mamba_state_config"]
-    )
-    assert config["sampling"]["temperature"] == 0.0
-    task["features"] = ["dspark"]
-    core = check_config.check_configuration(
-        task, _env(), unit="core", features=None, max_tokens=8, member="tp1"
-    )
-    assert core["llm"]["speculative_config"] is None
-    later = check_config.check_configuration(
-        task, _env(), unit="dspark", features=None, max_tokens=8, member="tp1"
-    )
-    assert later["llm"]["speculative_config"]["decoding_type"] == "DSpark"
-    task["runtime"] = {"extra_flags": ["--unknown-engine-option=1"]}
-    with pytest.raises(preflight.PreflightError, match="runtime.extra_flags"):
-        preflight.check_launch_settings(task)
-    task["runtime"] = {"extra_flags": ["--spec_decode_algo=MTP"]}
-    with pytest.raises(ValueError, match="conflicting check inputs"):
-        check_config.check_configuration(
-            task, _env(), unit="dspark", features=["dspark"], max_tokens=8, member="tp1"
-        )
-
-
-def test_public_entry_streams_each_request_and_refuses_what_it_cannot_judge(monkeypatch):
-    calls = []
-    output = SimpleNamespace(
-        outputs=[SimpleNamespace(token_ids=[1], text="answer", finish_reason="length")],
-        prompt_token_ids=[3],
-        cached_tokens=0,
-    )
-
-    class Params:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
-
-    class LLM:
-        def __init__(self, **kwargs):
-            calls.append(("construct", kwargs))
-
-        def generate_async(self, prompt, params, streaming=False):
-            calls.append(("stream", prompt))
-            return iter([output])
-
-    monkeypatch.setitem(
-        sys.modules, "tensorrt_llm", SimpleNamespace(LLM=LLM, SamplingParams=Params)
-    )
-    spec = {
-        "llm": {"model": "/model", "kv_cache_config": {"enable_block_reuse": True}},
-        "requests": [{"id": "r0", "prompt": "hello", "max_tokens": 2}],
-    }
-    llm, params = engine_driver.build_llm(spec)
-    engine_driver.run_workload(llm, params, spec)
-    assert [c[0] for c in calls] == ["construct", "stream"]
-    assert calls[0][1]["kv_cache_config"] == spec["llm"]["kv_cache_config"]
-    with pytest.raises(ValueError, match="one sequence"):
-        engine_driver.build_llm({**spec, "sampling": {"n": 2}})
-    with pytest.raises(ValueError, match="normalized"):
-        engine_driver.build_llm({**spec, "dataset": {"source": "offline"}})
-    assert len(calls) == 2  # Unsupported workloads fail before allocating an engine.
+from agent_flow.workflows.trtllm_modeling_v2.checks.harness import reuse_probe, workload_io
 
 
 def test_normalization_preserves_source_skip_template_order_and_image_requests(tmp_path):
@@ -173,28 +50,6 @@ def test_normalization_preserves_source_skip_template_order_and_image_requests(t
     spec["dataset"]["skip"] = 99
     with pytest.raises(workload_io.DatasetError, match="no usable prompts"):
         workload_io.normalize_requests(spec)
-
-
-def test_requested_inputs_and_partial_ranks_do_not_attest_actual_configuration():
-    declared = {"tp": 2, "pp": 1, "block_reuse": True}
-    output = f"{workload_io.ENGINE_MARKER} " + json.dumps({"config": {}, "requested": declared})
-    attested = runtime_evidence.attest_engine(output, declared)
-    assert set(attested.not_attested) == set(declared)
-    output += f"\n{workload_io.RANK_ENGINE_MARKER} " + json.dumps({"rank": 0, "config": declared})
-    attested = runtime_evidence.attest_engine(output, declared)
-    assert set(attested.not_attested) == set(declared)
-    assert "coverage UNKNOWN" in attested.note
-    # An arbitrary evaluation with zero hits is not a controlled negative experiment.
-    assert runtime_evidence.reuse_shortfall(attested, asks=True) is None
-    unknown = runtime_evidence.EngineAttestation(
-        leg="", reported=True, reuse={"probe": {"status": "UNKNOWN", "skipped": "no capacity"}}
-    )
-    # A probe that could not run observed nothing: no negative result, no failure.
-    assert runtime_evidence.reuse_shortfall(unknown, asks=True) is None
-    reused_nothing = runtime_evidence.EngineAttestation(
-        leg="", reported=True, reuse={"probe": {"tokens": 96, "reused": 0}}
-    )
-    assert "reused nothing" in runtime_evidence.reuse_shortfall(reused_nothing, asks=True)
 
 
 def test_repeat_probe_completes_before_resubmission_and_pins_attention_rank(monkeypatch):

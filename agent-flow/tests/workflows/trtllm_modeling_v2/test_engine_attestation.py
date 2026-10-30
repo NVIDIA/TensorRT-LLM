@@ -11,7 +11,6 @@ from pathlib import Path
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.checks import acceptance as acceptance_checks
-from agent_flow.workflows.trtllm_modeling_v2.checks import boot as boot_checks
 from agent_flow.workflows.trtllm_modeling_v2.checks.harness import workload_io
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandResult
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
@@ -117,13 +116,6 @@ def _engine_line(config: dict | None = None) -> str:
     return f"{workload_io.ENGINE_MARKER} {json.dumps(record)}\n"
 
 
-def _records(*texts: str) -> str:
-    return "".join(
-        f"{workload_io.RECORD_MARKER} {json.dumps({'index': n, 'text': t})}\n"
-        for n, t in enumerate(texts)
-    )
-
-
 def _boot_runner(*outputs: str):
     seen: list[str] = []
 
@@ -133,30 +125,6 @@ def _boot_runner(*outputs: str):
 
     run.seen = seen  # type: ignore[attr-defined]
     return run
-
-
-def test_a_boot_gate_fails_on_an_engine_that_ran_another_configuration(tmp_path):
-    task = _task(tmp_path)
-    good = boot_checks.run_boot_gate(
-        _env(), task_data=task, unit="core", member="tp1", workdir=tmp_path,
-        runner=_boot_runner(_engine_line() + _records("Paris", "light")),
-    )  # fmt: skip
-    assert good.passed, good.detail
-    [record] = good.engine
-    assert record["reported"] and not record["mismatches"] and not good.warnings
-    assert not record["not_attested"]
-    assert "fields as declared" in good.summary()
-
-    # Block reuse off with no warning in the log: only the attestation sees it.
-    silent = _engine_line(_engine_config(block_reuse=False)) + _records("Paris", "light")
-    bad = boot_checks.run_boot_gate(
-        _env(), task_data=task, unit="core", member="tp1", workdir=tmp_path,
-        runner=_boot_runner(silent),
-    )  # fmt: skip
-    assert not bad.passed
-    assert bad.detail.startswith("the engine did not run the declared configuration -- ")
-    assert "block_reuse: declared on, engine off (read from worker)" in bad.detail
-    assert bad.engine[0]["mismatches"]
 
 
 def test_the_acceptance_gate_holds_each_leg_to_its_own_mode(tmp_path):

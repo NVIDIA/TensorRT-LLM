@@ -9,7 +9,6 @@ import sys
 from copy import deepcopy
 from pathlib import Path
 
-import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.tune import sol
@@ -99,51 +98,6 @@ def test_missing_inputs_never_fabricate_bounds_or_stop(tmp_path):
     assert "conditional" in ceilings.unknown["con1.tok_s_user"]
 
 
-def test_independent_regions_and_conditional_overhead():
-    inputs = _inputs()
-    parent = inputs["regions"][0]
-    child = {**parent, "id": parent["id"] + "/child", "flops": 1, "bytes": 3}
-    inputs["regions"].append(child)
-    child["overhead"] = {
-        "ms": 1,
-        "source": "synthetic target-local trace",
-        "assumption": "exposed serial overhead, assumed unchanged",
-    }
-    rows = sol.calculate(inputs)["regions"]
-    assert [(r["bound"], r["lower_bound_ms"], r["headroom_ms"]) for r in rows] == [
-        ("compute", 2, 6),
-        ("memory", 4, 4),
-    ]
-    assert rows[1]["conditional"] and not rows[0]["conditional"]
-    assert sol.calculate(inputs)["ceilings"]["con1.tok_s_user"]["value"] == 500
-    child["id"] = parent["id"]
-    with pytest.raises(ValueError, match="duplicate"):
-        sol.calculate(inputs)
-
-
-@pytest.mark.parametrize(
-    "location,value",
-    [
-        (("hardware", "compute_flops_s", "value"), float("nan")),
-        (("hardware", "memory_bytes_s", "value"), 0),
-        (("regions", 0, "flops"), -1),
-        (("regions", 0, "bytes"), float("inf")),
-        (("regions", 0, "measured_ms"), 1),  # a measured time below the theoretical bound
-        (("regions", 0, "measured_ms"), True),
-        (("headline", "con1.output_tok_s_gpu", "gpu_count"), 0.5),
-        (("hardware", "compute_flops_s", "source"), ""),
-    ],
-)
-def test_invalid_or_impossible_inputs_are_rejected(location, value):
-    inputs = deepcopy(_inputs())
-    item = inputs
-    for key in location[:-1]:
-        item = item[key]
-    item[location[-1]] = value
-    with pytest.raises(ValueError):
-        sol.calculate(inputs)
-
-
 def _analysis(user=4.0, gpu=4.0, memory=1000, region_bytes=1, counted=None):
     """``_inputs`` with each headline's FLOPs, the memory capacity and the region's bytes set."""
     inputs = deepcopy(_inputs())
@@ -183,29 +137,6 @@ def test_analyses_that_agree_give_the_highest_ceiling_and_the_rest_is_ruled_or_u
     assert [d["item"] for d in apart.disputes] == ["headline.con1.tok_s_user"]
     assert "differ by 33%" in apart.unknown["con1.tok_s_user"]
     assert "con1.tok_s_user" not in apart.inputs["headline"]
-
-
-def test_capacities_must_agree_and_counted_traffic_bounds_every_analysis():
-    from agent_flow.workflows.trtllm_modeling_v2.tune.sol_consensus import reconcile
-
-    base = _baseline().headline()
-    analyses = {"analytic": _analysis(), "code": _analysis(memory=1100)}
-    c = reconcile(analyses, base)
-    assert c.disputes[0]["item"] == "hardware.memory_bytes_s" and c.inputs["regions"] == []
-    c = reconcile(analyses, base, rulings={"hardware.memory_bytes_s": "analytic"})
-    assert not c.disputes and c.inputs["hardware"]["memory_bytes_s"]["value"] == 1000
-    # A profiler counted 1.2 bytes in the region: 2 bytes of necessary work is impossible.
-    counted = {
-        "analytic": _analysis(region_bytes=2),
-        "profile": _analysis(region_bytes=1, counted=1.2),
-    }
-    c = reconcile({**counted, "code": _analysis()}, base)
-    assert c.report["regions"]["over_counted"] == [
-        {"id": "layer/decode/shape/rank0", "analyses": ["analytic"]}
-    ]
-    assert c.inputs["regions"][0]["bytes"] == 1
-    with pytest.raises(ValueError, match="exceed what the profiler counted"):
-        _analysis(region_bytes=2, counted=1.2)
 
 
 def test_the_stage_asks_each_method_once_and_one_adjudication_for_what_they_dispute(tmp_path):

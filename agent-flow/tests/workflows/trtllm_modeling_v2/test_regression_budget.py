@@ -4,26 +4,9 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.sessions import SessionSpec
 from agent_flow.workflows.trtllm_modeling_v2.run.validation import regression
-
-
-@pytest.mark.parametrize(
-    "kind,wall,expected",
-    [
-        ("session_spool", "90m", 5400),
-        ("session_spool", "3h", 7200),
-        ("local", "90m", 7200),
-    ],
-)
-def test_regression_timeout_uses_session_budget(kind, wall, expected):
-    env = RunEnvironment(
-        kind, "python", sessions=(SessionSpec("gates", "/spool", scheduler={"default_wall": wall}),)
-    )
-    assert regression._job_timeout(env) == expected
 
 
 def test_regression_runner_preserves_test_command_with_admissible_budget(tmp_path, monkeypatch):

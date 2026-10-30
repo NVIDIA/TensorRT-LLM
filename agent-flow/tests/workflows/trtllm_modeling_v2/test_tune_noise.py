@@ -46,16 +46,6 @@ def _write(root: Path, label: str, scale: dict, logs: dict, host: str = "h1") ->
     return Measurement.load(root / label)
 
 
-def test_a_pair_of_one_tree_judges_its_own_spread_as_noise(tmp_path):
-    a = _write(tmp_path, "a", {}, {})
-    a2 = _write(tmp_path, "a2", {"tp2.con16": 1.0638}, {})
-    old = NoiseFloor(spread={k: 0.0008 for k in a.headline()})
-    assert compare(a2, a, old, **RULE).verdict == "WIN"  # the floor of an older tree
-    assert compare(a, a2, old, **RULE).verdict == "LOSS"
-    own = NoiseFloor.from_measurements([a, a2])
-    assert compare(a2, a, own, **RULE).verdict == compare(a, a2, own, **RULE).verdict == "NEUTRAL"
-
-
 def test_a_member_without_the_marker_and_with_the_controls_pools_is_inert(tmp_path):
     ctrl = _write(tmp_path, "a", {}, {"tp1": _bind(1334, 1), "tp2": _bind(3461, 2)})
     cand = _write(

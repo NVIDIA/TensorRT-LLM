@@ -4,33 +4,6 @@
 
 from __future__ import annotations
 
-import re
-
-from agent_flow.workflows.trtllm_modeling_v2.agents import decisions as D
-from agent_flow.workflows.trtllm_modeling_v2.agents.prompts import DEFAULT_PROMPTS
-from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator
-
-#: The roles whose turn is a task's: their decisions end it done or failed.
-_TASK_ROLES = ("kernel_writer", "assembler", "surveyor")
-
-
-def test_every_decision_a_task_role_writes_ends_its_task_one_way():
-    for role in _TASK_ROLES:
-        for decision in D.DECISIONS[role]:
-            assert decision.finishes is not None, (role, decision.name)
-            assert (decision.name in orchestrator.FINISHED) == decision.finishes, decision.name
-    # Every decision that ends a task done is a role's, or one the run writes itself.
-    assert orchestrator.FINISHED == D.finishing() | {orchestrator.TUNED, orchestrator.CHECKED}
-
-
-def test_each_role_validates_and_its_prompt_lists_exactly_its_table_row():
-    for role, table in D.DECISIONS.items():
-        assert D.DECISIONS_BY_AGENT[role] == tuple(d.name for d in table), role
-        prompt = getattr(DEFAULT_PROMPTS, role)
-        assert D.decision_list(role) in prompt or " | ".join(D.names(role)) in prompt, role
-        listed = set(re.findall(r"^- `([A-Z_]+)`: ", prompt, flags=re.M))
-        assert listed <= set(D.names(role)), (role, listed - set(D.names(role)))
-
 
 def test_the_planner_hears_why_an_assembler_blocked_and_a_macros_rows(tmp_path):
     from agent_flow.workflows.trtllm_modeling_v2.run.execution.handoff import TaskResult

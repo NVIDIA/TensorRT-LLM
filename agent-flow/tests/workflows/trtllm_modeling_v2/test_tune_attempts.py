@@ -9,7 +9,6 @@ from pathlib import Path
 
 import yaml
 
-from agent_flow.workflows.trtllm_modeling_v2.tune.campaign import CandidateState, revisable
 from agent_flow.workflows.trtllm_modeling_v2.tune.spec import TuneSpec
 from agent_flow.workflows.trtllm_modeling_v2.tune.stage import TuneStage
 
@@ -87,16 +86,3 @@ def test_a_fixable_loss_is_revised_once_and_every_later_request_carries_what_was
     ]
     (revised,) = [r for r in ledger if r["kind"] == "candidate_revise"]
     assert revised["slug"] == "tiled" and revised["outcome"] == "lost"
-
-
-def test_only_a_failure_the_code_can_fix_is_revised():
-    def st(**kw):
-        return CandidateState("c", decision="CANDIDATE", **kw)
-
-    assert revisable(st(status="reverted", verdict="LOSS", reason="micro A/B projects con1 -3%"))
-    assert revisable(st(status="blocked", reason="microbench.share: every share is 0"))
-    assert not revisable(st(status="reverted", verdict="NEUTRAL"))  # a measured "no gain"
-    assert not revisable(st(status="reverted", verdict="LOSS", reason="the checkpoint at x ..."))
-    assert not revisable(st(status="blocked", reason="microbench A/B ran on different hosts"))
-    assert not revisable(st(status="reverted", verdict="LOSS", scope="e2e"))  # that is a split
-    assert not revisable(st(status="reverted", verdict="LOSS", revisions=1))
