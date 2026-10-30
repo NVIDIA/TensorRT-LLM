@@ -34,6 +34,7 @@ import pytest
 import torch
 from _torch.helpers import dspark_markov_chain_logits_reference
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
@@ -416,7 +417,9 @@ def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
 @pytest.mark.parametrize("order", ["bf16_then_fp32", "fp32_then_bf16"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_vocab_parallel_exchange_after_large_allreduce(order: str, mpi_pool_executor) -> None:
+def test_vocab_parallel_exchange_after_large_allreduce(
+    order: str, mpi_pool_executor: MPIPoolExecutor
+) -> None:
     tp = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_run, *zip(*[(_after_large_allreduce_check, tp, order)] * tp))
     assert all(results)

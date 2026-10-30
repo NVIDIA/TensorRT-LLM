@@ -20,6 +20,7 @@ import cloudpickle
 import pytest
 import torch
 from mpi4py import MPI
+from mpi4py.futures import MPIPoolExecutor
 from utils.util import check_accuracy, skip_pre_blackwell
 
 import tensorrt_llm
@@ -1019,12 +1020,76 @@ def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("dtype_order", ["bf16_then_fp32", "fp32_then_bf16"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_allreduce_lamport_mixed_dtype(mpi_pool_executor,
+def test_allreduce_lamport_mixed_dtype(mpi_pool_executor: MPIPoolExecutor,
                                        dtype_order: str) -> None:
     tensor_parallel_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(
         run_lamport_mixed_dtype_single_rank,
         *zip(*[(tensor_parallel_size, dtype_order)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+@torch.inference_mode()
+def run_minimax_rms_odd_tokens_single_rank(tensor_parallel_size: int) -> bool:
+    """One-token MiniMax reduce-RMS calls on one mapping.
+
+    Each call writes one 4-byte variance per rank, 8 bytes at TP2, and the
+    next call must still clear it: a call three calls later reuses the
+    sub-buffer and would otherwise take the late rank's old variance as
+    already arrived. Each rank holds a constant shard whose value changes
+    with the step, so an old variance changes the normalized output.
+    """
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=rank)
+    shard = 3072
+    minimax_allreduce_rms = MiniMaxAllReduceRMS(mapping=mapping)
+    weights = torch.ones((shard, ), dtype=torch.bfloat16, device="cuda")
+    try:
+        for step in range(12):
+            late_rank = step // 4 % tensor_parallel_size
+            values = [
+                float(1 + (step + r) % 5) for r in range(tensor_parallel_size)
+            ]
+            rms = (sum(v * v for v in values) / tensor_parallel_size)**0.5
+            local = torch.full((1, shard),
+                               values[rank],
+                               dtype=torch.bfloat16,
+                               device="cuda")
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
+            output = minimax_allreduce_rms(input=local,
+                                           rms_weights=weights,
+                                           eps=1e-6)
+            torch.cuda.synchronize()
+            torch.testing.assert_close(output.float(),
+                                       torch.full((1, shard),
+                                                  values[rank] / rms,
+                                                  device="cuda"),
+                                       rtol=2e-2,
+                                       atol=0,
+                                       msg=lambda m: f"step {step}: {m}")
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# A missed clear can also hang the ranks; see test_allreduce_lamport_mixed_dtype.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_minimax_allreduce_rms_odd_tokens(
+        mpi_pool_executor: MPIPoolExecutor) -> None:
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(
+        run_minimax_rms_odd_tokens_single_rank,
+        *zip(*[(tensor_parallel_size, )] * tensor_parallel_size),
     )
     for r in results:
         assert r is True

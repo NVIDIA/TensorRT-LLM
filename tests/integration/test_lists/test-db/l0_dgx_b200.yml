@@ -25,8 +25,9 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
-  # bf16 and fp32 one-shot all-reduces sharing one Lamport workspace.
+  # Lamport all-reduces of mixed dtypes and odd sizes sharing one workspace.
   - unittest/_torch/multi_gpu/test_allreduce.py::test_allreduce_lamport_mixed_dtype
+  - unittest/_torch/multi_gpu/test_allreduce.py::test_minimax_allreduce_rms_odd_tokens
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
   # vs the single-GPU drafter.
   - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py

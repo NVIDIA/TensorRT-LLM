@@ -33,7 +33,8 @@ struct LamportComm
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
         // Bytes the previous Lamport kernel wrote to its sub-buffer. Every Lamport kernel on this workspace reads and
-        // writes it, whatever its dtype, so it stays in bytes.
+        // writes it, whatever its dtype, so it stays in bytes. Readers round it up to whole 16-byte stores: the scalar
+        // MiniMax kernel writes 4-byte words.
         clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
         auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
@@ -256,7 +257,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = static_cast<int>(comm.clear_size / sizeof(float4));
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
     // * MoE related
     int threadid_in_cluster = cluster.thread_rank();
@@ -385,7 +386,7 @@ __global__ void moereduce_allreduce_fusion_kernel_oneshot_lamport(MoeReductionAl
         // * Fuse
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
-    comm.update(params.size * NRanks * sizeof(DType));
+    comm.update(static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
 #endif
 }
 
@@ -532,7 +533,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
     LamportComm<NRanks> comm(params.workspace, params.rank);
-    int clear_access = static_cast<int>(comm.clear_size / sizeof(float4));
+    int clear_access = static_cast<int>((comm.clear_size + sizeof(float4) - 1) / sizeof(float4));
 
     // * MoE related
     int threadid_in_cluster = cluster.thread_rank();
@@ -683,7 +684,7 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         // * Fuse
         fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
     }
-    comm.update(params.size * NRanks * sizeof(DType));
+    comm.update(static_cast<int64_t>(params.size) * NRanks * sizeof(DType));
 
 #endif
 }
