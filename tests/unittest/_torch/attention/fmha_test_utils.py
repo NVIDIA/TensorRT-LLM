@@ -28,12 +28,23 @@ class FakeAttention:
         self.kv_lora_rank = None
         self.v_head_dim = None
         self.head_dim = 4
+        self.qk_rope_head_dim = 0
+        self.rope_append = None
         self.num_heads = 1
         self.num_kv_heads = 1
         self.predicted_tokens_per_seq = 1
         self.has_fp8_kv_cache = False
         self.skip_correction_threshold = 0.0
         self.local_layer_idx = local_layer_idx
+
+    def out_head_size(self, is_gen_only: bool) -> int:
+        """Extents the fake layer reports, tolerant of its unset MLA dimensions."""
+        if not is_gen_only:
+            return self.v_head_dim if self.is_mla_enable and self.v_head_dim else self.head_dim
+        kv_lora_rank = self.kv_lora_rank or 0
+        if not (self.is_mla_enable and kv_lora_rank):
+            return self.head_dim
+        return kv_lora_rank if self.rope_append else kv_lora_rank + self.qk_rope_head_dim
 
 
 class FakePhasedFmha(PhasedFmha):

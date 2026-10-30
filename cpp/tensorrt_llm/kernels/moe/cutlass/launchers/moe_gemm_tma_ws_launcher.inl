@@ -133,26 +133,26 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGrou
 #ifndef COMPILE_HOPPER_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability >= 90 && ArchTag::kMinComputeCapability < 100)
     {
-        TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for hopper by passing 90 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability >= 100 && ArchTag::kMinComputeCapability < 120)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 100 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability == 103)
     {
         // fallback sm100f logic is done in dispatchMoeGemmFinalDispatchTmaWarpSpecialized
-        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 103 as an arch to build_wheel.py.");
     }
 #endif
 #ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
     else if constexpr (ArchTag::kMinComputeCapability >= 120)
     {
-        TLLM_THROW("Please recompile with support for blackwell by passing 120-real as an arch to build_wheel.py.");
+        TLLM_THROW("Please recompile with support for blackwell by passing 120 as an arch to build_wheel.py.");
     }
 #endif
     else
@@ -219,7 +219,7 @@ using namespace cutlass::epilogue;
         constexpr bool IsBlackwell = ArchTag::kMinComputeCapability >= 100;                                                                                                                                                                                                                                                 \
         constexpr static bool IsSM10x = ArchTag::kMinComputeCapability >= 100 && ArchTag::kMinComputeCapability < 120;                                                                                                                                                                                                      \
         constexpr static bool IsSM103 = ArchTag::kMinComputeCapability == 103;                                                                                                                                                                                                                                              \
-        constexpr bool IsSM120 = ArchTag::kMinComputeCapability == 120 || ArchTag::kMinComputeCapability == 121;                                                                                                                                                                                                            \
+        constexpr bool IsSM120 = ArchTag::kMinComputeCapability == 120;                                                                                                                                                                                                                                                     \
         /* constexpr static bool BIAS = BIAS_; */ /* Always false */                                                                                                                                                                                                                                                        \
         using T = DataType_;                                                                                                                                                                                                                                                                                                \
         using WeightType = WeightType_;                                                                                                                                                                                                                                                                                     \
@@ -235,19 +235,17 @@ using namespace cutlass::epilogue;
         if constexpr (!COMPILE_HOPPER_TMA_GROUPED_GEMMS_ENABLED && ArchTag::kMinComputeCapability >= 90                                                                                                                                                                                                                     \
             && ArchTag::kMinComputeCapability < 100)                                                                                                                                                                                                                                                                        \
         {                                                                                                                                                                                                                                                                                                                   \
-            TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");                                                                                                                                                                                                        \
+            TLLM_THROW("Please recompile with support for hopper by passing 90 as an arch to build_wheel.py.");                                                                                                                                                                                                             \
         }                                                                                                                                                                                                                                                                                                                   \
         else if constexpr (!COMPILE_BLACKWELL_TMA_GROUPED_GEMMS_ENABLED && ArchTag::kMinComputeCapability >= 100                                                                                                                                                                                                            \
             && ArchTag::kMinComputeCapability < 120)                                                                                                                                                                                                                                                                        \
         {                                                                                                                                                                                                                                                                                                                   \
-            TLLM_THROW(                                                                                                                                                                                                                                                                                                     \
-                "Please recompile with support for blackwell by passing 100-real as an arch to build_wheel.py.");                                                                                                                                                                                                           \
+            TLLM_THROW("Please recompile with support for blackwell by passing 100 as an arch to build_wheel.py.");                                                                                                                                                                                                         \
         }                                                                                                                                                                                                                                                                                                                   \
         else if constexpr (!COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS_ENABLED                                                                                                                                                                                                                                               \
             && ArchTag::kMinComputeCapability >= 120)                                                                                                                                                                                                                                                                       \
         {                                                                                                                                                                                                                                                                                                                   \
-            TLLM_THROW(                                                                                                                                                                                                                                                                                                     \
-                "Please recompile with support for blackwell by passing 120-real as an arch to build_wheel.py.");                                                                                                                                                                                                           \
+            TLLM_THROW("Please recompile with support for blackwell by passing 120 as an arch to build_wheel.py.");                                                                                                                                                                                                         \
         }                                                                                                                                                                                                                                                                                                                   \
         else if constexpr (!should_filter_tma_warp_specialized_gemm_problem_shape_v<ArchTag, MmaTileShape,                                                                                                                                                                                                                  \
                                ClusterShape, DYNAMIC_CGA, T>)                                                                                                                                                                                                                                                               \

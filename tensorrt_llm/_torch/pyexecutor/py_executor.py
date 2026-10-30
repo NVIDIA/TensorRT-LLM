@@ -119,7 +119,9 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
-                               ResourceManagerType, request_context)
+                               ResourceManagerType, is_context_only_kv_cache,
+                               request_context)
+from .runtime_hooks import ExecutorEvents, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -450,7 +452,60 @@ def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     return connector is None or connector.capacity_only
 
 
+@dataclasses.dataclass
+class PyExecutorResources:
+    """Resources and capacities replaced between profiling and serving.
+
+    The executor owns their execution lifetime. Model engines and weights
+    remain owned by the executor across resource transitions.
+
+    Add externally constructed, phase-dependent resources here and bind them
+    in ``_initialize_execution``. Create derived phase state in that method,
+    not in ``__init__``. Keep cross-phase objects on their existing owners.
+    Resources requiring teardown must also be handled explicitly by
+    ``_release_execution_resources`` and detached by ``release_resources``;
+    this input bundle does not perform automatic cleanup. Extend the resource
+    rebind tests when adding fields, including any cleanup ordering constraints.
+    """
+
+    resource_manager: ResourceManager
+    scheduler: RequestScheduler
+    kv_cache_transceiver: Optional[KvCacheTransceiver]
+    peft_cache_config: Optional[PeftCacheConfig]
+    virtual_memory_pools: Optional[dict]
+    kv_connector_manager: Optional[KvCacheConnectorManager]
+    dwdp_manager: Optional[DwdpManager]
+    max_seq_len: Optional[int]
+    max_num_sequences: int
+    waiting_queue_policy: WaitingQueuePolicy
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExecutorExecutionConfig:
+    disable_overlap_scheduler: bool
+    enable_early_first_token_response: bool
+    max_input_len: int
+    max_batch_size: int
+    max_beam_width: int
+    max_draft_len: int
+    max_total_draft_tokens: int
+    garbage_collection_gen0_threshold: Optional[int]
+    resource_governor_queue: object
+    hang_detection_timeout: Optional[int]
+    enable_kv_pool_rebalance: bool
+
+
 class PyExecutor:
+    # True while the overlap loop runs with the execution stream current
+    # (_overlap_loop_stream_scope).
+    _loop_on_execution_stream = False
+    # Whether the model opted into running the overlap loop on the execution
+    # stream (RuntimeHooks.loop_on_execution_stream); read once at construction.
+    _execution_stream_loop_armed = False
+    # The model's executor events (RuntimeHooks.executor_events); read once at
+    # construction.
+    _executor_events: Optional[ExecutorEvents] = None
+
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
     # If the number of micro batches is too small, the executor will spend too much time in synchronization.
@@ -499,6 +554,9 @@ class PyExecutor:
                 "kv_pool_rebalance_check_interval must be positive, got "
                 f"{kv_pool_rebalance_check_interval}")
         super(PyExecutor, self).__init__()
+        # Iteration throttle for the KV pool rebalance check.  See
+        # _can_pause_for_rebalance / _agreed_need_adjustment.
+        self._rebalance_check_interval = kv_pool_rebalance_check_interval
         self._metrics: dict[str, float | dict[str, float]] = {}
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -518,16 +576,6 @@ class PyExecutor:
             f"encoder_stream initialized: {self.encoder_stream}.")
 
         self.peft_cache_config = peft_cache_config
-
-        self.iter_counter = 0
-        # profile config
-        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
-            PROFILE_START_STOP_ENV_VAR_NAME)
-        # Convert to mutable sets so start_profile()/stop_profile() can
-        # .add() runtime-configured iteration indices.
-        # _load_iteration_indexes returns frozensets.
-        self.profile_start_iters = set(_env_start_iters)
-        self.profile_stop_iters = set(_env_stop_iters)
 
         # Runtime-configurable profiling state. Populated by start_profile()
         # when triggered via HTTP endpoints (e.g. trtllm-serve /start_profile)
@@ -568,13 +616,94 @@ class PyExecutor:
         # the manager operates on those fields via a weakref.
         self._profile_manager = PyExecutorProfileManager(self)
 
-        # related modules
-        self.resource_manager = resource_manager
         self.model_engine = model_engine
+        hooks = runtime_hooks_of(model_engine.model)
+        self._execution_stream_loop_armed = hooks.loop_on_execution_stream
+        self._executor_events = hooks.executor_events
         self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
         self._enable_scheduler_aware_adp_dummy = enable_scheduler_aware_adp_dummy
-        self._enable_non_overlap_adp_forward_intent = (
-            enable_non_overlap_adp_forward_intent)
+        self._enable_non_overlap_adp_forward_intent = enable_non_overlap_adp_forward_intent
+        self.sampler = sampler
+        self.drafter = drafter
+        self.guided_decoder = guided_decoder
+        self.dist = dist
+        self._execution_config = _ExecutorExecutionConfig(
+            disable_overlap_scheduler=disable_overlap_scheduler,
+            enable_early_first_token_response=enable_early_first_token_response,
+            max_input_len=max_input_len,
+            max_batch_size=max_batch_size,
+            max_beam_width=max_beam_width,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            resource_governor_queue=resource_governor_queue,
+            hang_detection_timeout=hang_detection_timeout,
+            enable_kv_pool_rebalance=enable_kv_pool_rebalance,
+        )
+        self._resources_released = False
+        self._closed = False
+        self._initialize_execution(
+            PyExecutorResources(
+                resource_manager=resource_manager,
+                scheduler=scheduler,
+                kv_cache_transceiver=kv_cache_transceiver,
+                peft_cache_config=peft_cache_config,
+                virtual_memory_pools=virtual_memory_pools,
+                kv_connector_manager=kv_connector_manager,
+                dwdp_manager=dwdp_manager,
+                max_seq_len=max_seq_len,
+                max_num_sequences=max_num_sequences,
+                waiting_queue_policy=waiting_queue_policy,
+            ))
+        if start_worker:
+            self.start_worker()
+
+    def _initialize_execution(self, resources: PyExecutorResources) -> None:
+        """Initialize a stopped execution phase and warm its bound resources."""
+        model_engine = self.model_engine
+        sampler = self.sampler
+        drafter = self.drafter
+        guided_decoder = self.guided_decoder
+        dist = self.dist
+        resource_manager = resources.resource_manager
+        scheduler = resources.scheduler
+        kv_cache_transceiver = resources.kv_cache_transceiver
+        peft_cache_config = resources.peft_cache_config
+        virtual_memory_pools = resources.virtual_memory_pools
+        kv_connector_manager = resources.kv_connector_manager
+        dwdp_manager = resources.dwdp_manager
+        max_seq_len = resources.max_seq_len
+        max_num_sequences = resources.max_num_sequences
+        waiting_queue_policy = resources.waiting_queue_policy
+        disable_overlap_scheduler = self._execution_config.disable_overlap_scheduler
+        enable_early_first_token_response = self._execution_config.enable_early_first_token_response
+        max_input_len = self._execution_config.max_input_len
+        max_batch_size = self._execution_config.max_batch_size
+        max_beam_width = self._execution_config.max_beam_width
+        max_draft_len = self._execution_config.max_draft_len
+        max_total_draft_tokens = self._execution_config.max_total_draft_tokens
+        garbage_collection_gen0_threshold = self._execution_config.garbage_collection_gen0_threshold
+        resource_governor_queue = self._execution_config.resource_governor_queue
+        hang_detection_timeout = self._execution_config.hang_detection_timeout
+        enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
+        self.peft_cache_config = peft_cache_config
+        self.iter_counter = 0
+        # profile config
+        _env_start_iters, _env_stop_iters = _load_iteration_indexes(
+            PROFILE_START_STOP_ENV_VAR_NAME)
+        # Convert to mutable sets so start_profile()/stop_profile() can
+        # .add() runtime-configured iteration indices.
+        # _load_iteration_indexes returns frozensets.
+        self.profile_start_iters = set(_env_start_iters)
+        self.profile_stop_iters = set(_env_stop_iters)
+
+        self._metrics = {}
+        self._disagg_coordinator = None
+        self._ctx_mla_kv_len_cap = "unset"
+        # related modules
+        self.resource_manager = resource_manager
+        self.kv_connector_manager = kv_connector_manager
+        self.dwdp_manager = dwdp_manager
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
@@ -585,8 +714,6 @@ class PyExecutor:
         # the hang-detector status provider are initialized.
         self.kv_cache_transceiver = kv_cache_transceiver
         self.enable_attention_dp = model_engine.enable_attention_dp
-        self.dist = dist
-        self.sampler = sampler
         # Opt-in in-graph sampling: let the engine sample inside its forward CUDA
         # graph. The sampler resolves each batch to a tier and stages the
         # buffers the in-graph step reads; the engine keys its graph cache on
@@ -606,15 +733,10 @@ class PyExecutor:
         if hasattr(sampler, "start_beam_histories"):
             model_engine.register_beam_histories_callable(
                 sampler.start_beam_histories)
-        self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
-        self.guided_decoder = guided_decoder
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.enable_kv_pool_rebalance = enable_kv_pool_rebalance
-        # Iteration throttle for the KV pool rebalance check.  See
-        # _can_pause_for_rebalance / _agreed_need_adjustment.
-        self._rebalance_check_interval = kv_pool_rebalance_check_interval
         # Countdown of drain iterations remaining before a pipeline-parallel
         # rebalance can run; None when no rebalance is pending.  Only
         # _executor_loop_pp uses it -- see _start_pp_rebalance_drain.
@@ -980,6 +1102,12 @@ class PyExecutor:
             # Ensure the default stream waits for execution_stream to complete
             # before subsequent operations.
             torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if self._executor_events is not None:
+                # The model's actions after warmup and graph capture, on every
+                # rank (some are collective, so every rank reaches this point,
+                # and a rank-local failure arms the rank-crash watchdog).
+                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                    self._executor_events.after_warmup()
             self.encoder_launch_executor = (ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="encoder-launch") if
                                             self.is_encoder_decoder else None)
@@ -1228,16 +1356,29 @@ class PyExecutor:
         # and race on the shared communicator, consuming the wrong ACKs.
         self._sleep_wakeup_lock = threading.Lock()
 
-        self.kv_connector_manager = kv_connector_manager
-
         self._maybe_init_kv_connector_manager()
-
-        self.dwdp_manager = dwdp_manager
 
         self._validate_moe_a2a_checkpoint_support()
 
-        if start_worker:
-            self.start_worker()
+    def rebind_resources(self, resources: PyExecutorResources) -> None:
+        """Bind fresh resources after release_resources(), without starting workers.
+
+        Call collectively on the startup thread. The previous phase must have
+        exited cleanly; failed and finally closed executors cannot be reused.
+        Warmup captures graphs against the new resource addresses.
+        """
+        if self._closed or not self._resources_released:
+            raise RuntimeError(
+                "Executor resources must be released before rebinding")
+        if self._event_loop_error is not None or self._fatal_error is not None:
+            raise RuntimeError(
+                "Cannot rebind an executor after an execution failure")
+        self._resources_released = False
+        try:
+            self._initialize_execution(resources)
+        except BaseException:
+            self.shutdown()
+            raise
 
     @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
@@ -2049,26 +2190,82 @@ class PyExecutor:
             self._mpi_progress_thread = None
             self._mpi_progress_thread_exit_hook = None
 
-    def shutdown(self) -> None:
-        """Shut down the terminal executor and all CUDA graphs it owns."""
-        self._shutdown(release_model_owned_graphs=True)
+    def release_resources(self) -> None:
+        """Stop a profiling phase and detach resources before cache replacement.
 
-    def shutdown_for_kv_cache_estimation(self) -> None:
-        """Shut down a temporary profiling executor whose model is reused."""
-        self._shutdown(release_model_owned_graphs=False)
-
-    def _shutdown(self, *, release_model_owned_graphs: bool) -> None:
-        """Shared shutdown implementation for explicit executor lifecycles.
-
-        Model-owned graphs are terminal model resources, unlike executor-owned
-        graphs that may reference the resource managers torn down below.
+        Call collectively after consuming profiling responses. Graph destruction
+        precedes workspace release, and transfer registrations precede cache
+        release. Model engines, weights and the execution stream remain valid.
         """
+        if self._closed or self._resources_released:
+            raise RuntimeError("Executor resources are already released")
+        if not self._release_execution_resources():
+            raise RuntimeError(
+                "Cannot release resources after an executor hang")
+        self.resource_manager = None
+        self.scheduler = None
+        self.kv_cache_manager = None
+        self.draft_kv_cache_manager = None
+        self.kv_cache_transceiver = None
+        self.kv_connector_manager = None
+        self.async_transfer_manager = None
+        self.adp_router = None
+        self._kv_load_tracker = None
+        self.hang_detector = None
+        self._sleep_wakeup_comm = None
+        self._sleep_wakeup_listener_thread = None
+        self.request_broadcaster = None
+        self._disagg_coordinator = None
+        self._disagg_pp_termination_handler = None
+        self.previous_batch = None
+        self.micro_batches = []
+        self.pending_encoder_steps.clear()
+        self.active_requests.clear()
+        self.responses.clear()
+        self.result_wait_queues.clear()
+        self._pending_transfer_responses.clear()
+        self._pending_response_terminations.clear()
+        self.request_accumulated.clear()
+        self.control_requests.clear()
+        self.waiting_queue = None
+        self._pending_adp_dummy_request = None
+        if self.dist.pp_size > 1:
+            self.executed_batch_queue = None
+            self.executed_batch_response_queue = None
+        self._resources_released = True
+
+    def shutdown(self) -> None:
+        """Finally close the executor; closed executors cannot be rebound."""
+        if self._closed:
+            return
+        if not self._resources_released:
+            if not self._release_execution_resources(
+                    release_model_owned_graphs=True):
+                return
+        else:
+            for engine in (self.model_engine, self.draft_model_engine):
+                if engine is not None:
+                    engine.release_executor_resources(
+                        release_model_owned_graphs=True)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        self._closed = True
+        del self.model_engine
+        if self.draft_model_engine is not None:
+            del self.draft_model_engine
+
+    def _release_execution_resources(self,
+                                     *,
+                                     release_model_owned_graphs: bool = False
+                                     ) -> bool:
+        """Stop execution and release GPU resources; retain model ownership."""
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
             self._openengine_node_server = None
-        self.executor_request_queue.enqueue_shutdown_request()
-        self.shutdown_event.wait()
+        if self.worker_started:
+            self.executor_request_queue.enqueue_shutdown_request()
+            self.shutdown_event.wait()
         if (self.enable_attention_dp and self.kv_connector_manager is not None
                 and self.kv_connector_manager.get_pending_transfer_requests()):
             self._kv_connector_failed = True
@@ -2082,7 +2279,7 @@ class PyExecutor:
         # every shutdown path.  A no-op when the executor loop already
         # unwound its own profiling state.
         self._profile_manager.cleanup()
-        if self.hang_detector.detected():
+        if self.hang_detector is not None and self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
             # this worker will be asked to shutdown immediately.
@@ -2094,11 +2291,12 @@ class PyExecutor:
             # already in flight is not interrupted.
             self._pp_mpi_progress_stop.set()
             self._stop_mpi_progress_thread()
-            return
-        self.worker_thread.join()
+            return False
+        if self.worker_started:
+            self.worker_thread.join()
         if self.kv_connector_manager is not None and not self._kv_connector_failed:
             self.kv_connector_manager.shutdown()
-        if self.dist.pp_size > 1:
+        if self.dist.pp_size > 1 and self.worker_started:
             # The worker thread has exited, so no PP traffic needs progress.
             self._pp_mpi_progress_stop.set()
             self.executed_batch_queue.put(None)
@@ -2128,7 +2326,7 @@ class PyExecutor:
             # Thread/listener cleanup above is safe. Graph destruction, device
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
-            return
+            return False
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2144,22 +2342,12 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        for manager in self.resource_manager.resource_managers.values():
-            if manager:
-                manager.shutdown()
-        # Note: do NOT call engine.cleanup() here. PyExecutor.shutdown() is
-        # paired with shutdown_for_kv_cache_estimation() mid-init in
-        # configure_kv_cache_capacity(); that path immediately reads
-        # model_engine.model.model_config
-        # to compute kv_cache_max_memory. cleanup() would set
-        # model_engine.model = None, breaking that read with
-        # `'NoneType' object has no attribute 'model_config'`.
-        # The engine's __del__ still calls cleanup() at terminal teardown
-        # (when the executor's reference is dropped), which is sufficient for
-        # the GMS daemon registry eviction the cleanup hook was added for.
-        del self.model_engine
-        if self.draft_model_engine is not None:
-            del self.draft_model_engine
+        if self.kv_cache_transceiver is not None:
+            self.kv_cache_transceiver.shutdown()
+        if self.resource_manager is not None:
+            for manager in self.resource_manager.resource_managers.values():
+                if manager:
+                    manager.shutdown()
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
@@ -2167,6 +2355,7 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        return True
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -3143,6 +3332,9 @@ class PyExecutor:
                 logger.error(
                     f"Error waiting on PP send handles during cleanup: "
                     f"{traceback.format_exc()}")
+
+        if self._executor_events is not None and self._event_loop_completed:
+            self._executor_events.at_shutdown()
 
     def _pp_rank_schedules(self) -> bool:
         """Whether this rank computes the schedule that the other PP ranks receive.
@@ -6197,11 +6389,44 @@ class PyExecutor:
     def _wait_for_model_engine_input_copy(self):
         self.model_engine.wait_for_input_copy()
 
+    @contextmanager
+    def _overlap_loop_stream_scope(self):
+        """Run the overlap loop with the execution stream current, when the model opted in.
+
+        _forward_step makes the execution stream wait for the current stream
+        before every forward and the current stream wait for the execution
+        stream after it. On the thread's default stream, which in steady decode
+        carries only these waits and timing events, step N+1's inputs wait for
+        decode graph N through two cross-stream event hops. With the execution
+        stream current the loop's stream work is queued in the same order on one
+        stream and _forward_step skips both waits.
+
+        Not taken with a two-model drafter, a guided decoder, a KV connector,
+        an encoder-decoder model or multimodal encoder item scheduling, whose
+        side streams synchronize with the current stream.
+        """
+        if not (self._execution_stream_loop_armed and self.drafter is None and
+                self.draft_model_engine is None and self.guided_decoder is None
+                and self.kv_connector_manager is None
+                and not self.is_encoder_decoder
+                and not self._mm_encoder_item_scheduling_enabled):
+            yield
+            return
+        with torch.cuda.stream(self.execution_stream):
+            self._loop_on_execution_stream = True
+            try:
+                yield
+            finally:
+                self._loop_on_execution_stream = False
+
     def _executor_loop_overlap(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
-        with self._profiler() as profile_step, self.hang_detector:
+        if self._executor_events is not None:
+            self._executor_events.before_overlap_loop()
+        with self._overlap_loop_stream_scope(), self._profiler() as profile_step, \
+                self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             previous_tensors_device = None
@@ -7092,9 +7317,13 @@ class PyExecutor:
         self,
         waiting_queue: WaitingQueue,
         total_num_active_requests: int,
-        all_ranks_num_active_requests: Optional[List[int]] = None
-    ) -> List[RequestQueueItem]:
-        """Pop requests from waiting_queue based on available capacity."""
+        all_rank_states: Optional[List[RankState]] = None
+    ) -> Tuple[List[RequestQueueItem], Dict[int, int]]:
+        """Pop requests from waiting_queue based on available capacity.
+
+        Returns the requests and, with attention DP, the ranks the router
+        planned for them (request id -> rank; empty when none are planned).
+        """
         admission_capacity = self._get_request_admission_capacity()
 
         max_new_requests = admission_capacity - total_num_active_requests
@@ -7109,17 +7338,26 @@ class PyExecutor:
                                            admission_capacity)
             max_new_requests = min(max_new_requests, self._fill_admit_cap)
 
+        if self.enable_attention_dp:
+            # FIFO in warmup and the benchmark fill phase, where every request
+            # must fit at once.
+            kv_balance = not (self.is_warmup or
+                              (self.is_benchmark_disagg
+                               and self._benchmark_fill_phase_active))
+            return self.adp_router.pop_requests(waiting_queue,
+                                                all_rank_states,
+                                                max_new_requests,
+                                                self.max_num_active_requests,
+                                                kv_balance=kv_balance)
         new_requests = get_from_waiting_queue(
             waiting_queue,
             max_new_requests,
-            enable_attention_dp=self.enable_attention_dp,
-            max_num_active_requests=self.max_num_active_requests,
-            all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or
-                not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
-                or self.enable_attention_dp):
-            return new_requests
-        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
+            enable_attention_dp=False,
+            max_num_active_requests=self.max_num_active_requests)
+        if (not new_requests or not getattr(
+                self, "_mm_encoder_item_scheduling_enabled", False)):
+            return new_requests, {}
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests), {}
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
@@ -7133,7 +7371,7 @@ class PyExecutor:
 
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
-            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # because _pop_from_waiting_queue needs the rank states
             # from the allgather result. Moving it to step 5 would require an
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
@@ -7202,10 +7440,8 @@ class PyExecutor:
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
                         gpu_forward_time_ms=record.gpu_forward_time_ms)
-            all_ranks_num_active_requests = [
-                s.num_active_requests for s in all_rank_states
-            ]
-            total_num_active_requests = sum(all_ranks_num_active_requests)
+            total_num_active_requests = sum(s.num_active_requests
+                                            for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(
                 s.num_retiring_requests for s in all_rank_states)
         else:
@@ -7217,16 +7453,14 @@ class PyExecutor:
                 # should_enable_overlap_headroom). They still count as live.
                 total_num_active_requests -= count_retiring_requests(
                     active_requests)
-            all_ranks_num_active_requests = None
             all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
 
         # 3. Pop requests from waiting queue
-        new_requests = self._pop_from_waiting_queue(
-            waiting_queue, total_num_active_requests,
-            all_ranks_num_active_requests)
+        new_requests, placement = self._pop_from_waiting_queue(
+            waiting_queue, total_num_active_requests, all_rank_states)
 
         # 4. Update performance metrics (before DP scheduling to clear all start_times)
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -7244,7 +7478,7 @@ class PyExecutor:
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
                     all_rank_states, new_requests,
-                    self.max_num_active_requests)
+                    self.max_num_active_requests, placement=placement)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
             all_new_flat = [
@@ -8281,6 +8515,13 @@ class PyExecutor:
         if not needs_dummy:
             return
 
+        if self._adp_dummy_is_gen and is_context_only_kv_cache(
+                self.kv_cache_manager):
+            # A context-only cache (KDA draft-verify buffers or FP4 MLA V
+            # scales omitted) cannot run a generation row, even when the
+            # peers' intent is generation; pad with a context dummy.
+            self._adp_dummy_is_gen = False
+
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
         token_nums = None
         if not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None:
@@ -8381,8 +8622,10 @@ class PyExecutor:
         Padding is rank-local because `_schedule()` allgathers inside
         `_balance_adp_requests`. A generation dummy is used rather than the
         context dummy the pre-schedule path would pick, since this rank is empty
-        precisely because it is short of KV cache. Not reached under pipeline
-        parallelism, which does not call `_prepare_and_schedule_batch`.
+        precisely because it is short of KV cache. A context-only cache cannot
+        run a generation row, so there the dummy is a one-token context
+        request. Not reached under pipeline parallelism, which does not call
+        `_prepare_and_schedule_batch`.
         """
         if not self.enable_attention_dp:
             return
@@ -8415,11 +8658,10 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        # A KDA context-only cache manager keeps no replay or draft-verification
-        # buffers, so it cannot run a generation row; pad with a one-token
-        # context dummy instead.
-        context_dummy = getattr(self.kv_cache_manager, "kda_context_only",
-                                False) is True
+        # A context-only cache manager keeps no KDA replay or draft-verification
+        # buffers, or no FP4 MLA V scales, so it cannot run a generation row;
+        # pad with a one-token context dummy instead.
+        context_dummy = is_context_only_kv_cache(self.kv_cache_manager)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
                 token_nums, draft_reserve=0 if context_dummy else None):
@@ -8946,8 +9188,10 @@ class PyExecutor:
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
-            # with KVCacheTransferManager's onboard/offload operations.
-            self.execution_stream.wait_stream(torch.cuda.current_stream())
+            # with KVCacheTransferManager's onboard/offload operations. With the
+            # loop on the execution stream both waits are program order.
+            if not self._loop_on_execution_stream:
+                self.execution_stream.wait_stream(torch.cuda.current_stream())
             self._attach_encoder_output_to_execution_stream(scheduled_requests)
             with torch.cuda.stream(self.execution_stream):
                 outputs = forward(scheduled_requests, self.resource_manager,
@@ -8964,7 +9208,8 @@ class PyExecutor:
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.
-            torch.cuda.current_stream().wait_stream(self.execution_stream)
+            if not self._loop_on_execution_stream:
+                torch.cuda.current_stream().wait_stream(self.execution_stream)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:

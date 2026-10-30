@@ -48,16 +48,9 @@ configure_file(
 
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
+list(REMOVE_ITEM SRC_CU "${CMAKE_CURRENT_SOURCE_DIR}/prepareCustomMask.cu")
 
-# Archs listed here are pruned when the build does not enable them. Sm100f has
-# no context FMHA kernel, so Rubin needs the prebuilt Sm107a cubins kept
-# unconditionally: 107 is omitted below, and the globally-set EXCLUDE_SM_107
-# that would drop their metadata rows is cleared for this directory.
-set(FMHA_PRUNABLE_ARCHS 100 103 100f)
-remove_definitions(-DEXCLUDE_SM_107)
-
-filter_source_cuda_architectures(SOURCE_LIST SRC_CPP
-                                 ARCHS ${FMHA_PRUNABLE_ARCHS})
+filter_source_cuda_architectures(SOURCE_LIST SRC_CPP ARCHS 100 103 107 100f)
 
 add_library(trtllm_gen_fmha_interface INTERFACE)
 target_include_directories(
@@ -67,14 +60,16 @@ target_include_directories(
 add_library(trtllm_gen_fmha OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET trtllm_gen_fmha PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fmha PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-target_link_libraries(trtllm_gen_fmha PUBLIC trtllm_gen_fmha_interface)
+target_link_libraries(
+  trtllm_gen_fmha
+  PUBLIC trtllm_gen_fmha_interface
+  PRIVATE tllm::kernel_attention_mask)
 target_include_directories(
   trtllm_gen_fmha PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/trtllmGen_fmha_export)
 
 include(tllm_cubin_archive)
 tllm_add_cubin_archive_sources(
-  trtllm_gen_fmha "${CMAKE_CURRENT_SOURCE_DIR}/cubin"
-  ARCHS ${FMHA_PRUNABLE_ARCHS})
+  trtllm_gen_fmha "${CMAKE_CURRENT_SOURCE_DIR}/cubin" ARCHS 100 103 107 100f)
 set(TRTLLM_FMHA_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}")
 target_compile_definitions(
   trtllm_gen_fmha
