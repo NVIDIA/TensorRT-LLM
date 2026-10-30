@@ -2905,7 +2905,7 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     supported_encoder_attention_backends = {
         "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
-        "audio": frozenset(),
+        "audio": frozenset(),  # Parakeet uses fixed relative-position SDPA.
     }
 
     _supports_flash_attn = True
