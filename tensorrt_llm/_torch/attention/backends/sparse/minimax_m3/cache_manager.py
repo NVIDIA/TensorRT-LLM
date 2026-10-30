@@ -392,8 +392,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if spec.owner is KVCacheLayerOwner.DRAFT
         }
         if draft_ids:
-            # Draft layers follow every target layer, so the first one is the global target count.
-            num_target_layers = min(draft_ids)
+            # Layer specs may be a PP rank's subset: the checkpoint's layer count is the global
+            # target count, and without it draft layers still follow every target layer.
+            num_target_layers = int(
+                getattr(kwargs.get("pretrained_config"), "num_hidden_layers", None)
+                or min(draft_ids)
+            )
         if sparse_layer_ids is None:
             sparse_layer_ids = default_sparse_layer_ids(
                 kwargs.get("pretrained_config"), num_target_layers

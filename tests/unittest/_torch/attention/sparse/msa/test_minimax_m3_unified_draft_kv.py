@@ -400,6 +400,8 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     assert manager._windowed_draft_pool_ratio(configs, 1 << 20, 128)[1] == pytest.approx(
         token_share
     )
+    # A quota that cannot hold the context-chunk floor keeps the backend's split.
+    assert manager._windowed_draft_pool_ratio(configs, 1 << 19, 128) is None
     # Without a context-chunk bound the backend keeps its own split.
     manager.max_num_tokens = None
     assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) is None
