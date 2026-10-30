@@ -1039,15 +1039,12 @@ class ModelEngine:
             self._warmup_impl(resource_manager)
 
     def _configure_allreduce_tuning(self) -> None:
-        """Configure the profiling buckets before compilation and capture."""
+        """Configure profiling buckets from the resolved budget before runner warmup."""
         from ..custom_ops.torch_custom_ops import AllReduceRunner
 
         if not self.llm_args.enable_autotuner:
             return
-        ceiling = self.max_num_tokens
-        if getattr(self.model.model_config, "is_encoder_decoder", False):
-            ceiling = max(ceiling, self.encoder_max_num_tokens)
-        AllReduceRunner.configure_tuning_buckets(ceiling)
+        AllReduceRunner.configure_tuning_buckets(self.max_num_tokens)
 
     def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """

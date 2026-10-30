@@ -73,7 +73,8 @@ class DynamicTensorSpec:
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to tuning buckets during inference.
             A negative result indicates the input is outside the supported tuning range.
-            Such inputs miss the cache and skip explicit-shape profiling.
+            Such inputs miss the cache. In skip-sweep mode, a negative mapping
+            for any required dimension suppresses profiling of the entire operation.
     """
     input_idx: int
     dim_idx: int

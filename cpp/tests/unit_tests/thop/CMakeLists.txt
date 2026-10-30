@@ -15,6 +15,18 @@
 
 if(${BUILD_PYT})
   add_tllm_gtest(
+    allreduceTacticCacheTest
+    OWNER
+    common
+    SOURCES
+    allreduceTacticCacheTest.cpp
+    LINK_LIBRARIES
+    tllm::common_headers
+    ${TORCH_LIBRARIES}
+    CUDA::cudart
+    LABELS
+    "unit;common;host")
+  add_tllm_gtest(
     thUtilsTest
     SOURCES
     thUtilsTest.cpp

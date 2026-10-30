@@ -36,6 +36,7 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include "tensorrt_llm/thop/allreduceTacticCache.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -1702,123 +1703,6 @@ void endNCCLWindowTensorScope(
 
 namespace
 {
-
-constexpr size_t kAllReduceNumInputs = 6;
-
-using AllReduceInputShape = c10::SmallVector<int64_t, 8>;
-using AllReduceInputShapes = std::array<AllReduceInputShape, kAllReduceNumInputs>;
-
-struct AllReduceTacticCacheKey
-{
-    std::vector<int64_t> group;
-    AllReduceFusionOp fusionOp;
-    bool inputUsesNcclWindow;
-    c10::ScalarType dtype;
-    AllReduceInputShapes staticInputShapes;
-
-    bool operator<(AllReduceTacticCacheKey const& other) const
-    {
-        return std::tie(group, fusionOp, inputUsesNcclWindow, dtype, staticInputShapes)
-            < std::tie(other.group, other.fusionOp, other.inputUsesNcclWindow, other.dtype, other.staticInputShapes);
-    }
-};
-
-constexpr int64_t kDefaultAllReduceTuningCeiling = 16384;
-
-std::vector<int64_t> makeAllReduceTuningBuckets(int64_t maxNumTokens)
-{
-    TORCH_CHECK(maxNumTokens > 0, "AllReduce tuning ceiling must be positive.");
-    auto const ceiling = maxNumTokens;
-    std::vector<int64_t> buckets;
-    for (int64_t bucket = 1; bucket < ceiling;)
-    {
-        buckets.push_back(bucket);
-        if (bucket > ceiling / 2)
-        {
-            break;
-        }
-        bucket *= 2;
-    }
-    buckets.push_back(ceiling);
-    return buckets;
-}
-
-std::optional<size_t> getAllReduceBucketIndex(std::vector<int64_t> const& buckets, int64_t numTokens)
-{
-    if (buckets.empty() || numTokens < buckets.front() || numTokens > buckets.back())
-    {
-        return std::nullopt;
-    }
-    return std::upper_bound(buckets.begin(), buckets.end(), numTokens) - buckets.begin() - 1;
-}
-
-class AllReduceTacticCache
-{
-public:
-    std::vector<int64_t> configure(int64_t maxNumTokens)
-    {
-        std::unique_lock lock(mMutex);
-        if (mBuckets.empty() || mBuckets.back() != maxNumTokens)
-        {
-            mBuckets = makeAllReduceTuningBuckets(maxNumTokens);
-            mTactics.clear();
-        }
-        return mBuckets;
-    }
-
-    std::vector<int64_t> getBuckets()
-    {
-        std::unique_lock lock(mMutex);
-        ensureDefaultBuckets();
-        return mBuckets;
-    }
-
-    int64_t mapToBucket(int64_t numTokens) const
-    {
-        std::shared_lock lock(mMutex);
-        auto const index = getAllReduceBucketIndex(mBuckets, numTokens);
-        return index.has_value() ? mBuckets[*index] : -1;
-    }
-
-    void insert(AllReduceTacticCacheKey key, int64_t bucket, int64_t tactic)
-    {
-        std::unique_lock lock(mMutex);
-        ensureDefaultBuckets();
-        auto const index = getAllReduceBucketIndex(mBuckets, bucket);
-        TORCH_CHECK(index.has_value() && mBuckets[*index] == bucket, "Invalid AllReduce autotuner bucket: ", bucket);
-        auto const entry = mTactics.try_emplace(std::move(key), mBuckets.size()).first;
-        entry->second[*index] = tactic;
-    }
-
-    std::optional<int64_t> find(AllReduceTacticCacheKey const& key, int64_t numTokens) const
-    {
-        std::shared_lock lock(mMutex);
-        auto const index = getAllReduceBucketIndex(mBuckets, numTokens);
-        auto const entry = mTactics.find(key);
-        return !index.has_value() || entry == mTactics.end() ? std::nullopt : entry->second[*index];
-    }
-
-    void clear()
-    {
-        std::unique_lock lock(mMutex);
-        mTactics.clear();
-    }
-
-private:
-    // Called with mMutex held exclusively, only by standalone consumers that
-    // need a table before an engine has configured its resolved token budget.
-    void ensureDefaultBuckets()
-    {
-        if (mBuckets.empty())
-        {
-            mBuckets = makeAllReduceTuningBuckets(kDefaultAllReduceTuningCeiling);
-        }
-    }
-
-    mutable std::shared_mutex mMutex;
-    std::vector<int64_t> mBuckets;
-    std::map<AllReduceTacticCacheKey, std::vector<std::optional<int64_t>>> mTactics;
-};
 
 AllReduceTacticCache& getAllReduceTacticCache()
 {
