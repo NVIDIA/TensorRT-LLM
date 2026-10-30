@@ -397,6 +397,23 @@ def make_forward_impl_check(moe_module, forward_impl_orig):
     return forward_impl
 
 
+def _check_load_balancer_support(load_balancer_config, use_cuda_graph: bool) -> None:
+    """Reject load balancers that cannot run on a layer slice driven by this harness."""
+    load_balancer_mode = getattr(load_balancer_config, "mode", None)
+    if load_balancer_mode == "per_layer_dynamic" and use_cuda_graph:
+        raise ValueError(
+            "Per-layer dynamic EPLB does not support CUDA graphs: it binds one submission"
+            " stream and keeps host-side plan state that a graph replay cannot advance."
+            " Rerun with --no-use-cuda-graph."
+        )
+    if load_balancer_mode == "standard" and load_balancer_config.layer_updates_per_iter > 0:
+        raise ValueError(
+            "Layer-wise benchmarks support per_layer_dynamic EPLB and static standard EPLB"
+            " (layer_updates_per_iter 0) only: online standard EPLB synchronizes every MoE"
+            " layer of the model, but only a slice of the layers runs here."
+        )
+
+
 class Runner:
     def __init__(
         self,
@@ -451,22 +468,8 @@ class Runner:
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
         )
-        # Reject load balancers that cannot run on a layer slice driven by this
-        # harness. The validator above has resolved a YAML path to its config.
-        load_balancer_config = llm_args.moe_config.load_balancer
-        load_balancer_mode = getattr(load_balancer_config, "mode", None)
-        if load_balancer_mode == "per_layer_dynamic" and use_cuda_graph:
-            raise ValueError(
-                "Per-layer dynamic EPLB does not support CUDA graphs: it binds one submission"
-                " stream and keeps host-side plan state that a graph replay cannot advance."
-                " Rerun with --no-use-cuda-graph."
-            )
-        if load_balancer_mode == "standard" and load_balancer_config.layer_updates_per_iter > 0:
-            raise ValueError(
-                "Layer-wise benchmarks support per_layer_dynamic EPLB and static standard EPLB"
-                " (layer_updates_per_iter 0) only: online standard EPLB synchronizes every MoE"
-                " layer of the model, but only a slice of the layers runs here."
-            )
+        # The validator above has resolved a YAML path to its config.
+        _check_load_balancer_support(llm_args.moe_config.load_balancer, use_cuda_graph)
         with (
             self.scaled_from_ctx(scaled_from, mapping),
             self.vision_config_ctx(vision_config),

@@ -84,16 +84,17 @@ def _split_rows(t: torch.Tensor, sizes: List[int]) -> List[torch.Tensor]:
 
 
 def _record_routes(
-    moe: "ConfigurableMoE", routes: Optional[torch.Tensor]
+    moe: "ConfigurableMoE", routes: Optional[torch.Tensor], num_slots: int
 ) -> Optional[torch.Tensor]:
-    """Record ``routes`` for expert statistics and the layer-wise calibrator.
+    """Record ``routes``, IDs in ``[0, num_slots)``, for expert statistics and
+    the layer-wise calibrator.
 
     Returns ``routes``, or the routes the calibrator replays in their place.
     """
     if routes is not None:
         ExpertStatistic.set_layer(moe.layer_idx)
-        ExpertStatistic.maybe_add_info(moe.num_slots, routes)
-    return get_calibrator().maybe_collect_or_replay_slots(moe.num_slots, routes)
+        ExpertStatistic.maybe_add_info(num_slots, routes)
+    return get_calibrator().maybe_collect_or_replay_slots(num_slots, routes)
 
 
 def _wait_input_ready(event: Optional[torch.cuda.Event]) -> None:
@@ -1573,10 +1574,12 @@ class FusedCommMoEScheduler(MoEScheduler):
 
         # ----- EPLB: update stats + remap expert ids -> slot ids -----
         # Per-layer dynamic EPLB plans from the routes that the layer-wise
-        # calibrator records or replays, so they are recorded before the route;
-        # otherwise the recorded routes are the slots routed to.
+        # calibrator records or replays, so they are recorded before the route,
+        # as expert IDs; otherwise the recorded routes are the slots routed to.
+        # With the load balancer off, slots are expert IDs, so one recording
+        # drives both arms.
         if uses_replica_plan:
-            token_selected_experts = _record_routes(moe, token_selected_experts)
+            token_selected_experts = _record_routes(moe, token_selected_experts, moe.num_experts)
             token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             replica_plan = moe.layer_load_balancer.require_replica_plan()
         else:
@@ -1594,7 +1597,7 @@ class FusedCommMoEScheduler(MoEScheduler):
                 token_selected_slots = moe._load_balancer_route(token_selected_experts, moe.use_dp)
             else:
                 token_selected_slots = token_selected_experts
-            token_selected_slots = _record_routes(moe, token_selected_slots)
+            token_selected_slots = _record_routes(moe, token_selected_slots, moe.num_slots)
             replica_plan = None
 
         # ----- quantize / prepare -----

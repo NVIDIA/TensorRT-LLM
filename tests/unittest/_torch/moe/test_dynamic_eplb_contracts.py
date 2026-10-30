@@ -2379,6 +2379,7 @@ class _ChunkRoutes:
 def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     source = _TORCH_ROOT / "moe/fused_moe/moe_scheduler.py"
     trace = []
+    labels = []
 
     class ExpertStatistic:
         @staticmethod
@@ -2387,9 +2388,11 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
 
         @staticmethod
         def maybe_add_info(num_slots, routes):
+            labels.append(num_slots)
             trace.append(("statistic", routes.name))
 
     def maybe_collect_or_replay_slots(num_slots, routes):
+        labels.append(num_slots)
         trace.append(("calibrator", routes.name))
         return _ChunkRoutes("replayed " + routes.name)
 
@@ -2429,6 +2432,7 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         apply_router_weight_on_input=False,
         mapping=SimpleNamespace(moe_ep_rank=0),
         layer_idx=7,
+        num_experts=16,
         num_slots=24,
         use_dp=True,
         layer_load_balancer=layer,
@@ -2506,6 +2510,8 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
             "done_set_cpu",
         ]
     assert trace == expected
+    # Routes recorded before the route are expert IDs; after it, slots.
+    assert labels == ([16, 16] if mode == "per_layer_dynamic" else [24, 24])
 
 
 def test_base_worker_finalizes_rank_follower_pyexecutor():

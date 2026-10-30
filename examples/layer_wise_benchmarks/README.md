@@ -138,11 +138,16 @@ NP=8 ./mpi_launch.sh -x MEGAMOE_COMBINE_FORMAT=16e2m1xbf16 -x ENABLE_PERFECT_ROU
 # Per-layer dynamic EPLB runs without CUDA graphs only, and online standard EPLB is not
 # supported on a layer slice; the runner rejects both.
 # To replay the routing of an end-to-end run, add --replay-file-path (see "Performance
-# alignment" below) to the first two arms only, each with a recording made with the same
-# num_slots: a recording with the load balancer off (384 slots) cannot be replayed into the
-# per-layer dynamic arm (408 slots), nor the reverse. Replay overrides the expert IDs that
-# ENABLE_PERFECT_ROUTER=expert_ids substitutes, so run the third arm without it; run.py
-# rejects that combination. Replay with MEGAMOE_CUTEDSL and the CTX phase is untested.
+# alignment" below) to the first two arms only. Both arms record and replay expert IDs, so
+# one recording, for example made with the load balancer off, drives both. Replay overrides
+# the expert IDs that ENABLE_PERFECT_ROUTER=expert_ids substitutes, so run the third arm
+# without it; run.py rejects that combination. Replay with MEGAMOE_CUTEDSL and the CTX
+# phase is untested.
+# Without replay every timed iteration reruns the same inputs, so the per-layer dynamic arm
+# plans the same placement each time: after warmup its helper slots already hold the planned
+# experts and the copies are skipped. That arm then times HALO-Q and the plan sync with
+# almost no helper copies, a best case. Run this arm with replay to include the copies;
+# compare the per-layer dynamic and balanced arms end to end.
 
 # Run with DeepEP A2A
 NP=4 ./mpi_launch.sh -x TRTLLM_FORCE_COMM_METHOD=DEEPEP ./run.sh config_ctx.yaml --moe-backend CUTEDSL
