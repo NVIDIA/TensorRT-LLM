@@ -28,6 +28,7 @@ python models/ltx2.py --visual_gen_args configs/ltx2-1gpu.yaml
 # FP8 blockwise config: configs/minimax-h3-fp8-blockwise-1gpu.yaml.
 # 2-GPU DiT tensor parallelism config: configs/minimax-h3-bf16-tp2.yaml.
 # 2-GPU Ulysses config: configs/minimax-h3-bf16-2gpu.yaml.
+# Pre-quantized ModelOpt NVFP4 checkpoint, 1 or 8 GPUs: configs/minimax-h3-nvfp4-{1gpu,8gpu}.yaml.
 python models/minimax_h3.py --model <approved-checkpoint> --visual_gen_args configs/minimax-h3-bf16-1gpu.yaml
 python models/flux1.py --visual_gen_args configs/flux1-dev-fp4-1gpu.yaml
 python models/flux2.py --visual_gen_args configs/flux2-dev-fp4-1gpu.yaml

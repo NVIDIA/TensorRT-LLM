@@ -58,6 +58,8 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # MiniMax-H3 pre-quantized ModelOpt NVFP4 checkpoint smoke (shared CI model store: MiniMax-H3-NVFP4).
+  - examples/visual_gen/test_minimax_h3_e2e.py::test_minimax_h3_prequantized_nvfp4_transformer_smoke TIMEOUT (30)
 - condition:
     ranges:
       system_gpu_count:

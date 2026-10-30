@@ -552,3 +552,97 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
 
     assert lpips_distance < MINIMAX_H3_LPIPS_THRESHOLD
     assert audio_distance < MINIMAX_H3_AUDIO_LOG_STFT_THRESHOLD
+
+
+def _minimax_h3_nvfp4_checkpoint_path() -> str:
+    """Resolve the pre-quantized ModelOpt NVFP4 MiniMax-H3 checkpoint from the CI model store.
+
+    ``MINIMAX_H3_NVFP4_CHECKPOINT`` overrides the location for a local run. Missing weights
+    fail rather than skip, for the same reason as ``_minimax_h3_checkpoint_path``.
+    """
+    override = os.environ.get("MINIMAX_H3_NVFP4_CHECKPOINT", "")
+    path = override or os.path.join(_llm_models_root(), "MiniMax-H3-NVFP4")
+    if not os.path.isdir(path):
+        pytest.fail(f"MiniMax-H3 NVFP4 checkpoint not found: {path}")
+    return path
+
+
+def test_minimax_h3_prequantized_nvfp4_transformer_smoke() -> None:
+    """Load the ModelOpt NVFP4 export as exported (static scales, FA4) and run compiled H3."""
+    checkpoint_path = _minimax_h3_nvfp4_checkpoint_path()
+    _disable_inductor_compile_worker_quiesce()
+    pipeline = PipelineLoader(
+        VisualGenArgs(
+            model=checkpoint_path,
+            attention_config={"backend": "FA4"},
+            torch_compile_config=TorchCompileConfig(enable=True),
+        )
+    ).load(
+        skip_warmup=True,
+        skip_components=[
+            PipelineComponent.TOKENIZER,
+            PipelineComponent.PROCESSOR,
+            PipelineComponent.TEXT_ENCODER,
+            PipelineComponent.VAE,
+            PipelineComponent.AUDIO_VAE,
+            PipelineComponent.SCHEDULER,
+            PipelineComponent.AUDIO_SCHEDULER,
+        ],
+    )
+    transformer = None
+    output = None
+    try:
+        transformer = pipeline.transformer
+        quant_config = transformer.model_config.quant_config
+        assert quant_config.quant_algo == QuantAlgo.NVFP4
+        assert not transformer.model_config.dynamic_weight_quant, "export must load as static"
+        assert transformer.context_embedder.has_any_quant
+        # The export excludes the small FP32 media projections.
+        for module in (
+            transformer.proj_in,
+            transformer.audio_proj_in,
+            transformer.proj_out,
+            transformer.audio_proj_out,
+        ):
+            assert not module.has_any_quant
+        first_linear = transformer.transformer_blocks[0].attn.qkv_proj
+        assert torch.isfinite(first_linear.input_scale).all(), "calibrated input_scale not loaded"
+
+        # 2048 video tokens so FA4 takes its long-sequence kernel path.
+        n_video = 2048
+        position_ids = torch.zeros(n_video + 3, 3, dtype=torch.long, device="cuda")
+        position_ids[2:, 0] = torch.arange(n_video + 1, device="cuda")
+        token_tags = torch.cat(
+            [
+                torch.tensor([1, 1], device="cuda"),
+                torch.zeros(n_video, dtype=torch.long, device="cuda"),
+                torch.tensor([2], device="cuda"),
+            ]
+        )
+        torch._dynamo.utils.counters.clear()
+        with torch.inference_mode():
+            output = transformer(
+                hidden_states=torch.randn(1, n_video, 96, device="cuda"),
+                audio_hidden_states=torch.randn(1, 1, 32, device="cuda"),
+                encoder_hidden_states=torch.randn(1, 2, 5120, device="cuda", dtype=torch.bfloat16),
+                timestep=torch.tensor([1.0], device="cuda"),
+                conditioning_timesteps=torch.tensor([1.0], device="cuda"),
+                timestep_indices=torch.zeros(n_video + 3, dtype=torch.long, device="cuda"),
+                token_tags=token_tags,
+                position_ids=position_ids,
+                video_indices=torch.arange(2, n_video + 2, device="cuda"),
+                audio_indices=torch.tensor([n_video + 2], device="cuda"),
+                text_indices=torch.tensor([0, 1], device="cuda"),
+            )
+
+        assert output.sample.shape == (1, n_video, 96)
+        assert output.audio_sample.shape == (1, 1, 32)
+        assert torch.isfinite(output.sample).all()
+        assert torch.isfinite(output.audio_sample).all()
+        assert torch._dynamo.utils.counters["frames"]["ok"] > 0
+    finally:
+        del output
+        del transformer
+        del pipeline
+        torch._dynamo.reset()
+        _cleanup_cuda()
