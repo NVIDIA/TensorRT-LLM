@@ -117,6 +117,7 @@ class MiniMaxM3SparseMetadataParams(SparseMetadataParams):
     global_num_kv_heads: int = 0
     num_index_heads: int = 4
     topk: int = 16
+    index_tp_split: bool = False
 
     def sharded_head_counts(self, mapping: Optional["Mapping"] = None) -> Tuple[int, int]:
         """Return per-rank (num_q_heads, num_kv_heads) for mapping.

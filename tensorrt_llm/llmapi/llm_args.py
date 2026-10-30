@@ -1154,6 +1154,16 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "or NVFP4 main KV cache.",
         status="prototype",
     )
+    index_tp_split: bool = Field(
+        default=False,
+        description=
+        "Split the decode indexer across the TP ranks: each rank scores every "
+        "index head on 1/TP of the index-K rows and the ranks exchange the "
+        "partial block maxima over NVLink. Replicates index-Q on every rank. "
+        "Requires fuse_qkv_index_projection, TP 2 or 4 on one node without "
+        "attention DP, and at most 7 draft tokens.",
+        status="prototype",
+    )
     num_attention_heads: Optional[int] = Field(
         default=None,
         description=
@@ -1197,6 +1207,9 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "indexer_kv_dtype='fp8'.")
+        if self.index_tp_split and not self.fuse_qkv_index_projection:
+            raise ValueError("MiniMax-M3 index_tp_split=True requires "
+                             "fuse_qkv_index_projection=True.")
         return self
 
     def supports_backend(self, backend: str) -> bool:
@@ -1253,6 +1266,7 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             global_num_kv_heads=num_kv_heads,
             num_index_heads=self.sparse_num_index_heads,
             topk=self.sparse_topk_blocks,
+            index_tp_split=self.index_tp_split,
         )
 
 

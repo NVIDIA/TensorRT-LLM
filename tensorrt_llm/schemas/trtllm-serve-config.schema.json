@@ -3840,6 +3840,13 @@
           "title": "Implementation",
           "type": "string"
         },
+        "index_tp_split": {
+          "default": false,
+          "description": "Split the decode indexer across the TP ranks: each rank scores every index head on 1/TP of the index-K rows and the ranks exchange the partial block maxima over NVLink. Replicates index-Q on every rank. Requires fuse_qkv_index_projection, TP 2 or 4 on one node without attention DP, and at most 7 draft tokens.",
+          "status": "prototype",
+          "title": "Index Tp Split",
+          "type": "boolean"
+        },
         "indexer_kv_dtype": {
           "default": "bf16",
           "description": "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses unscaled E4M3 values with FP32 score accumulation and is supported only by the MSA implementation.",

@@ -23,6 +23,7 @@ l0_dgx_b200:
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
   - unittest/_torch/multi_gpu/test_minimax_m3_piecewise.py::test_minimax_m3_piecewise_empty_adp_rank_preserves_caches
+  - unittest/_torch/multi_gpu/test_minimax_m3_index_tp_split.py::test_minimax_m3_index_tp_split_matches_unsplit
   # One process: the MNNVL workspace's capture guard raises before any MNNVL call.
   - unittest/_torch/multi_gpu/test_mnnvl_allreduce.py::test_mnnvl_workspace_creation_refuses_graph_capture
   # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)

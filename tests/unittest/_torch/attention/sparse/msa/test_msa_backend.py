@@ -836,6 +836,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
         msa_kv_lens_cpu = torch.full((2,), 128, dtype=torch.int32)
         msa_qo_offset_cpu = torch.full((2,), 127, dtype=torch.int32)
+        msa_index_split = None
         num_contexts = 2
         num_generations = 0
 
@@ -955,6 +956,8 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
         msa_qo_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_kv_lens_cpu = torch.tensor([num_tokens], dtype=torch.int32)
         msa_qo_offset_cpu = torch.tensor([0], dtype=torch.int32)
+
+        msa_index_split = None
 
         def __init__(self) -> None:
             self.num_contexts = num_contexts

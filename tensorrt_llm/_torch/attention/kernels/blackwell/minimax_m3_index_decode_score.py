@@ -25,12 +25,17 @@ Differences from upstream:
   blackwell.utils rather than cute.arch.
 * Compilation and caching live in the trtllm::cute_dsl_minimax_m3_index_decode_score
   runner, matching the other CuTe DSL ops in this tree.
+* TP split (shard_world > 1, index_tp_split): see IndexDecodeScoreKernel.
+* Proxy fences before the TMA stage releases.
+* One MMA warp stores the final scores rather than all four.
 """
 
 import cutlass
 from cuda.bindings.driver import CUstream
-from cutlass import Float8E4M3FN, Float16, Float32, Int64, Uint32, cute
+from cutlass import Float8E4M3FN, Float16, Float32, Int32, Int64, Uint32, cute
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.smem_allocator import SmemAllocator
 
 from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
@@ -39,7 +44,11 @@ from tensorrt_llm._torch.kernels.blackwell.cute_ptx_utils import (
     mma_sync,
     simple_tma_copy,
 )
-from tensorrt_llm._torch.kernels.blackwell.utils import TRTLLM_ENABLE_PDL, griddepcontrol_wait
+from tensorrt_llm._torch.kernels.blackwell.utils import (
+    TRTLLM_ENABLE_PDL,
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
 
 __all__ = ["IndexDecodeScoreKernel"]
 
@@ -68,13 +77,39 @@ def _fp8_to_f16_mma_fragments(src: cute.Tensor):
     return lower, upper
 
 
+@dsl_user_op
+def _store_sys(addr: Int64, values, *, loc=None, ip=None) -> None:
+    """System-scope store of 1, 2 or 4 consecutive fp32, so a peer GPU polling the address sees it."""
+    n = len(values)
+    regs = ", ".join(f"${i + 1}" for i in range(n))
+    llvm.inline_asm(
+        None,
+        [addr.ir_value(loc=loc, ip=ip)] + [v.ir_value(loc=loc, ip=ip) for v in values],
+        f"st.relaxed.sys.global.v{n}.f32 [$0], {{{regs}}};"
+        if n > 1
+        else "st.relaxed.sys.global.f32 [$0], $1;",
+        "l" + ",f" * n,
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
 class IndexDecodeScoreKernel:
     """Per-block max index score for one decode step.
 
-    Grid is (batch, split_k): CTA (b, s) walks KV blocks
+    Grid is (batch, split_k): CTA (b, s) walks KV block groups
     s, s + split_k, s + 2 * split_k, ... of request b and writes each block's
     score directly, so no cross-CTA reduction is needed. CTAs whose split_id
-    exceeds the request's block count exit immediately.
+    exceeds the request's group count exit immediately.
+
+    With shard_world W > 1, K holds 128 / W rows per block (rows r, r + W, ...)
+    and a group is W consecutive blocks, so a pipeline stage is still 128 rows.
+    The partial max of (head h, token t, block b) goes to
+    recv_bases[h // (num_heads // W)] at the offset of
+    (shard_rank, h % (num_heads // W), t, b) in the score layout. A group's W
+    partials go out as one vector store, so that layout has blocks innermost,
+    its other strides are multiples of W and the bases are 4 * W-byte aligned.
     """
 
     BLOCK_K = 128
@@ -88,12 +123,15 @@ class IndexDecodeScoreKernel:
         max_decode_query_len: int,
         split_k: int,
         head_dim: int = 128,
+        shard_world: int = 1,
     ):
         self.dtype = dtype
         self.num_heads = num_heads
         self.max_decode_query_len = max_decode_query_len
         self.split_k = split_k
         self.head_dim = head_dim
+        self.shard_world = shard_world
+        self.rows = self.BLOCK_K // shard_world
 
     def _swizzle_elems(self) -> int:
         """Elements spanned by one 128-byte swizzle atom."""
@@ -111,13 +149,13 @@ class IndexDecodeScoreKernel:
         return cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, layout)
 
     def _sk_layout(self):
-        """Composed SMEM layout for the pipelined K tiles."""
+        """Composed SMEM layout for the pipelined K pages; page p of stage s is s * W + p."""
         elems = self._swizzle_elems()
         head_dim = self.head_dim
-        block_k = self.BLOCK_K
+        rows = self.rows
         layout = cute.make_layout(
-            (1, block_k, (elems, head_dim // elems), self.num_stages),
-            stride=(0, elems, (1, block_k * elems), block_k * head_dim),
+            (1, rows, (elems, head_dim // elems), self.shard_world * self.num_stages),
+            stride=(0, elems, (1, rows * elems), rows * head_dim),
         )
         return cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, layout)
 
@@ -125,16 +163,20 @@ class IndexDecodeScoreKernel:
     def __call__(
         self,
         gQ: cute.Tensor,  # [bs * runtime_decode_query_len, num_heads, head_dim]
-        gK_cache: cute.Tensor,  # [num_pages, page_size, head_dim]
+        gK_cache: cute.Tensor,  # [num_pages, page_size / W, head_dim]
         block_table: cute.Tensor,  # [bs, max_pages]
-        score: cute.Tensor,  # [num_heads, bs * runtime_decode_query_len, max_pages]
+        score: cute.Tensor,  # [num_heads, bs * dql, max_pages], or [W, heads / W, bs * dql, max_pages]
         seq_lens: cute.Tensor,  # [bs]
+        recv_bases: cute.Tensor,  # [W] int64 base address of every rank's score (W > 1)
+        shard_rank: Int32,
         stream: CUstream,
     ):
         num_heads = self.num_heads
         head_dim = self.head_dim
         MAX_DQL = self.max_decode_query_len
         assert num_heads * MAX_DQL <= 32
+        # Split, the W pages of a stage stack to its 128 rows only if a row is one swizzle atom.
+        assert self.shard_world == 1 or head_dim * self.dtype.width == 1024
 
         batch = seq_lens.shape[0]
         decode_query_len = gQ.shape[0] // batch
@@ -154,7 +196,7 @@ class IndexDecodeScoreKernel:
             tma_g2s,
             cute.logical_divide(gK_cache, (None, None, elems)),
             self._sk_layout(),
-            (1, self.BLOCK_K, head_dim),
+            (1, self.rows, head_dim),
         )
 
         self.kernel(
@@ -166,6 +208,8 @@ class IndexDecodeScoreKernel:
             score,
             seq_lens,
             decode_query_len,
+            recv_bases,
+            shard_rank,
         ).launch(grid=grid, block=block, stream=stream, use_pdl=TRTLLM_ENABLE_PDL)
 
     @cute.kernel
@@ -179,6 +223,8 @@ class IndexDecodeScoreKernel:
         score: cute.Tensor,
         seq_lens: cute.Tensor,
         decode_query_len,
+        recv_bases: cute.Tensor,
+        shard_rank,
     ):
         batch_id, split_id, _ = cute.arch.block_idx()
         _, split_k, _ = cute.arch.grid_dim()
@@ -195,17 +241,30 @@ class IndexDecodeScoreKernel:
         num_stages = self.num_stages
         Q_TILES = cute.ceil_div(BLOCK_Q, MMA_N)
         EPI_Q = Q_TILES * MMA_N
+        W = self.shard_world
+        WARPS_PER_PAGE = 4 // W
+        H_LOCAL = NUM_HEADS // W
 
         sq_layout = self._sq_layout()
         sk_layout = self._sk_layout()
+        swz = self._swizzle_elems()
 
         smem = SmemAllocator()
-        sK = smem.allocate_tensor(
+        # One TMA destination per page; sK views the same bytes as the 128-row
+        # stage tiles the MMA warps read.
+        sK_pages = smem.allocate_tensor(
             dtype,
             sk_layout.outer,
-            byte_alignment=128,
+            byte_alignment=1024,
             swizzle=sk_layout.inner,
         )[0, None, None, None]
+        sK = cute.make_tensor(
+            sK_pages.iterator,
+            cute.make_layout(
+                (BLOCK_K, (swz, head_dim // swz), num_stages),
+                stride=(swz, (1, BLOCK_K * swz), BLOCK_K * head_dim),
+            ),
+        )
         # sQ aliases the first K stage: Q is consumed into registers before the
         # first K tile is needed, so the two never overlap in time.
         sQ_tma = cute.make_tensor(sK[None, None, 0].iterator, layout=sq_layout.outer)
@@ -237,11 +296,15 @@ class IndexDecodeScoreKernel:
             cpasync.prefetch_descriptor(k_tma_atom)
         cute.arch.sync_threads()
 
-        # No explicit launch_dependents: the only consumer is the block selector,
-        # which reduces over every block this grid writes, so triggering it early
-        # would leave it resident and spinning in its own wait. The implicit
-        # trigger as the CTAs exit still gives it the launch overlap.
+        # Unsplit, no explicit launch_dependents: the only consumer is the block
+        # selector, which reduces over every block this grid writes, so triggering
+        # it early would leave it resident and spinning in its own wait. The
+        # implicit trigger as the CTAs exit still gives it the launch overlap.
         griddepcontrol_wait()
+        if cutlass.const_expr(W > 1):
+            # The split's reduce polls for this grid's pushes. Triggering once every
+            # CTA has started lets it become resident without starving this grid.
+            griddepcontrol_launch_dependents()
 
         # seq_lens must be read after the wait. It is a graph-stable buffer that
         # on_update_kv_lens patches every step, and num_blocks bounds an unmasked
@@ -249,8 +312,9 @@ class IndexDecodeScoreKernel:
         # out-of-bounds write rather than just a wrong answer.
         seqlen = seq_lens[batch_id]
         num_blocks = cute.ceil_div(seqlen, BLOCK_K)
+        num_groups = cute.ceil_div(num_blocks, W)
 
-        if split_id < num_blocks:
+        if split_id < num_groups:
             if warp_id == 4:
                 # TMA warp
                 tma_stage = 0
@@ -273,22 +337,23 @@ class IndexDecodeScoreKernel:
                 if tma_stage == 0:
                     tma_parity ^= 1
 
-                for block_id in range(split_id, num_blocks, split_k):
-                    page_id = block_table[batch_id, block_id]
-                    gK_tile = k_tma_tensor[page_id, None, None]
+                for group_id in range(split_id, num_groups, split_k):
                     k_mbar = tma_full_mbar + tma_stage
 
                     cute.arch.mbarrier_wait(tma_empty_mbar + tma_stage, tma_parity)
                     with cute.arch.elect_one():
                         K_size = BLOCK_K * head_dim * (dtype.width // 8)
                         cute.arch.mbarrier_arrive_and_expect_tx(k_mbar, K_size)
-                    simple_tma_copy(
-                        k_tma_atom,
-                        gK_tile,
-                        sK[None, None, tma_stage],
-                        k_mbar,
-                        cache_policy=EVICT_FIRST,
-                    )
+                    for p in cutlass.range_constexpr(W):
+                        # Past the last block the last page is reloaded and never stored.
+                        block_id = cutlass.min(group_id * W + p, num_blocks - 1)
+                        simple_tma_copy(
+                            k_tma_atom,
+                            k_tma_tensor[block_table[batch_id, block_id], None, None],
+                            sK_pages[None, None, tma_stage * W + p],
+                            k_mbar,
+                            cache_policy=EVICT_FIRST,
+                        )
 
                     tma_stage = (tma_stage + 1) % num_stages
                     if tma_stage == 0:
@@ -329,6 +394,8 @@ class IndexDecodeScoreKernel:
                 cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
                 for q in cutlass.range_constexpr(Q_TILES):
                     cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+                # Order the ldmatrix reads before TMA refills this stage.
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 tma_stage = 1 % self.num_stages
@@ -342,7 +409,7 @@ class IndexDecodeScoreKernel:
                     rQ_f16[None, None, None, 0].store(q_lower.load())
                     rQ_f16[None, None, None, 1].store(q_upper.load())
 
-                for block_id in range(split_id, num_blocks, split_k):
+                for group_id in range(split_id, num_groups, split_k):
                     rC.fill(0.0)
 
                     if warp_id == 0:
@@ -377,9 +444,12 @@ class IndexDecodeScoreKernel:
                                         rC[None, m, n],
                                     )
 
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
-                    k_start = block_id * BLOCK_K + warp_id * 32
+                    # Row i of a page holds token i * W + shard_rank of its block.
+                    k_start = (group_id * W + warp_id // WARPS_PER_PAGE) * BLOCK_K + shard_rank
+                    row_start = (warp_id % WARPS_PER_PAGE) * 32
 
                     for q in cutlass.range_constexpr(Q_TILES):
                         for i in cutlass.range_constexpr(4):
@@ -387,7 +457,7 @@ class IndexDecodeScoreKernel:
                                 col = q * 8 + (lane_id % 4) * 2 + j
                                 q_local_pos = col % MAX_DQL
                                 q_pos = q_start + q_local_pos
-                                k_pos = k_start + i * 8 + lane_id // 4
+                                k_pos = k_start + (row_start + i * 8 + lane_id // 4) * W
                                 rC[q * 8 + i * 2 + j] = (
                                     rC[q * 8 + i * 2 + j] if q_pos >= k_pos else float("-inf")
                                 )
@@ -420,13 +490,32 @@ class IndexDecodeScoreKernel:
                     head_id = lane_id // MAX_DQL
                     q_local_pos = lane_id - head_id * MAX_DQL
                     valid_q = head_id < NUM_HEADS and q_local_pos < decode_query_len
-                    if lane_id < BLOCK_Q and valid_q:
-                        final_score = epi_buffer[lane_id, 0]
-                        for i in cutlass.range_constexpr(1, 4):
-                            final_score = cute.arch.fmax(final_score, epi_buffer[lane_id, i])
-
+                    # The four MMA warps hold the same final scores; one stores them.
+                    if warp_id == 0 and lane_id < BLOCK_Q and valid_q:
                         t = batch_id * decode_query_len + q_local_pos
-                        score[head_id, t, block_id] = final_score
+                        partials = []
+                        for p in cutlass.range_constexpr(W):
+                            final_score = epi_buffer[lane_id, p * WARPS_PER_PAGE]
+                            for i in cutlass.range_constexpr(1, WARPS_PER_PAGE):
+                                final_score = cute.arch.fmax(
+                                    final_score, epi_buffer[lane_id, p * WARPS_PER_PAGE + i]
+                                )
+                            partials.append(final_score)
+                        if cutlass.const_expr(W == 1):
+                            score[head_id, t, group_id] = partials[0]
+                        else:
+                            crd = (shard_rank, head_id % H_LOCAL, t, group_id * W)
+                            addr = (
+                                recv_bases[head_id // H_LOCAL]
+                                + Int64(cute.crd2idx(crd, score.layout)) * 4
+                            )
+                            if group_id * W + W <= num_blocks:
+                                _store_sys(addr, partials)
+                            else:
+                                # Blocks past the last one are never stored.
+                                for p in cutlass.range_constexpr(W - 1):
+                                    if group_id * W + p < num_blocks:
+                                        _store_sys(addr + p * 4, partials[p : p + 1])
 
                     tma_stage = (tma_stage + 1) % self.num_stages
                     if tma_stage == 0:

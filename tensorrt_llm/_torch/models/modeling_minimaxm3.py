@@ -108,8 +108,10 @@ class MiniMaxM3QKVIndexerLinear(Linear):
     Each rank emits ``[Q | K | V | index-Q | index-K]``. Q follows normal
     attention head sharding, K/V/index-Q follow KV-head sharding (including
     replication when TP exceeds the KV-head count), and the single index-K
-    head is replicated. The underlying :class:`Linear` remains the standard
-    quantized implementation; only checkpoint packing is model-specific.
+    head is replicated. With ``replicate_index_q`` every rank also gets all
+    index-Q heads (the TP-split indexer scores every head on every rank). The
+    underlying :class:`Linear` remains the standard quantized implementation;
+    only checkpoint packing is model-specific.
     """
 
     _SHARD_NAMES = ("q", "k", "v", "index_q", "index_k")
@@ -132,6 +134,7 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         use_custom_cublas_mm: bool,
         use_cute_dsl_bf16_gemm: bool,
         use_cute_dsl_blockscaling_mm: bool,
+        replicate_index_q: bool = False,
     ) -> None:
         if total_num_index_heads != total_num_kv_heads:
             raise ValueError(
@@ -168,12 +171,15 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         self.index_head_dim = int(index_head_dim)
         self.local_num_heads = total_num_heads // tp_size
         self.local_num_kv_heads = local_num_kv_heads
-        self.local_num_index_heads = local_num_kv_heads
+        self.replicate_index_q = replicate_index_q
+        self.local_num_index_heads = (
+            total_num_index_heads if replicate_index_q else local_num_kv_heads
+        )
         self.local_output_sizes = (
             self.local_num_heads * head_dim,
             local_num_kv_heads * head_dim,
             local_num_kv_heads * head_dim,
-            local_num_kv_heads * index_head_dim,
+            self.local_num_index_heads * index_head_dim,
             index_head_dim,
         )
         local_out_features = sum(self.local_output_sizes)
@@ -200,7 +206,7 @@ class MiniMaxM3QKVIndexerLinear(Linear):
         """Return effective (world size, rank) for one checkpoint shard."""
         if shard_name == "q":
             return self.tp_size, self.tp_rank
-        if shard_name == "index_k":
+        if shard_name == "index_k" or (shard_name == "index_q" and self.replicate_index_q):
             return 1, 0
 
         total_heads = (
@@ -1228,6 +1234,7 @@ class MiniMaxM3Attention(Attention):
                     use_custom_cublas_mm=old_qkv_proj.use_custom_cublas_mm,
                     use_cute_dsl_bf16_gemm=old_qkv_proj.use_cute_dsl_bf16_gemm,
                     use_cute_dsl_blockscaling_mm=old_qkv_proj.use_cute_dsl_blockscaling_mm,
+                    replicate_index_q=sparse_runtime_cfg.index_tp_split,
                 )
                 self.sparse_num_index_heads = self.qkv_proj.local_num_index_heads
             else:
@@ -1571,7 +1578,6 @@ class MiniMaxM3Attention(Attention):
             or position_ids is None
             or self.head_dim != 128
             or self.sparse_index_dim != 128
-            or self.sparse_num_index_heads != self.num_key_value_heads
             or not self.use_gemma_norm
             or self.pos_embd_params is None
             or not self.pos_embd_params.is_neox

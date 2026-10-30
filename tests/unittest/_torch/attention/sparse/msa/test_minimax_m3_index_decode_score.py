@@ -194,6 +194,37 @@ def test_index_decode_score_multi_round_split_k(dtype):
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("world", [2, 4])
+def test_index_decode_score_tp_split_matches_unsplit(world):
+    """W ranks scoring rows r, r + W, ... and pushing to the head owners combine to the unsplit scores."""
+    # 131073 tokens: more block groups than CTAs, so a CTA walks several.
+    seq_lens, dql = [4, 129, 1025, 4097, 131073], 4
+    idx_q, k_cache, block_table, seq_lens_dev, _, score, _ = _make_inputs(
+        seq_lens, dtype=torch.float8_e4m3fn, num_heads=4, decode_query_len=dql
+    )
+    torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+        idx_q, k_cache, block_table, seq_lens_dev, score, dql
+    )
+    # recv[owner, src]: the owner's receive slots for the partials of rank src,
+    # sized for more tokens than this step has, as in the server.
+    tokens, max_blocks = score.shape[1:]
+    recv = torch.full(
+        (world, world, 4 // world, tokens + 3, max_blocks), float("nan"), device="cuda"
+    )
+    bases = torch.tensor([slots.data_ptr() for slots in recv], device="cuda")
+    for rank in range(world):
+        torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+            idx_q, k_cache[:, rank::world], block_table, seq_lens_dev, recv[rank], dql, bases, rank
+        )
+    blocks = (torch.tensor(seq_lens + [0], device="cuda") + PAGE_SIZE - 1) // PAGE_SIZE
+    valid = (
+        torch.arange(max_blocks, device="cuda") < blocks.repeat_interleave(dql)[: tokens + 3, None]
+    )
+    assert torch.equal(recv.amax(1).flatten(0, 1)[:, valid], score[:, valid[:tokens]])
+    assert recv[..., ~valid].isnan().all()
+
+
+@skip_not_sm100
 def test_index_decode_score_transposed_view_matches_contiguous():
     """The transposed selector view must produce the same values as a direct write.
 

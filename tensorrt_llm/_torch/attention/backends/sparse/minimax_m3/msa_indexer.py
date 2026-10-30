@@ -382,6 +382,7 @@ class MsaIndexer:
         require_cutedsl: bool = False,
         gen_token_first: int = 0,
         ctx_rows: int = 0,
+        gen_scored: bool = False,
     ) -> torch.Tensor:
         """Return [total_q, num_kv_heads, topk] selected block indices.
 
@@ -402,13 +403,15 @@ class MsaIndexer:
         are 0 on a pure-decode step. The halves score into separate buffers,
         since fmha_sm100 writes a contiguous [heads, k_tiles, tokens] block and
         cannot fill a slice of the scorer's, then their tables are joined.
+        `gen_scored` says `max_score` already holds the span's scores.
         """
         page_size = int(idx_k_paged.shape[2])
         gen_first = int(gen_token_first)
 
-        scored = False
+        scored = gen_scored
         if (
-            max_score is not None
+            not scored
+            and max_score is not None
             and block_table is not None
             and seq_lens_cuda is not None
             and decode_query_len is not None
