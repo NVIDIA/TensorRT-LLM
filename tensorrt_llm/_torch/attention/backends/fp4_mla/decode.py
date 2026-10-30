@@ -11,6 +11,7 @@ import triton.language as tl
 
 from tensorrt_llm._utils import get_sm_version
 
+from . import decode_4x as _decode_4x
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
     _FP4_MLA_CUTEDSL_BACKEND,
@@ -1267,6 +1268,44 @@ def run_fp4_mla_attention_decode(
                     "full-pool base and page offset."
                 )
 
+        if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
+            # 4x sub-selection: inside its static envelope it replaces the 2x packed kernel; otherwise
+            # fall through to the packed path unchanged.
+            max_kv_len_4x = max_pages * metadata.page_size
+            reason_4x = _decode_4x._fp4_mla_cutedsl_4x_reason(
+                num_heads=num_heads,
+                query_len=query_len_per_seq,
+                num_requests=num_gen_seqs,
+                max_kv_len=max_kv_len_4x,
+                device=q.device,
+                helix_kv_bounds=helix_kv_bounds,
+                softmax_stats_tensor=softmax_stats_tensor,
+                v_packed=core_v_packed,
+            )
+            _decode_4x._fp4_mla_4x_record(reason_4x, num_gen_seqs, query_len_per_seq, max_kv_len_4x)
+            if reason_4x is None:
+                _decode_4x._run_cutedsl_4x_decode(
+                    q_fp4,
+                    q_sf,
+                    kv_cache,
+                    sf_cache,
+                    core_v_packed,
+                    core_v_sf,
+                    global_scale,
+                    q_global_scale,
+                    src_page_ids,
+                    metadata.fp4_mla_state.paged_kv_indptr_decode[: num_gen_seqs + 1],
+                    kv_lens,
+                    output,
+                    num_heads=num_heads,
+                    query_len=query_len_per_seq,
+                    num_requests=num_gen_seqs,
+                    max_kv_len=max_kv_len_4x,
+                    sm_scale=float(sm_scale),
+                    v_page_offset=v_page_offset,
+                    metadata=metadata,
+                )
+                return
         if packed_rows_per_seq:
             _run_cutedsl_packed_decode(
                 cutedsl_kernel,

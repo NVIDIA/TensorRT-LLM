@@ -43,6 +43,10 @@ class Fp4MlaState:
     # Packed decode plans its KV split once per step (the plan depends only on
     # the step's lengths); this key marks the plan as current.
     packed_plan_key: tuple | None = None
+    # Per-step serial of the generation lengths: the 4x split plan (one launch per step, not per layer)
+    # re-plans when it changes. Monotonic across steps, never reset.
+    generation_lengths_serial: int = 0
+    plan_4x_key: tuple | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False
     device_page_table_valid: bool = False
@@ -142,6 +146,7 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
+        self.plan_4x_key = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
         # All local layers reuse this FP8 view only within the current batch.

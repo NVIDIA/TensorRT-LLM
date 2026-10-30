@@ -818,6 +818,7 @@ def _fp4_mla_uniform_generation_lengths(
         metadata.fp4_mla_state.generation_lengths_num_tokens = num_gen_tokens
         metadata.fp4_mla_state.generation_lengths_num_seqs = num_gen
         metadata.fp4_mla_state.generation_lengths_num_contexts = num_contexts
+        metadata.fp4_mla_state.generation_lengths_serial += 1
         if record_for_capture:
             metadata.fp4_mla_state.generation_lengths_capture_recorded = True
     elif plan_pending:
