@@ -14,25 +14,24 @@
 # limitations under the License.
 """Communication buffers allocated outside the PyTorch allocator.
 
-Both kinds here are invisible to ``memory_reserved()`` and so, without a
-provider, land in the unexplained residual. Both report what was requested:
-the allocator rounds each request up, which the Python side cannot see, so
-the figures are lower bounds.
+Every kind here is invisible to ``memory_reserved()`` and so, without a
+provider, lands in the unexplained residual. Most report what was
+requested: the allocator rounds each request up, which the Python side
+cannot see, so those figures are lower bounds.
 
-Not covered, and why:
+Covered elsewhere:
 
-* NCCL window buffers come from ``ncclMemAlloc`` and are tracked only by the
-  C++ ``NCCLWindowAllocator`` singleton, which exposes no size to Python.
-* Fused GEMM+allreduce NVLS buffers are owned inside their C++ ops.
-* Custom-allreduce IPC workspaces live in ``threading.local``; a report built
-  on another thread cannot see them.
-* MoE all-to-all workspaces are ``MnnvlMemory`` and are already covered by
-  :class:`~.mnnvl.MnnvlProvider`.
+* MoE all-to-all workspaces are ``MnnvlMemory``: :class:`~.mnnvl.MnnvlProvider`.
+* NCCL communicators and the fused GEMM+allreduce NVLS workspace are recorded
+  by the C++ code that creates them: :class:`~.native.NativeMemoryProvider`.
+* Custom-allreduce IPC workspaces live in ``threading.local``, out of reach
+  of a report built on another thread, so they are measured as a named
+  region around their creation instead.
 """
 
 from ..schema import Basis, Category, Entry, Placement, Source
 
-__all__ = ["McastAllReduceProvider", "SymmMemProvider"]
+__all__ = ["McastAllReduceProvider", "NcclWindowProvider", "SymmMemProvider"]
 
 
 class SymmMemProvider:
@@ -130,5 +129,54 @@ class McastAllReduceProvider:
                 basis=Basis.REQUESTED,
                 owner="MNNVLAllReduce",
                 note=f"{counted} multicast workspace(s); excludes signal pad and rounding",
+            )
+        ]
+
+
+class NcclWindowProvider:
+    """NCCL window buffers, from ``NCCLWindowAllocator``.
+
+    ``ncclMemAlloc`` maps memory through the CUDA driver, outside the
+    PyTorch allocator. The C++ allocator pools these buffers per
+    communicator for the life of the communicator, and reports what it holds
+    on a device through ``trtllm::get_nccl_window_usage``.
+    """
+
+    name = "comm.nccl_window"
+    category = Category.COMM_NCCL_WINDOW
+
+    @staticmethod
+    def _op():
+        import torch
+
+        try:
+            return torch.ops.trtllm.get_nccl_window_usage
+        except (AttributeError, RuntimeError):
+            return None
+
+    def available(self) -> bool:
+        return self._op() is not None
+
+    def collect(self) -> list[Entry]:
+        import torch
+
+        op = self._op()
+        if op is None:
+            return []
+        count, total, in_use = op(torch.cuda.current_device())
+        if not count:
+            return []
+        return [
+            Entry(
+                category=Category.COMM_NCCL_WINDOW,
+                size_bytes=total,
+                source=Source.COMPONENT,
+                placement=Placement.NON_TORCH,
+                basis=Basis.REQUESTED,
+                owner="NCCLWindowAllocator",
+                note=(
+                    f"{count} buffer(s), {in_use / (1 << 20):.1f} MiB checked out; "
+                    "requested size, ncclMemAlloc rounds up"
+                ),
             )
         ]

@@ -88,6 +88,12 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.COMM_SYMM_MEM: Group.COMMUNICATION,
     Category.COMM_DEEPEP: Group.COMMUNICATION,
     Category.COMM_NVLS: Group.COMMUNICATION,
+    Category.COMM_NCCL_WINDOW: Group.COMMUNICATION,
+    Category.COMM_NCCL: Group.COMMUNICATION,
+    Category.COMM_ULYSSES: Group.COMMUNICATION,
+    Category.NATIVE_WORKSPACE: Group.WORKSPACE,
+    # Expert weight slots the load balancer moved out of PyTorch.
+    Category.EPLB: Group.WEIGHTS,
     Category.NONTORCH_RESIDUAL: Group.OVERHEAD,
     Category.TAGGED_OTHER: Group.OTHER,
     Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
