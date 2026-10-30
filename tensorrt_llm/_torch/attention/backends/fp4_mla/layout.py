@@ -235,14 +235,25 @@ def _ensure_workspace_tensor(
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
+    # Grow-only scratch keyed by element count, handed out as a contiguous view
+    # of the stored buffer. Callers that share one workspace across geometries
+    # (the q=4 target decode and the q=1 MTP-draft decode of one step both use
+    # the packed split-KV partials, with 512 vs 128 rows per task) therefore
+    # always get contiguous FP32 [tasks, rows, 512]; slicing the stored shape
+    # dimension-wise instead returned a strided view the kernel host rejects
+    # ("split-KV buffer must be contiguous ..."), which killed CUDA graph
+    # capture of small MTP buckets.
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
     workspaces = metadata.fp4_mla_state.workspaces
     tensor = workspaces.get(attr_name)
     needs_alloc = (
         tensor is None
         or tensor.dtype != dtype
         or tensor.device != device
-        or len(tensor.shape) != len(shape)
-        or any(tensor.shape[idx] < dim for idx, dim in enumerate(shape))
+        or not tensor.is_contiguous()
+        or tensor.numel() < numel
     )
     if needs_alloc:
         if torch.cuda.is_current_stream_capturing():
@@ -253,5 +264,6 @@ def _ensure_workspace_tensor(
         tensor = torch.empty(shape, dtype=dtype, device=device)
         workspaces[attr_name] = tensor
 
-    slices = tuple(slice(0, dim) for dim in shape)
-    return tensor[slices]
+    if tuple(tensor.shape) == tuple(shape):
+        return tensor
+    return tensor.reshape(-1)[:numel].view(shape)
