@@ -2665,6 +2665,11 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
                 or spec.get("draft_len_schedule") is not None
                 or spec.get("max_concurrency") is not None
                 or cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM"
+                or cfg.other_args.get("pipeline_parallel_size", 1) != 1
+                or cfg.other_args.get("context_parallel_size", 1) != 1
+                or cfg.other_args.get("kv_cache_compression_config") is not None
+                or str(kv_cache.get("dtype",
+                                    "auto")).lower().startswith("mixed_")
                 or kv_cache.get("tokens_per_block", 32) not in (16, 32, 64)):
             shared_draft_kv_supported = False
             break

@@ -328,11 +328,60 @@ def test_launcher_requires_trtllm_draft_attention_on_both_peers(
         ({}, {"draft_len_schedule": {8: 15}}, False),
         ({}, {"max_concurrency": 8}, False),
         ({"kv_cache_config": {"tokens_per_block": 128}}, {}, False),
+        ({"pipeline_parallel_size": 2}, {}, False),
+        ({"context_parallel_size": 2}, {}, False),
+        (
+            {
+                "kv_cache_compression_config": {
+                    "algorithm": "quantization_for_cold_page",
+                    "quant": "nvfp4",
+                }
+            },
+            {},
+            False,
+        ),
+        (
+            {"kv_cache_config": {"dtype": "mixed_nvfp4_fp8", "mixed_precision_last_n": 64}},
+            {},
+            False,
+        ),
+        (
+            {"kv_cache_config": {"dtype": "MIXED_NVFP4_BFLOAT16", "mixed_precision_last_n": 64}},
+            {},
+            False,
+        ),
         ({"kv_cache_config": {"tokens_per_block": 16}}, {}, True),
         ({"kv_cache_config": {"tokens_per_block": 64}}, {}, True),
+        ({"kv_cache_config": {"dtype": "fp8"}}, {}, True),
+        ({"kv_cache_config": {"dtype": "bfloat16"}}, {}, True),
+        (
+            {
+                "pipeline_parallel_size": 1,
+                "context_parallel_size": 1,
+                "kv_cache_compression_config": None,
+            },
+            {},
+            True,
+        ),
         ({}, {"draft_len_schedule": None, "max_concurrency": None}, True),
     ],
-    ids=["target-backend", "schedule", "concurrency", "page-128", "page-16", "page-64", "nulls"],
+    ids=[
+        "target-backend",
+        "schedule",
+        "concurrency",
+        "page-128",
+        "pipeline-parallel",
+        "context-parallel",
+        "compression",
+        "mixed-kv",
+        "mixed-kv-uppercase",
+        "page-16",
+        "page-64",
+        "fp8-kv",
+        "bf16-kv",
+        "explicit-defaults",
+        "nulls",
+    ],
 )
 def test_launcher_checks_all_peer_configs(
     monkeypatch: pytest.MonkeyPatch,
