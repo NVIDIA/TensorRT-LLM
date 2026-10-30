@@ -159,7 +159,10 @@ class RmsNormGatedTokenMajor(OpWrapper):
     A one-token `z` view reports the dense token stride (1536 at 12 heads);
     only token 0 is read, so it computes the same.
     Not certified: fp8 output, the silu gate, the generic fallback kernel,
-    fp16/fp32 operands, a strided `x`.
+    fp16/fp32 operands, a strided `x`. At 12 heads, the 8-row kernel's first
+    launch (2731 tokens) and its masked last program, which an odd token count
+    from 2731 up leaves half full (no 48-head row count does, and the 4-row
+    kernel never has one at either width): a prompt's last prefill chunk.
 
     Numerics: bf16 inside the default tolerance against the fp32 reference.
     Measured on sm_103: at most one bf16 ulp from the bf16-rounded reference,
