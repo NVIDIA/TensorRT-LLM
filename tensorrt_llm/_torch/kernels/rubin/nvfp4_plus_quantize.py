@@ -22,8 +22,9 @@ Each block scale is ``amax / 6`` rounded up to UE5M3, so no value exceeds the
 E2M1 range after the division by the decoded scale (see ``ue5m3_utils``).
 """
 
-from typing import Tuple
+from typing import Callable
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -51,11 +52,13 @@ class _Nvfp4PlusQuantize:
     columns zeroed, or row-major bytes [M, K / 32].
     """
 
-    def __init__(self, swizzled: bool):
+    def __init__(self, swizzled: bool) -> None:
         self.swizzled = swizzled
 
     @cute.jit
-    def __call__(self, x: cute.Tensor, fp4: cute.Tensor, sf: cute.Tensor, stream):
+    def __call__(
+        self, x: cute.Tensor, fp4: cute.Tensor, sf: cute.Tensor, stream: cuda.CUstream
+    ) -> None:
         rows = x.shape[0]
         if cutlass.const_expr(self.swizzled):
             rows = (rows + _SF_ROW_TILE - 1) // _SF_ROW_TILE * _SF_ROW_TILE
@@ -69,7 +72,7 @@ class _Nvfp4PlusQuantize:
         )
 
     @cute.kernel
-    def kernel(self, x: cute.Tensor, fp4: cute.Tensor, sf: cute.Tensor):
+    def kernel(self, x: cute.Tensor, fp4: cute.Tensor, sf: cute.Tensor) -> None:
         thread, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         num_rows = x.shape[0]
@@ -140,10 +143,10 @@ class _Nvfp4PlusQuantize:
                     )
 
 
-_compiled_kernels = {}
+_compiled_kernels: dict[tuple[torch.dtype, bool], Callable[..., None]] = {}
 
 
-def _compile(dtype: torch.dtype, swizzled: bool):
+def _compile(dtype: torch.dtype, swizzled: bool) -> Callable[..., None]:
     num_rows = cute.sym_int64()
     x = cute.runtime.make_fake_tensor(
         _CUTLASS_DTYPES[dtype],
@@ -177,7 +180,7 @@ def _compile(dtype: torch.dtype, swizzled: bool):
 
 def nvfp4_plus_quantize(
     x: torch.Tensor, sf_swizzled: bool = True
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize ``x`` [M, K] (bf16 or fp16, K % 32 == 0) to NVFP4_PLUS.
 
     Returns the packed E2M1 values [M, K // 2] (uint8, element 2j in the low

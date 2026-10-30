@@ -1424,6 +1424,15 @@ class DSv4DSparkDraftModel(nn.Module):
         new_qc = cls._draft_normalized_quant_config(model_config)
         resolved_moe_backend = None
         if draft_moe_backend is not None:
+            draft_qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict or {}
+            if any(
+                getattr(draft_qcd.get(f"model.layers.{base + s}.mlp.experts"), "quant_algo", None)
+                == QuantAlgo.NVFP4_PLUS
+                for s in range(num_stages)
+            ):
+                ModelConfig.require_nvfp4_plus_moe_backend(
+                    draft_moe_backend, "speculative_config.moe_backend"
+                )
             architectures = getattr(model_config.pretrained_config, "architectures", None) or []
             architecture = architectures[0] if architectures else ""
             draft_quant_config = new_qc if new_qc is not None else model_config.quant_config

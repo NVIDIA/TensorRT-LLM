@@ -471,6 +471,12 @@ TensorRT LLM detects supported quantization metadata from the checkpoint directo
 MXFP4 routed MoE expert weights, TensorRT LLM automatically applies the routed-expert quantization
 configuration.
 
+On Rubin (SM107), the MXFP4 routed experts can also run as NVFP4_PLUS (E2M1 values with one UE5M3
+scale per 32 values and no global scale): the MXFP4 weights load unchanged and the expert
+activations are quantized to FP4 as well. Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL
+MoE backend (`moe_config.backend: CUTEDSL`, which `AUTO` selects under this override). See
+[NVFP4_PLUS MoE from MXFP4 Checkpoints](../../../../docs/source/features/quantization.md#nvfp4_plus-moe-from-mxfp4-checkpoints).
+
 
 ## Notes and Troubleshooting
 

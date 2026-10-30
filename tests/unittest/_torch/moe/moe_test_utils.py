@@ -665,18 +665,26 @@ def should_skip_cutedsl(
     # TP per-shard alignment: NVFP4 and NVFP4_PLUS require 128-aligned per-shard
     # intermediate_size. fp4_utils.py asserts M % 128 == 0 where M = 2 * per_shard
     # (combined w3_w1), and can_implement declines the shard as shape_unaligned.
-    if (
-        moe_tp_size > 1
-        and quant_algo in (QuantAlgo.NVFP4, QuantAlgo.NVFP4_PLUS)
-        and intermediate_size % moe_tp_size == 0
+    # NVFP4_PLUS (one scale per 32 values) needs it unsharded too.
+    if (moe_tp_size > 1 or quant_algo == QuantAlgo.NVFP4_PLUS) and quant_algo in (
+        QuantAlgo.NVFP4,
+        QuantAlgo.NVFP4_PLUS,
     ):
         per_shard = intermediate_size // moe_tp_size
-        if per_shard % 128 != 0:
+        if intermediate_size % moe_tp_size == 0 and per_shard % 128 != 0:
             return (
                 f"{backend_name} {quant_algo}: per-shard intermediate_size="
                 f"{per_shard} (= {intermediate_size} / {moe_tp_size}) is not "
                 f"128-aligned. fp4_utils asserts M % 128 == 0."
             )
+
+    # NVFP4_PLUS gathers each token's UE5M3 scale row in 8-byte copies, so
+    # can_implement declines a hidden_size that is not a multiple of 256.
+    if quant_algo == QuantAlgo.NVFP4_PLUS and model_config.hidden_size % 256 != 0:
+        return (
+            f"{backend_name} NVFP4_PLUS: hidden_size={model_config.hidden_size} "
+            "is not a multiple of 256."
+        )
 
     return None
 

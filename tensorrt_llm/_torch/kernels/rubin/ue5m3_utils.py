@@ -34,7 +34,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import UE5M3_MAX
 
 
 @dsl_user_op
-def _bitcast_u32_f32(bits, *, loc=None, ip=None):
+def _bitcast_u32_f32(bits: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Float32:
     return cutlass.Float32(llvm.bitcast(T.f32(), cutlass.Uint32(bits).ir_value(loc=loc, ip=ip)))
 
 
@@ -50,7 +50,7 @@ def ue5m3_to_f32(code: cutlass.Uint32) -> cutlass.Float32:
 
 
 @cute.jit
-def f32_to_ue5m3(scales: cute.Tensor, codes: cute.Tensor):
+def f32_to_ue5m3(scales: cute.Tensor, codes: cute.Tensor) -> None:
     """Round the non-negative FP32 ``scales`` up into the UE5M3 ``codes``.
 
     Both are register tensors of the same size; values above the largest

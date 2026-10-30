@@ -16,6 +16,8 @@
 
 import torch
 
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_PLUS_SF_VEC_SIZE
+
 from .....autotuner import AutoTuner
 from .....utils import ActivationType, EventType, Fp4QuantizedTensor
 from ...activation import ActivationParamShape, MoEActivationSupport
@@ -25,6 +27,7 @@ from ...impl_contract import (
     MoEEligibility,
     MoEInputRequirement,
     MoEProblem,
+    MoERejectReason,
     MoERunContext,
     MoEStaticCapability,
     nvfp4_fc1_row_alignment_rejection,
@@ -38,6 +41,22 @@ from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
+
+# The UE5M3 scales of a token's hidden vector are packed four to an int32,
+# and the FC1 kernel gathers them 8 bytes at a time, so a token's scale row
+# must be a whole number of 8-byte copies.
+_HIDDEN_SIZE_ALIGNMENT = 8 * NVFP4_PLUS_SF_VEC_SIZE
+
+
+def _hidden_size_alignment_rejection(p: MoEProblem) -> MoEEligibility | None:
+    """Reject a hidden size whose UE5M3 scale row is not 8-byte aligned."""
+    if p.hidden_size is None or p.hidden_size % _HIDDEN_SIZE_ALIGNMENT == 0:
+        return None
+    return MoEEligibility.no(
+        MoERejectReason.SHAPE_UNALIGNED,
+        f"NVFP4_PLUS MoE requires hidden_size to be a multiple of "
+        f"{_HIDDEN_SIZE_ALIGNMENT}, but got {p.hidden_size}.",
+    )
 
 
 @register_moe_impl
@@ -78,8 +97,14 @@ class TrtllmCutedslGroupedGemmNvfp4PlusImpl(CuteDslFusedMoEBase):
     @classmethod
     def can_implement(cls, p: MoEProblem, d: MoEDeployment) -> MoEEligibility:
         # process_weights_after_loading() unswizzles the FC1 block scales,
-        # which asserts 128-row tiles.
-        return check_grouped_gemm_leaf(cls, p, d, nvfp4_fc1_row_alignment_rejection(p, d))
+        # and FC2 reads its input scales in whole 128x4 tiles.
+        return check_grouped_gemm_leaf(
+            cls,
+            p,
+            d,
+            nvfp4_fc1_row_alignment_rejection(p, d),
+            _hidden_size_alignment_rejection(p),
+        )
 
     def _get_quant_method(self) -> object:
         return NVFP4PlusCuteDslFusedMoEMethod()

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -139,11 +139,6 @@ public:
         return QuantMode(BaseType(1u) << 17);
     }
 
-    static constexpr QuantMode nvfp4Plus() noexcept
-    {
-        return QuantMode(BaseType(1u) << 18);
-    }
-
     constexpr BaseType value() const noexcept
     {
         return mValue;
@@ -237,11 +232,6 @@ public:
     constexpr bool hasMxfp8() const noexcept
     {
         return isSet(mxfp8());
-    }
-
-    constexpr bool hasNvfp4Plus() const noexcept
-    {
-        return isSet(nvfp4Plus());
     }
 
     constexpr bool hasKvCacheQuant() const noexcept
