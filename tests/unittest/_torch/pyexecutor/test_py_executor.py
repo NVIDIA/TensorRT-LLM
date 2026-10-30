@@ -121,8 +121,9 @@ def test_intermediate_pp_records_blocking_sampler_event_before_host_wait(
     factory = Mock(side_effect=lambda **kwargs: operations.append(("event", kwargs)) or event)
     monkeypatch.setattr(torch.cuda, "Event", factory)
     context_request, generation_request = object(), object()
-    batch = types.SimpleNamespace(context_requests_last_chunk=[context_request],
-                                  generation_requests=[generation_request])
+    batch = types.SimpleNamespace(
+        context_requests_last_chunk=[context_request], generation_requests=[generation_request]
+    )
     start, end = object(), object()
     perf = Mock(record_perf_events=Mock(return_value=nullcontext()))
     executor = types.SimpleNamespace(
