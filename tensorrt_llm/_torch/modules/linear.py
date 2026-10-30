@@ -3474,15 +3474,42 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 
 
 def _mxfp8_cutlass_op_available() -> bool:
-    """Cached check for whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in.
+    """Check whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in and runs on this GPU.
 
     Pre-M2-build the op is absent and we fall back to the dequant reference
     path; post-build the op is registered under torch.ops.trtllm and we route
     Linear.apply through it.
     """
-    return hasattr(torch.ops.trtllm,
-                   "mxfp8_mxfp8_gemm") and torch.cuda.is_available(
-                   ) and torch.cuda.get_device_capability()[0] >= 10
+    return hasattr(
+        torch.ops.trtllm,
+        "mxfp8_mxfp8_gemm") and torch.cuda.is_available() and is_sm_100f()
+
+
+def _mxfp8_flashinfer_only() -> bool:
+    """Blackwell GPUs outside the SM100 family run MXFP8 GEMMs through FlashInfer only."""
+    return (not _mxfp8_cutlass_op_available()
+            and hasattr(torch.ops.trtllm, "mxfp8_quantize")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and not is_sm_100f())
+
+
+def mxfp8_gemm_backend_override() -> Optional[str]:
+    """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
+
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence on SM100-family GPUs.
+    Elsewhere the native GEMM is not compiled, so FlashInfer is the only
+    backend and other explicit choices are rejected.
+    """
+    backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND")
+    if _mxfp8_flashinfer_only():
+        if backend not in (None, "flashinfer"):
+            raise ValueError(
+                f"TRTLLM_MXFP8_GEMM_BACKEND={backend!r} is not supported on "
+                "this GPU: the native MXFP8 GEMM runs on SM100-family GPUs "
+                "only, so use 'flashinfer' or leave it unset")
+        backend = "flashinfer"
+    return backend
 
 
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
@@ -3544,8 +3571,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.use_cutlass = _mxfp8_cutlass_op_available()
-        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.use_cutlass = _mxfp8_cutlass_op_available(
+        ) or _mxfp8_flashinfer_only()
+        self.backend = mxfp8_gemm_backend_override() or "trtllm"
         # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
@@ -3608,7 +3636,7 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def enable_flashinfer_auto(self) -> bool:
         """Enable graph-only FlashInfer dispatch unless the user overrode it."""
-        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+        if mxfp8_gemm_backend_override() is not None:
             return self.backend == "auto"
         if not self._load_flashinfer(required=False):
             return False

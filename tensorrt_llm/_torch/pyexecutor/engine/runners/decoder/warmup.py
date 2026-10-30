@@ -961,7 +961,11 @@ class DecoderWarmup:
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
             MXFP8GemmRunner,
         )
-        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, flashinfer_mxfp8_autotune
+        from tensorrt_llm._torch.modules.linear import (
+            MXFP8LinearMethod,
+            flashinfer_mxfp8_autotune,
+            mxfp8_gemm_backend_override,
+        )
 
         enable_trtllm_autotuner = self._config.enable_autotuner
         if not enable_trtllm_autotuner:
@@ -985,7 +989,7 @@ class DecoderWarmup:
         compile_all_batches = (
             self._config.torch_compile_enabled and not self._config.torch_compile_prefill_only
         )
-        if compile_all_batches and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ:
+        if compile_all_batches and mxfp8_gemm_backend_override() is None:
             # Compiled auto dispatch uses native; do not tune unused backends.
             # Prefill-only compile retains the eager generation-graph policy.
             for method in mxfp8_methods:
@@ -993,7 +997,7 @@ class DecoderWarmup:
         use_mxfp8_flashinfer_graph_default = (
             self._graphs.enabled
             and not compile_all_batches
-            and "TRTLLM_MXFP8_GEMM_BACKEND" not in os.environ
+            and mxfp8_gemm_backend_override() is None
             and any(
                 getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
                 for module in self.model.modules()
