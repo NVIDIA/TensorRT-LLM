@@ -1032,7 +1032,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert plan_kwargs == {
         "device": q_processed.device,
         "batch_size": 2,
-        "max_seq_len_q": 8,
+        "max_q_len": 8,
         "max_kv_len": 128,
         "num_qo_heads": attn.num_heads,
         "num_kv_heads": attn.num_kv_heads,
@@ -1044,7 +1044,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "page_size": 32,
         "mask_type": "causal",
         "window_left": -1,
-        "sm_scale": pytest.approx(1.0 / math.sqrt(attn.head_dim)),
+        "softmax_scale": pytest.approx(1.0 / math.sqrt(attn.head_dim)),
         "output_scale": 1.0,
         "paged_v_tail_is_zero": True,
     }
@@ -1250,11 +1250,11 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert decode_workspace.data_ptr() == params.workspace.data_ptr()
     assert decode_workspace.numel() == 64
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
-        "max_seq_len_q": 1,
+        "max_q_len": 1,
         "packed_query": False,
-        "q_data_type": torch.bfloat16,
-        "kv_data_type": torch.bfloat16,
-        "o_data_type": torch.bfloat16,
+        "q_dtype": torch.bfloat16,
+        "kv_dtype": torch.bfloat16,
+        "out_dtype": torch.bfloat16,
         "mask_type": "causal",
         "window_left": 15,
     }
@@ -1276,8 +1276,8 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
         fixed_block_tables,
         torch.tensor([[0, 1, 2, 3], [2, 3, 4, 5]], dtype=torch.int32),
     )
-    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
-    assert run_kwargs["bmm2_scale"] == 1.0
+    assert run_kwargs["softmax_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
+    assert run_kwargs["output_scale"] == 1.0
     assert run_kwargs["out"].shape == (2, attn.num_heads, attn.head_dim)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["validate"] is False
@@ -1389,12 +1389,12 @@ def test_context_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
             k_cache,
             v_cache,
             batch_size=batch_size,
-            max_seq_len_q=128,
+            max_q_len=128,
             max_kv_len=256,
             page_size=32,
             mask_type="causal",
             window_left=-1,
-            sm_scale=1.0 / math.sqrt(128),
+            softmax_scale=1.0 / math.sqrt(128),
             output_dtype=torch.bfloat16,
         )
 
@@ -1486,7 +1486,7 @@ def _get_test_mla_wrapper(
         kv_lora_rank=512,
         qk_rope_head_dim=64,
         page_size=32,
-        max_seq_len_q=1,
+        max_q_len=1,
         max_kv_len=96,
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
@@ -1592,11 +1592,11 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert workspace_buffer.data_ptr() == params.workspace.data_ptr()
     assert workspace_buffer.numel() == 64
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
-        "max_seq_len_q": 1,
+        "max_q_len": 1,
         "packed_query": False,
-        "q_data_type": kernel_dtype,
-        "kv_data_type": kernel_dtype,
-        "o_data_type": torch.bfloat16,
+        "q_dtype": kernel_dtype,
+        "kv_dtype": kernel_dtype,
+        "out_dtype": torch.bfloat16,
         "mask_type": "causal",
     }
     wrapper.run.assert_called_once()
@@ -1614,12 +1614,12 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         run_kwargs["block_tables"],
         torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32),
     )
-    assert run_kwargs["seq_lens"].data_ptr() == sequence_lengths.data_ptr()
-    torch.testing.assert_close(run_kwargs["seq_lens"], sequence_lengths)
+    assert run_kwargs["seq_lens_kv"].data_ptr() == sequence_lengths.data_ptr()
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], sequence_lengths)
     assert run_kwargs["out"].shape == (2, 1, attn.num_heads, 512)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
-    assert run_kwargs["bmm1_scale"] == pytest.approx(0.125 if fp8 else 1.0 / math.sqrt(128 + 64))
-    assert run_kwargs["bmm2_scale"] == (2.0 if fp8 else 1.0)
+    assert run_kwargs["softmax_scale"] == pytest.approx(0.125 if fp8 else 1.0 / math.sqrt(128 + 64))
+    assert run_kwargs["output_scale"] == (2.0 if fp8 else 1.0)
     assert run_kwargs["validate"] is False
 
     block_tables[:, 0].add_(20)
@@ -1636,7 +1636,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         run_kwargs["block_tables"],
         torch.tensor([[20, 21, 22], [23, 24, 25]], dtype=torch.int32),
     )
-    torch.testing.assert_close(run_kwargs["seq_lens"], torch.tensor([34, 65], dtype=torch.int32))
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], torch.tensor([34, 65], dtype=torch.int32))
     assert fmha._mla_decode_wrappers[2] is wrapper
 
 
@@ -1910,12 +1910,12 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
     assert run_kwargs["block_tables"].shape == (2, 3)
     assert run_kwargs["block_tables"].stride() == (6, 1)
     assert run_kwargs["block_tables"].data_ptr() == block_tables.data_ptr()
-    torch.testing.assert_close(run_kwargs["seq_lens"], params.sequence_lengths)
-    assert run_kwargs["seq_lens"].data_ptr() == params.sequence_lengths.data_ptr()
+    torch.testing.assert_close(run_kwargs["seq_lens_kv"], params.sequence_lengths)
+    assert run_kwargs["seq_lens_kv"].data_ptr() == params.sequence_lengths.data_ptr()
     assert run_kwargs["out"].shape == (2, 1, attn.num_heads, 512)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
-    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(128 + 64))
-    assert run_kwargs["bmm2_scale"] == 1.0
+    assert run_kwargs["softmax_scale"] == pytest.approx(1.0 / math.sqrt(128 + 64))
+    assert run_kwargs["output_scale"] == 1.0
     assert run_kwargs["validate"] is False
     builder_args = build_metadata.call_args.args
     assert builder_args[8] == total_num_blocks
@@ -2372,7 +2372,7 @@ def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.Mo
     wrapper.plan.assert_called_once()
     plan_kwargs = wrapper.plan.call_args.kwargs
     assert plan_kwargs["batch_size"] == batch_size
-    assert plan_kwargs["max_seq_len_q"] == plan_kwargs["max_kv_len"] == seq_len
+    assert plan_kwargs["max_q_len"] == plan_kwargs["max_kv_len"] == seq_len
     assert (
         plan_kwargs["q_dtype"] == plan_kwargs["k_dtype"] == plan_kwargs["v_dtype"] == torch.bfloat16
     )

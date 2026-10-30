@@ -108,14 +108,15 @@ def runtime_active_split_count(k_tile_total, split_kv_cap):
 
 
 @cute.jit
-def runtime_split_tile_range(k_tile_total, split_kv_cap, split_idx):
+def runtime_split_tile_range(k_tile_total, split_kv_cap, split_idx, split_divisor=None):
     """Device form of :func:`split_tile_range`."""
 
     k_tile_total = cute.math.max(Int32(k_tile_total), Int32(0))
     split_idx = Int32(split_idx)
     split_kv_cap = cute.math.max(Int32(split_kv_cap), Int32(1))
+    divisor = split_kv_cap if split_divisor is None else split_divisor
     tiles_per_split = cute.math.max(
-        (k_tile_total + split_kv_cap - Int32(1)) // split_kv_cap,
+        (k_tile_total + split_kv_cap - Int32(1)) // divisor,
         Int32(1),
     )
     start = split_idx * tiles_per_split
@@ -132,6 +133,7 @@ def runtime_row_prefix_active_split_count(
     row_k_tile_total,
     group_k_tile_total,
     split_kv_cap,
+    split_divisor=None,
 ):
     """Device form of :func:`row_prefix_active_split_count`."""
 
@@ -141,8 +143,9 @@ def runtime_row_prefix_active_split_count(
         Int32(0),
     )
     split_kv_cap = cute.math.max(Int32(split_kv_cap), Int32(1))
+    divisor = split_kv_cap if split_divisor is None else split_divisor
     tiles_per_split = cute.math.max(
-        (group_k_tile_total + split_kv_cap - Int32(1)) // split_kv_cap,
+        (group_k_tile_total + split_kv_cap - Int32(1)) // divisor,
         Int32(1),
     )
     row_active_splits = (

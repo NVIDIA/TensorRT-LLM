@@ -152,8 +152,9 @@ def is_throughput_2cta_mla_supported_shape(
 ) -> bool:
     """Return whether the 2CTA M128 TS MLA path is eligible.
 
-    The predicate is intentionally side-effect free: it only checks the dense
-    MLA shape constraints that can be known before kernel construction.
+    Physical M128 tiles cover consecutive logical (query, head) rows, including
+    partial final tiles. The tile width does not limit the logical head count;
+    the public planner validates flattened coordinate and workspace bounds.
     """
 
     del batch_size
@@ -163,7 +164,7 @@ def is_throughput_2cta_mla_supported_shape(
         and latent_dim == 512
         and rope_dim in (0, 64)
         and page_size in SUPPORTED_MLA_PAGE_SIZES
-        and 1 <= num_heads <= 128
+        and num_heads >= 1
         and seq_len_q >= 1
         and seq_len_k >= 1
     )

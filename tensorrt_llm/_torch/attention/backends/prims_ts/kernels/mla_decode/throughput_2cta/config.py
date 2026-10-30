@@ -21,7 +21,11 @@ the same explicit configuration structure and output-reduction contract.
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import (
+    SUPPORTED_MLA_PAGE_SIZES,
+    WARP_LANES,
+)
+from ..helpers.nvfp4_kv import Nvfp4KVConfig, validate_nvfp4_kv_formats
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -92,7 +96,7 @@ def compute_split_kv(
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
+    return split_wave_aware
 
 
 def compute_workspace_size(
@@ -120,7 +124,7 @@ def compute_workspace_size(
 
 
 @dataclass
-class MlaDecodeConfig:
+class MlaDecodeConfig(Nvfp4KVConfig):
     """MLA decode kernel configuration.
 
     All values are plain Python ints/tuples so they can be used as
@@ -267,9 +271,24 @@ class MlaDecodeConfig:
     # the useful split prefix. Grid and workspace geometry retain the maximum.
     is_var_split_kv: bool = False
     cache_uniform_sparse_pages: bool = False
+    # Storage pairs: native/native; D512 nvfp4/nvfp4 or fp8/nvfp4;
+    # D576 nvfp4.fp8rope/nvfp4.fp8rope. NVFP4 paths require E4M3 Q/MMA.
+    # The FP8 primary has a separate tensor scale; NVFP4 uses embedded block
+    # scales. Both pools retain their physical row strides and share stages.
+    kv_cache_format: str = "native"
+    extra_kv_cache_format: str = "native"
     # Causal is bottom-right aligned for speculative decode. Dense still masks
     # the ordinary per-batch KV tail at ``cache_seqs[batch]``.
     mask_type: str = MaskType.CAUSAL.value
+    # Threshold skip correction in log2 units (binades); 0 disables it.  A positive value
+    # freezes the running row max while a K tile raises it by at most this
+    # amount.  It is a compile-time constant: a runtime scalar stays live in
+    # every softmax iteration and costs registers under the 128-register cap.
+    # With E4M3 P it also lowers the P scale from 448 to ``448 * 2**-T``;
+    # BF16 P stays unscaled.  See ``max_softmax_rescale_threshold_log2`` for
+    # the bounds.
+    softmax_rescale_threshold_log2: float = 0.0
+    lse_base_on_e: bool = False
 
     @property
     def tokens_per_k_tile(self) -> int:
@@ -348,9 +367,33 @@ def make_mla_decode_config(
     cache_uniform_sparse_pages: bool = False,
     balance_sparse_registers: bool = False,
     fuse_output_quant: bool = False,
+    softmax_rescale_threshold_log2: float = 0.0,
+    kv_cache_format: str = "native",
+    extra_kv_cache_format: str = "native",
+    lse_base_on_e: bool = False,
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
+    validate_nvfp4_kv_formats(
+        kv_cache_format, extra_kv_cache_format, rope_dim, qkv_dtype, page_size
+    )
+    has_nvfp4_kv = kv_cache_format != "native"
+    if has_nvfp4_kv and not (
+        qkv_dtype == "e4m3"
+        and page_size == 1
+        and rope_dim in (0, 64)
+        and sparse_gather_warps == 1
+    ):
+        raise ValueError("NVFP4 KV needs sparse E4M3 D512/D576 (internal page size 1)")
+    if has_nvfp4_kv and (
+        mma_qk_tiler_mn != (128, 128) or mma_pv_tiler_mn != (128, 256)
+    ):
+        # The loader converts 64 token rows per CTA and exchanges 256-feature
+        # V halves in fixed SMEM panels. Other tiles need a matching producer
+        # layout, not just different pipeline byte counts.
+        raise ValueError("NVFP4 2CTA requires QK (128, 128) and PV (128, 256) tiles")
     cfg = MlaDecodeConfig()
+    cfg.kv_cache_format = kv_cache_format
+    cfg.extra_kv_cache_format = extra_kv_cache_format
     cfg.mma_qk_tiler_mn = mma_qk_tiler_mn
     cfg.mma_pv_tiler_mn = mma_pv_tiler_mn
     cfg.rope_dim = rope_dim
@@ -362,6 +405,9 @@ def make_mla_decode_config(
     cfg.is_var_seq = is_var_seq
     cfg.is_var_split_kv = is_var_split_kv
     cfg.mask_type = normalize_mask_type(mask_type)
+    # Range-checked by MlaDecodeTs and plan().
+    cfg.softmax_rescale_threshold_log2 = softmax_rescale_threshold_log2
+    cfg.lse_base_on_e = lse_base_on_e
 
     def _require_positive(name: str, value: int) -> None:
         """Validate that a named configuration value is positive."""
@@ -387,8 +433,10 @@ def make_mla_decode_config(
     if rope_dim < 0:
         raise ValueError(f"rope_dim must be non-negative, got {rope_dim}")
     _require_positive("page_size", page_size)
+    # Page size one is the sparse gather path: D512 (no RoPE) or D576 (RoPE is the
+    # last 64 channels of each gathered row).
     if page_size not in SUPPORTED_MLA_PAGE_SIZES and not (
-        page_size == 1 and rope_dim == 0
+        page_size == 1 and rope_dim in (0, 64)
     ):
         raise ValueError(
             f"page_size must be one of {SUPPORTED_MLA_PAGE_SIZES}, got {page_size}"
@@ -424,8 +472,9 @@ def make_mla_decode_config(
             # third V tile costs 32 KiB per CTA without improving overlap in
             # the qualified sparse schedule. Keep four metadata slots so
             # index prefetch can run ahead of both streams.
-            cfg.load_k_stage = 2
-            cfg.load_v_stage = 2
+            # Packed rows already have independent prefetch scratch. Two K
+            # slots let QK advance while the previous V tile is consumed.
+            cfg.load_k_stage, cfg.load_v_stage = (2, 1) if has_nvfp4_kv else (2, 2)
             cfg.use_fp8_dual_softmax_schedule = False
             cfg.second_compute_warp_ids = ()
             cfg.num_softmax_groups = 1
@@ -434,6 +483,22 @@ def make_mla_decode_config(
             cfg.load_num_warps = 4
             cfg.threads_per_cta = cfg.threads_per_warp * 20
             cfg.other_reg_num = 48
+
+    if has_nvfp4_kv:
+        # Convert each CTA's 64 rows once. D512 sends V directly from registers,
+        # allowing three V stages against two K stages; D576 bulk exchange
+        # retains the K source, so K and V lifetimes use paired two-stage slots.
+        # One S stage leaves the TMEM columns needed to retain FP8 NoPE Q.
+        # Fused FP8 output needs a 32-KiB shared output stage. Pair K/V at
+        # two stages for that path to fit the SMEM budget; equal stage counts
+        # select bulk DSMEM exchange and retain K until both V readers finish.
+        cfg.load_k_stage, cfg.load_v_stage = (
+            2,
+            2 if rope_dim or fuse_output_quant else 3,
+        )
+        cfg.load_num_warps = 8
+        cfg.mma_s_stage = 1
+        cfg.load_v_warp_id = cfg.load_k_warp_id
 
     if sparse_gather_warps != 1:
         if sparse_gather_warps not in (4, 8) or qkv_dtype != "bf16" or page_size != 1:
@@ -464,14 +529,19 @@ def make_mla_decode_config(
     if balance_sparse_registers:
         if page_size != 1 or qkv_dtype != "e4m3":
             raise ValueError("balanced registers require sparse FP8")
-        # Sparse FP8 keeps 64 registers for the gather issuers. Split the
-        # remaining budget equally: 128 softmax registers spilled live loop
-        # state on every KV tile, while correction fits in 144 registers.
-        # 4*144 + 4*144 + 12*64 = 1920 warp-registers, the same CTA total
-        # as the previous 128/160/64 allocation (61440 registers).
+        # D512's register DSMEM stores benefit from a larger loader budget;
+        # D576's bulk copies retain more registers for softmax/correction.
+        # Base splits claim 61,440 registers in the 640-thread CTA.
         cfg.softmax_reg_num = 144
         cfg.correction_reg_num = 144
         cfg.other_reg_num = 64
+        if has_nvfp4_kv and not rope_dim:
+            # Tensor-scale score/correction state needs more softmax registers.
+            # Borrow eight from the other warps; stay within the CTA's initial
+            # allocation (60,416 registers versus its 61,440-register credit).
+            cfg.softmax_reg_num = 112 if cfg.has_fp8_primary else 96
+            cfg.correction_reg_num = 96
+            cfg.other_reg_num = 88 if cfg.has_fp8_primary else 96
 
     if fuse_output_quant and cfg.is_fp8_qkv() and cfg.threads_per_cta == 640:
         # Quantization keeps an output block and rotary coefficients live.
@@ -480,6 +550,10 @@ def make_mla_decode_config(
         cfg.softmax_reg_num = 160
         cfg.correction_reg_num = 176
         cfg.other_reg_num = 48
+
+    if cfg.has_nvfp4_kv:
+        cfg.p_mma_stage = 2 if rope_dim else 1
+        assert cfg.sparse_offset_stages >= 2
 
     # SETMAXNREG redistributes the CTA's initial allocation, rounded down
     # to eight registers/thread; the remainder of the SM file is not credit.
@@ -569,6 +643,13 @@ def make_mla_decode_config(
             "page_size must partition each CTA's K tile unless both CTAs share "
             "one full-tile page: "
             f"tokens_per_k_cta={cfg.tokens_per_k_cta}, page_size={cfg.page_size}"
+        )
+    if cfg.page_size > 1 and WARP_LANES % cfg.pages_per_k_tile != 0:
+        # The BF16 TMA warp and the FP8 K/V loaders read dense page IDs from a
+        # one-entry-per-lane window that must hold whole K tiles.
+        raise ValueError(
+            f"dense MLA needs pages_per_k_tile to divide {WARP_LANES}: "
+            f"pages_per_k_tile={cfg.pages_per_k_tile}"
         )
     _require_divisible(
         "mma_pv_tiler_mn[0]", cfg.mma_pv_tiler[0], "num_mma_ctas", num_mma_ctas
@@ -679,7 +760,6 @@ def make_mla_decode_config(
     cfg.tma_copy_v_tile_bytes = (
         cfg.tma_copy_vc_bytes * cfg.iterations_pv_k * cfg.iterations_pv_n
     )
-
     # TMEM sync barrier thread count: QK MMA + softmax + correction, plus
     # the FP8 PV-MMA warp when it participates in TMEM O production.
     cfg.tmem_sync_bar_threads = (

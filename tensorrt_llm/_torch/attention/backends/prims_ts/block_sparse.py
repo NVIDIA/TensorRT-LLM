@@ -77,7 +77,7 @@ from .decode import (
     _validate_runtime_device,
 )
 from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from .sage import SageAttentionConfig, SageAttentionParams
+from .sage.config import SageAttentionConfig, SageAttentionParams
 
 
 class _BlockSparseWrapperBase:
@@ -150,8 +150,8 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
-        q_block_size: int,
-        kv_block_size: int,
+        q_block_size: int | None = None,
+        kv_block_size: int | None = None,
         *,
         device: torch.device | str | int,
         use_block_sparse: bool = True,
@@ -186,7 +186,9 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``use_block_sparse=False`` plans dense attention over the whole K/V
         sequence with the same Q-tile selection. Its route arguments must keep
         their defaults, and :meth:`run` takes Q/K/V only, plus the scales of a
-        Sage plan.
+        Sage plan. A dense plan may omit ``q_block_size`` and
+        ``kv_block_size``; each then defaults to 128, which selects the
+        Q128/KV128 Keeps tile. A block-sparse plan requires both.
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -235,16 +237,16 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``torch.float16``. Every :meth:`run` then supplies the scale tensors as
         :class:`SageAttentionParams`.
 
-        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to
-        block-sparse plans on the Q64/KV256 and Q128/KV128 profiles and to
-        dense Q64/KV256 plans: a row keeps its softmax exponent anchor while a
-        tile raises the row maximum by at most this many binades, which skips
-        the rescale of the accumulated output. Probabilities then reach
-        ``2**threshold``, so Sage FP8 P is quantized at ``448 * 2**-threshold``
-        and probabilities far below the anchor lose E4M3 precision; rows whose
-        largest scores come first, such as attention sinks in the first
-        blocks, are the most exposed. 0 rescales on every new row maximum and
-        quantizes FP8 P at 448.
+        ``softmax_rescale_threshold_log2`` (0 to 8, default 8) applies to the
+        Q64/KV256 and Q128/KV128 profiles of dense and block-sparse plans: a
+        row keeps its softmax exponent anchor while a tile raises the row
+        maximum by at most this many binades, which skips the rescale of the
+        accumulated output. Probabilities then reach ``2**threshold``, so Sage
+        FP8 P is quantized at ``448 * 2**-threshold`` and probabilities far
+        below the anchor lose E4M3 precision; rows whose largest scores come
+        first, such as attention sinks in the first blocks, are the most
+        exposed. 0 rescales on every new row maximum and quantizes FP8 P at
+        448.
         """
 
         if use_block_sparse:
@@ -454,8 +456,8 @@ def block_sparse_attention(
     v: torch.Tensor,
     block_indptr: torch.Tensor | None,
     block_indices: torch.Tensor | None,
-    q_block_size: int,
-    kv_block_size: int,
+    q_block_size: int | None = None,
+    kv_block_size: int | None = None,
     *,
     exact_block_bits: torch.Tensor | None = None,
     k_summary: torch.Tensor | None = None,
@@ -497,13 +499,15 @@ def block_sparse_attention(
     block_indices : torch.Tensor, optional
         Contiguous Int32 semantic KV-block IDs referenced by ``block_indptr``.
         Required in BSR mode.
-    q_block_size : int
+    q_block_size : int, optional
         Positive number of logical query tokens represented by one BSR row.
         The product with ``Hq / Hkv`` must be divisible by 8 so a physical Q
-        tile does not cross row boundaries.
-    kv_block_size : int
+        tile does not cross row boundaries. Required by a block-sparse call;
+        a dense call defaults it to 128.
+    kv_block_size : int, optional
         Number of logical KV tokens represented by one BSR block ID; it must
-        be 8, 16, 32, or a positive multiple of 64.
+        be 8, 16, 32, or a positive multiple of 64. Required by a block-sparse
+        call; a dense call defaults it to 128.
     exact_block_bits : torch.Tensor, optional
         Compact UInt32 exact-block bitmap required in bitmask mode.
     k_summary : torch.Tensor, optional

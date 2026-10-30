@@ -194,7 +194,7 @@ index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254
          f"prims_ts_{family}",
          f"{kind}_sm{major}{minor}_{key}",
 diff --git a/block_sparse.py b/block_sparse.py
-index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe2532a1c7 100644
+index ea05f2b3e10190fac869bbef3802adcf35418b3e..dc0ffd1d3219c873a1a57e3fe72aa642053c7a99 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -217,7 +217,7 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
  
  from ._block_sparse.common import (
      _num_sparse_pattern_heads,
-@@ -320,7 +315,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -322,7 +317,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          # previously published revision intact and runnable.
          self._plan_state = candidate
  
@@ -226,7 +226,7 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
      def run(
          self,
          q: torch.Tensor,
-@@ -452,7 +447,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
+@@ -454,7 +449,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
@@ -235,7 +235,7 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
  def block_sparse_attention(
      q: torch.Tensor,
      k: torch.Tensor,
-@@ -757,9 +752,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -761,9 +756,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
              )
          self._plan_state = candidate
  
@@ -246,7 +246,7 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
      def run(
          self,
          q: torch.Tensor,
-@@ -881,7 +874,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
+@@ -885,7 +878,7 @@ class BlockSparsePagedTSWrapper(_BlockSparseWrapperBase):
          return self._launch_validated_run(state, run_args, run_stream)
  
  
@@ -256,19 +256,46 @@ index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index d3f104e4e34b1bcb7ada697f9e76f7013d6ca100..1ec1080b942f60fad22e3e4a1627cad9592697ad 100644
+index f209da5fc9d515bf29fb7ff4b9aba459cd6165b5..2cdb3a0be100f63fb79fa651342f553bff9e0ea9 100644
 --- a/context.py
 +++ b/context.py
-@@ -48,7 +48,7 @@ from ._hardware import get_max_active_clusters
- 
- import torch
+@@ -54,7 +54,7 @@ from .vc_attention import (
+     vc_scale_shapes,
+ )
  
 -from flashinfer.api_logging import flashinfer_experimental_api
 +from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ from .decode import (
+     _validate_native_hnd_tma_strides,
+     prepare_lse,
+@@ -184,8 +184,8 @@ class _ContextPlanState:
+     """Atomically published state for one compiled contiguous context plan."""
+ 
+     geometry: _ContextPlanGeometry
+-    scale_softmax_log2: float
+-    output_scale: float
++    scale_softmax_log2: float | torch.Tensor
++    output_scale: float | torch.Tensor
+     empty_i32: torch.Tensor
+     variable_window_padded_starts: Optional[torch.Tensor]
+     variable_window_cta_starts: torch.Tensor
+@@ -197,6 +197,7 @@ class _ContextPlanState:
+     lse_mode: str = "none"
+     use_attention_sinks: bool = False
+     sage: Optional[SagePreparedScales] = None
++    cuda_scales: bool = False
  
  
- if TYPE_CHECKING:
-@@ -493,7 +493,7 @@ def _validate_device(device: torch.device) -> int:
+ @dataclass(frozen=True)
+@@ -284,6 +285,7 @@ class _ContextCompileSpec:
+     shape_signature: tuple[int, ...] = ()
+     # A Sage plan's prepared scale layout; the kernel reads the scales.
+     sage_scale_layout: _SageScaleLayout | None = None
++    cuda_scales: bool = False
+ 
+ 
+ @dataclass(frozen=True)
+@@ -564,7 +566,7 @@ def _validate_device(device: torch.device) -> int:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -277,8 +304,185 @@ index d3f104e4e34b1bcb7ada697f9e76f7013d6ca100..1ec1080b942f60fad22e3e4a1627cad9
  
          require_cute_dsl_arch(device_index)
      return device_index
+@@ -1892,6 +1894,7 @@ def _context_compile_spec(
+     runtime_lengths: bool | None = None,
+     lse_mode: str = "none",
+     use_attention_sinks: bool = False,
++    cuda_scales: bool = False,
+ ) -> _ContextCompileSpec:
+     """Keep resource/precision choices static and ordinary lengths runtime."""
+     fixed_seqlen = geometry.sage is not None or geometry.vc is not None
+@@ -1926,6 +1929,7 @@ def _context_compile_spec(
+         runtime_lengths=runtime_lengths,
+         lse_mode=lse_mode,
+         use_attention_sinks=use_attention_sinks,
++        cuda_scales=cuda_scales,
+         scheduler=_resolve_context_scheduler(geometry),
+         two_cta_umma=_two_cta_umma_geometry_eligible(geometry),
+         vc=geometry.vc,
+@@ -2094,7 +2098,7 @@ def _get_compiled_context(
+         out: cute.Tensor,
+         lse: cute.Tensor | None,
+         attention_sinks: cute.Tensor | None,
+-        scale_softmax_log2: cutlass.Float32,
++        scale_softmax_log2: cutlass.Float32 | cute.Tensor,
+         output_scale: cutlass.Float32 | cute.Tensor,
+         qo_indptr: cute.Tensor,
+         kv_indptr: cute.Tensor,
+@@ -2206,6 +2210,9 @@ def _get_compiled_context(
+     )
+     scale_fake = cutlass.Float32(1.0)
+     output_scale_fake = cutlass.Float32(1.0)
++    if compile_spec.cuda_scales:
++        scale_fake = fake_compact(cutlass.Float32, (1,), 4)
++        output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
+     if vc_attention:
+         output_scale_fake = fake_compact(
+             cutlass.Float32, (batch_size, num_qo_heads, head_dim_vo), 64
+@@ -2868,6 +2875,15 @@ def _variable_window_buffers(geometry, empty_i32):
+     return padded_starts, cta_starts
+ 
+ 
++def _cuda_scale(value: torch.Tensor, name: str, device: torch.device) -> torch.Tensor:
++    """Validate a live device scalar without reading it back to the host."""
++    if not isinstance(value, torch.Tensor):
++        raise TypeError(f"{name} must be a CUDA FP32 tensor")
++    if value.device != device or value.dtype != torch.float32 or value.numel() != 1:
++        raise ValueError(f"{name} must contain one FP32 value on {device}")
++    return value.reshape(1)
++
++
+ class BatchPrefillTSWrapper:
+     """Reusable contiguous context attention with eager planning.
+ 
+@@ -2909,6 +2925,7 @@ class BatchPrefillTSWrapper:
+         lse_mode: Literal["none", "base2"] = "none",
+         use_attention_sinks: bool = False,
+         sage: Optional[SageAttentionConfig] = None,
++        cuda_scales: bool = False,
+     ) -> None:
+         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
+ 
+@@ -2928,6 +2945,8 @@ class BatchPrefillTSWrapper:
+         a per-run sink binding. Context scales are positive host scalar defaults.
+         Sage plans use BF16 output by default and require per-run Sage scales.
+         Sage V-mean restoration cannot be combined with attention sinks.
++        cuda_scales binds one-element CUDA FP32 scales for graph-replayed
++        per-tensor quantization; it cannot be combined with Sage or VC plans.
+         Equivalent plans reuse policy and compiled-kernel caches.
+         VC runs sharing a plan must not overlap.
+         """
+@@ -2981,6 +3000,10 @@ class BatchPrefillTSWrapper:
+             raise NotImplementedError(
+                 "VC-Attention does not support LSE or attention sinks"
+             )
++        if not isinstance(cuda_scales, bool):
++            raise TypeError("cuda_scales must be a bool")
++        if cuda_scales and (vc_config is not None or sage is not None):
++            raise ValueError("cuda_scales requires a plain context plan")
+         geometry = replace(geometry, vc=vc_config)
+         if softmax_scale is None:
+             softmax_scale = geometry.head_dim**-0.5
+@@ -2989,6 +3012,13 @@ class BatchPrefillTSWrapper:
+             "softmax_scale * log2(e)",
+         )
+         output_scale = _validate_scale(output_scale, "output_scale")
++        if cuda_scales:
++            scale_softmax_log2 = torch.tensor(
++                [scale_softmax_log2], dtype=torch.float32, device=geometry.device
++            )
++            output_scale = torch.tensor(
++                [output_scale], dtype=torch.float32, device=geometry.device
++            )
+         vc_output_scale_buffer = (
+             torch.empty(
+                 (
+@@ -3031,6 +3061,7 @@ class BatchPrefillTSWrapper:
+                 runtime_lengths=vc_config is None,
+                 lse_mode=lse_mode,
+                 use_attention_sinks=use_attention_sinks,
++                cuda_scales=cuda_scales,
+             )
+         )
+         self._plan_state = _ContextPlanState(
+@@ -3044,6 +3075,7 @@ class BatchPrefillTSWrapper:
+             policy=policy,
+             vc_scale_shapes=vc_shapes,
+             vc_output_scale=vc_output_scale_buffer,
++            cuda_scales=cuda_scales,
+             lse_mode=lse_mode,
+             use_attention_sinks=use_attention_sinks,
+             sage=sage_state,
+@@ -3068,7 +3100,8 @@ class BatchPrefillTSWrapper:
+         return_lse: bool = False,
+         attention_sinks: Optional[torch.Tensor] = None,
+         softmax_scale: Optional[float] = None,
+-        output_scale: Optional[float] = None,
++        output_scale: float | torch.Tensor | None = None,
++        scale_softmax_log2: torch.Tensor | None = None,
+         vc: Optional[VCAttentionParams] = None,
+         sage: Optional[SageAttentionParams] = None,
+         validate: bool = True,
+@@ -3095,6 +3128,9 @@ class BatchPrefillTSWrapper:
+         wrapper-owned fallback scratch. Scale overrides are finite positive host
+         scalars: softmax_scale is the effective QK scale, and
+         output_scale scales V/output. They are runtime kernel operands, not JIT keys.
++        With cuda_scales, supply scale_softmax_log2 and output_scale as
++        one-element CUDA FP32 tensors instead. Their values remain on device
++        and must be positive and finite, including after graph updates.
+ 
+         Enabled attention_sinks supplies compact CUDA FP32 [Hq] natural-log sink
+         logits after QK scaling. Values must be finite or -inf; validation checks only
+@@ -3234,19 +3270,35 @@ class BatchPrefillTSWrapper:
+             runtime_window_starts = state.empty_i32
+             runtime_window_ends = state.empty_i32
+             runtime_window_cta_starts = state.empty_i32
+-        scale_softmax_log2 = (
+-            state.scale_softmax_log2
+-            if softmax_scale is None
+-            else _validate_scale(
+-                _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
+-                "softmax_scale * log2(e)",
++        if state.cuda_scales:
++            if softmax_scale is not None:
++                raise ValueError("cuda_scales uses the device scale_softmax_log2 operand")
++            scale_softmax_log2 = _cuda_scale(
++                state.scale_softmax_log2 if scale_softmax_log2 is None else scale_softmax_log2,
++                "scale_softmax_log2",
++                geometry.device,
++            )
++            output_scale = _cuda_scale(
++                state.output_scale if output_scale is None else output_scale,
++                "output_scale",
++                geometry.device,
++            )
++        else:
++            if scale_softmax_log2 is not None:
++                raise ValueError("device scale_softmax_log2 requires cuda_scales=True")
++            scale_softmax_log2 = (
++                state.scale_softmax_log2
++                if softmax_scale is None
++                else _validate_scale(
++                    _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
++                    "softmax_scale * log2(e)",
++                )
++            )
++            output_scale = (
++                state.output_scale
++                if output_scale is None
++                else _validate_scale(output_scale, "output_scale")
+             )
+-        )
+-        output_scale = (
+-            state.output_scale
+-            if output_scale is None
+-            else _validate_scale(output_scale, "output_scale")
+-        )
+         if vc_output_scale is not None:
+             output_scale = torch.mul(
+                 vc_output_scale, output_scale, out=state.vc_output_scale
 diff --git a/decode.py b/decode.py
-index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac722fed527 100644
+index cd2472da75685f073a78177c6f0e6ee8728f7274..0609b55f408f2d62e072fd11463ff01c6f1f6d75 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -286,20 +490,26 @@ index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac7
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -26,11 +27,7 @@ import torch
+@@ -26,17 +27,13 @@ import torch
  
  from ._compile_cache import build_and_load_attention_kernel
  
 -from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ from flashinfer.utils import (
+     get_device_sm_count,
+     _check_workspace_buffer_alignment,
+     check_shape_dtype_device,
+ )
+ 
 -from flashinfer.trace.templates.attention import (
 -    attention_ts_decode_trace_dispatch,
 -    prims_ts_decode_wrapper_trace_dispatch,
 -)
-+from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
  
  from . import _q_token_kv_block_sparse_policy as _sparse_policy
  from ._block_sparse.common import _num_sparse_pattern_heads
-@@ -780,7 +777,7 @@ def _validate_runtime_device(device: torch.device) -> None:
+@@ -770,7 +767,7 @@ def _validate_runtime_device(device: torch.device) -> None:
      # Rubin runs through the sm_100f family target; a CuTe DSL older than 4.8
      # cannot emit for it unless CUTE_DSL_ARCH=sm_100f is set before import.
      if capability == (10, 7):
@@ -308,7 +518,7 @@ index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac7
  
          require_cute_dsl_arch(device_index)
  
-@@ -4075,7 +4072,7 @@ class BatchDecodePagedTSWrapper:
+@@ -4281,7 +4278,7 @@ class BatchDecodePagedTSWrapper:
          # previous complete plan revision usable.
          self._plan_state = candidate
  
@@ -317,8 +527,8 @@ index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac7
      def run(
          self,
          q: torch.Tensor,
-@@ -4257,7 +4254,7 @@ class BatchDecodePagedTSWrapper:
-         )
+@@ -4481,7 +4478,7 @@ class BatchDecodePagedTSWrapper:
+         return (result, lse) if return_lse else result
  
  
 -@flashinfer_experimental_api(trace=attention_ts_decode_trace_dispatch)
@@ -326,8 +536,46 @@ index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac7
  def batch_decode_with_paged_kv_cache(
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
+diff --git a/kernels/fmha_context/fmha_kernel.py b/kernels/fmha_context/fmha_kernel.py
+index effc3d218a66309e48e3bbd9b31923c4cd02765a..d447b52846fa6ad8aaebf635c72cceb8973d6fda 100644
+--- a/kernels/fmha_context/fmha_kernel.py
++++ b/kernels/fmha_context/fmha_kernel.py
+@@ -1,3 +1,4 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ # Copyright (c) 2026 by FlashInfer team.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+@@ -3317,7 +3318,7 @@ class FmhaTs:
+         k_cute: cute.Tensor,
+         v_cute: cute.Tensor,
+         o_cute: cute.Tensor,
+-        scale_softmax_log2: Float32,
++        scale_softmax_log2: Float32 | cute.Tensor,
+         output_scale: Float32 | cute.Tensor,
+         max_active_clusters: int,
+         stream: cuda_drv.CUstream,
+@@ -3751,7 +3752,7 @@ class FmhaTs:
+             | utils.ClcDynamicPersistentTileSchedulerParams
+             | None
+         ),
+-        scale_softmax_log2: Float32,
++        scale_softmax_log2: Float32 | cute.Tensor,
+         output_scale: Float32 | cute.Tensor,
+         num_kv_tiles: Int32,
+         num_seq_tiles: Int32,
+@@ -3797,6 +3798,10 @@ class FmhaTs:
+ 
+             cfg = copy(cfg)
+             cfg.fixed_dense_k_tail = dense_tail_capacity
++        if cutlass.const_expr(isinstance(scale_softmax_log2, cute.Tensor)):
++            scale_softmax_log2 = scale_softmax_log2[0]
++        if cutlass.const_expr(isinstance(output_scale, cute.Tensor) and not cfg.vc_attention):
++            output_scale = output_scale[0]
+         cfg.num_seq_tiles = num_seq_tiles
+         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+ 
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2fe30a922 100644
+index 203cc25fb3814fa0fc793894a26d717515f31f76..ba7273fcea22713387a6234e9b935c028416fd16 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -335,7 +583,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -1199,8 +1200,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1424,8 +1425,6 @@ class GmemQKVResource(MemoryResource):
                  if cutlass.const_expr(self.cfg.has_uniform_varlen):
                      seqlen_k = Int32(self.cfg.uniform_seq_len_k)
                  else:
@@ -344,7 +592,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
                      seqlen_k = _load_runtime_seq_len_kv(
                          self.seqlens_kv, self.max_seq_len_kv, batch_coord
                      )
-@@ -1223,8 +1222,6 @@ class GmemQKVResource(MemoryResource):
+@@ -1448,8 +1447,6 @@ class GmemQKVResource(MemoryResource):
                      kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
                      kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
                  else:
@@ -353,7 +601,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
                      kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                          Int32(self.block_table_row_stride),
                          self.cfg,
-@@ -1300,13 +1297,9 @@ class GmemQKVResource(MemoryResource):
+@@ -1536,13 +1533,9 @@ class GmemQKVResource(MemoryResource):
              kv_request_begin = batch_coord * Int32(self.block_table_row_stride)
              kv_page_idx_ub = Int32(self.cfg.max_num_pages_per_seq_kv - 1)
          else:
@@ -367,25 +615,7 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
              kv_request_begin, kv_page_idx_ub = _load_block_table_row_bounds(
                  Int32(self.block_table_row_stride),
                  self.cfg,
-@@ -1743,8 +1736,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
-         kv_request_begin: Int32,
-         kv_page_idx_ub: Int32,
-     ) -> None:
--        from .helpers_paged import _resolve_kv_tile_idx_context
--
-         cfg = self.cfg
-         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
-         # producer runs one tile ahead in TAIL, so reuse the same expression
-@@ -1835,8 +1826,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
-         tile_offset: cutlass.Constexpr[int] = 0,
-     ) -> cutlass.Array:
-         """Retain one tile's page IDs after its SMEM window is released."""
--        from .helpers_paged import _resolve_kv_tile_idx_context
--
-         tile_idx = _resolve_kv_tile_idx_context(
-             stage_info, kv_tile_start, tile_offset=tile_offset
-         )
-@@ -5770,3 +5759,14 @@ class GmemOResource(MemoryResource):
+@@ -7616,3 +7609,13 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -398,7 +628,6 @@ index d17584b725e24235ce0ec90caac174a29d4ab965..af69ee7d51bc1179352d0bf2ba71fad2
 +from .helpers_paged import (
 +    _load_block_table_row_bounds,
 +    _load_runtime_seq_len_kv,
-+    _resolve_kv_tile_idx_context,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a32c5289e 100644
@@ -419,7 +648,7 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e231c98a52 100644
+index a42843f6ab47c0b1cefa0a0b51e27b355e0a4974..e60454d40ec7caf98e2bd5e70ebc951bd1e94fa2 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -427,28 +656,26 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -27,11 +28,7 @@ from ._hardware import get_max_active_clusters
- 
- import torch
+@@ -33,12 +34,8 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
+     validate_nvfp4_kv_formats,
+ )
  
 -from flashinfer.api_logging import flashinfer_experimental_api
++from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ from flashinfer.utils import get_device_sm_count
 -from flashinfer.trace.templates.attention import (
 -    prims_ts_decode_mla_one_shot_trace_dispatch,
 -    prims_ts_decode_mla_wrapper_trace_dispatch,
 -)
-+from flashinfer.api_logging import flashinfer_api as flashinfer_experimental_api
+ 
  
  from .decode import (
-     _WorkspaceSection,
-@@ -1047,11 +1044,35 @@ def _make_mla_decode_compile_spec(
-     )
+@@ -1185,8 +1182,34 @@ def _make_mla_decode_compile_spec(
+ _cached_mla_decode_compile_spec = functools.cache(_make_mla_decode_compile_spec)
  
  
 -@functools.cache
 -def _get_compiled_mla_decode(
--    compile_spec: _MLADecodeCompileSpec,
--):
--    """Compile and cache one batch-dynamic TS MLA topology."""
 +_COMPILED_MLA_DECODE: dict = {}
 +
 +
@@ -476,31 +703,12 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +    return is_placeholder(compiled)
 +
 +
-+def _compile_mla_decode(compile_spec: _MLADecodeCompileSpec):
-+    """Build (or load from the on-disk cache) one batch-dynamic TS MLA topology."""
- 
-     import cutlass
-     import cutlass.cute as cute
-@@ -1459,11 +1480,12 @@ def _launch_mla_decode(
-         runtime.sparse_inputs,
-         runtime.bmm1_scale,
-         runtime.bmm2_scale,
--        **(
--            {"output_quant_args": runtime.output_quant_args}
--            if runtime.output_quant_args is not None
--            else {}
--        ),
-+        # Passed positionally and also when None. The kernel was compiled with
-+        # ``output_quant_args`` in its signature (``None`` for unquantized
-+        # output), and a kernel reloaded from the persistent compile cache is
-+        # a positional TVM-FFI entry with no Python defaults: it rejects both
-+        # a missing parameter and a keyword argument.
-+        runtime.output_quant_args,
-     )
-     return runtime.out
- 
-@@ -1637,7 +1659,7 @@ class BatchMLADecodePagedTSWrapper:
-             split_kv=int(dict(policy)["split_kv"]),
++def _compile_mla_decode(
+     compile_spec: _MLADecodeCompileSpec,
+ ):
+     """Compile and cache one batch-dynamic TS MLA topology."""
+@@ -1872,7 +1895,7 @@ class BatchMLADecodePagedTSWrapper:
+             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
          )
  
 -    @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -508,8 +716,8 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
      def run(
          self,
          query: torch.Tensor,
-@@ -1742,7 +1764,7 @@ class BatchMLADecodePagedTSWrapper:
-         )
+@@ -1979,7 +2002,7 @@ class BatchMLADecodePagedTSWrapper:
+         return (result, lse) if return_lse else result
  
  
 -@flashinfer_experimental_api(trace=prims_ts_decode_mla_one_shot_trace_dispatch)
@@ -517,7 +725,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2099,6 +2121,7 @@ def _prepare_sparse_output_quant(
+@@ -2343,6 +2366,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -525,7 +733,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2119,17 +2142,17 @@ def _resolve_sparse_mla_plan(
+@@ -2368,17 +2392,17 @@ def _resolve_sparse_mla_plan(
  ):
      """Resolve sparse geometry and scratch sizing without allocation/compilation."""
      import cutlass
@@ -547,40 +755,36 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
          MlaDecodeTs,
      )
  
-@@ -2264,6 +2287,9 @@ def _resolve_sparse_mla_plan(
-     return device, profile, spec, sections, byte_end, capacity, output_quant
+@@ -2754,6 +2778,9 @@ def resolve_sparse_d576_reload_plan(
+     return device, profile, spec, sections, byte_end, capacity, None
  
  
-+# Prepared launches kept per plan (one per layer sharing the plan; DeepSeek-V4 has 61).
 +_PREPARED_LAUNCH_LIMIT = 256
++
 +
  class BatchSparseMLADecodePagedTSWrapper:
      """Plan native BF16/E4M3 attention, then bind one or two source index lists.
  
-@@ -2297,6 +2323,11 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2803,6 +2830,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+     def __init__(self, workspace_buffer=None):
          self._workspace_buffer = workspace_buffer
          self._state = None
-         self._scalar_cache = {}
-+        # Prepared launches for the unfused validate=False path: everything that
-+        # is static for one (plan, pools, scales, sinks) tuple, keyed by the pools'
-+        # storage and the sinks address. One plan serves every layer of a model,
-+        # and each layer brings its own sinks, so one entry per layer.
 +        self._prepared: dict[tuple, dict] = {}
          self.workspace_size_bytes = 0
  
      def plan(
-@@ -2386,6 +2417,7 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 kernel_signature=_mla_kernel_compile_signature(static_kernel),
+@@ -2964,6 +2992,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+                 kernel_signature=_mla_kernel_compile_signature(kernel),
              )
-         )
+         compiled = _get_compiled_mla_decode(spec)
 +        self._prepared.clear()
          self._state = dict(
+             reload_d576=reload_d576,
              device=device,
-             batch=batch_size,
-@@ -2608,6 +2640,38 @@ class BatchSparseMLADecodePagedTSWrapper:
-         state = self._state
-         if state is None:
+@@ -3210,6 +3239,40 @@ class BatchSparseMLADecodePagedTSWrapper:
              raise RuntimeError("plan() must be called before run()")
+         if softmax_scale is None:
+             softmax_scale = state["query_dim"] ** -0.5
 +        lse_arg = lse
 +        prepared_key = (
 +            kv_cache.data_ptr(),
@@ -595,7 +799,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +                extra_kv_cache.stride(),
 +                extra_kv_cache.dtype,
 +            ),
-+            None if sinks is None else sinks.data_ptr(),
++            None if attention_sinks is None else attention_sinks.data_ptr(),
 +            softmax_scale,
 +            output_scale,
 +        )
@@ -607,6 +811,8 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +            and token_positions is None
 +            and cos_sin_cache is None
 +            and out_scale is None
++            and type(kv_cache_scale) in (int, float)
++            and kv_cache_scale == 1.0
 +        ):
 +            prepared = self._prepared.get(prepared_key)
 +            if prepared is not None:
@@ -615,18 +821,20 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +                )
          _validate_query(
              query,
-             packed_query=state["packed"],
-@@ -2781,10 +2845,124 @@ class BatchSparseMLADecodePagedTSWrapper:
-                 if static_scales
-                 else state["compiled"],
+             packed_query=state["packed_query"],
+@@ -3405,10 +3468,127 @@ class BatchSparseMLADecodePagedTSWrapper:
+                 compiled=state["compiled"],
+                 max_q_len=1,
              )
 +        if (
 +            rows
 +            and quant is None
-+            and static_scales
-+            and not state["packed"]
++            and not state["packed_query"]
 +            and not state["return_lse"]
-+            and state["max_q"] == 1
++            and state["max_q_len"] == 1
++            and state["query_dim"] == 512
++            and state["kv_cache_format"] == "native"
++            and state["extra_kv_cache_format"] == "native"
 +            and lse_arg is None
 +        ):
 +            # Static for this (plan, pools, scales): pool views, scalars, sinks, split,
@@ -640,10 +848,10 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +                primary_rows=primary.shape[0],
 +                c_latent=primary.permute(1, 2, 0),
 +                c_rope=extra.permute(1, 2, 0),
-+                scalars=(scale_tensors[0], scale_tensors[1], sinks),
-+                bmm=(bmm1_scale, bmm2_scale),
-+                ks=state["ks"],
-+                kc=state["kc"],
++                sinks=attention_sinks,
++                bmm=(softmax_scale, output_scale),
++                ks=state["max_topk"],
++                kc=state["max_extra_topk"],
 +                dummy_indices=state["dummy_indices"],
 +                default_cl=state["default_cl"],
 +            )
@@ -661,10 +869,10 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +        full path for the same arguments.
 +        """
 +        state = self._state
-+        rows, heads, device = state["batch"], state["heads"], state["device"]
++        rows, heads, device = state["batch_size"], state["num_qo_heads"], state["device"]
 +        if (
 +            query.shape != (rows, 1, heads, 512)
-+            or query.dtype != state["dtype"]
++            or query.dtype != state["q_dtype"]
 +            or query.device != device
 +            or not query.is_contiguous()
 +            or query.data_ptr() % 16
@@ -715,11 +923,11 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +                raise ValueError("prepared launch: extra indices without a planned extra pool")
 +            ci, cl = prepared["dummy_indices"][:rows], prepared["default_cl"][:rows]
 +        buffers = state["buffers"]
-+        s0, s1, sinks = prepared["scalars"]
++        sinks = prepared["sinks"]
 +        q_kernel = query.permute(2, 3, 1, 0)
 +        lse_kernel = buffers["public_lse"][:rows].view(rows, 1, heads).permute(2, 1, 0)
 +        bmm1, bmm2 = prepared["bmm"]
-+        state["compiled_static"](
++        state["compiled"](
 +            q_kernel,
 +            q_kernel,
 +            prepared["c_latent"],
@@ -728,13 +936,14 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
 +            out.view(rows, 1, heads, 512).permute(2, 3, 1, 0),
 +            lse_kernel,
 +            buffers["core"] if buffers["core"].numel() else None,
-+            state["splits"],
++            state["requested_splits"],
 +            lengths,
 +            None,
-+            (indices, ci, lengths, cl, s0, s1, sinks),
++            (indices, ci, lengths, cl, sinks, 1.0),
 +            bmm1,
 +            bmm2,
 +            None,
++            1,
 +        )
 +        return out
 +
@@ -742,7 +951,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
      """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index e2bbef13c0f552030875e6b433e0fcdb20686cf6..dff16046cf7cf9ff03950043cf462ac28de6c670 100644
+index 146921278514aa664590b95362a9533a287b145d..142cdb1ec83a9471fce26398fedba94312c1a76c 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
@@ -750,7 +959,7 @@ index e2bbef13c0f552030875e6b433e0fcdb20686cf6..dff16046cf7cf9ff03950043cf462ac2
  # Copyright (c) 2026 by FlashInfer team.
  #
  # Licensed under the Apache License, Version 2.0 (the "License");
-@@ -41,9 +42,9 @@ from dataclasses import dataclass
+@@ -41,9 +42,9 @@ from dataclasses import dataclass, replace
  from typing import Any, Literal, Optional
  
  import torch

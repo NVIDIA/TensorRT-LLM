@@ -24,14 +24,15 @@ from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from ..sage import SageAttentionConfig
+from ..sage.config import SageAttentionConfig, validate_sage_recipe
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
+    _resolve_plan_block_sizes,
     _select_block_sparse_q_tile_size,
     _validate_sparse_kv_block_size,
 )
-from ..sage import _SageScaleLayout
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 if TYPE_CHECKING:
@@ -385,7 +386,7 @@ def _resolve_plan_dtypes(
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
     K defaults to Q and V to K. The output defaults to Q, or to bfloat16 with
-    Sage; the decode configuration validates the Sage dtype recipe.
+    Sage, whose recipe ``validate_sage_recipe`` checks.
     """
 
     if kv_dtype is None:
@@ -401,12 +402,15 @@ def _resolve_plan_dtypes(
             output_dtype,
             _validate_matching_dtypes(q_dtype, kv_dtype, v_dtype, output_dtype),
         )
-    if not isinstance(sage, SageAttentionConfig):
-        raise TypeError("sage must be a SageAttentionConfig instance")
-    if q_dtype != kv_dtype:
-        raise ValueError("Sage attention requires Q and K in one dtype")
     if output_dtype is None:
         output_dtype = torch.bfloat16
+    validate_sage_recipe(
+        sage,
+        q_dtype=q_dtype,
+        k_dtype=kv_dtype,
+        v_dtype=v_dtype,
+        output_dtype=output_dtype,
+    )
     return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
 
 
@@ -418,8 +422,8 @@ def _validate_block_sparse_static_profile(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_block_size: int,
-    kv_block_size: int,
+    q_block_size: int | None,
+    kv_block_size: int | None,
     use_kv_valid_bits: bool,
     mask_type: Literal["dense", "causal"],
     q_dtype: torch.dtype,
@@ -461,6 +465,9 @@ def _validate_block_sparse_static_profile(
             )
     if not isinstance(use_kv_valid_bits, bool):
         raise TypeError("use_kv_valid_bits must be a bool")
+    q_block_size, kv_block_size = _resolve_plan_block_sizes(
+        q_block_size, kv_block_size, use_block_sparse=use_block_sparse
+    )
     kv_block_size = _validate_sparse_kv_block_size(kv_block_size)
     if num_qo_heads % num_kv_heads != 0:
         raise ValueError("num_qo_heads must be divisible by num_kv_heads")
@@ -555,6 +562,8 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        # Block-sparse and Sage plans compile for their exact lengths.
+        "fixed_seqlen": True,
     }
     if key.use_block_sparse:
         config_args.update(

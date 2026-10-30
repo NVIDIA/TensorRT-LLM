@@ -24,7 +24,11 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from ..sage import SageAttentionConfig, sage_scale_shapes
+from ..sage.config import (
+    SageAttentionConfig,
+    sage_scale_shapes,
+    _validate_int8_qk_device,
+)
 from .common import (
     _SIGNED_INT32_MAX,
     _block_sparse_proxy_summary_geometry,
@@ -35,28 +39,11 @@ from .config import (
     _BlockSparseStaticProfile,
     _resolve_block_sparse_launch_spec,
 )
-from ..sage import _SageScaleLayout
+from ..sage.layout import _SageScaleLayout
 from .prepared import _BlockSparseRouteLayout
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
-
-# Only SM100 has the INT8 tcgen05 MMA kind; later GPUs use E4M3 Q/K.
-_INT8_QK_COMPUTE_CAPABILITIES = ((10, 0),)
-
-
-def _validate_int8_qk_device(q_dtype: torch.dtype, device_index: int) -> None:
-    """Reject Int8 Q/K on GPUs without the INT8 tcgen05 MMA."""
-
-    if q_dtype != torch.int8:
-        return
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability not in _INT8_QK_COMPUTE_CAPABILITIES:
-        raise NotImplementedError(
-            "Int8 Q/K Sage attention requires an SM100a/B200 GPU, whose tcgen05 "
-            "MMA supports INT8 operands; use the torch.float8_e4m3fn Q/K recipe "
-            f"on device cuda:{device_index} with compute capability {capability}"
-        )
 
 
 class _PlanLockOwner(Protocol):

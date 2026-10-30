@@ -34,6 +34,7 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from ..stage import FmhaStage
+from ...sage.modes import SageKTransport, SageScoreScaling
 from cutlass.experimental.task_scheduling.schedule_builder import (
     domain_loop,
     schedule,
@@ -50,6 +51,7 @@ from .fmha_resources import (
     SmemKVResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
+    SmemSageKScalesResource,
     SmemQResource,
     TmemOResource,
     TmemPResource,
@@ -59,25 +61,32 @@ from .fmha_resources import (
     TmemStatsDoneResource,
     TmemPPrefixReadyResource,
 )
+from .vc_attention.vc_resources import SmemMuResource
 
 
 @dataclass(kw_only=True)
 class PackedContextWorkQueue(WorkQueue):
-    """Persistent queue that skips Q tiles outside a live packed request."""
+    """Persistent queue that skips empty Q/KV requests and padded Q tiles."""
 
     cfg: cutlass.Constexpr[FmhaConfig] = field(init=False, default=None)
     cum_seqlen_q: Any = field(init=False, default=None)
+    cum_seqlen_k: Any = field(init=False, default=None)
+    seq_lens_kv: Any = field(init=False, default=None)
 
     def __init__(
         self,
         cfg: FmhaConfig,
-        cum_seqlen_q: cute.Tensor,
+        cum_seqlen_q: cute.Tensor | None,
+        cum_seqlen_k: cute.Tensor | None = None,
+        seq_lens_kv: cute.Pointer | None = None,
         **kwargs: Any,
     ) -> None:
         """Attach the live packed-Q metadata used by the skip predicate."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cum_seqlen_q = cum_seqlen_q
+        self.cum_seqlen_k = cum_seqlen_k
+        self.seq_lens_kv = seq_lens_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
@@ -87,10 +96,24 @@ class PackedContextWorkQueue(WorkQueue):
         if cutlass.const_expr(self.cfg.uses_causal_reversed_head_batch_seq_tile_order):
             seq_coord = Int32(self.cfg.num_seq_tiles) - seq_coord - Int32(1)
         batch_coord = Int32(work_tile.tile_idx[batch_idx])
-        q_begin = Int32(self.cum_seqlen_q[batch_coord])
-        q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
-        seqlen_q = q_end - q_begin
-        return seq_coord * Int32(self.cfg.cta_tiler[0]) >= seqlen_q
+        skip = cutlass.Boolean(False)
+        if cutlass.const_expr(
+            self.cum_seqlen_q is not None and not self.cfg.has_uniform_varlen
+        ):
+            q_begin = Int32(self.cum_seqlen_q[batch_coord])
+            q_end = Int32(self.cum_seqlen_q[batch_coord + Int32(1)])
+            skip = seq_coord * Int32(self.cfg.cta_tiler[0]) >= q_end - q_begin
+        if cutlass.const_expr(self.seq_lens_kv is not None):
+            skip = skip or Int32(self.seq_lens_kv[batch_coord]) <= Int32(0)
+        elif cutlass.const_expr(
+            self.cum_seqlen_k is not None and not self.cfg.has_uniform_varlen
+        ):
+            skip = (
+                skip
+                or self.cum_seqlen_k[batch_coord + Int32(1)]
+                <= self.cum_seqlen_k[batch_coord]
+            )
+        return skip
 
 
 def _persistent_tail(work_queue: WorkQueue) -> None:
@@ -188,13 +211,19 @@ def create_load_task(
     task_class: type[Task] = Task,
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
     smem_page_offsets_v: SmemPageOffsetsKvResource | None = None,
+    smem_mu: SmemMuResource | None = None,
+    smem_sage_k: SmemSageKScalesResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create the one-warp TMA load task.
 
+    ``smem_mu`` (VC-Attention) stages one bf16 tile-mean operand per K/V tile
+    beside V.
+
     When ``smem_page_offsets_kv`` is provided, each K/V TMA load consumes page
     IDs prefetched by the auxiliary warp through the ordinary asynchronous
-    page-offset pipeline.
+    page-offset pipeline. When ``smem_sage_k`` is provided, the warp also
+    stages each K tile's Sage ``sfK`` words after the tile's K load.
     """
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
@@ -205,10 +234,14 @@ def create_load_task(
         raise ValueError("split K/V staging requires a separate V buffer")
     kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
     dst = [smem_q, *kv_resources]
+    if smem_mu is not None:
+        dst.append(smem_mu)
     if smem_page_offsets_kv is not None:
         src.append(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
         src.append(smem_page_offsets_v)
+    if smem_sage_k is not None:
+        dst.append(smem_sage_k)
     if smem_q.cfg.single_qkv_instance and smem_q.cfg.has_tmem_p_pipeline:
         num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
@@ -266,6 +299,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     sq.acquire()
@@ -293,6 +327,7 @@ def create_load_task(
                                 seqlen_k=seqlen_k,
                                 kv_tile_start=kv_tile_start,
                                 kv_request_begin=kv_request_begin,
+                                kv_page_idx_lb=kv_page_idx_lb,
                                 kv_page_idx_ub=kv_page_idx_ub,
                             )
                             sk.commit()
@@ -327,6 +362,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             else:
@@ -339,6 +375,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             sv.commit()
@@ -471,6 +508,7 @@ def create_load_task(
                     seqlen_k,
                     kv_tile_start,
                     kv_request_begin,
+                    kv_page_idx_lb,
                     kv_page_idx_ub,
                 ) = coords
                 sq.acquire()
@@ -498,6 +536,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
@@ -519,6 +558,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
@@ -540,6 +580,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sv.commit()
@@ -561,6 +602,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sv.commit()
@@ -651,12 +693,32 @@ def create_load_task(
         sq: SmemQResource,
         sk: SmemKVResource,
         sv: SmemKVResource,
+        skr: SmemSageKScalesResource | None,
         wq: WorkQueue | None,
+        smu: SmemMuResource | None = None,
     ) -> None:
-        """Load paired Q instances and their directly addressed K/V tiles."""
+        """Load paired Q instances and their directly addressed K/V tiles.
+
+        With ``skr`` each K tile's Sage ``sfK`` words follow the tile's K
+        load into the scale ring.
+        """
         sq.init_load_state()
         sk.init_load_state()
         sv.init_load_state()
+        if smu is not None:
+            smu.init_load_state()
+
+        def stage_sage_k_scales() -> None:
+            if skr is None:
+                return
+            skr.acquire()
+            skr.copy_tile(
+                kv_head_coord=kv_head_coord,
+                batch_coord=batch_coord,
+                kv_tile_start=kv_tile_start,
+            )
+            skr.commit()
+
         with _work_tile_schedule_loop(wq, skip_if=skip_work_tile_if):  # noqa: SIM117
             # The first K-loop iteration also loads Q0/Q1. Later iterations
             # only stream the next K/V tiles through their respective pipelines.
@@ -675,6 +737,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     # Load Q0 for the first Q tile in this work tile.
@@ -714,9 +777,11 @@ def create_load_task(
                             kv_tile_start=kv_tile_start,
                             seqlen_k=seqlen_k,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
+                    stage_sage_k_scales()
                 else:
                     # Throttle TMA before reserving a KV stage.
                     sk.try_acquire()
@@ -729,9 +794,11 @@ def create_load_task(
                         kv_tile_start=kv_tile_start,
                         seqlen_k=seqlen_k,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
+                    stage_sage_k_scales()
                     with d.first_iter():
                         # Load Q1 for the second Q tile in this work tile.
                         sq.acquire()
@@ -755,9 +822,73 @@ def create_load_task(
                     seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
                     kv_request_begin=kv_request_begin,
+                    kv_page_idx_lb=kv_page_idx_lb,
                     kv_page_idx_ub=kv_page_idx_ub,
                 )
                 sv.commit()
+                if smu is not None:
+                    # VC-Attention: the mean operand of tile i-1 rides beside V_i.
+                    smu.try_acquire()
+                    smu.acquire()
+                    smu.mu_load(
+                        kv_head_coord=kv_head_coord,
+                        batch_coord=batch_coord,
+                        kv_tile_start=kv_tile_start,
+                    )
+                    smu.commit()
+            if smu is not None:
+                # The loop step at tile i adds the means of the group that ended
+                # at tile i - 1, so the loop covers groups 0 .. N - 2 and the
+                # group of the last tile never meets a following loop tile. Its
+                # operand is fetched once more here for the tail mean step.
+                (
+                    _seq_coord,
+                    _head_coord,
+                    kv_head_coord,
+                    _head_coord_kv,
+                    batch_coord,
+                    _seq_coord_q,
+                    _cuseqlen_q,
+                    _cuseqlen_k,
+                    _seqlen_q,
+                    _seqlen_k,
+                    kv_tile_start,
+                    _kv_request_begin,
+                    _kv_page_idx_lb,
+                    _kv_page_idx_ub,
+                ) = gqkv.compute_coords()
+                smu.try_acquire()
+                smu.acquire()
+                smu.mu_load(
+                    kv_head_coord=kv_head_coord,
+                    batch_coord=batch_coord,
+                    kv_tile_start=kv_tile_start,
+                    is_tail=True,
+                )
+                smu.commit()
+
+    @schedule
+    def load_schedule_mu(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        smu: SmemMuResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared K/V buffer plus the VC-Attention tile-mean ring."""
+        load_schedule_body(gqkv, sq, skv, skv, None, wq, smu)  # type: ignore[call-arg]
+
+    @schedule
+    def load_split_schedule_mu(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        smu: SmemMuResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K and V buffers plus the VC-Attention tile-mean ring."""
+        load_schedule_body(gqkv, sq, sk, sv, None, wq, smu)  # type: ignore[call-arg]
 
     @schedule
     def load_schedule(
@@ -768,7 +899,18 @@ def create_load_task(
     ) -> None:
         """Contiguous-KV captured schedule over a shared K/V buffer."""
         # Mypy retains the earlier branch's five-argument closure signature.
-        load_schedule_body(gqkv, sq, skv, skv, wq)  # type: ignore[call-arg]
+        load_schedule_body(gqkv, sq, skv, skv, None, wq)  # type: ignore[call-arg]
+
+    @schedule
+    def load_sage_schedule(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        skr: SmemSageKScalesResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Contiguous-KV captured schedule that also stages Sage ``sfK`` tiles."""
+        load_schedule_body(gqkv, sq, skv, skv, skr, wq)  # type: ignore[call-arg]
 
     @schedule
     def load_split_schedule(
@@ -779,15 +921,36 @@ def create_load_task(
         wq: WorkQueue | None = None,
     ) -> None:
         """Contiguous-KV captured schedule over split K and V buffers."""
-        load_schedule_body(gqkv, sq, sk, sv, wq)  # type: ignore[call-arg]
+        load_schedule_body(gqkv, sq, sk, sv, None, wq)  # type: ignore[call-arg]
 
-    captured_schedule = _schedule_with_work_queue(
-        load_split_schedule if split_kv else load_schedule,
-        gmem_qkv,
-        smem_q,
-        *kv_resources,
-        work_queue=work_queue,
-    )
+    if smem_mu is not None:
+        captured_schedule = _schedule_with_work_queue(
+            load_split_schedule_mu if split_kv else load_schedule_mu,
+            gmem_qkv,
+            smem_q,
+            *kv_resources,
+            smem_mu,
+            work_queue=work_queue,
+        )
+    elif smem_sage_k is not None:
+        if split_kv:
+            raise ValueError("the Sage scale ring requires a shared K/V buffer")
+        captured_schedule = _schedule_with_work_queue(
+            load_sage_schedule,
+            gmem_qkv,
+            smem_q,
+            *kv_resources,
+            smem_sage_k,
+            work_queue=work_queue,
+        )
+    else:
+        captured_schedule = _schedule_with_work_queue(
+            load_split_schedule if split_kv else load_schedule,
+            gmem_qkv,
+            smem_q,
+            *kv_resources,
+            work_queue=work_queue,
+        )
     return task_class(
         src_resources=src,
         dst_resources=dst,
@@ -817,9 +980,14 @@ def create_mma_task(
     tmem_p_prefix_ready_1: TmemPPrefixReadyResource | None = None,
     smem_p0: SmemPResource | None = None,
     smem_p1: SmemPResource | None = None,
+    smem_mu: SmemMuResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
-    """Create the one-warp MMA compute task."""
+    """Create the one-warp MMA compute task.
+
+    ``smem_mu`` (VC-Attention) supplies the bf16 tile-mean operand consumed by
+    one extra ``kind::f16`` step after each tile's PV steps.
+    """
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
     # Only paged MMA schedules read request coordinates from global metadata.
@@ -840,12 +1008,14 @@ def create_mma_task(
     if p_in_smem and (smem_p0 is None or smem_p1 is None):
         raise ValueError("p_in_smem requires both SMEM P resources")
     smem_p_resources = (smem_p0, smem_p1) if p_in_smem else ()
+    mu_resources = (smem_mu,) if smem_mu is not None else ()
     src = _src_resources(
         *qkv_resources,
         smem_q,
         *kv_resources,
         *p_prefix_resources,
         *smem_p_resources,
+        *mu_resources,
         work_queue=work_queue,
     )
     num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
@@ -861,12 +1031,10 @@ def create_mma_task(
         )
         num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
         num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
-        loop_carried_head_dim_stages = 2
-        if (
-            num_head_dim_stages_k != loop_carried_head_dim_stages
-            or num_head_dim_stages_v != loop_carried_head_dim_stages
-        ):
-            raise ValueError("loop-carried split S/P scheduling expects two K/V stages")
+        if num_head_dim_stages_k not in (1, 2) or num_head_dim_stages_v not in (1, 2):
+            raise ValueError(
+                "loop-carried split S/P scheduling expects one or two K/V stages"
+            )
 
         def mma_schedule_body(
             gqkv: GmemQKVResource,
@@ -908,6 +1076,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
 
@@ -947,15 +1116,16 @@ def create_mma_task(
                     )
                     sk.release()
 
-                    sk.wait()
-                    desc_k_base = sk.k_desc()
-                    sp0.qk_mma(
-                        desc_q_base=desc_q0_base,
-                        desc_k_base=desc_k_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    sk.release()
+                    if num_head_dim_stages_k > 1:
+                        sk.wait()
+                        desc_k_base = sk.k_desc()
+                        sp0.qk_mma(
+                            desc_q_base=desc_q0_base,
+                            desc_k_base=desc_k_base,
+                            section=FmhaStage.Loop,
+                            head_dim_stage_idx=1,
+                        )
+                        sk.release()
                     sp0.commit()
                     if not smem_q.cfg.stats_via_smem:
                         vd0.commit()
@@ -986,21 +1156,22 @@ def create_mma_task(
                     )
                     sv.release()
 
-                    sv.wait()
-                    if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
-                        desc_v_base = sv.v_desc_paged(
+                    if num_head_dim_stages_v > 1:
+                        sv.wait()
+                        if cutlass.const_expr(smem_q.cfg.needs_paged_v_tail_clear):
+                            desc_v_base = sv.v_desc_paged(
+                                section=FmhaStage.Loop,
+                                seqlen_k=v_seqlen_k,
+                                kv_tile_start=v_kv_tile_start,
+                            )
+                        else:
+                            desc_v_base = sv.v_desc()
+                        to.pv_mma(
+                            desc_v_base=desc_v_base,
                             section=FmhaStage.Loop,
-                            seqlen_k=v_seqlen_k,
-                            kv_tile_start=v_kv_tile_start,
+                            head_dim_stage_idx=1,
                         )
-                    else:
-                        desc_v_base = sv.v_desc()
-                    to.pv_mma(
-                        desc_v_base=desc_v_base,
-                        section=FmhaStage.Loop,
-                        head_dim_stage_idx=1,
-                    )
-                    sv.release()
+                        sv.release()
                     to.commit()
                     tp0.release()
 
@@ -1127,6 +1298,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                 if wq is not None:
@@ -1257,6 +1429,11 @@ def create_mma_task(
             return sk.k_desc()
         return sk.k_stage_desc()
 
+    def seed_scores(sp):
+        """Seed an acquired S stage with the INT32 score bias before its K wait."""
+        if smem_q.cfg.uses_int32_scores:
+            sp.seed_scores()
+
     def qk_mma_stages(sk, sp, desc_q_base, section, *, descriptors=None):
         """Issue all K slices, loading descriptors once and reusing them for Q1."""
         stages = []
@@ -1285,8 +1462,12 @@ def create_mma_task(
         pr1: TmemPPrefixReadyResource | None = None,
         pb0: SmemPResource | None = None,
         pb1: SmemPResource | None = None,
+        smu: SmemMuResource | None = None,
     ) -> None:
         """Interleave paired QK/PV while retaining each K slice for both Qs."""
+        # VC-Attention: the current tile's mean-operand descriptor, waited and
+        # released in lockstep with V.
+        mu_state: dict[str, Any] = {"desc": None}
 
         def pv(
             sp: TmemSPResource,
@@ -1301,6 +1482,14 @@ def create_mma_task(
             if p_in_smem:
                 pb.wait()
                 to.pv_mma(inst_idx=group, **kw)
+                if smu is not None:
+                    # VC-Attention: a group's row sums travel with the P of the
+                    # tile after it, so its mean step follows that tile's PV steps.
+                    to.vc_mean_mma(
+                        inst_idx=group,
+                        desc_mu_base=mu_state["desc"],
+                        is_tail=kw.get("is_tail", False),
+                    )
                 pb.release()
                 return
             if pv_half_overlap:
@@ -1314,6 +1503,8 @@ def create_mma_task(
         sq.init_descriptor_state()
         sk.init_descriptor_state()
         sv.init_descriptor_state()
+        if smu is not None:
+            smu.init_descriptor_state()
         sp0.init_mma_state()
         sp1.init_mma_state()
         to.init_mma_state()
@@ -1334,6 +1525,7 @@ def create_mma_task(
                     v_seqlen_k,
                     v_kv_tile_start,
                     _kv_request_begin,
+                    _kv_page_idx_lb,
                     _kv_page_idx_ub,
                 ) = gqkv.compute_coords()
             # HEAD: consume Q0, K0, Q1, and V0. TmemStatsDone starts empty, so
@@ -1349,6 +1541,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd0.acquire()
                     sp0.acquire()
+                    seed_scores(sp0)
                 qk_mma_slice(
                     sp0, desc_q0_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1362,6 +1555,7 @@ def create_mma_task(
                     if not smem_q.cfg.stats_via_smem:
                         vd1.acquire()
                     sp1.acquire()
+                    seed_scores(sp1)
                 qk_mma_slice(
                     sp1, desc_q1_base, desc_k, FmhaStage.Head, head_dim_stage_idx
                 )
@@ -1414,6 +1608,17 @@ def create_mma_task(
                     )
                 return sv.v_desc()
 
+            def release_mu() -> None:
+                """Release the mean operand of the tile whose PV steps were issued."""
+                if smu is not None:
+                    smu.release()
+
+            def wait_next_mu() -> None:
+                """Wait for the next tile's mean operand and cache its descriptor."""
+                if smu is not None:
+                    smu.wait()
+                    mu_state["desc"] = smu.mu_desc()
+
             if p_in_smem:
                 # With P in SMEM, softmax releases the S stage right after loading
                 # S, so QK(i+1) overlaps exp2(i). The MMA issues QK0(i+1), PV0(i),
@@ -1421,8 +1626,11 @@ def create_mma_task(
                 # waits on its group's P tile instead. The tail drains no SP slot.
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
+                    seed_scores(sp0)
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
                     sp0.commit()
+                    # Wait for the mean operand here, off the QK issue path.
+                    wait_next_mu()
                     to.acquire()
                     pv(
                         sp0,
@@ -1434,6 +1642,7 @@ def create_mma_task(
                     )
                     to.commit()
                     sp1.acquire()
+                    seed_scores(sp1)
                     qk_mma_stages(
                         sk, sp1, desc_q1_base, FmhaStage.Loop, descriptors=k_descriptors
                     )
@@ -1449,9 +1658,27 @@ def create_mma_task(
                     )
                     to.commit()
                     sv.release()
+                    release_mu()
                     desc_v_base = wait_next_v()
                 sq.release()
                 sq.release()
+                if smu is not None:
+                    # The loop issued the mean step of group g at the first tile
+                    # after it, so with N groups it covered 0 .. N - 2. The tail
+                    # O window of each query group adds group N - 1 from the
+                    # operand the loader fetched after the loop. Both ring slots
+                    # are held until then.
+                    wait_next_mu()
+                    smu.wait()
+                    desc_mu_last = smu.mu_desc_last()
+
+                def tail_mean(group: int, pb: Any) -> None:
+                    """Issue the final mean step of ``group`` inside its O window."""
+                    if smu is not None:
+                        pb.wait()
+                        to.vc_mean_mma_last(inst_idx=group, desc_mu_last=desc_mu_last)
+                        pb.release()
+
                 to.acquire()
                 pv(
                     sp0,
@@ -1462,6 +1689,7 @@ def create_mma_task(
                     section=FmhaStage.Tail,
                     is_tail=True,
                 )
+                tail_mean(0, pb0)
                 to.commit()
                 to.acquire()
                 pv(
@@ -1473,8 +1701,11 @@ def create_mma_task(
                     section=FmhaStage.Tail,
                     is_tail=True,
                 )
+                tail_mean(1, pb1)
                 to.commit()
                 sv.release()
+                release_mu()
+                release_mu()
             else:
                 # QK0 -> PV1 -> QK1 -> PV0: retain each K slice and the previous V
                 # until both peer query tiles have consumed the corresponding data.
@@ -1635,7 +1866,52 @@ def create_mma_task(
             gqkv, sq, skv, skv, sp0, sp1, to, vd0, vd1, wq, None, None, pb0, pb1
         )
 
-    if p_in_smem:
+    @schedule
+    def mma_split_schedule_pb_mu(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pb0: SmemPResource,
+        pb1: SmemPResource,
+        smu: SmemMuResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K/V captured schedule with P in SMEM and VC tile means."""
+        mma_schedule_body(
+            gqkv, sq, sk, sv, sp0, sp1, to, vd0, vd1, wq, None, None, pb0, pb1, smu
+        )
+
+    @schedule
+    def mma_schedule_pb_mu(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        pb0: SmemPResource,
+        pb1: SmemPResource,
+        smu: SmemMuResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared-buffer captured schedule with P in SMEM and VC tile means."""
+        mma_schedule_body(
+            gqkv, sq, skv, skv, sp0, sp1, to, vd0, vd1, wq, None, None, pb0, pb1, smu
+        )
+
+    if smem_mu is not None:
+        selected_mma_schedule = (
+            mma_split_schedule_pb_mu if split_kv else mma_schedule_pb_mu
+        )
+    elif p_in_smem:
         selected_mma_schedule = mma_split_schedule_pb if split_kv else mma_schedule_pb
     elif pv_half_overlap:
         selected_mma_schedule = mma_split_schedule_pr if split_kv else mma_schedule_pr
@@ -1653,6 +1929,7 @@ def create_mma_task(
         tmem_vec_done_1,
         *p_prefix_resources,
         *smem_p_resources,
+        *mu_resources,
         work_queue=work_queue,
     )
     return task_class(
@@ -1678,6 +1955,7 @@ def create_softmax_task(
     task_class: type[Task] = Task,
     tmem_p_prefix_ready: TmemPPrefixReadyResource | None = None,
     smem_p: SmemPResource | None = None,
+    smem_sage_k: SmemSageKScalesResource | None = None,
     **task_kwargs: Any,
 ) -> Task:
     """Create a four-warp Softmax task.
@@ -2190,6 +2468,26 @@ def create_softmax_task(
         if smem_p is None:
             raise ValueError("p_in_smem requires the group's SMEM P resource")
         dst.append(smem_p)
+    vc_attention = tmem_sp.cfg.vc_attention
+    # VC-Attention V treatment: tile means restored in-kernel, or V repair tiles.
+    vc_restores_means = tmem_sp.cfg.vc_restores_means
+    vc_repairs_v = vc_attention and not vc_restores_means
+    # Sage attention takes each K tile's sfK words from the prepared buffer
+    # or from the load warp's ring (``SageKTransport``), and scales blocks of
+    # raw scores or dequantizes them (``SageScoreScaling``).
+    use_sage = tmem_sp.cfg.use_sage_attention
+    sage_transport = tmem_sp.cfg.sage_k_transport
+    sage_scaling = tmem_sp.cfg.sage_score_scaling
+    if use_sage and not p_in_smem:
+        raise ValueError("Sage attention requires P in SMEM")
+    if sage_transport is SageKTransport.SMEM and sage_scaling is SageScoreScaling.BLOCK:
+        # The P pass of block-scaled scores reuses the max pass's words, and
+        # a ring stage is released after the max pass.
+        raise ValueError("block-scaled Sage scores load their sfK words directly")
+    if sage_transport is SageKTransport.SMEM:
+        if smem_sage_k is None:
+            raise ValueError("this Sage K block size requires the sfK ring")
+        src.append(smem_sage_k)
 
     def softmax_schedule_body(
         sp: TmemSPResource,
@@ -2198,6 +2496,7 @@ def create_softmax_task(
         wq: WorkQueue | None = None,
         pr: TmemPPrefixReadyResource | None = None,
         pb: SmemPResource | None = None,
+        skr: SmemSageKScalesResource | None = None,
     ) -> None:
         """Captured schedule for one softmax warp group."""
         if tmem_sp.enable_early_tile_sum:
@@ -2208,10 +2507,54 @@ def create_softmax_task(
             p_chunk = sp.init_softmax_state()
         scale_softmax_log2 = sp.load_scale_softmax_log2()
 
-        def exp2_p(sp: TmemSPResource, *, row_max: Any, scale_softmax_log2: Any) -> Any:
+        # VC-Attention sums the E4M3 probability codes inside the P store,
+        # so vc_store_p returns the row sum and softmax_aux_reduce is skipped.
+        vc_state: dict[str, Any] = {
+            "prev_sum": None,
+            "row_sum": None,
+            "sums": None,
+            "k_next": None,
+            "kept": None,
+        }
+
+        def exp2_p(
+            sp: TmemSPResource,
+            *,
+            row_max: Any,
+            scale_softmax_log2: Any,
+            old_row_max: Any = None,
+            is_tail: bool = False,
+            sage_q_scale: Any = None,
+            sage_k_words: Any = None,
+        ) -> Any:
             """Softmax and P store. With P in SMEM the store goes to the SMEM P tile,
             with the half overlap the leading half is published behind ``pr``, else P goes
-            to the TMEM S/P stage."""
+            to the TMEM S/P stage. VC-Attention then carries the group row sums
+            (rescaled to this tile's max) and stores the completed group's operand
+            for the deferred mean step. A Sage plan passes the work tile's ``sfQ`` and, when it
+            scales blocks, the tile's ``sfK`` words from its max pass."""
+            if sage_scaling is SageScoreScaling.BLOCK:
+                p_chunk = sp.sage_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
+            if use_sage:
+                # The scores carry sfK already; sfQ joins the exp2 scale.
+                p_chunk = sp.sage_dequantized_exp2_p_smem(
+                    row_max=row_max,
+                    scale_softmax_log2=scale_softmax_log2,
+                    sage_q_scale=sage_q_scale,
+                )
+                pb.acquire()
+                sp.store_p()
+                pb.commit()
+                return p_chunk
             if p_in_smem:
                 # The S stage is released already, so exp2 and the P store are
                 # auxiliary work on the loaded S and the SMEM P tile.
@@ -2219,7 +2562,30 @@ def create_softmax_task(
                     row_max=row_max, scale_softmax_log2=scale_softmax_log2
                 )
                 pb.acquire()
-                sp.store_p()
+                if vc_repairs_v:
+                    out = sp.vc_store_p_repair(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=vc_state["row_sum"],
+                        vc_kept_row_sum=vc_state["kept"],
+                        p_chunk=p_chunk,
+                        is_tail=is_tail,
+                    )
+                    vc_state["kept"], vc_state["row_sum"] = out[0], out[1]
+                elif vc_restores_means:
+                    out = sp.vc_store_p(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=vc_state["row_sum"],
+                        vc_prev_tile_sum=vc_state["prev_sum"],
+                        p_chunk=p_chunk,
+                        is_tail=is_tail,
+                        vc_meansums=vc_state["sums"],
+                    )
+                    vc_state["prev_sum"], vc_state["row_sum"] = out[0], out[1]
+                    vc_state["sums"] = out[2]
+                else:
+                    sp.store_p()
                 pb.commit()
                 return p_chunk
             if not pv_half_overlap:
@@ -2236,6 +2602,13 @@ def create_softmax_task(
             # Recompute per-tile SP/Vec TMEM state.
             old_row_max, row_max, row_sum, q_offset = sp.init_softmax_work_tile_state()
             vec.init_store_work_tile_state()
+            vc_state["row_sum"] = row_sum
+            if vc_attention:
+                init = sp.vc_init_row_scale()
+                vc_row_scale, vc_state["prev_sum"] = init[0], init[1]
+                vc_state["sums"] = init[2]
+                vc_state["kept"] = init[3]
+                vc_state["k_next"] = init[4]
             if tmem_sp.uses_varlen_q_offset_cache:
                 q_offset = sp.cache_q_offset()
             if tmem_sp.uses_packed_dense_k_mask:
@@ -2244,12 +2617,60 @@ def create_softmax_task(
             window_end = Int32(0)
             if tmem_sp.uses_variable_window:
                 window_start, window_end = sp.cache_variable_window_bounds()
+            sage_q_scale = sage_k_words = None
+            if use_sage:
+                sage_q_scale, sage_k_first_atom = sp.cache_sage_scales()
+
+            def start_sage_k_words(section: FmhaStage) -> Any:
+                """Start obtaining the K tile's ``sfK`` words before the wait for its scores.
+
+                The global transport loads the words, so the wait hides their
+                latency; the ring transport waits for the load warp's stage and
+                returns its offset, read after the score wait."""
+                if sage_transport is SageKTransport.GMEM:
+                    return sp.load_sage_k_words(
+                        sage_k_first_atom=sage_k_first_atom, section=section
+                    )
+                skr.wait()
+                return skr.open_stage()
+
+            def sage_row_max(row_max: Any, k_words: Any, section: FmhaStage) -> Any:
+                """Row max of the dequantized scores.
+
+                A ring stage's words are read after the score wait and the
+                stage is released after the max pass (``SmemSageKScalesResource``)."""
+                if sage_transport is SageKTransport.SMEM:
+                    k_words = sp.read_staged_sage_k_words(sage_k_stage_words=k_words)
+                if sage_scaling is SageScoreScaling.BLOCK:
+                    maxima = sp.sage_row_max(
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_words=k_words,
+                        section=section,
+                    )
+                else:
+                    maxima = sp.sage_dequantized_row_max(
+                        row_max=row_max,
+                        sage_q_scale=sage_q_scale,
+                        sage_k_words=k_words,
+                        section=section,
+                    )
+                if sage_transport is SageKTransport.SMEM:
+                    skr.release()
+                return maxima
+
             # Reserve a stats slot before the first softmax result is published.
             vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
+                if use_sage:
+                    sage_k_words = start_sage_k_words(FmhaStage.Loop)
                 sp.wait()
                 # Compute row max and publish vec.
-                if tmem_sp.uses_variable_window:
+                if use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Loop
+                    )
+                elif tmem_sp.uses_variable_window:
                     old_row_max, row_max = sp.variable_window_row_max(
                         row_max=row_max,
                         window_start=window_start,
@@ -2276,6 +2697,12 @@ def create_softmax_task(
                         row_max=row_max,
                         seqlen_k=seqlen_k,
                         section=FmhaStage.Loop,
+                    )
+                elif vc_attention:
+                    old_row_max, row_max, vc_state["k_next"] = sp.vc_compute_row_max(
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
@@ -2317,6 +2744,9 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    old_row_max=old_row_max,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None or early_token:
                     pass
@@ -2327,15 +2757,44 @@ def create_softmax_task(
                 if not p_in_smem:
                     sp.release()
                 # Reduction.
-                row_sum = sp.softmax_aux_reduce(
+                if vc_attention:
+                    row_sum = vc_state["row_sum"]
+                else:
+                    row_sum = sp.softmax_aux_reduce(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        p_chunk=p_chunk,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
+                # Acquire vec for next iter.
+                vec.acquire()
+
+            def publish_final_stats(row_max: Any, row_sum: Any) -> None:
+                """Store the last mean-group row sums or take the repair denominator, drain
+                the final SP slot and publish the identity stats of the work tile."""
+                if vc_restores_means:
+                    # The last row sums ride a second P handoff to the tail step.
+                    pb.acquire()
+                    sp.vc_store_rowsum_final(
+                        vc_prev_tile_sum=vc_state["prev_sum"],
+                        vc_meansums=vc_state["sums"],
+                    )
+                    pb.commit()
+                elif vc_repairs_v:
+                    # The repair tiles stay out of the denominator.
+                    row_sum = vc_state["kept"]
+                if not p_in_smem:
+                    sp.wait()
+                    sp.release()
+                old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
                     row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
+                    final_stats=True,
                 )
-                # Acquire vec for next iter.
-                vec.acquire()
+                vec.commit()
 
             if tmem_sp.uses_head_paired_causal_tail_mask:
                 # Head-paired maps Q0/Q1 to adjacent Hq slices at the same S
@@ -2370,13 +2829,16 @@ def create_softmax_task(
                 else:
                     seq.release()
                 sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if vc_attention:
+                    row_sum = vc_state["row_sum"]
+                else:
+                    row_sum = sp.softmax_aux_reduce(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        p_chunk=p_chunk,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 vec.acquire()
                 sp.wait()
                 sp.release()
@@ -2424,13 +2886,16 @@ def create_softmax_task(
                     seq.commit()
                 if not p_in_smem:
                     sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if vc_attention:
+                    row_sum = vc_state["row_sum"]
+                else:
+                    row_sum = sp.softmax_aux_reduce(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        p_chunk=p_chunk,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if tmem_sp.uses_query_paired_invalid_tail:
                     sp.wait()
                     old_row_max, row_max = sp.invalid_row_max(row_max=row_max)
@@ -2497,13 +2962,16 @@ def create_softmax_task(
                     seq.release()
                 if not p_in_smem:
                     sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if vc_attention:
+                    row_sum = vc_state["row_sum"]
+                else:
+                    row_sum = sp.softmax_aux_reduce(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        p_chunk=p_chunk,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if not p_in_smem:
                     sp.wait()
                     sp.release()
@@ -2518,11 +2986,24 @@ def create_softmax_task(
                 vec.commit()
             elif tmem_sp.uses_fixed_dense_k_tail_mask:
                 # Dense tail: one more loop step with the zero-filled lanes masked out.
+                if use_sage:
+                    sage_k_words = start_sage_k_words(FmhaStage.Tail)
                 sp.wait()
-                old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
-                    row_max=row_max,
-                    section=FmhaStage.Tail,
-                )
+                if vc_attention:
+                    old_row_max, row_max = sp.vc_fixed_dense_k_tail_masked_row_max(
+                        row_max=row_max,
+                        vc_row_scale=vc_row_scale,
+                        vc_k_scale_next=vc_state["k_next"],
+                    )
+                elif use_sage:
+                    old_row_max, row_max = sage_row_max(
+                        row_max, sage_k_words, FmhaStage.Tail
+                    )
+                else:
+                    old_row_max, row_max = sp.fixed_dense_k_tail_masked_row_max(
+                        row_max=row_max,
+                        section=FmhaStage.Tail,
+                    )
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -2541,6 +3022,10 @@ def create_softmax_task(
                     sp,
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
+                    old_row_max=old_row_max,
+                    is_tail=True,
+                    sage_q_scale=sage_q_scale,
+                    sage_k_words=sage_k_words,
                 )
                 if s0s1_seq is None:
                     pass
@@ -2550,39 +3035,21 @@ def create_softmax_task(
                     seq.release()
                 if not p_in_smem:
                     sp.release()
-                row_sum = sp.softmax_aux_reduce(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    p_chunk=p_chunk,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
+                if vc_attention:
+                    row_sum = vc_state["row_sum"]
+                else:
+                    row_sum = sp.softmax_aux_reduce(
+                        old_row_max=old_row_max,
+                        row_max=row_max,
+                        row_sum=row_sum,
+                        p_chunk=p_chunk,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 vec.acquire()
-                # Cleanup: drain the final SP slot and publish identity stats.
-                if not p_in_smem:
-                    sp.wait()
-                    sp.release()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
+                publish_final_stats(row_max, row_sum)
             else:
                 # Non-causal tail: no more tiles, just publish the final stats.
-                if not p_in_smem:
-                    sp.wait()
-                    sp.release()
-                old_row_max = sp.softmax_aux_identity(row_max=row_max)
-                vec.store_vec(
-                    old_row_max=old_row_max,
-                    row_max=row_max,
-                    row_sum=row_sum,
-                    final_stats=True,
-                )
-                vec.commit()
+                publish_final_stats(row_max, row_sum)
 
     @schedule
     def softmax_schedule(
@@ -2613,7 +3080,28 @@ def create_softmax_task(
     ) -> None:
         softmax_schedule_body(sp, vec, seq, wq, None, pb)
 
-    if p_in_smem:
+    @schedule
+    def softmax_schedule_pb_skr(
+        sp: TmemSPResource,
+        vec: TmemStatsResource,
+        seq: S0S1SequenceResource,
+        pb: SmemPResource,
+        skr: SmemSageKScalesResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        softmax_schedule_body(sp, vec, seq, wq, None, pb, skr)
+
+    if p_in_smem and sage_transport is SageKTransport.SMEM:
+        captured_schedule = _schedule_with_work_queue(
+            softmax_schedule_pb_skr,
+            tmem_sp,
+            tmem_vec,
+            s0s1_seq,
+            smem_p,
+            smem_sage_k,
+            work_queue=work_queue,
+        )
+    elif p_in_smem:
         captured_schedule = _schedule_with_work_queue(
             softmax_schedule_pb,
             tmem_sp,

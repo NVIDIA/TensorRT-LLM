@@ -23,8 +23,8 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _num_sparse_pattern_heads
-from ..sage import sage_adapter_slots, sage_scale_shapes
+from .common import _num_sparse_pattern_heads, sage_adapter_slots
+from ..sage.config import sage_scale_shapes
 from .config import _BlockSparseCompileKey, _make_block_sparse_config
 
 
@@ -59,7 +59,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         fmha_block_sparse_launch,
         fmha_decode_launch,
     )
-    from ..kernels.fmha_decode.sage_prepare import _PrepareSageScales
+    from ..sage.prepare import _PrepareSageScales
 
     config = _make_block_sparse_config(key)
     sparse_format = key.sparse_format
@@ -74,10 +74,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
     if config.use_sage_attention:
         sage_scale_layout = config.sage_scale_layout(key.seq_len_kv)
         prepare_sage_scales = _PrepareSageScales(
-            cfg=config,
-            layout=sage_scale_layout,
-            batch_size=key.batch_size,
-            num_kv_heads=key.num_kv_heads,
+            layout=sage_scale_layout, num_kv_heads=key.num_kv_heads
         )
     if key.use_block_sparse:
         prepare_kwargs = {
