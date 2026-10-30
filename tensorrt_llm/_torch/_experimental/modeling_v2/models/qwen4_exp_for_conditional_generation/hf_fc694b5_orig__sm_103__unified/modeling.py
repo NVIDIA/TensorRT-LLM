@@ -98,7 +98,6 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
@@ -718,14 +717,16 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         assert md.effective_beam_width == 1, "beam search is not implemented"
         assert md.cache_indirection is None, "beam search is not implemented"
         assert not md.is_cross, "cross attention is not implemented"
-        # The pool sizes the entries' page- and slot-addressed cells have to cover.
+        # The pool sizes the entries' page- and slot-addressed cells have to cover, reported
+        # on every rank (the executor's workers keep the info log level off).
         first_attn, first_gdn = self.attn_layers[0], self.gdn_layers[0]
-        logger.info(
+        print(
             f"modeling_v2 unified qwen4_exp: rank {self.mapping.rank} binds "
             f"{rank_pools.kv[first_attn].k.shape[0]} K/V pages, "
             f"{rank_pools.index_cache[first_attn].shape[0]} QSA index pages, "
             f"{rank_pools.conv[first_gdn].shape[0]} recurrent-state slots and "
-            f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})"
+            f"{rank_pools.ple_state[0].shape[0]} PLE slots (bind {self._binds})",
+            flush=True,
         )
         self._bound = _Bound(cm, rank_pools)
 
