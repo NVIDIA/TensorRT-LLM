@@ -1751,6 +1751,8 @@ def test_generation_allocation_reserves_dynamic_width() -> None:
     manager.kv_compression_manages_history = False
     # Fresh-page fill is off; the allocation path calls it unconditionally.
     manager._fresh_page_fill = None
+    # No windowed pools; the window-crossing check reads them on every growth.
+    manager._windowed_layer_group_sizes = {}
 
     assert manager.try_allocate_generation(request)
     assert kv_cache.resize.call_args_list[0].args == (105,)
@@ -3836,6 +3838,47 @@ def test_window_crossing_is_silent_without_a_crossing(
         "context",
     )
 
+    assert fake_logger.messages == []
+
+
+@pytest.mark.parametrize(
+    "pre_capacity,new_capacity",
+    [
+        (100, 101),  # an ordinary decode step far below the window
+        (2049, 2050),  # an ordinary decode step past the window
+        (2048, 2048),  # no growth at all
+    ],
+)
+def test_window_crossing_does_not_query_the_logger_without_a_crossing(
+    monkeypatch, pre_capacity: int, new_capacity: int
+) -> None:
+    """The per-step common case must not ask the logger anything.
+
+    ``_log_window_crossing`` runs for every generation request on every
+    step, and ``is_debug_enabled`` resolves the caller's module from the
+    stack, so consulting it before the integer crossing test puts that cost
+    on every request of every iteration.
+    """
+    fake_logger = _FakeLogger()
+    calls: list[None] = []
+
+    def counting_is_debug_enabled() -> bool:
+        calls.append(None)
+        return True
+
+    fake_logger.is_debug_enabled = counting_is_debug_enabled
+    monkeypatch.setattr(kv_cache_v2_module, "logger", fake_logger)
+
+    manager = _make_window_crossing_manager()
+    manager._log_window_crossing(
+        SimpleNamespace(py_request_id=1),
+        _FakeWindowedKVCache({0: [1]}),
+        pre_capacity,
+        new_capacity,
+        "generation",
+    )
+
+    assert calls == []
     assert fake_logger.messages == []
 
 
