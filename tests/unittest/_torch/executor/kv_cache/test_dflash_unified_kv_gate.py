@@ -15,6 +15,7 @@
 """Selection of the unified target+DFlash KV cache layout."""
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -249,7 +250,9 @@ def _launch_from_disagg_config(monkeypatch, tmp_path, context_servers, generatio
     )
 
 
-def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_path):
+def test_launcher_rejects_dflash_on_generation_worker_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     # The launcher rejects the variable when only one section sets speculative_config.
     with pytest.raises(click.UsageError, match="both context_servers and generation_servers"):
         _launch_from_disagg_config(
@@ -258,13 +261,17 @@ def test_dflash_on_generation_worker_only_keeps_separate_cache(monkeypatch, tmp_
             context_servers={},
             generation_servers={"speculative_config": {"decoding_type": "DFlash"}},
         )
+
+
+def test_disagg_without_shared_draft_kv_env_keeps_separate_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
     target = _model_config(kv_heads=8, head_dim=128)
     draft = _model_config(kv_heads=8, head_dim=128)
 
-    for _role in ("context", "generation"):
-        creator = _creator(is_disagg=True, target=target, draft=draft)
-        assert not creator._should_unify_dflash_kv_cache()
+    creator = _creator(is_disagg=True, target=target, draft=draft)
+    assert not creator._should_unify_dflash_kv_cache()
 
 
 def test_dflash_with_different_tp_keeps_separate_cache(monkeypatch, tmp_path):
