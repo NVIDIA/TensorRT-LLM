@@ -103,8 +103,8 @@ if TYPE_CHECKING:
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-# Number of worker threads for KV transfer queues (default: 1)
-KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
+# Number of Sender worker threads; each (request, peer) stream stays on one of them.
+KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "4"))
 
 # Keep standalone TxSession waits responsive to cancellation even when callers
 # do not configure a sender-future wait slice.
@@ -431,14 +431,19 @@ class SendTaskBase(_LogicalTask):
 
     def fail(self, exc: Exception) -> None:
         self._logical_outcomes.fail(exc)
-        self._exception = exc
-        self.status = TaskStatus.ERROR
-        self._event.set()
+        with self.lock:
+            self._exception = exc
+            self.status = TaskStatus.ERROR
+            self._event.set()
 
     def complete(self) -> None:
+        """Mark the task delivered, unless a failure already ended it."""
         self._logical_outcomes.complete(self._logical_index)
-        self.status = TaskStatus.TRANSFERRED
-        self._event.set()
+        with self.lock:
+            if self.status == TaskStatus.ERROR:
+                return
+            self.status = TaskStatus.TRANSFERRED
+            self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -554,6 +559,10 @@ class Sender(SenderBase):
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
     ) -> None:
+        if KV_TRANSFER_NUM_THREADS < 1:
+            raise ValueError(
+                f"TRTLLM_KV_TRANSFER_NUM_THREADS must be at least 1, got {KV_TRANSFER_NUM_THREADS}"
+            )
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
@@ -564,8 +573,9 @@ class Sender(SenderBase):
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._dealers = {}  # used by listener thread only (single-threaded path)
-        self._thread_local = threading.local()  # per-thread DEALER cache for worker threads
+        # Only worker threads send to receivers, each on its own DEALERs; other threads
+        # queue their messages on the worker that owns the stream.
+        self._thread_local = threading.local()
         self._sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _sessions and _pre_cancelled_rids
         # unique_rid -> whether the peer asked, for cancels that arrive before the session exists.
@@ -776,11 +786,16 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
+    def _worker_index(self, unique_rid: int, peer_rank: int) -> int:
+        """Return the worker that owns one (request, peer) stream.
+
+        Everything sent on a stream goes through this worker, so the peer receives it in
+        queue order on one DEALER. Different peers of a request can run on different workers.
+        """
+        return hash((unique_rid, peer_rank)) % self._num_threads
+
     def _enqueue(self, write_meta: WriteMeta):
-        # Route by (unique_rid, peer_rank) so that:
-        # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
-        # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        thread_idx = self._worker_index(write_meta.unique_rid, write_meta.peer_rank)
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -796,14 +811,6 @@ class Sender(SenderBase):
         if endpoint not in dealers:
             dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return dealers[endpoint]
-
-    def _get_result_dealer(
-        self, endpoint: Optional[str], *, legacy_shared: bool = False
-    ) -> ZMQMessenger:
-        """Keep legacy early-failure routing outside the ownership bridge."""
-        if legacy_shared and not self._enforce_physical_ownership:
-            return self._get_or_connect_dealer(endpoint)
-        return self._get_or_connect_thread_dealer(endpoint)
 
     def _submit_transfer(
         self,
@@ -891,7 +898,7 @@ class Sender(SenderBase):
                     try:
                         self._get_or_connect_thread_dealer(endpoint).send(message)
                     except Exception as e:
-                        logger.warning(f"failed to send transfer rejection: {e}")
+                        logger.warning(f"failed to send queued message to {endpoint}: {e}")
                     continue
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
@@ -931,14 +938,14 @@ class Sender(SenderBase):
         initial_report: list[bytes],
         send_slot_id: Optional[int] = None,
     ) -> None:
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        thread_idx = self._worker_index(write_meta.unique_rid, write_meta.peer_rank)
         key = (write_meta.task, write_meta.peer_rank)
         if key in self._pending_settlements[thread_idx]:
             return
         pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
         self._pending_settlements[thread_idx][key] = pending
         try:
-            self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(initial_report)
         except Exception as error:
             logger.warning(f"Failed to report ambiguous transfer; retaining evidence: {error}")
             pending.report_error_logged = True
@@ -950,7 +957,7 @@ class Sender(SenderBase):
         for key, pending in list(pending_transfers.items()):
             meta = pending.write_meta
             try:
-                dealer = self._get_result_dealer(meta.peer_endpoint)
+                dealer = self._get_or_connect_thread_dealer(meta.peer_endpoint)
                 if pending.initial_report is not None:
                     dealer.send(pending.initial_report)
                     pending.initial_report = None
@@ -1074,7 +1081,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1107,7 +1114,7 @@ class Sender(SenderBase):
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+                self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1189,7 +1196,7 @@ class Sender(SenderBase):
         if agent_result == AgentResult.IN_DOUBT:
             self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
             return
-        self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
         with task.lock:
             task.transferred_count += 1
@@ -1259,7 +1266,7 @@ class Sender(SenderBase):
                 # eligible claimant. Keep the claim at the send boundary so
                 # duplicate dispatch cannot publish contradictory evidence.
                 if not owned or session._claim_aux_terminal_result(write_meta.peer_rank):
-                    self._get_result_dealer(write_meta.peer_endpoint).send(
+                    self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                         _make_aux_result_msg(
                             self._instance_rank,
                             write_meta.unique_rid,
@@ -1296,7 +1303,7 @@ class Sender(SenderBase):
                     _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, agent_result),
                 )
                 return
-            self._get_result_dealer(write_meta.peer_endpoint).send(
+            self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(
                 _make_aux_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1670,7 +1677,7 @@ class Sender(SenderBase):
                 return
             marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
             self._pending_session_quiescence[key] = marker
-            self._send_task_queues[hash(key) % self._num_threads].put(marker)
+            self._send_task_queues[self._worker_index(unique_rid, instance_rank)].put(marker)
 
     def _send_session_quiesced(self, marker: _SessionQuiescence) -> bool:
         """Acknowledge a fenced, drained session; return False to retry later.
@@ -1688,7 +1695,7 @@ class Sender(SenderBase):
             with session.lock:
                 if not session.has_failed() or not session.resources_drained():
                     return False
-        thread_idx = hash(key) % self._num_threads
+        thread_idx = self._worker_index(marker.unique_rid, marker.peer_rank)
         if any(
             pending.write_meta.unique_rid == marker.unique_rid
             and pending.write_meta.peer_rank == marker.peer_rank
@@ -1754,7 +1761,6 @@ class Sender(SenderBase):
         info: RecvReqInfo,
         *,
         include_aux: bool = False,
-        defer_to_worker: bool = False,
     ):
         try:
             endpoint = self._get_result_receiver_endpoint(info)
@@ -1776,12 +1782,7 @@ class Sender(SenderBase):
                         AgentResult.FAILED,
                     )
                 )
-            self._route_result_messages_to_receiver(
-                info,
-                endpoint,
-                messages,
-                defer_to_worker=defer_to_worker,
-            )
+            self._queue_to_receiver_stream(info, endpoint, messages)
         except Exception as e:
             logger.warning(
                 f"_respond_with_kv: failed to abort receiver for rid={info.unique_rid}: {e}"
@@ -1791,8 +1792,6 @@ class Sender(SenderBase):
         self,
         info: RecvReqInfo,
         result: AgentResult,
-        *,
-        defer_to_worker: bool = True,
     ) -> None:
         try:
             endpoint = self._get_result_receiver_endpoint(info)
@@ -1801,12 +1800,7 @@ class Sender(SenderBase):
                 info.unique_rid,
                 result,
             )
-            self._route_result_messages_to_receiver(
-                info,
-                endpoint,
-                [message],
-                defer_to_worker=defer_to_worker,
-            )
+            self._queue_to_receiver_stream(info, endpoint, [message])
         except Exception as error:
             logger.warning(
                 f"failed to report auxiliary transfer result for rid={info.unique_rid}: {error}"
@@ -1838,12 +1832,7 @@ class Sender(SenderBase):
                     info.unique_rid,
                     AgentResult.FAILED,
                 )
-            self._route_result_messages_to_receiver(
-                info,
-                endpoint,
-                [message],
-                defer_to_worker=True,
-            )
+            self._queue_to_receiver_stream(info, endpoint, [message])
         except Exception as error:
             logger.warning(f"failed to settle rejected transfer {info.unique_rid}: {error}")
 
@@ -1852,31 +1841,20 @@ class Sender(SenderBase):
             info.instance_name, info.instance_rank
         ).self_endpoint
 
-    def _route_result_messages_to_receiver(
+    def _queue_to_receiver_stream(
         self,
         info: RecvReqInfo,
         endpoint: Optional[str],
         messages: Iterable[list[bytes]],
-        *,
-        defer_to_worker: bool,
     ) -> None:
-        if defer_to_worker or self._enforce_physical_ownership:
-            # Listener-side rejection must share the worker's ordered stream;
-            # it cannot overtake an ambiguous write's pending IN_DOUBT report.
-            thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
-            for message in messages:
-                self._send_task_queues[thread_idx].put((endpoint, message))
-            return
-        dealer = self._get_or_connect_dealer(endpoint)
-        for message in messages:
-            dealer.send(message)
+        """Queue ``messages`` on the worker that owns ``info``'s (request, peer) stream.
 
-    def _get_or_connect_dealer(self, endpoint: Optional[str]):
-        if endpoint is None:
-            raise ValueError("Sender: peer endpoint is None; peer may not have registered yet")
-        if endpoint not in self._dealers:
-            self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
-        return self._dealers[endpoint]
+        The worker sends them on its own DEALER after everything it already queued for
+        the stream, so they cannot overtake an earlier result or IN_DOUBT report.
+        """
+        thread_idx = self._worker_index(info.unique_rid, info.instance_rank)
+        for message in messages:
+            self._send_task_queues[thread_idx].put((endpoint, message))
 
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
@@ -1912,14 +1890,11 @@ class Sender(SenderBase):
         with self._peer_requests_lock:
             req_info_map = self._peer_requests.get(unique_rid)
             req_infos = list(req_info_map.values()) if req_info_map else []
+        cancel_message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
         for req_info in req_infos:
             try:
-                peer_ri = self._registrar.get_peer_rank_info(
-                    req_info.instance_name, req_info.instance_rank
-                )
-                self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
-                )
+                endpoint = self._get_result_receiver_endpoint(req_info)
+                self._queue_to_receiver_stream(req_info, endpoint, [cancel_message])
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
 
@@ -1956,12 +1931,6 @@ class Sender(SenderBase):
                 logger.warning(
                     f"Failed to invalidate remote agent '{agent_name}' during shutdown: {e}"
                 )
-        for dealer in self._dealers.values():
-            try:
-                dealer.stop()
-            except Exception as e:
-                logger.warning(f"Failed to stop dealer during Sender shutdown: {e}")
-        self._dealers.clear()
         self._shutdown = True
 
     def __del__(self):

@@ -738,7 +738,7 @@ def test_receive_aux_failure_precedes_late_kv_success() -> None:
 def _sending_pieces(count: int = 1) -> tuple[Sender, TxSession]:
     sender = _wired_sender()
     sender.dispatch_task = MagicMock()
-    sender._get_result_dealer = MagicMock()
+    sender._get_or_connect_thread_dealer = MagicMock()
     sender._instance_rank = 0
     session = TxSession(
         request_id=30, params=DisaggregatedParams(disagg_request_id=30), sender=sender
@@ -776,7 +776,7 @@ def test_queued_sender_abort_preserves_the_committed_cancellation(
     outcome = TaskHandle(session, task, TOKENS).poll()
     assert isinstance(outcome, Cancelled)
     assert outcome.by_peer is by_peer
-    sender._get_result_dealer.return_value.send.assert_called_once()
+    sender._get_or_connect_thread_dealer.return_value.send.assert_called_once()
 
 
 @pytest.mark.parametrize("poll_before_completion", [False, True])
