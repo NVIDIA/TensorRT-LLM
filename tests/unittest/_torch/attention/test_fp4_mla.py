@@ -1660,6 +1660,58 @@ def test_fp4_mla_manager_v2_registers_native_cache_and_hp_roles(monkeypatch) -> 
         manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("context_only", [False, True], ids=["decoding", "context_only"])
+def test_fp4_mla_quota_split_follows_bytes_per_token(monkeypatch, context_only) -> None:
+    """The MLA layers keep their share of the quota next to the HP rings.
+
+    A DeepSeek-R1 sized cache with MTP, both as a decoding cache and as the
+    single-copy cache of a disaggregated context worker. Sizing the pools
+    from a single typical request rounds each pool up to the allocation
+    granularity first and leaves the MLA layers well below 85% of the quota.
+    """
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import LayerId
+
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
+    monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
+    max_num_tokens = 16384
+    manager = Fp4MlaKVCacheManagerV2(
+        LlmKvCacheConfig(
+            dtype="nvfp4",
+            enable_block_reuse=True,
+            max_gpu_total_bytes=8 << 30,
+            host_cache_size=0,
+        ),
+        _CacheType.SELFKONLY,
+        num_layers=61,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_seq_len=163840,
+        max_batch_size=128,
+        mapping=Mapping(world_size=1, tp_size=1, rank=0),
+        dtype=_DataType.NVFP4,
+        spec_config=MTPDecodingConfig(max_draft_len=3, num_nextn_predict_layers=3),
+        max_num_tokens=max_num_tokens,
+        pretrained_config=SimpleNamespace(kv_lora_rank=512),
+        is_disagg=context_only,
+    )
+    try:
+        assert manager.fp4_mla_context_only_cache == context_only
+        stats = manager.impl.get_storage_statistics(0)
+        pool_groups = list(manager.impl.get_life_cycle_pool_group_indices(0))
+        pool_bytes = [stat.total * sum(stat.slot_sizes) for stat in stats]
+        mla = pool_groups[int(manager.impl.get_layer_group_id(LayerId(0)))]
+        hp = pool_groups[int(manager.impl.get_layer_group_id(manager._hp_manager_layer_ids[0]))]
+        assert pool_bytes[mla] >= 0.85 * sum(pool_bytes)
+        # A context chunk still finds an HP ring page for each of its blocks.
+        assert stats[hp].total >= max_num_tokens // FP4_MLA_TOKENS_PER_BLOCK + 1
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="FP4 MLA (NVFP4 KV cache) requires Blackwell or newer",
