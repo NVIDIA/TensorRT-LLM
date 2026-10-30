@@ -1,4 +1,6 @@
 # arch: MODEL_CLASS_MAPPING key; required when model has get_model_defaults. Add when adding entries.
+# Recipe-page records (title, recipe_page, config_paths, gpu_compatibility) name no model and no
+# command: the selector links the documented deployment page and its configs.
 - model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
   arch: NemotronNASForCausalLM
   config_path: examples/configs/curated/nemotron-3-super-throughput.yaml
@@ -133,3 +135,10 @@
   config_path: examples/configs/curated/deepseek-v4-pro-throughput.yaml
   scenario: Max Throughput
   gpu_compatibility: "B200"
+- title: Beam NVFP4 with DFlash2 and FP8 KV cache (aggregated and disaggregated)
+  recipe_page: docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md
+  config_paths:
+    - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml
+    - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml
+    - examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml
+  gpu_compatibility: "GB300: one 4-GPU node (aggregated) or two 4-GPU nodes (disaggregated)"

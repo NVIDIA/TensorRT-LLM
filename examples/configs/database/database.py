@@ -17,15 +17,17 @@ import logging
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Annotated, Any, Iterator, Literal
 
 import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Discriminator,
     Field,
     PositiveInt,
     RootModel,
+    Tag,
     field_validator,
     model_validator,
 )
@@ -50,6 +52,13 @@ VALIDATED_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
 Profile = Literal["latency", "balanced", "throughput"]
 
 
+def _relative_repo_path(v: str) -> str:
+    p = Path(v)
+    if p.is_absolute() or ".." in p.parts:
+        raise ValueError(f"Invalid config path: {v}")
+    return v
+
+
 class CuratedRecipe(BaseModel):
     """A curated (hand-tuned) recipe entry."""
 
@@ -65,14 +74,51 @@ class CuratedRecipe(BaseModel):
     @field_validator("config_path")
     @classmethod
     def _validate_config_path(cls, v: str) -> str:
-        p = Path(v)
-        if p.is_absolute() or ".." in p.parts:
-            raise ValueError(f"Invalid config path: {v}")
-        return v
+        return _relative_repo_path(v)
 
 
-class CuratedRecipeList(RootModel[list[CuratedRecipe]]):
-    """Validated list of curated recipe entries."""
+class CuratedRecipePage(BaseModel):
+    """A curated deployment documented only by its recipe page.
+
+    For a deployment without a public model identifier, or whose launch needs inputs a
+    one-line command cannot carry (more checkpoints, scale files, several workers). It names
+    no model or architecture and yields no command: the selector links the page and configs.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, description="Deployment description shown in the selector")
+    recipe_page: str = Field(description="Relative path to the docs/source Markdown recipe page")
+    config_paths: list[str] = Field(min_length=1, description="Relative paths to the YAML configs")
+    gpu_compatibility: str = Field(min_length=1, description="Supported GPUs and topology")
+
+    @field_validator("config_paths")
+    @classmethod
+    def _validate_config_paths(cls, v: list[str]) -> list[str]:
+        return [_relative_repo_path(path) for path in v]
+
+    @field_validator("recipe_page")
+    @classmethod
+    def _validate_recipe_page(cls, v: str) -> str:
+        if not v.startswith("docs/source/") or not v.endswith(".md"):
+            raise ValueError(f"recipe_page must be a docs/source/**.md page: {v}")
+        return _relative_repo_path(v)
+
+
+def _curated_kind(entry: Any) -> str:
+    if isinstance(entry, dict):
+        return "page" if "recipe_page" in entry else "command"
+    return "page" if isinstance(entry, CuratedRecipePage) else "command"
+
+
+CuratedEntry = Annotated[
+    Annotated[CuratedRecipe, Tag("command")] | Annotated[CuratedRecipePage, Tag("page")],
+    Discriminator(_curated_kind),
+]
+
+
+class CuratedRecipeList(RootModel[list[CuratedEntry]]):
+    """Validated list of curated recipe entries: command records and recipe-page records."""
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "CuratedRecipeList":
@@ -85,7 +131,7 @@ class CuratedRecipeList(RootModel[list[CuratedRecipe]]):
             logger.error("Failed to load curated recipe list from %s: %s", yaml_path, e)
             raise
 
-    def __iter__(self) -> Iterator[CuratedRecipe]:
+    def __iter__(self) -> Iterator[CuratedRecipe | CuratedRecipePage]:
         return iter(self.root)
 
     def __len__(self) -> int:

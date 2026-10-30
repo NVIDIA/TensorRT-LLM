@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Generation (decode) worker of the disaggregated Beam NVFP4 + DFlash2 + FP8 KV deployment: one
+# node of four GB300 GPUs. Pair with beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml on a second node
+# behind `trtllm-serve disaggregated`. Steps, inputs, limits and requests:
+# docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md
+#
+#   export TRTLLM_SKIP_KV_CACHE_ESTIMATION=1
+#   export TRTLLM_MODELING_V2_KV_CACHE_SCALES=<KV_SCALES>
+#   trtllm-serve <TARGET_CHECKPOINT> --config beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml \
+#     --chat_template <TARGET_CHECKPOINT>/chat_template.jinja --server_role GENERATION
+#
+# Replace <DRAFTER_CHECKPOINT> below with the DFlash2 drafter directory. Both workers must use the
+# same checkpoints, scale table and settings; they check each other's model, cache format and
+# scale identity before any KV transfer. The drafter's KV layers share the target's KV cache, so
+# the prompt's draft context travels with the target's pages (do not set
+# TRTLLM_DISAGG_SHARED_DRAFT_KV=0). Settings equal to today's defaults are pinned.
+modeling_v2: require
+checkpoint_format: beam_nvfp4
+custom_tokenizer: tensorrt_llm._torch.models.checkpoints.beam.tokenizer.BeamFastTokenizer
+reasoning_parser: beam_harmony_text
+tensor_parallel_size: 4
+pipeline_parallel_size: 1
+moe_tensor_parallel_size: 4
+moe_expert_parallel_size: 1
+enable_attention_dp: false
+attn_backend: TRTLLM
+disable_overlap_scheduler: true
+enable_chunked_prefill: false
+cuda_graph_config: null
+max_batch_size: 64
+max_seq_len: 69632
+max_num_tokens: 8192
+kv_cache_config:
+  enable_block_reuse: true
+  enable_partial_reuse: false
+  use_kv_cache_manager_v2: true
+  max_tokens: 4456448
+  dtype: fp8
+speculative_config:
+  decoding_type: DFlash
+  max_draft_len: 7
+  speculative_model: <DRAFTER_CHECKPOINT>
+  attention_backend: TRTLLM
+cache_transceiver_config:
+  backend: NIXL
+  transceiver_runtime: PYTHON
+  kv_transfer_timeout_ms: 60000

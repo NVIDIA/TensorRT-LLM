@@ -37,6 +37,7 @@ from examples.configs.database.database import (  # noqa: E402
     PROFILE_DISPLAY_NAMES,
     PROFILE_ORDER,
     CuratedRecipeList,
+    CuratedRecipePage,
     RecipeList,
     assign_profile,
 )
@@ -145,6 +146,34 @@ class CuratedRow:
     command: str
 
 
+@dataclass(frozen=True)
+class CuratedPageConfig:
+    config_path: str
+    config_filename: str
+    config_github_url: str
+    config_raw_url: str
+
+
+@dataclass(frozen=True)
+class CuratedPageRow:
+    """A documented deployment: links to its recipe page and configs, never a command."""
+
+    title: str
+    recipe_page: str
+    recipe_page_html: str
+    recipe_page_github_url: str
+    gpu_compatibility: str
+    configs: list[CuratedPageConfig]
+
+
+def _github_url(path: str) -> str:
+    return f"https://github.com/NVIDIA/TensorRT-LLM/blob/main/{path}"
+
+
+def _raw_url(path: str) -> str:
+    return f"https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/{path}"
+
+
 def _model_display_and_url(model: str) -> tuple[str, str]:
     if model in MODEL_INFO:
         info = MODEL_INFO[model]
@@ -187,7 +216,7 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
     curated_list = CuratedRecipeList.from_yaml(Path(yaml_path))
     rows: list[CuratedRow] = []
     for entry in curated_list:
-        if entry.disagg:
+        if isinstance(entry, CuratedRecipePage) or entry.disagg:
             continue
         model_display_name, model_url = _model_display_and_url(entry.model)
         config_path = entry.config_path
@@ -210,6 +239,34 @@ def build_curated_rows(yaml_path: Path) -> list[CuratedRow]:
             )
         )
     return rows
+
+
+def build_curated_pages(yaml_path: Path) -> list[CuratedPageRow]:
+    """Parse curated recipe YAML and return its recipe-page records (no model, no command)."""
+    pages: list[CuratedPageRow] = []
+    for entry in CuratedRecipeList.from_yaml(Path(yaml_path)):
+        if not isinstance(entry, CuratedRecipePage):
+            continue
+        html = entry.recipe_page.removeprefix("docs/source/").removesuffix(".md") + ".html"
+        pages.append(
+            CuratedPageRow(
+                title=entry.title,
+                recipe_page=entry.recipe_page,
+                recipe_page_html=html,
+                recipe_page_github_url=_github_url(entry.recipe_page),
+                gpu_compatibility=entry.gpu_compatibility,
+                configs=[
+                    CuratedPageConfig(
+                        config_path=path,
+                        config_filename=os.path.basename(path),
+                        config_github_url=_github_url(path),
+                        config_raw_url=_raw_url(path),
+                    )
+                    for path in entry.config_paths
+                ],
+            )
+        )
+    return pages
 
 
 def build_rows(yaml_path: Path) -> list[RecipeRow]:
@@ -307,9 +364,11 @@ def generate_json(
             }
 
     curated_entries = []
+    curated_pages = []
     if curated_yaml_path and curated_yaml_path.exists():
         curated_rows = build_curated_rows(curated_yaml_path)
         curated_entries = [asdict(r) for r in curated_rows]
+        curated_pages = [asdict(p) for p in build_curated_pages(curated_yaml_path)]
         for crow in curated_rows:
             if crow.model not in models:
                 models[crow.model] = {
@@ -324,6 +383,7 @@ def generate_json(
             {key: value for key, value in asdict(row).items() if value is not None} for row in rows
         ],
         "curated_entries": curated_entries,
+        "curated_pages": curated_pages,
     }
 
     with open(output_file, "w") as f:

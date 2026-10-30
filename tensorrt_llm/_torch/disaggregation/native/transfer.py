@@ -2797,8 +2797,9 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
+          * every head duplication factor is 1, rank-wide and in each matched view pair (target
+            and draft views may replicate heads differently) -- else some ranks don't send KV yet
+            still count in expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2806,7 +2807,12 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
         the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
+        # Any duplicated head, rank-wide or in a single view pair, leaves some
+        # writers without a share (sender side) or doubles one (receiver side).
+        view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
+        if overlap.duplicate_head_factor != 1 or any(
+            factor != 1 for pair in view_factors for factor in pair
+        ):
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
@@ -4183,10 +4189,6 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
-    # The transfer's page table when it covers more than kv_cache_manager (a
-    # build_composite_page_table of the target and draft managers); None builds it
-    # from kv_cache_manager alone.
-    page_table: Optional[KVCachePageTable] = None
     # Published in RankInfo for the peer registrar's semantic compatibility check.
     cache_identity: Optional[dict] = None
     # Transfer the auxiliary slot in every session, not only generation-first ones; it then
@@ -4216,7 +4218,6 @@ class TransferWorker:
             kvm,
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
-            page_table=config.page_table,
             cache_identity=config.cache_identity,
         )
         self._setup_peer_infrastructure(kvm)

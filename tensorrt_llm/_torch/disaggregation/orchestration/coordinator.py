@@ -127,9 +127,9 @@ class DisaggTransferCoordinator:
         # the executor thread on that event.
         self._defer_unready_gen_receives = defer_unready_gen_receives
         # Prepared generation requests awaiting publication, in admission
-        # order, each with the readiness events its cache admissions recorded.
+        # order, each with the readiness event its cache admission recorded.
         self._unpublished_gen_receives: Dict[
-            int, Tuple[LlmRequest, Optional[Tuple["torch.cuda.Event", ...]]]
+            int, Tuple[LlmRequest, Optional["torch.cuda.Event"]]
         ] = {}
 
     # -- loop head -----------------------------------------------------------
@@ -389,23 +389,12 @@ class DisaggTransferCoordinator:
 
     def _take_receive_fences(
         self, requests: List[LlmRequest]
-    ) -> Dict[int, Tuple["torch.cuda.Event", ...]]:
-        """Take each request's admission readiness events from every receiving manager.
-
-        The draft manager receives too when the transceiver transfers its pages; a
-        destination is published only after both admissions' events complete.
-        """
-        managers = [self._kv_cache_manager]
-        if getattr(self._transceiver, "_draft_kv_cache_manager", None) is not None:
-            managers.append(self._draft_kv_cache_manager)
-        takes = [getattr(manager, "take_disagg_receive_ready", None) for manager in managers]
-        if any(take is None for take in takes):
+    ) -> Dict[int, Optional["torch.cuda.Event"]]:
+        """Take each request's admission readiness event from the cache manager."""
+        take = getattr(self._kv_cache_manager, "take_disagg_receive_ready", None)
+        if take is None:
             return {}
-        fences = {}
-        for req in requests:
-            events = tuple(take(req) for take in takes)
-            fences[req.py_request_id] = tuple(event for event in events if event is not None)
-        return fences
+        return {req.py_request_id: take(req) for req in requests}
 
     def _publish_ready_gen_receives(self) -> None:
         """Start the asynchronous receive of each waiting request whose
@@ -426,7 +415,7 @@ class DisaggTransferCoordinator:
                 # Failed or finished before publication; nothing to start.
                 del self._unpublished_gen_receives[request_id]
                 continue
-            if ready and not all(event.query() for event in ready):
+            if ready is not None and not ready.query():
                 continue
             del self._unpublished_gen_receives[request_id]
             self._transceiver.request_and_receive_async(req)
