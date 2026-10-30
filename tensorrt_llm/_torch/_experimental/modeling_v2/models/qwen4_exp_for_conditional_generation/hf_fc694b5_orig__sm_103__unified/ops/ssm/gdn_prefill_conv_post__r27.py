@@ -7,7 +7,9 @@ in, and each sequence's conv window published to the paged pool.
 
 The conv pass is CuTe DSL, the gates and the window publish Triton, all three
 written for the Qwen3.8-Flash-Next tp1 target (its `ops/ssm/gdn_prefill_conv_post`)
-and reused here unchanged, at this target's per-rank geometries. The three-call
+and reused here at this target's per-rank geometries, the conv pass reading a pool
+slot through a 64-bit base address (on a dep4 rank's stock conv page a slot's offset
+passes 2^31 elements from slot 1942). The three-call
 composition it replaces -- `extract_transpose_prefill_slice` (token-major ->
 channel-major copy), `causal_conv1d_fwd` (channel-major conv, in place) and
 `fused_gdn_post_conv` (split + norm + gates) -- moves the `[T, 10240]`
@@ -302,6 +304,22 @@ def _cp_async16(smem_addr, gmem_addr, src_bytes, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _ld_bf16(addr, *, loc=None, ip=None):
+    """One bf16 from global memory at a 64-bit byte address, as fp32."""
+    return cutlass.Float32(
+        _asm1(
+            T.f32(),
+            [cutlass.Int64(addr)],
+            "{ .reg .b32 r; ld.global.u16 r, [$1]; shl.b32 r, r, 16; mov.b32 $0, r; }",
+            "=f,l",
+            loc,
+            ip,
+            side_effects=True,
+        )
+    )
+
+
+@dsl_user_op
 def _cp_async_wait_all(*, loc=None, ip=None):
     _asm1(T.i32(), [], "{ cp.async.wait_all; mov.u32 $0, 0; }", "=r", loc, ip, side_effects=True)
 
@@ -355,10 +373,9 @@ class _ConvPassKernel:
         stream: cuda.CUstream,
     ):
         weight = cute.make_tensor(w_ptr, cute.make_layout((self.qkv, 4), stride=(w_s0, w_s1)))
-        # The pool's slot extent is never read: only `cache_indices` slots are addressed.
-        pool = cute.make_tensor(
-            st_ptr, cute.make_layout((1 << 20, self.qkv, 3), stride=(st_s0, st_s1, st_s2))
-        )
+        # The pool goes in as its base address and strides: a carried column is read at
+        # `base + slot * st_s0` in 64 bits (on the stock page that passes 2^31 elements
+        # from slot 1942 at 16 / 48 heads, 7768 at 4 / 12) plus its in-slot offset in 32.
         qsl = cute.make_tensor(qsl_ptr, cute.make_layout((num_seqs + 1,), stride=(1,)))
         slots = cute.make_tensor(slot_ptr, cute.make_layout((num_seqs,), stride=(1,)))
         init = cute.make_tensor(init_ptr, cute.make_layout((num_seqs,), stride=(1,)))
@@ -367,7 +384,10 @@ class _ConvPassKernel:
         self.kernel(
             x_ptr.toint(),
             weight,
-            pool,
+            st_ptr.toint(),
+            st_s0,
+            st_s1,
+            st_s2,
             qsl,
             slots,
             init,
@@ -391,7 +411,10 @@ class _ConvPassKernel:
         self,
         x_base: cutlass.Int64,
         mW: cute.Tensor,
-        mState: cute.Tensor,
+        st_base: cutlass.Int64,
+        st_s0: cutlass.Int32,
+        st_s1: cutlass.Int32,
+        st_s2: cutlass.Int32,
         mQsl: cute.Tensor,
         mSlot: cute.Tensor,
         mInit: cute.Tensor,
@@ -521,6 +544,7 @@ class _ConvPassKernel:
                     s0 = mQsl[lo2]
                 slot = mSlot[sq]
                 init = cutlass.Int32(mInit[sq])
+                slot_base = st_base + cutlass.Int64(slot) * cutlass.Int64(st_s0) * 2
                 for v in cutlass.range_constexpr(_VEC):
                     a = cutlass.Float32(0.0)
                     for kk in cutlass.range_constexpr(4):
@@ -530,7 +554,11 @@ class _ConvPassKernel:
                             xv = cutlass.Float32(0.0)
                             if init != 0:
                                 if slot != pad_slot_id:
-                                    xv = mState[slot, c0 + v, 3 + pos - s0].to(cutlass.Float32)
+                                    xv = _ld_bf16(
+                                        slot_base
+                                        + cutlass.Int64((c0 + v) * st_s1 + (3 + pos - s0) * st_s2)
+                                        * 2
+                                    )
                         a = _fma_rn(xv, w[v, kk], a)
                     acc[v] = a
             y0, y1 = _silu2(acc[0], acc[1])
@@ -601,13 +629,15 @@ _CONV_PASS: dict = {}
 
 def _cute_conv_pass_ok(x, weight, conv_states, num_k_heads, head_k_dim, num_v_heads) -> bool:
     """The CuTe conv pass's preconditions: bf16, 128-channel heads, 16-byte aligned rows
-    of `x` (its `cp.async` copies), int32 element strides."""
+    of `x` (its `cp.async` copies), int32 element strides and an int32 offset inside a
+    pool slot (a slot's base is 64-bit)."""
+    in_slot = (conv_states.shape[1] - 1) * conv_states.stride(1) + 2 * conv_states.stride(2)
     return (
         x.dtype == torch.bfloat16
         and head_k_dim == _VEC * 32
         and x.data_ptr() % 16 == 0
         and (x.stride(0) * 2) % 16 == 0
-        and max(*weight.stride(), *conv_states.stride()) < 2**31
+        and max(*weight.stride(), *conv_states.stride(), in_slot) < 2**31
     )
 
 
@@ -893,6 +923,24 @@ class GdnPrefillConvPost(OpWrapper):
             why="dep4 rank at max_num_tokens: one carrying 8192-token chunk, last of 850 slots",
             spec=_rank_cell(False, (8192,), (True,), DEP4_SLOTS, (DEP4_SLOTS - 1,), True),
         ),
+        # Pools past the int32 slot offset (slot 1942 at 16 / 48 heads, 7768 at 4 / 12):
+        # larger dep4 pools than core's (kv_nvfp4, reuse, the tune's 0.85 fraction).
+        Cell(
+            why="dep4 rank, 2048-slot pool: 37+1+128 tokens at slots 2047, 1942, 0, past int32",
+            spec=_rank_cell(False, (37, 1, 128), (True, False, True), 2048, (2047, 1942, 0), True),
+        ),
+        Cell(
+            why="dep4 rank, 4096-slot pool: a carrying 8192-token chunk at slot 4095, past 2^32",
+            spec=_rank_cell(False, (8192,), (True,), 4096, (4095,), True),
+        ),
+        Cell(
+            why="tp4/tep4 rank, 8192-slot pool: a fresh 8192-token context at slot 8191",
+            spec=_rank_cell(True, (8192,), (False,), 8192, (8191,), True),
+        ),
+        Cell(
+            why="tp4/tep4 rank, 8192-slot pool: carrying 8192 tokens at slot 8191, past int32",
+            spec=_rank_cell(True, (8192,), (True,), 8192, (8191,), True),
+        ),
     )
 
     note = """
@@ -935,8 +983,10 @@ class GdnPrefillConvPost(OpWrapper):
     first token's sequence by a binary search of `query_start_loc`
     (sync-free, capture-safe), and a thread whose 16 tokens and windows lie
     inside one sequence takes a straight-line branch, the rest read the pool
-    token by token. The gates (Triton): one row-coalesced `[8, 48]` tile a
-    program (`exp(g)` with `linear_gate`, libdevice `expf`). Then a
+    token by token (a carried column at the slot's 64-bit base address plus
+    its 32-bit in-slot offset, one `ld.global.u16`). The gates (Triton): one
+    row-coalesced `[8, 48]` tile a program (`exp(g)` with `linear_gate`,
+    libdevice `expf`). Then a
     per-sequence window publish (Triton), after both, so no
     program reads a window another has already advanced.
 
@@ -978,6 +1028,27 @@ class GdnPrefillConvPost(OpWrapper):
     torch's default bf16 band; g and beta inside the fp32 band; conv pool
     bitwise.
 
+    Certified past the int32 slot offset, on the same page (larger dep4
+    pools than core's: kv_fp8 binds 1217 slots, kv_nvfp4 1498; reuse and the
+    tune's 0.85-fraction fp8 engine are uncounted), all with `linear_gate`:
+      - 16 / 48 heads, a 2048-slot pool: 37 + 1 + 128 tokens carrying /
+        fresh / carrying at slots 2047, 1942 and 0; a 4096-slot pool: one
+        carrying 8192-token chunk at slot 4095 (offset past 2^32).
+      - 4 / 12 heads, an 8192-slot pool: an 8192-token context at slot 8191,
+        fresh and carrying.
+    Same bands as above (q/k/v one-ulp flips on 2.9e-6 to 2.5e-5 of
+    elements). The int32 slot offset this replaced fails the carrying ones:
+    slots 2047 (16 / 48) and 8191 (4 / 12) an illegal memory access; slot
+    4095 a wrapped offset inside the page, so a silently wrong q/k/v (max
+    abs 0.70 on q, 5.6 on v, 3.8e-4 of elements). The fresh 8192-slot cell
+    reads no carry and passes under either. Peak device memory 12.7 GiB
+    (2048 and 8192 slots) and 25.6 GiB (4096), under 3 s a cell. On every
+    cell below 1942 slots the 64-bit base gives the int32 form's q, k, v, g,
+    beta and pool bitwise; graph replay on GB300 moved 134.2 -> 135.9 us at
+    3000 + 8192 + 5000 tokens, 132.5 -> 133.8 at the 128 short contexts,
+    18.4 -> 18.5 at tep4's 37 + 1 + 128 (Int64 strides on the whole pool
+    layout cost 151 at the first).
+
     A `pad_slot_id` context reads no carry and publishes nothing; its outputs
     are computed from a zero window (the unfused conv leaves those columns
     unconvolved instead -- nothing consumes either). The engine gives every
@@ -991,7 +1062,7 @@ class GdnPrefillConvPost(OpWrapper):
     `has_initial_state`. Loud (`__call__`): `head_k_dim != head_v_dim`, conv
     width other than 4, and what the conv pass cannot take: an `x` not bf16,
     heads other than 128 channels, a row of `x` not 16-byte aligned, a weight
-    or pool stride from 2^31 elements.
+    or pool stride, or an offset inside one pool slot, from 2^31 elements.
 
     Not checked: `cache_indices` within the pool and distinct;
     `query_start_loc` non-decreasing and ending at `T`.
@@ -1005,21 +1076,16 @@ class GdnPrefillConvPost(OpWrapper):
     and 4 / 12; bias; a row stride of `x` other than the projections' 16480
     and 4120 (the conv pass compiles one kernel per row stride); zero-token
     contexts; `a + dt_bias` past the softplus threshold on every head; pools
-    larger than the stock engine's core-config counts above (the dep4 kv_fp8,
-    kv_nvfp4, chunked and reuse variants and the MTP members were not
-    counted); tp4's own pool (never booted).
+    past 4096 slots at 16 / 48 heads or 8192 at 4 / 12; tp4's own pool
+    (never booted).
 
     Hard limits
-      element offsets  64-bit for the rows of x and the outputs; weight and
-        pool strides int32 (refused from 2^31)  not probed beyond 8192 tokens.
-      pool slot  the conv pass reads a carried column at
-        `slot * stride(0) + c * stride(1) + w * stride(2)` in int32 (its CuTe
-        pool layout has Int32 strides); the publish is 64-bit. On the stock
-        page that bounds the slot index at 1941 for 16 / 48 heads (stride
-        1105920) and 7767 for 4 / 12 (stride 276480). Measured at 16 / 48:
-        slot 1941 bitwise the reference, slot 1942 an illegal memory access
-        (loud, so not an `is_valid` guard). The core-config counts (850, 1874)
-        sit well inside; a pool past 1942 slots at dep4 is not.
+      element offsets  64-bit for the rows of x, the outputs and a pool
+        slot's base (`slot * stride(0)`, in the conv pass and the publish);
+        weight and pool strides and the offset inside a slot int32 (refused
+        from 2^31)  not probed beyond 8192 tokens.
+      pool slot  `cache_indices` is int32, so a slot index below 2^31; driven
+        to offsets past 2^32 elements (slot 4095 at 16 / 48 heads, 4.5e9).
     """
 
     def __call__(

@@ -9,7 +9,8 @@ a 16480-wide projection) at tp1 and on a dep4 rank, a quarter of it (4 / 12 head
 qkv_dim 2560, a 4120-wide projection) on a tp4 or tep4 rank. The pool is a view of a
 bigger buffer, which the test also checks the call leaves alone outside the view: a
 two-layer buffer for the tp1 cells, the stock manager's page (36 GDN layers a slot,
-the view at the last) at an engine's measured slot count for a rank's cells.
+the view at the last) for a rank's cells: at an engine's measured slot count, or at
+slots whose offset passes 2^31 elements.
 """
 
 import math
@@ -162,6 +163,22 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     layer = (pool.storage_offset() - page.storage_offset()) // page.stride(1)
     page_before[:, layer] = want[5]
     assert torch.equal(page, page_before), "the call wrote outside its layer's view of the pool"
+
+
+def test_cells_carry_from_slots_past_the_int32_offset() -> None:
+    """The cells read a carried window at a slot whose element offset on the stock page
+    passes 2^31 at both rank geometries, and 2^32 at 16 / 48 heads -- where a 32-bit slot
+    offset faults or wraps back into the page -- so the 64-bit slot base stays exercised."""
+    reach = {}
+    for cell in op.CELLS:
+        spec = cell.spec
+        if "page_layers" not in spec:
+            continue
+        hk, _, _, qkv, _ = _geometry(spec)
+        slot_stride = spec["page_layers"] * qkv * (CONV_WIDTH - 1)
+        carried = [s for s, init in zip(spec["slots"], spec["initial"]) if init]
+        reach[hk] = max([reach.get(hk, 0)] + [s * slot_stride for s in carried])
+    assert reach[NUM_K_HEADS] >= 2**32 and reach[NUM_K_HEADS // 4] >= 2**31, reach
 
 
 def test_guard_refuses_channel_strided_x() -> None:
