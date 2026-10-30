@@ -5,17 +5,140 @@ temporal / spatial Winograd pieces, the compiled frame ops and the sm100 pipelin
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
+    TEMPORAL_WINO,
     add_rms_norm_silu_cuda,
-    add_rms_norm_silu_reference,
+    apply_in_bias,
     can_use_cuda_rms_norm_silu,
     cuda_op_available,
     rms_norm_silu_cuda,
-    rms_norm_silu_reference,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel")
+
+
+# ---------------------------------------------------------------------------
+# Eager references: what each kernel must compute, in plain PyTorch ops
+# ---------------------------------------------------------------------------
+
+
+def rms_norm_silu_reference(
+    x: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+    in_bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The eager path, verbatim (WanRMSNorm.forward followed by F.silu)."""
+    x = apply_in_bias(x, in_bias)
+    needs_fp32 = x.dtype in (torch.float16, torch.bfloat16)
+    normalized = F.normalize(x.float() if needs_fp32 else x, dim=1).to(x.dtype)
+    return F.silu(normalized * scale * gamma + bias)
+
+
+def add_rms_norm_silu_reference(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+    in_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    s = apply_in_bias(x, in_bias) + residual
+    return s, rms_norm_silu_reference(s, gamma, bias, scale)
+
+
+def rms_norm_reference(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
+    """The eager WanRMSNorm.forward alone (no activation, no bias)."""
+    needs_fp32 = x.dtype in (torch.float16, torch.bfloat16)
+    normalized = F.normalize(x.float() if needs_fp32 else x, dim=1).to(x.dtype)
+    return normalized * scale * gamma
+
+
+def interleave_bias_reference(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+    t, p, c2 = u.shape
+    c = c2 // 2
+    ub = u + bias.reshape(1, 1, -1) if bias is not None else u
+    return torch.stack([ub[:, :, :c], ub[:, :, c:]], dim=1).reshape(2 * t, p, c)
+
+
+def wino_combine_reference(m: list[torch.Tensor]) -> torch.Tensor:
+    """``m[k] [groups, P, C]`` (``order + 2`` of them) -> bf16 frames ``[order*groups, P, C]``:
+    frame j of a group is ``sum_k AT[j][k] m_k`` in index order with bf16 rounding after every
+    add (the products are exact: powers of two)."""
+    order = len(m) - 2
+    at = TEMPORAL_WINO[order]["AT"]
+    frames = []
+    for row in at:
+        terms = [(c, m[k]) for k, c in enumerate(row) if c != 0]
+        acc = (terms[0][0] * terms[0][1].float()).to(torch.bfloat16)
+        for c, mk in terms[1:]:
+            acc = (acc.float() + c * mk.float()).to(torch.bfloat16)
+        frames.append(acc)
+    return torch.stack(frames, dim=1).reshape(order * m[0].shape[0], *m[0].shape[1:])
+
+
+def wino_norm_silu_reference(
+    x: torch.Tensor | None,
+    m: list[torch.Tensor] | None,
+    residual: torch.Tensor | None,
+    in_bias: torch.Tensor | None,
+    cache: torch.Tensor | None,
+    gamma: torch.Tensor,
+    bias: torch.Tensor | float,
+    scale: float,
+    order: int = 2,
+    winograd_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
+    """Eager form of the kernel, same rounding points (bf16 after every add of the combine,
+    the Winograd inputs formed in fp32 and rounded once to ``winograd_dtype``)."""
+    if x is None:
+        assert m is not None
+        x = wino_combine_reference(m)
+    s = None
+    if in_bias is not None:
+        x = s = x + in_bias.reshape(1, 1, -1)
+    if residual is not None:
+        x = s = x + residual
+    if m is not None and s is None:
+        s = x
+    t, p, c = x.shape
+    y = rms_norm_silu_reference(x.permute(0, 2, 1), gamma.reshape(1, -1, 1), bias, scale).permute(
+        0, 2, 1
+    )
+    cache_frames = cache.shape[0] if cache is not None else 0
+    pad = torch.zeros(2 - cache_frames, p, c, dtype=x.dtype, device=x.device)
+    hist = torch.cat([pad, cache], 0) if cache is not None and cache_frames else pad
+    f = torch.cat([hist, y], 0).float()  # frames -2 .. T-1
+    bt = torch.tensor(TEMPORAL_WINO[order]["BT"], dtype=torch.float32, device=x.device)
+    groups = f.unfold(0, order + 2, order)  # [groups, P, C, order+2]
+    d = torch.einsum("ki,gpci->kgpc", bt, groups).to(winograd_dtype)
+    return s, y[-2:].contiguous(), [d[k] for k in range(order + 2)]
+
+
+def upsample_gather_reference(
+    temp: torch.Tensor,
+    batch: int,
+    frames: int,
+    shortcut_expanded: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Eager phase gather: ``out[.., 2i+p, 2j+q] = temp[.., phase, i+p, j+q]`` (+ bias, + shortcut)."""
+    bt, c4, hp1, wp1 = temp.shape
+    cout, h, w = c4 // 4, hp1 - 1, wp1 - 1
+    t4 = temp.view(bt, 4, cout, hp1, wp1)
+    out = temp.new_empty(bt, cout, 2 * h, 2 * w)
+    for p in (0, 1):
+        for q in (0, 1):
+            out[:, :, p::2, q::2] = t4[:, 2 * p + q, :, p : p + h, q : q + w]
+    out = out.view(batch, frames, cout, 2 * h, 2 * w).permute(0, 2, 1, 3, 4)
+    out = apply_in_bias(out, bias)
+    if shortcut_expanded is not None:
+        out = out + shortcut_expanded
+    return out.contiguous(memory_format=torch.channels_last_3d)
+
 
 # Decoder/encoder channel counts of the Cosmos3 VAE plus a few small ones.
 CHANNELS = [48, 96, 160, 256, 320, 512, 640, 1024, 16, 24, 32]
@@ -223,14 +346,12 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
 # Upsample: packed 2x2 conv + phase gather vs nearest-2x + 3x3 conv (+ DupUp3D shortcut)
 # ---------------------------------------------------------------------------
 
-import torch.nn.functional as F  # noqa: E402
 
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     cuda_upsample_available,
     pack_upsample_weights,
     upsample_gather_cuda,
-    upsample_gather_reference,
 )
 
 upsample_op = _built(cuda_upsample_available(), "trtllm::vae_upsample_gather")
@@ -342,7 +463,6 @@ def test_cuda_upsample_gather_with_shortcut(
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     wino_norm_silu_cuda,
-    wino_norm_silu_reference,
 )
 
 wino_op = cuda_op
@@ -448,7 +568,6 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
     of the normalized frames (fp32 reference on the same 16-bit inputs)."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         TEMPORAL_WINO,
-        rms_norm_silu_reference,
         winograd_weights,
     )
 
@@ -493,9 +612,7 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     cuda_frame_ops_available,
     interleave_bias_cuda,
-    interleave_bias_reference,
     wino_combine_cuda,
-    wino_combine_reference,
 )
 
 frame_ops = _built(cuda_frame_ops_available(), "trtllm::vae_interleave_bias")
@@ -596,11 +713,6 @@ def test_avg_down_add_matches_eager(
     )
     got = got.view(1, x.shape[2], h // 2, w // 2, cout).permute(0, 4, 1, 2, 3)
     assert torch.equal(got, ref), "group size 4 means the mean is exact: bitwise with eager"
-
-
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    rms_norm_reference,
-)
 
 
 @cuda_op
