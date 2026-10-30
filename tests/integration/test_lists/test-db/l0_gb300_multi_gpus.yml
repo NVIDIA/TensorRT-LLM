@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 version: 0.0.1
-l0_gb300:
+l0_gb300_multi_gpus:
 - condition:
     ranges:
       system_gpu_count:

@@ -24,5 +24,5 @@ a deliberate, confirmed decision rather than a forgotten step.
 Choose the list by where a CI test runs: CPU-only tests go in `l0_cpu.yml`;
 single-GPU tests in the per-GPU list for their target (e.g. `l0_b200.yml`);
 multi-GPU tests in a multi-GPU list (e.g. `l0_dgx_b200.yml`,
-`l0_gb300.yml`). If you are unsure which list(s) a test belongs in,
+`l0_gb300_multi_gpus.yml`). If you are unsure which list(s) a test belongs in,
 ask the author/reviewer rather than leaving it unlisted.
