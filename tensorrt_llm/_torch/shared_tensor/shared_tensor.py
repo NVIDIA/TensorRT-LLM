@@ -123,6 +123,30 @@ class _SharedTensorRebuildMethodRegistry:
         return cls._registry[key]
 
 
+class _CudaStorageProxy:
+    """Track export ownership before PyTorch constructs a tensor view."""
+
+    def __init__(self, storage_cls: type,
+                 container: 'SharedTensorContainer') -> None:
+        self.storage_cls = storage_cls
+        self.container = container
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.storage_cls(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.storage_cls, name)
+
+    def _new_shared_cuda(self, *args: Any, **kwargs: Any) -> Any:
+        storage = self.storage_cls._new_shared_cuda(*args, **kwargs)
+        self.container._reference_consumed = True
+        return storage
+
+    def _release_ipc_counter(self, *args: Any, **kwargs: Any) -> None:
+        self.storage_cls._release_ipc_counter(*args, **kwargs)
+        self.container._reference_consumed = True
+
+
 class SharedTensorContainer:
     """A class for sharing tensors between processes (non-Python multiprocessing processes).
 
@@ -154,6 +178,13 @@ class SharedTensorContainer:
 
     """
 
+    # Positions in the handle tuples returned by ``reduce_tensor``.
+    _CPU_STORAGE = 1
+    _CUDA_STORAGE_CLASS = 4
+    _CUDA_STORAGE_DEVICE = 6
+    _CUDA_REF_COUNTER_HANDLE = 11
+    _CUDA_REF_COUNTER_OFFSET = 12
+
     def __init__(self, method_key: int, tensor_handle: Dict[str, Any]):
         """Initialize the SharedTensorContainer.
 
@@ -163,6 +194,7 @@ class SharedTensorContainer:
         """
         self.method_key = method_key
         self.tensor_handle = tensor_handle
+        self._reference_consumed = False
 
     @staticmethod
     def cuda_handle_to_dict(tensor_handle) -> Dict[str, Any]:
@@ -406,7 +438,10 @@ class SharedTensorContainer:
         else:
             raise ValueError(
                 f"Unsupported shared tensor method key: {method_key}")
-        return cls(method_key, tensor_handle)
+        container = cls(method_key, tensor_handle)
+        container._reference_consumed = (
+            method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU)
+        return container
 
     def get_local_view(self) -> torch.Tensor:
         """Convert the shared tensor back to a local tensor (Consumer side).
@@ -429,7 +464,43 @@ class SharedTensorContainer:
             return tensor
         rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(
             self.method_key)
-        return rebuild_method(*self.tensor_handle)
+        tensor_handle = self.tensor_handle
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            tensor_handle = list(tensor_handle)
+            tensor_handle[self._CUDA_STORAGE_CLASS] = _CudaStorageProxy(
+                tensor_handle[self._CUDA_STORAGE_CLASS], self)
+        return rebuild_method(*tensor_handle)
+
+    @property
+    def reference_consumed(self) -> bool:
+        """Whether importing has taken ownership of this export reference.
+
+        This remains true if tensor view construction fails after a successful
+        storage import or a cached CUDA storage's counter release.
+        """
+        return self._reference_consumed
+
+    def release_unconsumed(self) -> None:
+        """Release one export reference that no consumer opened (Producer side).
+
+        Each CUDA export takes one reference in ``from_tensor``, and each CPU
+        export takes one in ``dump_to_dict``. A consumer that rebuilds the
+        tensor releases it. Call this once for each exported handle that will
+        never be rebuilt, so the producer can free the memory.
+
+        Raises:
+            ValueError: If the container is not a CPU or CUDA export.
+        """
+        if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
+            self.tensor_handle[self._CPU_STORAGE]._shared_decref()
+        elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
+            torch.UntypedStorage._release_ipc_counter(
+                self.tensor_handle[self._CUDA_REF_COUNTER_HANDLE],
+                self.tensor_handle[self._CUDA_REF_COUNTER_OFFSET],
+                device=self.tensor_handle[self._CUDA_STORAGE_DEVICE])
+        else:
+            raise ValueError(
+                f"Unsupported shared tensor method key: {self.method_key}")
 
     @classmethod
     def release_dict(cls, tensor_info: Dict[str, Any]) -> None:
