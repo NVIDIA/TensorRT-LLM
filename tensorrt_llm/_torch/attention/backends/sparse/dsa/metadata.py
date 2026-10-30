@@ -390,6 +390,31 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
         return self.retained_block_table is not None
 
+    def _fill_retained_block_tables(self) -> None:
+        """Refresh the twin page tables over their full width.
+
+        The MTP draft loop writes past this step's kv lengths, so every column a request
+        has allocated must be current; the rest stay -1.
+        """
+        for manager, high_table in (
+            (self.kv_cache_manager, self.retained_block_table),
+            (self.draft_kv_cache_manager, self.draft_retained_block_table),
+        ):
+            if high_table is None:
+                continue
+            table = torch.full(
+                (self.num_seqs, high_table.shape[1]),
+                -1,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+            # Every twin shares one pool and page scale, so one table serves all layers.
+            local = next(iter(manager.high_layers))
+            manager.fill_high_precision_page_table(
+                self.request_ids, manager.pp_layers[local], table.numpy()
+            )
+            high_table[: self.num_seqs].copy_(table, non_blocking=True)
+
     def prepare(self):
         self._validate_ragged_verification()
         super().prepare()
@@ -2111,22 +2136,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        for manager, high_table in (
-            (self.kv_cache_manager, self.retained_block_table),
-            (self.draft_kv_cache_manager, self.draft_retained_block_table),
-        ):
-            if high_table is None:
-                continue
-            width = min(max_blocks_used, high_table.shape[1])
-            table = torch.full(
-                (self.num_seqs, width), -1, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            # Every twin shares one pool and page scale, so one table serves all layers.
-            local = next(iter(manager.high_layers))
-            manager.fill_high_precision_page_table(
-                self.request_ids, manager.pp_layers[local], table.numpy()
-            )
-            high_table[: self.num_seqs, :width].copy_(table, non_blocking=True)
+        self._fill_retained_block_tables()
         high_table = self.retained_block_table
         if high_table is not None:
             # Absolute position of every context token, for the retained-row write.
