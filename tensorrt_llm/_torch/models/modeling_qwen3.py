@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 from typing import Optional
 
@@ -274,6 +277,8 @@ class Qwen3Model(DecoderModel):
 
 @register_auto_model("Qwen3ForCausalLM")
 class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
+
+    supports_multimodal_breakable_cuda_graph = True
 
     def __init__(
         self,

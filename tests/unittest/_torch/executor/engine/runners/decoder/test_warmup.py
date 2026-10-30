@@ -370,6 +370,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     engine = SimpleNamespace(
         _warmup_timer=_WarmupTimer(rank=0),
         _config=SimpleNamespace(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.DISABLED,
             enable_autotuner=True,
             torch_compile_enabled=compile_enabled,
             torch_compile_prefill_only=prefill_only,

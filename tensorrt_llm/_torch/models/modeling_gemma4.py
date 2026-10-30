@@ -1353,6 +1353,7 @@ class Gemma4TextModel(DecoderModel):
 
 @register_auto_model("Gemma4ForCausalLM")
 class Gemma4ForCausalLM(SpecDecOneEngineForCausalLM[Gemma4TextModel, Gemma4TextConfig]):
+    supports_multimodal_breakable_cuda_graph = True
     build_mtp_draft_model_from_config = True
 
     def __init__(

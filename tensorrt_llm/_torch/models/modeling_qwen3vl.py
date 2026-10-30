@@ -1801,6 +1801,30 @@ class Qwen3VLModelBase(MultimodalModelMixin, PreTrainedModel):
         )
         return fused_input_ids, inputs_embeds, tuple(deepstack_buffer.unbind(0))
 
+    def prepare_breakable_cuda_graph_inputs(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        prepared_inputs = super().prepare_breakable_cuda_graph_inputs(inputs)
+        num_tokens = prepared_inputs["inputs_embeds"].shape[0]
+        if self.deepstack_num_level > 0 and not prepared_inputs.get("deepstack_embeds"):
+            deepstack_buffer = self.deepstack_input_embeds[:, :num_tokens, :]
+            deepstack_buffer.zero_()
+            prepared_inputs["deepstack_embeds"] = list(deepstack_buffer.unbind(0))
+
+        mrope_config = prepared_inputs.get("mrope_config")
+        if mrope_config is not None and "mrope_rotary_cos_sin" in mrope_config:
+            padded_deltas = torch.zeros(
+                (num_tokens, 1), dtype=torch.int32, device=prepared_inputs["inputs_embeds"].device
+            )
+            deltas = mrope_config.get("mrope_position_deltas")
+            if deltas is not None:
+                if deltas.numel() > num_tokens:
+                    raise ValueError("MRoPE generation deltas exceed the prefill token count")
+                # Generation kernels index deltas from zero, without a context-request offset.
+                padded_deltas[: deltas.numel()].copy_(deltas.reshape(-1, 1))
+            prepared_inputs["mrope_config"] = dict(
+                mrope_config, mrope_position_deltas=padded_deltas
+            )
+        return prepared_inputs
+
     def get_language_model_extra_forward_kwargs(
         self,
         *,
