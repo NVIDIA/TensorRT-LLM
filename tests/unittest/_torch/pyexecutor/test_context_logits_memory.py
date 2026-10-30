@@ -24,6 +24,8 @@ def make_head(
         weight=torch.randn(vocab, hidden, device="cuda", dtype=dtype),
         output_dtype=output_dtype,
         num_embeddings=vocab,
+        tp_size=1,
+        mapping=None,
     )
     head.context_logits_workspace = ContextLogitsWorkspace(head)
     return head
