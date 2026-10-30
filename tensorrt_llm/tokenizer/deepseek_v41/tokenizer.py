@@ -270,7 +270,10 @@ def _name_calls_as_declared(
     ``_qualified_names_by_dotted_spelling``) is renamed to the tool's
     ``namespace::name``, the name the model was shown and writes its calls
     under, so a replayed turn renders as the model generated it. A call that
-    carries its namespace in a field of its own is left as it is.
+    carries its namespace in a field of its own is left as it is. Renaming
+    uses only the current request's tools. If a later turn drops a namespace
+    declaration, earlier dotted calls stay dotted and prefix reuse stops at
+    that call.
     """
     qualified_names = _qualified_names_by_dotted_spelling(tools)
     if not qualified_names:

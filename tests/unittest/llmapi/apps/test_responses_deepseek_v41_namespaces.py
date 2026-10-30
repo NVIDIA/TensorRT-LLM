@@ -310,3 +310,14 @@ def test_matches_the_checkpoint_encoder(thinking):
     )
 
     assert _render(request) == expected
+
+
+def test_replay_keeps_the_dotted_name_when_the_namespace_is_no_longer_declared():
+    flat_tools = [tool for tool in _responses_tools() if tool["type"] != "namespace"]
+    request = _request(
+        {"type": "function_call", "call_id": "c1", "name": "functions.do_it", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c1", "output": "done"},
+        tools=flat_tools,
+    )
+
+    assert '<｜DSML｜ invoke name="functions.do_it">' in _render(request)
