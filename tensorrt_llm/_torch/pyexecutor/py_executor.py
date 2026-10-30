@@ -155,6 +155,68 @@ def _stats_buffer_is_unbounded(max_stats_len: int) -> bool:
     return max_stats_len == _UNBOUNDED_STATS_MAX_LEN
 
 
+# Default context-coalescing window applied to one-model EAGLE3 when the user
+# has not configured batch waiting (see resolve_spec_dec_batch_wait_defaults).
+SPEC_DEC_CTX_COALESCE_ITERS = 2
+SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO = 0.5
+_BATCH_WAIT_FIELDS = frozenset(
+    ("batch_wait_timeout_ms", "batch_wait_timeout_iters",
+     "batch_wait_max_tokens_ratio"))
+
+
+def resolve_spec_dec_batch_wait_defaults(
+        llm_args,
+        model_engine,
+        enable_attention_dp: bool,
+        is_disaggregated: bool = False) -> Optional[Tuple[int, float]]:
+    """Return default (timeout_iters, max_tokens_ratio) for one-model EAGLE3.
+
+    With one-model EAGLE3, a generation-only iteration replays the decode CUDA
+    graph (target verify plus draft loop) in a few milliseconds, while any
+    iteration that also carries a context request runs the target model and the
+    draft loop eagerly. For small and medium models that eager iteration is
+    host-launch bound and costs roughly an order of magnitude more than a
+    graph step, almost independently of how many context requests it holds.
+
+    Speculation makes requests finish at acceptance-dependent iterations, so
+    under concurrent load new requests are admitted in a trickle and most
+    iterations turn into eager mixed iterations, stalling every in-flight
+    request; this can make EAGLE3 slower than no speculation
+    (https://nvbugs/6917001). Holding new context requests for a couple of
+    iterations while generation is in flight batches them into far fewer mixed
+    iterations, at a TTFT cost bounded by ``SPEC_DEC_CTX_COALESCE_ITERS``
+    decode steps.
+
+    Returns None (keep the configured values) unless all of the following hold:
+    the user did not set any batch-waiting knob, the model runs one-model
+    EAGLE3 with decode CUDA graphs, prefill CUDA graphs are disabled (with
+    them, mixed iterations are cheap), attention DP is off (it has its own
+    context balancing and batch waiting is not applied there), and the
+    executor is not part of a disaggregated deployment (context arrives as
+    transferred KV there, so delaying admission only adds latency).
+    """
+    fields_set = getattr(llm_args, "model_fields_set", None)
+    if not isinstance(fields_set, (set, frozenset)):
+        return None
+    if fields_set & _BATCH_WAIT_FIELDS:
+        return None
+    if (llm_args.batch_wait_timeout_ms != 0
+            or llm_args.batch_wait_timeout_iters != 0
+            or llm_args.batch_wait_max_tokens_ratio != 0):
+        return None
+    if enable_attention_dp or is_disaggregated:
+        return None
+    spec_config = getattr(model_engine, "spec_config", None)
+    spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
+    if spec_dec_mode is None or spec_dec_mode.is_eagle3_one_model() is not True:
+        return None
+    if getattr(model_engine, "cuda_graph_config", None) is None:
+        return None
+    if llm_args.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+        return None
+    return SPEC_DEC_CTX_COALESCE_ITERS, SPEC_DEC_CTX_COALESCE_MAX_TOKENS_RATIO
+
+
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
@@ -807,10 +869,8 @@ class PyExecutor:
                     "TLLM_ADP_BALANCE_LOW_OCCUPANCY_TIMEOUT_ITERS must be "
                     "between 0 and attention_dp_config.timeout_iters "
                     f"({self.attention_dp_time_out_iters})")
-        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
-        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
-        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
-        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
+        self._init_batch_waiting(
+            is_disaggregated=kv_cache_transceiver is not None)
 
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
@@ -7728,6 +7788,30 @@ class PyExecutor:
                              for req in scheduled_requests.generation_requests
                              if getattr(req, "is_attention_dp_dummy", False))
         return num_ctx_tokens, num_gen_tokens
+
+    def _init_batch_waiting(self, is_disaggregated: bool) -> None:
+        """Resolve the batch-waiting knobs, including the one-model EAGLE3
+        default from resolve_spec_dec_batch_wait_defaults."""
+        self.batch_wait_timeout_ms = self.llm_args.batch_wait_timeout_ms
+        self.batch_wait_timeout_iters = self.llm_args.batch_wait_timeout_iters
+        self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
+        spec_dec_batch_wait = resolve_spec_dec_batch_wait_defaults(
+            self.llm_args,
+            self.model_engine,
+            self.enable_attention_dp,
+            is_disaggregated=is_disaggregated)
+        if spec_dec_batch_wait is not None:
+            (self.batch_wait_timeout_iters,
+             self.batch_wait_max_tokens_ratio) = spec_dec_batch_wait
+            logger.info(
+                "One-model EAGLE3 with decode CUDA graphs: coalescing new "
+                "context requests for up to "
+                f"{self.batch_wait_timeout_iters} iterations while generation "
+                "is in flight (batch_wait_timeout_iters="
+                f"{self.batch_wait_timeout_iters}, batch_wait_max_tokens_ratio="
+                f"{self.batch_wait_max_tokens_ratio}). Set "
+                "batch_wait_timeout_iters=0 to disable.")
+        self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
