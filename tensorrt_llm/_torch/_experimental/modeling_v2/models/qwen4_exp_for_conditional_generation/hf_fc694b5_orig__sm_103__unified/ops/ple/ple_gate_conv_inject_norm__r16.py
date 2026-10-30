@@ -38,6 +38,7 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
+from .ngram_token_history__r14 import DEP4_SLOTS, TEP4_SLOTS
 from .ple_ngram_embed__r15 import PER_SEQ_MAX_ROWS, _seq_of_rows
 
 
@@ -302,8 +303,16 @@ CKPT_HC_COUNT = 4
 CKPT_HIDDEN = 2560
 CKPT_DILATION = 3
 CKPT_CLAMP_MIN = 1e-6
-#: Largest PLE-conv pool seen for this checkpoint (see `dilated_short_conv_paged`).
+#: Largest PLE-conv pool seen for this checkpoint at tp1 (see `dilated_short_conv_paged`).
 ENGINE_SLOTS = 461
+#: This target's per-rank PLE-conv pools: the conv state and the n-gram context are
+#: bound over one slot space (the stock manager asserts their slot counts equal and
+#: logs both on its "PLE state views bound" line), so the counts are the n-gram
+#: pool's, measured with `ngram_token_history` (`TEP4_SLOTS`, `DEP4_SLOTS`). Every
+#: rank holds the whole `[hc_count * hidden, 9]` conv state at every member. A tp4
+#: rank holds the same per-rank PLE and GDN state as a tep4 rank and no engine has
+#: counted its pool, so tp4 is bounded by tep4's.
+TP4_SLOTS = TEP4_SLOTS
 
 
 def _cell(why: str, lengths, **spec) -> Cell:
@@ -352,7 +361,8 @@ class PleGateConvInjectNorm(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: lengths (rows per sequence), pool_slots (default num_seqs + 2),
-    # max_rows (max(lengths)), carries (None -> the argument is None). The
+    # max_rows (max(lengths)), carries (None -> the argument is None),
+    # conv_input (True -> a staged conv-input buffer is passed). The
     # checkpoint's 4 x 2560 bf16 geometry throughout.
     CELLS: tuple[Cell, ...] = (
         _cell("decode 128 x 1 row at the 461-slot pool", (1,) * 128, pool_slots=ENGINE_SLOTS),
@@ -364,6 +374,45 @@ class PleGateConvInjectNorm(OpWrapper):
             (3001, 5000) + (1,) * 64,
             carries=(False, True) + (True,) * 64,
             pool_slots=ENGINE_SLOTS,
+        ),
+        # This target's members, each at the per-rank conv pool its rank binds, as
+        # the forward calls it: decode and verify with `has_initial_states` None and
+        # `max_rows` the rows per sequence (a verify step also stages the conv
+        # input), prefill with one flag per sequence and `max_rows` the step's rows.
+        _cell(
+            f"tep4 decode: 128 x 1 row, {TEP4_SLOTS} slots",
+            (1,) * 128,
+            pool_slots=TEP4_SLOTS,
+        ),
+        _cell(
+            f"dep4 decode: a rank's 32 x 1 row, {DEP4_SLOTS} slots",
+            (1,) * 32,
+            pool_slots=DEP4_SLOTS,
+        ),
+        _cell(
+            f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
+            (2,) * 128,
+            pool_slots=TEP4_SLOTS,
+            conv_input=True,
+        ),
+        _cell(
+            f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row conv), {TEP4_SLOTS} slots",
+            (8,) * 128,
+            pool_slots=TEP4_SLOTS,
+            conv_input=True,
+        ),
+        _cell(
+            f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
+            (8192,),
+            carries=(False,),
+            pool_slots=TEP4_SLOTS,
+        ),
+        _cell(
+            f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
+            (8192 - 127,) + (1,) * 127,
+            carries=(False,) + (True,) * 127,
+            max_rows=8192,
+            pool_slots=TEP4_SLOTS,
         ),
     )
 
@@ -381,9 +430,31 @@ class PleGateConvInjectNorm(OpWrapper):
     column stride; weights contiguous. Certified at the checkpoint's 4 x 2560
     bf16 geometry with every slot live (the target never passes `pad_slot_id`),
     at a 128 x 1-row decode, a 64 x 4-row MTP3 verify, an 8192-row fresh
-    prefill and a mixed 2-context + 64-decode step, all on the 461-slot pool.
+    prefill and a mixed 2-context + 64-decode step, all on the 461-slot pool;
+    and at this target's per-rank pools (`TEP4_SLOTS` 1874, `DEP4_SLOTS` 850,
+    slots spread over the whole pool with both ends taken): a 128 x 1 tep4 and
+    a 32 x 1 dep4 decode, 128 x 2 (MTP1) and 128 x 8 (MTP7, the packed-row conv
+    with no carry flags) verifies staging `conv_input`, an 8192-row fresh
+    prefill, and the envelope's largest step, 8192 rows over 128 sequences (one
+    8065-row context, 127 carrying decode rows). A tp4 rank binds the same
+    conv state as a tep4 rank, so the tep4 cells cover it by bound.
     Not certified: sequences shorter than `max_rows` on the per-sequence path
-    (a verify step gives every sequence `max_rows` rows).
+    (a verify step gives every sequence `max_rows` rows); verify widths 3, 5,
+    6 and 7 rows at the per-rank pools (4 rows only at 64 x 4 over 461 slots);
+    the MTP member's own pool (max_seq_len 16384; the verify cells run at core's
+    tep4 count); a dep4 prefill or verify step; a chunked continuation at the
+    per-rank pools (a carrying context chunk is certified only by the 461-slot
+    mixed cell). Every pool count is the stock engine's at core's config with
+    the n-gram table host-resident.
+
+    Index range: slots and rows are widened to int64 before every offset, so
+    neither the pool (2^31 elements at 23301 slots of `[10240, 9]`) nor the
+    rows (2^31 elements at 209715 rows of 10240) is near a 32-bit limit at
+    the envelope (1874 slots, 8192 rows); nothing is indexed in fp32.
+
+    Source: the four Triton kernels in this file (three launches a call, the
+    packed-row conv a fourth on context-shaped steps), JIT-compiled for the
+    running device; every cell ran the JIT path on sm_103 (GB300).
 
     Numerics: every rounding point of the composition is kept, so the only
     differences are fp32 reduction order (the three norms' sums of squares
