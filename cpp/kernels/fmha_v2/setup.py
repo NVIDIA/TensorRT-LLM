@@ -3876,10 +3876,13 @@ enum Data_type
     DATA_TYPE_E2M1,
     DATA_TYPE_E4M3,
     DATA_TYPE_E5M2,
+    DATA_TYPE_MXE4M3,
     // Composite kv data types
     DATA_TYPE_KV_FP16_E4M3,
     DATA_TYPE_KV_BF16_E4M3,
-    DATA_TYPE_KV_INT8_E4M3
+    DATA_TYPE_KV_INT8_E4M3,
+    // Unknown
+    DATA_TYPE_UNKNOWN
 }};
 
 struct FusedMultiHeadAttentionKernelMetaInfoV2
