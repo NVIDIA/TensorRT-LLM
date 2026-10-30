@@ -22,7 +22,11 @@ from tensorrt_llm._torch.models.modeling_utils import timing_metric
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManager,
+    ResourceManagerType,
+    is_context_only_kv_cache,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
@@ -875,8 +879,13 @@ class DecoderWarmup:
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
-        if self.guided_decoder is None:
-            # doesn't support guided decoding
+        # A context-only cache cannot hold generation rows. The property is the same on every
+        # rank of a role, so its shapes are left out here rather than skipped by agreement.
+        supports_generation = not is_context_only_kv_cache(
+            resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+        )
+        if self.guided_decoder is None and supports_generation:
+            # doesn't support guided decoding or a context-only cache
             warmup_requests_configs.append(
                 (1 + self._config.max_total_draft_tokens, 1)
             )  # one generation request
@@ -892,7 +901,7 @@ class DecoderWarmup:
         # here: they always run on a ``MambaHybridCacheManager``, so
         # ``can_run_general_warmup`` is False and the configs above never run.
 
-        if self.guided_decoder is None and can_run_general_warmup:
+        if self.guided_decoder is None and supports_generation and can_run_general_warmup:
             # The cute_dsl_mla FMHA lib now only support the generation-only batch, we need to
             # warmup the TRTLLM-Gen FMHA lib for the mixed context+generation batch.
             # One MIXED context+generation batch (1 ctx token + 1 gen request).
@@ -1101,7 +1110,11 @@ class DecoderWarmup:
             warmup_configs = [(curr_max_num_tokens, num_gen_requests)]
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
-            if self.guided_decoder is None and not self.mapping.has_pp():
+            if (
+                self.guided_decoder is None
+                and not self.mapping.has_pp()
+                and not is_context_only_kv_cache(kv_cache_manager)
+            ):
                 # Add generation request to warmup the autotuner cache.
                 warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
 
