@@ -5,8 +5,8 @@
 The thing under test is a formula -- which operand is gated, which axis is
 reduced, where each division by `hc_count` sits, the factor on the injection
 -- and every mis-reading of it keeps the shapes; the cells' band sits 32x..192x
-inside the nearest wrong formula (measured). Beyond the cells: graph replay and
-one loud misuse.
+inside the nearest wrong formula (measured). Beyond the cells: the band refusing
+wrong formulas, graph replay and one loud misuse.
 """
 
 import zlib
@@ -14,6 +14,7 @@ from typing import Optional, Tuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.hc.qwen4_exp_gated_residual__r42 import (  # noqa: E501
     gate_ratio,
@@ -125,6 +126,51 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
         assert inject.shape == (*spec["leading"], hc_count)
     assert torch.equal(args[0], before), "the normed stream is read-only"
     _compare((mixed, inject), op.reference(*args))
+
+
+def _wrong_mixed(normed, down, up, hc_count, kind):
+    """`mixed` under one mis-reading of the formula, in float64, rounded once."""
+    hidden = normed.shape[-1] // hc_count
+    x = normed.double()
+    logit = x @ down.double().t()
+    low = F.silu(logit if kind == "logit_not_divided_by_C" else logit / hc_count)
+    gate_logits = low @ up.double().t()
+    gate = torch.sigmoid(gate_logits).unflatten(-1, (hc_count, hidden))
+    streams = x.unflatten(-1, (hc_count, hidden))
+    if kind == "stream_sum":
+        mixed = (gate * streams).sum(dim=-2)
+    elif kind == "ungated_mean":
+        mixed = streams.mean(dim=-2)
+    elif kind == "mean_gate_times_mean_stream":
+        mixed = gate.mean(dim=-2) * streams.mean(dim=-2)
+    elif kind == "hidden_major_gate":
+        gate = torch.sigmoid(gate_logits).unflatten(-1, (hidden, hc_count)).transpose(-1, -2)
+        mixed = (gate * streams).mean(dim=-2)
+    else:
+        mixed = (gate * streams).mean(dim=-2)
+    return mixed.to(normed.dtype)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "logit_not_divided_by_C",
+        "stream_sum",
+        "ungated_mean",
+        "mean_gate_times_mean_stream",
+        "hidden_major_gate",
+    ],
+)
+def test_the_band_refuses_a_wrong_formula(kind) -> None:
+    """The band is wider than torch's bf16 `atol`, so it has to be shown to
+    refuse what it exists to catch. Measured on sm_103 at the 1024-row MTP
+    cell: the op at 0.276 of the band, these five at 31.9x..192x; refused
+    here at 10x, so the margin is stated rather than assumed."""
+    _, (normed, down, up, _, c) = _build((1024,), seed=1042, inject=False)
+    mixed, _ = op(normed, down, up, None, c)
+    want, _ = op.reference(normed, down, up, None, c)
+    assert gate_ratio(mixed, want) <= 1.0
+    assert gate_ratio(_wrong_mixed(normed, down, up, c, kind), want) > 10.0
 
 
 def test_malformed_operands_raise_rather_than_return() -> None:

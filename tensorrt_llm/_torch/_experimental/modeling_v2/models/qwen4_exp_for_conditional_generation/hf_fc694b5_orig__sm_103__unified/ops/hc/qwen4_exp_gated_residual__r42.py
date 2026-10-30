@@ -3,8 +3,8 @@
 """Qwen4-Exp hyper-connection gating: low-rank stream mixer plus block-injection
 weights.
 
-Tier-3 composed from native torch (three ``F.linear`` GEMMs and four elementwise
-passes); it launches no TensorRT-LLM kernel. The ``mhc_*`` op family
+A macro entry composed from native torch (three ``F.linear`` GEMMs and four
+elementwise passes); it launches no TensorRT-LLM kernel. The ``mhc_*`` op family
 (``mhc_gemm_sqrsum_fma``, ``mhc_big_fuse``, ``mhc_post_mapping``) computes a
 structurally different hyper-connection -- a per-stream *scalar* gate from one
 linear rather than a rank-320 SiLU bottleneck, a weighted *sum* rather than a
@@ -88,6 +88,25 @@ class Qwen4ExpGatedResidual(OpWrapper):
             why="stack-final mixer: block_inject_weight None",
             spec=dict(leading=(256,), inject=False),
         ),
+        # The MTP layer's shared_head mixer (block_inject_weight None) at the
+        # rows DecodeTarget.mtp_forward runs: one request, the largest decode
+        # graph batch, and mtp7's first draft over 128 x (1 + 7) verify rows.
+        Cell(
+            why="1 row, no injection: one request's MTP shared_head",
+            spec=dict(leading=(1,), inject=False),
+        ),
+        Cell(
+            why="128 rows, no injection: MTP shared_head at the largest decode graph batch",
+            spec=dict(leading=(128,), inject=False),
+        ),
+        Cell(
+            why="1024 rows, no injection: mtp7's first draft over 128 x 8 verify rows",
+            spec=dict(leading=(1024,), inject=False),
+        ),
+        Cell(
+            why="8192 rows, no injection: the envelope's largest, a max_num_tokens prefill chunk",
+            spec=dict(leading=(8192,), inject=False),
+        ),
     )
 
     note = """
@@ -115,15 +134,24 @@ class Qwen4ExpGatedResidual(OpWrapper):
     range).
 
     Certified: bf16 2-D `[rows, 10240]` at 8 and 8192 rows with the
-    injection, 256 rows without it (the stack-final mixer); CUDA-graph replay
-    at 8 rows, bitwise equal to eager. Cost, not gated, shared device: ~235 us
-    at 1..512 tokens (overhead-bound), 475 us at 4096, 902 us at 8192.
+    injection; without it (the stack-final mixer, the MTP layer's
+    shared_head) at 1, 128, 256, 1024 and 8192 rows; CUDA-graph replay at 8
+    rows, bitwise equal to eager. Measured on sm_103 at the 1 / 128 / 1024 /
+    8192-row cells without injection: `mixed` at 0.271 / 0.399 / 0.276 /
+    0.371 of the test's band, cosine >= 0.9999982 and relative L2 <= 1.88e-3
+    against float64; five wrong formulas (logit not divided by C, stream sum,
+    ungated mean, mean gate times mean stream, hidden-major gate) at
+    31.9x..192x the band. Cost, not gated, shared device: ~150-235 us at
+    1..1024 rows (overhead-bound), 475 us at 4096, ~850-900 us at 8192.
 
-    Not certified: other row counts, more than one leading dim, hc_count other
-    than 4, hidden other than 2560, lowrank other than 320, float16 and
-    float32, weight/activation dtype mixing; the operand-range bounds above
-    are measured. Hard limits: not probed (largest operand 8192 x 10240 =
-    2^26.3 elements).
+    Not certified: other row counts; `inject` at 128 and 1024 rows (the MTP
+    layer's unfused attention and MoE sites; `mixed` there is bitwise the
+    no-injection cells'); more than one leading dim, hc_count other than 4,
+    hidden other than 2560, lowrank other than 320, float16 and float32,
+    weight/activation dtype mixing; the operand-range bounds above are
+    measured. Hard limits: not probed (largest operand 8192 x 10240 = 2^26.3
+    elements; a 2^31-element operand would take 209716 rows, beyond the
+    envelope's 8192).
     """
 
     def __call__(
