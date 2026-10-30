@@ -194,6 +194,13 @@ exercised:
    scales in a second pool, unit fp32 [3] second-level scales, bf16 output):
    the pool and its block scales bitwise as the append writes them, and the
    output against `reference` over the NVFP4 values (the cells).
+15. The unified tp4 / tep4 / dep4 target's cells: a tensor-parallel rank's
+   6q/1kv share at d256 and the dep4 rank's 24/2, at row 47 of a real
+   48-layer manager's pool (and one through the two-pool hybrid mapping),
+   at the engines' max_seq_len -- the packed and paged context paths, the
+   8192-row max_num_tokens prefill, decode and MTP verify at 128 requests,
+   a 9215-token history, a mixed step, and bf16 / fp8 / NVFP4 pools; over
+   NVFP4 the manager's block-scale pool is checked bitwise per layer.
 The cells at the end drive the entry's own `reference` and `_compare` over the
 configurations the targets run.
 """
@@ -220,11 +227,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     thop_attention as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.functional import RotaryScalingType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
 
 __extra_import_path__ = ["../../../.."]
 from _cells import certified_cells  # noqa: E402 — needs the path declared above
@@ -934,8 +943,9 @@ class _MultiLayerPagedAttnEnv:
     """Real multi-layer op state: a trtllm KVCacheManagerV2 hosting one paged
     pool shared by several layers, whose pool pointers, layer->pool mapping,
     and block offsets the op consumes exactly as produced. The pool element
-    type follows the manager dtype (bf16, or fp8-e4m3 with the same quant
-    args as the single-layer fp8 env).
+    type follows the manager dtype (bf16, fp8-e4m3 with the same quant args
+    as the single-layer fp8 env, or NVFP4 with its e4m3 block scales in the
+    manager's second pool and fp32 [3] kv scales).
 
     The manager owns page allocation; the test mirrors every K/V fed per
     (layer, request) so references and bitwise cache checks come from the
@@ -966,6 +976,7 @@ class _MultiLayerPagedAttnEnv:
         self.max_batch = max_batch
         self.max_seq_len = max_seq_len
         self.quant_mode = quant_mode
+        self.nvfp4 = dtype == DataType.NVFP4
 
         self.mgr = KVCacheManagerV2(
             KvCacheConfig(
@@ -983,13 +994,16 @@ class _MultiLayerPagedAttnEnv:
             dtype=dtype,
         )
         # KV-cache scaling factor s, same construction as the single-layer
-        # env: quant_orig = s, orig_quant = 1/s, both fp32 [1] CUDA; None =
-        # unquantized pool, scale args passed as None.
+        # env: quant_orig = s, orig_quant = 1/s, both fp32 [1] CUDA ([3] -- q,
+        # K, V -- over an NVFP4 pool); None = unquantized pool, scale args
+        # passed as None.
         if kv_scaling_factor is None:
             self.kv_scale_quant_orig: Optional[torch.Tensor] = None
             self.kv_scale_orig_quant: Optional[torch.Tensor] = None
         else:
-            factor = torch.full((1,), kv_scaling_factor, dtype=torch.float32, device="cuda")
+            factor = torch.full(
+                (3 if self.nvfp4 else 1,), kv_scaling_factor, dtype=torch.float32, device="cuda"
+            )
             self.kv_scale_quant_orig = factor
             self.kv_scale_orig_quant = 1.0 / factor
         assert self.mgr.num_pools == 1, "test expects one pool holding all layers"
@@ -1015,6 +1029,14 @@ class _MultiLayerPagedAttnEnv:
             view = view[:: page_scale // 2]
             view.zero_()
             self.layer_views.append(view)
+        # Over an NVFP4 pool, each layer's e4m3 block scales, viewed page by
+        # page the way its data is.
+        self.scale_views: List[torch.Tensor] = []
+        if self.nvfp4:
+            for idx in range(num_layers):
+                view = _block_scale_view(self.mgr, idx, num_kv_heads, tokens_per_block, head_dim)
+                view.zero_()
+                self.scale_views.append(view)
         # Auto-resized in place by the op on first call.
         self.workspace = torch.empty(0, dtype=torch.int8, device="cuda")
 
@@ -1280,6 +1302,11 @@ class _MultiLayerPagedAttnEnv:
         layer has no history to compare against."""
         tpb = self.tokens_per_block
         slabs_per_page = self.num_layers * 2
+        if self.nvfp4:
+            for layer_idx in range(self.num_layers) if layers is None else layers:
+                for s, rid in enumerate(request_ids):
+                    self._check_nvfp4_cache(layer_idx, s, rid)
+            return
         for layer_idx in range(self.num_layers) if layers is None else layers:
             view = self.layer_views[layer_idx]
             for s, rid in enumerate(request_ids):
@@ -1302,9 +1329,73 @@ class _MultiLayerPagedAttnEnv:
                         f"V cache mismatch: layer {layer_idx}, request {rid}, page {j}"
                     )
 
+    def _check_nvfp4_cache(self, layer_idx: int, slot: int, request_id: int) -> None:
+        """`_check_nvfp4_cache` for one layer of the shared pool: each token's
+        e2m1 bytes and its block scales (K's token-major, V's in four-token
+        groups), bitwise as the append writes them, at the pages the
+        manager assigned."""
+        tpb, hkv, d = self.tokens_per_block, self.num_kv_heads, self.head_dim
+        groups = d // NVFP4_BLOCK
+        slabs_per_page = self.num_layers * 2
+        data = self.layer_views[layer_idx].view(torch.uint8)
+        block_scales = self.scale_views[layer_idx]
+        histories = (self.k_history[layer_idx, request_id], self.v_history[layer_idx, request_id])
+        for role, history in enumerate(histories):
+            seq = torch.cat(history)
+            total = seq.shape[0]
+            packed, scales = _nvfp4_quantize(
+                seq.reshape(total * hkv, d), self.kv_scale_orig_quant[1 + role]
+            )
+            packed = packed.reshape(total, hkv, d // 2)
+            scales = scales.reshape(total, hkv, groups)
+            for j in range((total + tpb - 1) // tpb):
+                k_off = int(self.block_offsets[0, slot, 0, j].item())
+                assert k_off % slabs_per_page == 0, "multi-layer K offset stride"
+                page = k_off // slabs_per_page
+                n = min(tpb, total - j * tpb)
+                rows = slice(j * tpb, j * tpb + n)
+                label = f"layer {layer_idx}, request {request_id}, role {role}, page {j}"
+                got = data[page, role, :, :n].permute(1, 0, 2)
+                assert torch.equal(got, packed[rows]), label
+                sf_page = block_scales[page, role]
+                if role == 0:
+                    got_sf = sf_page[:, :n].permute(1, 0, 2)
+                else:
+                    grouped = sf_page.reshape(hkv, tpb // 4, groups, 4).permute(0, 1, 3, 2)
+                    got_sf = grouped.reshape(hkv, tpb, groups)[:, :n].permute(1, 0, 2)
+                assert torch.equal(got_sf, scales[rows]), f"{label}: block scales"
+
     def random_qkv(self, num_tokens: int) -> torch.Tensor:
         width = (self.num_heads + 2 * self.num_kv_heads) * self.head_dim
         return torch.randn(num_tokens, width, dtype=torch.bfloat16, device="cuda")
+
+
+def _block_scale_view(
+    mgr: KVCacheManagerV2, layer_idx: int, num_kv_heads: int, tokens_per_block: int, head_dim: int
+) -> torch.Tensor:
+    """One layer's e4m3 block scales in an NVFP4 manager's scale pool,
+    `[pages, 2, Hkv, tokens_per_block, D/16]` uint8: the data view's shape at
+    D/16 bytes a row.
+
+    The manager has no accessor for them, so this mirrors `get_buffers`,
+    which builds the data view from the layer's slot-0 KEY address: the
+    scale slabs keep the data slabs' order (the manager asserts each layer's
+    block-scale offset equals its data offset), with V's scales right after
+    K's, so stepping by the layer's page-index scale walks its pages."""
+    layer = mgr.layer_offsets[layer_idx]
+    role = Role.KEY_BLOCK_SCALE
+    groups = head_dim // NVFP4_BLOCK
+    slab = num_kv_heads * tokens_per_block * groups
+    addr = mgr.impl.get_mem_pool_base_address(layer, role, PageIndexMode.SHARED)
+    assert mgr.impl.get_page_stride(layer, role) == slab, "one e4m3 scale per 16 values"
+    v_addr = mgr.impl.get_mem_pool_base_address(layer, Role.VALUE_BLOCK_SCALE, PageIndexMode.SHARED)
+    assert v_addr == addr + slab, "V's block scales follow K's within the page"
+    page_scale = int(mgr.impl.get_page_index_scale(layer, role))
+    assert page_scale == mgr.get_layer_page_index_scale(layer_idx), "scales page with their data"
+    pages = int(mgr.impl.get_page_index_upper_bound(layer, role)) // 2
+    shape = [pages, 2, num_kv_heads, tokens_per_block, groups]
+    view = convert_to_torch_tensor(TensorWrapper(addr, torch.uint8, shape))
+    return view[:: page_scale // 2]
 
 
 def _compose_two_pools(env_a, env_b):
@@ -6187,16 +6278,22 @@ def test_fp8_std_append_race_control() -> None:
 # tolerance is the bf16 one-hot bound over a bf16 pool; over fp8 the softmax
 # probabilities are an e4m3 MMA operand and carry its 2**-4 relative error --
 # the zeros stay exactly zero, which is the part that pins the mask.
+# (name, query heads, kv heads, pool dtype, quant_mode, kv scale, weight rtol). 6/1/256 is a
+# tensor-parallel rank's share of the 24/2/256 layer at four ranks.
 _DRAFT_POOLS = [
-    ("bf16 24/2/256", 2, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
-    ("bf16 24/4/256", 4, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
-    ("fp8 24/4/256", 4, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
-    ("fp8 24/2/256", 2, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("bf16 24/2/256", 24, 2, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
+    ("bf16 24/4/256", 24, 4, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
+    ("fp8 24/4/256", 24, 4, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("fp8 24/2/256", 24, 2, torch.float8_e4m3fn, QUANT_MODE_FP8_KV_CACHE, 1.0, 2**-4),
+    ("bf16 6/1/256", 6, 1, torch.bfloat16, 0, None, SWA_WEIGHT_RTOL),
 ]
 
 
-def _draft_env(num_kv_heads: int, pool_dtype, quant_mode: int, scale) -> _PagedAttnEnv:
+def _draft_env(
+    num_heads: int, num_kv_heads: int, pool_dtype, quant_mode: int, scale
+) -> _PagedAttnEnv:
     return _std_fp8_env(
+        num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         pool_dtype=pool_dtype,
         quant_mode=quant_mode,
@@ -6214,10 +6311,10 @@ def test_std_predicted_tokens_mask_is_bottom_right_causal(pool) -> None:
     zero, at P = 2, 3, 4. Rows are token-major within a sequence, all P tokens
     are appended, and mask_type 0 and 1 are bitwise identical.
     """
-    _, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
+    _, hq, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
     for p in (2, 3, 4):
         torch.manual_seed(450 + p)
-        env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+        env = _draft_env(hq, hkv, pool_dtype, quant_mode, scale)
         cached = 40
         env.add_request(0, cached)
         env.add_request(1, cached)
@@ -6256,13 +6353,14 @@ def test_std_predicted_tokens_full_block_rival(pool) -> None:
     model -- every draft row seeing its later siblings -- sits outside the
     band by, at P = 2, 3, 4 and the mixed step on sm_103: 45x, 89x, 113x, 75x
     (bf16 24/2/256); 61x, 59x, 118x, 104x (bf16 24/4/256); 4.8x, 6.2x, 11.3x,
-    10.0x (fp8 24/4/256, in the fp8 decode band). At P = 1 the two coincide."""
-    name, hkv, pool_dtype, quant_mode, scale, _ = pool
+    10.0x (fp8 24/4/256, in the fp8 decode band); 42x, 57x, 59x, 77x (bf16
+    6/1/256). At P = 1 the two coincide."""
+    name, hq, hkv, pool_dtype, quant_mode, scale, _ = pool
     fp8 = pool_dtype == torch.float8_e4m3fn
     atol, rtol = (FP8_DECODE_ATOL, FP8_DECODE_RTOL) if fp8 else (ATOL, RTOL)
     for p in (2, 3, 4):
         torch.manual_seed(460 + p)
-        env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+        env = _draft_env(hq, hkv, pool_dtype, quant_mode, scale)
         env.add_request(0, 70)
         env.add_request(1, 35)
         _paged_ctx_call(env, env.random_qkv(105), [70, 35], 2, [0, 1])
@@ -6289,7 +6387,7 @@ def test_std_predicted_tokens_full_block_rival(pool) -> None:
     # A context row ahead of two draft blocks of different histories.
     torch.manual_seed(470)
     p = 3
-    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    env = _draft_env(hq, hkv, pool_dtype, quant_mode, scale)
     env.add_request(0, 31)
     env.add_request(1, 64)
     env.add_request(2, 20)
@@ -6313,11 +6411,11 @@ def test_std_predicted_tokens_page_crossing_and_consecutive_steps(pool) -> None:
     cached, P = 3, pages of 32), read out one-hot; then three consecutive
     P = 4 steps over a growing history, so the block lands at several offsets,
     each inside `_compare`."""
-    name, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
+    name, hq, hkv, pool_dtype, quant_mode, scale, weight_rtol = pool
     fp8 = pool_dtype == torch.float8_e4m3fn
     torch.manual_seed(471)
     p = 3
-    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    env = _draft_env(hq, hkv, pool_dtype, quant_mode, scale)
     cached = 31
     env.add_request(0, cached)
     env.call_op(_std_onehot_qkv(env, cached, list(range(cached)), 0), [cached], 1, [0], MASK_CAUSAL)
@@ -6337,7 +6435,7 @@ def test_std_predicted_tokens_page_crossing_and_consecutive_steps(pool) -> None:
     env.check_unwritten_pool_zero()
 
     torch.manual_seed(472)
-    env = _draft_env(hkv, pool_dtype, quant_mode, scale)
+    env = _draft_env(hq, hkv, pool_dtype, quant_mode, scale)
     env.add_request(0, 100)
     env.call_op(env.random_qkv(100), [100], 1, [0], MASK_CAUSAL)
     for _ in range(3):
@@ -6377,14 +6475,18 @@ def _qwen_bf16_env(**kwargs) -> _PagedAttnEnv:
     return _PagedAttnEnv(**kwargs)
 
 
-def test_bf16_gqa24_2_cached_prefix_rival() -> None:
+@pytest.mark.parametrize("heads", [(QWEN_HQ, QWEN_HKV), (6, 1)], ids=["24/2", "6/1"])
+def test_bf16_gqa24_2_cached_prefix_rival(heads) -> None:
     """A 96-token request served by two paged-context calls, 48 then 33 over
     the 48-token prefix: each inside `_compare`, and the second far outside
     the band around the prefix-ignored model -- every row seeing only this
     call's own 33 tokens, which is what a call that never reached the pool
-    computes (183x on sm_103). On the fresh call the two coincide."""
+    computes (on sm_103: 183x at 24/2, 163x at 6/1). On the fresh call the
+    two coincide. At the checkpoint's 24/2 and at a tensor-parallel rank's 6/1
+    share of it."""
+    hq, hkv = heads
     torch.manual_seed(523)
-    env = _qwen_bf16_env()
+    env = _qwen_bf16_env(num_heads=hq, num_kv_heads=hkv)
     env.add_request(0, 96)
     for new_tokens in (48, 33):
         cached = env.cached_len(0)
@@ -6394,7 +6496,7 @@ def test_bf16_gqa24_2_cached_prefix_rival() -> None:
         if cached:
             _assert_far_outside_band(
                 out,
-                _packed_reference(qkv, [new_tokens], QWEN_HQ, QWEN_HKV, QWEN_D, causal=True),
+                _packed_reference(qkv, [new_tokens], hq, hkv, QWEN_D, causal=True),
                 QWEN_MIN_SEPARATION,
                 f"the {cached}-token cached prefix never reached the FMHA",
                 ATOL,
@@ -6515,6 +6617,8 @@ def _qwen_layer_pools(
     other_blocks: int = 32,
     max_seq_len: int = 256,
     max_batch: int = 4,
+    num_heads: int = QWEN_HQ,
+    num_kv_heads: int = QWEN_HKV,
     **pool_kw,
 ) -> Tuple[_MultiLayerPagedAttnEnv, _MultiLayerPagedAttnEnv]:
     """The two pools of the hybrid mapping, at the full-attention cell.
@@ -6524,11 +6628,12 @@ def _qwen_layer_pools(
     somewhere to look. Both managers take the same max_seq_len and max_batch,
     which makes their block-offset tables concatenable into the per-pool table
     the op indexes by the mapping's pool column. `pool_kw` (dtype, quant_mode,
-    kv_scaling_factor) goes to both.
+    kv_scaling_factor) goes to both, and so do the head counts: the
+    checkpoint's 24/2, or a tensor-parallel rank's share of them.
     """
     kw = dict(
-        num_heads=QWEN_HQ,
-        num_kv_heads=QWEN_HKV,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
         head_dim=QWEN_D,
         tokens_per_block=QWEN_TPB,
         max_seq_len=max_seq_len,
@@ -6549,7 +6654,9 @@ def _compose_engine_mapping(
     offsets of the hybrid arrangement. Row i is what local_layer_idx=i selects:
     rows 3, 7, ..., 47 are pool 0 at layer-in-pool 0..11, every other row is
     pool 1. Recompose after each refresh_offsets: offsets are concatenated by
-    value."""
+    value. A manager whose max_seq_len outgrows its pool clamps it to the
+    pool's capacity, so the two tables can differ in width; the narrower is
+    zero-padded to the wider, the one width an engine's table has."""
     pool_pointers = torch.zeros(2, 2, dtype=torch.int64, device="cpu")
     pool_pointers[0] = attn.mgr.kv_cache_pool_pointers[0]
     pool_pointers[1] = other.mgr.kv_cache_pool_pointers[0]
@@ -6563,7 +6670,9 @@ def _compose_engine_mapping(
             rows.append([1, in_other])
             in_other += 1
     mapping = torch.tensor(rows, dtype=torch.int32, device="cpu")
-    offsets = torch.cat([attn.block_offsets, other.block_offsets], dim=0)
+    width = max(attn.block_offsets.shape[-1], other.block_offsets.shape[-1])
+    tables = [F.pad(t, (0, width - t.shape[-1])) for t in (attn.block_offsets, other.block_offsets)]
+    offsets = torch.cat(tables, dim=0)
     return pool_pointers, mapping, offsets
 
 
@@ -6572,17 +6681,20 @@ def _assert_only_this_layer_moved(
     snapshot: List[torch.Tensor],
     layer: int,
     label: str,
+    views: Optional[List[torch.Tensor]] = None,
 ) -> None:
     """This layer's slabs moved, and every other layer's slabs are bitwise as
     they were. The complement's size is asserted too, so the sibling loop
-    cannot pass by being empty."""
-    assert not _bitwise_equal(snapshot[layer], env.layer_views[layer]), (
+    cannot pass by being empty. `views` defaults to the layers' data views;
+    an NVFP4 pool's block-scale views are checked the same way."""
+    views = env.layer_views if views is None else views
+    assert not _bitwise_equal(snapshot[layer], views[layer]), (
         f"{label}: the named layer's slabs did not move at all"
     )
     siblings = [m for m in range(env.num_layers) if m != layer]
     assert len(siblings) == env.num_layers - 1 and siblings, f"{label}: empty complement"
     for m in siblings:
-        assert _bitwise_equal(snapshot[m], env.layer_views[m]), (
+        assert _bitwise_equal(snapshot[m], views[m]), (
             f"{label}: the call wrote layer {m}'s slabs as well as its own"
         )
 
@@ -7294,35 +7406,56 @@ def _cell_layered(cell, arm) -> None:
 
     `hybrid48` is the engine's arrangement (rows 3, 7, ..., 47 on pool 0 at
     layer-in-pool 0..11, the other 36 rows on pool 1); `identity48` a real
-    48-layer manager's single pool. The history goes in through the same row
-    by an uncertified context call. Beside `_compare`: the call moved its own
-    layer's slabs and no sibling's, and the second pool stayed untouched.
+    48-layer manager's single pool. Every sequence with a `cached` history
+    gets it through the same row by an uncertified paged-context call; a
+    context row with none is a fresh prompt, and a generation row is `P` rows
+    over its history. The pool holds the cell's pages, and `max_seq_len`
+    (when the cell names the engine's) is what the call passes as
+    max_seq_len and max_context_length. Beside `_compare`: the call moved its own
+    layer's slabs (and, over NVFP4, its block scales) and no sibling's, and
+    the second pool stayed untouched.
     """
     spec = cell.spec
     arm(op)
     _seed(cell)
     row, p = spec["local_layer_idx"], spec["predicted_tokens_per_seq"]
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
-    assert all(cached), "the history call drives every sequence of the cell"
+    paged = spec["use_paged_context_fmha"]
+    assert all(n == p for n in new[nc:]), "a generation row carries P q rows"
+    assert all(cached[nc:]), "a generation row attends over a history"
+    assert paged or not any(cached[:nc]), "a cached prefix needs the paged-context path"
     fp8 = bool(spec["quant_mode"] & QUANT_MODE_FP8_KV_CACHE)
-    pool_kw = (
-        dict(dtype=DataType.FP8, quant_mode=spec["quant_mode"], kv_scaling_factor=spec["kv_scale"])
-        if fp8
-        else {}
-    )
+    nvfp4 = bool(spec["quant_mode"] & QUANT_MODE_NVFP4_KV_CACHE)
+    assert not ((fp8 or nvfp4) and not paged and 0 < nc < len(new))
+    if fp8 or nvfp4:
+        pool_kw = dict(
+            dtype=DataType.NVFP4 if nvfp4 else DataType.FP8,
+            quant_mode=spec["quant_mode"],
+            kv_scaling_factor=spec["kv_scale"],
+        )
+    else:
+        pool_kw = {}
+    tpb = spec["tokens_per_block"]
+    pages = sum(-(-(c + n) // tpb) for c, n in zip(cached, new)) + 16
+    heads = dict(num_heads=spec["num_heads"], num_kv_heads=spec["num_kv_heads"])
     if spec["pool_layout"] == "hybrid48":
-        env, other = _qwen_layer_pools(max_batch=spec["max_num_requests"], **pool_kw)
+        env, other = _qwen_layer_pools(
+            attn_blocks=max(48, pages),
+            max_seq_len=spec.get("max_seq_len", 256),
+            max_batch=spec["max_num_requests"],
+            **heads,
+            **pool_kw,
+        )
         layer = QWEN_ATTN_LAYERS.index(row)
     else:
         env = _MultiLayerPagedAttnEnv(
             num_layers=QWEN_NUM_LAYERS,
-            num_heads=spec["num_heads"],
-            num_kv_heads=spec["num_kv_heads"],
             head_dim=spec["head_size"],
-            tokens_per_block=spec["tokens_per_block"],
-            num_blocks=24,
+            tokens_per_block=tpb,
+            num_blocks=max(24, pages),
             max_batch=spec["max_num_requests"],
-            max_seq_len=128,
+            max_seq_len=spec.get("max_seq_len", 128),
+            **heads,
             **pool_kw,
         )
         other, layer = None, row
@@ -7337,26 +7470,28 @@ def _cell_layered(cell, arm) -> None:
     rids = list(range(len(new)))
     for rid in rids:
         env.add_request(rid, cached[rid] + (new[rid] if rid < nc else 0))
-    env.refresh_offsets(rids, num_contexts=len(rids))
-    hist = list(cached)
-    env.call_op(
-        layer,
-        env.random_qkv(sum(hist)),
-        hist,
-        len(rids),
-        rids,
-        local_layer_idx=row,
-        use_paged_context_fmha=True,
-        ctx_lens=hist,
-        **tables(),
-    )
-    if nc == 0:
-        for rid in rids:
-            for _ in range(p):
-                env.add_decode_token(rid)
+    prior = [rid for rid in rids if cached[rid]]
+    if prior:
+        hist = [cached[rid] for rid in prior]
+        env.refresh_offsets(prior, num_contexts=len(prior))
+        env.call_op(
+            layer,
+            env.random_qkv(sum(hist)),
+            hist,
+            len(prior),
+            prior,
+            local_layer_idx=row,
+            use_paged_context_fmha=True,
+            ctx_lens=hist,
+            **tables(),
+        )
+    for rid in rids[nc:]:
+        for _ in range(p):
+            env.add_decode_token(rid)
     env.refresh_offsets(rids, num_contexts=nc)
     qkv = env.random_qkv(sum(new))
     snapshot = [v.clone() for v in env.layer_views]
+    scale_snapshot = [v.clone() for v in env.scale_views]
     out = env.call_op(
         layer,
         qkv,
@@ -7364,14 +7499,20 @@ def _cell_layered(cell, arm) -> None:
         nc,
         rids,
         local_layer_idx=row,
-        use_paged_context_fmha=True,
+        use_paged_context_fmha=paged,
         ctx_lens=[new[i] if i < nc else env.prompt_lens[i] for i in rids],
         predicted_tokens_per_seq=p,
         **tables(),
     )
-    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer, e4m3=fp8))
+    # The packed path's context rows read the bf16 q rows, never the pool.
+    e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
+    _compare(out, _op_reference(env, qkv, list(new), rids, layer=layer, e4m3=e4m3, nvfp4=nvfp4))
     env.check_caches(rids, layers=[layer])
     _assert_only_this_layer_moved(env, snapshot, layer, cell.why)
+    if nvfp4:
+        _assert_only_this_layer_moved(
+            env, scale_snapshot, layer, f"{cell.why} (block scales)", views=env.scale_views
+        )
     for before, after in zip(other_before, [] if other is None else other.layer_views):
         assert _bitwise_equal(before, after), "a pool-0 row wrote the second pool"
 
@@ -7408,6 +7549,19 @@ _QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 #: needs 133 of the 144).
 _QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
 _QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
+
+
+#: The unified target's full-attention call at a tp4 / tep4 rank: the checkpoint's 24 query and
+#: 2 kv heads split four ways, 6 query heads over one kv head (a dep4 rank keeps 24/2).
+_QWEN4_TP4 = dict(QWEN4_DENSE, num_heads=6, num_kv_heads=1)
+#: The max_seq_len the unified target's core engine runs (and its MTP engine): what the call
+#: passes as max_seq_len and max_context_length. The manager sizes its block-offset table from
+#: it, clamped to what the cell's pool can hold.
+_CORE_MAX_SEQ_LEN = 9216
+_MTP_MAX_SEQ_LEN = 16384
+#: Row 47 of a real 48-layer manager's single pool: the last attention row, the widest
+#: layer-base shift.
+_IDENTITY_ROW_47 = dict(pool_layout="identity48", local_layer_idx=47)
 
 
 def _spread(batch: int, longest: int) -> tuple[int, ...]:
@@ -7895,6 +8049,182 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
                 new=(20, 4, 4),
                 num_contexts=1,
                 predicted_tokens_per_seq=4,
+            ),
+        ),
+    ),
+    # The unified target at tp4 / tep4 (6q/1kv per rank) and dep4 (24/2 per rank), over a
+    # 48-layer pool as the engine's manager builds it, at the batches and lengths its engines
+    # run: up to 128 requests per rank at tp4 / tep4 and 32 at dep4, max_num_tokens 8192.
+    "qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified": (
+        Cell(
+            why="unified tp4 prefill 6q/1kv: a fresh 70-row context on the packed path, "
+            "one sequence in 4 slots",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                use_paged_context_fmha=False,
+                cached=(0,),
+                new=(70,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified tp4 decode, one request in one slot: 6q/1kv over a 9215-token "
+            "history, the KV at max_seq_len",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                cached=(9215,),
+                new=(1,),
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                max_num_requests=1,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified tp4 decode at 128 requests, the captured-batch ceiling: 6q/1kv "
+            "over histories 1..1000",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                cached=_spread(128, 1000),
+                new=(1,) * 128,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                max_num_requests=128,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified tp4 mixed step 6q/1kv: a fresh 40-row context and 33 rows over a "
+            "48-token prefix ahead of two decode rows",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                cached=(0, 48, 70, 35),
+                new=(40, 33, 1, 1),
+                num_contexts=2,
+                predicted_tokens_per_seq=1,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified tp4 hybrid pool 6q/1kv: 33 context rows over a 48-token prefix "
+            "through row 47 of the two-pool mapping",
+            spec=dict(
+                _QWEN4_TP4,
+                pool_layout="hybrid48",
+                local_layer_idx=47,
+                cached=(48,),
+                new=(33,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified tp4 prefill at max_num_tokens: one fresh 8192-row context, 6q/1kv",
+            spec=dict(
+                _QWEN4_TP4,
+                **_IDENTITY_ROW_47,
+                cached=(0,),
+                new=(8192,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_num_requests=1,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        *(
+            Cell(
+                why=f"unified tep4 MTP verify P={p} at 128 requests: 6q/1kv over histories "
+                f"1..1000, {128 * p} q rows",
+                spec=dict(
+                    _QWEN4_TP4,
+                    **_IDENTITY_ROW_47,
+                    cached=_spread(128, 1000),
+                    new=(p,) * 128,
+                    num_contexts=0,
+                    predicted_tokens_per_seq=p,
+                    max_num_requests=128,
+                    max_seq_len=_MTP_MAX_SEQ_LEN,
+                ),
+            )
+            for p in (2, 4, 8)
+        ),
+        Cell(
+            why="unified dep4 decode at 32 requests: 24q/2kv over histories 1..1000",
+            spec=dict(
+                QWEN4_DENSE,
+                **_IDENTITY_ROW_47,
+                cached=_spread(32, 1000),
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                max_num_requests=32,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        # KV within one 128-key tile (histories to 119 plus the new row), where the e4m3
+        # probability model of `reference` is the kernel's own: past it the model drifts
+        # from the kernel's per-tile rounding (see the entry's note).
+        Cell(
+            why="unified dep4 fp8 pool decode at 32 requests: 24q/2kv over histories 1..119",
+            spec=dict(
+                _QWEN4_FP8,
+                **_IDENTITY_ROW_47,
+                cached=_spread(32, 119),
+                new=(1,) * 32,
+                num_contexts=0,
+                predicted_tokens_per_seq=1,
+                max_num_requests=32,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified dep4 nvfp4 pool: 33 context rows over a 48-token e2m1 prefix "
+            "in a 48-layer pool, 32 slots",
+            spec=dict(
+                _QWEN4_NVFP4,
+                **_IDENTITY_ROW_47,
+                cached=(48,),
+                new=(33,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_num_requests=32,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified dep4 chunked prefill: a 512-row chunk over a 512-token prefix, "
+            "24q/2kv, 32 slots",
+            spec=dict(
+                QWEN4_DENSE,
+                **_IDENTITY_ROW_47,
+                cached=(512,),
+                new=(512,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_num_requests=32,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
+            ),
+        ),
+        Cell(
+            why="unified dep4 prefill at max_num_tokens: one fresh 8192-row context on the "
+            "packed path, 24q/2kv",
+            spec=dict(
+                QWEN4_DENSE,
+                **_IDENTITY_ROW_47,
+                use_paged_context_fmha=False,
+                cached=(0,),
+                new=(8192,),
+                num_contexts=1,
+                predicted_tokens_per_seq=1,
+                max_num_requests=32,
+                max_seq_len=_CORE_MAX_SEQ_LEN,
             ),
         ),
     ),

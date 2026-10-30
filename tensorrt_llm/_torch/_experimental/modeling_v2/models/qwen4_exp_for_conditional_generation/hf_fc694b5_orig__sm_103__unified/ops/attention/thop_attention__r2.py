@@ -101,7 +101,7 @@ class ThopAttention(OpWrapper):
     without allocating.
     """
 
-    ARCHS: frozenset[Arch] = frozenset()
+    ARCHS = frozenset({Arch.SM_103})
 
     # The shipped targets' cells are in this entry's test. gpt-oss alternates its
     # two window classes inside one engine, so both of its cells are live every
@@ -350,6 +350,32 @@ class ThopAttention(OpWrapper):
     The kv head count moves the compiled decode kernel at fixed Hq and D
     (24/2/256 runs a VarSeqQ16 variant, 24/4/256 VarSeqQ8), so a geometry that
     differs from a cell only in `num_kv_heads` is not covered by it.
+
+    The unified Qwen3.8-Flash-Next target runs a tensor-parallel rank's share
+    of the 24/2/256 layer, 6/1/256 (tp4, tep4), and the whole of it on a dep4
+    rank. Driven over a real 48-layer manager pool at row 47 (and once through
+    the two-pool hybrid mapping), at max_seq_len 9216 (16384 for MTP): 6/1
+    packed and paged context up to 8192 fresh rows, a mixed step, decode of one
+    request over 9215 keys (the multi-CTA KV path) and of 128 requests over
+    histories 1..1000, MTP verify P 2, 4 and 8 at 128 requests; 24/2 decode
+    at 32 requests, a 512-row chunk over a 512-token prefix, an 8192-row packed
+    prefill, and paged context over an NVFP4 pool -- the manager's
+    `[pools, 2, 2]` pointers, its block-scale pool checked bitwise per layer.
+    Measured on sm_103 against `reference`: at most 2.0 bf16 ulp of the row
+    scale per element and 0.78 of relative RMS. 6/1 decodes on a VarSeqQ8
+    kernel, like 24/4. P = 3 is driven at 6/1 only by the one-hot mask
+    read-out and the full-block rival, at two requests; P 5..7 not at all.
+
+    An fp8-pool decode at 24/2 and 32 requests is certified while each
+    history fits one 128-key tile (up to 119 cached keys plus the new one),
+    where `reference(e4m3_probabilities=True)` is the kernel's arithmetic:
+    0.75 ulp per element at most, 0.01 RMS, against 7.4-7.9 and 4.4 for
+    probabilities left fp32. Past it the row-max model drifts from the
+    kernel's per-tile rounding: over histories 1..200, 9.2 ulp per element
+    (1-3 elements of 196608 past the 8-ulp gate) at 1.35 RMS; over 1..1000,
+    10.5 and 2.8, while the fp32-probability rival sits at 6.9-7.9 and
+    3.8-4.3 -- this gate cannot tell the kernel from that rival there, so a
+    longer fp8 decode history is not certified by this entry.
 
     Generation kernels JIT through NVRTC and find their headers with `pip show
     tensorrt_llm`: a `pip` on PATH that cannot see the install fails every
