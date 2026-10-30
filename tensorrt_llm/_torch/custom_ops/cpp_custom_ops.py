@@ -15,6 +15,62 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 
 def _register_fake():
+    from .._experimental.modeling_v2.models.kimi_k3_vl.ops import \
+        _native as _native
+
+    @torch.library.register_fake("trtllm::rotate_rows_")
+    def rotate_rows_(self: torch.Tensor, shift: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::scatter_kv_slots_")
+    def scatter_kv_slots_(
+        pool: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        dst: torch.Tensor,
+        dst2: Optional[torch.Tensor] = None,
+        src: Optional[torch.Tensor] = None,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::block_causal_layout_")
+    def block_causal_layout_(
+        table: torch.Tensor,
+        private_pages: torch.Tensor,
+        causal_block_pages: torch.Tensor,
+        causal_block_offsets: torch.Tensor,
+        seq_len_kv: torch.Tensor,
+        own_slots: torch.Tensor,
+        current_private_src: torch.Tensor,
+        current_private_dst: torch.Tensor,
+        committed_private_src: torch.Tensor,
+        committed_private_dst: torch.Tensor,
+        staged_slots: Optional[torch.Tensor],
+        refill_src: Optional[torch.Tensor],
+        refill_dst: Optional[torch.Tensor],
+        causal_block_size: int,
+        tokens_per_page: int,
+        past: int,
+        fixed_tokens: int,
+        window_tokens: int,
+        num_pages: int,
+        drop_pages: int,
+        kv_factor: int,
+        kv_offset: int,
+        rows_per_page: int,
+    ) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::copy_kv_slots_")
+    def copy_kv_slots_(
+        pool: torch.Tensor,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        num_layers: int,
+        num_heads: int,
+        tokens_per_page: int,
+    ) -> None:
+        return None
 
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(

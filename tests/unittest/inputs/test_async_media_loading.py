@@ -13,7 +13,7 @@ import base64
 import tempfile
 import threading
 from io import BytesIO
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -322,3 +322,21 @@ class TestDataUriMimeCheck:
         with patch.object(media_io_module.VideoMediaIO, "load_base64", return_value="decoded"):
             result = await io.async_load("data:video/mp4;base64,AAAA")
         assert result == "decoded"
+
+
+def test_video_media_io_forwards_decoded_frame_limit():
+    decoded = object()
+    reserver = Mock()
+    io = media_io_module.VideoMediaIO(
+        max_decoded_frame_bytes=123,
+        decoded_memory_reserver=reserver,
+    )
+
+    with (
+        patch.object(media_io_module, "_select_cv2_stream_buffered_backend", return_value=7),
+        patch.object(media_io_module, "_load_video_by_cv2", return_value=decoded) as decode,
+    ):
+        assert io.load_bytes(b"video") is decoded
+
+    assert decode.call_args.kwargs["max_decoded_frame_bytes"] == 123
+    assert decode.call_args.kwargs["decoded_memory_reserver"] is reserver

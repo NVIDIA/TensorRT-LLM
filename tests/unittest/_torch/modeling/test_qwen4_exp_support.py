@@ -228,6 +228,136 @@ def test_text_model_registration_and_defaults() -> None:
     assert Qwen4ExpForCausalLM.get_preferred_kv_cache_manager_version() == "V2"
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="requires CUDA with bfloat16 support",
+)
+@torch.inference_mode()
+def test_conditional_generation_text_forward() -> None:
+    from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.configs import Qwen4ExpConfig
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+
+    assert (
+        get_registered_model_class("Qwen4ExpForConditionalGeneration")
+        is Qwen4ExpForConditionalGeneration
+    )
+    fields = _text_config_dict()
+    fields.update(
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        ple_layer_ids=[],
+        max_position_embeddings=32,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    config = Qwen4ExpConfig(
+        architectures=["Qwen4ExpForConditionalGeneration"],
+        text_config=fields,
+        vision_config={
+            "depth": 1,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_heads": 4,
+            "out_hidden_size": fields["hidden_size"],
+            "deepstack_visual_indexes": [],
+        },
+        image_token_id=1000,
+        video_token_id=1001,
+        vision_start_token_id=1002,
+        vision_end_token_id=1003,
+        pad_token_id=None,
+        bos_token_id=1,
+        eos_token_id=2,
+        torch_dtype=torch.bfloat16,
+        tie_word_embeddings=False,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        disable_mm_encoder=True,
+        attn_backend="TRTLLM",
+        moe_backend="CUTLASS",
+        max_num_tokens=4,
+        max_seq_len=32,
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(141)
+        with torch.device("cuda"):
+            model = Qwen4ExpForConditionalGeneration(model_config, disable_fuse_rope=True).eval()
+        model.cuda()
+        for name, parameter in model.named_parameters():
+            if parameter.is_floating_point():
+                if name.endswith("norm.weight"):
+                    parameter.fill_(1)
+                else:
+                    parameter.normal_(mean=0, std=0.02)
+
+    assert len(model.llm.model.layers) == 1
+    input_ids = torch.tensor([10, 11, 12, 13], device="cuda", dtype=torch.long)
+    position_ids = torch.arange(4, device="cuda").view(1, 1, 4).repeat(3, 1, 1)
+
+    def prepare_metadata():
+        metadata = TrtllmAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=4,
+            seq_lens=torch.tensor([4], dtype=torch.int32, device="cpu"),
+            num_contexts=1,
+            request_ids=[0],
+        )
+        metadata.max_seq_len = 4
+        metadata.prepare()
+        return metadata
+
+    context_logits = model(
+        attn_metadata=prepare_metadata(),
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=True,
+    )
+    assert context_logits.shape == (4, fields["vocab_size"])
+    assert context_logits.dtype == torch.float32
+    assert torch.isfinite(context_logits).all()
+
+    embeddings = model.llm.model.embed_tokens(input_ids)
+    # Different raw IDs: the logits must come from the supplied embeddings
+    # rather than from re-embedding input_ids (PLE is disabled above).
+    embedded_logits = model(
+        attn_metadata=prepare_metadata(),
+        input_ids=input_ids + 100,
+        position_ids=position_ids,
+        inputs_embeds=embeddings,
+        return_context_logits=True,
+    )
+    torch.testing.assert_close(context_logits, embedded_logits, rtol=1.6e-2, atol=1e-5)
+    last_logits = model(
+        attn_metadata=prepare_metadata(),
+        input_ids=input_ids,
+        position_ids=position_ids,
+        return_context_logits=False,
+    )
+    torch.testing.assert_close(last_logits, context_logits[-1:], rtol=1.6e-2, atol=1e-5)
+
+    # Keep the final mixer and head, but compute this baseline without the decoder.
+    bundle = torch.cat([embeddings] * fields["hc_count"], dim=-1)
+    collapsed, _ = model.llm.model.hyper_connection_mixer.mix(bundle)
+    bypass_logits = model.llm.lm_head(collapsed).float()
+    assert not torch.allclose(context_logits, bypass_logits, rtol=1.6e-2, atol=1e-5)
+
+    changed_ids = input_ids.clone()
+    changed_ids[:3] = torch.tensor([20, 21, 22], device="cuda")
+    changed_logits = model(
+        attn_metadata=prepare_metadata(),
+        input_ids=changed_ids,
+        position_ids=position_ids,
+        return_context_logits=False,
+    )
+    assert torch.isfinite(changed_logits).all()
+    assert (changed_logits - last_logits).abs().max().item() > 1e-5
+
+
 def test_empty_architecture_list_is_not_qwen4_exp() -> None:
     from tensorrt_llm._torch.pyexecutor.config_utils import is_qwen4_exp
 
@@ -445,7 +575,7 @@ def test_shared_expert_finalize_defers_only_when_no_collective_follows(
     # deferring stays sound above TP1.
     block.mapping.tp_size = 2
     block.enable_attention_dp = True
-    monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(modeling_qwen3_next, "is_sm_120f", lambda: False)
     deferred_adp = block(
         hidden_states,
         metadata,

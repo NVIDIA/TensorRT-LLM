@@ -737,7 +737,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                              reserved_sms: int) -> int:
         """Return the cached full-device occupancy for a cluster shape.
 
-        ``reserved_sms`` (``TRTLLM_CUTEDSL_SM_RESERVE``, applied inside
+        ``reserved_sms`` (``cute_dsl_utils.sm_reserve()``, applied inside
         ``HardwareInfo.get_max_active_clusters``) is part of the key so a
         reserve set after the first query is not hidden by the cache.
         """

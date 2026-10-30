@@ -1355,14 +1355,14 @@ standard-no-fastapi-cloud-cli = ["email-validator (>=2.0.0)", "fastapi-cli[stand
 
 [[package]]
 name = "filelock"
-version = "4.1.0"
+version = "3.20.3"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-4.1.0-py3-none-any.whl", hash = "sha256:2ce9818e3e2d8f284c1a964414447ef148d42a5fd5e2a477a7118e574b293ec1"},
-    {file = "filelock-4.1.0.tar.gz", hash = "sha256:ad7f724afef953e731b1cc39bcd3a09166d72ed7fcdf29e6e88b1c3235c6715d"},
+    {file = "filelock-3.20.3-py3-none-any.whl", hash = "sha256:4b0dda527ee31078689fc205ec4f1c1bf7d56cf88b6dc9426c4f230e46c2dce1"},
+    {file = "filelock-3.20.3.tar.gz", hash = "sha256:18c57ee915c7ec61cff0ecf7f0f869936c7c30191bb0cf406f1341778d0834e1"},
 ]
 
 [[package]]
@@ -1807,30 +1807,30 @@ numpy = ">=1.19.3"
 
 [[package]]
 name = "hf-xet"
-version = "1.7.0"
+version = "1.7.1"
 description = "Fast transfer of large files with the Hugging Face Hub."
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"AMD64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""
 files = [
-    {file = "hf_xet-1.7.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:fa029678be1ba7f953c409b0b27bf15cc69cd1c9b3a674fbd78856ebefca1052"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:57bc157b8b7fe3bee9dcb9af7f3da8de41801c3b31a9ef68a77a33c6a6be382f"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:87dab080f8f7d32781c2586904e3603f4e60d09bfc727706c3ae419e0829beeb"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:b01fe18dbbd151a2403d2c64ed30dc6547b00d6babab9a617d77c7acdb81ee66"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:4ee5e05a627f5ab5bad7a86582277d645556ea1e199903aae19e033a392aa13a"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:19c0e64f14175ccb6a1aff69e0d2ab9ec5269a560e6687abaf2b3fa4f73de7cd"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-win_amd64.whl", hash = "sha256:757168feb5679647c0bb13ee5d0faebe799c4dff9051419885a566ebd79f949d"},
-    {file = "hf_xet-1.7.0-cp314-cp314t-win_arm64.whl", hash = "sha256:b91569d5f1b61c34b043687da02c05dd3604f3d329e7868510bf3f7971599006"},
-    {file = "hf_xet-1.7.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e3e88a7a75d7d95cbee1f37dc31341d6201124cf21c6c4b1dfab8ccba9b09e0f"},
-    {file = "hf_xet-1.7.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:59fba37039233c7fcbe196817d6cdcf1b40dfb17b410f229d85b0cf0a1848da4"},
-    {file = "hf_xet-1.7.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:2814a6e999d13464c4d679b788cc5d784eb5a4edfc638a31f10e9a11ab531ef8"},
-    {file = "hf_xet-1.7.0-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:fcfd6c22418e57dd5b3aea649e813b2e2cfb2aebf317b210d90f1fe4b3018b52"},
-    {file = "hf_xet-1.7.0-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:80f79dae613ce9e0ea1fd1ae15616ca9ac74aed4c770aabc199c4f03ebecc863"},
-    {file = "hf_xet-1.7.0-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:0a9e802f33bf50c851abe45fc5380e61f959e2d369647d6742b79ad9d6c27cab"},
-    {file = "hf_xet-1.7.0-cp38-abi3-win_amd64.whl", hash = "sha256:2b7bb5727889b0f2436dbaaad8fc4c3e66b8240d992716989e0c086b4278b1bc"},
-    {file = "hf_xet-1.7.0-cp38-abi3-win_arm64.whl", hash = "sha256:acc3851cf2576a8fb2ae926da863f4efabe21303cf292e9a44332802ab0dcc6a"},
-    {file = "hf_xet-1.7.0.tar.gz", hash = "sha256:d406ec79053c0871817f700c2ac8c36ba0d87f9c34b7458b0f0063bb218b0466"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:4498ae151a4576d18f8714302c9be16aceda4b34ed028b3f5226656377d77163"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:fc2767e5b6ba9f74aa5b86728e64cef48668bed91c50e7313ba1d78f7c510c75"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:cfcb057a0e9dc337839056f3eb11b2d7e3b594686a56f37a0e4458071b6f84ca"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:6e6639f77da484eb36671d86262a48f7904946f31f6ce980dcf0690f2dfdc1c4"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:b269c6fe9f5c8104561b7320458a07865f64d159ee1306487be6f95ed9960013"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:bfa59cfeea1d3161bb6b86e8ceaaf1ee4bd07b0353222c27cfb643e0521c04d4"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-win_amd64.whl", hash = "sha256:4e649d3e9fd045a8563cf1346a6f67bbe3fa8215f5cce9b84042c876f26fe02c"},
+    {file = "hf_xet-1.7.1-cp314-cp314t-win_arm64.whl", hash = "sha256:4b5bc399ad059a2a7484f185162666fb7ecd77b573e8bafc336fd38a5741a522"},
+    {file = "hf_xet-1.7.1-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:e2f21d368a84f798cd394549292e3abe3be22d362aaf13fdd10b0f85a630590c"},
+    {file = "hf_xet-1.7.1-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:46d09bc6200388622f6aeb6db6d7b47060f63c483b6fb637e0e13e87470bfabf"},
+    {file = "hf_xet-1.7.1-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:f26bfd4a6e31b4e37e749a07e8642589406e8537be05eccfd633a92b95e2fb51"},
+    {file = "hf_xet-1.7.1-cp38-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:b7fe4b5c4cc912a2c7b36538c6696d3312bd1471835ee814c3dd3dfc5509c3b9"},
+    {file = "hf_xet-1.7.1-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:1b710504674091061d4f26fb7991773992dad091f8e162d0a8c965c3ec7427fe"},
+    {file = "hf_xet-1.7.1-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:aaa2cf2f7a35bd653a365f6444ac0860b7b5ec11b7658090005d4aa6e10ae60b"},
+    {file = "hf_xet-1.7.1-cp38-abi3-win_amd64.whl", hash = "sha256:d6e2c99e5dc7d6fa301e92e79a4f02cf962620dfc9fef84b687df597845cd72a"},
+    {file = "hf_xet-1.7.1-cp38-abi3-win_arm64.whl", hash = "sha256:c1f2c5685e89ee251e885c65ab366d981f555b2c8857642f4f8ee1e7dc4efdf6"},
+    {file = "hf_xet-1.7.1.tar.gz", hash = "sha256:89d06f4975e807eefc6f6777180f452cfb86f6c79f2a6caa6fb28809c84c6777"},
 ]
 
 [package.extras]
@@ -2721,6 +2721,7 @@ description = "Mistral-common is a library of common utilities for Mistral AI."
 optional = false
 python-versions = "<3.15,>=3.10.0"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "mistral_common-1.12.0-py3-none-any.whl", hash = "sha256:fa4504b66c30c0201ae4578c0340c5ee2abd22151c271532f62e373b985a53cf"},
     {file = "mistral_common-1.12.0.tar.gz", hash = "sha256:d0f150926733cf422d4750ca19b47568df1f714557c9054a432b866f1f30bf52"},
@@ -2741,6 +2742,40 @@ all = ["mistral_common[audio,guidance,hf-hub,image,opencv,sentencepiece,server]"
 audio = ["mistral_common[soundfile]", "mistral_common[soxr]"]
 guidance = ["jinja2 (>=3.1.0)", "llguidance (>=1.3.0,<1.4.0)"]
 hf-hub = ["huggingface-hub (>=1.0)"]
+image = ["mistral_common[opencv]"]
+opencv = ["opencv-python-headless (>=4.0.0)"]
+sentencepiece = ["sentencepiece (>=0.2.0)"]
+server = ["click (>=8.1.0)", "fastapi[standard] (>=0.118.3)", "pydantic-settings (>=2.9.1)", "uvloop (>=0.22.1) ; python_version >= \"3.14\""]
+soundfile = ["soundfile (>=0.12.1)"]
+soxr = ["soxr (>=0.5.0)"]
+
+[[package]]
+name = "mistral-common"
+version = "1.13.0"
+description = "Mistral-common is a library of common utilities for Mistral AI."
+optional = false
+python-versions = "<3.16,>=3.11.0"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "mistral_common-1.13.0-py3-none-any.whl", hash = "sha256:6304455b69ae9ca02cddb9bb3bb888ab8dcbe3945a3cafe3368897795611993d"},
+    {file = "mistral_common-1.13.0.tar.gz", hash = "sha256:8559b6e22e9b15d4d7445ae34db6d27578f3a6c0e3d74c5fd57b4bf2db543333"},
+]
+
+[package.dependencies]
+jsonschema = ">=4.21.1"
+numpy = {version = ">=1.25,<2.4", markers = "python_version <= \"3.12\""}
+pillow = ">=10.3.0"
+pydantic = ">=2.12,<3.0"
+pydantic-extra-types = {version = ">=2.10.5", extras = ["pycountry"]}
+requests = ">=2.0.0"
+tiktoken = {version = ">=0.7.0", markers = "python_version <= \"3.13\""}
+
+[package.extras]
+all = ["mistral_common[audio,guidance,hf-hub,image,opencv,sentencepiece,server]"]
+audio = ["mistral_common[soundfile]", "mistral_common[soxr]"]
+guidance = ["jinja2 (>=3.1.0)", "llguidance (>=1.3.0,<1.4.0)"]
+hf-hub = ["huggingface-hub (>=1.31.0)"]
 image = ["mistral_common[opencv]"]
 opencv = ["opencv-python-headless (>=4.0.0)"]
 sentencepiece = ["sentencepiece (>=0.2.0)"]
@@ -3428,14 +3463,14 @@ dill = ">=0.4.1"
 
 [[package]]
 name = "narwhals"
-version = "2.27.1"
+version = "2.28.0"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "narwhals-2.27.1-py3-none-any.whl", hash = "sha256:d057df13f5852b8e157596e82eb5e955fad267425df5e420e0ee9863da483b31"},
-    {file = "narwhals-2.27.1.tar.gz", hash = "sha256:aed93076a3ea42d9c32c88e4eb5ea422a21937011cbe1f480f9572a523c82094"},
+    {file = "narwhals-2.28.0-py3-none-any.whl", hash = "sha256:1f69d6385ec30e2fa6e1fdeb37c562ecabd0f713f6f3e3b58a668c5c9df9567f"},
+    {file = "narwhals-2.28.0.tar.gz", hash = "sha256:2d9860c80d6610820826e94c6e42ce4b1d92d89cdd479586e652a8d211dab345"},
 ]
 
 [package.extras]
@@ -4152,14 +4187,14 @@ dev = ["PyYAML (>=5.1.0)", "attrs", "build", "bump-my-version", "coveralls", "no
 
 [[package]]
 name = "openai"
-version = "3.39.0"
+version = "3.41.0"
 description = "The official Python library for the openai API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "openai-3.39.0-py3-none-any.whl", hash = "sha256:e29bc8d9785d9a386cffa0bed1726e7f3989e096245c0c003cb29f1d4ae67e32"},
-    {file = "openai-3.39.0.tar.gz", hash = "sha256:02687994f7bb6a4e80ed7796426d46c654889821ce4eb48699be15b3a425e1d3"},
+    {file = "openai-3.41.0-py3-none-any.whl", hash = "sha256:7060a74b239609b21f2919eb98807a8aad463b4f510b8b3b388b15559360b0a8"},
+    {file = "openai-3.41.0.tar.gz", hash = "sha256:d065fc59d3d7d8537a77b3ceb527732952c6ff610158e8a2a95b246be637e86f"},
 ]
 
 [package.dependencies]
@@ -5350,15 +5385,15 @@ yaml = ["pyyaml (>=6.0.1)"]
 
 [[package]]
 name = "pydantic-settings"
-version = "2.16.1"
+version = "2.16.2"
 description = "Settings management using Pydantic"
 optional = false
 python-versions = ">=3.11"
 groups = ["main"]
 markers = "python_version >= \"3.11\""
 files = [
-    {file = "pydantic_settings-2.16.1-py3-none-any.whl", hash = "sha256:30f5313340da4e8f1b440d1910b92a5bc3ccbb6b4ba70ec2b8395bc921f418f5"},
-    {file = "pydantic_settings-2.16.1.tar.gz", hash = "sha256:aff602a1886338c2df3d1e958e2193a8dc33cec75b91f202e83fd98484b4b0da"},
+    {file = "pydantic_settings-2.16.2-py3-none-any.whl", hash = "sha256:8d523e5c129b097686bde019bd6109bff53f4c8c3f63f1ddf9933ffa42e5ab4f"},
+    {file = "pydantic_settings-2.16.2.tar.gz", hash = "sha256:3dc08ffabed2bbd5dc2dd55ead7b78b4e4c5cd776aecd04310db5f1224caaf46"},
 ]
 
 [package.dependencies]
@@ -6850,36 +6885,16 @@ dev = ["bitsandbytes", "blobfile", "cmake (>=3.19.0,<4.0.0)", "diskcache", "expe
 
 [[package]]
 name = "torchvision"
-version = "0.29.1"
+version = "0.29.2"
 description = "image and video datasets and models for torch deep learning"
 optional = false
 python-versions = "!=3.14.1,>=3.10"
 groups = ["main"]
 files = [
-    {file = "torchvision-0.29.1-cp310-cp310-macosx_14_0_arm64.whl", hash = "sha256:9ef8de9b4a47b00dbe0a6a35bba22907f86f091adef57a76f1581502dbfc59f8"},
-    {file = "torchvision-0.29.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:2485e48e13afa9a8459ee7514b3cc70ed8a0a00778e0eac9c666a6fcdc7e7719"},
-    {file = "torchvision-0.29.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:ad9e4516294d6911a4287bdb8256d6fed96f34be3efa53b3eefa6716663de0c8"},
-    {file = "torchvision-0.29.1-cp310-cp310-win_amd64.whl", hash = "sha256:c432464fe421311bee39c30597107db01fa5a02a525cb38573dc75e7b21104fc"},
-    {file = "torchvision-0.29.1-cp311-cp311-macosx_14_0_arm64.whl", hash = "sha256:880c1c789fd9cdc31cdb4dbe906b8c74bd8b9b70509cc9fffe6b996ad0a0f656"},
-    {file = "torchvision-0.29.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:4838f8989eaf85eb84602639f4354cdad9c38468b8b05b34b0e6e96945814e7c"},
-    {file = "torchvision-0.29.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:2cb678029a5dd45afbbfa662fce49736827d52be33242b5a8a731e0db02ccdf5"},
-    {file = "torchvision-0.29.1-cp311-cp311-win_amd64.whl", hash = "sha256:3ffbf206311067faa5d8d7c70237d26df7b74012bcaa1bc6782a4eb615394925"},
-    {file = "torchvision-0.29.1-cp312-cp312-macosx_14_0_arm64.whl", hash = "sha256:3b6eb9d2f8fe9b93d9d37637749df361efeed133d96ddd503184a1b5b12bb27f"},
-    {file = "torchvision-0.29.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:6e111c6ead37ba63347548c5bd84e1b6a60b187854a19bc2c87c9a48396888d9"},
-    {file = "torchvision-0.29.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:6c717bd68dddaebbd9525377a17a84e38a291a33a218f59fdb76e8bb41e61c99"},
-    {file = "torchvision-0.29.1-cp312-cp312-win_amd64.whl", hash = "sha256:551c567fd39581570bf553c8df58895d567258b9997760179719f205ec5cd859"},
-    {file = "torchvision-0.29.1-cp313-cp313-macosx_14_0_arm64.whl", hash = "sha256:b0b3de76f2ee5678b7950ba9971cf72d9c5887cd7993db61788552f371686fed"},
-    {file = "torchvision-0.29.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:6231a8913a87b2943ad8779c4315992d1fce833901ddd28316382d3b003628c5"},
-    {file = "torchvision-0.29.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:c1b7f92604791dd0daa566f6fcc1eea0801753a34430c3ebdf79cfab2d96904c"},
-    {file = "torchvision-0.29.1-cp313-cp313-win_amd64.whl", hash = "sha256:41338cd71864419de9ae1e1b0058f6b8645f0548370c4750c7694ffa9bff611c"},
-    {file = "torchvision-0.29.1-cp314-cp314-macosx_14_0_arm64.whl", hash = "sha256:c33cbd596afa13c24de752ead437eb5da48285efd6dc2a06543948821bfde57a"},
-    {file = "torchvision-0.29.1-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:ad1e39d2b249d5c814a08f4846e927bac1dfa37c21e4c98a6b6a3cfa2032f5ab"},
-    {file = "torchvision-0.29.1-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:7e525b2fb6ba6575223e7e3b64bb4c3992124f3f4083c3097127bbce5098c237"},
-    {file = "torchvision-0.29.1-cp314-cp314-win_amd64.whl", hash = "sha256:63790be6f7b4f769d151b9282d7aba372a67d8b3412323157a9cc865d3c39866"},
-    {file = "torchvision-0.29.1-cp314-cp314t-macosx_14_0_arm64.whl", hash = "sha256:8b26ff2c61cd1da60d74cf704cae6007bc38902a60d4a7068fe327db1cb45c62"},
-    {file = "torchvision-0.29.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:22d992ada5a3717fd2f3e08b1f41ed984f3a7f498fd92f32618c26649592c700"},
-    {file = "torchvision-0.29.1-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:8ce8d1baa17da6d681ae35128148624287dcf3ea947116ec07520f860828f4ff"},
-    {file = "torchvision-0.29.1-cp314-cp314t-win_amd64.whl", hash = "sha256:97856838132174da848a18b766ace9bd34728123118f888fa2da86b97c6a5370"},
+    {file = "torchvision-0.29.2-py3-none-macosx_14_0_arm64.whl", hash = "sha256:d412494ff011f24c884a3cffd33eba1cb45a0299d4e26c1e175113f9d3b3ebc7"},
+    {file = "torchvision-0.29.2-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:a47f8f586df22d9e8e436854f9f613448e36788af8fb2e0eba91516034df2189"},
+    {file = "torchvision-0.29.2-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:0875f7a23bd298813240f716c56df44ce72ddb45146589442a38edd0e1f59637"},
+    {file = "torchvision-0.29.2-py3-none-win_amd64.whl", hash = "sha256:5812c312d4401c3587a045fa4c6228d982ebc4faa9b472275d11afe5852e24f9"},
 ]
 
 [package.dependencies]
@@ -7049,14 +7064,14 @@ typing-extensions = ">=4.15.0"
 
 [[package]]
 name = "tzdata"
-version = "2026.5"
+version = "2026.6"
 description = "Provider of IANA time zone data"
 optional = false
 python-versions = ">=2"
 groups = ["main"]
 files = [
-    {file = "tzdata-2026.5-py2.py3-none-any.whl", hash = "sha256:b683bd1b6659ddcd810ff02ad09ba821d4bf1065072805063eb35c49617905ac"},
-    {file = "tzdata-2026.5.tar.gz", hash = "sha256:8cc73c0a0bfca7dbfa59235d60b2eff82231dee33f53d206db1acd9173cfc0a7"},
+    {file = "tzdata-2026.6-py2.py3-none-any.whl", hash = "sha256:0a10eec6e13ef16b627fabed9a5f2ba61a62b1c67f327305f4e7e412a70b4aec"},
+    {file = "tzdata-2026.6.tar.gz", hash = "sha256:85d2cd9c09f81f0bb29db27759fc83af4f1e620efb814f8c5bf8b4cc4feece6d"},
 ]
 
 [[package]]
@@ -7675,4 +7690,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "e120f2c35a1a921b018f89c648106d52f0d763c76e7c9d4468d295f7e28bfd6e"
+content-hash = "c5bb6c4b97ae2a2e60a92bca494c9d30b37a43f6812e03a3e5b2434303f9d5fd"

@@ -79,6 +79,13 @@ class MoEInputRequirement:
     # Overrides the NVLink one-sided combine payload dtype; None means the
     # buffer follows the model output dtype.
     onesided_workspace_dtype: Optional[torch.dtype] = None
+    # ``run_moe`` works in buffers the backend keeps across calls: the tensor it
+    # returns may be a view of one, overwritten by the next call, and two calls
+    # in flight on different streams would share the same scratch. A multi-chunk
+    # forward therefore runs every chunk on one stream and copies each chunk's
+    # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
+    # chunk output, so it refuses a backend that declares this.
+    run_moe_reuses_buffers: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
@@ -327,6 +334,11 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The deployment forces per-call activation scales
+    # (``force_dynamic_quantization``) and the impl quantizes against scales
+    # fixed at load time. Distinct from QUANT_UNSUPPORTED: the impl serves the
+    # format, so the report must name this rejection as the degradation cause.
+    DYNAMIC_QUANT_UNSUPPORTED = "dynamic_quant_unsupported"
     # The impl only has a fused-finalize FC2 epilogue, and the caller disabled
     # finalize fusion (explicitly, or implicitly by configuring LoRA).
     FINALIZE_FUSION_REQUIRED = "finalize_fusion_required"

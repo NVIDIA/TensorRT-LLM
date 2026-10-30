@@ -40,9 +40,7 @@ LifeCycle makeLifeCycle(LayerConfig const& layer, int tokensPerBlock)
             }
             else
             {
-                bool const isSparse = !cfg.buffers.empty() && cfg.buffers.front().isSparse;
-                return AttnLifeCycle::make(
-                    cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, isSparse, cfg.reusePolicy);
+                return AttnLifeCycle::make(cfg.slidingWindowSize, cfg.numSinkTokens, tokensPerBlock, cfg.reusePolicy);
             }
         },
         layer);
@@ -88,18 +86,6 @@ LifeCycleId LifeCycleRegistry::getId(LifeCycle const& lc) const
         throw std::out_of_range("LifeCycleRegistry::getId: life cycle not found");
     }
     return it->second;
-}
-
-LifeCycleId LifeCycleRegistry::size() const noexcept
-{
-    check();
-    return mLifeCycleList.size();
-}
-
-inline void LifeCycleRegistry::check() const
-{
-    TLLM_CHECK_DEBUG_WITH_INFO(
-        toSizeT(mLifeCycleList.size()) == mLifeCycleIdMap.size(), "corrupted life cycle registry");
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

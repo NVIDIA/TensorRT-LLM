@@ -3008,6 +3008,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 "nightly-release" :
                                 (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
                             'register_images': runMode == "nightly_release" || (env.JOB_NAME ==~ /.*PostMerge.*/),
+                            'useWheelFromBuildStage': (env.JOB_NAME ==~ /.*PostMerge.*/),
                             'defaultTag': defaultTag,
                             // Canonical images carry BOLT profiles: the raw build is
                             // published as <tag>-noprofiles and <tag> is produced by the

@@ -1463,10 +1463,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
 
         op->mUseNvfp4MlaKvCache = op->mKVCacheQuantMode.hasFp4KvCache() && op->mUseTllmGenSparseAttention
             && !sparse_attn_kv_lens.has_value() && aux_kv_cache_pool_ptr.has_value();
-        op->mFP8ContextMLA
-            = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::getSMVersion() == 100
-                  || tensorrt_llm::common::getSMVersion() == 103 || tensorrt_llm::common::getSMVersion() == 107
-                  || tensorrt_llm::common::getSMVersion() == 120)
+        op->mFP8ContextMLA = (tensorrt_llm::common::getSMVersion() == 90 || tensorrt_llm::common::isSM100Family()
+                                 || tensorrt_llm::common::isSM120Family())
             && (op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache);
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache() || op->mUseNvfp4MlaKvCache;
@@ -1633,9 +1631,8 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     std::optional<int64_t> const tokens_per_block, int64_t const mask_type, int64_t const quant_mode,
     bool const use_paged_context_fmha, bool is_mla_enable)
 {
-    // Only Blackwell supports NVFP4 output.
-    // SM 120 does not support NVFP4 output.
-    if (tensorrt_llm::common::getSMVersion() < 100 || tensorrt_llm::common::getSMVersion() == 120)
+    // Only SM100 family supports NVFP4 output.
+    if (!tensorrt_llm::common::isSM100Family())
     {
         return false;
     }

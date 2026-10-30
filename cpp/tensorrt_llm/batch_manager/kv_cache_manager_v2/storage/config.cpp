@@ -154,12 +154,14 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     LifeCycleRegistry registry{config};
     int tokensPerBlock = config.tokensPerBlock;
 
-    // Map: lifeCycleId → ((coalescingGroup, expanded buffer size) → list of BufferId).
+    // Map: lifeCycleId → ((coalescingGroup, expanded buffer size, sparsity) → list of BufferId).
     // NOTE: Python uses insertion-ordered dict/defaultdict here. The std::map
     // grouping below intentionally remains sorted, which can make observable
     // pool-group indices/layout order differ from Python. Later lookups use
     // StorageConfig mappings, so this is not expected to affect correctness.
-    using CoalescingKey = std::pair<int, size_t>;
+    // Keyed on sparsity as well as group and size: a pool is uniformly sparse or uniformly
+    // dense, so one layer's buffers may land in both.
+    using CoalescingKey = std::tuple<int, size_t, bool>;
     std::map<LifeCycleId, std::map<CoalescingKey, std::vector<BufferId>>> bufferGroups;
     std::unordered_map<BufferId, int, BufferIdHash> expansionMap;
 
@@ -179,7 +181,7 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
 
                     BufferId bid{cfg.layerId, buf.role};
                     expansionMap[bid] = exp;
-                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize}].push_back(bid);
+                    bufferGroups[lcId][{buf.coalescingGroup, expandedSize, buf.isSparse}].push_back(bid);
                 }
             },
             layer);
@@ -195,28 +197,33 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
         var.lifeCycleId = lcId;
         for (auto const& [key, bufIds] : coalescingMap)
         {
+            [[maybe_unused]] auto const& [coalescingGroup, sz, isSparse] = key;
             CoalescedBuffer cb;
-            cb.singleBufferSize = key.second;
+            cb.singleBufferSize = sz;
+            cb.isSparse = isSparse;
             cb.bufferIds = bufIds;
             var.coalescedBuffers.push_back(std::move(cb));
         }
-        // Sort descending by size.
-        std::sort(var.coalescedBuffers.begin(), var.coalescedBuffers.end(),
+        // Sort descending by size. Stable, so pools of equal size keep the order their
+        // keys gave them -- by coalescing group, then sparsity -- which `size()` alone
+        // does not distinguish.
+        std::ranges::stable_sort(var.coalescedBuffers,
             [](CoalescedBuffer const& a, CoalescedBuffer const& b) { return a.size() > b.size(); });
         slotGroups.push_back(std::move(var));
     }
 
-    // Distinct sparsity and reuse policies need separate GPU pools and eviction queues.
+    // Distinct reuse policies need separate GPU pools and eviction queues. Keying on
+    // per-pool sparsity too keeps a shared pool uniformly host-backed or device-backed.
     struct PoolGroupKey
     {
         AttentionReusePolicy reusePolicy = AttentionReusePolicy::REQUIRED;
         std::vector<size_t> slotSizes;
-        bool isSparse = false;
+        std::vector<bool> sparsity;
 
         bool operator<(PoolGroupKey const& other) const
         {
-            return std::tie(reusePolicy, slotSizes, isSparse)
-                < std::tie(other.reusePolicy, other.slotSizes, other.isSparse);
+            return std::tie(reusePolicy, slotSizes, sparsity)
+                < std::tie(other.reusePolicy, other.slotSizes, other.sparsity);
         }
     };
 
@@ -225,13 +232,20 @@ StorageConfig createStorageConfig(KVCacheManagerConfig const& config)
     {
         auto const sizes = sg.slotSizeList();
         auto const* attn = std::get_if<AttnLifeCycle>(&registry.getLifeCycle(sg.lifeCycleId));
-        bool const isSparse = attn != nullptr && attn->isSparse;
         auto const policy = attn ? attn->reusePolicy : AttentionReusePolicy::REQUIRED;
-        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .isSparse = isSparse}].push_back(std::move(sg));
+        TypedVec<PoolIndex, bool> sparsity;
+        sparsity.reserve(sizes.size());
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
+        {
+            sparsity.push_back(sg.isSparse(pool));
+        }
+        poolGroups[{.reusePolicy = policy, .slotSizes = sizes.raw(), .sparsity = sparsity.raw()}].push_back(
+            std::move(sg));
     }
 
     StorageConfig out;
     out.cacheTiers = TypedVec<CacheLevel, CacheTierConfig>{config.cacheTiers};
+    out.hostSparsePoolQuota = config.hostSparsePoolQuota;
     out.expansion = expansionMap;
 
     for (auto& [key, variants] : poolGroups)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,13 @@ from cbts.rules.visual_gen import _is_vg_claim
 pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_CPU_STAGE_NAMES = {"CPU-Generic-x86-1", "CPU-Generic-arm-1"}
+_CPU_STAGE_NAMES = set(
+    re.findall(
+        r'^\s*"(CPU-Generic-[^"]+)":\s*\["cpu",',
+        (_REPO_ROOT / "jenkins/L0_Test.groovy").read_text(),
+        re.MULTILINE,
+    )
+)
 
 
 def _docs_rule() -> DocsRule:

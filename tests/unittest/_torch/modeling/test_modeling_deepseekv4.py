@@ -13,7 +13,7 @@ import pytest
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from utils.util import getSMVersion, skip_blackwell_geforce, skip_pre_blackwell
+from utils.util import isSM120Family, skip_blackwell_geforce, skip_pre_blackwell
 
 # from utils.util import default_dtype
 import tensorrt_llm
@@ -540,7 +540,7 @@ def test_deepseek_v4_mla_builds_both_norms_at_the_v4_widths():
             index_n_heads=32, index_head_dim=128, index_topk=512
         ),
     )
-    if getSMVersion() in (120, 121):
+    if isSM120Family():
         # SM120/SM121 only support DeepSeek-V4 sparse MLA through the FlashInfer
         # fp8_ds_mla path; construction raises ValueError with any other dtype.
         model_config.extra_attrs["kv_cache_dtype"] = "fp8_ds_mla"
@@ -1258,7 +1258,7 @@ def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, 
             256,
             tensorrt_llm.bindings.DataType.FP8,
             marks=pytest.mark.skipif(
-                getSMVersion() not in (120, 121),
+                not isSM120Family(),
                 reason="FlashInfer sparse MLA requires SM 120 or SM 121",
             ),
             id="fp8-ds-mla",

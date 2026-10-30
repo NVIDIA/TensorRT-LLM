@@ -19,6 +19,8 @@ l0_gb300:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  # MLA context head slices, including FP8 scale-block boundaries.
+  - unittest/_torch/modules/test_linear_output_slice.py
   # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
   - unittest/_torch/modeling/test_modeling_deepseekv41.py
   - unittest/_torch/modules/test_engram_decode_hash.py

@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -72,7 +72,11 @@ from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
     _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends)
+    _spawn_attached_frontends, _terminate_attached_frontends,
+    _watch_attached_frontends)
+from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
+                                               LAUNCHER_UDS_NAME,
+                                               MultiFrontendServing)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -517,6 +521,43 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
+def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
+    """Bind the Unix socket attached frontends forward launcher-owned routes to.
+
+    It lives in the multi-frontend ipc dir, which is private to the user and
+    removed, socket file included, when the executor proxy shuts down.
+    """
+    # Only the classic IPC proxy has the attribute.
+    ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
+    if not ipc_dir:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the classic IPC executor "
+            "proxy in multi-frontend mode")
+    path = os.path.join(ipc_dir, LAUNCHER_UDS_NAME)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(path)
+    except OSError:
+        sock.close()
+        raise
+    return sock, path
+
+
+def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
+    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning them.
+
+    Not via set_prometheus_multiproc_dir(): it keeps only its latest
+    TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
+    """
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return
+    if llm.args.return_perf_metrics or llm.args.perf_metrics_output_dir:
+        path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = path
+        logger.info(
+            f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -548,6 +589,16 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # An attached frontend gets the launcher's socket from its spawn env; the
+    # launcher is its parent.
+    multi_frontend_serving = None
+    if multi_frontend.is_attached_frontend:
+        attached_launcher_uds = os.environ.pop(LAUNCHER_UDS_ENV, None)
+        if attached_launcher_uds is not None:
+            multi_frontend_serving = MultiFrontendServing(
+                launcher_uds=attached_launcher_uds,
+                is_launcher=False,
+                launcher_pid=os.getppid())
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
         raise click.BadParameter(
             "Runtime control endpoints require num_serve_frontends=1 because "
@@ -625,12 +676,25 @@ def launch_server(
             # server construction, middleware registration, and runtime, or a
             # failure in between leaks the child processes.
             frontend_children = []
+            stop_watching_frontends = None
+            sockets = [s]
+            launcher_uds_sock = None
             try:
                 if multi_frontend.is_launcher:
+                    launcher_uds_sock, launcher_uds_path = _bind_launcher_uds(
+                        llm)
+                    _share_prometheus_multiproc_dir(
+                        llm, os.path.dirname(launcher_uds_path))
                     frontend_children = _spawn_attached_frontends(
                         llm,
                         multi_frontend.num_frontends,
+                        extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
                         report_failure=_report_observed_child_failure)
+                    stop_watching_frontends = _watch_attached_frontends(
+                        frontend_children)
+                    multi_frontend_serving = MultiFrontendServing(
+                        launcher_uds=launcher_uds_path, is_launcher=True)
+                    sockets.append(launcher_uds_sock)
 
                 server = OpenAIServer(
                     generator=llm,
@@ -647,7 +711,8 @@ def launch_server(
                     internal_disagg_auth_key=internal_disagg_auth_key,
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
-                    runtime_control_api_key=runtime_control_api_key)
+                    runtime_control_api_key=runtime_control_api_key,
+                    multi_frontend_serving=multi_frontend_serving)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -655,10 +720,15 @@ def launch_server(
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
-                uvloop.run(server(host, port, sockets=[s]))
+                uvloop.run(server(host, port, sockets=sockets))
             finally:
+                if stop_watching_frontends is not None:
+                    stop_watching_frontends.set()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
+                if launcher_uds_sock is not None:
+                    # Its file goes with the ipc dir (see _bind_launcher_uds).
+                    launcher_uds_sock.close()
 
 
 def launch_mm_encoder_server(
@@ -1203,6 +1273,19 @@ def launch_visual_gen_server(
                   help="Protocol used when --grpc is enabled.",
                   status="prototype")
 @stability_option(
+    "--openengine-metrics-port",
+    type=click.IntRange(1, 65535),
+    default=None,
+    help="OpenEngine Prometheus HTTP port (default: 8001). "
+    "Enabled by return_perf_metrics or perf_metrics_output_dir in the engine configuration.",
+    status="prototype")
+@stability_option(
+    "--openengine-metrics-host",
+    type=str,
+    default=None,
+    help="Bind address for OpenEngine Prometheus (default: --host).",
+    status="prototype")
+@stability_option(
     "--openengine-enable-load-metrics",
     is_flag=True,
     default=False,
@@ -1310,6 +1393,8 @@ def serve(
     grpc: bool,
     grpc_protocol: str,
     openengine_enable_load_metrics: bool,
+    openengine_metrics_port: Optional[int],
+    openengine_metrics_host: Optional[str],
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1342,6 +1427,20 @@ def serve(
         raise click.UsageError(
             "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
         )
+    if openengine_metrics_port is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-port requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_host is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-host requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_port is not None and openengine_metrics_port == port:
+        raise click.UsageError(
+            "--openengine-metrics-port must differ from --port")
+
     if moe_cluster_parallel_size is not None:
         logger.warning(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
@@ -1601,6 +1700,9 @@ def serve(
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
+                        metrics_host=openengine_metrics_host,
+                        metrics_port=8001 if openengine_metrics_port is None
+                        else openengine_metrics_port,
                         subagent_affinity_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server

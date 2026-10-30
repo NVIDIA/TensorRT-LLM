@@ -14,6 +14,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -74,7 +75,7 @@ def _cuda_graphs(requests: DummyRequestFactory, warmup_only: bool) -> DecoderCud
         cuda_graph_runner=SimpleNamespace(enabled=True, is_warmup_only=warmup_only),
         breakable_cuda_graph_runner=None,
         config=requests._config,
-        mapping=None,
+        mapping=Mapping(),
         model=None,
         sparse_attention_config=None,
         metrics={},

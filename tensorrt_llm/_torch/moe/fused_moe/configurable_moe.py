@@ -736,7 +736,7 @@ class ConfigurableMoE(MoE):
         # Owned at the wrapper because schedulers must not run it twice (external-comm
         # might enter via single- or multi-chunk paths).
         if self.enable_dwdp:
-            self.dwdp_manager.record_compute_and_prefetch_next(self.layer_idx)
+            self.dwdp_manager.finish_layer(self.layer_idx)
 
         # EPLB repeat counter: advance once per forward, regardless of chunk count.
         # Schedulers are forbidden from rotating ``repeat_idx`` themselves.

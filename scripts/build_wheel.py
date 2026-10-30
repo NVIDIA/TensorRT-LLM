@@ -792,6 +792,31 @@ def has_sm90_or_newer(cuda_architectures: str) -> bool:
     return False
 
 
+def install_modeling_v2_libs(mv2_build_dir: Path, lib_dir: Path,
+                             install_file) -> None:
+    """Install the modeling_v2 family libraries the way deep_ep and flash_mla are.
+
+    Each family's build directory holds cuda_architectures.txt, written at
+    configure time: the architectures its library was built for, empty when
+    there is none (cpp/cmake/modules/modeling_v2.cmake). As deep_ep's package
+    is, a family library installed by an earlier build that this build did not
+    produce is removed, so it is neither loaded nor shipped.
+    """
+    installed = set()
+    for arch_file in sorted(mv2_build_dir.glob("*/cuda_architectures.txt")):
+        if not arch_file.read_text().strip().strip(";"):
+            continue
+        libraries = list(arch_file.parent.glob("libth_modeling_v2_*.so"))
+        assert len(libraries) == 1, (
+            "Exactly one modeling_v2 library should be present in "
+            f"{arch_file.parent}: {libraries}")
+        install_file(libraries[0], lib_dir / libraries[0].name)
+        installed.add(libraries[0].name)
+    for stale in lib_dir.glob("libth_modeling_v2_*.so"):
+        if stale.name not in installed:
+            stale.unlink()
+
+
 def stage_nccl_extensions_package(wheel: Path, staging_dir: Path) -> None:
     """Stage NCCL-EP namespace packages from the intermediate wheel."""
     package_root = staging_dir / "3rdparty" / "nccl_extensions"
@@ -897,8 +922,10 @@ def main(*,
                              build_root=build_root)
 
     if cuda_architectures is not None:
-        if "70-real" in cuda_architectures:
-            raise RuntimeError("Volta architecture is deprecated support.")
+        if any(
+                re.match(r"^70a?(-real)?$", arch.strip())
+                for arch in cuda_architectures.split(";")):
+            raise RuntimeError("Volta architecture support is deprecated.")
 
     # Debug and RelWithDebInfo enable CUDA `--generate-line-info`, which
     # inflates .text so much that linking against every supported arch
@@ -907,7 +934,7 @@ def main(*,
     if build_type in ("Debug", "RelWithDebInfo") and not cuda_architectures:
         raise RuntimeError(
             f"Building {build_type} requires --cuda_architectures to be set "
-            "explicitly (e.g. --cuda_architectures=90-real). Building for all "
+            "explicitly (e.g. --cuda_architectures=90). Building for all "
             "architectures with line info enabled exceeds linker section "
             "limits. Pass a narrow arch list matching the GPU you intend to "
             "debug/profile.")
@@ -1018,7 +1045,7 @@ def main(*,
 
     targets = [
         "tensorrt_llm", "th_common", "bindings", "deep_ep", "deep_gemm",
-        "pg_utils", "flash_mla"
+        "pg_utils", "flash_mla", "modeling_v2_libs"
     ]
     build_nccl_extensions_enabled = has_sm90_or_newer(cuda_architectures)
     if build_nccl_extensions_enabled:
@@ -1341,6 +1368,8 @@ def main(*,
                      lib_dir / "libtensorrt_llm.so")
         install_file(build_dir / "tensorrt_llm/thop/libth_common.so",
                      lib_dir / "libth_common.so")
+        install_modeling_v2_libs(build_dir / "tensorrt_llm/modeling_v2",
+                                 lib_dir, install_file)
         if os.path.exists(
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so"
@@ -1607,8 +1636,10 @@ def add_arguments(parser: ArgumentParser):
         "--cuda_architectures",
         "-a",
         help=
-        "CUDA architectures to build for, will be passed to cmake `CUDA_ARCHITECTURES` variable. Example: `--cuda_architectures=90-real;100-real`"
-    )
+        "Exact CUDA architectures the build supports, as plain SM numbers separated by ';' "
+        "(passed to CMake as CMAKE_CUDA_ARCHITECTURES). Each listed architecture gets its fully "
+        "optimized kernels; unlisted architectures are unsupported. Do not add -real/-a/-f "
+        "suffixes. Example: `--cuda_architectures=90;100`")
     parser.add_argument("--install",
                         "-i",
                         action="store_true",

@@ -1104,7 +1104,7 @@ class BeamSearchStep:
         beam_width_in: int,
         beam_width_out: int,
         row_stride: int,
-        temperature: torch.Tensor,
+        temperature: Optional[torch.Tensor],
         length_penalty: Optional[torch.Tensor],
         diversity_rate: Optional[torch.Tensor],
         early_stopping: BeamSearchEarlyStop,
@@ -1133,13 +1133,16 @@ class BeamSearchStep:
             )
 
         # Unset length_penalty / diversity_rate stay None so the op skips them.
+        # Temperature stays None when it is 1.0 everywhere, so ``sample`` skips
+        # the full-vocab rescaling pass over the logits.
+        temperatures = [p.temperature for p in params]
         length_penalties = [p.length_penalty for p in params]
         diversity_rates = [p.diversity_rate for p in params]
         return cls(
             beam_width_in,
             beam_width_out,
             row_stride,
-            _to_device([p.temperature for p in params]),
+            _to_device(temperatures) if any(t != 1.0 for t in temperatures) else None,
             _to_device(length_penalties) if any(length_penalties) else None,
             _to_device(diversity_rates) if any(diversity_rates) else None,
             early_stopping,
@@ -1150,11 +1153,13 @@ class BeamSearchStep:
         self, logits: torch.Tensor, *, metadata: BeamSearchMetadata
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Sample the group's logits rows, ``row_stride`` per request."""
-        # Temperature is applied before the op slices the padding rows off, so
-        # it must cover every row the forward laid out.
-        temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
+        if self.temperature is not None:
+            # Temperature is applied before the op slices the padding rows off,
+            # so it must cover every row the forward laid out.
+            temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
+            logits = logits / temperature
         return beam_search_sampling_batch_cba(
-            logits / temperature,
+            logits,
             beam_width_in=self._beam_width_in,
             beam_width_out=self._beam_width_out,
             row_stride=self._row_stride,
