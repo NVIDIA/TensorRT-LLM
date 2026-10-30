@@ -361,9 +361,9 @@ _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
 """Largest per-rank token count for which the fused epilogue is taken.
 
-Accepts any integer >= 1. The default follows ``KIMI_K3_ATTN_RES_TOPOLOGY``:
-1 when the persistent port is off (the pre-existing decode-only gate) and 32
-when it is on. Setting this explicitly overrides both.
+Accepts any integer >= 1. Defaults to 32, the top of the measured range, for
+every ``KIMI_K3_ATTN_RES_TOPOLOGY``, so speculative-decoding verify steps and
+small decode batches take the fused epilogue as well as single-token decode.
 
 Read at import, so CUDA-graph capture and replay cannot disagree about it.
 """
@@ -374,8 +374,8 @@ KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
 Accepted values:
 
   ``per_token``   one CTA (N<=4) or one 8-CTA cluster (N>=5) per token; the
-                  persistent kernel is never used. This is the default, i.e.
-                  the feature is off and behaviour is unchanged.
+                  persistent kernel is never used. This is the default: the
+                  persistent kernel is off.
   ``persistent``  one CTA per SM looping over tokens, used at every shape the
                   persistent kernel implements (H == 7168 and 2 <= N <= 9).
   ``split``       persistent above ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``
@@ -420,15 +420,12 @@ def _read_attn_res_topology() -> str:
 
 
 def _read_fused_attn_res_max_tokens() -> int:
-    """Resolved after the topology, because its default follows it.
+    """Token ceiling of the fused epilogue; see KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS.
 
-    With the persistent port off -- the default -- the ceiling is 1, the
-    pre-existing gate: the fused epilogue is taken at the single-token decode
-    shape and nowhere else. Enabling the port raises it to 32, the top of the
-    measured range, so that "off" keeps meaning "unchanged".
+    Under ``split`` it is also the boundary above which the persistent kernel
+    takes over.
     """
-    default = "1" if _ATTN_RES_TOPOLOGY == "per_token" else "32"
-    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, default)
+    raw = os.environ.get(KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "32")
     try:
         value = int(raw)
     except ValueError:
