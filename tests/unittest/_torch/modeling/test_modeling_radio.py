@@ -172,7 +172,8 @@ def test_clear_blocks_cuda_graph_releases_only_at_explicit_boundary():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
-def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
+@pytest.mark.parametrize("vision_attn_backend", ["FLASHINFER", "TRTLLM"])
+def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic, vision_attn_backend):
     """Block-loop CUDA graph wiring must produce the same output as eager.
 
     Runs the tiny ViT once in eager mode to capture a reference, then enables the encoder graph
@@ -189,6 +190,7 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
         RADIOVisionModel(
             _make_bf16_model_config(),
             disable_quantization=True,
+            vision_attn_backend=vision_attn_backend,
             encoder_cuda_graph_config=(
                 MultimodalEncoderCudaGraphConfig(max_batch_size=2, max_num_tokens=16)
                 if automatic
@@ -204,7 +206,7 @@ def test_radio_blocks_cuda_graph_matches_eager(tiny_vit_config, automatic):
     )
     model.eval()
     _init_finite_weights(model)
-    assert model.model_config.attn_backend == "FLASHINFER"
+    assert model.model_config.attn_backend == vision_attn_backend
     if automatic:
         from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
 

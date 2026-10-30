@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import itertools
 import math
 from dataclasses import dataclass
@@ -10,6 +13,117 @@ from utils.util import skip_blackwell
 from tensorrt_llm._torch.attention.backends.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("static_device_lengths", [False, True])
+def test_no_cache_metadata_owns_pending_prompt_length_copy(
+        static_device_lengths: bool) -> None:
+    metadata = get_attention_backend("TRTLLM").Metadata(max_num_requests=1,
+                                                        max_num_tokens=8,
+                                                        kv_cache_manager=None)
+    metadata.num_contexts = 1
+    metadata.request_ids = [1]
+    metadata.max_seq_len = 8
+    metadata.is_cuda_graph = static_device_lengths
+    encoder_stream = torch.cuda.Stream()
+    encoder_stream.wait_stream(torch.cuda.current_stream())
+    observed = []
+    pending = torch.cuda.Event()
+
+    with torch.cuda.stream(encoder_stream):
+        torch.cuda._sleep(1_000_000_000)
+        pending.record()
+        for index, length in enumerate((3, 7)):
+            if index:
+                assert not pending.query(), "copy gate expired before reuse"
+            metadata.seq_lens = torch.tensor([length],
+                                             dtype=torch.int32,
+                                             pin_memory=True)
+            metadata.prepare()
+            observed.append(metadata.prompt_lens_cuda[:1].clone())
+
+    encoder_stream.synchronize()
+    assert observed[0].item() == 3
+    assert observed[1].item() == 7
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("cuda_graph", [False, True], ids=["eager", "graph"])
+def test_no_cache_attention_owns_pending_prompt_length_copy(
+        cuda_graph: bool) -> None:
+    num_heads, head_dim, num_tokens = 4, 128, 10
+    attention_cls = get_attention_backend("TRTLLM")
+    attention = attention_cls(layer_idx=0,
+                              num_heads=num_heads,
+                              num_kv_heads=num_heads,
+                              head_dim=head_dim)
+    metadata = attention_cls.Metadata(max_num_requests=2,
+                                      max_num_tokens=num_tokens,
+                                      kv_cache_manager=None)
+    metadata.num_contexts = 2
+    metadata.request_ids = [1, 2]
+    metadata.max_seq_len = 7
+    metadata.is_cuda_graph = cuda_graph
+    q = torch.zeros(num_tokens,
+                    num_heads * head_dim,
+                    device="cuda",
+                    dtype=torch.float16)
+    k = torch.zeros_like(q)
+    v = torch.arange(num_tokens, device=q.device, dtype=q.dtype)
+    v = v[:, None].expand_as(q).contiguous()
+    qkv = torch.cat((q, k, v), dim=-1)
+    lengths = ([3, 7], [7, 3])
+    expected = [
+        calculate_ref_result(q, k, v, num_heads, num_heads, head_dim, seq_lens)
+        for seq_lens in lengths
+    ]
+
+    def prepare(seq_lens: list[int]) -> None:
+        metadata.seq_lens = torch.tensor(seq_lens,
+                                         dtype=torch.int32,
+                                         pin_memory=True)
+        metadata.prepare()
+
+    def forward() -> torch.Tensor:
+        return attention.forward(qkv,
+                                 None,
+                                 None,
+                                 metadata,
+                                 attention_mask=PredefinedAttentionMask.FULL)
+
+    encoder_stream = torch.cuda.Stream()
+    encoder_stream.wait_stream(torch.cuda.current_stream())
+    observed = []
+    pending = torch.cuda.Event()
+    with torch.cuda.stream(encoder_stream):
+        # Warm both shapes before delaying the stream so allocations and
+        # first-use kernel setup cannot consume the pending-copy window.
+        for seq_lens in lengths:
+            prepare(seq_lens)
+            forward()
+        encoder_stream.synchronize()
+        if cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=encoder_stream):
+                graph_output = forward()
+
+        torch.cuda._sleep(1_000_000_000)
+        pending.record()
+        for index, seq_lens in enumerate(lengths):
+            if index:
+                assert not pending.query(), "copy gate expired before reuse"
+            prepare(seq_lens)
+            if cuda_graph:
+                graph.replay()
+                result = graph_output
+            else:
+                result = forward()
+            observed.append(result.clone())
+
+    encoder_stream.synchronize()
+    for actual, reference in zip(observed, expected):
+        torch.testing.assert_close(actual, reference, atol=1e-2, rtol=1e-2)
 
 
 def generate_attn_scenarios(num_q_heads_kv_heads: List[Tuple[int, int]],
