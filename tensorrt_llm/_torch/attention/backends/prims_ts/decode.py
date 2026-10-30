@@ -132,6 +132,7 @@ class _DecodeCompileSpec:
     max_active_clusters: int
     kv_prefix_mode: Literal["dynamic", "planned_full"]
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
+    use_device_scales: bool = False
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None
 
 
@@ -1480,6 +1481,7 @@ def _make_decode_compile_spec(
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
     flat_native_kv_tma: bool = False,
+    use_device_scales: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
@@ -1504,16 +1506,15 @@ def _make_decode_compile_spec(
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
         direct_q1_spec=direct_q1_spec,
+        use_device_scales=use_device_scales,
     )
 
 
 @functools.cache
-def _get_compiled_decode(
-    compile_spec: _DecodeCompileSpec,
-    use_device_scales: bool = False,
-):
+def _get_compiled_decode(compile_spec: _DecodeCompileSpec):
     """Compile and cache one batch-dynamic TS decode topology."""
 
+    use_device_scales = compile_spec.use_device_scales
     device_index = compile_spec.device_index
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
@@ -1706,8 +1707,6 @@ def _get_compiled_decode(
             partial_o: cute.Tensor,
             partial_stats: cute.Tensor,
             attention_sinks: cute.Tensor,
-            bmm1_scale: cutlass.Float32,
-            bmm2_scale: cutlass.Float32,
             direct_q1_inputs: tuple,
             stream: cuda_drv.CUstream,
             static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
@@ -1754,8 +1753,6 @@ def _get_compiled_decode(
                 partial_o.iterator,
                 partial_stats.iterator,
                 attention_sinks.iterator,
-                bmm1_scale,
-                bmm2_scale,
                 stream,
                 static_cfg,
                 static_full_split_prefix,
@@ -1953,8 +1950,6 @@ def _get_compiled_decode(
             partial_o_fake,
             partial_stats_fake,
             attention_sinks_fake,
-            Float32(1.0),
-            Float32(1.0),
             direct_q1_fake,
             stream_fake,
             cfg,
@@ -1973,7 +1968,6 @@ def _get_compiled_decode(
             compile_spec,
             _COMPILE_OPTIONS,
             compile_main,
-            extra=(use_device_scales,),
         )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
@@ -2260,9 +2254,6 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             workspace.attention_sinks,
-            # Producers already scale normalized partial O and log2-LSE.
-            1.0,
-            1.0,
             (),
         )
     return runtime.out
@@ -2600,8 +2591,6 @@ class PrimsTSBatchDecodePlan:
                 self._workspace.partial_o,
                 self._workspace.partial_stats,
                 self._workspace.attention_sinks,
-                scale_qk,
-                scale_v,
                 direct_inputs,
             )
         return out
@@ -4026,12 +4015,9 @@ class BatchDecodePagedTSWrapper:
             use_packed_q=packed_query,
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
+            use_device_scales=use_device_scales,
         )
-        compiled_main, compiled_reducer = (
-            _get_compiled_decode(compile_spec, use_device_scales=True)
-            if use_device_scales
-            else _get_compiled_decode(compile_spec)
-        )
+        compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
         policy = spec.policy + (
             ("kv_prefix_mode", kv_prefix_mode),
             ("kv_lengths_mode", kv_lengths_mode),
