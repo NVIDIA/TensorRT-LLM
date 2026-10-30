@@ -10790,6 +10790,7 @@ W_CI = STATIC_WORDS__regclus + 3 * NB__regclus + CMPC
 
 _NEG_INF__regclus = float("-inf")
 _POS_INF__regclus = float("inf")
+_NAN__regclus = float("nan")
 
 
 # ---------------------------------------------------------------------------
@@ -11254,7 +11255,9 @@ class GvrRegClusKernel:
                 if whole == cutlass.Int32(1):
                     dR1 = dR1 + dR2
                 if degen == cutlass.Int32(0):
-                    HIf = cutlass.Float32(_POS_INF)
+                    # NaN: nothing tests as above the crossing bin when that bin is the top bin, so
+                    # an unsampled +inf (saturated into the top bin by P4) stays a crossing candidate.
+                    HIf = cutlass.Float32(_NAN__regclus)
                     LOf = cutlass.Float32(_POS_INF)
                     if whole == cutlass.Int32(1):
                         HIf = cutlass.Float32(Bv)
