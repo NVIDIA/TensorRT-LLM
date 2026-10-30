@@ -4711,18 +4711,6 @@ class PyExecutor:
                     and error is None):
                 error = ("Conditional attention-DP execution lost its reserved "
                          "CUDA graph padding request")
-            if waiting and error is None:
-                # Every load is finished and the padding dummy did not fit.
-                # Without a transfer or response left to free KV, this owner
-                # would wait forever, so fail all owners through the vote.
-                connector = self.kv_connector_manager
-                loads_done = all(req.is_finished for req in loading_context)
-                if (loads_done
-                        and not connector.get_pending_transfer_requests()
-                        and not self._pending_response_terminations):
-                    error = ("Attention-DP padding does not fit and no pending "
-                             "KV connector transfer or response can free KV "
-                             "cache")
             waiting, can_queue = self._kv_connector_sync_status(
                 waiting,
                 error,
