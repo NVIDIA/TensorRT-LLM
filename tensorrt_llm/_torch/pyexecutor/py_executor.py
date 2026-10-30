@@ -8501,6 +8501,11 @@ class PyExecutor:
         still let the C++ batch allocation fail after a peer rank has
         succeeded. ``draft_reserve`` overrides the draft tokens reserved for
         the dummy; by default they follow the dummy role.
+
+        The estimate covers one sequence. A generation dummy with
+        ``max_beam_width > 1`` can need a block per beam; if those do not
+        fit, ``add_dummy_requests`` returns None and the callers schedule an
+        empty batch instead.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
