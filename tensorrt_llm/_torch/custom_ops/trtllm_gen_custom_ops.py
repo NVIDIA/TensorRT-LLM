@@ -814,7 +814,8 @@ def fp4_block_scale_moe_runner(
         topk_ids_for_tuner,  # Dummy if need_dummy_topk, else actual value
     ]
 
-    input_tensors = input_tensors_for_tuner
+    # A copy: the tuner below must still see the dummy routing tensors.
+    input_tensors = list(input_tensors_for_tuner)
     input_tensors[
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
