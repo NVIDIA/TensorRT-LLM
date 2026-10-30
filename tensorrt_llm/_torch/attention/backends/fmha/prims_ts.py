@@ -683,12 +683,12 @@ class PrimsTSFmha(PhasedFmha):
         v_cache: torch.Tensor,
         *,
         batch_size: int,
-        max_seq_len_q: int,
+        max_q_len: int,
         max_kv_len: int,
         page_size: int,
         mask_type: str,
         window_left: int,
-        sm_scale: float,
+        softmax_scale: float,
         output_dtype: torch.dtype,
     ) -> "BatchPrefillPagedTSWrapper":
         wrapper = self._context_wrappers.get(batch_size)
@@ -704,7 +704,7 @@ class PrimsTSFmha(PhasedFmha):
         wrapper.plan(
             device=q.device,
             batch_size=batch_size,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             max_kv_len=max_kv_len,
             num_qo_heads=int(q.shape[-2]),
             num_kv_heads=int(k_cache.shape[1]),
@@ -716,7 +716,7 @@ class PrimsTSFmha(PhasedFmha):
             page_size=page_size,
             mask_type=mask_type,
             window_left=window_left,
-            sm_scale=sm_scale,
+            softmax_scale=softmax_scale,
             output_scale=1.0,
             # Preprocessing establishes this invariant for every context
             # request admitted by this adapter.
@@ -760,11 +760,11 @@ class PrimsTSFmha(PhasedFmha):
             head_dim,
             page_size,
             max_kv_len,
-            max_seq_len_q=seq_len_q,
+            max_q_len=seq_len_q,
             packed_query=False,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=output_dtype,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=output_dtype,
             mask_type=mask_type,
             window_left=window_left,
             workspace_buffer=workspace_buffer,
@@ -781,7 +781,7 @@ class PrimsTSFmha(PhasedFmha):
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         page_size: int,
-        max_seq_len_q: int,
+        max_q_len: int,
         max_kv_len: int,
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
@@ -808,11 +808,11 @@ class PrimsTSFmha(PhasedFmha):
             qk_rope_head_dim,
             page_size,
             max_kv_len,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             packed_query=False,
-            q_data_type=q_dtype,
-            kv_data_type=kv_dtype,
-            o_data_type=output_dtype,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=output_dtype,
             mask_type=mask_type,
             workspace_buffer=workspace_buffer,
         )
@@ -859,17 +859,18 @@ class PrimsTSFmha(PhasedFmha):
         k_bshd = k.view(batch_size, seq_len, num_kv_heads, head_dim)
         v_bshd = v.view(batch_size, seq_len, num_kv_heads, head_dim)
         # Per-tensor E4M3 operands as selected by the recipe. The Q and K dequant scales
-        # fold into the per-run base-2 softmax scale and the V dequant scale into the
+        # fold into the per-run softmax scale and the V dequant scale into the
         # kernel output scale.
-        sm_scale = self._get_bmm1_scale(attn)
-        scale_softmax_log2 = None
+        softmax_scale = self._get_bmm1_scale(attn)
         if forward_args.qk_fp8_per_tensor:
             q_bshd, q_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(q_bshd)
             k_bshd, k_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(k_bshd)
-            scale_softmax_log2 = (
-                q_dequant_scale.float() * k_dequant_scale.float() * (sm_scale * math.log2(math.e))
+            softmax_scale = (
+                q_dequant_scale.float()
+                * k_dequant_scale.float()
+                * softmax_scale
             ).reshape(1)
-        output_scale = None
+        output_scale = 1.0
         vc_params = None
         vc_repair_tiles = 0
         vc_demean = True
@@ -901,6 +902,8 @@ class PrimsTSFmha(PhasedFmha):
             mask_type,
             vc_demean,
             vc_repair_tiles,
+            isinstance(softmax_scale, torch.Tensor),
+            isinstance(output_scale, torch.Tensor),
         )
         wrapper = self._contiguous_context_wrappers.get(key)
         if wrapper is None:
@@ -922,7 +925,7 @@ class PrimsTSFmha(PhasedFmha):
             wrapper.plan(
                 device=q.device,
                 batch_size=batch_size,
-                max_seq_len_q=seq_len,
+                max_q_len=seq_len,
                 max_kv_len=seq_len,
                 num_qo_heads=num_heads,
                 num_kv_heads=num_kv_heads,
@@ -932,7 +935,8 @@ class PrimsTSFmha(PhasedFmha):
                 v_dtype=v_bshd.dtype,
                 out_dtype=out.dtype,
                 mask_type=mask_type,
-                sm_scale=sm_scale,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
                 vc_config=VCAttentionConfig(demean=vc_demean, repair_tiles=vc_repair_tiles)
                 if vc_params is not None
                 else None,
@@ -943,7 +947,7 @@ class PrimsTSFmha(PhasedFmha):
             k_bshd,
             v_bshd,
             out=out,
-            scale_softmax_log2=scale_softmax_log2,
+            softmax_scale=softmax_scale,
             output_scale=output_scale,
             vc=vc_params,
             validate=False,
@@ -1045,7 +1049,7 @@ class PrimsTSFmha(PhasedFmha):
                 int(self.attn.qk_rope_head_dim),
                 int(metadata.tokens_per_block),
                 max_seq_len,
-                max_seq_len_q=seq_len_q,
+                max_q_len=seq_len_q,
                 q_dtype=kernel_dtype,
                 kv_dtype=kernel_dtype,
                 out_dtype=forward_args.output.dtype,
@@ -1222,7 +1226,7 @@ class PrimsTSFmha(PhasedFmha):
         if kv_page_offset is None:
             raise RuntimeError("PrimTS could not resolve the K-to-V page displacement.")
         k_cache, v_cache = self._standard_kv_views(kv_pool, kv_page_offset)
-        max_seq_len_q = int(meta.max_context_length)
+        max_q_len = int(meta.max_context_length)
         max_kv_len = int(meta.max_seq_len)
         fixed_block_tables = self._get_fixed_block_tables(block_tables, params.batch_size)
         seq_lens_kv = self._get_sequence_lengths(
@@ -1235,12 +1239,12 @@ class PrimsTSFmha(PhasedFmha):
             k_cache,
             v_cache,
             batch_size=params.batch_size,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             max_kv_len=max_kv_len,
             page_size=params.tokens_per_block,
             mask_type=mask_type,
             window_left=window_left,
-            sm_scale=self._get_bmm1_scale(attn),
+            softmax_scale=self._get_bmm1_scale(attn),
             output_dtype=params.output.dtype,
         )
         wrapper.run(
@@ -1441,8 +1445,8 @@ class PrimsTSFmha(PhasedFmha):
             (k_cache, v_cache),
             seq_lens,
             block_tables=fixed_block_tables,
-            bmm1_scale=self._get_bmm1_scale(attn),
-            bmm2_scale=1.0,
+            softmax_scale=self._get_bmm1_scale(attn),
+            output_scale=1.0,
             out=output,
             validate=False,
         )
@@ -1525,7 +1529,7 @@ class PrimsTSFmha(PhasedFmha):
             kv_lora_rank=int(attn.kv_lora_rank),
             qk_rope_head_dim=int(attn.qk_rope_head_dim),
             page_size=params.tokens_per_block,
-            max_seq_len_q=seq_len_q,
+            max_q_len=seq_len_q,
             max_kv_len=max_seq_len,
             q_dtype=query.dtype,
             kv_dtype=kv_cache.dtype,
@@ -1536,10 +1540,10 @@ class PrimsTSFmha(PhasedFmha):
             query,
             kv_cache,
             block_tables=fixed_block_tables,
-            seq_lens=seq_lens,
+            seq_lens_kv=seq_lens,
             out=output,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            softmax_scale=bmm1_scale,
+            output_scale=bmm2_scale,
             validate=False,
         )
 

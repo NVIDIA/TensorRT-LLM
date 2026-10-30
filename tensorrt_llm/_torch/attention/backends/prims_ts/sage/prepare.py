@@ -32,19 +32,14 @@ from cuda.bindings import driver as cuda_drv
 
 from flashinfer.utils import ceil_div
 
-from ...sage import (
+from .config import sage_log2_block_size
+from .index import load_sage_flat_scale
+from .layout import (
     _FLOAT4_WORDS,
     _SAGE_ATOM_TOKENS,
     _SageKSection,
     _SageScaleLayout,
-    log2_block_size,
 )
-from .fmha_decode_config import FmhaDecodeConfig
-from .fmha_decode_resources.helpers_common import (
-    _q_row_token_and_local_head,
-    _q_tile_valid_rows_for_seq,
-)
-from .fmha_decode_resources.sage_scales import load_flat_scale
 
 _THREADS_PER_CTA = 128
 
@@ -78,7 +73,7 @@ class _KSectionSource:
             atom_float4s=cutlass.Int32(section.atom_float4s),
             tokens_per_word=cutlass.Int32(section.tokens_per_word),
             words_per_atom=cutlass.Int32(section.words_per_atom),
-            log2_block=cutlass.Int32(log2_block_size(section.source_block_size)),
+            log2_block=cutlass.Int32(sage_log2_block_size(section.source_block_size)),
             scale_addr=scales.iterator.toint(),
             head_stride=cutlass.Int32(scales.shape[1]),
             length=cutlass.Int32(section.length),
@@ -188,7 +183,7 @@ def _write_k_float4(
         words[elem] = cutlass.Float32(0.0)
         # Only a two-word atom pads, and it is a single float4.
         if word < section.words_per_atom:
-            words[elem] = load_flat_scale(
+            words[elem] = load_sage_flat_scale(
                 section.scale_addr,
                 section.head_stride,
                 head_idx=head_idx,
@@ -206,7 +201,6 @@ def _write_q_float4(
     q_scale: cute.Tensor,
     scales: cute.Tensor,
     float4_idx: cutlass.Int32,
-    cfg: cutlass.Constexpr[FmhaDecodeConfig],
     layout: cutlass.Constexpr[_SageScaleLayout],
     *,
     batch_idx: cutlass.Int32,
@@ -216,48 +210,42 @@ def _write_q_float4(
     """Write float4 ``float4_idx`` of the buffer: four rows of one Q tile.
 
     ``float4_in_section`` places the float4 in the sequence's Q rows. Row
-    ``r`` of the tile takes the Q scale of the token and Q head the softmax
-    maps the row to (``_q_row_token_and_local_head``); a row past the
-    tile's valid rows (``_q_tile_valid_rows_for_seq``) takes the last valid
-    row's.
+    ``r`` of the tile takes the Q scale of the token and Q head the section's
+    row order maps it to (``_SageQSection.row_token_and_head``);
+    ``load_sage_flat_scale`` gives a token past the sequence's end the last token's.
     """
 
     q_rows = layout.q_rows
-    tile_float4s = cutlass.Int32(q_rows.tile_size_q // _FLOAT4_WORDS)
+    tile_float4s = cutlass.Int32(q_rows.rows_per_tile // _FLOAT4_WORDS)
     tile_idx = float4_in_section // tile_float4s
     first_row = (float4_in_section - tile_idx * tile_float4s) * cutlass.Int32(
         _FLOAT4_WORDS
     )
-    # The row helpers take the plan's heads per KV head as the packed row
-    # count and its fixed Q length; Sage plans have no variable Q lengths.
     heads_q_per_kv = cutlass.Int32(q_rows.heads_q_per_kv)
-    seq_len_q = cutlass.Int32(q_rows.seq_len_q)
-    last_row = _q_tile_valid_rows_for_seq(
-        cfg, heads_q_per_kv, tile_idx, seq_len_q
-    ) - cutlass.Int32(1)
-
     words = cutlass.Array(
         cutlass.Float32, _FLOAT4_WORDS, space=cutlass.AddressSpace.rmem
     )
     for elem in cutlass.range_constexpr(_FLOAT4_WORDS):
-        row = cute.math.min(first_row + cutlass.Int32(elem), last_row)
-        q_token_idx, local_head_idx = _q_row_token_and_local_head(
-            cfg, heads_q_per_kv, tile_idx, row
+        q_token_idx, local_head_idx = q_rows.row_token_and_head(
+            tile_idx, first_row + cutlass.Int32(elem)
         )
-        words[elem] = load_flat_scale(
+        words[elem] = load_sage_flat_scale(
             q_scale.iterator.toint(),
             cutlass.Int32(q_scale.shape[1]),
             head_idx=kv_head_idx * heads_q_per_kv + local_head_idx,
             batch_idx=batch_idx,
-            seq_len=seq_len_q,
+            seq_len=cutlass.Int32(q_rows.seq_len_q),
             token_idx=q_token_idx,
-            log2_block=cutlass.Int32(log2_block_size(q_rows.q_block_size)),
+            log2_block=cutlass.Int32(sage_log2_block_size(q_rows.q_block_size)),
         )
     _store_float4(scales, float4_idx, words)
 
 
 class _PrepareSageScales:
     """Write a Sage plan's prepared scales from its flat scale tensors.
+
+    Serves the decode and the context kernels: the layout fixes the Q row
+    order, the K sections and the V rows.
 
     The buffer covers ``batch_size * num_kv_heads`` sequences
     (``_SageScaleLayout``); the grid gives each of its float4s one thread. The kernel is an ordinary launch on the plan's
@@ -267,20 +255,10 @@ class _PrepareSageScales:
     route prepare in stream order.
     """
 
-    def __init__(
-        self,
-        *,
-        cfg: FmhaDecodeConfig,
-        layout: _SageScaleLayout,
-        batch_size: int,
-        num_kv_heads: int,
-    ) -> None:
-        self.cfg = cfg
+    def __init__(self, *, layout: _SageScaleLayout, num_kv_heads: int) -> None:
         self.layout = layout
         self.num_kv_heads = num_kv_heads
-        num_sequences = batch_size * num_kv_heads
         self.sequence_float4s = layout.sequence_words // _FLOAT4_WORDS
-        self.num_float4s = layout.total_words(num_sequences) // _FLOAT4_WORDS
 
     @cute.jit
     def __call__(
@@ -293,8 +271,10 @@ class _PrepareSageScales:
         scales: cute.Tensor,
         stream: cuda_drv.CUstream,
     ) -> None:
+        # The buffer's float4 count follows the run's batch size.
+        num_float4s = scales.shape[0] // _FLOAT4_WORDS
         self.kernel(q_scale, k_scale, k_summary_scale, v_scale, v_mean, scales).launch(
-            grid=[ceil_div(self.num_float4s, _THREADS_PER_CTA), 1, 1],
+            grid=[ceil_div(num_float4s, _THREADS_PER_CTA), 1, 1],
             block=[_THREADS_PER_CTA, 1, 1],
             stream=stream,
         )
@@ -314,7 +294,7 @@ class _PrepareSageScales:
         thread_idx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
         float4_idx = block_idx * cutlass.Int32(_THREADS_PER_CTA) + thread_idx
-        if float4_idx < cutlass.Int32(self.num_float4s):
+        if float4_idx < cutlass.Int32(scales.shape[0] // _FLOAT4_WORDS):
             sequence_idx = float4_idx // cutlass.Int32(self.sequence_float4s)
             float4_in_sequence = float4_idx - sequence_idx * cutlass.Int32(
                 self.sequence_float4s
@@ -353,7 +333,6 @@ class _PrepareSageScales:
                     q_scale,
                     scales,
                     float4_idx,
-                    self.cfg,
                     self.layout,
                     batch_idx=batch_idx,
                     kv_head_idx=head_idx,

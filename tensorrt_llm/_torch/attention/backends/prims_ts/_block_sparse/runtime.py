@@ -15,21 +15,21 @@
 """Runtime validation and launch adapter for block-sparse attention."""
 
 from dataclasses import dataclass
-import math
 from typing import TYPE_CHECKING, Literal
 
 import torch
 
+from .._scales import GlobalScale, resolve_scale
 from ..decode import (
     PagedKVCache,
     _normalize_paged_kv_cache,
     _validate_16byte_alignment,
     _validate_block_table_metadata,
     _validate_exact_compact_strides,
-    _validate_scale,
 )
-from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
+from ..sage.config import SageAttentionParams, validate_sage_params
 from .common import (
+    sage_adapter_slots,
     _SIGNED_INT32_MAX,
     _num_sparse_pattern_heads,
     _validate_dense_contiguous_plan_inputs,
@@ -94,8 +94,9 @@ class _BlockSparseRunArgs:
     # ``None`` for a dense run.
     kv_valid_bits: torch.Tensor | None
     kv_valid_bits_is_live: bool
-    sm_scale: float
+    sm_scale: GlobalScale
     paged_kv: _PagedKVLaunchPayload | None
+    output_scale: GlobalScale = 1.0
     exact_block_bits: torch.Tensor | None = None
     k_summary: torch.Tensor | None = None
     v_summary: torch.Tensor | None = None
@@ -322,7 +323,8 @@ def validate_block_sparse_run(
     k_summary: torch.Tensor | None = None,
     v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None,
-    sm_scale: float | None,
+    sm_scale: GlobalScale | None,
+    output_scale: GlobalScale | None = None,
     out: torch.Tensor | None,
     sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
@@ -333,7 +335,7 @@ def validate_block_sparse_run(
     normalized once into zero-copy HND cache views plus launch metadata. An
     explicit output is returned by identity and may not overlap any live launch
     input or plan-owned buffer. Storage overlap is a caller precondition and
-    is not checked. ``sm_scale=None`` is materialized as ``1 / sqrt(D)``.
+    is not checked. Omitted global scales inherit the planned defaults.
     """
 
     use_proxy_routes = state.use_proxy_routes
@@ -470,10 +472,9 @@ def validate_block_sparse_run(
         assert state.sage_scale_shapes is not None
         validate_sage_params(sage, state.sage_scale_shapes, device=state.device)
 
-    effective_scale = (
-        1.0 / math.sqrt(state.head_dim)
-        if sm_scale is None
-        else _validate_scale(sm_scale, "sm_scale")
+    effective_scale = resolve_scale(sm_scale, state.sm_scale, "sm_scale", state.device)
+    effective_output_scale = resolve_scale(
+        output_scale, state.output_scale, "output_scale", state.device
     )
     if out is None:
         out = torch.empty(q_shape, device=state.device, dtype=state.output_dtype)
@@ -498,6 +499,7 @@ def validate_block_sparse_run(
         kv_valid_bits=effective_kv_valid_bits,
         kv_valid_bits_is_live=state.use_kv_valid_bits,
         sm_scale=effective_scale,
+        output_scale=effective_output_scale,
         paged_kv=paged_kv,
         sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
@@ -514,7 +516,8 @@ def prepare_block_sparse_run_unchecked(
     k_summary: torch.Tensor | None = None,
     v_summary: torch.Tensor | None = None,
     kv_valid_bits: torch.Tensor | None,
-    sm_scale: float | None,
+    sm_scale: GlobalScale | None,
+    output_scale: GlobalScale | None = None,
     out: torch.Tensor | None,
     sage: SageAttentionParams | None = None,
 ) -> _BlockSparseRunArgs:
@@ -569,9 +572,10 @@ def prepare_block_sparse_run_unchecked(
         v_summary=v_summary,
         kv_valid_bits=effective_kv_valid_bits,
         kv_valid_bits_is_live=state.use_kv_valid_bits,
-        sm_scale=1.0 / math.sqrt(state.head_dim)
-        if sm_scale is None
-        else float(sm_scale),
+        sm_scale=resolve_scale(sm_scale, state.sm_scale, "sm_scale", state.device),
+        output_scale=resolve_scale(
+            output_scale, state.output_scale, "output_scale", state.device
+        ),
         paged_kv=paged_kv,
         sage_slots=sage_adapter_slots({} if sage is None else vars(sage)),
     )
@@ -583,6 +587,9 @@ def record_block_sparse_run_args(
 ) -> None:
     """Extend tensor lifetimes for the asynchronous launch currently in flight."""
 
+    for scale in (run_args.sm_scale, run_args.output_scale):
+        if isinstance(scale, torch.Tensor):
+            scale.record_stream(stream)
     for tensor in (run_args.q, run_args.k, run_args.v):
         tensor.record_stream(stream)
     if run_args.k_summary is not None:
@@ -638,6 +645,7 @@ def launch_block_sparse(
             run_args.paged_kv.k_page_stride,
             run_args.paged_kv.v_page_stride,
             run_args.sm_scale,
+            run_args.output_scale,
         )
     else:
         state.compiled(
@@ -657,6 +665,7 @@ def launch_block_sparse(
             0 if state.max_blocks_per_row is None else state.max_blocks_per_row,
             *run_args.sage_slots,
             run_args.sm_scale,
+            run_args.output_scale,
         )
     return run_args.out
 

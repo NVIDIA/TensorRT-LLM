@@ -41,6 +41,7 @@ from .mla_decode import (
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
     BatchMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
 )
@@ -87,6 +88,7 @@ __all__ = [
     "get_q_token_kv_block_sparse_workspace_size",
     "q_token_kv_block_sparse_attention_with_paged_kv_cache",
     "BatchMLADecodePagedTSWrapper",
+    "MLAAttentionTuning",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
 ]
