@@ -55,7 +55,8 @@ from tensorrt_llm.models.quant_config_utils import \
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo, is_modelopt_quant_config,
-    read_modelopt_quant_config, warn_if_inline_diverges)
+    read_modelopt_quant_config, reject_checkpoint_nvfp4_plus,
+    warn_if_inline_diverges)
 from tensorrt_llm.quantization.utils.fp4_utils import (
     NVFP4_SF_VEC_SIZE, W4A16_NVFP4_LINEAR_SF_VEC_SIZES,
     nvfp4_scaling_vector_size)
@@ -568,6 +569,11 @@ class ModelConfig(Generic[TConfig]):
         if moe_backend.upper() != "AUTO":
             return moe_backend
 
+        # NVFP4_PLUS, which OVERRIDE_QUANT_ALGO selects for MXFP4 experts, runs
+        # on the CuteDSL grouped GEMM only.
+        if ModelConfig.override_quant_algo() == QuantAlgo.NVFP4_PLUS:
+            return "CUTEDSL"
+
         if architecture in _KIMI_K3_ARCHITECTURES:
             return "TRTLLM"
 
@@ -718,6 +724,8 @@ class ModelConfig(Generic[TConfig]):
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
                 config.kv_cache_quant_algo = kv_cache_quant_algo
+                reject_checkpoint_nvfp4_plus(layer_cfg['quant_algo'],
+                                             f"Quantized layer {layer}")
                 config.quant_algo = QuantAlgo(
                     canonicalize_quant_algo(layer_cfg['quant_algo']))
                 config.group_size = layer_cfg.get('group_size', None)
@@ -743,8 +751,27 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def require_nvfp4_plus_moe_backend(
+            moe_backend: Optional[str],
+            backend_setting: str = "moe_config.backend") -> None:
+        """Reject an explicit MoE backend that cannot run NVFP4_PLUS experts.
+
+        Only the CuteDSL grouped GEMM implements NVFP4_PLUS, and AUTO resolves
+        to it under the override (``resolve_moe_backend``).
+        """
+        if moe_backend is None or str(moe_backend).upper() in ("AUTO",
+                                                               "CUTEDSL"):
+            return
+        raise ValueError(
+            "OVERRIDE_QUANT_ALGO=NVFP4_PLUS runs MXFP4 experts on the CuteDSL "
+            f"MoE only, but {backend_setting} is {moe_backend}; set "
+            f"{backend_setting}: CUTEDSL or leave it AUTO.")
+
+    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
+        if quant_algo == QuantAlgo.NVFP4_PLUS:
+            ModelConfig.require_nvfp4_plus_moe_backend(moe_backend)
         if quant_algo is None and not is_dynamic_quant:
             if get_sm_version() >= 100:
                 if moe_backend == 'TRITON':
@@ -1113,6 +1140,9 @@ class ModelConfig(Generic[TConfig]):
             "W4A16_MXFP4": QuantAlgo.W4A16_MXFP4,
             "W4A8_MXFP4_MXFP8": QuantAlgo.W4A8_MXFP4_MXFP8,
             "W4A8_MXFP4_FP8": QuantAlgo.W4A8_MXFP4_FP8,
+            # MXFP4 weights with E8M0 scales converted to UE5M3 at load, and
+            # E2M1 activations with UE5M3 block scales (Rubin SM107 only).
+            "NVFP4_PLUS": QuantAlgo.NVFP4_PLUS,
         }
         if new_algo is not None:
             if new_algo.upper() in supported_algos:

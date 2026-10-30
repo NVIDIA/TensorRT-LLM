@@ -472,6 +472,7 @@
         "W4A16_NVFP4",
         "NVFP4_AWQ",
         "NVFP4_ARC",
+        "NVFP4_PLUS",
         "NO_QUANT"
       ],
       "title": "QuantAlgo",

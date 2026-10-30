@@ -45,6 +45,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslFusedFc12Nvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.identity import GROUPED_GEMM_FAMILY
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
@@ -2103,6 +2104,7 @@ def test_build_gate_runs_after_the_leaf_gates(leaf, problem, deployment, reason)
 _CUTEDSL_GROUPED_GEMM_IDS = (
     "trtllm.cutedsl.grouped_gemm.nvfp4",
     "trtllm.cutedsl.grouped_gemm.none",
+    "trtllm.cutedsl.grouped_gemm.nvfp4_plus",
 )
 
 
@@ -2150,6 +2152,18 @@ _CUTEDSL_DECLARATIONS = (
         MoEStaticCapability(supports_eplb=True, supports_apply_router_weight_on_input=True),
         MoEActivationSupport(kinds=frozenset({ActivationType.Swiglu})),
         id="none",
+    ),
+    pytest.param(
+        TrtllmCutedslGroupedGemmNvfp4PlusImpl,
+        QuantAlgo.NVFP4_PLUS,
+        {107},
+        MoEStaticCapability(supports_eplb=True, supports_apply_router_weight_on_input=True),
+        MoEActivationSupport(
+            kinds=frozenset({ActivationType.Swiglu}),
+            limit=ActivationParamShape.UNIFORM_SCALAR,
+            limit_when_absent=float("inf"),
+        ),
+        id="nvfp4_plus",
     ),
 )
 
@@ -2200,6 +2214,9 @@ def test_cutedsl_leaf_declarations(leaf, quant_algo, sms, capabilities, activati
     [
         pytest.param(QuantAlgo.NVFP4, 100, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4-sm100"),
         pytest.param(None, 107, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none-sm107"),
+        pytest.param(
+            QuantAlgo.NVFP4_PLUS, 107, _CUTEDSL_GROUPED_GEMM_IDS[2], id="nvfp4_plus-sm107"
+        ),
     ],
 )
 def test_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm, impl_id):
@@ -2215,6 +2232,7 @@ def test_cutedsl_literal_picks_the_leaf_that_publishes_the_format(quant_algo, sm
     [
         pytest.param(QuantAlgo.NVFP4, _CUTEDSL_GROUPED_GEMM_IDS[0], id="nvfp4"),
         pytest.param(None, _CUTEDSL_GROUPED_GEMM_IDS[1], id="none"),
+        pytest.param(QuantAlgo.NVFP4_PLUS, _CUTEDSL_GROUPED_GEMM_IDS[2], id="nvfp4_plus"),
     ],
 )
 def test_pinned_cutedsl_grouped_gemm_identity_resolves_to_its_leaf(quant_algo, impl_id):

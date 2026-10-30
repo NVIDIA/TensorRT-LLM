@@ -37,6 +37,12 @@ from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
 from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    NVFP4_PLUS_SF_VEC_SIZE,
+    e8m0_to_ue5m3,
+    nvfp4_plus_dequantize_ref,
+    nvfp4_plus_quantize_ref,
+)
 
 
 def round_up(x, alignment):
@@ -205,6 +211,11 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     elif quant_algo == QuantAlgo.W4A16_MXFP4:
         quantize_util_cls = WFP4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
+    elif quant_algo == QuantAlgo.NVFP4_PLUS:
+        quantize_util_cls = NVFP4PlusQuantizeUtil
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4_PLUS, group_size=NVFP4_PLUS_SF_VEC_SIZE
+        )
     elif quant_algo == QuantAlgo.W8A16:
         quantize_util_cls = W8A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
@@ -2544,6 +2555,143 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
         """
         Create a reference module for correctness testing with swiglu_gptoss_style support.
         """
+        return super().create_ref_module(routing_method, ref_cls)
+
+
+def _nvfp4_plus_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """Round ``x`` through NVFP4_PLUS quantization, in float32."""
+    return nvfp4_plus_dequantize_ref(*nvfp4_plus_quantize_ref(x))
+
+
+class NVFP4PlusRefGatedMLPFusedMoE(RefMLPFusedMoE):
+    """Reference NVFP4_PLUS MoE for correctness testing.
+
+    The weights come from an MXFP4 checkpoint and are dequantized to float32;
+    the FC1 input and the SwiGLU output are rounded through NVFP4_PLUS, the way
+    the kernels quantize the inputs of FC1 and FC2.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        routing_method: BaseMoeRoutingMethod,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: Optional[ModelConfig] = None,
+        bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+    ):
+        assert activation_type == ActivationType.Swiglu and not bias, (
+            "NVFP4PlusRefGatedMLPFusedMoE covers SwiGLU without bias"
+        )
+        self._original_quant_config = model_config.quant_config if model_config else None
+        super().__init__(
+            num_experts=num_experts,
+            routing_method=routing_method,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            model_config=ModelConfig(),  # The weights are dequantized below.
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+        self.swiglu_limit = swiglu_limit
+        self.w1, self.w3, self.w2 = [], [], []
+
+    def load_weights(self, weights_list: List[Dict]):
+        assert len(weights_list) == 1
+        weights = weights_list[0]
+        assert (
+            self._original_quant_config
+            and self._original_quant_config.quant_algo == QuantAlgo.NVFP4_PLUS
+        ), "expect quant_algo to be NVFP4_PLUS"
+
+        def dequantize(name: str) -> torch.Tensor:
+            fp4 = weights[f"{name}.weight"].view(torch.uint8).cuda()
+            sf = e8m0_to_ue5m3(weights[f"{name}.weight_scale"]).cuda()
+            # E2M1 times a power of two is exact in bf16.
+            return nvfp4_plus_dequantize_ref(fp4, sf).to(torch.bfloat16)
+
+        for expert in range(self.num_experts):
+            self.w1.append(dequantize(f"{expert}.w1"))
+            self.w3.append(dequantize(f"{expert}.w3"))
+            self.w2.append(dequantize(f"{expert}.w2"))
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        selected_experts, routing_weights = self.routing_method.apply(router_logits)
+        x = _nvfp4_plus_round_trip(hidden_states)
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=torch.float32, device=hidden_states.device
+        )
+        limit = self.swiglu_limit
+        for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
+            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+            gate = x[batch_idx] @ self.w1[expert_id].float().T
+            up = x[batch_idx] @ self.w3[expert_id].float().T
+            if limit is not None and limit != float("inf"):
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            act = _nvfp4_plus_round_trip(F.silu(gate) * up)
+            output = act @ self.w2[expert_id].float().T
+            final_hidden_states[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+        return final_hidden_states.to(hidden_states.dtype)
+
+    def check_accuracy(self, output, ref_output):
+        # The kernels quantize the FC2 input from the fp32 accumulator with an
+        # approximate reciprocal and finalize with bf16 adds, so a fraction of
+        # the FC2 inputs land on a neighbouring FP4 code.
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
+
+
+class NVFP4PlusQuantizeUtil(BaseQuantizeUtil):
+    """Correctness testing for NVFP4_PLUS MoE, loaded from an MXFP4 checkpoint.
+
+    The weights are random E2M1 values with random E8M0 block scales per 32
+    values, under the checkpoint's ``weight_scale`` keys.
+    """
+
+    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+        assert (
+            self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.NVFP4_PLUS
+        ), "expect quant_algo to be NVFP4_PLUS"
+        assert self._is_gated and not self.bias, "NVFP4_PLUS MoE tests cover SwiGLU without bias"
+
+        def packed(rows: int, cols: int) -> torch.Tensor:
+            return torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, device="cuda")
+
+        def e8m0(rows: int, cols: int) -> torch.Tensor:
+            # 2**-9 .. 2**-5, the range DeepSeek-V4 routed experts use.
+            return torch.randint(
+                118,
+                123,
+                (rows, cols // NVFP4_PLUS_SF_VEC_SIZE),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+
+        weights = {}
+        hidden, inter = self.hidden_size, self.intermediate_size
+        for expert_id in range(self.num_experts):
+            weights[f"{expert_id}.w1.weight"] = packed(inter, hidden)
+            weights[f"{expert_id}.w3.weight"] = packed(inter, hidden)
+            weights[f"{expert_id}.w2.weight"] = packed(hidden, inter)
+            weights[f"{expert_id}.w1.weight_scale"] = e8m0(inter, hidden)
+            weights[f"{expert_id}.w3.weight_scale"] = e8m0(inter, hidden)
+            weights[f"{expert_id}.w2.weight_scale"] = e8m0(hidden, inter)
+        return weights
+
+    def create_ref_module(
+        self, routing_method, ref_cls=NVFP4PlusRefGatedMLPFusedMoE
+    ) -> torch.nn.Module:
         return super().create_ref_module(routing_method, ref_cls)
 
 

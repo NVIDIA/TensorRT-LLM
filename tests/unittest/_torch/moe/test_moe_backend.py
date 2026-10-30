@@ -74,6 +74,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
@@ -4537,6 +4538,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
+    QuantAlgo.NVFP4_PLUS,
 ]
 
 # Backend types to test
@@ -4579,6 +4581,7 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
+    MoeModelConfig(384, 6, 5120, 2304),  # DeepSeek-V4.1-Flash
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
@@ -5988,6 +5991,40 @@ def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
     assert verdict.eligible is not rejected
     if rejected:
         assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size, moe_tp_size, rejected",
+    [
+        # DeepSeek-V4-Flash routed experts.
+        (4096, 2048, 16, False),
+        # A 192-wide FC2 input has 6 scale columns, not whole 128x4 tiles.
+        (4096, 1536, 8, True),
+        # 72-byte scale rows are not whole 16-byte FC1 scale gathers.
+        (2304, 2048, 1, True),
+    ],
+    ids=["aligned", "intermediate_unaligned", "hidden_unaligned"],
+)
+def test_nvfp4_plus_shape_alignment_gate(
+    hidden_size: int, intermediate_size: int, moe_tp_size: int, rejected: bool
+) -> None:
+    """With one scale per 32 values, NVFP4_PLUS needs 256 FC1 rows per shard
+    and a hidden size that is a multiple of 512."""
+    problem = dataclasses.replace(
+        _nvfp4_problem(intermediate_size, "Swiglu"),
+        quant=QuantAlgo.NVFP4_PLUS.value,
+        hidden_size=hidden_size,
+    )
+    deployment = dataclasses.replace(
+        _deployment_at_moe_tp(moe_tp_size),
+        env=MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN,)),
+    )
+    verdict = TrtllmCutedslGroupedGemmNvfp4PlusImpl.can_implement(problem, deployment)
+    if rejected:
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+    else:
+        assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
 
 
 @pytest.mark.parametrize(

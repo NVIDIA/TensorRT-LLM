@@ -471,11 +471,13 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     return tuple(low) + tuple(dense) + (max_m, )
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+def fp4_scale_infer_shape(input_shapes: List[List[int]],
+                          sf_vec_size: int = 16) -> int:
     """Calculate the swizzled scale size for a packed FP4 input tensor."""
     unpacked_shape = list(input_shapes[0])
     unpacked_shape[-1] *= 2
-    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape,
+                                             sf_vec_size=sf_vec_size)
     return scale_shape
 
 
