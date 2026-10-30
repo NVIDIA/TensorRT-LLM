@@ -381,6 +381,7 @@ def _make_manager_for_cache_tier_test(
     spec_config=None,
     is_draft: bool = False,
     is_disagg: bool = False,
+    is_estimating_kv_cache: bool = False,
     joint_reuse: bool = False,
     mapping: Mapping | None = None,
     vocab_size: int | None = 16,
@@ -453,6 +454,7 @@ def _make_manager_for_cache_tier_test(
             spec_config=spec_config,
             is_draft=is_draft,
             is_disagg=is_disagg,
+            is_estimating_kv_cache=is_estimating_kv_cache,
             joint_kv_cache_reuse=joint_reuse,
             vocab_size=vocab_size,
             execution_stream=Mock(),
@@ -1406,6 +1408,63 @@ def test_avg_seq_len_must_not_exceed_max_seq_len() -> None:
             KvCacheConfig(avg_seq_len=2048),
             max_seq_len=1024,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("estimating", [False, True])
+@pytest.mark.parametrize("host_cache_size", [None, -1, 0, 1 << 20, 128 << 20])
+@pytest.mark.parametrize(
+    "mem_available,local_ranks,memlock_limit,auto_quota",
+    [
+        (1 << 30, 1, -1, 16 << 20),
+        (16 << 20, 2, -1, 4 << 20),
+        (1 << 30, 1, 8 << 20, int((8 << 20) * 0.8)),
+    ],
+)
+def test_estimation_host_tier_respects_explicit_and_auto_bounds(
+    estimating: bool,
+    host_cache_size: int | None,
+    mem_available: int,
+    local_ranks: int,
+    memlock_limit: int,
+    auto_quota: int,
+) -> None:
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    original_sysconf = os.sysconf
+
+    def sysconf(name: str | int) -> int:
+        if name == "SC_PAGE_SIZE":
+            return 4096
+        if name == "SC_AVPHYS_PAGES":
+            return mem_available // 4096
+        return original_sysconf(name)
+
+    with (
+        patch(f"{module}.os.sysconf", side_effect=sysconf),
+        patch("resource.getrlimit", return_value=(memlock_limit, memlock_limit)),
+        patch(f"{module}.is_device_integrated", return_value=False),
+        patch(
+            f"{module}.Distributed.get", return_value=SimpleNamespace(local_world_size=local_ranks)
+        ),
+        patch(f"{module}._sync_host_tier_quota", side_effect=lambda quota, mapping: quota) as sync,
+    ):
+        manager, impl_constructor = _make_manager_for_cache_tier_test(
+            KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=host_cache_size),
+            [Mock()],
+            is_estimating_kv_cache=estimating,
+        )
+
+    has_explicit_cap = host_cache_size is not None and host_cache_size >= 0
+    expected_quota = host_cache_size if has_explicit_cap else auto_quota
+    if estimating and has_explicit_cap:
+        expected_quota = min(auto_quota, host_cache_size)
+    cache_tiers = impl_constructor.call_args.args[0].cache_tiers
+    host_quotas = [tier.quota for tier in cache_tiers if isinstance(tier, HostCacheTierConfig)]
+    assert host_quotas == ([expected_quota] if expected_quota > 0 else [])
+    if estimating or not has_explicit_cap:
+        sync.assert_called_once_with(expected_quota, manager.mapping)
+    else:
+        sync.assert_not_called()
 
 
 def test_disk_secondary_tier_enables_eviction(tmp_path) -> None:

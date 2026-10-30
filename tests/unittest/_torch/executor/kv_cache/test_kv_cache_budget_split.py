@@ -15,6 +15,7 @@
 """Tests for KV cache budget splitting between target and draft managers."""
 
 import math
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1092,15 +1093,21 @@ class TestBuildManagersBudgetGates:
         assert draft_share < total_offload
 
     @pytest.mark.parametrize("budget_attr", OFFLOAD_TIER_BUDGET_ATTRS)
-    def test_estimation_managers_drop_explicit_offload_tiers(self, budget_attr, tmp_path):
-        """An explicit offload tier would reserve capacity a probe cannot fill."""
+    @pytest.mark.parametrize("is_v2", [False, True])
+    def test_estimation_managers_drop_explicit_offload_tiers(self, budget_attr, is_v2, tmp_path):
+        """V2 host budgets cap automatic tiers; other explicit tiers are omitted."""
         c = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        c._is_kv_cache_manager_v2 = is_v2
 
         c.build_managers({}, estimating_kv_cache=True)
 
         target_config, draft_config = self._configs_passed_to_managers(c)
-        assert getattr(target_config, budget_attr) is None
-        assert getattr(draft_config, budget_attr) is None
+        if is_v2 and budget_attr == "host_cache_size":
+            assert target_config.host_cache_size == 16 * GB
+            assert draft_config.host_cache_size == 4 * GB
+        else:
+            assert getattr(target_config, budget_attr) is None
+            assert getattr(draft_config, budget_attr) is None
 
     def test_gpu_budget_split_stays_skipped_during_estimation(self, tmp_path):
         """Estimation sizes GPU pools from max_tokens, so it keeps the budget whole."""
@@ -1111,6 +1118,62 @@ class TestBuildManagersBudgetGates:
         target_config, _ = self._configs_passed_to_managers(c)
         assert target_config.max_gpu_total_bytes == 10 * GB
         c._needs_gpu_kv_cache_budget_split.assert_not_called()
+
+    @pytest.mark.parametrize("is_v2", [False, True])
+    @pytest.mark.parametrize("separate_draft", [False, True])
+    @pytest.mark.parametrize("host_cache_size", [None, 0, GB, 20 * GB])
+    def test_estimation_preserves_v2_host_budget_caps(
+        self,
+        is_v2: bool,
+        separate_draft: bool,
+        host_cache_size: int | None,
+        tmp_path: Path,
+    ) -> None:
+        creator = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        creator._is_kv_cache_manager_v2 = is_v2
+        creator._should_create_separate_draft_kv_cache.return_value = separate_draft
+        creator._kv_cache_config.host_cache_size = host_cache_size
+
+        creator.build_managers({}, estimating_kv_cache=True)
+
+        target_config = creator._create_kv_cache_manager.call_args.kwargs[
+            "kv_cache_config_override"
+        ]
+        expected_target = host_cache_size
+        expected_draft = host_cache_size
+        if host_cache_size and host_cache_size > 0:
+            if is_v2 and separate_draft:
+                expected_draft = host_cache_size // 5
+                expected_target = host_cache_size - expected_draft
+            elif not is_v2:
+                expected_target = expected_draft = None
+        assert target_config.host_cache_size == expected_target
+        assert target_config.disk_cache_size is None
+        if separate_draft:
+            draft_config = creator._create_one_model_draft_kv_cache_manager.call_args.kwargs[
+                "kv_cache_config_override"
+            ]
+            assert draft_config.host_cache_size == expected_draft
+            assert draft_config.disk_cache_size is None
+        else:
+            creator._create_one_model_draft_kv_cache_manager.assert_not_called()
+        assert creator._kv_cache_config.host_cache_size == host_cache_size
+        assert creator._kv_cache_config.disk_cache_size == 20 * GB
+
+    @pytest.mark.parametrize("host_cache_size", [0, GB, 20 * GB])
+    def test_estimation_unknown_costs_do_not_duplicate_host_cap(
+        self, host_cache_size: int, tmp_path: Path
+    ) -> None:
+        creator = self._make_build_creator(20 * GB, total_gpu=10 * GB, disk_path=str(tmp_path))
+        creator._kv_cache_config.host_cache_size = host_cache_size
+        creator._get_target_and_draft_cache_costs = Mock(return_value=None)
+
+        creator.build_managers({}, estimating_kv_cache=True)
+
+        target_config, draft_config = self._configs_passed_to_managers(creator)
+        assert target_config.host_cache_size == host_cache_size
+        assert draft_config.host_cache_size == 0
+        assert creator._kv_cache_config.host_cache_size == host_cache_size
 
 
 class TestExternalDrafterKvDtype:

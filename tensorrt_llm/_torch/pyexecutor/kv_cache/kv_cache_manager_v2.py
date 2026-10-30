@@ -2256,7 +2256,8 @@ class KVCacheManagerV2(BaseResourceManager):
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
-        if connector_registers_pages and kv_cache_config.host_cache_size is None:
+        host_cache_size = kv_cache_config.host_cache_size
+        if connector_registers_pages and host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -2269,8 +2270,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 "KV cache manager v2 host tier disabled: a KV connector is attached "
                 "and registers GPU page addresses that tier migration would invalidate."
             )
-        elif kv_cache_config.host_cache_size is not None and kv_cache_config.host_cache_size >= 0:
-            host_quota = kv_cache_config.host_cache_size
+        elif (
+            not self.is_estimating_kv_cache and host_cache_size is not None and host_cache_size >= 0
+        ):
+            host_quota = host_cache_size
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
             # evict and later restore KV cache pages. Without a secondary
@@ -2306,6 +2309,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 memlock_limit,
                 shares_device_memory=is_device_integrated(),
             )
+            if self.is_estimating_kv_cache and host_cache_size is not None and host_cache_size >= 0:
+                host_quota = min(host_quota, host_cache_size)
             logger.info(
                 f"KV cache manager v2 auto host tier sizing: "
                 f"{local_ranks} co-located rank(s) on this node, "

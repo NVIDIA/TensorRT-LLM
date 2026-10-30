@@ -3065,23 +3065,21 @@ class KvCacheCreator:
             max_seq_len, kv_cache_config)
         return uses_vswa_kv_cache_layout(draft_windows)
 
-    @classmethod
-    def _drop_explicit_offload_tier_budgets(
-            cls, kv_cache_config: Optional[KvCacheConfig]
+    def _prepare_estimation_kv_cache_config(
+            self, kv_cache_config: Optional[KvCacheConfig]
     ) -> Optional[KvCacheConfig]:
-        """Return a copy of the config with explicit offload budgets unset.
+        """Keep V2 host budgets as caps on automatically sized probe tiers.
 
-        Host sizing then falls to the V2 auto host tier policy, which matches
-        the tier to the manager's own device quota; V1 builds no secondary pool.
-        The disk tier is V2 only and has no auto policy, so dropping its budget
-        leaves the tier out.
+        V1 host budgets and V2 disk budgets are unset so estimation does not
+        reserve their full explicit offload tiers.
         """
         if kv_cache_config is None:
             return kv_cache_config
         dropped = {
             attr: None
-            for attr in cls._OFFLOAD_TIER_BUDGET_ATTRS
-            if getattr(kv_cache_config, attr)
+            for attr in self._OFFLOAD_TIER_BUDGET_ATTRS
+            if getattr(kv_cache_config, attr) and (
+                attr != "host_cache_size" or not self._is_kv_cache_manager_v2)
         }
         if not dropped:
             return kv_cache_config
@@ -3090,7 +3088,11 @@ class KvCacheCreator:
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
-        """Construct KV caches for model and draft model (if applicable)."""
+        """Construct KV caches for model and draft model (if applicable).
+
+        When estimation cannot split a V2 host cap using the cache costs,
+        retain the cap on the target and give the draft no host tier.
+        """
         if self._skip_est:
             self.configure_kv_cache_capacity()
         original_max_seq_len = self._max_seq_len
@@ -3113,14 +3115,10 @@ class KvCacheCreator:
                                       self_kv_cache_config.enable_block_reuse
                                       and self._joint_reuse_supported())
 
-        # Estimation managers are throwaway probes whose pools only hold dummy
-        # requests, so an explicit offload tier would reserve capacity the probe
-        # cannot fill. Encoder-decoder runs skip estimation, so dropping the
-        # cross budgets is defensive.
         if estimating_kv_cache:
-            self_kv_cache_config = self._drop_explicit_offload_tier_budgets(
+            self_kv_cache_config = self._prepare_estimation_kv_cache_config(
                 self_kv_cache_config)
-            cross_kv_cache_config = self._drop_explicit_offload_tier_budgets(
+            cross_kv_cache_config = self._prepare_estimation_kv_cache_config(
                 cross_kv_cache_config)
 
         # Split combined KV cache budgets before creating managers.
@@ -3142,6 +3140,12 @@ class KvCacheCreator:
                     self._split_kv_cache_budget_for_draft(
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
+            if (estimating_kv_cache and self._is_kv_cache_manager_v2
+                    and draft_kv_cache_config is None
+                    and self_kv_cache_config.host_cache_size is not None
+                    and self_kv_cache_config.host_cache_size >= 0):
+                draft_kv_cache_config = self_kv_cache_config.model_copy(
+                    update={"host_cache_size": 0})
 
         # Estimation managers are throwaway probes; the real build that
         # follows runs the check against the same engine and scheduler
