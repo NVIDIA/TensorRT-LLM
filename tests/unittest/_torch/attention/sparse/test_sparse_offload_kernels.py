@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the kernels that assemble sparse offload arena rows."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import (
+    SPARSE_ARENA_COVERAGE_MESSAGE,
     gather_sparse_batch_rows,
     merge_sparse_arena_indices,
     select_sparse_history_units,
@@ -166,6 +169,43 @@ def test_merge_replays_in_a_cuda_graph_with_new_watermarks_and_rows():
         active[0] = active_count
         graph.replay()
         torch.testing.assert_close(out[0].cpu(), torch.tensor(expected0, dtype=torch.int32))
+
+
+@_requires_cuda
+@pytest.mark.parametrize("missing", [False, True], ids=["covered", "missing_fetch"])
+def test_merge_coverage_flags_a_live_selection_without_a_row(missing: bool):
+    # Request 0 holds two history units and writes its third; request 1's last
+    # selection is past its length, so it needs no row.
+    topk = _cuda_tensor([[0, 1, 2], [0, -1, 3]])
+    requests = _cuda_tensor([0, 1])
+    batch_rows = _cuda_tensor([0, 1])
+    active = _cuda_tensor([2])
+    history = _cuda_tensor([2, 1])
+    lengths = _cuda_tensor([3, 2])
+    fetched = _cuda_tensor([[10, -1 if missing else 11, -1], [20, -1, -1]])
+    writes = _cuda_tensor([7, 8])
+    out = torch.empty((2, 3), dtype=torch.int32, device="cuda")
+    coverage = _cuda_tensor([0])
+
+    # A failed device assertion would leave the CUDA context unusable, so read the flag.
+    with patch.object(torch, "_assert_async") as assert_async:
+        merge_sparse_arena_indices(
+            topk,
+            requests,
+            batch_rows,
+            active,
+            lengths,
+            history,
+            fetched,
+            writes,
+            out,
+            unit_tokens=1,
+            coverage=coverage,
+        )
+
+    assert coverage.item() == (0 if missing else 1)
+    assert_async.assert_called_once_with(coverage, SPARSE_ARENA_COVERAGE_MESSAGE)
+    assert out.tolist() == [[10, -1 if missing else 11, 7], [20, -1, -1]]
 
 
 @_requires_cuda

@@ -324,6 +324,7 @@ class DSATrtllmAttention(TrtllmAttention):
             state.write_indices[len(descriptor.buffer_ids)][:, data_slot],
             metadata.sparse_offload_attn_indices[:num_tokens],
             unit_tokens=descriptor.unit_tokens,
+            coverage=state.coverage,
         )
         if state.nvfp4_scratch is None:
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (

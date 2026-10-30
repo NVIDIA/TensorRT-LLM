@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _estimate_full_attn_size_per_token,
     _estimate_swa_cache_size,
     _fill_kv_pages,
+    get_scratch_entry,
 )
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
@@ -49,14 +50,6 @@ from .quantization import (
     store_layer_rows,
     store_rows,
 )
-
-
-def _scratch_entry(cache, pool_id):
-    """The scratch range and the slots serving it, or None when none of the blocks do."""
-    scratch_range = cache.get_swa_scratch_range(pool_id)
-    if not scratch_range:
-        return None
-    return scratch_range, cache.get_scratch_slots(pool_id)
 
 
 def _validate_context_swa_layer_limit(limit: int | None, num_layers: int) -> None:
@@ -797,11 +790,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         cache = self.kv_cache_map[request_id]
         converter = self._get_page_index_converter(layer_id, role.role)
+        scratch_range, scratch_slots = get_scratch_entry(cache, pool_id) or (None, ())
         return converter(
             cache.get_base_page_indices(pool_id).tolist(),
             role.index_mode,
-            cache.get_swa_scratch_range(pool_id) or None,
-            cache.get_scratch_slots(pool_id),
+            scratch_range,
+            scratch_slots,
         )
 
     def compute_batch_page_tables(self, request_ids, num_contexts) -> None:
@@ -868,7 +862,7 @@ class CSA2CacheManager(KVCacheManagerV2):
             (index, row, entry)
             for row, cache in holders
             for index, pool in enumerate(self._scratch_pools.tolist())
-            if (entry := _scratch_entry(cache, pool))
+            if (entry := get_scratch_entry(cache, pool))
         ]
         ranges = np.zeros((len(self._scratch_pools), len(request_ids), 2), dtype=np.int32)
         width = max((len(slot_ids) for _, _, (_, slot_ids) in descs), default=1)

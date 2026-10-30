@@ -391,7 +391,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             layers,
             max_batch_size=manager.max_batch_size,
             topk=self.sparse_mla_topk,
-            nvfp4_head_dim=manager.head_dim if manager._use_nvfp4_compress else None,
+            # The hook the device reservation counts the scratch by.
+            nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )
 
     def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:
@@ -601,7 +602,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         swa_buffer_ptrs = {layer_idx: manager.swa_pool_ptr for layer_idx in manager.pp_layers}
         compressed_buffer_ptrs = {
             layer_idx: (
-                manager._ensure_sparse_batch().get_sparse_cache_base_address(
+                manager._sparse_arena_base(
                     manager._layer_attn_to_layer_id[layer_idx, DeepseekV4AttentionType.COMPRESS],
                     DeepseekV4AttentionType.COMPRESS.role,
                 )
@@ -685,48 +686,15 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         return None
 
     def validate_sparse_offload_batch(self) -> None:
-        """Reject unsupported layouts on the host before any model writes.
+        """Reject batches offload cannot run, on the host before any model writes.
 
-        Only a fresh, unchunked context batch or one query per decode request
-        is supported. This runs during prepare(), outside capture/replay;
-        the per-layer path consumes the resulting phase and device metadata.
-        Fixed configuration is validated during offload metadata initialization.
+        An offloading worker only decodes, one query token per request, as DSA's
+        does, so the check is DSA's. It runs during prepare(), outside capture and
+        replay; fixed configuration is validated when the offload metadata is
+        initialized.
         """
-        if not self.sparse_metadata_params.enable_kv_cache_offload:
-            return
-        state = self.sparse_offload_state
-        if state is not None:
-            state.prepared = False
-            state.is_prefill = False
-        if self.num_contexts and self.num_generations:
-            raise NotImplementedError(
-                "Sparse offload does not support mixed context/decode batches"
-            )
-        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
-            raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        if not torch.equal(self.seq_lens, self.seq_lens_kv):
-            raise NotImplementedError("Sparse offload requires matching query and new-KV lengths")
-        if not self.num_contexts:
-            if not torch.all(self.seq_lens == 1):
-                raise NotImplementedError("Sparse offload decode requires one query per request")
-            return
-        cached = self.kv_cache_params.num_cached_tokens_per_seq
-        if (
-            self.prompt_lens is None
-            or len(self.prompt_lens) < self.num_contexts
-            or len(cached) < self.num_contexts
-            or any(cached[: self.num_contexts])
-            or self.seq_lens.tolist() != self.prompt_lens[: self.num_contexts]
-            or any(
-                self.kv_cache_manager.kv_cache_map[request_id].history_length != 0
-                for request_id in self.request_ids
-            )
-        ):
-            raise NotImplementedError(
-                "Sparse offload prefill must be fresh, uncached, and unchunked"
-            )
-        if state is not None:
-            state.is_prefill = True
+        if self.sparse_offload_state is not None:
+            self._validate_dsa_sparse_offload_batch()
 
     def prepare(self) -> None:
         self._validate_ragged_verification()

@@ -22,15 +22,15 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_sm_version
+from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, is_sm_100f
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or get_sm_version() < 100,
-    reason="DSA KV cache offload needs an SM100+ GPU",
+    not torch.cuda.is_available() or not is_sm_100f(),
+    reason="DSA KV cache offload needs an SM100-family GPU",
 )
 
 NUM_LAYERS = 7
@@ -326,114 +326,117 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
     """
     generator = torch.Generator().manual_seed(seed)
     manager = _manager(num_layers=num_layers, dtype=dtype)
-    requests = [_request(9 + index, 1) for index in range(num_requests)]
-    join_step = {request.py_request_id: 40 * index for index, request in enumerate(requests)}
-    descriptors = manager.get_sparse_offload_descriptors()
-    nvfp4 = dtype == DataType.NVFP4
-    arenas = {
-        layer: [_arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)]
-        for layer, descriptor in descriptors.items()
-    }
-    if nvfp4:
+    try:
+        requests = [_request(9 + index, 1) for index in range(num_requests)]
+        join_step = {request.py_request_id: 40 * index for index, request in enumerate(requests)}
+        descriptors = manager.get_sparse_offload_descriptors()
+        nvfp4 = dtype == DataType.NVFP4
         arenas = {
-            layer: [
-                _arena_rows(descriptor, descriptor.data_buffer_index, NVFP4_DATA_BYTES),
-                _arena_rows(descriptor, descriptor.scale_buffer_index, NVFP4_SCALE_BYTES),
-            ]
+            layer: [_arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)]
             for layer, descriptor in descriptors.items()
         }
-    state = allocate_sparse_offload_state(
-        lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
-        descriptors,
-        max_batch_size=MAX_BATCH_SIZE,
-        topk=TOPK,
-    )
-    active: list[LlmRequest] = []
-    permuted = False
-    for step in range(6 * TOKENS_PER_BLOCK):
-        for request in requests:
-            if join_step[request.py_request_id] == step:
-                assert manager.prepare_disagg_gen_init(request)
-                active.append(request)
-        for request in active:
-            assert manager.try_allocate_generation(request)
-        scheduled = SimpleNamespace(context_requests=[], generation_requests=active[::-1])
-        manager.prepare_resources(scheduled)
-        request_ids = [request.py_request_id for request in scheduled.generation_requests]
-        manager.prepare_sparse_offload(state, request_ids, beam_width=1)
-        # The rows the manager recorded at add_kv_cache are still the native ones.
-        for member in manager._sparse_batch_members.values():
-            assert manager._sparse_batch.row_of(member.cache) == member.row
-        batch_rows = state.batch_rows.tolist()[: len(active)]
-        permuted |= batch_rows != list(range(len(active)))
-        histories = [manager.kv_cache_map[rid].history_length for rid in request_ids]
-        topk = torch.full((len(active), TOPK), -1, dtype=torch.int32)
-        for position, history in enumerate(histories):
-            # Unit 0 came with the prompt and was never written; select from the rest,
-            # always including the token written this step.
-            candidates = torch.randperm(history, generator=generator)[: TOPK - 1]
-            candidates = candidates[candidates > 0][: TOPK - 1].to(torch.int32)
-            topk[position, : candidates.numel()] = candidates
-            topk[position, -1] = history
-        topk = topk.cuda()
-        request_indices = torch.arange(len(active), dtype=torch.int32, device="cuda")
-        kv_lengths = torch.tensor([h + 1 for h in histories], dtype=torch.int32, device="cuda")
-        out = torch.empty((len(active), TOPK), dtype=torch.int32, device="cuda")
-        for layer in range(num_layers):
-            descriptor = descriptors[layer]
-            data = descriptor.data_buffer_index
-            writes = manager.prepare_sparse_write_indices(state, layer)
-            # At the buffer's slice, not its position: buffers whose arena indices
-            # coincide share one, and the slices no buffer maps to are never written.
-            data = state.out_slots[layer][data]
-            for row, rid, history in zip(batch_rows, request_ids, histories):
-                write_row = writes[row, data].item()
-                assert write_row >= 0, (rid, history, layer)
-                # The token's row: its position, its layer, its request.
-                for arena in arenas[layer]:
-                    arena[write_row, :3] = torch.tensor(
-                        [history, layer, rid], dtype=torch.int32, device="cuda"
-                    )
-            free_rows = [row for row in range(MAX_BATCH_SIZE) if row not in batch_rows]
-            assert (writes[free_rows, data] == -1).all()
-            fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
-            if nvfp4:
-                # The scale mirrors the data pool, so it resolves to the same index and
-                # reads the data's slice rather than one of its own. One slice written
-                # once is what replaces the two equal rows this used to compare.
-                assert state.out_slots[layer][descriptor.scale_buffer_index] == data
-            merge_sparse_arena_indices(
-                topk,
-                request_indices,
-                state.batch_rows,
-                state.active_request_count,
-                kv_lengths,
-                state.history_lengths,
-                fetched[:, data, :],
-                writes[:, data],
-                out,
-                unit_tokens=1,
-            )
-            for position, rid in enumerate(request_ids):
-                valid = topk[position] >= 0
-                units = topk[position][valid]
-                expected = torch.stack(
-                    (units, torch.full_like(units, layer), torch.full_like(units, rid)), dim=1
+        if nvfp4:
+            arenas = {
+                layer: [
+                    _arena_rows(descriptor, descriptor.data_buffer_index, NVFP4_DATA_BYTES),
+                    _arena_rows(descriptor, descriptor.scale_buffer_index, NVFP4_SCALE_BYTES),
+                ]
+                for layer, descriptor in descriptors.items()
+            }
+        state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+            descriptors,
+            max_batch_size=MAX_BATCH_SIZE,
+            topk=TOPK,
+        )
+        active: list[LlmRequest] = []
+        permuted = False
+        for step in range(6 * TOKENS_PER_BLOCK):
+            for request in requests:
+                if join_step[request.py_request_id] == step:
+                    assert manager.prepare_disagg_gen_init(request)
+                    active.append(request)
+            for request in active:
+                assert manager.try_allocate_generation(request)
+            scheduled = SimpleNamespace(context_requests=[], generation_requests=active[::-1])
+            manager.prepare_resources(scheduled)
+            request_ids = [request.py_request_id for request in scheduled.generation_requests]
+            manager.prepare_sparse_offload(state, request_ids, beam_width=1)
+            # The rows the manager recorded at add_kv_cache are still the native ones.
+            for member in manager._sparse_batch_members.values():
+                assert manager._sparse_batch.row_of(member.cache) == member.row
+            batch_rows = state.batch_rows.tolist()[: len(active)]
+            permuted |= batch_rows != list(range(len(active)))
+            histories = [manager.kv_cache_map[rid].history_length for rid in request_ids]
+            topk = torch.full((len(active), TOPK), -1, dtype=torch.int32)
+            for position, history in enumerate(histories):
+                # Unit 0 came with the prompt and was never written; select from the rest,
+                # always including the token written this step.
+                candidates = torch.randperm(history, generator=generator)[: TOPK - 1]
+                candidates = candidates[candidates > 0][: TOPK - 1].to(torch.int32)
+                topk[position, : candidates.numel()] = candidates
+                topk[position, -1] = history
+            topk = topk.cuda()
+            request_indices = torch.arange(len(active), dtype=torch.int32, device="cuda")
+            kv_lengths = torch.tensor([h + 1 for h in histories], dtype=torch.int32, device="cuda")
+            out = torch.empty((len(active), TOPK), dtype=torch.int32, device="cuda")
+            for layer in range(num_layers):
+                descriptor = descriptors[layer]
+                data = descriptor.data_buffer_index
+                writes = manager.prepare_sparse_write_indices(state, layer)
+                # At the buffer's slice, not its position: buffers whose arena indices
+                # coincide share one, and the slices no buffer maps to are never written.
+                data = state.out_slots[layer][data]
+                for row, rid, history in zip(batch_rows, request_ids, histories):
+                    write_row = writes[row, data].item()
+                    assert write_row >= 0, (rid, history, layer)
+                    # The token's row: its position, its layer, its request.
+                    for arena in arenas[layer]:
+                        arena[write_row, :3] = torch.tensor(
+                            [history, layer, rid], dtype=torch.int32, device="cuda"
+                        )
+                free_rows = [row for row in range(MAX_BATCH_SIZE) if row not in batch_rows]
+                assert (writes[free_rows, data] == -1).all()
+                fetched = manager.fetch_sparse_indices(
+                    state, layer, topk, request_indices, kv_lengths
                 )
-                for arena in arenas[layer]:
-                    got = arena[out[position][valid].long(), :3]
-                    wrong = (got != expected).any(dim=1)
-                    assert not wrong.any(), (
-                        f"request {rid}, history {histories[position]}, layer {layer}: units "
-                        f"{units[wrong].tolist()} read {got[wrong].tolist()}"
+                if nvfp4:
+                    # The scale mirrors the data pool, so it resolves to the same index and
+                    # reads the data's slice rather than one of its own.
+                    assert state.out_slots[layer][descriptor.scale_buffer_index] == data
+                merge_sparse_arena_indices(
+                    topk,
+                    request_indices,
+                    state.batch_rows,
+                    state.active_request_count,
+                    kv_lengths,
+                    state.history_lengths,
+                    fetched[:, data, :],
+                    writes[:, data],
+                    out,
+                    unit_tokens=1,
+                )
+                for position, rid in enumerate(request_ids):
+                    valid = topk[position] >= 0
+                    units = topk[position][valid]
+                    expected = torch.stack(
+                        (units, torch.full_like(units, layer), torch.full_like(units, rid)), dim=1
                     )
-        manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
-        for rid, history in zip(request_ids, histories):
-            assert manager.kv_cache_map[rid].history_length == history + 1
-    assert permuted == (num_requests > 1)
-    for request in active:
-        manager.free_resources(request)
-    manager.shutdown()
+                    for arena in arenas[layer]:
+                        got = arena[out[position][valid].long(), :3]
+                        wrong = (got != expected).any(dim=1)
+                        assert not wrong.any(), (
+                            f"request {rid}, history {histories[position]}, layer {layer}: units "
+                            f"{units[wrong].tolist()} read {got[wrong].tolist()}"
+                        )
+            manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+            for rid, history in zip(request_ids, histories):
+                assert manager.kv_cache_map[rid].history_length == history + 1
+        assert permuted == (num_requests > 1)
+        for request in active:
+            manager.free_resources(request)
+    finally:
+        manager.shutdown()
 
 
 def test_nvfp4_attention_reads_the_selected_rows_dequantized():
@@ -537,12 +540,14 @@ def test_nvfp4_attention_reads_the_selected_rows_dequantized():
         manager.shutdown()
 
 
-def test_offload_scratch_counts_the_latent_writer(manager):
+def test_offload_scratch_counts_the_latent_writer_and_attention_indices(manager):
     with_writer = manager.get_sparse_offload_scratch_bytes(manager.kv_cache_manager_py_config)
     state_only = super(DSACacheManagerV2, manager).get_sparse_offload_scratch_bytes(
         manager.kv_cache_manager_py_config
     )
-    assert with_writer - state_only == 2 * 3 * MAX_BATCH_SIZE * 4
+    # Each metadata copy holds a K and a V offset and a write slot per row, and the
+    # top-k indices the attention reads per row.
+    assert with_writer - state_only == 2 * (3 + TOPK) * MAX_BATCH_SIZE * 4
 
 
 @pytest.mark.parametrize("dtype", [DataType.FP8, DataType.NVFP4])

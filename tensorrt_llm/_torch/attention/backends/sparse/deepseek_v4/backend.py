@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..offload import NVFP4_SCRATCH_TAIL_ROWS
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -43,25 +44,20 @@ from .params import DeepseekV4AttentionType, DeepSeekV4Params
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-# The trtllm-gen DSv4 dynamic sparse MLA FMHA can read its aux KV pool up to one KV tile
-# (tileSizeKv, 128 rows) past the rows named in the sparse indices. With FP8 KV the aux pool
-# is the whole compressed KV pool, so those reads stay inside it; with NVFP4 KV it is the
-# per-call FP8 scratch below, which is sized to the batch.
-_SPARSE_MLA_FMHA_KV_TILE_SIZE = 128
-
 
 def _alloc_nvfp4_compress_fp8_scratch(
     num_rows: int, head_dim: int, device: torch.device
 ) -> torch.Tensor:
     """Allocate the FP8 scratch the sparse MLA FMHA reads as its aux KV pool.
 
-    Rows [0, num_rows) receive the dequantized compressed KV. A zeroed tail of one FMHA KV tile
-    keeps the kernel's reads past the last indexed row inside the allocation; without it the
-    FMHA faults whenever the caching allocator places the scratch at the end of a mapped
-    segment (https://nvbugs/6796296).
+    Rows [0, num_rows) receive the dequantized compressed KV. With FP8 KV the aux pool is the
+    whole compressed KV pool, so the FMHA's reads past the last indexed row stay inside it;
+    this per-call scratch is sized to the batch, so it carries the same zeroed tail of one
+    FMHA KV tile as the offload scratch (``NVFP4_SCRATCH_TAIL_ROWS``). Without it the FMHA
+    faults whenever the caching allocator places the scratch at the end of a mapped segment.
     """
     scratch = torch.empty(
-        (num_rows + _SPARSE_MLA_FMHA_KV_TILE_SIZE, head_dim),
+        (num_rows + NVFP4_SCRATCH_TAIL_ROWS, head_dim),
         dtype=torch.float8_e4m3fn,
         device=device,
     )
@@ -357,6 +353,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         compressed_lengths=compressed_lengths,
                         compressed_batch_rows=sparse_state.batch_rows,
                         active_request_count=sparse_state.active_request_count,
+                        compressed_coverage=sparse_state.coverage,
                     )
                     compress_pool_base_ptr = descriptor.arena_base_addresses[data_index]
                     forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (

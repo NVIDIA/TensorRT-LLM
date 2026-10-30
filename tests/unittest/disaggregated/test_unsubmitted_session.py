@@ -17,7 +17,7 @@
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -47,7 +47,7 @@ def _sender(*, ownership: bool = True) -> transfer_mod.Sender:
     sender._pre_cancelled_rids = {}
     sender._peer_requests_lock = threading.Lock()
     sender._peer_requests, sender._peer_requests_timestamps = {}, {}
-    sender._request_info_ttl_s = transfer_mod.Sender._STALE_REQ_INFO_TTL_S
+    sender._request_info_timeout_s = 0.0
     sender._shutdown, sender._shutdown_requested = True, False
     sender._retirement_watchdog = None
     sender._instance_rank = 7
@@ -162,6 +162,33 @@ def test_queued_prefill_metadata_uses_transfer_timeout(
         now = 601.0
         sender.sweep_stale_req_infos()
         assert sender._get_req_info(401) is None
+    finally:
+        sender.shutdown()
+
+
+def test_orphaned_context_first_request_fails_after_the_base_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A context-first request's long transfer timeout does not keep its receiver waiting.
+
+    Its REQUEST_DATA names a session that should already exist.
+    """
+    monkeypatch.setattr(transfer_mod, "ZMQMessenger", Mock())
+    monkeypatch.setattr(transfer_mod, "KV_TRANSFER_NUM_THREADS", 0)
+    now = 0.0
+    monkeypatch.setattr(transfer_mod.time, "monotonic", lambda: now)
+    sender = transfer_mod.Sender(Mock(), Mock(), request_info_timeout_s=600.0)
+    info = transfer_mod.RecvReqInfo.from_bytes(_request_data()[1])
+    info.context_first = True
+    try:
+        sender._add_req_info(401, 0, info)
+        with patch.object(sender, "_fail_orphaned_receiver") as fail:
+            now = 121.0
+            sender.sweep_stale_req_infos()
+
+        assert sender._get_req_info(401) is None
+        # The log names the TTL the entry actually waited.
+        fail.assert_called_once_with(info, transfer_mod.Sender._STALE_REQ_INFO_TTL_S)
     finally:
         sender.shutdown()
 

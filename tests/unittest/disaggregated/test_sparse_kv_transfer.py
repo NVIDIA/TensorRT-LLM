@@ -42,6 +42,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 pytestmark = pytest.mark.cpu_only
 
@@ -75,8 +76,17 @@ def _manager(offload: bool) -> Mock:
                 pool_group_index=0,
                 num_slots=4,
                 pools=[
-                    SimpleNamespace(base_address=0x100000 * (i + 1), slot_bytes=2 * size)
-                    for i, size in enumerate(sizes)
+                    SimpleNamespace(
+                        base_address=0x100000 * (i + 1),
+                        slot_bytes=2 * size,
+                        # Offloaded sparse buffers are host memory; the indexer stays on the GPU.
+                        storage_medium=(
+                            CacheTier.HOST_MEM
+                            if offload and role != "indexer"
+                            else CacheTier.GPU_MEM
+                        ),
+                    )
+                    for i, (role, size) in enumerate(zip(roles, sizes))
                 ],
                 slot_desc=SimpleNamespace(
                     variants=[SimpleNamespace(layer_group_id=0, coalesced_buffers=coalesced)]
@@ -172,10 +182,11 @@ def test_v2_extracts_host_data_and_scales_beside_device_indexer() -> None:
     assert [p.memory_type for p in table.pool_groups[0].pools] == ["DRAM", "DRAM", "VRAM"]
     assert table.has_host_pools
     assert not build_page_table_from_manager(_manager(False)).has_host_pools
+    # Each pool's memory type is its native storage medium, not the layer config's.
     manager = _manager(True)
     manager.impl.init_config.layers[1].buffers[0].is_sparse = False
-    with pytest.raises(ValueError, match="mixes host and device"):
-        build_page_table_from_manager(manager)
+    table = build_page_table_from_manager(manager)
+    assert [p.memory_type for p in table.pool_groups[0].pools] == ["DRAM", "DRAM", "VRAM"]
 
 
 def test_registration_separates_memory_types_and_device_ids() -> None:

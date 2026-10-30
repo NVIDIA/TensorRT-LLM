@@ -28,6 +28,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     _fill_kv_pages,
     _get_generation_kv_capacity,
+    get_scratch_entry,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
@@ -307,14 +308,6 @@ def _get_attn_bytes_per_token(
     return token_bytes
 
 
-def _scratch_entry(kv_cache, pool_id) -> tuple[HalfOpenRange, list[int]] | None:
-    """The scratch range and the slots serving it, or None when none of the blocks do."""
-    scratch_range = kv_cache.get_swa_scratch_range(pool_id)
-    if not scratch_range:
-        return None
-    return scratch_range, kv_cache.get_scratch_slots(pool_id)
-
-
 def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
     if attn_type in DEEPSEEK_V4_SLIDING_ATTENTION:
         return PageIndexMode.PER_LAYER
@@ -379,14 +372,8 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             enabled=sparse_attn_config.enable_kv_cache_offload,
             topk=sparse_attn_config.index_topk,
         )
+        # The base manager checks what offload can honor before it sizes anything.
         sparse_kv_offload_config = sparse_attn_config.get_kv_cache_offload_config()
-        if sparse_kv_offload_config is not None:
-            self._check_sparse_kv_offload_config(
-                sparse_kv_offload_config,
-                kv_cache_config,
-                mapping,
-                spec_config=kwargs.get("spec_config"),
-            )
 
         # DeepSeek-V4 specific attributes initialization
         assert kv_cache_type == CacheTypeCpp.SELFKONLY, "DeepSeek-V4 only supports SELFKONLY"
@@ -896,13 +883,9 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         )
 
         if self.enable_swa_scratch_reuse:
-            valid_scales = self._layer_attn_scales[self._layer_attn_pool_ids >= 0]
-            min_scale = int(valid_scales.min().item()) if valid_scales.numel() > 0 else 1
-            max_scratch_pages = int(self._scratch_pages.max().item())
-            self._max_scratch_slots = max(
-                1,
-                (self.max_blocks_per_seq * max_scratch_pages + min_scale - 1) // min_scale,
-            )
+            # Asked of the manager, as the base does: only it knows which blocks the
+            # window and the rewind margin keep from going stale.
+            self._max_scratch_slots = max(1, self.impl.max_scratch_slots(self.max_blocks_per_seq))
             scratch_slots_shape = (
                 self.num_pools,
                 staging_capacity,
@@ -998,12 +981,8 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         base_indices = kv_cache.get_base_page_indices(pool_id).tolist()
         converter = self.impl.get_page_index_converter(layer_id, data_role)
         page_index_mode = _get_index_mode(attn_type)
-        return converter(
-            base_indices,
-            page_index_mode,
-            kv_cache.get_swa_scratch_range(pool_id) or None,
-            kv_cache.get_scratch_slots(pool_id),
-        )
+        scratch_range, scratch_slots = get_scratch_entry(kv_cache, pool_id) or (None, ())
+        return converter(base_indices, page_index_mode, scratch_range, scratch_slots)
 
     def _get_window_page_headroom(self) -> int | None:
         """Headroom for counting the pages a window holds with offload, else None."""
@@ -1699,7 +1678,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         if self.enable_swa_scratch_reuse and num_contexts > 0:
             scratch_descs_by_pool = [
                 [
-                    _scratch_entry(self.kv_cache_map[req], pool_id)
+                    get_scratch_entry(self.kv_cache_map[req], pool_id)
                     for req in request_ids[:num_contexts]
                 ]
                 for pool_id in range(self.num_pools)
@@ -1875,15 +1854,12 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     ) -> torch.Tensor:
         """Reserve this layer's pinned destinations on the compressor's stream.
 
-        Return int32[B, F] in Batch and descriptor buffer order. The caller
-        must join Batch publication before this call, and join the compressor
-        stream before fetch/attention or a history update. No KV is fetched here.
-        Padding roles were initialized during manager construction. The fused
-        compressor uses the data column as a one-row page table for data and
-        NVFP4 scales, whose matching geometry is checked during descriptor construction
-        and, once per layer outside graph capture, by ``prepare_sparse_write_indices``
-        against the indices native returns. Each buffer still uses its own arena base
-        and byte stride.
+        Returns :meth:`prepare_sparse_write_indices`'s int32[B, F], in Batch and
+        descriptor buffer order, under the same stream contract. The fused compressor
+        uses the data column as a one-row page table for both the data and the NVFP4
+        scales; that is sound because their arena geometry matches, which building the
+        sparse descriptors checks. Each buffer still uses its own arena base and byte
+        stride.
         """
         return self.prepare_sparse_write_indices(state, layer_idx)
 

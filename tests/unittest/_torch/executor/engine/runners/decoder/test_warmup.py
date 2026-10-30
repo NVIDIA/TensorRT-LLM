@@ -1498,6 +1498,16 @@ def test_generation_warmup_shapes_drop_context_tokens(
 
 
 @pytest.mark.cpu_only
+def test_generation_warmup_shapes_keep_generation_batches_stated_without_draft_tokens() -> None:
+    """The general and max-shape warmups state a generation batch as one token per
+    request whatever the draft length; it is still a pure-generation batch."""
+    warmup = SimpleNamespace(_config=SimpleNamespace(max_total_draft_tokens=2))
+    configs = [(1, 0), (1, 1), (258, 0), (13, 13), (2, 0)]
+
+    assert DecoderWarmup._generation_warmup_shapes(warmup, configs) == [(3, 1), (39, 13)]
+
+
+@pytest.mark.cpu_only
 def test_decode_only_skips_prefill_cuda_graph_capture() -> None:
     """A decode-only worker never runs a context batch, so prefill graphs are dead weight."""
     graphs = SimpleNamespace(

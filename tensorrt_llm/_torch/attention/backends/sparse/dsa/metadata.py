@@ -457,12 +457,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         An offloading worker only decodes, one query token per request.
         """
-        state = self.sparse_offload_state
-        state.prepared = False
-        state.is_prefill = False
+        self.sparse_offload_state.prepared = False
         if self.num_contexts:
             raise NotImplementedError(
-                "DSA KV cache offload runs decode batches only; context requests reach "
+                "Sparse KV cache offload runs decode batches only; context requests reach "
                 "an offloading worker through disaggregated KV transfer"
             )
         if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":

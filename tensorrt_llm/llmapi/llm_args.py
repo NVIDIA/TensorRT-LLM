@@ -938,15 +938,17 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         status="prototype",
         description=
         "Pinned host memory in bytes, per rank, for offloaded attention history "
-        "and the staging buffers that publish it to the GPU. History pages share "
-        "slots with the GPU KV cache pools, so the GPU KV cache quota is lowered "
-        "when needed to stay within it. It is separate from "
-        "kv_cache_config.host_cache_size, the host tier that evicted KV cache "
-        "pages move to, and the two together must fit this rank's share of "
-        "available host memory and the pinned-memory limit. When unset, it "
-        "holds max_batch_size requests at kv_cache_config.avg_seq_len, or "
-        "max_seq_len when that is unset, capped by the host memory automatic "
-        "sizing may pin.")
+        "and the staging buffers that publish it to the GPU. The KV cache "
+        "manager holds the history pools within it, beside the GPU KV cache "
+        "quota, which it does not lower; a size too small for the batches the "
+        "manager must always hold, such as one max_seq_len request, is "
+        "rejected. It is separate from kv_cache_config.host_cache_size, the "
+        "host tier that evicted KV cache pages move to, and the two together "
+        "must fit this rank's share of available host memory and the "
+        "pinned-memory limit. When unset, it holds max_batch_size requests at "
+        "kv_cache_config.avg_seq_len, or max_seq_len when that is unset, "
+        "capped by the host memory automatic sizing may pin, and at least what "
+        "those batches need.")
 
 
 class BaseSparseAttentionConfig(StrictBaseModel):
@@ -1452,11 +1454,12 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         default=False,
         status="prototype",
         description=
-        "Offload the sparse attention KV history to host memory with KV cache "
-        "manager v2. Each decode step fetches the units the indexer selects "
-        "into a per-request GPU cache; the indexer cache remains on GPU. Only "
-        "a decode-only worker, such as the generation worker of a "
-        "disaggregated deployment, can offload.")
+        "Offload the KV history sparse attention selects from to host memory "
+        "with KV cache manager v2: the MLA latent cache, or for DeepSeek-V4 "
+        "the ratio-4 compressed cache. Each decode step fetches the units the "
+        "indexer selects into a per-request GPU cache; the indexer and "
+        "sliding-window caches remain on GPU. Only a decode-only worker, such "
+        "as the generation worker of a disaggregated deployment, can offload.")
     kv_cache_offload_config: SparseKvCacheOffloadConfig = Field(
         default_factory=SparseKvCacheOffloadConfig,
         status="prototype",
@@ -1688,14 +1691,6 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
         description="The sliding window size in tokens for SWA layers.")
     index_topk: Optional[int] = Field(default=512,
                                       description="The top-k for the indexer.")
-    enable_kv_cache_offload: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Offload ratio-4 compressed attention KV history to host memory with "
-        "KV cache manager v2. The indexer and sliding-window caches remain on "
-        "GPU. Only a decode-only worker, such as the generation worker of a "
-        "disaggregated deployment, can offload.")
 
     @field_validator("index_head_dim")
     @classmethod

@@ -887,23 +887,11 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         events.append("history")
 
     kv_cache_manager.update_forward_resources.side_effect = update_forward_resources
-    executor = types.SimpleNamespace(
-        model_engine=types.SimpleNamespace(route_capture=None, forward=forward),
-        resource_manager=object(),
-        kv_cache_manager=kv_cache_manager,
-        _is_kv_manager_v2=is_v2,
-        iter_counter=0,
-        sampler=Mock(),
-        execution_stream=Mock(),
-        _iter_adp_dummy_ctx_tokens=0,
-        _iter_adp_dummy_gen_tokens=0,
-        _compute_adp_dummy_tokens=PyExecutor._compute_adp_dummy_tokens,
-        _maybe_record_hang_diagnostic_phase=Mock(),
-        _attach_encoder_output_to_execution_stream=Mock(),
-        _mark_cross_kv_projection_consumed=Mock(),
-        _kv_connector_wait_for_save=Mock(),
-        _wait_for_model_engine_input_copy=Mock(side_effect=lambda: events.append("input_copy")),
-        _handle_errors=Mock(),
+    executor = _forward_step_executor(types.SimpleNamespace(route_capture=None, forward=forward))
+    executor.kv_cache_manager = kv_cache_manager
+    executor._is_kv_manager_v2 = is_v2
+    executor._wait_for_model_engine_input_copy = Mock(
+        side_effect=lambda: events.append("input_copy")
     )
     with (
         patch("torch.cuda.current_stream", return_value=caller_stream),

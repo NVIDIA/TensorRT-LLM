@@ -236,6 +236,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
+    warmup.sparse_attention_config = None
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
     warmup._warmup_timer = _WarmupTimer(rank=0)
@@ -249,7 +250,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     observed = []
 
     def observe(phase):
-        def forward(*args):
+        def forward(*args, **kwargs):
             observed.append((phase, model.use_compiled_forward()))
 
         return forward

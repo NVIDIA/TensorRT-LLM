@@ -4106,33 +4106,21 @@ def test_offload_counts_gpu_history_and_window_pages_exactly() -> None:
 
 
 @pytest.mark.cpu_only
-def test_sparse_offload_rejects_kv_pool_rebalance() -> None:
+def test_sparse_offload_settings_reach_the_base_manager_check() -> None:
+    """The base manager rejects what offload cannot honor, such as speculative decoding
+    or pool rebalancing, before it sizes anything; DeepSeek-V4 hands it both configs."""
     sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
+    spec_config = MTPDecodingConfig(max_draft_len=1)
+
+    class StopAtBaseInit(Exception):
+        pass
+
     with (
-        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
-        pytest.raises(ValueError, match="enable_kv_pool_rebalance"),
-    ):
-        DeepseekV4CacheManager(
-            kv_cache_config=KvCacheConfig(enable_block_reuse=False, enable_kv_pool_rebalance=True),
-            kv_cache_type=CacheTypeCpp.SELFKONLY,
-            num_layers=len(sparse_config.compress_ratios),
-            max_batch_size=1,
-            tokens_per_block=128,
-            max_seq_len=256,
-            vocab_size=128,
-            mapping=Mapping(),
-            sparse_attn_config=sparse_config,
-        )
-
-    initialize_cache.assert_not_called()
-
-
-@pytest.mark.cpu_only
-def test_sparse_offload_rejects_speculative_decoding() -> None:
-    sparse_config = DeepSeekV4SparseAttentionConfig(enable_kv_cache_offload=True)
-    with (
-        patch.object(deepseek_v4_cache.KVCacheManagerV2, "__init__") as initialize_cache,
-        pytest.raises(ValueError, match="does not support speculative decoding"),
+        patch.object(deepseek_v4_cache, "get_sm_version", return_value=100),
+        patch.object(
+            deepseek_v4_cache.KVCacheManagerV2, "__init__", side_effect=StopAtBaseInit
+        ) as initialize_cache,
+        pytest.raises(StopAtBaseInit),
     ):
         DeepseekV4CacheManager(
             kv_cache_config=KvCacheConfig(enable_block_reuse=False),
@@ -4144,10 +4132,12 @@ def test_sparse_offload_rejects_speculative_decoding() -> None:
             vocab_size=128,
             mapping=Mapping(),
             sparse_attn_config=sparse_config,
-            spec_config=MTPDecodingConfig(max_draft_len=1),
+            spec_config=spec_config,
         )
 
-    initialize_cache.assert_not_called()
+    kwargs = initialize_cache.call_args.kwargs
+    assert kwargs["sparse_kv_offload_config"] == sparse_config.get_kv_cache_offload_config()
+    assert kwargs["spec_config"] is spec_config
 
 
 @pytest.mark.cpu_only
@@ -4160,36 +4150,13 @@ def test_offload_capacity_report_names_the_binding_limit() -> None:
     # four ranks with 400 GiB available.
     manager._host_history_budget = 50 << 30
     # The native group holds 4,096 slots: four requests of 128K tokens. Its pool of
-    # sparse pages holds 217,728 host bytes per slot; its indexer pool is on the GPU.
-    sparse_layer = next(
-        layer for layer in manager.kv_cache_manager_py_config.layers if layer.sparse_cache
+    # sparse pages holds 217,728 host bytes per slot; its indexer pool is on the GPU,
+    # and the device quota counts only device-backed pools.
+    manager.impl = SimpleNamespace(
+        get_quota=lambda level: 100 << 30,
+        sparse_backing_medium=lambda: CacheTier.HOST_MEM,
+        get_num_bytes=lambda level, medium: 4096 * 217_728 if medium == CacheTier.HOST_MEM else 0,
     )
-    sparse_buffer = next(buffer for buffer in sparse_layer.buffers if buffer.is_sparse)
-    dense_buffer = next(buffer for buffer in sparse_layer.buffers if not buffer.is_sparse)
-    host_pool = SimpleNamespace(
-        num_slots=4096,
-        slot_desc=SimpleNamespace(
-            variants=[
-                SimpleNamespace(
-                    coalesced_buffers=[
-                        SimpleNamespace(
-                            buffer_ids=[
-                                SimpleNamespace(layer_id=sparse_layer.layer_id, role=buffer.role)
-                            ]
-                        )
-                        for buffer in (sparse_buffer, dense_buffer)
-                    ]
-                )
-            ]
-        ),
-        pools=[
-            SimpleNamespace(pool_index=0, slot_bytes=217_728),
-            SimpleNamespace(pool_index=1, slot_bytes=52_176),
-        ],
-    )
-    manager.get_host_backed_pool_groups = lambda: [host_pool]
-    # The device quota counts only device-backed pools.
-    manager.impl = SimpleNamespace(get_quota=lambda level: 100 << 30)
 
     with (
         patch.object(kv_cache_v2_module.logger, "info") as info,

@@ -22,6 +22,7 @@ from tensorrt_llm._utils import (
     convert_to_torch_tensor,
     get_size_in_bytes,
     get_sm_version,
+    is_sm_100f,
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -751,7 +752,16 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         return cache_bytes
 
     def _check_dsa_offload_support(self, dtype: DataType) -> None:
-        """Refuse offload on the paths that have no arena read or write yet."""
+        """Refuse offload on the paths that have no arena read or write yet.
+
+        The GPU is checked first: elsewhere it decides which KV cache dtypes are
+        allowed at all, so a dtype error on an unsupported GPU would mislead.
+        """
+        if not is_sm_100f():
+            raise NotImplementedError(
+                "DSA KV cache offload reads the latent through the trtllm-gen sparse MLA "
+                f"kernels, which run on the SM100 family only; this GPU is SM{get_sm_version()}."
+            )
         if self.use_fp8_ds_mla:
             raise NotImplementedError(
                 "DSA KV cache offload does not support kv_cache_config.dtype='fp8_ds_mla'."
@@ -759,11 +769,6 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         if dtype not in (DataType.FP8, DataType.BF16, DataType.NVFP4):
             raise NotImplementedError(
                 f"DSA KV cache offload supports an FP8, BF16 or NVFP4 MLA latent, got {dtype}."
-            )
-        if get_sm_version() < 100:
-            raise NotImplementedError(
-                "DSA KV cache offload reads the latent through the trtllm-gen sparse MLA "
-                f"kernels, which need SM100 or newer; this GPU is SM{get_sm_version()}."
             )
         if self._sparse_offload_topk is None or self._sparse_offload_topk <= 0:
             raise ValueError("DSA KV cache offload requires a positive index_topk")
@@ -951,16 +956,22 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         return self.head_dim if self.dtype == DataType.NVFP4 else None
 
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfigPy) -> int:
-        """Count the offload state and the latent writer's one-token page table.
+        """Count the offload state, the latent writer's one-token page table and the
+        indices the sparse attention reads.
 
         Per Batch row, the page table holds a K and a V offset and the write slots
-        one entry, since an offloading step has one query token per request.
-        Both metadata copies hold them.
+        one entry, since an offloading step has one query token per request, and the
+        attention reads ``topk`` merged indices. Both metadata copies hold them.
         """
         scratch = super().get_sparse_offload_scratch_bytes(config)
         if scratch:
             writer_entries = 3 * self.max_batch_size
-            scratch += SPARSE_OFFLOAD_STATE_COPIES * writer_entries * torch.int32.itemsize
+            attn_index_entries = self.max_batch_size * self._sparse_offload_topk
+            scratch += (
+                SPARSE_OFFLOAD_STATE_COPIES
+                * (writer_entries + attn_index_entries)
+                * torch.int32.itemsize
+            )
         return scratch
 
     def get_cache_bytes_per_token(self) -> int:

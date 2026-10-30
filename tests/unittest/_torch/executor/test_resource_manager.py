@@ -1655,7 +1655,7 @@ class TestRequestBudget(unittest.TestCase):
         req = self._make_request(prompt_len=200, max_new_tokens=5, beam_width=4)
         with self.assertRaisesRegex(
                 ValueError, "KV_CACHE_MANAGER requires 29 KV cache blocks.*"
-                "GPU-primary capacity of 8"):
+                "capacity of 8"):
             executor._validate_request_budget(req)
 
         # shared(2) + per_beam(2) * beam(2) = 6, so it fits.

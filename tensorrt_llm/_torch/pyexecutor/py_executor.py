@@ -461,6 +461,8 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
+    _is_kv_manager_v2 = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -3402,8 +3404,8 @@ class PyExecutor:
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
-                    # Sort before preparing resources: a resource manager can
-                    # assign per-request rows in this order.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
@@ -6341,8 +6343,8 @@ class PyExecutor:
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
-                    # Sort before preparing resources: a resource manager can
-                    # assign per-request rows in this order.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
@@ -6708,10 +6710,12 @@ class PyExecutor:
         for resource_type, required_blocks, primary_capacity in (
                 self.resource_manager.get_request_kv_block_budgets(request)):
             if required_blocks > primary_capacity:
+                # The capacity is of the pool the budget checks: the GPU primary
+                # pool, or with sparse KV cache offload the host history pool.
                 raise ValueError(
                     f"{resource_type.value} requires {required_blocks} KV cache "
                     f"blocks to complete the request, which exceeds its "
-                    f"GPU-primary capacity of {primary_capacity} blocks "
+                    f"capacity of {primary_capacity} blocks "
                     f"(prompt_len={request.orig_prompt_len}, "
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")

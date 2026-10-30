@@ -9,7 +9,12 @@ import torch
 import triton
 import triton.language as tl
 
-from ..offload_kernels import check_sparse_offload_tensor
+from ..offload_kernels import (
+    SPARSE_ARENA_COVERAGE_MESSAGE,
+    check_sparse_arena_merge_inputs,
+    check_sparse_offload_tensor,
+    sparse_arena_rows,
+)
 
 ########################################################
 # Index gather kernel
@@ -75,6 +80,8 @@ def _deepseek_v4_local_to_global_kernel(
     SPARSE_BATCH_SIZE: tl.constexpr,
     sparse_num_lengths,
     UNIT_TOKENS: tl.constexpr,
+    coverage_ptr,
+    CHECK_COVERAGE: tl.constexpr,
 ):
     """
     Triton kernel for converting local indices to global KV cache pool indices.
@@ -162,17 +169,20 @@ def _deepseek_v4_local_to_global_kernel(
 
         if MERGE_SPARSE_INDICES:
             history = tl.load(history_lengths_ptr + row * history_stride, mask=live, other=0)
-            history_units = history // UNIT_TOKENS
             length = tl.load(compressed_lengths_ptr + req * length_stride, mask=live, other=0)
-            valid = live & (compressed_local_idx >= 0) & (compressed_local_idx < length)
-            fetched = tl.load(
-                fetched_indices_ptr + row * fetch_stride0 + compressed_ids * fetch_stride1,
-                mask=valid & (compressed_local_idx < history_units),
-                other=-1,
-            )
             write = tl.load(write_indices_ptr + row * write_stride, mask=live, other=-1)
-            compressed_global_index = tl.where(
-                valid & (compressed_local_idx == history_units), write, fetched
+            compressed_global_index = sparse_arena_rows(
+                compressed_local_idx,
+                compressed_ids < num_compressed_indices,
+                live,
+                length,
+                history // UNIT_TOKENS,
+                fetched_indices_ptr + row * fetch_stride0,
+                fetch_stride1,
+                compressed_ids,
+                write,
+                coverage_ptr,
+                CHECK_COVERAGE,
             )
         else:
             compressed_valid_mask = compressed_local_idx >= 0
@@ -245,6 +255,7 @@ def deepseek_v4_local_to_global_indices(
     compressed_history_lengths: torch.Tensor | None = None,
     compressed_lengths: torch.Tensor | None = None,
     compressed_batch_rows: torch.Tensor | None = None,
+    compressed_coverage: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
@@ -281,15 +292,17 @@ def deepseek_v4_local_to_global_indices(
             graph dummy requests, refreshed in place before replay. Single-token
             decode only: mask both pools for padded queries without reading their
             page-table rows. Do not pass this for multi-query context inputs.
-        mask_invalid_pages: Mask negative physical page mappings in both pools
-            when consuming an offload read table. Compiled out by default to
-            preserve the original non-offload indexing behavior.
+        mask_invalid_pages: Mask negative physical page mappings in both pools.
+            A sparse offload Batch publishes its page tables with
+            ``BAD_PAGE_INDEX`` for the pages it does not hold. Compiled out by
+            default to preserve the original non-offload indexing behavior.
         compressed_fetched_indices: CUDA int32 [B, K] physical history indices,
             in Batch row order and original top-k column order. Supply all five
             sparse tensors and active_request_count together for single-token
             decode. The kernel merges history and in-flight destinations into
-            query order while preparing SWA indices; no compressed page table
-            or additional address conversion is used.
+            query order while preparing SWA indices, by the rule of
+            ``offload_kernels.sparse_arena_rows``; no compressed page table or
+            additional address conversion is used.
         compressed_write_indices: CUDA int32 [B] prepared in-flight destinations,
             by Batch row. May be a strided data-column view shared by paired
             NVFP4 pools.
@@ -302,6 +315,10 @@ def deepseek_v4_local_to_global_indices(
         compressed_batch_rows: CUDA int32 [B] native Batch row of each request,
             in req_id's numbering, or -1 for no live request. A request whose
             row is -1 gets no indices in either pool.
+        compressed_coverage: Optional CUDA int32 [1] diagnostic flag for the
+            merge, as ``offload_kernels.merge_sparse_arena_indices`` takes it:
+            reset, cleared when a live selection gets no arena row, and asserted
+            on the device. Pass it only for debugging.
 
     Returns:
         A combined index tensor, or separate SWA and compressed tensors when
@@ -334,13 +351,15 @@ def deepseek_v4_local_to_global_indices(
     swa_buffer_offset_in_tokens = (swa_buffer_ptr - swa_pool_base_ptr) // token_stride
 
     sparse_tensors = (
-        (compressed_fetched_indices, "compressed_fetched_indices", 2),
-        (compressed_write_indices, "compressed_write_indices", 1),
-        (compressed_history_lengths, "compressed_history_lengths", 1),
-        (compressed_lengths, "compressed_lengths", 1),
-        (compressed_batch_rows, "compressed_batch_rows", 1),
+        compressed_fetched_indices,
+        compressed_write_indices,
+        compressed_history_lengths,
+        compressed_lengths,
+        compressed_batch_rows,
     )
-    merge_sparse_indices = any(tensor is not None for tensor, _, _ in sparse_tensors)
+    merge_sparse_indices = any(tensor is not None for tensor in sparse_tensors)
+    if compressed_coverage is not None and not merge_sparse_indices:
+        raise ValueError("compressed_coverage checks a sparse merge; pass the sparse mappings")
     sparse_batch_size = sparse_num_lengths = 0
     fetch_stride0 = fetch_stride1 = write_stride = history_stride = length_stride = 0
     batch_rows_stride = 0
@@ -348,32 +367,27 @@ def deepseek_v4_local_to_global_indices(
         if (
             not has_compressed
             or active_request_count is None
-            or any(tensor is None for tensor, _, _ in sparse_tensors)
+            or compressed_local_indices is None
+            or any(tensor is None for tensor in sparse_tensors)
         ):
             raise ValueError(
-                "Sparse indices require a compressed layer, all mappings and an active count"
+                "Sparse indices require a compressed layer, the original top-k selection, "
+                "all mappings and an active count"
             )
-        for tensor, name, ndim in sparse_tensors:
-            check_sparse_offload_tensor(tensor, name, ndim, req_id.device)
-        sparse_batch_size, width = compressed_fetched_indices.shape
-        sparse_num_lengths = compressed_lengths.numel()
-        if (
-            width != num_compressed_indices
-            or compressed_write_indices.shape != (sparse_batch_size,)
-            or compressed_history_lengths.shape != (sparse_batch_size,)
-            or compressed_batch_rows.shape != (sparse_batch_size,)
-            or not num_tokens <= sparse_num_lengths <= sparse_batch_size
-        ):
-            raise ValueError(
-                "Sparse mappings must cover the native Batch and configured top-k width"
-            )
-        if compressed_local_indices is None:
-            raise ValueError("Sparse index preparation requires the original top-k selection")
-        check_sparse_offload_tensor(
-            compressed_local_indices, "compressed_local_indices", 2, req_id.device
+        check_sparse_arena_merge_inputs(
+            compressed_local_indices,
+            compressed_lengths,
+            compressed_history_lengths,
+            compressed_batch_rows,
+            compressed_fetched_indices,
+            compressed_write_indices,
+            active_request_count,
+            compressed_coverage,
         )
         if compressed_local_indices.shape != (num_tokens, num_compressed_indices):
-            raise ValueError("Sparse top-k indices must be [Q, K]")
+            raise ValueError("Sparse top-k indices must be [Q, K] at the configured width")
+        sparse_batch_size = compressed_fetched_indices.shape[0]
+        sparse_num_lengths = compressed_lengths.numel()
         fetch_stride0, fetch_stride1 = compressed_fetched_indices.stride()
         write_stride = compressed_write_indices.stride(0)
         history_stride = compressed_history_lengths.stride(0)
@@ -474,6 +488,8 @@ def deepseek_v4_local_to_global_indices(
             "(bmm1_scale, bmm2_scale, quant_scale_o, dequant_scale_q, dequant_scale_kv)"
         )
 
+    if compressed_coverage is not None:
+        compressed_coverage.fill_(1)
     # Launch kernel
     _deepseek_v4_local_to_global_kernel[grid](
         req_id_c,
@@ -533,8 +549,12 @@ def deepseek_v4_local_to_global_indices(
         SPARSE_BATCH_SIZE=sparse_batch_size,
         sparse_num_lengths=sparse_num_lengths,
         UNIT_TOKENS=compress_ratio,
+        coverage_ptr=compressed_coverage if compressed_coverage is not None else out,
+        CHECK_COVERAGE=compressed_coverage is not None,
         launch_pdl=launch_with_pdl,
     )
+    if compressed_coverage is not None:
+        torch._assert_async(compressed_coverage, SPARSE_ARENA_COVERAGE_MESSAGE)
 
     if split_extra:
         return out, out_extra

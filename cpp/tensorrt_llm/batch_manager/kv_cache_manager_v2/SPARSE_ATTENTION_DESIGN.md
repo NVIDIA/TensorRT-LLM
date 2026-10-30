@@ -943,8 +943,8 @@ never run.
 
 ## Sizing
 
-Per sparse buffer: **`num_selected_blocks`** (the selection width `k`) and **N** (the
-reservation upper bound, in the same units).
+Per sparse cache (`SparseCacheConfig`): **`num_selected_blocks`** (the selection width
+`k`) and **N**, `max_cached_units` (the reservation upper bound, in the same units).
 
 N should be `2k`–`4k`, not `k`. `k` is the correctness floor — it guarantees a fetch can
 satisfy its layer — but it leaves no room for retention, and retention across steps is
@@ -965,15 +965,17 @@ so `N` is sized by one demand rather than two: retention wants
 
 ## Python surface
 
-Declared or planned in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
+Declared in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
 
-- `BufferConfig.is_sparse: bool`, `BufferConfig.num_selected_blocks: int`, the reservation
-  bound, `BufferConfig.sparse_selection_unit_tokens: int | None` and
-  `BufferConfig.sparse_unit_chunks: int` — construction-time, per buffer.
+- `BufferConfig.is_sparse: bool` and `BufferConfig.sparse_unit_chunks: int` —
+  construction-time, per buffer.
+- `AttentionLayerConfig.sparse_cache: SparseCacheConfig | None` — the layer's fetch path:
+  `num_selected_blocks` (the selection width `k`), `max_cached_units` (the reservation
+  bound), `unit_tokens` and `selection_id`; construction-time, per layer.
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
 - `Batch` — membership, row order, device arrays, `resize()` and `publish()`, which
   transfers the whole table; dirty-row tracking is planned, not declared.
-- `KVCacheManager.fetch_sparse_pages(batch, buffers, selected, out, stream)`.
+- `Batch.fetch_sparse_pages(buffers, selected, out, stream)`.
 - `Batch.sparse_out_slots(buffers) -> list[int]` — the slice of `out` each buffer's
   indices land in, for both the fetch and the write.
 

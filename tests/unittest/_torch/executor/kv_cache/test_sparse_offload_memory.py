@@ -29,10 +29,9 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     sparse_cache_cells,
     sparse_cache_config,
     sparse_history_bytes_per_block,
-    sparse_offload_pool_ratio,
+    sparse_history_floor_bytes,
     sparse_units_per_page,
 )
-from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BatchDesc,
@@ -59,7 +58,8 @@ V4_FLASH_ARENA = SparseArenaShape(
     cell_bytes=(32 * 288, 32 * 36) * 21,
 )
 # 256 rows of up to 1M tokens: a table of 8,196 pages for each of three life
-# cycles, and one fetch of 512 rows.
+# cycles, a converted index table for each of the history's two sparse buffers,
+# and one fetch of 512 rows.
 V4_FLASH_BATCH = SparseBatchShape(
     num_life_cycles=3,
     max_batch_size=256,
@@ -67,6 +67,7 @@ V4_FLASH_BATCH = SparseBatchShape(
     selection_widths=(512,),
     layer_counts=(2,),
     flush_capacities=(256,),
+    index_table_entries=2,
 )
 # The Batch and DeepSeek-V4's attention metadata offload state, of which the eager
 # and the CUDA graph metadata each hold one: 64 MiB of dequantized NVFP4 rows and
@@ -341,38 +342,6 @@ def test_life_cycle_with_only_sparse_buffers_is_rejected() -> None:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize(
-    ("window", "sink_tokens", "capacity", "headroom", "pages"),
-    [
-        (None, 0, 1 << 17, 1, 1024),
-        # A 128-token window and the token being written can straddle two pages.
-        (128, 0, 1 << 17, 1, 2),
-        (128, 0, 1 << 17, 4, 3),
-        (128, 200, 1 << 17, 1, 4),
-        # A request never holds more pages than its capacity spans.
-        (4096, 0, 300, 1, 3),
-    ],
-)
-def test_pages_a_decoding_request_holds(
-    window: int | None, sink_tokens: int, capacity: int, headroom: int, pages: int
-) -> None:
-    life_cycle = LifeCyclePage(
-        window_size=window,
-        num_sink_tokens=sink_tokens,
-        is_state=False,
-        device_bytes=1,
-        host_bytes=0,
-        device_pool_bytes=(1,),
-    )
-    assert (
-        life_cycle.pages_per_request(
-            capacity=capacity, capacity_headroom=headroom, tokens_per_block=TOKENS_PER_BLOCK
-        )
-        == pages
-    )
-
-
-@pytest.mark.cpu_only
 def test_batch_matches_native_layout() -> None:
     # Three int32 page tables of 8,196 pages, two watermarks per row, and one arena slot
     # per row, which serves every life cycle.
@@ -390,9 +359,12 @@ def test_batch_matches_native_layout() -> None:
         256 * (512 + 2) + (3 * 256 * 512 + 1) + 2 * (3 * 256 + 1) + 256 * 2
     )
     assert V4_FLASH_BATCH.fetch_scratch_bytes == 2_107_404
+    # The fetch and the write-back read converted indices: a table per sparse buffer,
+    # shared by the life cycle's layers since nothing substitutes a scratch slot there.
+    assert V4_FLASH_BATCH.index_table_bytes == 4 * 2 * 256 * 8196 == 16_785_408
     # The device holds the staged block a publish fills ahead of the step, the mirror of
-    # its tail that a captured kernel reads, and the work arrays.
-    assert V4_FLASH_BATCH.device_bytes == 25_181_184 + 3_072 + 2_107_404 == 27_291_660
+    # its tail that a captured kernel reads, the converted tables and the work arrays.
+    assert V4_FLASH_BATCH.device_bytes == 25_181_184 + 3_072 + 16_785_408 + 2_107_404 == 44_077_068
 
 
 @pytest.mark.cpu_only
@@ -524,59 +496,6 @@ def test_sparse_cache_config_rejects_a_unit_that_does_not_divide_a_page() -> Non
 
 
 @pytest.mark.cpu_only
-def test_pool_ratio_buys_the_same_requests_in_every_life_cycle() -> None:
-    life_cycles = life_cycle_pages(_v4_flash_like_layers(), TOKENS_PER_BLOCK)
-
-    ratio = sparse_offload_pool_ratio(
-        life_cycles, capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-    )
-
-    # Every pool counts, host-backed ones included: the ratio is compared against a layout
-    # measured the same way, and is projected onto cold levels where one pool holds dense and
-    # sparse buffers together. Host pages costing the GPU quota nothing is a fact about the
-    # quota, not about the ratio.
-    request_bytes = [
-        (life_cycle.device_bytes + life_cycle.host_bytes)
-        * life_cycle.pages_per_request(
-            capacity=1 << 17, capacity_headroom=1, tokens_per_block=TOKENS_PER_BLOCK
-        )
-        for life_cycle in life_cycles
-    ]
-    assert ratio == pytest.approx([b / sum(request_bytes) for b in request_bytes])
-    # The history life cycle is the one with host-backed pages, so counting them moves it.
-    assert ratio[1] > 0.9, "the offloaded history dominates once its host pages are counted"
-    assert sum(ratio) == pytest.approx(1.0, abs=1e-9)
-
-
-def _history_beside_five_window_pools() -> list[LifeCyclePage]:
-    """The history's one dense pool wastes little of its granules on whole slots,
-    while the windowed life cycles have five pools that can each leave one."""
-    layers = [
-        _layer(
-            0, ("key", 131_072, False), ("value", 65_536, False), ("x", 16_384, False), window=128
-        ),
-        _sparse_layer(1),
-        _layer(2, ("state", 65_536, False), ("score", 800, False), window=8),
-    ]
-    return life_cycle_pages(layers, TOKENS_PER_BLOCK)
-
-
-def _native_slots(life_cycles: list[LifeCyclePage], ratio: list[float], quota: int) -> list[int]:
-    """Slots the native manager gives each life cycle, one pool group apiece.
-
-    It rounds the quota up to a whole granule, then splits it by ``ratio``.
-    """
-    granule = _introspection.tier_allocation_granularity(CacheTier.GPU_MEM, quota)
-    return _introspection.ratio_to_slot_count_list(
-        ceil_div(quota, granule) * granule,
-        [list(life_cycle.device_pool_bytes) for life_cycle in life_cycles],
-        ratio,
-        granule,
-        [1] * len(life_cycles),
-    )
-
-
-@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("host_history_size", "pinnable_host_bytes", "budget"),
     [
@@ -606,6 +525,48 @@ def test_host_budget(
 
 
 @pytest.mark.cpu_only
+def test_automatic_host_budget_grows_to_the_floor() -> None:
+    # 256 requests of 1,000 bytes would take 256,000 bytes, short of the 300,000 the
+    # manager's constraint batches need.
+    assert (
+        plan_host_history_bytes(
+            host_history_size=None,
+            max_batch_size=256,
+            host_bytes_per_request=1000,
+            pinnable_host_bytes=float("inf"),
+            staging_bytes=4096,
+            floor_bytes=300_000,
+        )
+        == 300_000
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("host_history_size", "pinnable_host_bytes", "match"),
+    [
+        (200_000, float("inf"), "host_history_size .* less than the 0.3MiB"),
+        (None, 200_000.0, "automatically leaves 0.2MiB .* less than the 0.3MiB"),
+    ],
+    ids=["explicit", "automatic"],
+)
+def test_host_budget_below_the_floor_is_refused(
+    host_history_size: int | None, pinnable_host_bytes: float, match: str
+) -> None:
+    # The native manager refuses a budget below the floor at construction; refusing it
+    # here says what to change.
+    with pytest.raises(ValueError, match=match):
+        plan_host_history_bytes(
+            host_history_size=host_history_size,
+            max_batch_size=256,
+            host_bytes_per_request=1000,
+            pinnable_host_bytes=pinnable_host_bytes,
+            staging_bytes=4096,
+            floor_bytes=300_000,
+        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("host_history_size", "pinnable_host_bytes", "match"),
     [
@@ -624,6 +585,44 @@ def test_host_budget_must_leave_the_pools_room(
             pinnable_host_bytes=pinnable_host_bytes,
             staging_bytes=4096,
         )
+
+
+@pytest.mark.cpu_only
+def test_host_floor_holds_the_largest_constraint_batch() -> None:
+    layers = _v4_flash_like_layers()
+    shorter = BatchDesc([KVCacheDesc(capacity=1 << 16, history_length=0)])
+    # DeepSeek-V4's constraint: one max_seq_len request beside short decode requests.
+    longest = BatchDesc(
+        [KVCacheDesc(capacity=1 << 17, history_length=(1 << 17) - 1)]
+        + [KVCacheDesc(capacity=1, history_length=0)] * 15
+    )
+
+    floor = sparse_history_floor_bytes(
+        layers, [shorter, longest], tokens_per_block=TOKENS_PER_BLOCK, max_util_for_resume=0.95
+    )
+
+    # The longest request spans 1,024 pages and each short one a page: 1,039 slots, or
+    # 1,094 under the 0.95 utilization the manager keeps. Each slot holds a page of both
+    # sparse layers' data and scales, and each of those two pools rounds up to a 2 MiB
+    # grain.
+    assert sparse_history_bytes_per_block(layers) == 2 * (32 * 288 + 32 * 36)
+    assert floor == 1094 * 20_736 + 2 * (2 << 20) == 26_879_488
+    # A manager without constraints, or without host-backed pools, keeps no floor.
+    assert (
+        sparse_history_floor_bytes(
+            layers, [], tokens_per_block=TOKENS_PER_BLOCK, max_util_for_resume=0.95
+        )
+        == 0
+    )
+    assert (
+        sparse_history_floor_bytes(
+            [_layer(0, ("key", 4096, False))],
+            [longest],
+            tokens_per_block=TOKENS_PER_BLOCK,
+            max_util_for_resume=0.95,
+        )
+        == 0
+    )
 
 
 @pytest.mark.cpu_only
@@ -681,7 +680,7 @@ def test_capacity_names_the_binding_limit_and_the_batch_that_fits() -> None:
     assert "4 by host" in report
     assert "limited by host" in report
     assert "256 leases" in report
-    assert "offload buffers 157.0MiB for 256 rows" in report
+    assert "offload buffers 173.0MiB for 256 rows" in report
     assert "A max_batch_size of 240 fits" in report
 
 

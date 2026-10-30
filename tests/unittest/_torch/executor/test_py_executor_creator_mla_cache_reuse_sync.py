@@ -746,6 +746,13 @@ def test_decode_only_worker_skips_kv_cache_estimation(monkeypatch, decode_only):
         sm_version=100,
         kv_cache_quant_algo=QuantAlgo.NO_QUANT,
         kv_cache_creator_cls=RecordingCacheCreator,
+        # A decode-only worker is a disaggregated generation server; creation refuses
+        # one without a cache transceiver.
+        cache_transceiver_config=(
+            CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+            if decode_only
+            else None
+        ),
     )
 
     assert skip_est_args == [decode_only]
