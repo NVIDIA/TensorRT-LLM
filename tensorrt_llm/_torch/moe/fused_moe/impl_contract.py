@@ -15,9 +15,9 @@
 """Contracts for declaring, selecting, and executing MoE implementations."""
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 import torch
 
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.utils import ActivationType
     from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+    from .impl_base import MoEImplBase
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
 
@@ -46,6 +47,9 @@ class MoEStaticCapability:
     # ``_supports_load_balancer()``, which TrtllmGenFusedMoEBase overrides to mean
     # "separated routing is used".
     supports_eplb: bool = False
+    # Whether the backend consumes a per-forward helper-slot plan whose live
+    # weights may be published concurrently with shared-expert computation.
+    supports_per_layer_dynamic_eplb: bool = False
     # Legacy gate: the ``assert moe_cls in [...]`` bias allow-list in
     # ``create_moe_backend``. Per-expert FC bias from the checkpoint, added
     # before the activation functor runs -- not an activation constant.
@@ -78,6 +82,13 @@ class MoEInputRequirement:
     # Overrides the NVLink one-sided combine payload dtype; None means the
     # buffer follows the model output dtype.
     onesided_workspace_dtype: Optional[torch.dtype] = None
+    # ``run_moe`` works in buffers the backend keeps across calls: the tensor it
+    # returns may be a view of one, overwritten by the next call, and two calls
+    # in flight on different streams would share the same scratch. A multi-chunk
+    # forward therefore runs every chunk on one stream and copies each chunk's
+    # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
+    # chunk output, so it refuses a backend that declares this.
+    run_moe_reuses_buffers: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
@@ -241,6 +252,7 @@ class MoEEnvironment:
     sm: int  # e.g. 100, 103
     available_deps: Tuple[str, ...] = ()
     env_flags: Tuple[Tuple[str, str], ...] = ()  # sorted (name, value) pairs
+    oss_cutlass_moe: bool = True
 
     def has_dep(self, name: str) -> bool:
         return name in self.available_deps
@@ -259,7 +271,7 @@ class MoEEnvironment:
 
     def fingerprint(self) -> str:
         """Return a stable fingerprint for the selection environment."""
-        payload = repr((self.sm, sorted(self.available_deps), self.env_flags))
+        payload = repr((self.sm, sorted(self.available_deps), self.env_flags, self.oss_cutlass_moe))
         return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
@@ -278,6 +290,8 @@ class MoEDeployment:
     cluster_size: int = 1
     # True only when an EPLB load balancer is registered.
     eplb_enabled: bool = False
+    # Unified EPLB mode: disabled, standard, or per_layer_dynamic.
+    eplb_mode: str = "disabled"
     # True only for routed-expert LoRA targets.
     moe_lora_enabled: bool = False
     # False when ``moe_disable_finalize_fusion`` is set or any LoRA is
@@ -286,6 +300,7 @@ class MoEDeployment:
     # ``model_config.locality_domain_policy.enabled``. Whether the machine can
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
+    force_dynamic_quantization: bool = False
 
     @property
     def smart_router(self) -> bool:
@@ -324,6 +339,11 @@ class MoERejectReason(str, Enum):
     # EPLB is registered for this layer and the impl cannot lay out slots for
     # it. Distinct from TOPOLOGY_UNSUPPORTED: the parallel sizes are fine.
     EPLB_UNSUPPORTED = "eplb_unsupported"
+    # The deployment forces per-call activation scales
+    # (``force_dynamic_quantization``) and the impl quantizes against scales
+    # fixed at load time. Distinct from QUANT_UNSUPPORTED: the impl serves the
+    # format, so the report must name this rejection as the degradation cause.
+    DYNAMIC_QUANT_UNSUPPORTED = "dynamic_quant_unsupported"
     # The impl only has a fused-finalize FC2 epilogue, and the caller disabled
     # finalize fusion (explicitly, or implicitly by configuring LoRA).
     FINALIZE_FUSION_REQUIRED = "finalize_fusion_required"
@@ -335,6 +355,12 @@ class MoERejectReason(str, Enum):
     BACKEND_DEPRECATED = "backend_deprecated"
     # A wrapper or aggregate that is never itself an execution unit.
     NOT_AN_IMPL = "not_an_impl"
+
+
+# Rejections that usually mean the candidate implements another format or has
+# no kernel for this SM. A best-effort signal: the CUTLASS build gate also
+# answers QUANT_UNSUPPORTED, and not every candidate checks format and SM first.
+_NOT_A_CONTENDER = frozenset({MoERejectReason.QUANT_UNSUPPORTED, MoERejectReason.SM_UNSUPPORTED})
 
 
 @dataclass(frozen=True)
@@ -392,17 +418,67 @@ def check_quant_matches_identity(cls: type, p: "MoEProblem") -> Optional[MoEElig
     return None
 
 
+def activation_rejection_detail(cls: type, p: "MoEProblem") -> Optional[str]:
+    """Why ``cls.activation_support`` cannot carry ``p``'s activation, or ``None``."""
+    support = getattr(cls, "activation_support", None)
+    if support is None:
+        return None
+    return support.rejection_detail(
+        cls.__name__,
+        p.activation_type,
+        clamp_after_silu=p.clamp_after_silu,
+        constants=p.activation_constants,
+    )
+
+
+def check_activation_support(cls: type, p: "MoEProblem") -> Optional[MoEEligibility]:
+    """Reject an activation ``cls.activation_support`` does not cover.
+
+    Resolution runs the same check; this one answers a direct ``can_implement`` call.
+    """
+    detail = activation_rejection_detail(cls, p)
+    if detail is None:
+        return None
+    return MoEEligibility.no(MoERejectReason.ACTIVATION_UNSUPPORTED, detail)
+
+
+def require_layer_quant_format(impl: "MoEImplBase", expected: str) -> None:
+    """Raise unless ``impl``'s final ``quant_config`` is the format ``expected``.
+
+    A leaf is one format, picked from the layer's quantization when
+    ``create_moe`` runs. The model's ``__post_init__`` passes
+    (``apply_layerwise_quant_config``, ``apply_quant_config_exclude_modules``)
+    can change that format before weights are allocated, and have returned by
+    the time this fires, so the message carries the diagnosis.
+    """
+    quant_config = impl.quant_config
+    actual = normalize_quant(
+        canonical_quant(None if quant_config is None else quant_config.quant_algo)
+    )
+    if actual != expected:
+        raise ValueError(
+            f"{type(impl).__name__} implements quant={expected}, but layer "
+            f"{impl.layer_idx}'s quant_config resolves to {actual}. The "
+            f"implementation was picked when the layer was built; layerwise "
+            f"quantization or a module exclusion changed its format afterwards. "
+            f"Pass the layer's final quantization to create_moe as "
+            f"override_quant_config."
+        )
+
+
 def nvfp4_fc1_row_alignment_rejection(
     p: "MoEProblem", d: "MoEDeployment"
 ) -> Optional[MoEEligibility]:
     """NVFP4 block scales swizzle in 128x4 tiles, so a gated FC1 buffer rounded
     up to that tile splits gate/up at the wrong row. Returns the rejection when
     this shard would be rounded up, else None (unknown shapes abstain).
+
+    ``W4A16_NVFP4`` is answered too: its weights go through the same CUTLASS
+    NVFP4 loader, and the op then splits the dequantized buffer the same way.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
-    from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-    if p.quant_algo != QuantAlgo.NVFP4 or p.intermediate_size is None:
+    if p.identity_quant not in ("nvfp4", "w4a16_nvfp4") or p.intermediate_size is None:
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.
@@ -426,7 +502,7 @@ def nvfp4_fc1_row_alignment_rejection(
         hint = "no moe_tp_size satisfies this for this intermediate_size"
     return MoEEligibility.no(
         MoERejectReason.SHAPE_UNALIGNED,
-        f"NVFP4 MoE requires gated FC1 rows "
+        f"{p.quant} MoE requires gated FC1 rows "
         f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
         f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
     )
@@ -447,6 +523,11 @@ class MoERejection:
             "detail": self.detail,
         }
 
+    def describe(self) -> str:
+        """``name: reason (detail)``, as the logs print one rejection."""
+        text = f"{self.legacy_backend}: {self.reason.value}"
+        return f"{text} ({self.detail})" if self.detail else text
+
 
 @dataclass(frozen=True)
 class MoEResolutionReport:
@@ -462,6 +543,9 @@ class MoEResolutionReport:
     eligible: Tuple[str, ...] = ()
     requested: Optional[str] = None  # backend literal, as written
     env_fingerprint: str = ""
+    # ``MoERejection.legacy_backend`` names of what the request named: its
+    # backend family, or the pin's matches. Fallback candidates are excluded.
+    requested_impls: frozenset[str] = frozenset()
 
     @property
     def alternatives(self) -> Tuple[str, ...]:
@@ -479,12 +563,31 @@ class MoEResolutionReport:
         return self.selected_by == "heuristic"
 
     @property
+    def requested_rejections(self) -> tuple[MoERejection, ...]:
+        """The rejections of the implementations the request named, in priority
+        order; the fallback candidates' are not among them."""
+        return tuple(r for r in self.rejected if r.legacy_backend in self.requested_impls)
+
+    @property
     def degraded_from(self) -> Optional[MoERejection]:
-        """The rejection that caused the substitution, if there was one."""
+        """The most telling of :attr:`requested_rejections`, if anything degraded.
+
+        Reason codes only approximate which implementation was a contender, so
+        the degradation warning also names the other requested rejections.
+        """
         if not self.degraded or not self.rejected:
             return None
-        # The last family rejection best explains the fallback.
-        return self.rejected[-1]
+        # The first one declined for a reason other than format/SM, else one
+        # declined on SM, else the first; with no requested rejection, the last
+        # rejection of all.
+        requested = self.requested_rejections
+        for rejection in requested:
+            if rejection.reason not in _NOT_A_CONTENDER:
+                return rejection
+        for rejection in requested:
+            if rejection.reason is not MoERejectReason.QUANT_UNSUPPORTED:
+                return rejection
+        return requested[0] if requested else self.rejected[-1]
 
     def to_dict(self) -> Dict[str, object]:
         """Serializable form. Field names are part of the artifact format."""
@@ -517,7 +620,10 @@ class MoEResolutionReport:
                 "use_dp": self.deployment.use_dp,
                 "num_slots": self.deployment.num_slots,
                 "eplb_enabled": self.deployment.eplb_enabled,
+                "eplb_mode": self.deployment.eplb_mode,
                 "moe_lora_enabled": self.deployment.moe_lora_enabled,
+                "force_dynamic_quantization": self.deployment.force_dynamic_quantization,
+                "oss_cutlass_moe": self.deployment.env.oss_cutlass_moe,
                 "sm": self.deployment.env.sm,
                 "env_flags": dict(self.deployment.env.env_flags),
             },
@@ -552,11 +658,7 @@ class MoEResolutionReport:
             # Nothing was turned down because nothing was asked: the candidate
             # list is the bug, and that is a different diagnosis from silence.
             return "(no candidate was considered)"
-        return "; ".join(
-            f"{rejection.legacy_backend}: {rejection.reason.value}"
-            + (f" ({rejection.detail})" if rejection.detail else "")
-            for rejection in self.rejected
-        )
+        return "; ".join(rejection.describe() for rejection in self.rejected)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +695,48 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class MoEReplicaPlan:
+    """Per-forward physical replica layout produced by the EPLB layer.
+
+    The backend consumes these facts but does not own the planner, copy stream,
+    weight arena, or generation lifecycle.  The private wait callback preserves
+    the late dependency: independent input preparation remains overlapped until
+    the fused kernel is about to read the physical routes.
+    """
+
+    resident_experts_per_rank: int
+    compute_slots_per_rank: int
+    ready_flags: torch.Tensor
+    ready_generation: int
+    reserved_sms: int
+    _wait_for_routes: Callable[[], None] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        resident = int(self.resident_experts_per_rank)
+        compute = int(self.compute_slots_per_rank)
+        generation = int(self.ready_generation)
+        if resident <= 0 or compute <= resident:
+            raise ValueError(
+                "A replica plan requires compute slots M greater than resident "
+                f"experts H; got H={resident}, M={compute}."
+            )
+        if not 1 <= generation < (1 << 63):
+            raise ValueError(
+                f"A replica plan READY generation must be in [1, 2**63); got {generation}."
+            )
+        if int(self.reserved_sms) <= 0:
+            raise ValueError("A replica plan must reserve at least one auxiliary SM")
+
+    @property
+    def helper_slots_per_rank(self) -> int:
+        return int(self.compute_slots_per_rank) - int(self.resident_experts_per_rank)
+
+    def wait_for_routes(self) -> None:
+        """Order the first route consumer after the plan producer on device."""
+        self._wait_for_routes()
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -622,6 +766,8 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
+    replica_plan: Optional[MoEReplicaPlan] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

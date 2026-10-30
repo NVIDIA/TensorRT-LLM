@@ -37,12 +37,12 @@ import torch
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     BufferConfig,
     CudaStream,
     GpuCacheTierConfig,
     KVCacheManager,
     KVCacheManagerConfig,
+    ReusePolicy,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -188,7 +188,7 @@ def test_optional_selection_and_resume_with_concurrent_priority_callbacks() -> N
             layer_id=1,
             buffers=[BufferConfig(role="key", size=4096)],
             sliding_window_size=4,
-            reuse_policy=AttentionReusePolicy.OPTIONAL,
+            reuse_policy=ReusePolicy.OPTIONAL,
         ),
     ]
     manager = KVCacheManager(config)
@@ -356,6 +356,8 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
                 manager.get_and_reset_iteration_stats()
                 manager.get_and_reset_iteration_cached_tokens_by_level()
                 manager.get_and_reset_iteration_reused_blocks_by_level()
+                manager.get_and_reset_iteration_connector_reused_blocks()
+                manager.get_and_reset_iteration_connector_cached_tokens()
                 manager.get_and_reset_iteration_disk_prefetch_blocks()
                 manager.get_and_reset_iteration_peak_block_stats_by_level()
                 for stats in manager.get_storage_statistics():
@@ -387,6 +389,8 @@ def test_stats_queries_do_not_block_a_concurrent_resize() -> None:
     [
         ("manager", "get_and_reset_iteration_cached_tokens_by_level"),
         ("manager", "get_and_reset_iteration_reused_blocks_by_level"),
+        ("manager", "get_and_reset_iteration_connector_reused_blocks"),
+        ("manager", "get_and_reset_iteration_connector_cached_tokens"),
         ("manager", "get_and_reset_iteration_disk_prefetch_blocks"),
         ("manager", "get_and_reset_iteration_peak_block_stats_by_level"),
         ("manager", "get_storage_statistics"),

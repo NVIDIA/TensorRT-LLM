@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -142,7 +142,6 @@ static_assert(hasSerializedSize<kv_cache::CacheState>(size_t()));
 static_assert(hasSerializedSize<DataTransceiverState>(size_t()));
 static_assert(hasSerializedSize<ContextPhaseParams>(size_t()));
 static_assert(hasSerializedSize<Tensor>(size_t()));
-static_assert(hasSerializedSize<SpeculativeDecodingFastLogitsInfo>(size_t()));
 static_assert(hasSerializedSize<Result>(size_t()));
 static_assert(hasSerializedSize<Response>(size_t()));
 static_assert(hasSerializedSize<KvCacheConfig>(size_t()));
@@ -254,7 +253,6 @@ static_assert(hasSerialize<MultimodalInput>(nullptr));
 static_assert(hasSerialize<MropeConfig>(nullptr));
 static_assert(hasSerialize<LoraConfig>(nullptr));
 static_assert(hasSerialize<Tensor>(nullptr));
-static_assert(hasSerialize<SpeculativeDecodingFastLogitsInfo>(nullptr));
 static_assert(hasSerialize<Result>(nullptr));
 static_assert(hasSerialize<Response>(nullptr));
 static_assert(hasSerialize<KvCacheConfig>(nullptr));
@@ -477,10 +475,6 @@ T deserialize(std::istream& is)
     {
         return Serialization::deserializeTensor(is);
     }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SpeculativeDecodingFastLogitsInfo>)
-    {
-        return Serialization::deserializeSpecDecFastLogitsInfo(is);
-    }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::Result>)
     {
         return Serialization::deserializeResult(is);
@@ -500,10 +494,6 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::SchedulerConfig>)
     {
         return Serialization::deserializeSchedulerConfig(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::ExtendedRuntimePerfKnobConfig>)
-    {
-        return Serialization::deserializeExtendedRuntimePerfKnobConfig(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::PeftCacheConfig>)
     {
@@ -572,10 +562,6 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::RequestStatsPerIteration>)
     {
         return Serialization::deserializeRequestStatsPerIteration(is);
-    }
-    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::AdditionalOutput>)
-    {
-        return Serialization::deserializeAdditionalOutput(is);
     }
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::CacheTransceiverConfig>)
     {

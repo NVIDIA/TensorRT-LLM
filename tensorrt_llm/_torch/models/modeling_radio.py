@@ -565,6 +565,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     Modified from https://github.com/huggingface/pytorch-image-models/blob/main/timm/models/vision_transformer.py.
     """
 
+    encoder_cuda_graph_modality = "vision"
+
     def __init__(
         self,
         img_size: int = 224,
@@ -769,7 +771,11 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # order.
         self._blocks_graph_runner: Optional[MultimodalEncoderGraphRunner] = None
 
-    def setup_attn_metadata(self, max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[Dict[str, int]] = None,
+    ) -> None:
         # Override the default to add `kv_layout="NHD"` for FlashInfer.
         # FlashInfer's original default is "NHD"; TRT-LLM switched the default
         # to "HND" for paged KV cache paths (see PR #6917). Ragged prefill
@@ -777,8 +783,10 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
         # default while allowing one attention segment per encoder token.
-        capacities = self.get_encoder_attention_metadata_capacity(
-            max_num_tokens)
+        capacities = (
+            attention_metadata_capacity
+            if attention_metadata_capacity is not None else
+            self.get_encoder_attention_metadata_capacity(max_num_tokens))
         metadata_kwargs = dict(
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
@@ -787,27 +795,6 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         if self._attn_backend == "FLASHINFER":
             metadata_kwargs["kv_layout"] = "NHD"
         self.attn_metadata = self.metadata_cls(**metadata_kwargs)
-
-    def enable_blocks_cuda_graph(
-        self,
-        config: "MultimodalEncoderCudaGraphConfig",
-        *,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        """Build the block-stack runner from `config` and capture startup graphs.
-
-        The caller must ensure the model parameters already live on `device`
-        (or on a CUDA device discoverable from `self.parameters()`); captures
-        are recorded immediately.
-        """
-        if self._blocks_graph_runner is not None:
-            return
-
-        graph_runner = self._build_blocks_graph_runner(config)
-        if device is None:
-            device = next(self.parameters()).device
-        graph_runner.capture_all(device)
-        self._blocks_graph_runner = graph_runner
 
     def prepare_attn_metadata(
             self, batch_size: int, seq_lengths: List[int],
@@ -938,7 +925,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         return x
 
 
-class _VisionEncoderMetadataProvider(EncoderMetadataProvider):
+class _VisionEncoderMetadataProvider(EncoderMetadataProvider[AttentionMetadata]
+                                     ):
     """Bridges the multimodal encoder graph runner to the model's eager metadata path.
 
     `build` returns a fresh `AttentionMetadata` with `is_cuda_graph=True`; that flag flips
@@ -1298,6 +1286,7 @@ class RADIOVisionModel(PreTrainedModel):
             inter_feature_normalizer=inter_feature_normalizer,
             model_config=self.model_config,
         )
+        self.radio_model.model.encoder_cuda_graph_config = encoder_cuda_graph_config
 
     def load_weights(self, weights):
         # Load radio_model weights for pytorch modules.

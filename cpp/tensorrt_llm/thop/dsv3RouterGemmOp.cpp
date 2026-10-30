@@ -153,45 +153,65 @@ th::Tensor dsv3_router_gemm_op(th::Tensor const& mat_a, th::Tensor const& mat_b,
     constexpr int kNumExpertsKimiK3 = 896;
     constexpr int kHiddenDim7168 = 7168; // DeepSeek-V3 / DeepSeek-V3.2 / Kimi K3
     constexpr int kHiddenDim6144 = 6144; // GLM-5
-    constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4
+    constexpr int kHiddenDim4096 = 4096; // DeepSeek-V4, GLM-5.3-Flash
+    constexpr int kNumExperts288 = 288;  // GLM-5.3-Flash
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[1]};
     th::Tensor out = th::empty(output_size, mat_a.options().dtype(out_dtype_));
     TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2);
     TORCH_CHECK(mat_a.strides()[1] == 1 && out.strides()[1] == 1); // Row-major
     TORCH_CHECK(mat_b.strides()[0] == 1);                          // Column-major
     auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-    bool const base_ok = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim
-        && data_type == torch::kBFloat16 && out_dtype_ == torch::kFloat32 && !bias.has_value());
-    bool const shape_ok = base_ok && num_experts == kNumExperts;
+    // The low-latency kernels and the cuBLAS fallback both read rows of hidden_dim elements (the input is
+    // row-major, the weights column-major) that start on a 16-byte boundary. Copy an operand that is padded
+    // or misaligned into that layout.
+    auto const packed = [hidden_dim](th::Tensor const& t, int pitch_dim)
+    {
+        if (t.strides()[pitch_dim] == hidden_dim && reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0)
+        {
+            return t;
+        }
+        return pitch_dim == 0 ? t.clone(at::MemoryFormat::Contiguous) : t.t().clone(at::MemoryFormat::Contiguous).t();
+    };
+    th::Tensor const input = packed(mat_a, 0);
+    th::Tensor const weights = packed(mat_b, 1);
+    bool const shape_ok
+        = (num_tokens >= 1 && num_tokens <= 16 && mat_b.sizes()[0] == hidden_dim && data_type == torch::kBFloat16
+            && mat_b.scalar_type() == data_type && out_dtype_ == torch::kFloat32 && !bias.has_value());
 
-    if (base_ok && num_experts == kNumExpertsKimiK3 && hidden_dim == kHiddenDim7168)
+    if (shape_ok && num_experts == kNumExpertsKimiK3 && hidden_dim == kHiddenDim7168)
     {
         // Kimi K3: tensor-core kernel; the cuBLAS fallback below costs ~7.4 us at M=8 on B200 (split-K + reduce).
         LoopUnroller<1, 16, kNumExpertsKimiK3, kHiddenDim7168, /*kUseMma=*/true>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim7168)
+    else if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim7168)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim7168>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim6144)
+    else if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim6144)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim6144>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
-    else if (shape_ok && hidden_dim == kHiddenDim4096)
+    else if (shape_ok && num_experts == kNumExperts && hidden_dim == kHiddenDim4096)
     {
         LoopUnroller<1, 16, kNumExperts, kHiddenDim4096>::unroll(num_tokens,
-            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-            reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
+    }
+    else if (shape_ok && num_experts == kNumExperts288 && hidden_dim == kHiddenDim4096)
+    {
+        LoopUnroller<1, 16, kNumExperts288, kHiddenDim4096>::unroll(num_tokens,
+            reinterpret_cast<float*>(out.mutable_data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(input.data_ptr()),
+            reinterpret_cast<__nv_bfloat16 const*>(weights.data_ptr()), stream);
     }
     else // fallback to cublas, can be slow
     {
-        cublas_mm_out(mat_a, mat_b, bias, out);
+        cublas_mm_out(input, weights, bias, out);
     }
 
     return out;

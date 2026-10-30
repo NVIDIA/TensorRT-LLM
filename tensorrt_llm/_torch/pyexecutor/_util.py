@@ -15,7 +15,8 @@
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional, Sequence, Union
+from contextlib import ExitStack
+from typing import Dict, List, Optional, Sequence, Union
 
 import torch
 
@@ -28,10 +29,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    CacheTransceiverConfig, CapacitySchedulerPolicy, KVEventsConfig,
+    KvCacheCompressionConfig, KvCacheConfig, MultimodalEncoderSchedulingPolicy,
+    PeftCacheConfig, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -44,26 +45,26 @@ from tensorrt_llm.quantization import QuantAlgo
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..attention.backends.sparse.params import \
     get_indexer_mqa_logits_workspace_bytes
-from ..disaggregation.kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver,
-    maybe_enable_fabric_memory_for_python_transceiver)
+from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
+                                                   create_kv_cache_transceiver)
 from ..hostfunc import set_low_latency_dispatch
-from ..model_config import ModelConfig
+from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
-from ..utils import is_gdn_replay_enabled
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
-                           extract_qwen4_exp_ple_cache_params,
-                           get_layer_attention_window, is_gemma4_hybrid,
-                           is_hybrid_linear, is_kimi_linear, is_mla,
-                           is_nemotron_hybrid, is_qwen3_hybrid, is_qwen4_exp,
-                           resolve_vocab_size, uses_vswa_kv_cache_layout)
+                           get_layer_attention_window, is_hybrid_linear,
+                           is_kimi_linear, is_mla, is_nemotron_hybrid,
+                           is_qwen3_hybrid, is_qwen4_exp, resolve_vocab_size,
+                           uses_vswa_kv_cache_layout)
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
+from .engine.lora import make_lora_model_config
+from .engine.multimodal import is_multimodal, use_mrope
 from .guided_decoder import GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
@@ -72,8 +73,8 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager,
                                            use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
-from .model_engine import PyTorchModelEngine
-from .py_executor import PyExecutor
+from .model_engine import ModelEngine
+from .py_executor import PyExecutor, PyExecutorResources
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
@@ -87,14 +88,21 @@ from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
 
-# Page size of a standalone drafter's separate KV pool (DFlash, standalone
-# DSpark). Deliberately not kv_cache_config.tokens_per_block: that describes
-# the target pool, and target attention backends and deployment configs set it
-# to values the drafter's block-decode kernels reject (FP4 MLA forces 128, which
-# the trtllm-gen MLA decode does not take). The drafter adopts whatever page
-# size its pool is carved with, so the pool picks one every drafter kernel
-# accepts. Matches the KvCacheConfig.tokens_per_block default.
+# Page sizes of a standalone drafter's separate KV pool (DFlash, standalone
+# DSpark). The pool keeps the target's kv_cache_config.tokens_per_block when it
+# is in _DRAFTER_KERNEL_TOKENS_PER_BLOCK, the page sizes every drafter
+# block-decode kernel accepts: trtllm-gen MLA decode takes 32 or 64, the CuTe
+# DSL MLA decode a divisor of 128 above 1, and the trtllm-gen attention of a GQA
+# drafter 16, 32 or 64. Target attention backends and deployment configs set
+# other values (FP4 MLA forces 128), and those get
+# _STANDALONE_DRAFT_TOKENS_PER_BLOCK, the KvCacheConfig.tokens_per_block
+# default. The drafter adopts whatever page size its pool is carved with.
+_DRAFTER_KERNEL_TOKENS_PER_BLOCK = frozenset((32, 64))
 _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
+
+# Aggregated helix skips memory profiling, so its default KV fraction leaves
+# room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
+_HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -111,11 +119,17 @@ def _get_initial_lora_data_type(
     return None
 
 
-def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
-    # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
-    # require KVCacheManagerV2 for per-layer buffer sizes.
+def _has_variable_kv_cache_geometry(model_config: ModelConfig) -> bool:
+    layer_specs = _get_kv_cache_layer_specs(model_config)
+    return bool(layer_specs) and len({(spec.head_dim, spec.num_kv_heads)
+                                      for spec in layer_specs}) > 1
+
+
+def _non_hybrid_kv_cache_manager_cls(model_config: ModelConfig,
+                                     kv_cache_config: KvCacheConfig):
+    # Variable per-layer geometry requires V2's per-layer buffer sizes.
     needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
-                or is_gemma4_hybrid(config))
+                or _has_variable_kv_cache_geometry(model_config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
@@ -181,6 +195,17 @@ def is_disagg_enabled(
             and cache_transceiver_config.backend is not None)
 
 
+def _validate_v2_mamba_block_reuse_without_rebalance(
+        kv_cache_config: KvCacheConfig) -> None:
+    """Reject block reuse with pool rebalancing on the V2 hybrid manager."""
+    if (kv_cache_config.enable_block_reuse
+            and kv_cache_config.enable_kv_pool_rebalance):
+        raise ValueError(
+            "V2 Mamba block reuse is not compatible with "
+            "enable_kv_pool_rebalance because the rebalancer does not "
+            "yet model retained recurrent-state snapshots.")
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -215,13 +240,28 @@ def get_kv_cache_manager_cls(
         if model_config.attn_backend != "TRTLLM":
             raise ValueError("FP4 MLA requires the TRTLLM attention backend.")
         if is_disagg:
-            raise NotImplementedError(
-                "FP4 MLA disaggregated serving requires the follow-up "
-                "Python NIXL integration.")
-        if is_hybrid_linear(config):
-            raise NotImplementedError(
-                "FP4 MLA requires Fp4MlaKVCacheManagerV2, which does not "
-                "support hybrid linear-attention models.")
+            # Only the Python NIXL transceiver moves the V2 FP4 MLA roles.
+            backend, runtime = _resolve_disagg_transceiver_route(
+                cache_transceiver_config)
+            if runtime != "PYTHON" or backend != "NIXL":
+                raise ValueError(
+                    "FP4 MLA disaggregated serving requires "
+                    "cache_transceiver_config backend='NIXL' with "
+                    "transceiver_runtime='PYTHON' (got "
+                    f"backend={backend!r}, transceiver_runtime={runtime!r}).")
+        if (is_hybrid_linear(config)
+                and model_config.get_num_mamba_layers() > 0):
+            # The hybrid V2 manager composes the FP4 MLA cache layout with
+            # its recurrent-state lifecycle; the Kimi K3 manager adds the KDA
+            # replay caches used by fused speculative verification. Its
+            # disaggregation declarations cover both the MLA and the
+            # recurrent-state roles.
+            _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
+            if is_kimi_linear(config):
+                from ..modules.kimi_kda.cache_manager import \
+                    KimiK3HybridCacheManager
+                return KimiK3HybridCacheManager
+            return MambaHybridCacheManagerV2
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 
@@ -236,7 +276,8 @@ def get_kv_cache_manager_cls(
             if sparse_attn_config is not None:
                 return get_sparse_attn_kv_cache_manager(
                     sparse_attn_config, use_kv_cache_manager_v2=use_v2)
-            return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+            return _non_hybrid_kv_cache_manager_cls(model_config,
+                                                    kv_cache_config)
 
         if sparse_attn_algorithm == "qsa" and not use_v2:
             raise ValueError(
@@ -300,12 +341,12 @@ def get_kv_cache_manager_cls(
                 "hybrid managers do not implement per-token verify-group "
                 "bookkeeping.")
 
-        # Kimi uses MambaHybridCacheManagerV2 with or without reuse when
+        # Kimi uses KimiK3HybridCacheManager with or without reuse when
         # use_kv_cache_manager_v2=True, the KvCacheConfig default. V1 can
         # be selected explicitly or resolved from "auto". Aggregated V1
         # uses Mixed without reuse and the C++ hybrid manager with reuse.
-        # Disaggregated serving requires Python NIXL below, using V2 for
-        # the configured default or Mixed for V1 without reuse.
+        # Disaggregated serving requires Python NIXL below. The Python
+        # transceiver rejects a V1 manager at creation.
         if is_kimi_linear(config) and not use_v2 and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 logger.info(
@@ -409,16 +450,23 @@ def get_kv_cache_manager_cls(
         if not use_v2:
             return CppMambaHybridCacheManager
 
-        if (kv_cache_config.enable_block_reuse
-                and kv_cache_config.enable_kv_pool_rebalance):
-            raise ValueError(
-                "V2 Mamba block reuse is not compatible with "
-                "enable_kv_pool_rebalance because the rebalancer does not "
-                "yet model retained recurrent-state snapshots.")
+        _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
         if sparse_attn_algorithm == "qsa":
             return get_sparse_attn_kv_cache_manager(
                 sparse_attn_config, use_kv_cache_manager_v2=True)
-        return MambaHybridCacheManagerV2
+        if is_kimi_linear(config):
+            from ..modules.kimi_kda.cache_manager import \
+                KimiK3HybridCacheManager
+            return KimiK3HybridCacheManager
+        if is_qwen4_exp(config):
+            from ..modules.qwen4_exp.cache_manager import \
+                Qwen4ExpHybridCacheManager
+            return Qwen4ExpHybridCacheManager
+        if is_qwen3_hybrid(config):
+            from ..modules.fla.cache_manager import Qwen35HybridCacheManager
+            return Qwen35HybridCacheManager
+        from ..modules.mamba.cache_manager import NemotronHybridCacheManager
+        return NemotronHybridCacheManager
     elif sparse_attn_config is not None:
         if sparse_attn_algorithm == "qsa":
             # The QSA manager extends the hybrid manager because it must retain
@@ -429,7 +477,7 @@ def get_kv_cache_manager_cls(
         return get_sparse_attn_kv_cache_manager(sparse_attn_config,
                                                 use_kv_cache_manager_v2=use_v2)
     else:
-        return _non_hybrid_kv_cache_manager_cls(config, kv_cache_config)
+        return _non_hybrid_kv_cache_manager_cls(model_config, kv_cache_config)
 
 
 # --- KV cache cost model ------------------------------------------------------
@@ -534,9 +582,14 @@ def get_attention_workspace_fixed_bytes(model_config, mapping,
                                         **capacities) -> int:
     """Capacity-sized reserve declared by the model's selected backend."""
     from ..attention.backends.utils import get_attention_backend
-    return get_attention_backend(
-        model_config.attn_backend).runtime_workspace_fixed_bytes(
-            model_config, mapping, **capacities)
+    backend = get_attention_backend(model_config.attn_backend)
+    if config_utils.is_glm5_next(model_config.pretrained_config):
+        # glm5_next layers select the glm_kpool sparse backend themselves, so
+        # model_config carries no sparse_attention_config naming it.
+        from ..attention.backends.sparse.glm_kpool import \
+            GlmKpoolSparseAttention as backend
+    return backend.runtime_workspace_fixed_bytes(model_config, mapping,
+                                                 **capacities)
 
 
 def get_overlap_headroom_penalty_workspace_bytes(
@@ -741,7 +794,17 @@ def _derive_v2_layer_type_attention_windows(
             and issubclass(kv_cache_manager_cls, KVCacheManagerV2)):
         return None
     config = model_config.pretrained_config
-    derived_windows = _derive_layer_type_attention_windows(config, max_seq_len)
+    layer_specs = _get_kv_cache_layer_specs(model_config)
+    if layer_specs and any(spec.attention_window is not None
+                           for spec in layer_specs):
+        derived_windows = _normalize_attention_windows(
+            [spec.attention_window for spec in layer_specs], max_seq_len)
+        if derived_windows is not None and not uses_vswa_kv_cache_layout(
+                derived_windows):
+            derived_windows = None
+    else:
+        derived_windows = _derive_layer_type_attention_windows(
+            config, max_seq_len)
     if derived_windows is None:
         return None
     if is_hybrid_linear(config):
@@ -762,62 +825,46 @@ def _derive_v2_layer_type_attention_windows(
 
 
 def _get_num_pool_groups_for_estimation(
-    model_config: object,
+    model_config: ModelConfig,
     max_seq_len: int,
-    fallback_attention_windows: Optional[List[Optional[int]]],
+    kv_cache_config: KvCacheConfig,
 ) -> int:
-    """Estimate V2 pool groups from KV storage windows and layer metadata.
+    """Estimate pool groups for the temporary V2 profiling manager.
 
-    Model sliding attention alone does not imply separate storage pools.
-    Preserve distinctions required by hybrid layer types and page sizes.
+    Hybrid recurrent/attention models also retain their distinct layer types
+    when automatic window derivation does not apply.
     """
-    if (fallback_attention_windows is not None
-            and not is_hybrid_linear(model_config)):
-        normalized_windows = _normalize_attention_windows(
-            fallback_attention_windows, max_seq_len)
-        return 1 if normalized_windows is None else len(set(normalized_windows))
-
-    layer_types = getattr(model_config, "layer_types", None)
-    attention_windows = None
-    if (fallback_attention_windows is None and is_gemma4_hybrid(model_config)):
-        attention_windows = _derive_layer_type_attention_windows(
-            model_config, max_seq_len)
-    # Check whether KV storage uses configured or inferred attention windows,
-    # which can be independently configured from the model's use of sliding-window
-    # attention for computation.
-    kv_cache_uses_attention_windows = (fallback_attention_windows is not None
-                                       or attention_windows is not None)
-
-    if attention_windows is not None:
+    config = model_config.pretrained_config
+    attention_windows = kv_cache_config.max_attention_window
+    if attention_windows is None and _has_variable_kv_cache_geometry(
+            model_config):
+        attention_windows = _derive_v2_layer_type_attention_windows(
+            kv_cache_config, KVCacheManagerV2, model_config, max_seq_len)
+    if attention_windows is not None and not is_hybrid_linear(config):
         normalized_windows = _normalize_attention_windows(
             attention_windows, max_seq_len)
-        if normalized_windows is None:
-            return 1
-        return len(set(normalized_windows))
+        return 1 if normalized_windows is None else len(set(normalized_windows))
 
+    layer_types = getattr(config, "layer_types", None)
     if isinstance(layer_types, (list, tuple)):
-        # These tags come from HF pretrained_config.layer_types.
-        # As above, sliding-window attention in the model does not imply windowed
-        # KV storage. Without windowed storage, sliding/full attention share a pool
-        # type unless their page sizes differ (Gemma4).
+        # Without distinct storage windows, sliding/full computation and
+        # different page geometries do not create separate window groups.
         pool_types = set()
         for layer_type in layer_types:
-            if (not kv_cache_uses_attention_windows
-                    and not is_gemma4_hybrid(model_config) and
-                (_is_sliding_attention_layer(layer_type)
-                 or getattr(layer_type, "name",
-                            str(layer_type)).lower() == "full_attention")):
+            if attention_windows is None and (
+                    _is_sliding_attention_layer(layer_type)
+                    or getattr(layer_type, "name",
+                               str(layer_type)).lower() == "full_attention"):
                 layer_type = "full_attention"
             pool_types.add(layer_type)
         if len(pool_types) > 1:
             return len(pool_types)
 
-    if fallback_attention_windows is not None:
+    if attention_windows is not None:
         normalized_windows = _normalize_attention_windows(
-            fallback_attention_windows, max_seq_len)
+            attention_windows, max_seq_len)
         if normalized_windows is not None:
             return len(set(normalized_windows))
-
     return 1
 
 
@@ -900,8 +947,7 @@ class KvCacheCreator:
     def __init__(
         self,
         *,
-        model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
+        model_engine: ModelEngine,
         mapping: Mapping,
         net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -921,7 +967,6 @@ class KvCacheCreator:
         skip_est: bool = False,
     ):
         self._model_engine = model_engine
-        self._draft_model_engine = draft_model_engine
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
@@ -945,10 +990,27 @@ class KvCacheCreator:
         self._is_disagg = is_disagg
         self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._execution_stream = execution_stream
-        self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-            model_engine)
+        self._kv_cache_manager_cls = self._get_model_kv_cache_manager_cls()
         self._is_kv_cache_manager_v2 = issubclass(self._kv_cache_manager_cls,
                                                   KVCacheManagerV2)
+        if mapping.has_cp_helix() and not is_disagg:
+            if not self._is_kv_cache_manager_v2:
+                raise ValueError(
+                    "Aggregated helix context parallelism requires "
+                    f"KVCacheManagerV2, got {self._kv_cache_manager_cls.__name__}: "
+                    "only V2 sizes prefill KV in global ledger blocks shared "
+                    "by every CP rank. Set "
+                    "kv_cache_config.use_kv_cache_manager_v2=True and disable "
+                    "features that fall back to V1.")
+            # Read from the engine rather than llm_args: an SM-version fallback
+            # may have turned chunked prefill off after the args were parsed.
+            if not model_engine.attn_runtime_features.chunked_prefill:
+                raise ValueError(
+                    "Aggregated helix context parallelism requires chunked "
+                    "prefill: the context phase gathers cached KV across CP "
+                    "ranks only in the chunked-context path. Set "
+                    "enable_chunked_prefill=True on a GPU that supports it "
+                    "for MLA.")
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -956,20 +1018,14 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
-        self._maybe_enable_fabric_memory_for_python_transceiver()
-
-    def _maybe_enable_fabric_memory_for_python_transceiver(self) -> None:
-        maybe_enable_fabric_memory_for_python_transceiver(
-            self._cache_transceiver_config, self._kv_cache_manager_cls)
 
     def _get_model_kv_cache_manager_cls(
         self,
-        model_engine: PyTorchModelEngine,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
     ):
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
-        model_config = model_engine.model.model_config
+        model_config = self._model_engine.model.model_config
         cls = get_kv_cache_manager_cls(
             model_config,
             kv_cache_config,
@@ -984,7 +1040,7 @@ class KvCacheCreator:
         # Compatibility managers do not support MTP block reuse. Warn at the
         # routing site so users see the concrete manager selected for the
         # incompatible combination.
-        if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
+        if is_hybrid_linear(model_config.pretrained_config) \
                 and kv_cache_config.enable_block_reuse \
                 and self._speculative_config is not None:
             if not issubclass(cls, MambaHybridCacheManagerV2):
@@ -1037,13 +1093,11 @@ class KvCacheCreator:
                         f"supported with "
                         f"{incompat_str}. Disable the incompatible features to "
                         f"run sparse-attention models.")
-                # Gemma4 hybrid uses per-layer head_dim that V1 would coerce to
-                # ``max(head_dim)``, changing per-layer KV byte sizes.
-                if is_gemma4_hybrid(config):
+                if _has_variable_kv_cache_geometry(model_config):
                     raise NotImplementedError(
-                        f"Gemma4 hybrid attention requires KVCacheManagerV2, "
+                        f"Variable per-layer KV geometry requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
-                        f"Disable these features to run Gemma4 hybrid models.")
+                        f"Disable these features to run this model.")
                 if fp4_mla:
                     raise NotImplementedError(
                         "FP4 MLA requires Fp4MlaKVCacheManagerV2, which is "
@@ -1115,6 +1169,7 @@ class KvCacheCreator:
                 kv_cache_config=kv_cache_config,
                 spec_config=self._speculative_config,
                 is_draft=is_draft,
+                is_disagg=self._is_disagg,
                 **extra_kwargs))
         if include_request_cost:
             if cost.bytes_per_request is None:
@@ -1240,10 +1295,9 @@ class KvCacheCreator:
         token (the target stores only every cp_size-th page per rank).
         Intercepts are per-request rank-local bytes and stay unscaled.
         """
-        draft_mapping = self._mapping
+        draft_mapping = self._get_draft_mapping()
         helix_cp_scale = 1
         if self._mapping.has_cp_helix():
-            draft_mapping = self._mapping.repurpose_helix_cp_to_tp()
             helix_cp_scale = self._mapping.cp_size
 
         def scaled(cost: CacheCost) -> CacheCost:
@@ -1254,17 +1308,6 @@ class KvCacheCreator:
             # fields would silently drop it.
             return dataclasses.replace(cost, slope=cost.slope * helix_cp_scale)
 
-        if self._draft_model_engine is not None:
-            draft_model_config = self._draft_model_engine.model.model_config
-            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-                self._draft_model_engine, kv_cache_config)
-            return scaled(
-                self._per_manager_cache_cost(
-                    draft_kv_cache_manager_cls,
-                    draft_model_config,
-                    kv_cache_config,
-                    mapping=draft_mapping,
-                    include_request_cost=include_request_cost))
         if use_separate_draft_kv_cache:
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
@@ -1404,7 +1447,7 @@ class KvCacheCreator:
                                          beam_width=max_beam_width, ),
                                      output_config=trtllm.OutputConfig(),
                                      end_id=-1)
-            if self._model_engine.use_mrope:
+            if use_mrope(self._model_engine.model):
                 request.py_multimodal_data = {
                     "mrope_config": {
                         "mrope_position_ids":
@@ -1503,11 +1546,14 @@ class KvCacheCreator:
                             None,
                         ),
                     )
-                output = self._model_engine.model.encode_multimodal_inputs(
-                    encoder_inputs)
-                # The runtime store owns detached copies rather than views of
-                # an encoder batch. Reproduce that allocation boundary here.
-                return output.detach().clone()
+                # The clone is retained only for memory accounting; no tensor
+                # data is consumed after this profiling forward returns.
+                with discard_nccl_window_tensor_outputs(encoder_inputs):
+                    output = self._model_engine.model.encode_multimodal_inputs(
+                        encoder_inputs)
+                    # The runtime store owns detached copies rather than views
+                    # of an encoder batch. Reproduce that allocation boundary.
+                    return output.detach().clone()
         finally:
             self._dummy_encoder_inputs = []
 
@@ -1592,7 +1638,7 @@ class KvCacheCreator:
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
-                                self._model_engine._max_cuda_graph_batch_size)
+                                self._model_engine.max_cuda_graph_batch_size)
         # Round up the max seq len to the block size
         max_seq_len_blocks = ceil_div(self._model_engine.max_seq_len + 1,
                                       self._tokens_per_block)
@@ -1610,11 +1656,11 @@ class KvCacheCreator:
         # (distinct layer types without sliding windows).
         num_pool_groups = 1
         if self._is_kv_cache_manager_v2:
-            model_cfg = self._model_engine.model.model_config.pretrained_config
+            model_cfg = self._model_engine.model.model_config
             num_pool_groups = _get_num_pool_groups_for_estimation(
                 model_cfg,
                 self._model_engine.max_seq_len,
-                self._kv_cache_config.max_attention_window,
+                self._kv_cache_config,
             )
         num_cache_blocks *= num_pool_groups
 
@@ -1686,14 +1732,14 @@ class KvCacheCreator:
                 "models, disable it.")
 
         if estimating_kv_cache:
+            # User-provided pool sizing can underprovision the temporary
+            # estimation cache and cause warmup to hang or fail. Override it
+            # before budgeting, then restore it in configure_kv_cache_capacity().
+            self._kv_cache_config.pool_ratio = None
             estimate_max_tokens = self._get_token_num_for_estimation()
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
-            # User-provided pool sizing can underprovision the temporary
-            # estimation cache and cause warmup to hang or fail. Override it
-            # for estimation, then restore it in configure_kv_cache_capacity().
-            self._kv_cache_config.pool_ratio = None
             self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
@@ -1728,6 +1774,16 @@ class KvCacheCreator:
                         "the explicitly configured quota.")
             return
         fraction = self._kv_cache_config.free_gpu_memory_fraction
+        default_fraction = KvCacheConfig.model_fields[
+            "free_gpu_memory_fraction"].default
+        if fraction == default_fraction and not self._is_disagg:
+            fraction = _HELIX_AGG_FREE_GPU_MEMORY_FRACTION
+            logger.warning(
+                "Helix CP (aggregated): capacity profiling is unsupported, so "
+                f"the default free_gpu_memory_fraction {default_fraction} is "
+                f"lowered to {fraction} to leave room for prefill "
+                "activations. Set kv_cache_config.max_tokens or "
+                "max_gpu_total_bytes to override.")
         free_mem, _total = torch.cuda.mem_get_info()
         budget_bytes = int(free_mem * fraction)
         if budget_bytes <= 0:
@@ -1797,7 +1853,8 @@ class KvCacheCreator:
             if py_executor.dist.mapping.rank == 0:
                 req_ids = py_executor.enqueue_requests(self._dummy_reqs)
             req_ids = py_executor.dist.broadcast(req_ids, root=0)
-            py_executor.is_warmup = True
+            warmup = ExitStack()
+            warmup.enter_context(py_executor.warmup_scope())
             py_executor.start_worker()
             try:
                 responses = py_executor.await_responses(req_ids)
@@ -1829,8 +1886,7 @@ class KvCacheCreator:
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-                # Get draft KV cache stats if present (either from two-model mode or one-model
-                # mode with separate draft KV cache)
+                # Get draft KV cache stats if present (one-model mode with a separate draft KV cache)
                 draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
                 kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
@@ -1840,8 +1896,8 @@ class KvCacheCreator:
                 allocated_bytes = kv_stats.allocated_bytes + (
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
-                py_executor.is_warmup = False
-                py_executor.shutdown()
+                warmup.close()
+                py_executor.release_resources()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 
@@ -2036,17 +2092,16 @@ class KvCacheCreator:
 
     def _create_kv_cache_manager(
         self,
-        model_engine: PyTorchModelEngine,
         estimating_kv_cache: bool = False,
         kv_cache_config_override: Optional[KvCacheConfig] = None,
         cold_page_codec_provider: Optional[object] = None,
     ) -> KVCacheManager:
         mapping = self._mapping
-        assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
+        assert self._model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
         kv_cache_config = (kv_cache_config_override if kv_cache_config_override
                            is not None else self._kv_cache_config)
         kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-            model_engine, kv_cache_config)
+            kv_cache_config)
 
         # When using separate draft KV cache in one-model speculative decoding,
         # use layer_mask to include only target layers. The draft layers should
@@ -2054,12 +2109,12 @@ class KvCacheCreator:
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
         spec_dec_layer_mask = None
         if self._should_create_separate_draft_kv_cache():
-            num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
+            num_target_layers = self._model_engine.model.model_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         kv_cache_manager = _create_kv_cache_manager(
-            model_engine=model_engine,
+            model_engine=self._model_engine,
             kv_cache_manager_cls=kv_cache_manager_cls,
             mapping=mapping,
             kv_cache_config=kv_cache_config,
@@ -2085,24 +2140,14 @@ class KvCacheCreator:
         )
 
         if not self._skip_est:
-            # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
-            if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
-                # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-                if kv_cache_manager is not None:
-                    if kv_cache_manager.max_seq_len < self._max_seq_len:
-                        self._dummy_reqs = self._create_dummy_context_requests(
-                            max(
-                                1, self._net_max_seq_len - 1 -
-                                (self._max_seq_len -
-                                 kv_cache_manager.max_seq_len)))
-                    self._max_seq_len = kv_cache_manager.max_seq_len
-
-                # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-                if kv_cache_manager is not None:
-                    if kv_cache_manager.max_seq_len < self._max_seq_len:
-                        self._dummy_reqs = self._create_dummy_context_requests(
-                            max(1, kv_cache_manager.max_seq_len - 1))
-                    self._max_seq_len = kv_cache_manager.max_seq_len
+            # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
+            if kv_cache_manager is not None:
+                if kv_cache_manager.max_seq_len < self._max_seq_len:
+                    self._dummy_reqs = self._create_dummy_context_requests(
+                        max(
+                            1, self._net_max_seq_len - 1 -
+                            (self._max_seq_len - kv_cache_manager.max_seq_len)))
+                self._max_seq_len = kv_cache_manager.max_seq_len
         else:
             if kv_cache_manager is not None:
                 self._max_seq_len = kv_cache_manager.max_seq_len
@@ -2165,6 +2210,22 @@ class KvCacheCreator:
             return False
         return True
 
+    def _get_draft_mapping(self) -> Mapping:
+        """Mapping the drafter's KV is sized and allocated with.
+
+        Under helix the drafter is dense, built against the repurposed mapping
+        (CP ranks become TP ranks), so its paged manager needs the CP-free
+        mapping: the round-robin ledger applies to the TARGET KV alone, and
+        KVCacheManagerV2 rejects is_draft x helix outright.
+
+        Heads are sharded like the drafter's attention: helix + attention DP
+        builds it head-TP (``mapping_for_full_rows``), unlike the executor mapping.
+        """
+        mapping = (self._draft_config.mapping
+                   if self._draft_config is not None else self._mapping)
+        return (mapping.repurpose_helix_cp_to_tp()
+                if mapping.has_cp_helix() else mapping)
+
     def _get_effective_draft_config(self) -> ModelConfig:
         """
         Return the ModelConfig to use for draft KV cache creation.
@@ -2185,8 +2246,8 @@ class KvCacheCreator:
     def _get_draft_kv_model_config(self) -> ModelConfig:
         """The draft ModelConfig describing the KV pool as it is ALLOCATED.
 
-        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 KV
-        algo onto every loaded model, including a standalone drafter. The drafter
+        The args-level ``kv_cache_config.dtype`` sync stamps the TARGET's fp8 or
+        nvfp4 KV algo onto every loaded model, including a standalone drafter. The drafter
         stores and reads its pool in its weights dtype (DFlash validates a bf16 pool
         and otherwise falls back to the max_seq_len-dense private arena, which OOMs at
         long context), so the pool dtype must follow the drafter.
@@ -2207,12 +2268,13 @@ class KvCacheCreator:
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
         quant_config = getattr(effective_draft_config, "quant_config", None)
-        if quant_config is None or not quant_config.quant_mode.has_fp8_kv_cache(
-        ):
+        if quant_config is None or not (
+                quant_config.quant_mode.has_fp8_kv_cache()
+                or quant_config.quant_mode.has_fp4_kv_cache()):
             return effective_draft_config
         logger.info(
             "External drafter KV pool keeps the drafter dtype; dropping "
-            "the fp8 KV quant algo inherited from the target.")
+            "the fp8/nvfp4 KV quant algo inherited from the target.")
         neutral_quant = copy.copy(quant_config)
         neutral_quant.kv_cache_quant_algo = None
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
@@ -2232,11 +2294,13 @@ class KvCacheCreator:
     def _get_draft_tokens_per_block(self) -> int:
         """Page size of the separate one-model draft KV pool.
 
-        A standalone drafter (DFlash, standalone DSpark) gets its own page
-        size, ``_STANDALONE_DRAFT_TOKENS_PER_BLOCK``, NOT self._tokens_per_block:
-        the target's value can be one the drafter's kernels reject (FP4 MLA
-        forces 128; trtllm-gen MLA decode takes only 32 or 64). Those drafters
-        read their pool geometry from the manager, so nothing else has to agree.
+        A standalone drafter (DFlash, standalone DSpark) keeps
+        self._tokens_per_block when every drafter block-decode kernel accepts
+        it (``_DRAFTER_KERNEL_TOKENS_PER_BLOCK``), and otherwise gets its own
+        page size, ``_STANDALONE_DRAFT_TOKENS_PER_BLOCK``: the target's value
+        can be one the drafter's kernels reject (FP4 MLA forces 128;
+        trtllm-gen MLA decode takes only 32 or 64). Those drafters read their
+        pool geometry from the manager, so nothing else has to agree.
 
         Every other separate draft pool (MTP, Eagle3, ...) keeps the target's
         page size: its draft layers run through the target's attention
@@ -2247,7 +2311,8 @@ class KvCacheCreator:
         the split charges one page granularity and the pool uses another.
         """
         spec_dec_mode = self._speculative_config.spec_dec_mode
-        if spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark():
+        if ((spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()) and
+                self._tokens_per_block not in _DRAFTER_KERNEL_TOKENS_PER_BLOCK):
             return _STANDALONE_DRAFT_TOKENS_PER_BLOCK
         return self._tokens_per_block
 
@@ -2308,7 +2373,7 @@ class KvCacheCreator:
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP), with the
-        # target's inherited fp8 KV algo dropped for a standalone drafter. The
+        # target's inherited fp8/nvfp4 KV algo dropped for a standalone drafter. The
         # budget split in _get_kv_size_per_token resolves it through the SAME
         # helper, so the bytes/token it charges match the pool allocated here.
         effective_draft_config = self._get_draft_kv_model_config()
@@ -2356,14 +2421,7 @@ class KvCacheCreator:
         # the sparse_attention_config. Get it from effective_draft_config which
         # falls back to the target model's config for MTP mode.
         sparse_attn_config = effective_draft_config.sparse_attention_config
-        # Under helix the standalone drafter is built against the repurposed
-        # mapping (CP ranks become TP ranks) and every rank keeps its full
-        # drafter KV, so its paged manager needs the CP-free mapping: the
-        # round-robin ledger applies to the TARGET KV alone, and
-        # KVCacheManagerV2 rejects is_draft x helix outright.
-        draft_mapping = self._mapping
-        if draft_mapping.has_cp_helix():
-            draft_mapping = draft_mapping.repurpose_helix_cp_to_tp()
+        draft_mapping = self._get_draft_mapping()
         draft_tokens_per_block = self._get_draft_tokens_per_block()
         if draft_tokens_per_block != self._tokens_per_block:
             # Logged because nothing fails when the two differ: only the draft
@@ -2374,7 +2432,7 @@ class KvCacheCreator:
         return _create_kv_cache_manager(
             model_engine=None,
             max_cuda_graph_batch_size=self._model_engine.
-            _max_cuda_graph_batch_size,
+            max_cuda_graph_batch_size,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=draft_mapping,
             kv_cache_config=draft_kv_config,
@@ -2550,7 +2608,6 @@ class KvCacheCreator:
         successful split (which already sizes both managers) is unaffected.
         """
         if (not self._is_kv_cache_manager_v2
-                or self._draft_model_engine is not None
                 or not self._should_create_separate_draft_kv_cache()
                 or target_kv_cache_config.max_tokens is not None):
             return draft_kv_cache_config
@@ -2568,6 +2625,60 @@ class KvCacheCreator:
             f"Cannot split KV cache max_gpu_total_bytes between target and "
             f"draft; bounding the draft to max_tokens={max_tokens}.")
         return bounded
+
+    # Warn only when admissible concurrency exceeds the graph-covered range
+    # by this factor, so a small overshoot off-graph does not trip it.
+    _CUDA_GRAPH_CAPTURE_WARN_FACTOR = 1.5
+
+    def _warn_if_admitted_concurrency_outruns_graph_capture(self) -> None:
+        """Warn when admitted decode concurrency far outruns CUDA-graph coverage.
+
+        Decode above the covered range runs eager, which can cost more
+        throughput than the extra concurrency buys; still valid at low load,
+        hence a warning that names the knobs rather than a refusal.
+        """
+        capture_sizes = self._model_engine.cuda_graph_batch_sizes
+        padding = self._model_engine.cuda_graph_padding_enabled
+        if (not isinstance(capture_sizes, (list, tuple)) or not capture_sizes
+                or not all(isinstance(s, int) for s in capture_sizes)):
+            # CUDA graphs disabled, or the engine does not expose its capture
+            # set.
+            return
+        if padding is True:
+            # Padding rounds a decode batch up to the nearest captured size,
+            # so everything up to the largest capture replays a graph.
+            covered = max(capture_sizes)
+        else:
+            # Without padding a decode batch replays a graph only at an exactly
+            # captured size, so the reliably covered range is the dense {1..n}
+            # prefix of the capture set; above it ragged batches rarely match.
+            covered = 0
+            for size in sorted(set(capture_sizes)):
+                if size != covered + 1:
+                    break
+                covered = size
+        if covered <= 0:
+            return
+        if not (isinstance(self._max_batch_size, int)
+                and self._max_batch_size > 0):
+            return
+        admissible = self._max_batch_size
+        if admissible <= self._CUDA_GRAPH_CAPTURE_WARN_FACTOR * covered:
+            return
+        logger.warning(
+            f"The engine admits up to ~{admissible} concurrent decode "
+            f"requests (scheduler max_batch_size={self._max_batch_size}), but "
+            f"captured CUDA graphs only cover decode "
+            f"batches up to {covered} (largest capture "
+            f"{max(capture_sizes)}, enable_padding="
+            f"{bool(padding)}). Decode batches above {covered} run in eager "
+            f"mode with a large per-iteration latency penalty, which can "
+            f"cost more throughput than the added concurrency buys. Raise "
+            f"cuda_graph_config.max_batch_size (or add larger "
+            f"cuda_graph_config.batch_sizes) and set "
+            f"cuda_graph_config.enable_padding=True so ragged batches round "
+            f"up to a captured size, or lower max_batch_size if decode above "
+            f"{covered} concurrent requests is not intended.")
 
     def _split_kv_cache_budget_for_draft(
         self,
@@ -2994,9 +3105,8 @@ class KvCacheCreator:
             self_kv_cache_config, cross_kv_cache_config = self._split_kv_cache_budget_for_cross(
             )
 
-        has_separate_one_model_draft = (
-            self._draft_model_engine is None
-            and self._should_create_separate_draft_kv_cache())
+        has_separate_one_model_draft = self._should_create_separate_draft_kv_cache(
+        )
         # One term per axis: a draft pool exists to pair with, block reuse is on,
         # and the span is known. Anything outside keeps its unpaired path.
         self._joint_kv_cache_reuse = (has_separate_one_model_draft and
@@ -3014,11 +3124,8 @@ class KvCacheCreator:
                 cross_kv_cache_config)
 
         # Split combined KV cache budgets before creating managers.
-        has_draft = (
-            self._draft_model_engine is not None  # two-model
-            or has_separate_one_model_draft)  # one-model
         draft_kv_cache_config = None
-        if has_draft:
+        if has_separate_one_model_draft:
             # The GPU split applies when each manager sizes its pools from
             # max_gpu_total_bytes (V2 and V1 VSWA). V1 non-VSWA and estimation
             # size GPU pools from a shared max_tokens instead.
@@ -3036,6 +3143,12 @@ class KvCacheCreator:
                         budget_attr, self_kv_cache_config,
                         draft_kv_cache_config))
 
+        # Estimation managers are throwaway probes; the real build that
+        # follows runs the check against the same engine and scheduler
+        # settings.
+        if not estimating_kv_cache:
+            self._warn_if_admitted_concurrency_outruns_graph_capture()
+
         compression_config = self._llm_args.kv_cache_compression_config
         compression_manager = create_kv_cache_compression_manager(
             compression_config,
@@ -3048,7 +3161,6 @@ class KvCacheCreator:
             and compression_manager.provides_cold_page_codec else None)
 
         kv_cache_manager = self._create_kv_cache_manager(
-            self._model_engine,
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config,
             cold_page_codec_provider=cold_page_codec_provider,
@@ -3061,32 +3173,13 @@ class KvCacheCreator:
         if not estimating_kv_cache and kv_cache_manager is not None:
             kv_cache_manager.fp8_ctx_mla_kv_len_cap = self._fp8_ctx_mla_kv_len_cap
 
-        if (not estimating_kv_cache and self._kv_connector_manager is not None
-                and self._draft_model_engine is not None):
-            raise NotImplementedError(
-                "Connector manager is not supported for draft model.")
-
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Two-model speculative decoding: draft model has separate engine
-        if self._draft_model_engine is not None:
-            if (self._is_kv_cache_manager_v2
-                    and draft_kv_cache_config is not None):
-                # Offload budgets are divided per manager, GPU budgets are not.
-                assert (draft_kv_cache_config.max_gpu_total_bytes ==
-                        self_kv_cache_config.max_gpu_total_bytes), (
-                            "KVCacheManagerV2 does not support two-model "
-                            "speculative decoding with separate draft GPU "
-                            "budgets.")
-            draft_kv_cache_manager = self._create_kv_cache_manager(
-                self._draft_model_engine,
-                estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
         # One-model speculative decoding with different KV layouts
-        elif self._should_create_separate_draft_kv_cache():
+        if has_separate_one_model_draft:
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 original_max_seq_len,
                 estimating_kv_cache,
@@ -3184,6 +3277,7 @@ def _get_mamba_cache_layer_masks(
 _CONV_STATE_LAYOUT_BY_MODEL_TYPE = {
     "nemotron_hybrid": "x_b_c",
     "qwen3_next": "q_k_v",
+    "kimi_linear": "q_k_v",
 }
 
 
@@ -3202,31 +3296,8 @@ def _mamba_conv_layout_kwargs(kv_cache_manager_cls: type,
     return {"model_type": model_type}
 
 
-def _get_qwen4_exp_ple_cache_params(config, *, total_layers: int,
-                                    is_draft: bool):
-    """Align target-only PLE state with a target/draft cache layout."""
-    if is_draft:
-        return None
-
-    params = extract_qwen4_exp_ple_cache_params(config)
-    num_target_layers = len(params.ple_layer_mask)
-    if num_target_layers > total_layers:
-        raise ValueError(
-            "PLE layer mask cannot exceed the hybrid cache layout: "
-            f"got {num_target_layers}, expected at most {total_layers}")
-    if num_target_layers == total_layers:
-        return params
-
-    # Unified one-model caches append attention-only MTP layers.
-    return dataclasses.replace(
-        params,
-        ple_layer_mask=params.ple_layer_mask + [False] *
-        (total_layers - num_target_layers),
-    )
-
-
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
+        model_engine: Optional[ModelEngine],
         kv_cache_manager_cls,
         mapping: Mapping,
         kv_cache_config: KvCacheConfig,
@@ -3249,7 +3320,7 @@ def _create_kv_cache_manager(
         layer_mask: Optional[List[bool]] = None,
         num_layers: Optional[int] = None,
         num_kv_heads: Optional[Union[int, List[int]]] = None,
-        head_dim: Optional[int] = None,
+        head_dim: Optional[Union[int, List[int]]] = None,
         kv_cache_type=None,
         is_disagg: bool = False,
         disable_overlap_scheduler: bool = False,
@@ -3291,44 +3362,25 @@ def _create_kv_cache_manager(
         _model_config = model_engine.model.model_config
 
     if dtype is None:
-        dtype = model_engine.dtype
+        dtype = model_engine.model.config.torch_dtype
 
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
 
     hidden_size = config.hidden_size
-    num_attention_heads = config.num_attention_heads
-    num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
-        config, 'num_key_value_heads', num_attention_heads)
-    if not isinstance(head_dim, int):
-        head_dim = getattr(config, "head_dim", None)
-    if not isinstance(head_dim, int):
-        head_dim = hidden_size // num_attention_heads
 
-    # Gemma4: build per-layer head_dim, num_kv_heads, and sliding window
-    # for hybrid attention. Different layer types need different KV cache
-    # pool groups (via max_attention_window) so FlashInfer page indices
-    # are consistent within each group.
-    if is_gemma4_hybrid(config):
-        layer_types = config.layer_types
-        global_head_dim = config.global_head_dim
-        attention_k_eq_v = getattr(config, 'attention_k_eq_v', False)
-        num_global_kv_heads = (getattr(config, 'num_global_key_value_heads',
-                                       None) or num_key_value_heads)
-        head_dim_list = []
-        kv_heads_list = []
-        for lt in layer_types:
-            is_sliding = (lt == "sliding_attention")
-            if is_sliding:
-                head_dim_list.append(head_dim)
-                kv_heads_list.append(num_key_value_heads)
-            else:
-                head_dim_list.append(global_head_dim)
-                use_k_eq_v = attention_k_eq_v and not is_sliding
-                kv_heads_list.append(
-                    num_global_kv_heads if use_k_eq_v else num_key_value_heads)
-        head_dim = head_dim_list
-        num_key_value_heads = kv_heads_list
+    layer_specs = _get_kv_cache_layer_specs(_model_config)
+    if layer_specs:
+        head_dim = [spec.head_dim for spec in layer_specs]
+        num_key_value_heads = [spec.num_kv_heads for spec in layer_specs]
+    else:
+        num_attention_heads = config.num_attention_heads
+        num_key_value_heads = num_kv_heads if num_kv_heads is not None else getattr(
+            config, 'num_key_value_heads', num_attention_heads)
+        if not isinstance(head_dim, int):
+            head_dim = getattr(config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = hidden_size // num_attention_heads
 
     # Derive per-layer max_attention_window for any model that publishes a
     # mixed sliding/full `layer_types` schedule (Gemma4 hybrid included) so V2
@@ -3359,7 +3411,8 @@ def _create_kv_cache_manager(
     derived_windows = None
     if (not is_draft and kv_cache_type
             == tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
-            and (not estimating_kv_cache or is_gemma4_hybrid(config))):
+            and (not estimating_kv_cache
+                 or _has_variable_kv_cache_geometry(_model_config))):
         derived_windows = _derive_v2_layer_type_attention_windows(
             kv_cache_config, kv_cache_manager_cls, _model_config, max_seq_len)
     if derived_windows is not None:
@@ -3380,10 +3433,6 @@ def _create_kv_cache_manager(
             f"({len(set(derived_windows))} distinct windows)")
         kv_cache_config = copy.copy(kv_cache_config)
         kv_cache_config.max_attention_window = derived_windows
-
-    # Note: Gemma4 KV sharing is handled at the model level — shared layers
-    # use cache_layer_idx to read from the target layer's cache slot via
-    # Gemma4Attention. No layer_mask exclusion needed here.
 
     if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache():
         kv_cache_dtype = tensorrt_llm.bindings.DataType.FP8
@@ -3410,8 +3459,8 @@ def _create_kv_cache_manager(
     if layer_mask is None:
         draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
                                if model_engine is not None else None)
-    # If num_key_value_heads is already a per-layer list (e.g., Gemma4 hybrid),
-    # use it directly; otherwise build from the scalar value.
+    # Use model-provided per-layer KV heads directly; otherwise expand the
+    # scalar value for speculative decoding when needed.
     if isinstance(num_key_value_heads, list):
         per_layer_num_kv_heads = num_key_value_heads
     else:
@@ -3421,7 +3470,7 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["max_cuda_graph_batch_size"] = (
-            model_engine._max_cuda_graph_batch_size
+            model_engine.max_cuda_graph_batch_size
             if model_engine is not None else max_cuda_graph_batch_size)
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
@@ -3435,7 +3484,8 @@ def _create_kv_cache_manager(
         # digest scan. Leave it unset for text-only engines. Without an engine
         # (e.g. separate one-model draft caches), preserve config resolution:
         # a text sub-config alone cannot identify a multimodal deployment.
-        needs_multimodal_keys = model_engine is None or model_engine.is_multimodal
+        needs_multimodal_keys = model_engine is None or is_multimodal(
+            model_engine.model, model_engine.input_processor)
         manager_extra_kwargs["vocab_size"] = (resolve_vocab_size(config) if
                                               needs_multimodal_keys else None)
         if (needs_multimodal_keys and manager_extra_kwargs["vocab_size"] is None
@@ -3495,32 +3545,24 @@ def _create_kv_cache_manager(
         # manager's own internal gate (`tp_size = 1 if enable_attention_dp
         # else tp_size`, then num_heads / n_groups / conv_dim divide by
         # it), so the params pass through unscaled.
-        # KDA fused multi-token verify (trtllm::kda_mtp_decode): when the
-        # kernel can run here, allocate the per-slot replay caches instead
-        # of the legacy per-step intermediate verification buffers. The
-        # kernel replays accepted drafts from these caches and commits
-        # states in place, replacing the intermediate-buffer + promotion
-        # flow for KDA layers.
-        kda_extra_kwargs = {}
-        kda_replay_manager_types = (MixedMambaHybridCacheManager,
-                                    MambaHybridCacheManagerV2)
+        kda_extra_kwargs = _mamba_conv_layout_kwargs(kv_cache_manager_cls,
+                                                     "kimi_linear")
+        backbone = getattr(getattr(model_engine, "model", None), "model", None)
         if (spec_config is not None
-                and issubclass(kv_cache_manager_cls, kda_replay_manager_types)):
-            from ..modules.kimi_kda._kda_kernels import kda_mtp_replay_num_spec
-            kda_replay_num_spec = kda_mtp_replay_num_spec(
-                spec_config.tokens_per_gen_step - 1)
-            if kda_replay_num_spec is not None:
-                kda_extra_kwargs["kda_replay_num_spec"] = kda_replay_num_spec
+                and issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2)
+                and getattr(backbone, "kda_draft_records", False)):
+            kda_extra_kwargs["kda_draft_records"] = True
+        if (not is_glm5_next and issubclass(kv_cache_manager_cls,
+                                            MambaHybridCacheManagerV2)):
+            # The V2 manager reads the MLA geometry and the per-layer KV
+            # dtype policy from the model config when it composes the FP4
+            # MLA cache layout (NVFP4 KV cache).
+            kda_extra_kwargs["pretrained_config"] = config
         if is_glm5_next:
-            # The manager places an indexer buffer on every attention layer.
             from ..attention.backends.sparse.glm_kpool import \
                 glm_kpool_cache_row_dim
             kda_extra_kwargs["index_state_dim"] = glm_kpool_cache_row_dim(
                 int(text_config.index_head_dim))
-        # KDA's conv state is a [Q | K | V] concatenation whose three sections
-        # have identical width, i.e. the qwen3_next section layout.
-        kda_extra_kwargs.update(
-            _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
         kv_cache_manager = kv_cache_manager_cls(
             # mamba (KDA) cache parameters
             mamba_params.state_size,
@@ -3616,54 +3658,9 @@ def _create_kv_cache_manager(
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
 
-        # Replay state update kernel for MTP: default on for sm >= 80; gates
-        # below disable it for incompatible feature combinations.  Cpp cache
-        # manager doesn't expose use_replay_state_update, so the wrapper
-        # property's getattr default keeps replay off there automatically.
-        sm = get_sm_version()
         stochastic_rounding = getattr(
             quant_config, 'mamba_ssm_stochastic_rounding',
             False) if quant_config is not None else False
-
-        use_replay = spec_config is not None and sm >= 80
-        if spec_config is None:
-            logger.info(
-                "Replay kernel requires speculative decoding; using non-replay path"
-            )
-
-        # Block reuse (prefix caching): replay leaves SSM state at a
-        # checkpoint after speculation. The next decode step replays forward
-        # to correct it. If block reuse feeds that stale state into a new
-        # prefill, the correction never happens.
-        # Currently we only save and reuse context tokens so this does not affect.
-
-        # Tree attention: replay assumes linear token sequence.
-        if (spec_config is not None
-                and getattr(spec_config, 'use_dynamic_tree', False)):
-            logger.info("Replay kernel incompatible with tree attention; "
-                        "using legacy MTP path")
-            use_replay = False
-
-        # Replay Philox uses PTX cvt.rs.f16x2.f32 which needs 100 <= sm < 120.
-        # Flashinfer has a SW fallback at any SM.
-        if (stochastic_rounding
-                and mamba_params.mamba_ssm_cache_dtype == torch.float16
-                and (sm < 100 or sm in (120, 121))):
-            logger.info("Replay kernel Philox requires 100 <= sm < 120; "
-                        "using legacy MTP path for stochastic rounding support")
-            use_replay = False
-
-        # Use replay algorithm for mamba (default is on).
-        enforce_disable_replay = os.environ.get('TRTLLM_USE_MAMBA_REPLAY',
-                                                '1') == '0'
-        if enforce_disable_replay:
-            logger.info(
-                "Replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
-            use_replay = False
-        else:
-            logger.info(
-                "Replay kernel is not changed since TRTLLM_USE_MAMBA_REPLAY=1")
-
         # Stochastic-rounding seeds must live on the cache manager (not be
         # re-created with torch.randint per forward) whenever SR can fire
         # on the fp16 SSM cache.  This mirrors the predicate the mixer uses
@@ -3703,7 +3700,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            use_replay_state_update=use_replay,
+            use_replay_state_update=None,
             mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
             **mamba_manager_extra_kwargs,
         )
@@ -3730,75 +3727,14 @@ def _create_kv_cache_manager(
             ))
         num_mamba_layers = (0 if is_draft and mamba_params.num_draft_layers > 0
                             else mamba_params.num_mamba_layers)
-        # Replay state update for GDN MTP: mirrors the nemotron_hybrid gating
-        # above, minus the Mamba2-specific stochastic-rounding/Philox gate.
-        # The GDN replay kernel does a plain cast on checkpoint commit, so
-        # quantized SSM cache dtypes stay on the legacy path.
-        sm = get_sm_version()
-        use_replay = spec_config is not None and sm >= 80
-        if spec_config is None:
-            logger.info(
-                "GDN replay kernel requires speculative decoding; using "
-                "non-replay path")
-        elif spec_config.tokens_per_gen_step > 8:
-            logger.info("GDN cached replay supports at most 8 tokens per "
-                        "generation step; using non-replay path")
-            use_replay = False
-
-        # Tree attention: replay assumes a linear token sequence.
-        if (spec_config is not None
-                and getattr(spec_config, 'use_dynamic_tree', False)):
-            logger.info("GDN replay kernel incompatible with tree attention; "
-                        "using legacy MTP path")
-            use_replay = False
-
-        if mamba_params.mamba_ssm_cache_dtype not in (torch.float32,
-                                                      torch.bfloat16,
-                                                      torch.float16):
-            logger.info(
-                "GDN replay kernel does not support quantized SSM cache "
-                f"dtype {mamba_params.mamba_ssm_cache_dtype}; using legacy "
-                "MTP path")
-            use_replay = False
-
-        # Replay is enabled by default for eligible GDN MTP workloads.
-        if not is_gdn_replay_enabled():
-            use_replay = False
-
-        # GDN replay supports the contiguous C++ V1 state pool and the indirect
-        # per-layer state views exposed by V2. Mixed/Python does not expose an
-        # all-layer commit, so keep that manager but use non-replay MTP.
-        replay_manager_types = (CppMambaHybridCacheManager,
-                                MambaHybridCacheManagerV2)
-        if use_replay and not issubclass(kv_cache_manager_cls,
-                                         replay_manager_types):
-            logger.info("GDN replay requires C++ V1 or V2 Mamba cache manager; "
-                        f"{kv_cache_manager_cls.__name__} was selected, so the "
-                        "non-replay MTP path will be used")
-            use_replay = False
-        logger.info("GDN replay state update: " +
-                    ("ENABLED" if use_replay else "DISABLED"))
-
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
-        if getattr(sparse_attention_config, "algorithm", None) == "qsa":
-            # Resolve the side-cache shape from the same checkpoint geometry
-            # used to construct the QSA index projection.
-            mamba_manager_extra_kwargs.update(
-                sparse_attention_config=sparse_attention_config,
-                pretrained_config=config,
-            )
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
-            ple_cache_params = _get_qwen4_exp_ple_cache_params(
-                config,
-                total_layers=len(mamba_layer_mask),
-                is_draft=is_draft,
-            )
-            if ple_cache_params is not None:
-                mamba_manager_extra_kwargs[
-                    "qwen4_exp_ple_cache_params"] = ple_cache_params
+            mamba_manager_extra_kwargs.update(
+                pretrained_config=config,
+                sparse_attention_config=sparse_attention_config)
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -3827,7 +3763,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
-            use_replay_state_update=use_replay,
+            use_replay_state_update=None,
             **mamba_manager_extra_kwargs,
         )
     else:
@@ -3873,10 +3809,6 @@ def _create_kv_cache_manager(
             is_disagg=is_disagg,
             **manager_extra_kwargs,
         )
-    # Note: Gemma4 KV sharing cache remapping is handled in Gemma4Attention
-    # via cache_layer_idx — shared layers use target layer's index for
-    # get_buffers(). No layer_offsets remapping needed here.
-
     # Propagate the finalized chunked-prefill flag so KVCacheManager.fit_token_budget
     # only shrinks context chunks when the attention backend can consume a
     # partial context chunk. The flag is read from attn_runtime_features, which
@@ -3935,7 +3867,7 @@ def validate_kv_cache_compression_compatibility(
 def create_kv_cache_compression_manager(
     config: Optional[KvCacheCompressionConfig],
     *,
-    model_engine: PyTorchModelEngine,
+    model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
     estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
@@ -4026,7 +3958,7 @@ def resolve_max_num_sequences(model_engine,
                                      llm_args.disable_overlap_scheduler,
                                      enable_overlap_headroom=getattr(
                                          model_engine,
-                                         "_enable_overlap_headroom", False))
+                                         "enable_overlap_headroom", False))
 
 
 def should_enable_adp_dummy_fixes(mapping: Mapping) -> bool:
@@ -4114,7 +4046,7 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         "shortfall means one of them was re-derived from max_batch_size.")
 
 
-def create_py_executor_instance(
+def create_py_executor_resources(
     *,
     dist,
     resources,
@@ -4122,14 +4054,8 @@ def create_py_executor_instance(
     llm_args,
     ctx_chunk_config,
     model_engine,
-    start_worker,
-    sampler,
-    drafter,
-    guided_decoder: Optional[GuidedDecoder] = None,
     lora_config: Optional[LoraConfig] = None,
-    garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-    resource_governor_queue=None,
     max_seq_len: Optional[int] = None,
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
@@ -4141,13 +4067,12 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
     max_num_sequences: Optional[int] = None,
-) -> PyExecutor:
+) -> PyExecutorResources:
+    """Build the resource graph shared by initial execution and rebinding."""
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
 
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
-
-    spec_config = model_engine.spec_config
 
     is_disagg = is_disagg_enabled(cache_transceiver_config)
 
@@ -4169,6 +4094,7 @@ def create_py_executor_instance(
 
     peft_cache_manager = None
     if lora_config is not None:
+        lora_owner = model_engine.initialize_lora_owner()
         # TODO: Refactor dimension resolution into a LoraModuleDimensions
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
@@ -4177,7 +4103,7 @@ def create_py_executor_instance(
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
             initial_lora_data_type = _get_initial_lora_data_type(
-                load_torch_lora(lora_config))
+                load_torch_lora(lora_config, owner=lora_owner))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -4302,21 +4228,25 @@ def create_py_executor_instance(
             rank=dist.mapping.rank,
             gpus_per_node=dist.mapping.gpus_per_node,
         )
+        lora_model_config = make_lora_model_config(
+            model_engine.model,
+            target_modules,
+            lora_config.trtllm_modules_to_hf_modules,
+            lora_config.swap_gate_up_proj_lora_b_weight,
+            owner=lora_owner,
+        )
+        model_engine.set_lora_model_config(lora_model_config)
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config_model,
             lora_config=lora_config,
             model_config=model_binding_config,
+            lora_model_config=lora_model_config,
             world_config=world_config,
             execution_stream=execution_stream,
-            lora_target_modules=target_modules,
             initial_data_type=initial_lora_data_type,
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
-        model_engine.set_lora_model_config(
-            target_modules, lora_config.trtllm_modules_to_hf_modules,
-            lora_config.swap_gate_up_proj_lora_b_weight)
-        if isinstance(model_engine, PyTorchModelEngine):
-            model_engine._init_cuda_graph_lora_manager(lora_config)
+        model_engine.init_cuda_graph_lora_manager(lora_config)
 
     validate_seq_slot_pool_covers_admission(max_num_sequences, kv_cache_manager)
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
@@ -4453,7 +4383,7 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
 
-    if (getattr(model_engine, "mm_encoder_item_scheduling_enabled", False)
+    if (model_engine.mm_encoder_item_scheduling_enabled
             and model_engine.mapping.is_first_pp_rank()):
         # Wrap the LLM scheduler with atomic MM item budgeting. ModelEngine
         # already validated model-capability-dependent feature combinations.
@@ -4480,6 +4410,12 @@ def create_py_executor_instance(
             bytes_per_encoder_embedding=(
                 model_engine.bytes_per_mm_encoder_embedding),
             retain_cache_entries=model_engine.model.encoder_cache_active,
+            # V2 resolves actual KV reuse before encoder item selection.
+            # V1 keeps whole-request encoder scheduling.
+            context_chunk_unit_size=(
+                ctx_chunk_config[1]
+                if isinstance(kv_cache_manager, KVCacheManagerV2)
+                and ctx_chunk_config is not None else None),
         )
 
     config = model_engine.model.model_config.pretrained_config
@@ -4510,14 +4446,79 @@ def create_py_executor_instance(
             executor_max_seq_len = min(executor_max_seq_len,
                                        int(decoder_position_limit))
 
+    return PyExecutorResources(
+        resource_manager=resource_manager,
+        scheduler=scheduler,
+        kv_cache_transceiver=kv_cache_transceiver,
+        peft_cache_config=peft_cache_config,
+        virtual_memory_pools=virtual_memory_pools,
+        kv_connector_manager=kv_connector_manager,
+        dwdp_manager=dwdp_manager,
+        max_seq_len=executor_max_seq_len,
+        max_num_sequences=max_num_sequences,
+        waiting_queue_policy=waiting_queue_policy,
+    )
+
+
+def create_py_executor_instance(
+    *,
+    dist,
+    resources,
+    mapping,
+    llm_args,
+    ctx_chunk_config,
+    model_engine,
+    start_worker,
+    sampler,
+    drafter,
+    guided_decoder: Optional[GuidedDecoder] = None,
+    lora_config: Optional[LoraConfig] = None,
+    garbage_collection_gen0_threshold: Optional[int] = None,
+    kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+    resource_governor_queue=None,
+    max_seq_len: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
+    max_beam_width: Optional[int] = None,
+    max_num_tokens: Optional[int] = None,
+    peft_cache_config: Optional[PeftCacheConfig] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
+    virtual_memory_pools: Optional[dict] = None,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
+    max_num_sequences: Optional[int] = None,
+) -> PyExecutor:
+    execution_resources = create_py_executor_resources(
+        dist=dist,
+        resources=resources,
+        mapping=mapping,
+        llm_args=llm_args,
+        ctx_chunk_config=ctx_chunk_config,
+        model_engine=model_engine,
+        lora_config=lora_config,
+        kv_connector_manager=kv_connector_manager,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
+        max_num_tokens=max_num_tokens,
+        peft_cache_config=peft_cache_config,
+        scheduler_config=scheduler_config,
+        cache_transceiver_config=cache_transceiver_config,
+        virtual_memory_pools=virtual_memory_pools,
+        execution_stream=execution_stream,
+        dwdp_manager=dwdp_manager,
+        max_num_sequences=max_num_sequences,
+    )
+    spec_config = model_engine.spec_config
+    config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
-        resource_manager,
-        scheduler,
+        execution_resources.resource_manager,
+        execution_resources.scheduler,
         model_engine=model_engine,
         sampler=sampler,
         drafter=drafter,
         dist=dist,
-        max_num_sequences=max_num_sequences,
+        max_num_sequences=execution_resources.max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         enable_early_first_token_response=llm_args.
         enable_early_first_token_response,
@@ -4527,22 +4528,29 @@ def create_py_executor_instance(
         if spec_config is not None else 0,
         max_total_draft_tokens=(spec_config.tokens_per_gen_step -
                                 1) if spec_config is not None else 0,
-        kv_cache_transceiver=kv_cache_transceiver,
+        kv_cache_transceiver=execution_resources.kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-        kv_connector_manager=kv_connector_manager,
+        kv_connector_manager=execution_resources.kv_connector_manager,
         resource_governor_queue=resource_governor_queue,
-        max_seq_len=executor_max_seq_len,
-        peft_cache_config=peft_cache_config,
-        virtual_memory_pools=virtual_memory_pools,
+        max_seq_len=execution_resources.max_seq_len,
+        peft_cache_config=execution_resources.peft_cache_config,
+        virtual_memory_pools=execution_resources.virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy,
-        dwdp_manager=dwdp_manager,
+        waiting_queue_policy=execution_resources.waiting_queue_policy,
+        dwdp_manager=execution_resources.dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
         kv_pool_rebalance_config.check_interval,
+        enable_adp_dummy_fixes=should_enable_adp_dummy_fixes(mapping),
+        enable_scheduler_aware_adp_dummy=should_enable_scheduler_aware_adp_dummy(
+            getattr(config, "model_type", None), mapping,
+            llm_args.disable_overlap_scheduler),
+        enable_non_overlap_adp_forward_intent=(
+            should_enable_non_overlap_adp_forward_intent(
+                mapping, llm_args.disable_overlap_scheduler)),
     )
 
 
@@ -4576,7 +4584,7 @@ def create_torch_sampler_args(
 
 
 def instantiate_sampler(
-    engine: PyTorchModelEngine,
+    engine: ModelEngine,
     llm_args: TorchLlmArgs,
     mapping: Mapping,
     *,
@@ -4793,60 +4801,3 @@ def _adjust_torch_mem_fraction():
         f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
     )
     torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
-
-
-def validate_feature_combination(llm_args, model_engine):
-    # Validate the flags for features' combination
-    def init_feature_status(llm_args) -> Dict[str, bool]:
-        assert isinstance(
-            llm_args, TorchLlmArgs
-        ), "Expect TorchLlmArgs used for feature status validation."
-        feature_list = [
-            "overlap_scheduler",
-            "cuda_graph",
-            "attention_dp",
-            "disaggregated_serving",
-            "chunked_prefill",
-            "mtp",
-            "eagle3_one_model",
-            "kv_cache_reuse",
-            "slide_window_attention",
-            "guided_decoding",
-        ]
-        feature_status: Dict[str, bool] = dict.fromkeys(feature_list)
-        feature_status[
-            "overlap_scheduler"] = not llm_args.disable_overlap_scheduler
-        feature_status["cuda_graph"] = llm_args.cuda_graph_config is not None
-        feature_status["attention_dp"] = llm_args.enable_attention_dp
-        feature_status[
-            "disaggregated_serving"] = llm_args.cache_transceiver_config is not None
-        feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
-        feature_status["mtp"] = isinstance(llm_args.speculative_config,
-                                           MTPDecodingConfig)
-        feature_status["eagle3_one_model"] = isinstance(
-            llm_args.speculative_config, EagleDecodingConfig)
-        feature_status[
-            "kv_cache_reuse"] = llm_args.kv_cache_config is not None and llm_args.kv_cache_config.enable_block_reuse
-        feature_status["slide_window_attention"] = (
-            hasattr(model_engine.model.model_config.pretrained_config,
-                    "layer_types") and "sliding_attention"
-            in model_engine.model.model_config.pretrained_config.layer_types)
-        feature_status[
-            "guided_decoding"] = llm_args.guided_decoding_backend is not None
-        assert all(v is not None for v in feature_status.values()
-                   ), "feature status has not been fully initialized."
-        assert all(
-            k in feature_list for k in
-            feature_status.keys()), "unexpected feature type in feature_status."
-        return feature_status
-
-    feature_status: Dict[str, bool] = init_feature_status(llm_args)
-
-    # Kept as an extension point; there are currently no conflicting feature
-    # combinations to reject.
-    CONFLICT_RULES: list[dict[str, Any]] = [
-        # Add new conflict rules here in the future
-    ]
-    for rule in CONFLICT_RULES:
-        if all(feature_status[feature] for feature in rule["features"]):
-            raise ValueError(rule["message"])

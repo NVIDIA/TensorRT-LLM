@@ -17,7 +17,7 @@
 ConfigurableMoE-compatible MoE backend wrapping the ported
 architecture-specific MegaMoE kernels (fused dispatch + FC1 + activation + FC2 +
 combine) from
-``tensorrt_llm/_torch/cute_dsl_kernels/cutedsl_megamoe``. The kernel is
+``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe``. The kernel is
 invoked through the standard CuteDSL TunableRunner / torch op pattern;
 the runner + op live in
 ``tensorrt_llm/_torch/moe/custom_ops/cute_dsl_megamoe_custom_op.py``. This
@@ -68,12 +68,12 @@ non-1 scales compute correctly.
 
 from __future__ import annotations
 
+import functools
 import os
 import socket
-import time
 import weakref
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -240,7 +240,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
             return False, reason
 
     try:
-        from ....cute_dsl_kernels.cutedsl_megamoe import (  # noqa: F401
+        from ....moe.kernels.megamoe_kernels import (  # noqa: F401
             BlackwellInferenceMegaMoE,
             RubinInferenceGenphaseMegaMoE,
             RubinInferenceLocalMegaMoE,
@@ -249,7 +249,7 @@ def is_megamoe_cute_dsl_runtime_available() -> Tuple[bool, Optional[str]]:
     except ImportError as e:
         reason = (
             f"Ported MegaMoE NVFP4 kernel package failed to import: "
-            f"{e!r}. Verify tensorrt_llm/_torch/cute_dsl_kernels/"
+            f"{e!r}. Verify tensorrt_llm/_torch/moe/kernels/"
             f"cutedsl_megamoe is in the install tree."
         )
         _RUNTIME_PROBE_CACHE[sm_version] = reason
@@ -284,6 +284,17 @@ def _as_nvfp4(t: torch.Tensor) -> torch.Tensor:
 
 def _as_fp8_sf(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype == torch.float8_e4m3fn else t.view(torch.float8_e4m3fn)
+
+
+@functools.cache
+def _fp4_quantize_has_sm_budget() -> bool:
+    if hasattr(torch.ops.trtllm.fp4_quantize, "sm_budget"):
+        return True
+    logger.warning(
+        "fp4_quantize.sm_budget is unavailable; per-layer dynamic EPLB "
+        "quantization will use the selected backend without SM control"
+    )
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +367,7 @@ class _MegaMoeBuffers:
     topk_weights: torch.Tensor  # (max_T, top_k) float32
     combine_output: torch.Tensor  # (max_T, top_k, hidden) bf16
     shared_workspace: torch.Tensor  # (shared_ws_bytes,) uint8
-    peer_offsets: List[int]  # length == world_size; [0] for single-rank
+    peer_offsets: Tuple[int, ...]  # length == world_size; (0,) for single-rank
     topk_idx_local: torch.Tensor  # (max_T, top_k), int32 on Rubin, otherwise int64
 
 
@@ -375,8 +386,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     The per-architecture kernel variants dispatch inside this one identity,
     because architecture is not an id segment: all four segments hold whichever
     kernel runs. The class name carries its ``kernel_name`` segment because
-    ``CuteDslFusedMoE``'s ``trtllm.cutedsl.grouped_gemm.nvfp4`` will differ from
-    this id in that field alone.
+    ``TrtllmCutedslGroupedGemmNvfp4Impl``'s ``trtllm.cutedsl.grouped_gemm.nvfp4``
+    differs from this id in that field alone.
 
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
@@ -404,7 +415,10 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Static and dynamic EPLB both work: see ``_supports_load_balancer``
         # below for why the MegaMoE-format derived parameters migrate
         # atomically.
-        capabilities=MoEStaticCapability(supports_eplb=True),
+        capabilities=MoEStaticCapability(
+            supports_eplb=True,
+            supports_per_layer_dynamic_eplb=True,
+        ),
         doc="MegaMoE CuteDSL fused NVFP4 kernels: NVFP4 weights and activations, SM100/103/107.",
     )
 
@@ -517,16 +531,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 f"MegaMoECuteDsl requires num_slots ({d.num_slots}) "
                 f"divisible by ep_size ({d.ep_size}).",
             )
-        # The fused kernel returns a globally combined routed output. MiniMax-M3
-        # accounts for that when composing routed and shared experts; the other
-        # current model wrappers would apply a second AllReduce under TEP.
-        if d.parallel_size > 1 and not d.use_dp and not is_minimax_swiglu_bias:
-            return _reject(
-                MoERejectReason.TOPOLOGY_UNSUPPORTED,
-                "MegaMoECuteDsl supports TEP only for bias-free MiniMax-style "
-                "SwigluBias; other model compositions would reduce its already-global "
-                "routed output twice.",
-            )
+        # TEP (attention TP + MoE EP) needs no gate here: the fused kernel
+        # returns a globally combined routed output, and FusedCommMoEScheduler
+        # hands it to callers that reduce externally as a rank partial. It is
+        # correct but not cheap: every TP rank dispatches the same replicated
+        # tokens, so expert compute runs parallel_size times (the reason
+        # MegaMoEDeepGemm rejects TEP). validate_configurable_moe warns once.
         # ADP wider than EP would need an outer allgather + reducescatter
         # wrapper that this backend does not have.
         if d.use_dp and d.parallel_size > 1 and d.ep_size != d.parallel_size:
@@ -602,10 +612,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         self._topk_idx_dtype = torch.int32 if get_sm_version() == 107 else torch.int64
 
-        # Cross-rank combine wire format is selected with
-        # MEGAMOE_COMBINE_FORMAT (default bf16). It MUST be rank-identical:
-        # it sizes the symmetric workspace and picks the compiled kernel, so
-        # divergence desyncs the rendezvous / NVLink barrier.
+        # The wire format must match on all EP ranks: it sizes the symmetric workspace.
         combine_format = os.environ.get("MEGAMOE_COMBINE_FORMAT", "bf16")
         if combine_format not in self._SUPPORTED_COMBINE_FORMATS:
             raise ValueError(
@@ -643,6 +650,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # Per-bucket symmetric providers (bucket -> MegaMoeSymmMemProvider);
         # filled in ``create_weights`` on the multi-rank EP path.
         self._symm_providers = {}
+        # Launch buffers per (bucket, top_k, hidden, device, dtype, inference mode).
+        self._launch_buffers: Dict[Tuple, _MegaMoeBuffers] = {}
         self._genphase_direct_input_buckets: set[int] = set()
         # Lockstep per-chunk cross-rank max for the NEXT run_moe (set via
         # ``set_adaptive_launch_tokens``); ``None`` -> full bucket.
@@ -682,6 +691,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         # deferred factory in ``_launch_megamoe_kernel``.
         self._profiling_scratch_provider_ref = None
         self._profiling_scratch_kwargs = None
+        # Cute views of this module's weights, reused across launches.
+        self._cute_weight_cache: Dict[tuple, Any] = {}
         self._weights_loaded = False
         self._weights_created = False
         self.quant_method = None
@@ -695,6 +706,37 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         self._last_staged_T: Dict[int, int] = {}
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+    # ------------------------------------------------------------------
+    # Compute axis
+    # ------------------------------------------------------------------
+    @property
+    def compute_slot_count(self) -> int:
+        """Return the kernel-only slot axis ``M = H + S``.
+
+        ``expert_size_per_partition`` remains the resident/checkpoint axis H.
+        The per-layer dynamic EPLB layer handle supplies the S helper slots;
+        without one, M is H. Only the seven live kernel planes, symmetric
+        workspace, and launch geometry use this wider axis.
+        """
+        resident_experts = int(self.expert_size_per_partition)
+        layer_load_balancer = self.layer_load_balancer
+        if layer_load_balancer is None or not layer_load_balancer.produces_replica_plan:
+            return resident_experts
+        return resident_experts + int(layer_load_balancer.helper_slots_per_rank)
+
+    # ------------------------------------------------------------------
+    # Backend facts the per-layer dynamic EPLB layer handle reads
+    # ------------------------------------------------------------------
+    @property
+    def ep_process_group(self):
+        """The EP ProcessGroup resolved at construction, or ``None`` on one rank."""
+        return self._ep_pg
+
+    @property
+    def max_tokens_per_rank_capacity(self) -> int:
+        """The largest per-rank token count of any launch bucket."""
+        return int(self._maxt_buckets[-1])
 
     # ------------------------------------------------------------------
     # Topology
@@ -802,6 +844,14 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if moe.moe_max_num_tokens <= 0:
             raise ValueError(
                 f"MegaMoECuteDsl requires moe_max_num_tokens > 0; got {moe.moe_max_num_tokens}."
+            )
+        if not moe.use_dp and moe.parallel_size > 1:
+            logger.warning_once(
+                f"MegaMoECuteDsl under attention TP (TEP, tp_size="
+                f"{moe.parallel_size}) dispatches the same tokens from every TP "
+                f"rank, so expert compute is repeated {moe.parallel_size} times. "
+                "Prefer enable_attention_dp=True for throughput.",
+                key="megamoe_cutedsl_tep_redundant_compute",
             )
         # Dynamic EPLB is intentionally allowed: the quant method
         # registers mega-format derived parameters alongside the raw
@@ -1007,6 +1057,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         top_k = self.routing_method.experts_per_token
         full_T = self._maxt_buckets[-1]
         self._profiling_scratch_provider_ref = None
+        self._launch_buffers.clear()
         for max_T in self._maxt_buckets:
             (
                 shared_workspace_bytes,
@@ -1014,7 +1065,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             ) = query_megamoe_kernel_properties(
                 world_size=self.ep_size,
                 num_topk=top_k,
-                num_experts_per_rank=int(self.expert_size_per_partition),
+                num_experts_per_rank=self.compute_slot_count,
                 hidden_size=self.hidden_size,
                 intermediate_size_per_partition=int(self.intermediate_size_per_partition),
                 expand_intermediate_size_per_partition=int(
@@ -1152,6 +1203,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         x: Union[torch.Tensor, "Fp4QuantizedTensor"],
         *,
         post_quant_comm: bool = False,
+        reserved_sms: int = 0,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """BF16 -> NVFP4 packed activation + plain K-major FP8 SF.
@@ -1162,6 +1214,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ``self.fc31_input_scale`` is the per-tensor FP32 input scale
         registered by the quantization method's ``create_weights``; the
         value defaults to 1.0 until the checkpoint loader sets it.
+
+        A checkpoint that carries a per-channel pre-quant scale (NVFP4_AWQ /
+        NVFP4_ARC) gets it applied before quantization: the quantization
+        method loads it into ``self.fc31_act_scale`` (``[1, hidden]``), and
+        ``fc31_input_scale`` was calibrated on the scaled activation. The
+        kernel itself only ever sees the quantized input.
+
+        ``reserved_sms`` is the number of SMs left to the concurrent
+        HALO-Q/TMA kernel of a replica plan; zero uses the default
+        quantization overload.
 
         Empty input (``x.shape[0] == 0``) short-circuits to empty NVFP4
         + empty SF without launching a quantization kernel, so the
@@ -1183,13 +1245,28 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             empty_x = torch.empty((0, hidden // 2), dtype=torch.uint8, device=x_bf16.device)
             empty_sf = torch.empty((0, sf_cols), dtype=torch.uint8, device=x_bf16.device)
             return empty_x, empty_sf
-        x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
-            x_bf16,
-            self.fc31_input_scale,
-            16,  # scaling_vector_size == Nvfp4BlockSize
-            False,  # sf_use_ue8m0
-            False,  # is_sf_swizzled - MegaMoE expects plain K-major
-        )
+        fc31_act_scale = getattr(self, "fc31_act_scale", None)
+        if fc31_act_scale is not None:
+            # Product stays bf16, which is what ``fp4_quantize`` below is given
+            # on every other route into it: ``_SUPPORTED_ACTIVATION_DTYPES``
+            # admits bf16 activations only, so ``fc31_act_scale``, created at
+            # ``module.dtype``, is bf16 as well.
+            x_bf16 = x_bf16 * fc31_act_scale
+        # Leave a replica plan's SMs to its concurrent HALO-Q/TMA kernel. The
+        # default overload remains unchanged without a plan.
+        if reserved_sms > 0 and _fp4_quantize_has_sm_budget():
+            # Positional: a keyword argument costs the op dispatch about a microsecond.
+            x_fp4, x_sf = torch.ops.trtllm.fp4_quantize.sm_budget(
+                x_bf16, self.fc31_input_scale, 16, False, False, reserved_sms
+            )
+        else:
+            x_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+                x_bf16,
+                self.fc31_input_scale,
+                16,  # scaling_vector_size == Nvfp4BlockSize
+                False,  # sf_use_ue8m0
+                False,  # is_sf_swizzled - MegaMoE expects plain K-major
+            )
         # ``fp4_quantize(is_sf_swizzled=False)`` returns LINEAR layout
         # ``(rows, ceil(hidden/16))`` with no column pad. The kernel TMA
         # load needs ``pad_up(ceil_div(hidden, 16), 4)`` bytes per row
@@ -1203,6 +1280,42 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         padded_sf = torch.zeros((x_bf16.shape[0], sf_cols), dtype=torch.uint8, device=x_bf16.device)
         padded_sf[:, :raw_cols] = x_sf_raw
         return x_fp4, padded_sf
+
+    def _replica_plan_launch_args(self, replica_plan):
+        """Validate and unpack the caller-owned per-forward replica plan."""
+        if replica_plan is None:
+            return None
+        resident_experts = int(replica_plan.resident_experts_per_rank)
+        compute_slots = int(replica_plan.compute_slots_per_rank)
+        helper_slots = compute_slots - resident_experts
+        expected_resident = int(self.expert_size_per_partition)
+        expected_compute = self.compute_slot_count
+        if resident_experts != expected_resident or compute_slots != expected_compute:
+            raise RuntimeError(
+                "MegaMoECuteDsl replica-plan geometry does not match its allocated "
+                f"weights: plan H/M={resident_experts}/{compute_slots}, "
+                f"backend H/M={expected_resident}/{expected_compute}."
+            )
+        generation = int(replica_plan.ready_generation)
+        reserved_sms = int(replica_plan.reserved_sms)
+        if helper_slots <= 0 or not 1 <= generation < (1 << 63) or reserved_sms <= 0:
+            raise RuntimeError(
+                "MegaMoECuteDsl received an invalid replica plan: "
+                f"S={helper_slots}, generation={generation}, "
+                f"reserved_sms={reserved_sms}."
+            )
+        return (
+            compute_slots,
+            helper_slots,
+            replica_plan.ready_flags,
+            generation,
+            reserved_sms,
+        )
+
+    def _wait_rebalance_routes(self, replica_plan=None) -> None:
+        """Order route consumers after HALO-Q while leaving setup overlapped."""
+        if replica_plan is not None:
+            replica_plan.wait_for_routes()
 
     def run_moe(
         self,
@@ -1222,6 +1335,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         token_selected_experts = ctx.token_selected_experts
         token_final_scales = ctx.token_final_scales
         x_sf = ctx.x_sf
+        replica_plan = getattr(ctx, "replica_plan", None)
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
@@ -1254,13 +1368,16 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         top_k = int(token_selected_experts.shape[-1])
         device = x.device
 
-        topk_idx = token_selected_experts.to(self._topk_idx_dtype).contiguous()
-        topk_weights_f32 = token_final_scales.to(torch.float32).contiguous()
+        topk_weights_f32 = token_final_scales
+        if topk_weights_f32.dtype != torch.float32 or not topk_weights_f32.is_contiguous():
+            topk_weights_f32 = topk_weights_f32.to(torch.float32).contiguous()
 
+        # Routes stay as produced: the staging copy into the kernel's index
+        # buffer widens int32 to its dtype, and it is the first route reader.
         return self._run_moe(
             x=x,
             x_sf=x_sf,
-            topk_idx=topk_idx,
+            topk_idx=token_selected_experts,
             topk_weights=topk_weights_f32,
             weight_view=weight_view,
             num_tokens=num_tokens,
@@ -1268,6 +1385,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             hidden=hidden,
             device=device,
             output_dtype=output_dtype,
+            replica_plan=replica_plan,
         )
 
     def _ensure_local_staging(self, *, top_k: int, hidden: int, device, output_dtype, max_T: int):
@@ -1338,7 +1456,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             shared_bytes, supports_direct_inputs = query_megamoe_kernel_properties(
                 world_size=1,
                 num_topk=top_k,
-                num_experts_per_rank=int(self.expert_size_per_partition),
+                num_experts_per_rank=self.compute_slot_count,
                 hidden_size=hidden,
                 intermediate_size_per_partition=int(self.intermediate_size_per_partition),
                 expand_intermediate_size_per_partition=int(
@@ -1384,7 +1502,32 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         in plain CUDA memory. ``launch_max_T`` selects both the local staging
         set and (multi-rank) the symmetric provider, which MUST share the same
         ``max_T`` as the kernel's compile-time ``max_tokens_per_rank``.
+        Each bundle is built once; views made under inference mode cannot be
+        updated in place outside it, so the mode is part of the key.
         """
+        key = (
+            launch_max_T,
+            top_k,
+            hidden,
+            device,
+            output_dtype,
+            torch.is_inference_mode_enabled(),
+        )
+        bufs = self._launch_buffers.get(key)
+        if bufs is None:
+            bufs = self._build_buffers(
+                top_k=top_k,
+                hidden=hidden,
+                device=device,
+                output_dtype=output_dtype,
+                launch_max_T=launch_max_T,
+            )
+            self._launch_buffers[key] = bufs
+        return bufs
+
+    def _build_buffers(
+        self, *, top_k: int, hidden: int, device, output_dtype, launch_max_T: int
+    ) -> _MegaMoeBuffers:
         staging = self._ensure_local_staging(
             top_k=top_k, hidden=hidden, device=device, output_dtype=output_dtype, max_T=launch_max_T
         )
@@ -1395,7 +1538,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 topk_weights=staging["topk_weights"],
                 combine_output=staging["combine_output"],
                 shared_workspace=staging["shared_workspace"],
-                peer_offsets=[0],
+                peer_offsets=(0,),
                 topk_idx_local=staging["topk_idx"],
             )
         # Multi-rank: the provider must have been rendezvous'd at
@@ -1444,6 +1587,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         num_tokens: int,
         top_k: int,
         stage_activation: bool,
+        replica_plan=None,
     ) -> None:
         """Copy live rows of the user-domain inputs into the kernel's
         pre-allocated buffers and refresh the padded tail.
@@ -1473,13 +1617,15 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         if last_T is not None and last_T > num_tokens:
             bufs.topk_idx_local[num_tokens:last_T].fill_(-1)
         if num_tokens > 0:
-            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
             if stage_activation:
                 bufs.activation[:num_tokens].copy_(x.view(torch.uint8), non_blocking=True)
                 bufs.activation_sf[:num_tokens].copy_(x_sf.view(torch.uint8), non_blocking=True)
             bufs.topk_weights[:num_tokens, :top_k].copy_(topk_weights, non_blocking=True)
         if num_tokens < max_T:
             bufs.topk_weights[num_tokens:max_T, :top_k].zero_()
+        if num_tokens > 0:
+            self._wait_rebalance_routes(replica_plan)
+            bufs.topk_idx_local[:num_tokens].copy_(topk_idx, non_blocking=True)
         self._last_staged_T[max_T] = num_tokens
 
     def _launch_megamoe_kernel(
@@ -1500,6 +1646,8 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         num_tokens: int,
         output_dtype: torch.dtype,
         launch_max_T: int,
+        replica_plan=None,
+        staged_inputs: bool = False,
     ) -> torch.Tensor:
         """Launch the fused MegaMoE CuteDSL kernel and return its reduced output.
 
@@ -1508,13 +1656,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         upstream by :meth:`_acquire_buffers`). NVFP4 / FP8-SF dtype views
         happen through the module-level :func:`_as_nvfp4` /
         :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
-        tensors).
+        tensors). ``staged_inputs`` states that activation, activation_sf,
+        topk_idx and topk_weights are this bucket's launch buffers, whose cute
+        views the op may then reuse.
         """
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
         # a later same-process call for a different shape never sees a stale
         # scratch (ownership: see ``_profiling_scratch_provider_ref``).
         from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
+            run_cute_dsl_megamoe_nvfp4_blackwell,
+            set_active_megamoe_cute_buffer_cache,
+            set_active_megamoe_cute_weight_cache,
             set_active_megamoe_profiling_scratch,
             set_active_megamoe_profiling_scratch_factory,
         )
@@ -1557,8 +1710,39 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             else None
         )
         set_active_megamoe_profiling_scratch_factory(scratch_factory)
+        # READY generation comes only from the caller-owned replica plan.
+        # Helper-free launches (OFF and internal bucket priming) keep the
+        # M-shaped allocation but compile out the READY gate with S=0.
+        helper_ready_flags = None
+        helper_ready_generation = 0
+        compute_slots = self.compute_slot_count
+        plan_args = self._replica_plan_launch_args(replica_plan)
+        if plan_args is None:
+            _S_active = 0
+        else:
+            (
+                compute_slots,
+                _S_active,
+                helper_ready_flags,
+                helper_ready_generation,
+                _reserved_sms,
+            ) = plan_args
+        # Quantization, independent staging, output clears, and host setup
+        # are already enqueued. The router inside this op first reads routes.
+        self._wait_rebalance_routes(replica_plan)
+        # Eager launches call the op's implementation directly: the custom-op
+        # dispatch costs tens of microseconds of host time per layer.
+        megamoe_op = (
+            torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell
+            if torch.compiler.is_compiling()
+            else run_cute_dsl_megamoe_nvfp4_blackwell
+        )
+        set_active_megamoe_cute_weight_cache(self._cute_weight_cache)
+        # The provider owns its symmetric regions, so it owns their cute views.
+        provider = self._symm_providers.get(launch_max_T) if staged_inputs else None
+        set_active_megamoe_cute_buffer_cache(provider.cute_views if provider is not None else None)
         try:
-            torch.ops.trtllm.cute_dsl_megamoe_nvfp4_blackwell(
+            megamoe_op(
                 activation=_as_nvfp4(activation),
                 activation_sf=_as_fp8_sf(activation_sf),
                 topk_idx=topk_idx,
@@ -1575,7 +1759,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 world_size=world_size,
                 local_rank=local_rank,
                 num_topk=top_k,
-                num_experts_per_rank=int(self.expert_size_per_partition),
+                num_experts_per_rank=compute_slots,
                 hidden_size=hidden,
                 intermediate_size_per_partition=int(self.intermediate_size_per_partition),
                 expand_intermediate_size_per_partition=int(
@@ -1598,12 +1782,18 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 combine_format=self.combine_format,
                 tactic_autotune=bool(self.tactic_autotune),
                 num_tokens=num_tokens,
+                # Helper-free launches omit the READY gate.
+                helper_expert_count=_S_active,
+                hot_expert_weight_ready_flags=helper_ready_flags,
+                hot_expert_weight_ready_generation=int(helper_ready_generation),
             )
         finally:
             # Always clear: a raising op call must not leave the factory
             # global alive (its closure strongly references this module).
             set_active_megamoe_profiling_scratch(None)
             set_active_megamoe_profiling_scratch_factory(None)
+            set_active_megamoe_cute_weight_cache(None)
+            set_active_megamoe_cute_buffer_cache(None)
         if num_tokens == 0:
             return torch.empty((0, hidden), dtype=output_dtype, device=combine_output.device)
         # The kernel already collapsed the top-k axis into the (T, 1, hidden)
@@ -1634,7 +1824,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             self.ep_size,
             hidden,
             int(self.intermediate_size_per_partition),
-            int(self.expert_size_per_partition),
+            self.compute_slot_count,
             top_k,
             self.combine_format,
             self.act_clamp,
@@ -1646,8 +1836,35 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         )
         if key in _MEGAMOE_PRIMED_LADDERS:
             return
-        t0 = time.perf_counter()
         primed = []
+        self._prime_ladder_buckets(
+            live_T=live_T,
+            top_k=top_k,
+            hidden=hidden,
+            device=device,
+            output_dtype=output_dtype,
+            weight_view=weight_view,
+            primed=primed,
+        )
+        _MEGAMOE_PRIMED_LADDERS.add(key)
+        if self.ep_rank == 0:
+            logger.debug(
+                "[MegaMoECuteDsl] adaptive bucket priming complete: count=%s",
+                len(primed),
+            )
+
+    def _prime_ladder_buckets(
+        self,
+        *,
+        live_T,
+        top_k,
+        hidden,
+        device,
+        output_dtype,
+        weight_view,
+        primed,
+    ):
+        """Prime each max-token bucket."""
         for max_T in self._maxt_buckets:
             if max_T == live_T:
                 continue
@@ -1668,6 +1885,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 top_k=top_k,
                 stage_activation=False,
             )
+            # Bucket priming has no replica plan and therefore compiles the S=0 path.
             self._launch_megamoe_kernel(
                 activation=bufs.activation,
                 activation_sf=bufs.activation_sf,
@@ -1686,12 +1904,6 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 launch_max_T=max_T,
             )
             primed.append(max_T)
-        _MEGAMOE_PRIMED_LADDERS.add(key)
-        if self.ep_rank == 0:
-            logger.info(
-                f"[MegaMoECuteDsl] primed adaptive buckets {primed} (live bucket "
-                f"{live_T}) in {time.perf_counter() - t0:.1f}s"
-            )
 
     def _run_moe(
         self,
@@ -1706,6 +1918,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         hidden: int,
         device,
         output_dtype: torch.dtype,
+        replica_plan=None,
     ) -> torch.Tensor:
         """Unified MegaMoE CuteDSL forward: acquire -> stage -> launch.
 
@@ -1795,6 +2008,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
                 num_tokens=num_tokens,
                 top_k=top_k,
                 stage_activation=not use_direct_inputs,
+                replica_plan=replica_plan,
             )
         return self._launch_megamoe_kernel(
             activation=x if use_direct_inputs else bufs.activation,
@@ -1814,6 +2028,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
             num_tokens=num_tokens,
             output_dtype=output_dtype,
             launch_max_T=launch_max_T,
+            replica_plan=replica_plan,
+            # Direct routing inputs imply direct activation inputs.
+            staged_inputs=not use_direct_inputs,
         )
 
 

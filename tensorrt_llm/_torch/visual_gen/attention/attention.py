@@ -553,12 +553,20 @@ class Attention(nn.Module):
         """
         B, S, D = qkv.shape
         tokens_per_batch = S if num_txt_tokens > 0 else 0
-        assert self.tp_size == 1, "fused_dit_split_norm_rope does not support TP"
+        # Under tensor parallelism the packed projection holds this rank's heads. Per-head
+        # norm is local to a head; full-dim norm takes its variance over every head, across
+        # ranks, which the fused kernel does not reduce. The constructor refuses that
+        # combination for fuse_qk_norm_rope; this also covers a model calling here directly.
+        if self.tp_size > 1 and self.qk_norm_mode == "full":
+            raise NotImplementedError(
+                "fused QK norm + RoPE with qk_norm_mode='full' under TP>1: the fused kernel lacks "
+                "the cross-rank all-reduce for the cross-head RMSNorm variance"
+            )
         torch.ops.trtllm.fused_dit_qk_norm_rope(
             qkv.view(B * S, D),
-            self.num_attention_heads,
-            self.num_key_value_heads,
-            self.num_key_value_heads,
+            self.local_num_attention_heads,
+            self.local_num_key_value_heads,
+            self.local_num_key_value_heads,
             self.head_dim,
             self.eps,
             self.norm_q.weight,
@@ -659,6 +667,14 @@ class Attention(nn.Module):
         Two layout paths:
         1. HND backends (VANILLA): [B, S, H*D] -> [B, H, S, D]
         2. NHD backends (TRTLLM, UlyssesAttention, Attention2DAttention): [B, S, H*D] -> [B, S, H, D]
+
+        ``seq_len`` is derived from ``q.shape[1]`` and overrides any caller value. A
+        forward over a K/V cache takes ``kv``, a ``ForwardPlan`` from the cache: it
+        carries the real token count of this forward across all ranks, because the rows
+        may carry padding from the sequence-parallel exchange and the backend writes
+        this forward's K/V into the cache. Only the caller knows where the real tokens
+        end; a padding row written as history would be attended by every later forward
+        of the rollout.
         """
         backend_layout = getattr(self.attn, "preferred_layout", AttentionTensorLayout.NHD)
 
@@ -688,17 +704,16 @@ class Attention(nn.Module):
             k = k.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
             v = v.view(batch_size, -1, self.local_num_key_value_heads, self.head_dim)
 
-        kwargs.update(
-            {
-                "batch_size": batch_size,
-                "seq_len": seq_len,
-                "seq_len_kv": seq_len_kv,
-            }
-        )
+        kwargs.update({"batch_size": batch_size, "seq_len": seq_len, "seq_len_kv": seq_len_kv})
         for gate_key in ("gate_compress", "gate_fine"):
             if kwargs.get(gate_key) is not None:
                 kwargs[gate_key] = _reshape_gate(kwargs[gate_key])
 
+        if kwargs.get("kv") is not None and not self.attn.support_kv_cache():
+            raise NotImplementedError(
+                f"{type(self.attn).__name__} does not support a K/V cache "
+                "(support_kv_cache() is False for this backend/parallel configuration)."
+            )
         out = self.attn.forward(q=q, k=k, v=v, **kwargs)
 
         # Flatten back to [B, S, H*D]

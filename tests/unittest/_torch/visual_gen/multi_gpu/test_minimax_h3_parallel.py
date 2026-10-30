@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Real NCCL coverage of H3 Ulysses padding and distributed spatial VAE tiles."""
+"""Real NCCL coverage of H3 TP, Ulysses padding and distributed spatial VAE tiles."""
 
 from types import SimpleNamespace
 
@@ -24,12 +24,17 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.transformer_minimax_h3 imp
 )
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.args import AttentionConfig, ParallelConfig
 
 from ._worker_pool import run_distributed
 
 
-def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
+def _make_model_config(
+    backend: str = "VANILLA", async_ulysses: bool = False
+) -> DiffusionModelConfig:
+    parallel = (
+        ParallelConfig(ulysses_size=2, async_ulysses=True) if async_ulysses else ParallelConfig()
+    )
     return DiffusionModelConfig(
         pretrained_config=SimpleNamespace(
             num_attention_heads=2,
@@ -55,7 +60,21 @@ def _make_model_config(backend: str = "VANILLA") -> DiffusionModelConfig:
         mapping=Mapping(),
         attention=AttentionConfig(backend=backend),
         attention_metadata_state=create_attention_metadata_state(),
+        parallel=parallel,
     )
+
+
+def _split_fused_qkv(state: dict[str, torch.Tensor], keys) -> dict[str, torch.Tensor]:
+    """Translate a fused-QKV state dict to the separate to_q / to_k / to_v layout of async Ulysses."""
+    out = {}
+    for key in keys:
+        if key in state:
+            out[key] = state[key]
+            continue
+        prefix, name = key.rsplit(".", 2)[0], key.rsplit(".", 2)[1]
+        q, k, v = state[f"{prefix}.qkv_proj.weight"].chunk(3, dim=0)
+        out[key] = {"to_q": q, "to_k": k, "to_v": v}[name]
+    return out
 
 
 class _TileDecoder(torch.nn.Module):
@@ -78,10 +97,19 @@ def _make_vae() -> TiledAutoencoderKLMiniMaxH3:
     return vae
 
 
-def _logic_h3_ulysses_and_parallel_vae(rank: int, world_size: int, backend: str) -> None:
+def _logic_h3_ulysses_and_parallel_vae(
+    rank: int,
+    world_size: int,
+    backend: str,
+    async_ulysses: bool = False,
+    tp_size: int = 1,
+    ulysses_size: int = 2,
+) -> None:
+    assert world_size == tp_size * ulysses_size
     device = torch.device("cuda", rank)
     torch.manual_seed(42)
     config = _make_model_config(backend)
+    config.pretrained_config.num_attention_heads = 4
     reference = MiniMaxH3Transformer3DModel(config).to(device).eval()
     with torch.no_grad():
         for name, parameter in reference.named_parameters():
@@ -89,12 +117,42 @@ def _logic_h3_ulysses_and_parallel_vae(rank: int, world_size: int, backend: str)
                 parameter.fill_(1)
             else:
                 parameter.normal_(0, 0.02)
-    config = _make_model_config(backend)
-    vgm = VisualGenMapping(world_size=2, rank=rank, ulysses_size=2, parallel_vae_size=2)
+    config = _make_model_config(backend, async_ulysses)
+    config.pretrained_config.num_attention_heads = 4
+    vgm = VisualGenMapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        parallel_vae_size=2,
+    )
     config.visual_gen_mapping = vgm
     config.mapping = vgm.to_llm_mapping()
     candidate = MiniMaxH3Transformer3DModel(config).to(device).eval()
-    candidate.load_state_dict(reference.state_dict())
+    if async_ulysses:
+        candidate.load_state_dict(_split_fused_qkv(reference.state_dict(), candidate.state_dict()))
+    else:
+        checkpoint = {}
+        for name, parameter in reference.state_dict().items():
+            if ".qkv_proj." in name:
+                prefix, suffix = name.split("qkv_proj.", maxsplit=1)
+                for projection, value in zip(("to_q", "to_k", "to_v"), parameter.chunk(3, dim=0)):
+                    checkpoint[f"{prefix}{projection}.{suffix}"] = value
+            elif ".gate_up_proj." in name:
+                prefix, suffix = name.split("gate_up_proj.", maxsplit=1)
+                gate, up = parameter.chunk(2, dim=0)
+                checkpoint[f"{prefix}net.0.proj.{suffix}"] = torch.cat((up, gate), dim=0)
+            else:
+                checkpoint[name.replace(".ff.down_proj.", ".ff.net.2.")] = parameter
+        candidate.load_weights(checkpoint)
+    assert candidate.transformer_blocks[0].attn.local_num_attention_heads == 4 // tp_size
+    assert candidate.transformer_blocks[0].adaln_proj.linear.weight.shape == (
+        reference.transformer_blocks[0].adaln_proj.linear.weight.shape
+    )
+    if tp_size > 1:
+        assert sum(p.numel() for p in candidate.parameters()) < sum(
+            p.numel() for p in reference.parameters()
+        )
     # Five packed rows and one text row both require padding for two ranks.
     inputs = {
         "hidden_states": torch.randn(1, 3, 2, device=device),
@@ -131,13 +189,20 @@ def _logic_h3_ulysses_and_parallel_vae(rank: int, world_size: int, backend: str)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two CUDA GPUs")
+@pytest.mark.parametrize("async_ulysses", [False, True], ids=["nccl", "async"])
 @pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
-def test_h3_ulysses_and_parallel_vae(backend: str) -> None:
+def test_h3_ulysses_and_parallel_vae(backend: str, async_ulysses: bool) -> None:
     if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("FA4 requires SM100 or newer")
     if torch.cuda.device_count() < 2:
         pytest.skip(f"Test requires 2 GPUs, only {torch.cuda.device_count()} available")
-    run_distributed(2, _logic_h3_ulysses_and_parallel_vae, backend, preload=("tensorrt_llm",))
+    run_distributed(
+        2,
+        _logic_h3_ulysses_and_parallel_vae,
+        backend,
+        async_ulysses,
+        preload=("tensorrt_llm",),
+    )
 
 
 def _logic_h3_partial_vae_groups(rank: int, world_size: int) -> None:
@@ -193,3 +258,21 @@ def test_h3_partial_vae_groups() -> None:
     if torch.cuda.device_count() < 4:
         pytest.skip(f"Test requires 4 GPUs, only {torch.cuda.device_count()} available")
     run_distributed(4, _logic_h3_partial_vae_groups, preload=("tensorrt_llm",))
+
+
+@pytest.mark.parametrize("tp_size,ulysses_size", [(2, 1), (4, 1), (2, 2)])
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+def test_h3_tensor_parallel(tp_size: int, ulysses_size: int, backend: str) -> None:
+    world_size = tp_size * ulysses_size
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"Requires {world_size} CUDA GPUs")
+    if backend == "FA4" and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FA4 requires SM100 or newer")
+    run_distributed(
+        world_size,
+        _logic_h3_ulysses_and_parallel_vae,
+        backend,
+        tp_size=tp_size,
+        ulysses_size=ulysses_size,
+        preload=("tensorrt_llm",),
+    )

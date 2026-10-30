@@ -723,34 +723,6 @@ private:
     std::unique_ptr<Impl> mImpl;
 };
 
-/// @brief Struct that holds the logits information when using direct transfer
-struct SpeculativeDecodingFastLogitsInfo
-{
-    /// @brief Draft request id
-    uint64_t draftRequestId;
-
-    /// @brief MPI world rank of the draft model leader
-    int32_t draftParticipantId;
-};
-
-struct AdditionalOutput
-{
-    AdditionalOutput(std::string name, Tensor output)
-        : name(std::move(name))
-        , output(std::move(output))
-    {
-    }
-
-    AdditionalOutput(AdditionalOutput const& other) = default;
-    AdditionalOutput(AdditionalOutput&& other) noexcept = default;
-    AdditionalOutput& operator=(AdditionalOutput const& other) = default;
-    AdditionalOutput& operator=(AdditionalOutput&& other) noexcept = default;
-    ~AdditionalOutput() = default;
-
-    std::string name;
-    Tensor output;
-};
-
 /// @brief Struct that holds the generation result
 struct Result
 {
@@ -766,22 +738,8 @@ struct Result
     /// @brief The log probabilities for each generated token. Size [beamSize, outputLen]
     std::optional<std::vector<VecLogProbs>> logProbs;
 
-    /// @brief The context logits. Size [promptLen, vocabSizePadded]
-    std::optional<Tensor> contextLogits;
-
-    /// @brief The generation logits. Size [beamSize, maxTokens, vocabSizePadded] (non-streaming)
-    /// or [maxTokens, beamSize, vocabSizePadded] (streaming and allGeneratedTokens)
-    /// or [1, beamSize, vocabSizePadded] (streaming and non-allGeneratedTokens)
-    std::optional<Tensor> generationLogits;
-
-    /// @brief Logits information for direct transfer when using fast logits
-    std::optional<SpeculativeDecodingFastLogitsInfo> specDecFastLogitsInfo;
-
-    /// @brief The encoder output. Size [encoderLen, hiddenSize]
-    std::optional<Tensor> encoderOutput;
-
     /// @brief The reason why the model stopped generating tokens for each beam in this request. Size [beamSize].
-    /// Currently only supported when beamSize is 1 and when using BatchingType::kINFLIGHT.
+    /// Currently only supported when beamSize is 1 and when using in-flight batching.
     std::vector<FinishReason> finishReasons;
 
     /// @brief The params of the context phase.
@@ -808,9 +766,6 @@ struct Result
 
     /// @brief Performance metrics if returnPerfMetrics is set in OutputConfig
     std::optional<RequestPerfMetrics> requestPerfMetrics;
-
-    /// @brief The additional outputs
-    std::vector<AdditionalOutput> additionalOutputs;
 };
 
 /// @brief Class that holds either an error or a result
@@ -1035,46 +990,6 @@ private:
     /// If both mMaxGpuTotalBytes and mFreeGpuMemoryFraction are specified, memory corresponding to the minimum will
     /// be allocated.
     uint64_t mMaxGpuTotalBytes;
-};
-
-/// @brief Configuration class for the runtime perf knobs
-class ExtendedRuntimePerfKnobConfig
-{
-public:
-    explicit ExtendedRuntimePerfKnobConfig(bool multiBlockMode = true, bool enableContextFMHAFP32Acc = false,
-        bool cudaGraphMode = false, SizeType32 cudaGraphCacheSize = 0);
-
-    bool operator==(ExtendedRuntimePerfKnobConfig const& other) const
-    {
-        return mMultiBlockMode == other.mMultiBlockMode && mEnableContextFMHAFP32Acc == other.mEnableContextFMHAFP32Acc
-            && mCudaGraphMode == other.mCudaGraphMode && mCudaGraphCacheSize == other.mCudaGraphCacheSize;
-    }
-
-    [[nodiscard]] bool getMultiBlockMode() const;
-    [[nodiscard]] bool getEnableContextFMHAFP32Acc() const;
-    [[nodiscard]] bool getCudaGraphMode() const;
-    [[nodiscard]] SizeType32 getCudaGraphCacheSize() const;
-
-    void setMultiBlockMode(bool multiBlockMode);
-    void setEnableContextFMHAFP32Acc(bool enableContextFMHAFP32Acc);
-    void setCudaGraphMode(bool cudaGraphMode);
-    void setCudaGraphCacheSize(SizeType32 cacheSize);
-
-private:
-    friend class Serialization;
-
-    /// @brief Control if multi block mode should be enabled or not.
-    bool mMultiBlockMode;
-
-    /// @brief If enable FMHA runner FP32 accumulation.
-    bool mEnableContextFMHAFP32Acc;
-
-    /// @brief Control if enable cuda graph.
-    bool mCudaGraphMode;
-
-    /// @brief Number of cuda graphs to be cached in the runtime.
-    /// The larger the cache, the better the perf, but more GPU memory is consumed.
-    SizeType32 mCudaGraphCacheSize;
 };
 
 /// @brief config for PeftCacheManager

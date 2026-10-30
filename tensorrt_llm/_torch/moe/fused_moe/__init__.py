@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
                          ActivationParamShape, MoEActivation,
                          MoEActivationSupport, SimpleActivation, SiTuActivation,
@@ -5,10 +20,16 @@ from .activation import (ACTIVATION_PAYLOAD, DEFAULT_MOE_ACTIVATION,
 from .configurable_moe import ConfigurableMoE
 from .create_moe import (MoEImplClass, create_moe, resolve_moe_cls,
                          resolve_moe_impl)
+from .cutedsl import (TrtllmCutedslFusedFc12Nvfp4Impl,
+                      TrtllmCutedslGroupedGemmBf16Impl,
+                      TrtllmCutedslGroupedGemmNvfp4Impl,
+                      cutedsl_grouped_gemm_leaf, find_cutedsl_grouped_gemm_leaf)
+from .cutlass import cutlass_leaf, find_cutlass_leaf
 from .fused_moe_cute_dsl import CuteDslFusedMoE
-from .fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
-from .fused_moe_cute_dsl_fc12 import (CuteDslFc12FusedMoE,
-                                      TrtllmCutedslFusedFc12Nvfp4Impl)
+from .fused_moe_cute_dsl_b12x import (CuteDslB12xFusedMoE,
+                                      CuteDslB12xNvfp4FusedMoE,
+                                      CuteDslB12xW4a16Nvfp4FusedMoE)
+from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
 from .fused_moe_triton import TritonFusedMoE
@@ -48,10 +69,18 @@ __all__ = [
     "SwigluActivation",
     "SwigluBiasActivation",
     "CuteDslB12xFusedMoE",
+    "CuteDslB12xNvfp4FusedMoE",
+    "CuteDslB12xW4a16Nvfp4FusedMoE",
     "CuteDslFc12FusedMoE",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
+    "TrtllmCutedslGroupedGemmNvfp4Impl",
+    "TrtllmCutedslGroupedGemmBf16Impl",
+    "cutedsl_grouped_gemm_leaf",
+    "find_cutedsl_grouped_gemm_leaf",
     "CutlassFusedMoE",
+    "cutlass_leaf",
+    "find_cutlass_leaf",
     "DeepSeekV3MoeRoutingMethod",
     "DefaultMoeRoutingMethod",
     "FusedMoEQuantScalesFP8",

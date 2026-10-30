@@ -159,10 +159,10 @@ four-B200, CTX2/GEN2, C++ NIXL profile described below.
 
 | Revision / run | Suite and stage | Observed result | Native evidence |
 | --- | --- | --- | --- |
-| `2886217a8aec42236dffb2d4bd195a1a2d27ba59` / [#62874](https://nv/trt-llm-cicd/job/main/job/L0_MergeRequest_PR/62874/) | Acceptance, `CPU-Generic-x86-1-cbts` and `CPU-Generic-arm-1-cbts` | 4 passed + 2 strict XFAILs on each architecture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
+| `2886217a8aec42236dffb2d4bd195a1a2d27ba59` / #62874 | Acceptance, `CPU-Generic-x86-1-cbts` and `CPU-Generic-arm-1-cbts` | 4 passed + 2 strict XFAILs on each architecture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
 | Same revision / #62874 | Startup and exit-observer helpers, same CPU stages | 20 passed + 1 setup error on each architecture: startup `capsys` conflicted with the autouse `capfd` fixture | [x86 log][cpu-x86-evidence], [ARM log][cpu-arm-evidence] |
 | Same revision / #62874 | GPU qualification | Not executed: the CPU failure blocked multi-GPU dispatch; no GPU pass is claimed | [Dispatch log][gpu-dispatch-evidence] |
-| `a16bc402a7302d02edb9ec9eb84985b5cd123a14` / [#62774](https://nv/trt-llm-cicd/job/main/job/L0_MergeRequest_PR/62774/) | GPU qualification, `DGX_B200-4_GPUs-PyTorch-1-cbts` | 6 passed; `timeout_late_aux` failed during four-rank startup, before transfer assertions | [B200 log][gpu-evidence] |
+| `a16bc402a7302d02edb9ec9eb84985b5cd123a14` / #62774 | GPU qualification, `DGX_B200-4_GPUs-PyTorch-1-cbts` | 6 passed; `timeout_late_aux` failed during four-rank startup, before transfer assertions | [B200 log][gpu-evidence] |
 
 The CPU setup conflict is corrected by using `capfd`; later startup changes need
 fresh native execution. The [PR verification section](https://github.com/NVIDIA/TensorRT-LLM/pull/19663)
@@ -182,8 +182,10 @@ worlds. Each world has an active attention-DP rank and an idle peer. The tests
 use generic `KVCacheManagerV2` NVFP4/`SELFKONLY` allocations with explicit key and
 block-scale coverage and real KV/AUX transfers, without loading a model or
 introducing production fault-injection hooks. This deliberately excludes the
-unfinished dense FP4 MLA manager/serving integration: its high-precision tail,
-V-scale/packed-V roles, and replicated-role mapping are not qualified here.
+dense FP4 MLA manager's high-precision tail, local-only V-scale/packed-V roles,
+and replicated-role mapping, which are not qualified here under the bridge;
+[test_fp4_mla_kv_transfer.py](test_fp4_mla_kv_transfer.py) covers their transfer
+without it.
 A minimally initialized
 `PyExecutor` exercises its real cancellation gate and termination methods through
 the production coordinator and resource manager; no scheduler/serving loop or
@@ -209,7 +211,7 @@ or reused identities mean the original process no longer executes; a live or
 unobservable rank fails. This process observation is not GPU/RDMA fencing proof.
 The [exit-observer tests](test_transfer_lifecycle_process_exit.py) exercise all
 nine scenarios on each rank. The [startup tests](test_transfer_lifecycle_startup.py)
-check that both workers and the supervisor share one 120-second startup deadline,
+check that both workers and the supervisor share one 600-second startup deadline,
 reject readiness observed at or after expiry, and leave relative transfer waits
 unchanged; startup failures print bounded worker logs and missing readiness
 markers before cleanup.

@@ -10,8 +10,8 @@ import transformers
 
 from .._utils import global_mpi_rank, local_mpi_rank, mpi_rank
 # yapf: disable
-from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
-                                 ContextChunkingPolicy, KvCacheRetentionConfig)
+from ..bindings.executor import (CapacitySchedulerPolicy, ContextChunkingPolicy,
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..logger import logger
 from ..models.modeling_utils import QuantAlgo, QuantConfig
@@ -139,6 +139,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "fp8_ds_mla": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
+            "mixed_nvfp4_fp8": QuantAlgo.FP8,
         }.get(kv_cache_dtype)
         requires_global_quant_config_fallback = False
 
@@ -464,7 +465,6 @@ __all__ = [
     'ModelLoader',
     '_ParallelConfig',
     '_ModelWrapper',
-    'BatchingType',
     'SchedulerConfig',
     'KvCacheRetentionConfig',
     'MTPDecodingConfig',
@@ -632,6 +632,12 @@ def _resolve_kv_cache_manager_v2_auto(llm_args: 'TorchLlmArgs',
             swa_endpoint_rewind_tokens > 0):
         raise ValueError(
             "block_reuse_config.swa_endpoint_rewind_tokens requires KV cache "
+            "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
+            "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
+    if (not use_v2 and
+            llm_args.kv_cache_config.block_reuse_config.enable_branch_snapshot):
+        raise ValueError(
+            "block_reuse_config.enable_branch_snapshot requires KV cache "
             "manager v2, but use_kv_cache_manager_v2='auto' resolved to V1. "
             "Set kv_cache_config.use_kv_cache_manager_v2=True explicitly.")
     llm_args.kv_cache_config.use_kv_cache_manager_v2 = use_v2

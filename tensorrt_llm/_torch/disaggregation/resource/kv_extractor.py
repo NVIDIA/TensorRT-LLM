@@ -26,8 +26,6 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.resource.page import (
     BUFFER_ENTRY_DTYPE,
-    MAMBA_CONV_ROLE,
-    MAMBA_SSM_ROLE,
     AttentionLayerGroup,
     CacheKind,
     KVCachePageTable,
@@ -45,14 +43,9 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_physical_pool,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    MambaHybridCacheManagerV2,
-)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
-from tensorrt_llm.bindings import DataType
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
@@ -79,7 +72,7 @@ _MAPPER_KINDS_BY_CACHE_KIND = {
 class KVRegionExtractorV1(RegionExtractorBase):
     """
     Descriptor and region extractor for KV cache pool managed by
-    KVCacheManager, KVCacheManagerV2, or described by a KVCachePageTable.
+    KVCacheManagerV2, or described by a KVCachePageTable.
 
     Provides region descriptors for adapting block-wise view.
     """
@@ -88,7 +81,6 @@ class KVRegionExtractorV1(RegionExtractorBase):
         if isinstance(kv_arg, KVCachePageTable):
             self._page_table = kv_arg
         else:
-            # Assume it is a manager (KVCacheManager / KVCacheManagerV2)
             self._page_table = build_page_table_from_manager(kv_arg)
         self._data_layout = DataLayout.HND
         # extract_slot runs per request per view, but the page table is fixed
@@ -178,283 +170,6 @@ class KVRegionExtractorV1(RegionExtractorBase):
 # ---------------------------------------------------------------------------
 
 
-def _build_mamba_pool_views(
-    conv_pool,
-    ssm_pool,
-    local_layers,
-    *,
-    conv_section_bytes: List[int],
-    ssm_bytes_per_head: int,
-):
-    """Build pool_views for mamba: conv at pool_idx=0, ssm at pool_idx=1.
-
-    Conv uses mapper_kind=SECTIONED with ``section_bytes`` (each section is
-    TP-sharded independently), SSM uses mapper_kind=INDEXED with
-    ``bytes_per_head`` (head-level granularity). MambaPolicy.build_mapper
-    dispatches ConvStateMismatchMapper vs MambaHeadMismatchMapper accordingly.
-    """
-    sorted_lids = [
-        ll.local_layer_id for ll in sorted(local_layers, key=lambda ll: ll.local_layer_id)
-    ]
-    conv_layer_stride = int(conv_pool.layer_stride_bytes)
-    ssm_layer_stride = int(ssm_pool.layer_stride_bytes)
-    return [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [
-                    (lid, offset * conv_layer_stride, conv_pool.slot_bytes)
-                    for offset, lid in enumerate(sorted_lids)
-                ],
-                dtype=BUFFER_ENTRY_DTYPE,
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_pool.slot_bytes,
-            section_bytes=[int(x) for x in conv_section_bytes],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [
-                    (lid, offset * ssm_layer_stride, ssm_pool.slot_bytes)
-                    for offset, lid in enumerate(sorted_lids)
-                ],
-                dtype=BUFFER_ENTRY_DTYPE,
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_pool.slot_bytes,
-            bytes_per_head=int(ssm_bytes_per_head),
-        ),
-    ]
-
-
-def _build_layer_group_for_mamba(
-    manager: MambaHybridCacheManager, pool_group_idx: int
-) -> "tuple[MambaLayerGroup, PhysicalPoolGroup]":
-    local_layers = [
-        LocalLayer(local_layer_id=int(lid), global_layer_id=int(gid))
-        for gid, lid in sorted(manager._impl.mamba_layer_offsets.items(), key=lambda x: x[1])
-    ]
-
-    conv_state = manager._impl.mamba_cache.conv
-    ssm_state = manager._impl.mamba_cache.temporal
-
-    conv_pool = PhysicalPool(
-        base_address=conv_state.data_ptr(),
-        slot_bytes=conv_state.stride(1) * conv_state.element_size(),
-        num_slots=conv_state.shape[1],
-        layer_stride_bytes=conv_state.stride(0) * conv_state.element_size(),
-    )
-
-    ssm_pool = PhysicalPool(
-        base_address=ssm_state.data_ptr(),
-        slot_bytes=ssm_state.stride(1) * ssm_state.element_size(),
-        num_slots=ssm_state.shape[1],
-        layer_stride_bytes=ssm_state.stride(0) * ssm_state.element_size(),
-    )
-
-    # Per-section bytes for conv_state and per-head bytes for ssm_state.
-    # The section ordering is supplied by the cache manager because Mamba2
-    # uses [x | B | C], while GDN uses [Q | K | V].
-    # ssm_state layout: (nheads/tp, head_dim, d_state)
-    d_conv_m1 = conv_state.shape[3]
-    conv_elem_size = conv_state.element_size()
-    conv_section_dims = manager._impl.conv_section_dims
-    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in conv_section_dims]
-
-    head_dim = ssm_state.shape[3]
-    d_state = ssm_state.shape[4]
-    ssm_elem_size = ssm_state.element_size()
-    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
-
-    pool_group = PhysicalPoolGroup(pools=[conv_pool, ssm_pool])
-    layer_group = MambaLayerGroup(
-        pool_group_idx=pool_group_idx,
-        local_layers=local_layers,
-        pool_views=_build_mamba_pool_views(
-            conv_pool,
-            ssm_pool,
-            local_layers,
-            conv_section_bytes=conv_section_bytes,
-            ssm_bytes_per_head=ssm_bytes_per_head,
-        ),
-    )
-    return layer_group, pool_group
-
-
-def _build_non_kv_layers(
-    manager,
-    layer_groups: List[LayerGroup],
-    pool_groups: List[PhysicalPoolGroup],
-) -> None:
-    """Append non-KV (recurrent/state) layer groups for a V1 manager.
-
-    V1 managers have no pool descriptors, so the recurrent layer group is
-    described from the state tensors. V2 managers describe every life cycle,
-    recurrent ones included, from ``pool_group_descs`` in
-    ``_build_page_table_v2``.
-    """
-    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
-        manager, MambaHybridCacheManagerV2
-    ):
-        pool_group_idx = len(pool_groups)
-        layer_group, pool_group = _build_layer_group_for_mamba(manager, pool_group_idx)
-        layer_groups.append(layer_group)
-        pool_groups.append(pool_group)
-
-
-def build_page_table(kv_cache_manager: KVCacheManager) -> KVCachePageTable:
-    """Build a KVCachePageTable from a KVCacheManager (V1)."""
-    if kv_cache_manager.dtype == DataType.NVFP4:
-        raise NotImplementedError("NVFP4 quantization not supported")
-
-    tokens_per_block = kv_cache_manager.tokens_per_block
-
-    # Group local layers by their window size (layer group)
-    window_size_to_local_layer_ids = kv_cache_manager._get_window_size_to_layers()
-    layer_offsets = kv_cache_manager.layer_offsets
-    local_to_global = {local_id: global_id for global_id, local_id in layer_offsets.items()}
-
-    if len(window_size_to_local_layer_ids) < 1:
-        raise ValueError("KVRegionExtractorV1: window_size_to_local_layer_ids is empty")
-
-    sorted_window_sizes = sorted(
-        window_size_to_local_layer_ids.keys(), key=lambda x: (x is None, x)
-    )
-
-    pool_groups: List[PhysicalPoolGroup] = []
-    layer_groups: List[LayerGroup] = []
-
-    for group_id, window_size in enumerate(sorted_window_sizes):
-        local_layer_ids = window_size_to_local_layer_ids[window_size]
-        first_local_layer = local_layer_ids[0]
-
-        # Get pool base address via pool_mapping -> pool_pointers
-        pool_id = int(kv_cache_manager.kv_cache_pool_mapping[first_local_layer][0].item())
-        base_addr = int(kv_cache_manager.kv_cache_pool_pointers[pool_id][0].item())
-
-        # Get num_blocks from per-layer pool view: shape = (numBlocks, kvFactor, blockSize)
-        pool_layer_view = kv_cache_manager.impl.get_primary_pool_data(first_local_layer)
-        num_blocks = pool_layer_view.shape[0]
-
-        num_kv_heads = kv_cache_manager.num_kv_heads_per_layer[first_local_layer]
-        kv_factor = kv_cache_manager.kv_factor
-        is_key_only = kv_factor == 1
-
-        elements_per_buffer = tokens_per_block * num_kv_heads * kv_cache_manager.head_dim
-        buffer_size = get_size_in_bytes(elements_per_buffer, kv_cache_manager.dtype)
-        stride = buffer_size * kv_factor
-        slot_bytes = stride * len(local_layer_ids)
-
-        entries = []
-        kv_role_names: set[str] = {"key"}
-        if not is_key_only:
-            kv_role_names.add("value")
-        for i, lid in enumerate(local_layer_ids):
-            base_offset = i * stride
-            entries.append((lid, base_offset, buffer_size))
-            if not is_key_only:
-                entries.append((lid, base_offset + buffer_size, buffer_size))
-
-        kv_physical = PhysicalPool(
-            base_address=base_addr, slot_bytes=slot_bytes, num_slots=num_blocks
-        )
-        kv_view = PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=frozenset(kv_role_names),
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=stride,
-        )
-        physical_pools = [kv_physical]
-        pool_views = [kv_view]
-
-        # Indexer K cache support. The DSA indexer K cache is identical on
-        # every TP rank (single index head), so its view is REPLICATED. With a
-        # per-layer indexer mask (cross-layer indexer sharing, e.g. GLM 5.2)
-        # only the "full" indexer-owning layers get a pool row, so the view
-        # covers that subset: one buffer entry per owning layer, each mapped to
-        # its packed row in the (possibly masked) pool. When the mask is absent
-        # every layer owns a row (dense/legacy layout) and this reduces to the
-        # equal-sized packing in local-layer order.
-        if kv_cache_manager.enable_indexer_k_cache:
-            local_indexer_mask = kv_cache_manager.indexer_k_cache_local_layer_mask
-            owning_layer_ids = [
-                lid
-                for lid in local_layer_ids
-                if local_indexer_mask is None or local_indexer_mask[lid]
-            ]
-            # A layer group whose layers are all masked out owns no indexer pool
-            # row on this rank (the pool getter would raise); skip it so the peer
-            # simply transfers nothing for this rank's indexer.
-            if owning_layer_ids:
-                indexer_pool = kv_cache_manager.impl.get_indexer_k_cache_pool()
-                if indexer_pool.shape[1] != len(owning_layer_ids):
-                    raise RuntimeError(
-                        "The DSA indexer K-cache pool row count does not match "
-                        "the number of indexer-owning layers in its layer group: "
-                        f"{indexer_pool.shape[1]} rows for {len(owning_layer_ids)} layers"
-                    )
-                # indexer_pool shape: (numBlocks, numIndexerLayers, kvFactor,
-                # blockSize), dtype=UINT8. numIndexerLayers is the number of
-                # owning layers on this rank (== the attention layer count when
-                # unmasked). slot_bytes packs every owning-layer row.
-                per_block_elems = 1
-                for d in indexer_pool.shape[1:]:  # skip numBlocks dim
-                    per_block_elems *= d
-                indexer_slot_bytes = per_block_elems * indexer_pool.element_size()
-                indexer_bytes_per_layer = indexer_slot_bytes // indexer_pool.shape[1]
-                indexer_physical = PhysicalPool(
-                    base_address=int(indexer_pool.data_ptr()),
-                    slot_bytes=indexer_slot_bytes,
-                    num_slots=num_blocks,
-                )
-                indexer_view = PoolView(
-                    pool_idx=len(physical_pools),
-                    buffer_entries=np.array(
-                        [
-                            (
-                                lid,
-                                kv_cache_manager.impl.get_indexer_k_cache_pool_layer_idx(lid)
-                                * indexer_bytes_per_layer,
-                                indexer_bytes_per_layer,
-                            )
-                            for lid in owning_layer_ids
-                        ],
-                        dtype=BUFFER_ENTRY_DTYPE,
-                    ),
-                    pool_role=frozenset({"indexer_k"}),
-                    mapper_kind=MapperKind.REPLICATED,
-                    bytes_per_layer=indexer_bytes_per_layer,
-                )
-                physical_pools.append(indexer_physical)
-                pool_views.append(indexer_view)
-
-        pool_groups.append(PhysicalPoolGroup(pools=physical_pools))
-        local_layers = [
-            LocalLayer(local_layer_id=int(lid), global_layer_id=int(local_to_global[lid]))
-            for lid in local_layer_ids
-        ]
-        layer_groups.append(
-            AttentionLayerGroup(
-                pool_group_idx=group_id,
-                kv_head_num_per_rank=num_kv_heads,
-                sliding_window_size=window_size,
-                local_layers=local_layers,
-                pool_views=pool_views,
-            )
-        )
-    _build_non_kv_layers(kv_cache_manager, layer_groups, pool_groups)
-
-    return KVCachePageTable(
-        tokens_per_block=tokens_per_block,
-        layer_groups=layer_groups,
-        pool_groups=pool_groups,
-    )
-
-
 def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     """Compute collision-free layer IDs for a pool group for disaggregated transfer.
 
@@ -464,6 +179,8 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     - Consistent: the same internal layer produces the same ID regardless of
       PP configuration, so that peer matching in peer.py works correctly.
 
+    For managers that declare ``get_disagg_global_layer_ids``: returns the
+    manager's declaration, which must satisfy the same two guarantees.
     For standard V2 managers: maps local IDs to global model layer IDs via
     pp_layers (which happen to also be collision-free).
     For managers with virtual layers: encodes
@@ -471,6 +188,16 @@ def _compute_global_layer_ids(manager, lg_idx: int) -> List[int]:
     _layer_attn_to_layer_id inverse mapping.
     """
     local_layer_ids = manager.impl.layer_grouping[lg_idx]
+
+    get_global_layer_ids = getattr(manager, "get_disagg_global_layer_ids", None)
+    if get_global_layer_ids is not None:
+        global_layer_ids = [int(layer_id) for layer_id in get_global_layer_ids(lg_idx)]
+        if len(global_layer_ids) != len(local_layer_ids):
+            raise ValueError(
+                f"Layer group {lg_idx}: {len(global_layer_ids)} declared global layer ids "
+                f"for {len(local_layer_ids)} layers"
+            )
+        return global_layer_ids
 
     if not hasattr(manager, "_layer_attn_to_layer_id"):
         # Standard: local_layer_id is index into pp_layers
@@ -583,6 +310,15 @@ def _build_pool_views_for_variant(
                 f"{context} bytes_per_layer={bytes_per_layer} is not a multiple of "
                 f"bytes_per_head={layout.bytes_per_head}"
             )
+        if layout.ring_slot_bytes is not None and (
+            mapper_kind != MapperKind.REPLICATED
+            or layout.ring_slot_bytes <= 0
+            or bytes_per_layer % layout.ring_slot_bytes != 0
+        ):
+            raise ValueError(
+                f"{context} ring_slot_bytes={layout.ring_slot_bytes} needs a REPLICATED view "
+                f"whose bytes_per_layer={bytes_per_layer} is a positive multiple of it"
+            )
         pool_views.append(
             PoolView(
                 pool_idx=pool_idx,
@@ -594,6 +330,7 @@ def _build_pool_views_for_variant(
                     list(layout.section_bytes) if layout.section_bytes is not None else None
                 ),
                 bytes_per_head=layout.bytes_per_head,
+                ring_slot_bytes=layout.ring_slot_bytes,
             )
         )
 
@@ -746,7 +483,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                     pool_group_idx=storage_pg_to_list_idx[storage_pg_idx],
                     local_layers=local_layers,
                     pool_views=pool_views,
-                    slot_major_layout=True,
                 )
                 continue
 
@@ -783,16 +519,8 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     )
 
 
-def _is_kv_cache_manager_v2(obj) -> bool:
-    return hasattr(obj, "impl") and hasattr(obj.impl, "layer_grouping")
-
-
-def build_page_table_from_manager(manager) -> KVCachePageTable:
-    """Unified entry point: build a KVCachePageTable from any manager type.
-
-    Supports KVCacheManager (V1) and KVCacheManagerV2.
-    """
-    if _is_kv_cache_manager_v2(manager):
-        return _build_page_table_v2(manager)
-    else:
-        return build_page_table(manager)
+def build_page_table_from_manager(manager: KVCacheManagerV2) -> KVCachePageTable:
+    """Build a KVCachePageTable from a V2 cache manager."""
+    if not isinstance(manager, KVCacheManagerV2):
+        raise ValueError("Python KV cache transfer requires KVCacheManagerV2; V1 is unsupported.")
+    return _build_page_table_v2(manager)

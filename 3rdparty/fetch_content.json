@@ -46,7 +46,10 @@
       "git_tag": "b64107f2b9599ca76445b7f62eedf66bae1d095b",
       "git_submodules_recurse": true,
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/deepgemm_configurable_barrier_timeout.patch"
+      "patch_file": [
+        "patches/deepgemm_configurable_barrier_timeout.patch",
+        "patches/deepgemm_sm10x_family_target.patch"
+      ]
     },
     {
       "name": "eigen",
@@ -115,15 +118,15 @@
       "name": "ucxx",
       "git_repository": "https://github.com/rapidsai/ucxx",
       "git_tag": "16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5",
-      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory",
+      "_comment": "When changing git_tag, check the GITHUB_MIRROR handling for UCXX in cpp/CMakeLists.txt, e.g. whether the hardcoded CPM version and MD5 need updating."
     },
     {
       "name": "xgrammar",
       "git_repository": "https://github.com/mlc-ai/xgrammar",
-      "git_tag": "v0.1.32",
+      "git_tag": "v0.2.8",
       "git_shallow": true,
-      "source_subdir": "dont-add-this-project-with-add-subdirectory",
-      "patch_file": "patches/xgrammar_cxx20.patch"
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
     }
   ]
 }

@@ -41,8 +41,11 @@ MODEL_ARCH_TO_MODULE = {
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",
     "Cohere2ForCausalLM": "modeling_cohere2",
+    "Cosmos3EdgeForCausalLM": "modeling_cosmos3_edge",
+    "Cosmos3EdgeForConditionalGeneration": "modeling_cosmos3_edge",
     "Cosmos3ForConditionalGeneration": "modeling_cosmos3",
     "DeciLMForCausalLM": "modeling_nemotron_nas",
+    "DSparkMiniMaxDraftModel": "modeling_dspark",
     "DeepseekV32ForCausalLM": "modeling_deepseekv3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
     "DeepseekV41ForCausalLM": "modeling_deepseekv41",
@@ -88,6 +91,7 @@ MODEL_ARCH_TO_MODULE = {
     "MistralLarge3ForCausalLM": "modeling_mistral_large3",
     "MixtralForCausalLM": "modeling_mixtral",
     "MllamaForConditionalGeneration": "modeling_mllama",
+    "MuseSparkForConditionalGeneration": "modeling_musespark_open_omni",
     "NemotronForCausalLM": "modeling_nemotron",
     "NemotronHForCausalLM": "modeling_nemotron_h",
     "NemotronHPuzzleForCausalLM": "modeling_nemotron_h",
@@ -132,6 +136,7 @@ MODEL_CLASS_TO_MODULE = {
     "BertForSequenceClassification": "modeling_bert",
     "CLIPVisionModel": "modeling_clip",
     "Cohere2ForCausalLM": "modeling_cohere2",
+    "Cosmos3EdgeModel": "modeling_cosmos3_edge",
     "Cosmos3Model": "modeling_cosmos3",
     "DeepseekV3ForCausalLM": "modeling_deepseekv3",
     "DeepseekV41ForCausalLM": "modeling_deepseekv41",
@@ -168,6 +173,7 @@ MODEL_CLASS_TO_MODULE = {
     "MistralForCausalLM": "modeling_mistral",
     "MixtralForCausalLM": "modeling_mixtral",
     "MllamaForConditionalGeneration": "modeling_mllama",
+    "MuseSparkForConditionalGeneration": "modeling_musespark_open_omni",
     "NemotronForCausalLM": "modeling_nemotron",
     "NemotronHForCausalLM": "modeling_nemotron_h",
     "NemotronHMultimodalModel": "modeling_nemotron_h_multimodal",
@@ -210,6 +216,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "NemotronH_Nano_Omni_Reasoning_V3": "modeling_nemotron_h_multimodal",
     "NemotronH_Nano_VL_V2": "modeling_nemotron_h_multimodal",
     "cosmos3": "modeling_cosmos3",
+    "cosmos3_edge": "modeling_cosmos3_edge",
     "cosmos3_omni": "modeling_cosmos3",
     "deepseek_v41": "modeling_deepseekv41_multimodal",
     "exaone4_5": "modeling_exaone4_5",
@@ -227,6 +234,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
     "mistral3": "modeling_mistral",
     "mistral_common": "modeling_mistral",
     "mistral_large_3": "modeling_mistral",
+    "muse_spark": "modeling_musespark_open_omni",
     "nemotron_h_omni": "modeling_nemotron_h_multimodal",
     "phi4mm": "modeling_phi4mm",
     "qwen2_5_vl": "modeling_qwen2vl",
@@ -244,7 +252,7 @@ MULTIMODAL_MODEL_TYPE_TO_MODULE = {
 # model builder (registered via ``@register_draft_model``). Keyed by the enum
 # member *name* rather than the enum itself so this module keeps importing
 # nothing. Modes absent from this table have no one-engine draft model to build
-# (two-model / drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
+# (model-free or drafter-loop modes such as NGRAM, SA and USER_PROVIDED).
 #
 # Adding a speculative decoding mode
 # ----------------------------------

@@ -405,6 +405,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
+        uses_fp4_mla_attention = False
 
         @staticmethod
         def has_cached_kv_for_mla_context_warmup(_metadata):
@@ -1042,286 +1043,297 @@ def _run_test_for_backend(backend_name,
         mapping=mapping,
         dtype=str_dtype_to_binding(torch_dtype_to_str(kv_cache_dtype)),
     )
-    request_list = []
-    for req_id, ctx_len in enumerate(context_sequence_lengths):
-        req = LlmRequest(
-            request_id=req_id,
-            max_new_tokens=num_generation_steps + 1,
-            input_tokens=[1] * ctx_len,
-            sampling_config=SamplingConfig(
-                SamplingParams()._get_sampling_config()),
-            is_streaming=False,
-        )
-        req.paged_kv_block_ids = []
-        beam_width = 1
-        request_list.append(req)
-        if v2_kv_cache:
-            kv_cache = kv_cache_manager._create_kv_cache(req_id, None, None)
-            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
-            assert success, f"Failed to resume KV cache for request {req_id}"
-            kv_cache.capacity = ctx_len
-        else:
-            kv_cache_manager.impl.add_sequence_batch(
-                [(req_id, ctx_len, beam_width)], [req])
-    attn_metadata = AttentionCls.Metadata(
-        seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
-        request_ids=list(range(len(context_sequence_lengths))),
-        max_num_requests=len(context_sequence_lengths),
-        num_contexts=len(context_sequence_lengths),
-        prompt_lens=context_sequence_lengths,
-        max_num_tokens=sum(context_sequence_lengths),
-        kv_cache_manager=kv_cache_manager,
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
-        ),
-        mapping=mapping,
-    )
-    attn_metadata.prepare()
-
-    # run forward for each step and each layer
-    latent_cache_ref_all_list = [None for _ in range(num_layers)]
-    for step in range(num_generation_steps + 1):
-        if step > 0:
-            for req_id in range(len(context_sequence_lengths)):
-                for _ in range(generation_seq_len_q):
-                    if v2_kv_cache:
-                        kv_cache = kv_cache_manager.kv_cache_map[req_id]
-                        kv_cache.capacity += 1
-                    else:
-                        kv_cache_manager.impl.add_token(req_id)
-            gen_metadata_kwargs = dict(
-                seq_lens=torch.tensor([generation_seq_len_q] *
-                                      len(context_sequence_lengths),
-                                      dtype=torch.int),
-                request_ids=list(range(len(context_sequence_lengths))),
-                max_num_requests=len(context_sequence_lengths),
-                num_contexts=0,
-                prompt_lens=context_sequence_lengths,
-                max_num_tokens=max(
-                    sum(context_sequence_lengths),
-                    generation_seq_len_q * len(context_sequence_lengths),
-                ),
-                kv_cache_manager=kv_cache_manager,
-                kv_cache_params=KVCacheParams(
-                    use_cache=True,
-                    num_cached_tokens_per_seq=[
-                        ctx_len + (step - 1) * generation_seq_len_q
-                        for ctx_len in context_sequence_lengths
-                    ],
-                ),
-                mapping=mapping,
+    try:
+        request_list = []
+        for req_id, ctx_len in enumerate(context_sequence_lengths):
+            req = LlmRequest(
+                request_id=req_id,
+                max_new_tokens=num_generation_steps + 1,
+                input_tokens=[1] * ctx_len,
+                sampling_config=SamplingConfig(
+                    SamplingParams()._get_sampling_config()),
+                is_streaming=False,
             )
-            if backend_name == "TRTLLM":
-                gen_metadata_kwargs["enable_flash_mla"] = (cuda_capability == (
-                    9, 0))
-            attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
-            attn_metadata.prepare()
-        for layer_idx in range(num_layers):
-            print(
-                f"--------------------------------step {step} layer {layer_idx} start--------------------------------"
-            )
-            if step == 0:
-                q = inputs_per_layer[layer_idx]["ctx_q"]
-                k = inputs_per_layer[layer_idx]["ctx_k"]
-                v = inputs_per_layer[layer_idx]["ctx_v"]
-                compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
-                k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
-                latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-                # q/k will be modified in the forward pass, so we need to clone them
-                # we should not clone v because we need to keep the stride of v
-                if backend_name == "FLASHINFER":
-                    # FlashInfer MLA does not fuse RoPE; pre-apply it here.
-                    ctx_positions = [
-                        pos for ctx_len in context_sequence_lengths
-                        for pos in range(ctx_len)
-                    ]
-                    q_fwd = q.clone().view(-1, num_heads, qk_head_dim)
-                    q_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
-                        q_fwd[..., qk_nope_head_dim:], ctx_positions,
-                        rope_cos_sin)
-                    q_fwd = q_fwd.view(-1, num_heads * qk_head_dim)
-                    k_fwd = k.clone().view(-1, num_kv_heads, qk_head_dim)
-                    k_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
-                        k_fwd[..., qk_nope_head_dim:], ctx_positions,
-                        rope_cos_sin)
-                    k_fwd = k_fwd.view(-1, num_kv_heads * qk_head_dim)
-                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
-                    lc_kpe_rope = apply_mla_rope(lc_kpe, ctx_positions,
-                                                 rope_cos_sin).squeeze(1)
-                    latent_cache_fwd = torch.cat(
-                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
-                else:
-                    q_fwd = q.clone()
-                    k_fwd = k.clone()
-                    latent_cache_fwd = latent_cache
-                result = ctx_layers[layer_idx].forward(
-                    q_fwd,
-                    k_fwd,
-                    v,
-                    attn_metadata,
-                    attention_input_type=AttentionInputType.context_only,
-                    latent_cache=latent_cache_fwd,
-                )
-                ref_result, latent_cache_ref = calculate_ref_result_ctx(
-                    q,
-                    k,
-                    v,
-                    compressed_kv,
-                    k_pe,
-                    rope_cos_sin,
-                    num_heads,
-                    num_kv_heads,
-                    qk_nope_head_dim,
-                    qk_rope_head_dim,
-                    v_head_dim,
-                    context_sequence_lengths,
-                    q_scaling,
-                )
-                latent_cache_ref_all_list[layer_idx] = latent_cache_ref
-                for req in request_list:
-                    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+            req.paged_kv_block_ids = []
+            beam_width = 1
+            request_list.append(req)
+            if v2_kv_cache:
+                kv_cache = kv_cache_manager._create_kv_cache(req_id, None, None)
+                success = kv_cache.resume(
+                    torch.cuda.current_stream().cuda_stream)
+                assert success, f"Failed to resume KV cache for request {req_id}"
+                kv_cache.capacity = ctx_len
             else:
-                fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][step -
-                                                                          1]
-                q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step - 1]
-                compressed_kv = inputs_per_layer[layer_idx][
-                    "gen_compressed_kv_list"][step - 1]
-                k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
-                latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                kv_cache_manager.impl.add_sequence_batch(
+                    [(req_id, ctx_len, beam_width)], [req])
+        attn_metadata = AttentionCls.Metadata(
+            seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
+            request_ids=list(range(len(context_sequence_lengths))),
+            max_num_requests=len(context_sequence_lengths),
+            num_contexts=len(context_sequence_lengths),
+            prompt_lens=context_sequence_lengths,
+            max_num_tokens=sum(context_sequence_lengths),
+            kv_cache_manager=kv_cache_manager,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[0 for _ in context_sequence_lengths],
+            ),
+            mapping=mapping,
+        )
+        attn_metadata.prepare()
 
-                if backend_name == "FLASHINFER":
-                    # FlashInfer MLA does not fuse RoPE; pre-apply before
-                    # appending to the KV cache.  Keep original q_pe and
-                    # latent_cache intact for the reference calculation
-                    # (calculate_ref_result_gen applies RoPE internally).
-                    gen_positions = [
-                        ctx_len + (step - 1) * generation_seq_len_q + i
-                        for ctx_len in context_sequence_lengths
-                        for i in range(generation_seq_len_q)
-                    ]
-                    q_pe_for_gen = apply_mla_rope(q_pe, gen_positions,
-                                                  rope_cos_sin)
-                    lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
-                    lc_kpe_rope = apply_mla_rope(lc_kpe, gen_positions,
-                                                 rope_cos_sin).squeeze(1)
-                    latent_cache_for_gen = torch.cat(
-                        [latent_cache[:, :kv_lora_rank], lc_kpe_rope], dim=-1)
-                    # Copy RoPE'd q_pe into the rope portion of fused_q
-                    num_tokens = fused_q.size(0)
-                    fused_q_3d = fused_q.view(num_tokens, num_heads,
-                                              kv_lora_rank + qk_rope_head_dim)
-                    fused_q_3d[..., kv_lora_rank:].copy_(q_pe_for_gen)
-
-                    result = gen_layers[layer_idx].forward(
-                        fused_q,
-                        None,
-                        None,
-                        attn_metadata,
-                        attention_input_type=AttentionInputType.generation_only,
-                        latent_cache=latent_cache_for_gen,
-                    )
-                else:
-                    q_pe_for_gen = q_pe
-                    latent_cache_for_gen = latent_cache
-
-                    num_tokens = fused_q.size(0)
-                    num_seqs = len(context_sequence_lengths)
-                    cu_q_seqlens = torch.empty(num_seqs + 1,
-                                               dtype=torch.int32,
-                                               device=q.device)
-                    cu_kv_seqlens = torch.empty(num_seqs + 1,
-                                                dtype=torch.int32,
-                                                device=q.device)
-                    fmha_scheduler_counter = torch.empty(1,
-                                                         dtype=torch.uint32,
-                                                         device=q.device)
-                    has_fp8_kv_cache = gen_layers[
-                        layer_idx].has_fp8_kv_cache if hasattr(
-                            gen_layers[layer_idx],
-                            'has_fp8_kv_cache') else False
-
-                    if has_fp8_kv_cache:
-                        mla_bmm1_scale = torch.empty(2,
-                                                     dtype=torch.float32,
-                                                     device=q.device)
-                        mla_bmm2_scale = torch.empty(1,
-                                                     dtype=torch.float32,
-                                                     device=q.device)
-                        quant_q_buffer = torch.empty(
-                            num_tokens,
-                            num_heads * (kv_lora_rank + qk_rope_head_dim),
-                            dtype=torch.uint8,
-                            device=q.device)
-                    else:
-                        mla_bmm1_scale = None
-                        mla_bmm2_scale = None
-                        quant_q_buffer = None
-
-                    gen_layers[layer_idx].mla_rope_generation(
-                        fused_q, q_pe_for_gen, latent_cache_for_gen,
-                        attn_metadata, cu_q_seqlens, cu_kv_seqlens,
-                        fmha_scheduler_counter, mla_bmm1_scale, mla_bmm2_scale,
-                        quant_q_buffer)
-
-                    result = gen_layers[layer_idx].forward(
-                        fused_q,
-                        None,
-                        None,
-                        attn_metadata,
-                        attention_input_type=AttentionInputType.generation_only,
-                        latent_cache=latent_cache,
-                        q_pe=q_pe,
-                        cu_q_seqlens=cu_q_seqlens,
-                        cu_kv_seqlens=cu_kv_seqlens,
-                        fmha_scheduler_counter=fmha_scheduler_counter,
-                        mla_bmm1_scale=mla_bmm1_scale,
-                        mla_bmm2_scale=mla_bmm2_scale,
-                        quant_q_buffer=quant_q_buffer,
-                    )
-                ref_result, latent_cache_ref = calculate_ref_result_gen(
-                    fused_q,
-                    q_pe,
-                    compressed_kv,
-                    k_pe,
-                    latent_cache_ref_all_list[layer_idx],
-                    rope_cos_sin,
-                    num_heads,
-                    kv_lora_rank,
-                    qk_nope_head_dim,
-                    qk_rope_head_dim,
-                    [
-                        ctx_len + (step - 1) * generation_seq_len_q
-                        for ctx_len in context_sequence_lengths
-                    ],
-                    q_scaling,
+        # run forward for each step and each layer
+        latent_cache_ref_all_list = [None for _ in range(num_layers)]
+        for step in range(num_generation_steps + 1):
+            if step > 0:
+                for req_id in range(len(context_sequence_lengths)):
+                    for _ in range(generation_seq_len_q):
+                        if v2_kv_cache:
+                            kv_cache = kv_cache_manager.kv_cache_map[req_id]
+                            kv_cache.capacity += 1
+                        else:
+                            kv_cache_manager.impl.add_token(req_id)
+                gen_metadata_kwargs = dict(
+                    seq_lens=torch.tensor([generation_seq_len_q] *
+                                          len(context_sequence_lengths),
+                                          dtype=torch.int),
+                    request_ids=list(range(len(context_sequence_lengths))),
+                    max_num_requests=len(context_sequence_lengths),
+                    num_contexts=0,
+                    prompt_lens=context_sequence_lengths,
+                    max_num_tokens=max(
+                        sum(context_sequence_lengths),
+                        generation_seq_len_q * len(context_sequence_lengths),
+                    ),
+                    kv_cache_manager=kv_cache_manager,
+                    kv_cache_params=KVCacheParams(
+                        use_cache=True,
+                        num_cached_tokens_per_seq=[
+                            ctx_len + (step - 1) * generation_seq_len_q
+                            for ctx_len in context_sequence_lengths
+                        ],
+                    ),
+                    mapping=mapping,
                 )
-                latent_cache_ref_all_list[layer_idx] = latent_cache_ref
-            # Compare results
-            print(
-                f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
-            )
-            print(
-                f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
-            )
-            print(
-                f"Difference mean: {(result - ref_result).abs().mean().item()}, max: {(result - ref_result).abs().max().item()}"
-            )
+                if backend_name == "TRTLLM":
+                    gen_metadata_kwargs["enable_flash_mla"] = (
+                        cuda_capability == (9, 0))
+                attn_metadata = AttentionCls.Metadata(**gen_metadata_kwargs)
+                attn_metadata.prepare()
+            for layer_idx in range(num_layers):
+                print(
+                    f"--------------------------------step {step} layer {layer_idx} start--------------------------------"
+                )
+                if step == 0:
+                    q = inputs_per_layer[layer_idx]["ctx_q"]
+                    k = inputs_per_layer[layer_idx]["ctx_k"]
+                    v = inputs_per_layer[layer_idx]["ctx_v"]
+                    compressed_kv = inputs_per_layer[layer_idx][
+                        "ctx_compressed_kv"]
+                    k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                    # q/k will be modified in the forward pass, so we need to clone them
+                    # we should not clone v because we need to keep the stride of v
+                    if backend_name == "FLASHINFER":
+                        # FlashInfer MLA does not fuse RoPE; pre-apply it here.
+                        ctx_positions = [
+                            pos for ctx_len in context_sequence_lengths
+                            for pos in range(ctx_len)
+                        ]
+                        q_fwd = q.clone().view(-1, num_heads, qk_head_dim)
+                        q_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                            q_fwd[..., qk_nope_head_dim:], ctx_positions,
+                            rope_cos_sin)
+                        q_fwd = q_fwd.view(-1, num_heads * qk_head_dim)
+                        k_fwd = k.clone().view(-1, num_kv_heads, qk_head_dim)
+                        k_fwd[..., qk_nope_head_dim:] = apply_mla_rope(
+                            k_fwd[..., qk_nope_head_dim:], ctx_positions,
+                            rope_cos_sin)
+                        k_fwd = k_fwd.view(-1, num_kv_heads * qk_head_dim)
+                        lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                        lc_kpe_rope = apply_mla_rope(lc_kpe, ctx_positions,
+                                                     rope_cos_sin).squeeze(1)
+                        latent_cache_fwd = torch.cat(
+                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope],
+                            dim=-1)
+                    else:
+                        q_fwd = q.clone()
+                        k_fwd = k.clone()
+                        latent_cache_fwd = latent_cache
+                    result = ctx_layers[layer_idx].forward(
+                        q_fwd,
+                        k_fwd,
+                        v,
+                        attn_metadata,
+                        attention_input_type=AttentionInputType.context_only,
+                        latent_cache=latent_cache_fwd,
+                    )
+                    ref_result, latent_cache_ref = calculate_ref_result_ctx(
+                        q,
+                        k,
+                        v,
+                        compressed_kv,
+                        k_pe,
+                        rope_cos_sin,
+                        num_heads,
+                        num_kv_heads,
+                        qk_nope_head_dim,
+                        qk_rope_head_dim,
+                        v_head_dim,
+                        context_sequence_lengths,
+                        q_scaling,
+                    )
+                    latent_cache_ref_all_list[layer_idx] = latent_cache_ref
+                    for req in request_list:
+                        req.state = LlmRequestState.GENERATION_IN_PROGRESS
+                else:
+                    fused_q = inputs_per_layer[layer_idx]["gen_fused_q_list"][
+                        step - 1]
+                    q_pe = inputs_per_layer[layer_idx]["gen_q_pe_list"][step -
+                                                                        1]
+                    compressed_kv = inputs_per_layer[layer_idx][
+                        "gen_compressed_kv_list"][step - 1]
+                    k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step -
+                                                                        1]
+                    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
 
-            # Assert results are close
-            atol, rtol = accuracy_dict[kv_cache_dtype]
-            assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), \
-                f"Results for MLA in {backend_name} backend don't match reference implementation at layer {layer_idx} in step {step}"
+                    if backend_name == "FLASHINFER":
+                        # FlashInfer MLA does not fuse RoPE; pre-apply before
+                        # appending to the KV cache.  Keep original q_pe and
+                        # latent_cache intact for the reference calculation
+                        # (calculate_ref_result_gen applies RoPE internally).
+                        gen_positions = [
+                            ctx_len + (step - 1) * generation_seq_len_q + i
+                            for ctx_len in context_sequence_lengths
+                            for i in range(generation_seq_len_q)
+                        ]
+                        q_pe_for_gen = apply_mla_rope(q_pe, gen_positions,
+                                                      rope_cos_sin)
+                        lc_kpe = latent_cache[:, kv_lora_rank:].unsqueeze(1)
+                        lc_kpe_rope = apply_mla_rope(lc_kpe, gen_positions,
+                                                     rope_cos_sin).squeeze(1)
+                        latent_cache_for_gen = torch.cat(
+                            [latent_cache[:, :kv_lora_rank], lc_kpe_rope],
+                            dim=-1)
+                        # Copy RoPE'd q_pe into the rope portion of fused_q
+                        num_tokens = fused_q.size(0)
+                        fused_q_3d = fused_q.view(
+                            num_tokens, num_heads,
+                            kv_lora_rank + qk_rope_head_dim)
+                        fused_q_3d[..., kv_lora_rank:].copy_(q_pe_for_gen)
 
-            print(
-                f"Test for MLA in {backend_name} backend passed at layer {layer_idx} in step {step}"
-            )
-            print(
-                f"--------------------------------step {step} layer {layer_idx} end--------------------------------"
-            )
+                        result = gen_layers[layer_idx].forward(
+                            fused_q,
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.
+                            generation_only,
+                            latent_cache=latent_cache_for_gen,
+                        )
+                    else:
+                        q_pe_for_gen = q_pe
+                        latent_cache_for_gen = latent_cache
 
-    print(f"Test for MLA in {backend_name} backend passed")
-    kv_cache_manager.shutdown()
+                        num_tokens = fused_q.size(0)
+                        num_seqs = len(context_sequence_lengths)
+                        cu_q_seqlens = torch.empty(num_seqs + 1,
+                                                   dtype=torch.int32,
+                                                   device=q.device)
+                        cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                                    dtype=torch.int32,
+                                                    device=q.device)
+                        fmha_scheduler_counter = torch.empty(1,
+                                                             dtype=torch.uint32,
+                                                             device=q.device)
+                        has_fp8_kv_cache = gen_layers[
+                            layer_idx].has_fp8_kv_cache if hasattr(
+                                gen_layers[layer_idx],
+                                'has_fp8_kv_cache') else False
+
+                        if has_fp8_kv_cache:
+                            mla_bmm1_scale = torch.empty(2,
+                                                         dtype=torch.float32,
+                                                         device=q.device)
+                            mla_bmm2_scale = torch.empty(1,
+                                                         dtype=torch.float32,
+                                                         device=q.device)
+                            quant_q_buffer = torch.empty(
+                                num_tokens,
+                                num_heads * (kv_lora_rank + qk_rope_head_dim),
+                                dtype=torch.uint8,
+                                device=q.device)
+                        else:
+                            mla_bmm1_scale = None
+                            mla_bmm2_scale = None
+                            quant_q_buffer = None
+
+                        gen_layers[layer_idx].mla_rope_generation(
+                            fused_q, q_pe_for_gen, latent_cache_for_gen,
+                            attn_metadata, cu_q_seqlens, cu_kv_seqlens,
+                            fmha_scheduler_counter, mla_bmm1_scale,
+                            mla_bmm2_scale, quant_q_buffer)
+
+                        result = gen_layers[layer_idx].forward(
+                            fused_q,
+                            None,
+                            None,
+                            attn_metadata,
+                            attention_input_type=AttentionInputType.
+                            generation_only,
+                            latent_cache=latent_cache,
+                            q_pe=q_pe,
+                            cu_q_seqlens=cu_q_seqlens,
+                            cu_kv_seqlens=cu_kv_seqlens,
+                            fmha_scheduler_counter=fmha_scheduler_counter,
+                            mla_bmm1_scale=mla_bmm1_scale,
+                            mla_bmm2_scale=mla_bmm2_scale,
+                            quant_q_buffer=quant_q_buffer,
+                        )
+                    ref_result, latent_cache_ref = calculate_ref_result_gen(
+                        fused_q,
+                        q_pe,
+                        compressed_kv,
+                        k_pe,
+                        latent_cache_ref_all_list[layer_idx],
+                        rope_cos_sin,
+                        num_heads,
+                        kv_lora_rank,
+                        qk_nope_head_dim,
+                        qk_rope_head_dim,
+                        [
+                            ctx_len + (step - 1) * generation_seq_len_q
+                            for ctx_len in context_sequence_lengths
+                        ],
+                        q_scaling,
+                    )
+                    latent_cache_ref_all_list[layer_idx] = latent_cache_ref
+                # Compare results
+                print(
+                    f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
+                )
+                print(
+                    f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
+                )
+                print(
+                    f"Difference mean: {(result - ref_result).abs().mean().item()}, max: {(result - ref_result).abs().max().item()}"
+                )
+
+                # Assert results are close
+                atol, rtol = accuracy_dict[kv_cache_dtype]
+                assert torch.allclose(result, ref_result, atol=atol, rtol=rtol), \
+                    f"Results for MLA in {backend_name} backend don't match reference implementation at layer {layer_idx} in step {step}"
+
+                print(
+                    f"Test for MLA in {backend_name} backend passed at layer {layer_idx} in step {step}"
+                )
+                print(
+                    f"--------------------------------step {step} layer {layer_idx} end--------------------------------"
+                )
+
+        print(f"Test for MLA in {backend_name} backend passed")
+    finally:
+        kv_cache_manager.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -1450,11 +1462,66 @@ def test_context_prefix_counts_tokens_not_rows():
     assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mapping_override,backend,cp_size,sparse,rejected",
+    [
+        (False, "FLASHINFER", 2, False, True),
+        (False, "VANILLA", 2, False, True),
+        (False, "TRTLLM", 2, False, False),
+        (True, "FLASHINFER", 2, False, True),
+        (True, "TRTLLM", 2, False, False),
+        (False, "FLASHINFER", 1, False, False),
+        (False, "FLASHINFER", 2, True, False),
+    ],
+)
+def test_mla_helix_backend_validation(monkeypatch, mapping_override, backend,
+                                      cp_size, sparse, rejected):
+    """Reject unsupported dense Helix backends before allocating projections."""
+    mapping = Mapping(world_size=cp_size,
+                      cp_size=cp_size,
+                      cp_config={"cp_type": "HELIX"})
+    config = mla_module.ModelConfig(
+        mapping=Mapping() if mapping_override else mapping,
+        attn_backend=backend,
+    )
+    hooks = types.SimpleNamespace() if sparse else None
+    monkeypatch.setattr(mla_module, "get_sparse_mla_hooks", lambda _: hooks)
+    # Stop accepted configurations before projection/backend allocation.
+    quant_config = mock.Mock(side_effect=RuntimeError("quantization setup"))
+    monkeypatch.setattr(mla_module.ModelConfig, "get_quant_config",
+                        quant_config)
+    expected_error = NotImplementedError if rejected else RuntimeError
+    expected_message = "Dense MLA.*TRTLLM" if rejected else "quantization setup"
+    with pytest.raises(expected_error, match=expected_message):
+        mla_module.MLA(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=128,
+            bias=False,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams(dim=8, max_positions=128),
+            ),
+            config=config,
+            mapping_with_cp=mapping if mapping_override else None,
+        )
+    assert quant_config.call_count == (0 if rejected else 1)
+
+
 def _context_projection(device: str,
                         dtype: torch.dtype,
                         bias: bool = False) -> types.SimpleNamespace:
     model = types.SimpleNamespace(
         num_heads_tp=4,
+        num_context_heads=4,
         qk_nope_head_dim=16,
         qk_rope_head_dim=8,
         qk_head_dim=24,
@@ -1472,6 +1539,8 @@ def _context_projection(device: str,
         mla_module.MLA._use_kvbproj_strided_out, model)
     model._get_kvbproj_head_weights = types.MethodType(
         mla_module.MLA._get_kvbproj_head_weights, model)
+    model._project_context_kv = types.MethodType(
+        mla_module.MLA._project_context_kv, model)
     return model
 
 

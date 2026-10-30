@@ -116,6 +116,9 @@ class ReasoningParserFactory:
                     parser, parser has not opted in, or neither marker is at
                     the tail). Callers must treat this as "ask elsewhere"
                     (e.g. the relayed disagg value), not as thinking-off.
+            A prompt ending with neither marker is referred to the parser's
+            `resolve_unmarked_prompt`, which returns None unless the parser
+            recognises the tail.
         """
         entry = cls._parsers.get(reasoning_parser.lower())
         if entry is None:
@@ -129,7 +132,7 @@ class ReasoningParserFactory:
             return False
         if tail.endswith(parser_cls.reasoning_start):
             return True
-        return None
+        return parser_cls.resolve_unmarked_prompt(tail)
 
     @classmethod
     def keys(cls) -> KeysView[str]:
@@ -162,6 +165,15 @@ class BaseReasoningParser(ABC):
     resolves_thinking_from_prompt: ClassVar[bool] = False
     reasoning_start: ClassVar[str]
     reasoning_end: ClassVar[str]
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        """Mode of a rendered prompt whose stripped tail ends with neither marker.
+
+        None leaves the mode unresolved, which is right for a template that
+        prefills a marker whenever it prefills anything at all.
+        """
+        return None
 
     def __init__(self,
                  *,
@@ -346,31 +358,41 @@ class GlmReasoningParser(BaseReasoningParser):
     """Reasoning parser for the GLM family.
 
     GLM-4.7 and GLM-5 templates prefill `<think>` (`reasoning_at_start`), or
-    `</think>` when `enable_thinking` is false. GLM-4.5/4.6 (`glm45`) do not
-    prefill `<think>`; the model opens the block at the start of its output.
+    close the block when `enable_thinking` is false; GLM-5.3 prefills `<think>`
+    either way. GLM-4.5/4.6 (`glm45`) do not prefill `<think>`; the model
+    opens the block at the start of its output. A rendered prompt that ends in
+    `<think>` or `</think>` sets the mode, whatever `enable_thinking` says.
 
     The block ends at the first `</think>`, or at a `<tool_call>` opened
     before it; a later `<think>` is text. A `</think>` before any content, or
     directly before the first `<tool_call>`, closes the block again and is
-    dropped. Text from the first `<tool_call>` on is kept verbatim.
+    dropped. Text from the first `<tool_call>` on is kept verbatim, except
+    for the `</think>` still owed by a block that a call ended: the first one
+    outside a call (a call runs from `<tool_call>` to its `</tool_call>`) is
+    dropped.
     """
 
+    resolves_thinking_from_prompt = True
     reasoning_start = "<think>"
     reasoning_end = "</think>"
     _tool_call_start = "<tool_call>"
+    _tool_call_end = "</tool_call>"
 
     def __init__(self,
                  *,
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         super().__init__(chat_template_kwargs=chat_template_kwargs)
-        # The templates close the block in the prompt when `enable_thinking`
-        # is passed and false.
+        # `enable_thinking` is the mode read off the rendered prompt when the
+        # server could read it, else the request's; false means the prompt
+        # closed the block.
         if not (chat_template_kwargs or {}).get("enable_thinking", True):
             reasoning_at_start = False
         self.reasoning_at_start = reasoning_at_start
         # "start": the block may still open after leading whitespace;
-        # "closed": the block ended and no content followed yet.
+        # "closed": the block ended and no content followed yet;
+        # "call" and "owed": a call ended the block, which still owes its
+        # `</think>`, and the text is inside a call or between calls.
         self._state = "reasoning" if reasoning_at_start else "start"
         self._buffer = ""
 
@@ -390,6 +412,19 @@ class GlmReasoningParser(BaseReasoningParser):
             if state == "tool_calls":
                 content.append(data)
                 break
+            if state == "call":
+                close = data.find(self._tool_call_end)
+                if close == -1:
+                    cut = len(data) - _trailing_partial_marker(
+                        data, self._tool_call_end)
+                    content.append(data[:cut])
+                    self._buffer = data[cut:]
+                    break
+                close += len(self._tool_call_end)
+                content.append(data[:close])
+                data = data[close:]
+                self._state = "owed"
+                continue
             if state == "start":
                 stripped = data.lstrip()
                 if stripped.startswith(self.reasoning_start):
@@ -405,8 +440,15 @@ class GlmReasoningParser(BaseReasoningParser):
             end = data.find(self.reasoning_end)
             call = data.find(self._tool_call_start)
             if call != -1 and (end == -1 or call < end):
-                # A tool call ends the block; everything after it is content.
                 out.append(data[:call])
+                if state in ("reasoning", "owed"):
+                    # The call ends the block, which still owes `</think>`.
+                    opened = call + len(self._tool_call_start)
+                    content.append(data[call:opened])
+                    data = data[opened:]
+                    self._state = "call"
+                    continue
+                # Everything from the first tool call on is content.
                 content.append(data[call:])
                 self._state = "tool_calls"
                 break
@@ -420,6 +462,11 @@ class GlmReasoningParser(BaseReasoningParser):
                 break
             out.append(data[:end])
             rest = data[end + len(self.reasoning_end):]
+            if state == "owed":
+                # The `</think>` the block owed: drop it.
+                self._state = "tool_calls"
+                data = rest
+                continue
             if state == "reasoning":
                 self._state = "closed"
             elif end:
@@ -542,35 +589,46 @@ class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
     tag; with thinking disabled it prefills ``</mm:think>``, so the output is
     all content; in adaptive mode (the template default) it prefills nothing
     and the model emits ``<mm:think>`` or the bare sentinel first. The parser
-    therefore takes its mode from an explicit ``thinking_mode`` or from the
-    mode the server resolved off the rendered prompt (relayed as
-    ``enable_thinking``), and otherwise starts outside reasoning. Both
-    tags are delimiters and never appear in the result; text before an
-    opening tag is content; an opening tag without a closing tag is
-    reasoning cut off by the token limit. ``parse`` and ``parse_delta``
-    agree on every input for every chunking.
+    takes its mode from the one the server resolved off the rendered prompt
+    (relayed as ``enable_thinking``), falls back to ``thinking_mode`` when
+    nothing was resolved, and otherwise starts outside reasoning. Both tags
+    are delimiters and never appear in the result; text before an opening tag
+    is content; an opening tag without a closing tag is reasoning cut off by
+    the token limit. ``parse`` and ``parse_delta`` agree for every chunking.
     """
 
     resolves_thinking_from_prompt = True
     reasoning_start = "<mm:think>"
     reasoning_end = "</mm:think>"
+    # The template's generation prompt is ``bos_token ~ 'ai' ~ '\\n'``.
+    _assistant_header = "]~b]ai"
+
+    @classmethod
+    def resolve_unmarked_prompt(cls, tail: str) -> Optional[bool]:
+        # Adaptive mode prefills nothing after the header, so the output
+        # starts outside reasoning. Any other unmarked tail, such as a custom
+        # template that prefills text after ``<mm:think>``, carries no mode the
+        # tail can read and is left to ``thinking_mode``.
+        if tail.endswith(cls._assistant_header):
+            return False
+        return None
 
     def __init__(self,
                  *,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
         kwargs = chat_template_kwargs or {}
-        # The template's own knob is `thinking_mode`; only "enabled" prefills
-        # the opening tag. Without it, trust the mode the server resolved
-        # from the rendered prompt, relayed as `enable_thinking` (a caller
-        # cannot pass that key: the template never reads it, so the
-        # unused-kwargs guard rejects it). A bare `thinking` is what the
-        # Responses path injects for `reasoning.effort`; this template does
-        # not act on it, so neither does the parser.
+        # The server overwrites `enable_thinking` with the mode resolved from
+        # the rendered prompt, so it wins over `thinking_mode`, which decides
+        # only when nothing was resolved. The Responses path's bare `thinking`
+        # is ignored because the template never reads it.
+        resolved = kwargs.get("enable_thinking")
         thinking_mode = kwargs.get("thinking_mode")
-        if thinking_mode is not None:
+        if resolved is not None:
+            prefilled_open = resolved is True
+        elif thinking_mode is not None:
             prefilled_open = thinking_mode == "enabled"
         else:
-            prefilled_open = kwargs.get("enable_thinking") is True
+            prefilled_open = False
         super().__init__(reasoning_at_start=prefilled_open,
                          chat_template_kwargs=chat_template_kwargs)
         self.reasoning_start = "<mm:think>"
@@ -768,6 +826,10 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
     The `enable_thinking` flag is read from `chat_template_kwargs`.
     """
 
+    resolves_thinking_from_prompt = True
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
     def __init__(self,
                  *,
                  reasoning_at_start: bool = True,
@@ -803,32 +865,35 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to also treat `<tool_call>` as an
-        implicit end-of-reasoning marker.  When the model omits `</think>`
-        before generating a tool call, the tag would otherwise be absorbed
-        into reasoning_content and the downstream tool parser would never
-        see it (NVBug 6082303).
-
-        `<tool_call>` is a special token that always arrives as a single
-        atomic delta, so we only need to check `delta_text` (not the
-        parent's internal buffer)."""
-        if (self.in_reasoning and self._tool_call_start in delta_text
-                and self.reasoning_end not in self._buffer):
-            remaining = self._buffer
+        """End reasoning at the first closing marker or tool-call opener."""
+        buffered = self._buffer + delta_text
+        tool_idx = buffered.find(self._tool_call_start)
+        end_idx = buffered.find(self.reasoning_end)
+        if self.in_reasoning and tool_idx != -1 and (end_idx == -1
+                                                     or tool_idx < end_idx):
             self._buffer = ""
             self.in_reasoning = False
-            # Guaranteed non-negative: guarded by `in delta_text` above.
-            tool_idx = delta_text.find(self._tool_call_start)
-            reasoning = remaining + delta_text[:tool_idx]
-            content = delta_text[tool_idx:]
+            reasoning = buffered[:tool_idx]
+            content = buffered[tool_idx:]
             if self._force_nonempty_content:
                 self._found_closing_tag = True
                 self._accumulated_reasoning = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning)
 
+        pending = ""
+        if self.in_reasoning and end_idx == -1 and tool_idx == -1:
+            for size in range(
+                    min(len(buffered),
+                        len(self._tool_call_start) - 1), 0, -1):
+                if buffered.endswith(self._tool_call_start[:size]):
+                    pending = buffered[-size:]
+                    self._buffer = ""
+                    delta_text = buffered[:-size]
+                    break
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
+        self._buffer += pending
         if self._force_nonempty_content:
             if result.reasoning_content:
                 self._accumulated_reasoning += result.reasoning_content
@@ -868,14 +933,19 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return ReasoningParserResult()
 
     def parse(self, text: str) -> ReasoningParserResult:
-        result = super().parse(text)
-        tc = (result.reasoning_content.find(self._tool_call_start)
-              if result.reasoning_content else -1)
-        if tc != -1:
-            result = ReasoningParserResult(
-                content=result.reasoning_content[tc:] + result.content,
-                reasoning_content=result.reasoning_content[:tc])
-        return self._maybe_swap_content(result)
+        start = 0 if self.reasoning_at_start else text.find(
+            self.reasoning_start)
+        if start != -1:
+            if not self.reasoning_at_start:
+                start += len(self.reasoning_start)
+            tool_idx = text.find(self._tool_call_start, start)
+            end_idx = text.find(self.reasoning_end, start)
+            if tool_idx != -1 and (end_idx == -1 or tool_idx < end_idx):
+                return self._maybe_swap_content(
+                    ReasoningParserResult(
+                        content=text[tool_idx:],
+                        reasoning_content=text[start:tool_idx]))
+        return self._maybe_swap_content(super().parse(text))
 
 
 @register_reasoning_parser("gemma4")

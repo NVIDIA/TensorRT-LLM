@@ -50,9 +50,14 @@ from ..moe.fused_moe.interface import MoEWeightLoadingMode
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
-from .checkpoints.hf.weight_mapper import HfWeightMapper
+from .checkpoints.hf.weight_mapper import HfWeightMapper, convert_compressed_tensors_nvfp4_weights
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, register_auto_model, register_mapper
+from .modeling_utils import (
+    DecoderModel,
+    moe_experts_quant_config,
+    register_auto_model,
+    register_mapper,
+)
 
 # ---------------------------------------------------------------------------
 #  Gate (MoE router)
@@ -142,6 +147,9 @@ class LagunaMoE(nn.Module):
                 strategy=model_config.allreduce_strategy,
             )
 
+        experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.mlp.experts"
+        )
         self.gate = LagunaGate(
             hidden_size=self.hidden_dim,
             num_experts=self.num_experts,
@@ -149,12 +157,14 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             moe_backend_cls=resolve_moe_cls(
                 model_config,
+                override_quant_config=experts_quant_config,
                 routing=RoutingMethodType.MiniMax2,
                 # Match the create_moe call below, which passes no bias and no
                 # swiglu alpha/beta. Left unknown, gates that create_moe
                 # rejects abstain here and the gate would name a backend the
                 # layer does not run.
                 swiglu_gptoss_style=False,
+                layer_idx=layer_idx,
             ),
             scoring_func=getattr(config, "moe_router_score_func", "sigmoid"),
         )
@@ -168,6 +178,7 @@ class LagunaMoE(nn.Module):
             dtype=config.torch_dtype,
             reduce_results=False,
             model_config=model_config,
+            override_quant_config=experts_quant_config,
             layer_idx=layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
         )
@@ -626,59 +637,8 @@ class LagunaHfWeightMapper(HfWeightMapper):
             weights,
         )
 
-        # Translate llm-compressor "compressed-tensors" NVFP4 naming into what
-        # TRT-LLM's NVFP4 linear / MoE loaders expect. llm-compressor stores
-        #   weight_packed        (uint8, packed FP4)
-        #   weight_scale         (FP8 per-group)
-        #   weight_global_scale  (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_weight)
-        #   input_global_scale   (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_input)
-        # TRT-LLM's loaders expect:
-        #   weight               (uint8 view of float4_e2m1x2)
-        #   weight_scale         (FP8, same)
-        #   weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
-        #   input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
-        # which is the reciprocal of the *_global_scale values.
         if self._config is not None and self._config.quant_config.quant_mode.has_nvfp4():
-
-            def _invert_global_scale(t: torch.Tensor) -> torch.Tensor:
-                """Convert compressed-tensors multiplier form to TRT-LLM
-                divisor form, protecting against uncalibrated experts.
-
-                llm-compressor stores global_scale=(FP8_MAX*FP4_MAX)/amax;
-                TRT-LLM expects {weight_scale_2, input_scale}=amax/(FP8_MAX*FP4_MAX),
-                i.e. the reciprocal. Some checkpoints store 0 for experts with
-                no calibration data (amax unavailable); a naive 1/x would
-                produce Inf which then contaminates the MoE per-layer
-                max-reduction over experts and zeroes out *every* expert's
-                input_scale. We preserve 0 -> 0 so those entries are harmless
-                in the max reduction and the corresponding expert's alpha
-                evaluates to 0 (silencing the dead expert).
-                """
-                t = t.to(torch.float32)
-                out = torch.where(
-                    t > 0,
-                    1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
-                    torch.zeros_like(t),
-                )
-                # Belt-and-braces: any residual Inf/NaN becomes 0.
-                return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
-
-            renamed: dict = {}
-            for name, value in weights.items():
-                if name.endswith(".weight_packed"):
-                    new_name = name[: -len(".weight_packed")] + ".weight"
-                    renamed[new_name] = value
-                elif name.endswith(".weight_global_scale"):
-                    new_name = name[: -len(".weight_global_scale")] + ".weight_scale_2"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                elif name.endswith(".input_global_scale"):
-                    new_name = name[: -len(".input_global_scale")] + ".input_scale"
-                    t = value[...] if not isinstance(value, torch.Tensor) else value
-                    renamed[new_name] = _invert_global_scale(t)
-                else:
-                    renamed[name] = value
-            weights = renamed
+            weights = convert_compressed_tensors_nvfp4_weights(weights)
 
         return weights
 
