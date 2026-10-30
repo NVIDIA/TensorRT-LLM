@@ -88,6 +88,43 @@ def resolve_commit(repo: str | Path, rev: str = "HEAD") -> str | None:
     return answer.strip() or None
 
 
+def read_files_at(
+    repo: str | Path, commit: str, paths: Sequence[str], timeout: float = 120
+) -> dict[str, str] | None:
+    """The text of each of ``paths`` at ``commit``, read in one ``git cat-file --batch``.
+
+    A path ``commit`` does not hold is left out. ``None`` when git cannot answer.
+    """
+    if not paths:
+        return {}
+    request = "".join(f"{commit}:{path}\n" for path in paths).encode()
+    try:
+        done = subprocess.run(
+            ["git", "--no-optional-locks", "-C", str(repo), "cat-file", "--batch"],
+            input=request,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if done.returncode != 0:
+        return None
+    out, texts, at = done.stdout, {}, 0
+    for path in paths:
+        end = out.find(b"\n", at)
+        if end < 0:
+            return None
+        header, at = out[at:end], end + 1
+        if header.endswith(b" missing"):
+            continue
+        _, kind, size = header.rsplit(b" ", 2)
+        if kind == b"blob":
+            texts[path] = out[at : at + int(size)].decode("utf-8", "replace")
+        at += int(size) + 1
+    return texts
+
+
 #: The optional task.yaml block that configures the policy; every key has a default.
 COMMIT_POLICY_FIELD = "commit_policy"
 COMMIT_POLICY_KEYS: tuple[str, ...] = ("allowed_paths", "allow_co_authors", "base_ref")
@@ -526,6 +563,7 @@ __all__ = [
     "git_checked",
     "git_output",
     "is_sandbox_placeholder",
+    "read_files_at",
     "resolve_base",
     "resolve_commit",
     "resolve_commit_identity",

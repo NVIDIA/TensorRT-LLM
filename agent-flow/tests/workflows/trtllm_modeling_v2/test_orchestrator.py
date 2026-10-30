@@ -267,16 +267,20 @@ def test_only_an_infrastructure_failure_is_retried_and_only_once(tmp_path, decis
 # ------------------------------------------------------------ a tune campaign
 
 
-def test_a_campaign_starts_once_the_onboarding_holds_and_the_run_waits_for_it(tmp_path):
-    """The campaign follows the onboarding: it starts once every required check has passed."""
+def test_a_campaign_starts_once_its_checks_hold_and_the_run_does_not_wait_for_it(tmp_path):
+    """The campaign follows the onboarding; the onboarding's verdict never waits for it."""
     logs: list[str] = []
     started: list[tuple[str, tuple[str, ...]]] = []
+    release = threading.Event()
 
     def work(task):
         started.append((task.id, tuple(services.ran_checks)))
-        return "TUNED\ntuned: best branch `tune/x/best`" if task.kind == "tune" else "UNIT_READY"
+        if task.kind == "tune":
+            assert release.wait(10)
+            return "TUNED\ntuned: best branch `tune/x/best`"
+        return "UNIT_READY"
 
-    # Listed first, the campaign still waits for the whole contract, delivery tier included.
+    # Listed first, the campaign still waits for the checks it is gated on.
     services = _services(
         _plan_once(_task("tune", "tune", touches=[]), _task("core", "assemble", _KEYS))
     )
@@ -292,13 +296,77 @@ def test_a_campaign_starts_once_the_onboarding_holds_and_the_run_waits_for_it(tm
     orchestrator = _orchestrator(
         tmp_path, services, required_kinds=("tune",), start_after={"tune": _KEYS}
     )
-    assert orchestrator.run() == "delivered"
+    try:
+        assert orchestrator.run() == "delivered"
+        # Delivered with the campaign still running: handed over, not waited for.
+        assert orchestrator.campaign is not None and not orchestrator.campaign.done()
+    finally:
+        release.set()
     assert started[0] == ("core", ()) and started[1][0] == "tune"
     assert set(_KEYS) <= set(started[1][1])
-    assert orchestrator.graph.by_id()["tune"].status == "done"
-    # The campaign's report is journaled for the record; no planner turn had to read it.
-    assert any("best branch `tune/x/best`" in line for line in logs)
+    assert orchestrator.campaign.result(10)[0].startswith("TUNED")
     assert [m.marker for m in c.milestones(tmp_path)] == ["v1"]
+    # While the core works, the journal says what the campaign waits for, once per change.
+    waits = [line for line in logs if line.startswith("[gated] tune (tune) waits for")]
+    assert waits and waits[0].endswith(f"{', '.join(_KEYS)} to pass")
+    assert len(waits) == len(set(waits))
+
+
+def test_an_escalation_does_not_wait_for_a_campaign(tmp_path):
+    turns, escalated, release = [], threading.Event(), threading.Event()
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            graph = g.Graph(
+                tasks=[
+                    _task("vision", "feature", ["core:boot@tp1"]),
+                    _task("core", "assemble", _KEYS[1:]),
+                    _task("tune", "tune", touches=[]),
+                ]
+            )
+            return PlannerAnswer("GRAPH_UPDATED", "plan", graph)
+        escalated.set()
+        return PlannerAnswer("ESCALATE", "the checkpoint has no image processor")
+
+    def work(task):
+        if task.id == "vision":
+            return "BLOCKED"
+        if task.kind == "tune":
+            assert release.wait(10)
+            return "TUNED"
+        assert escalated.wait(10)
+        return "UNIT_READY"
+
+    services = _services(plan)
+    services.work = work
+    orchestrator = _orchestrator(
+        tmp_path, services, required_kinds=("tune",), start_after={"tune": [_KEYS[1]]}
+    )
+    try:
+        assert orchestrator.run() == "escalated"
+        assert orchestrator.campaign is not None and not orchestrator.campaign.done()
+    finally:
+        release.set()
+    assert orchestrator.campaign.result(10)[0] == "TUNED"
+
+
+def test_a_campaign_takes_at_most_two_agent_slots_while_the_onboarding_works(tmp_path):
+    from agent_flow.workflows.trtllm_modeling_v2.run import orchestrator as orchestrator_mod
+
+    loop = _orchestrator(tmp_path, _services(_plan_once()), max_parallel=9)
+    idle = loop.idle_agent_slots()
+    assert idle > orchestrator_mod.CAMPAIGN_SLOTS_BESIDE_ONBOARDING == 2
+    campaign = _task("tune", "tune", touches=[])
+    campaign.status = "running"
+    loop.graph = g.Graph(tasks=[campaign, _task("vision", "feature")])
+    assert loop.campaign_agent_slots() == 2
+    loop._foreground_demand = idle - 1
+    assert loop.campaign_agent_slots() == 1
+    # The onboarding's work all ended: the campaign may take every idle slot.
+    loop.graph.by_id()["vision"].status = "done"
+    loop._foreground_demand = 0
+    assert loop.campaign_agent_slots() == idle
 
 
 def test_an_escalation_lets_the_work_that_does_not_wait_on_it_finish(tmp_path):

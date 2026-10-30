@@ -116,8 +116,6 @@ ROLE_BY_KIND = {
 #: Checks in flight at once on a run's sessions: each is a spool job, and the
 #: session's scheduler queues what its devices cannot start yet, by class.
 MAX_PARALLEL_CHECKS = 32
-#: The task kind that runs the tune campaign.
-TUNE_KIND = "tune"
 
 
 class ExecutionStage:
@@ -125,6 +123,8 @@ class ExecutionStage:
 
     def __init__(self, workflow) -> None:
         self.workflow = workflow
+        #: The campaign the orchestrator handed over with the onboarding's verdict.
+        self.campaign = None
         self._turn_lock = threading.Lock()
         self._turns_by_key = {}
         self._tasks_dispatched = set()
@@ -140,8 +140,9 @@ class ExecutionStage:
         self.state = state
         tune = self.workflow._tune_requested()
         units = assembly_units(self.workflow.task_data)
-        # The campaign starts once onboarding is complete: every required check has passed.
-        onboarded = [c.key for c in contract.required()]
+        # The campaign tunes the core: it starts once the core's required checks have passed.
+        # The features' and variants' checks go on beside it; delivery still owes them.
+        core_owed = [c.key for c in contract_mod.core_checks(contract, units[0] if units else None)]
         core_boots = [
             c.key for c in contract.required() if units and c.unit == units[0] and c.gate == "boot"
         ]
@@ -194,19 +195,16 @@ class ExecutionStage:
             revision_cap=self.workflow.revision_cap,
             event_window_s=self.workflow.event_window_s,
             required_kinds=("tune",) if tune else (),
-            start_after={"tune": onboarded} if onboarded else {},
+            start_after={"tune": core_owed} if core_owed else {},
             after_core=(feature_refs, core_boots),
             own_paths=self._own_paths,
             repo_root=self.workflow.task_data.get("trtllm_repo_path") or "",
         )
 
-        # A tune task whose jobs all run on the perf sessions holds none of the run's.
-        offsite = offsite_kinds(self.workflow.task_data.get("perf"), self.workflow._gate_env())
-
         def held(task: graph_mod.Task) -> int:
             # A running task waiting on its soft dependencies or running its checks
             # holds none: its checks queue for the sessions' devices of their own.
-            return 0 if orchestrator.agentless(task.id) else held_gpus(task, offsite)
+            return 0 if orchestrator.agentless(task.id) else held_gpus(task)
 
         def free_gpus() -> int:
             return self._task_capacity(total, orchestrator.graph, held)
@@ -216,10 +214,10 @@ class ExecutionStage:
         self._soft_dependencies = orchestrator.soft_dependencies
         self._mark_integrated = orchestrator.mark_integrated
         # A campaign's turns, and the side turns, take only the agent slots the
-        # foreground work leaves idle.
+        # foreground work leaves idle; a campaign's, at most two while the onboarding works.
         gate = getattr(self.workflow, "_agent_gate", None)
         if gate is not None:
-            gate.background_limit = orchestrator.idle_agent_slots
+            gate.background_limit = orchestrator.campaign_agent_slots
             gate.side_limit = orchestrator.idle_agent_slots
         # Beside the planner's first turn, as the run's other early work is.
         self.workflow._start_primers()
@@ -229,6 +227,7 @@ class ExecutionStage:
             # No foreground work is left to yield to: the closing turns run at once.
             if gate is not None:
                 gate.background_limit = gate.side_limit = None
+        self.campaign = orchestrator.campaign
         marker = self.workflow._target_marker()
         evaluation = contract_mod.evaluate(
             contract,
@@ -797,6 +796,11 @@ class ExecutionStage:
             decision, note = tune_stage.run_tune_task(
                 self.workflow, self.state, self.workflow._head(), attempt=task.attempts
             )
+            # The tune stage's verdict, wherever the campaign ends: here, or past the
+            # onboarding's close (`workflow._campaign_after_onboarding`).
+            ended = tune_stage.campaign_verdict(decision)
+            if ended:
+                self.state.tune["verdict"] = ended
             self.workflow._checkpoint(self.state)
             return TaskResult(decision, note)
         if task.kind == "kernel":
@@ -1076,36 +1080,14 @@ class ExecutionStage:
         return messages
 
 
-def offsite_kinds(perf: Mapping[str, Any] | None, environment: Any) -> frozenset[str]:
-    """The task kinds none of whose jobs runs on the run's sessions: ``{"tune"}`` or none.
-
-    A ``tune`` task measures on ``perf.spools``, and gates its keeps and runs its tuners'
-    jobs on ``perf.dev_spools`` (the measuring spools without them). Once ``perf.spools``
-    is set and none of those is one of the run's sessions (``environment.spool`` and
-    ``environment.sessions``), its ``gpus`` are never the sessions' to hold. Without
-    ``perf.spools`` the campaign measures on the run's own sessions, and its ``gpus``
-    count as any task's.
-    """
-    if not isinstance(perf, Mapping) or not perf.get("spools"):
-        return frozenset()
-    measuring = [str(spool) for spool in perf["spools"]]
-    its_own = {*measuring, *(str(spool) for spool in perf.get("dev_spools") or measuring)}
-    sessions = {environment.spool, *(session.spool for session in environment.sessions)} - {
-        None,
-        "",
-    }
-    resolved = lambda spool: str(Path(spool).expanduser().resolve())  # noqa: E731
-    if {resolved(s) for s in its_own} & {resolved(str(s)) for s in sessions}:
-        return frozenset()
-    return frozenset({TUNE_KIND})
-
-
-def held_gpus(task: Any, offsite: frozenset[str] = frozenset()) -> int:
+def held_gpus(task: Any) -> int:
     """The devices of the run's sessions ``task`` holds while it runs.
 
-    Its ``gpus``; none for a task of a kind in ``offsite`` (:func:`offsite_kinds`).
+    Its ``gpus``; none for a campaign (a ``tune`` task), whatever spools it measures on: its
+    jobs queue below every job of the onboarding (``executor.PERF``), so it keeps no task of
+    the onboarding from starting, here or on a session.
     """
-    return 0 if task.kind in offsite else max(0, int(task.gpus or 0))
+    return 0 if task.kind in graph_mod.BACKGROUND_KINDS else max(0, int(task.gpus or 0))
 
 
 def _newest(items: list[str], what: str) -> list[str]:

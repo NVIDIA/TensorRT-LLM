@@ -584,12 +584,18 @@ def _plan_with_tune(turn: int, prompt: str) -> dict:
 
 
 def test_a_tune_task_starts_once_the_core_is_correct(tmp_path, task_file, monkeypatch):
+    """The onboarding closes on its own verdict; the campaign goes on past it, as the tune stage."""
     import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
 
     started_with: list[set] = []
+    closed: list[tuple[bool, str]] = []
 
     def fake_tune(wf, state, base, attempt=1, should_stop=lambda: False):
         started_with.append({(v["gate"], v["passed"]) for v in _verdicts(tmp_path)})
+        deadline = time.monotonic() + 20
+        while not state.done and time.monotonic() < deadline:
+            time.sleep(0.01)
+        closed.append((state.done, state.verdict))
         state.tune.update(phase="done", base_commit=base)
         return "TUNED", "tuned from c0ffee1: best branch `tune/x/best`"
 
@@ -599,10 +605,65 @@ def test_a_tune_task_starts_once_the_core_is_correct(tmp_path, task_file, monkey
     with workflow:
         workflow.run(_with_perf(task_file, enabled=True))
     assert started_with == [{("boot", True), ("accuracy[gsm8k]", True)}]
+    # The onboarding was delivered and closed while the campaign still ran.
+    assert closed == [(True, "delivered")]
     state = _state(tmp_path)
-    assert state.verdict == "tuned" and state.tune["phase"] == "done"
-    # The campaign's report is an artifact of the run: journaled, with no planner turn to read it.
+    assert state.verdict == "delivered" and state.tune["phase"] == "done"
+    assert state.tune["onboarded"] == "delivered" and state.tune["verdict"] == "tuned"
     journal = (tmp_path / "ws" / "journal.md").read_text()
-    assert "tune reports: tuned from c0ffee1" in journal
+    assert "ended `tuned`; the onboarding's verdict stays `delivered`" in journal
     graph = graph_mod.Graph.load(tmp_path / "ws" / graph_mod.GRAPH_FILENAME)
-    assert {t.id: t.status for t in graph.tasks} == {"tune": "done", "core": "done"}
+    assert graph.by_id()["core"].status == "done"
+
+
+def test_a_closed_run_whose_campaign_did_not_end_resumes_only_the_campaign(
+    tmp_path, task_file, monkeypatch
+):
+    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
+
+    first = _workflow(tmp_path)
+    _install(monkeypatch, first, Script(None))
+    with first:
+        first.run(task_file)
+    state = _state(tmp_path)
+    # The process stopped while the campaign the onboarding closed beside still ran.
+    state.tune = {"onboarded": "delivered", "base_commit": "c0ffee1", "attempt": 2}
+    save_state(tmp_path / "ws" / _STATE, state)
+    resumed: list[dict] = []
+    monkeypatch.setattr(
+        stage, "resume_campaign", lambda wf, st: resumed.append(dict(st.tune)) or "tuned"
+    )
+    second = _workflow(tmp_path)
+    calls = _install(monkeypatch, second, Script(None))
+    with second:
+        second.run(task_file)
+    assert calls == [] and [r["base_commit"] for r in resumed] == ["c0ffee1"]
+    state = _state(tmp_path)
+    assert state.done and state.verdict == "delivered" and state.tune["verdict"] == "tuned"
+    # Once it ended, a re-run finds the run complete.
+    third = _workflow(tmp_path)
+    _install(monkeypatch, third, Script(None))
+    with third:
+        third.run(task_file)
+    assert len(resumed) == 1
+
+
+def test_a_campaign_resumes_on_its_first_pin_as_its_last_attempt(monkeypatch):
+    from types import SimpleNamespace
+
+    import agent_flow.workflows.trtllm_modeling_v2.tune.stage as stage
+
+    seen = []
+
+    def stage_for(wf, state, base_commit="", attempt=1):
+        seen.append((base_commit, attempt))
+        return "tune-failed:spec"
+
+    monkeypatch.setattr(stage, "_stage_for", stage_for)
+    state = SimpleNamespace(tune={"base_commit": "c0ffee1", "attempt": 2})
+    assert stage.resume_campaign(None, state) == "tune-failed:spec"
+    assert seen == [("c0ffee1", 2)]
+    assert stage.campaign_verdict("TUNED\ntuned from c0ffee1") == "tuned"
+    assert stage.campaign_verdict("TUNE_FAILED (tune-failed:baseline)") == "tune-failed:baseline"
+    assert stage.campaign_verdict("TUNE_FAILED (incomplete)") is None
+    assert stage.campaign_verdict("raised OSError: the session went away") is None

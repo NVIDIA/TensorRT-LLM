@@ -140,6 +140,34 @@ def test_a_gate_lost_to_its_session_says_so_rather_than_timed_out(tmp_path):
         assert "timed out" not in result.detail
 
 
+def test_a_cancelled_gate_has_no_verdict_and_is_not_queued_again_at_once(tmp_path):
+    """A gate job cancelled through the spool raises: missing, not FAIL, and no re-run here."""
+    from types import SimpleNamespace
+
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import CANCELLED
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import check_runner
+    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
+
+    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
+    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
+    workflow.task_data = dict(_TASK, trtllm_repo_path=str(tmp_path))
+    runner = check_runner.CheckRunner(workflow)
+    runner._await_session = lambda log: pytest.fail("a cancelled gate waits for no session")
+    cancelled = f"{CANCELLED}: cancelled before it started"
+    runs = []
+
+    def run():
+        runs.append(1)
+        return SimpleNamespace(
+            name="accuracy[gsm8k]", member="dep4", passed=False, infrastructure=cancelled
+        )
+
+    with pytest.raises(check_runner._SessionLost, match="measured nothing"):
+        runner._gate_until_verdict(run, None)
+    assert runs == [1]
+
+
 # ----------------------------------------------------------- accuracy gate
 
 

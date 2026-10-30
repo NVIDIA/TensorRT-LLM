@@ -70,8 +70,8 @@ EVENTS_FILENAME = "planner_events.json"
 #: How many tasks run at once, and how many checks, unless the caller says otherwise.
 DEFAULT_MAX_PARALLEL_TASKS = 9
 DEFAULT_MAX_PARALLEL_CHECKS = 8
-#: Task kinds that run for hours beside the graph: while only they run, the
-#: planner reads its events at once instead of waiting for the event window.
+#: Task kinds that run for hours beside the graph: while only they run, the loop
+#: reads the graph as idle, and no verdict of the onboarding waits for them.
 BACKGROUND_KINDS = graph_mod.BACKGROUND_KINDS
 #: How many times a task the run's infrastructure failed starts again on its own.
 INFRA_RETRIES = 1
@@ -80,6 +80,8 @@ STORAGE_FULL = frozenset({errno.EDQUOT, errno.ENOSPC})
 #: How many stale checks run again, in the contract's order, beside running work each
 #: time the target changes; the rest wait for the graph to run out of work.
 RECHECKS_WHILE_BUSY = 4
+#: Agent slots a campaign's turns may take at once while the onboarding has work open.
+CAMPAIGN_SLOTS_BESIDE_ONBOARDING = 2
 #: How long a task thread waiting on its soft dependencies sleeps between looks,
 #: past the wake-up each recorded outcome gives it.
 SOFT_POLL_S = 5.0
@@ -399,6 +401,9 @@ class GraphOrchestrator:
         self._rehearsed: set[str] = set()
         #: The task threads in flight, by task id, as the loop drives them.
         self._running: dict[str, Future] = {}
+        #: The campaign whose end the loop had not recorded when :meth:`run` returned the
+        #: onboarding's verdict: not waited for, the tune stage reads its end.
+        self.campaign: Future | None = None
         #: Tasks whose work finished but some of whose checks raised: why, until recorded.
         self._inconclusive: dict[str, str] = {}
         #: Planner turns that raised in a row, and when the planner may be asked again.
@@ -409,6 +414,8 @@ class GraphOrchestrator:
         #: Running tasks whose thread needs no agent now: waiting on soft dependencies
         #: or running its checks. They take no task slot and hold no devices meanwhile.
         self._agentless: set[str] = set()
+        #: Per ready task of a gated kind, the checks it was last journaled as waiting for.
+        self._gated_said: dict[str, tuple[str, ...]] = {}
         #: Tasks whose commits were integrated on the target, and the attempt that did:
         #: a soft dependency is met then, without waiting for its checks.
         self._integrated: dict[str, int] = {}
@@ -631,8 +638,21 @@ class GraphOrchestrator:
         return Priority.CRITICAL if path.get(task.id, 0) >= longest else Priority.REQUIRED
 
     def idle_agent_slots(self) -> int:
-        """Agent slots the open foreground work leaves idle: what a campaign's turns may use."""
+        """Agent slots the open foreground work leaves idle: what a side turn may use."""
         return max(0, AgentGate(self.max_parallel).task_slots - self._foreground_demand)
+
+    def campaign_agent_slots(self) -> int:
+        """Agent slots a campaign's turns may take now.
+
+        The idle ones; while the onboarding has a task open, at most
+        :data:`CAMPAIGN_SLOTS_BESIDE_ONBOARDING` of them.
+        """
+        idle = self.idle_agent_slots()
+        onboarding = any(
+            t.status in ("pending", "running") and t.kind not in BACKGROUND_KINDS
+            for t in self.graph.tasks
+        )
+        return min(idle, CAMPAIGN_SLOTS_BESIDE_ONBOARDING) if onboarding else idle
 
     def agentless(self, task_id: str) -> bool:
         """Whether running ``task_id`` needs no agent and no device now (waiting or checking)."""
@@ -756,6 +776,21 @@ class GraphOrchestrator:
             kind: [k for k in keys if k not in passed] for kind, keys in self.start_after.items()
         }
         return {kind: keys for kind, keys in waiting.items() if keys}
+
+    def _say_gated(self, gated: Mapping[str, Sequence[str]], ready: set[str]) -> None:
+        """Journal, as it changes, what each ready task of a gated kind still waits for.
+
+        While the onboarding's work runs, the note that names a blocked task's
+        checks (once nothing else does) never comes: this one says it meanwhile.
+        """
+        kinds = {t.id: t.kind for t in self.graph.tasks}
+        waiting = {
+            tid: tuple(gated[kinds[tid]]) for tid in sorted(ready) if kinds.get(tid) in gated
+        }
+        for tid, keys in waiting.items():
+            if self._gated_said.get(tid) != keys:
+                self.s.log(f"[gated] {tid} ({kinds[tid]}) waits for {', '.join(keys)} to pass")
+        self._gated_said = waiting
 
     def _waiting_for_core(self) -> set[str]:
         """The pending feature-unit and variant tasks that wait for the core to boot once.
@@ -1093,12 +1128,6 @@ class GraphOrchestrator:
             f"[planner] revision {len(self.graph.revisions)} already answered "
             f"{len(dropped)} event(s) of its turn: " + "; ".join(event.text for event in dropped)
         )
-
-    def _only_background(self, running: dict) -> bool:
-        """Whether every running task is one that runs for hours beside the graph (a campaign)."""
-        if not running or self._settling is not None:
-            return False
-        return not self._foreground(running)
 
     def _operator_waiting(self) -> bool:
         """Whether a message from the operator waits for the planner's next turn."""
@@ -1771,6 +1800,10 @@ class GraphOrchestrator:
         then returns at once, and the turns and checks in flight are left to
         end on their own. The loop's own failure, or Ctrl-C, records what
         finished and raises at once, the same way; a resumed run starts them again.
+
+        A verdict never waits for a campaign: the onboarding's own work in flight
+        is waited for, and a campaign still running is left running, as
+        :attr:`campaign`, for the tune stage to wait for.
         """
         checks = ThreadPoolExecutor(
             max_workers=self.max_parallel_checks, thread_name_prefix="mv2-check"
@@ -1796,13 +1829,26 @@ class GraphOrchestrator:
                     self._closing = True
                     self._ended.notify_all()
                 stopped = crashed or self._stop.done()
-                for pool in (planner, tasks):
-                    pool.shutdown(wait=not stopped, cancel_futures=stopped)
+                planner.shutdown(wait=not stopped, cancel_futures=stopped)
+                self.campaign = None if stopped else self._unrecorded_campaign()
+                if self.campaign is not None:
+                    wait([f for f in self._running.values() if f is not self.campaign])
+                tasks.shutdown(wait=not stopped and self.campaign is None, cancel_futures=stopped)
         finally:
             # After the tasks: a task still running submits its checks here.
             stopped = crashed or self._stop.done()
             checks.shutdown(wait=not stopped, cancel_futures=stopped)
             self._check_pool = None
+
+    def _unrecorded_campaign(self) -> Future | None:
+        """The thread of a campaign (:data:`BACKGROUND_KINDS`) whose end the loop has not recorded.
+
+        Still running, or ended as the verdict came: either way the tune stage reads its end.
+        """
+        kinds = {t.id: t.kind for t in self.graph.tasks}
+        return next(
+            (f for tid, f in self._running.items() if kinds.get(tid) in BACKGROUND_KINDS), None
+        )
 
     def _record_finished(self) -> None:
         """Record the tasks whose thread already ended, as the loop would have: their work stands."""
@@ -1872,6 +1918,7 @@ class GraphOrchestrator:
             self._follow_shared_changes()
             waiting = self._regression_step() | self._closing_holds() | self._waiting_for_core()
             ready_now = {t.id for t in graph_mod.ready(self.graph, self._receipts_landed)}
+            self._say_gated(gated, ready_now)
             now = time.monotonic()
             self._ready_since = {tid: self._ready_since.get(tid, now) for tid in ready_now}
             chosen = graph_mod.next_to_start(
@@ -1916,10 +1963,10 @@ class GraphOrchestrator:
             # campaign runs (it changes nothing a check measures) the rest.
             if self._settling is None:
                 self._settle(busy=bool(self._foreground(running)))
-            idle = not running and self._settling is None and self._planner is None
-            # Nothing in flight but a campaign: what the graph owes is read as
-            # when idle; the run is delivered once the campaign ends.
-            spent = idle or (
+            # Nothing in flight but a campaign is nothing in flight: the onboarding
+            # decides, delivers and escalates without waiting for one, which goes on
+            # past it as the tune stage (:attr:`campaign`).
+            spent = (
                 not self._foreground(running) and self._settling is None and self._planner is None
             )
             if spent:
@@ -1942,8 +1989,7 @@ class GraphOrchestrator:
                 self._correctness(marker, evaluation, completion)
                 unreviewed, gaps = completion.unreviewed, completion.gaps
                 # A message the operator left is read before the run is delivered.
-                # A campaign started once the contract held: the run waits for it to end.
-                if completion.ready and not self._operator_waiting() and idle:
+                if completion.ready and not self._operator_waiting():
                     return "delivered"
                 # Standing complaints wake no turn while an escalation waits on the operator.
                 if unreviewed and not self._escalated:
@@ -1954,14 +2000,14 @@ class GraphOrchestrator:
                         "run: the run is not delivered before one has passed",
                         urgent=True,
                     )
-                elif idle and self._done_said and not holds:
+                elif self._done_said and not holds:
                     self.revisions_since_progress += 1
                     self._note(
                         "planner said DONE, but the contract does not hold:\n"
                         + evaluation.render(),
                         urgent=True,
                     )
-                elif idle and self._done_said and gaps:
+                elif self._done_said and gaps:
                     # Every check holds, and something else keeps full support out of
                     # reach: a DONE that changes nothing is no progress either.
                     self.revisions_since_progress += 1
@@ -1970,38 +2016,37 @@ class GraphOrchestrator:
                         + "\n".join(f"- {gap}" for gap in gaps),
                         urgent=True,
                     )
-                if idle:
-                    self._done_said = False
-                    blocked = graph_mod.ready(self.graph, self._receipts_landed)
-                    if blocked and not self._escalated:
-                        # Ready work that cannot start with nothing running never will.
-                        before_core = self._waiting_for_core()
-                        reasons = ", ".join(
-                            f"{t.id} (waits for {', '.join(gated[t.kind])})"
-                            if t.kind in gated
-                            else f"{t.id} (waits for a core boot to pass)"
-                            if t.id in before_core
-                            else f"{t.id} ({self._held(t)} GPUs)"
-                            for t in blocked
-                        )
-                        self._note(
-                            f"ready tasks cannot start on {free} free GPUs: {reasons}", urgent=True
-                        )
-                        self.revisions_since_progress += 1
+                self._done_said = False
+                blocked = graph_mod.ready(self.graph, self._receipts_landed)
+                if blocked and not self._escalated:
+                    # Ready work that cannot start with nothing running never will
+                    # (a campaign holds none of the run's devices).
+                    before_core = self._waiting_for_core()
+                    reasons = ", ".join(
+                        f"{t.id} (waits for {', '.join(gated[t.kind])})"
+                        if t.kind in gated
+                        else f"{t.id} (waits for a core boot to pass)"
+                        if t.id in before_core
+                        else f"{t.id} ({self._held(t)} GPUs)"
+                        for t in blocked
+                    )
+                    self._note(
+                        f"ready tasks cannot start on {free} free GPUs: {reasons}", urgent=True
+                    )
+                    self.revisions_since_progress += 1
                 self._save_events()
             if self._planner is None:
-                if self._escalated and idle and not self._loud():
-                    # Nothing runs, and nothing came in since: only the operator can move it.
+                if self._escalated and spent and not self._loud():
+                    # Nothing runs but a campaign, and nothing came in since: only the
+                    # operator can move it.
                     return "escalated"
                 if self._loud() and self._first_event_at is None:
                     self._first_event_at = time.monotonic()
-                # With nothing in flight the graph is spent or stuck: the planner
-                # decides what comes next. A campaign alone in flight leaves the
-                # graph as idle for hours, so its events do not wait for the window.
-                # Otherwise the planner reads events as they come due.
-                background = bool(self.events) and self._only_background(running)
+                # With nothing in flight but a campaign the graph is spent or stuck: the
+                # planner decides what comes next. Otherwise it reads events as they
+                # come due.
                 retry_due = time.monotonic() >= self._planner_retry_at
-                if retry_due and (idle or background or self._events_due()):
+                if retry_due and (spent or self._events_due()):
                     # A stall is judged only once no task but a campaign runs: while
                     # work is in flight its outcome may still be the progress.
                     if spent and graph_mod.stalled(

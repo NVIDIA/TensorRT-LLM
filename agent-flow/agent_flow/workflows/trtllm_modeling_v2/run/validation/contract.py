@@ -874,6 +874,18 @@ def bringup_checks(contract: Contract) -> tuple[Check, ...]:
     return tuple(c for c in own if c.member == narrowest)
 
 
+def core_checks(contract: Contract, core: str | None = None) -> tuple[Check, ...]:
+    """The core's required checks (``core``, else the first unit's): what a campaign waits for.
+
+    A campaign tunes the core. The features' and the variants' checks do not
+    hold it back; they go on beside it, and delivery still owes every one.
+    """
+    if not contract.checks:
+        return ()
+    unit = core or contract.checks[0].unit
+    return tuple(c for c in contract.required() if c.unit == unit)
+
+
 def bringup_holds(contract: Contract, evaluation: Evaluation) -> bool:
     """Whether every bring-up check passed in ``evaluation`` (its own verdict or an equivalent's)."""
     owed = bringup_checks(contract)
@@ -943,6 +955,7 @@ __all__ = [
     "benchmark_members",
     "bringup_checks",
     "bringup_holds",
+    "core_checks",
     "bringup_milestone",
     "cell_name",
     "cells",

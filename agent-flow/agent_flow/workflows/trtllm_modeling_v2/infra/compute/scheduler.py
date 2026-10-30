@@ -85,7 +85,9 @@ One priority queue per watcher, ordered by effective priority (``priority`` plus
 :data:`AGING_S` waited), then whole-node jobs before device-slot jobs, then submission order (the
 pending file's mtime), then name. A GPU job waiting for devices blocks every GPU job ranked below
 it, so a stream of single-device jobs never starves a whole-node or multi-device one; a job that
-holds no device never waits for one.
+holds no device never waits for one. A job of a negative priority is background work (the tune
+campaign's): it does not age, so every other job ranks ahead of it however long it has waited,
+and, ranked last, it holds none of them back.
 
 A GPU job starts only on devices whose memory has come back. An engine sizes its KV-cache and
 recurrent pools from the device memory it finds free, so one started beside memory a cancelled
@@ -179,6 +181,8 @@ RC_GANG_STOPPED = 219
 
 #: Verdict reasons of a job its session ended, not the job: nothing in them is a verdict.
 SESSION_LOSS_REASONS = frozenset({"orphaned", "node_lost"})
+#: The verdict reason of a job withdrawn through the spool (``cancel/<name>``): it measured nothing.
+CANCELLED_REASON = "cancelled"
 
 #: A watcher that has not heart-beat for this long is gone, and its allocation with it.
 WATCHER_STALE_S = 180.0
@@ -959,6 +963,9 @@ class Scheduler:
     # ------------------------------------------------------------- admission
 
     def _effective_priority(self, spec: JobSpec, now: float) -> int:
+        if spec.priority < 0:
+            # Background work (the tune campaign's) never ages past anyone else's.
+            return spec.priority
         return spec.priority + int(max(0.0, now - spec.submitted) // AGING_S)
 
     def _rank_key(self, spec: JobSpec, now: float) -> tuple:
@@ -1039,7 +1046,7 @@ class Scheduler:
                 continue
             if (self.paths.cancel / spec.name).exists():
                 self._refuse(
-                    spec, "cancelled before it started", rc=RC_CANCELLED, reason="cancelled"
+                    spec, "cancelled before it started", rc=RC_CANCELLED, reason=CANCELLED_REASON
                 )
                 continue
             if (self.paths.running / f"{spec.name}.sh").exists():
@@ -1715,7 +1722,7 @@ class Scheduler:
         """Why a still-running job must stop now, if it must."""
         name = job.gang["name"] if job.gang else job.spec.name
         if (self.paths.cancel / name).exists():
-            return Verdict(RC_CANCELLED, "cancelled", "cancel requested through the spool")
+            return Verdict(RC_CANCELLED, CANCELLED_REASON, "cancel requested through the spool")
         if job.gang:
             stop = self._gang_stop(job, now)
             if stop is not None:
@@ -2167,6 +2174,7 @@ __all__ = [
     "DEVICE_RELEASE_WAIT_S",
     "FAILURE_STALL_S",
     "FREE_PREFIX",
+    "CANCELLED_REASON",
     "HANDOVER_DIRNAME",
     "HANDOVER_MARGIN_S",
     "HEADER_KEYS",

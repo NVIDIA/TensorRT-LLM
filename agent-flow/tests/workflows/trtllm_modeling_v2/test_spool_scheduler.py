@@ -16,7 +16,10 @@ import pytest
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import scheduler, spoolctl
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.commands import CommandSpec
-from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import SpoolCommandExecutor
+from agent_flow.workflows.trtllm_modeling_v2.infra.compute.executor import (
+    CANCELLED,
+    SpoolCommandExecutor,
+)
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
     DEVICE_RELEASE_WAIT_S,
     FAILURE_STALL_S,
@@ -407,3 +410,42 @@ def test_a_wall_limit_is_a_timeout_not_a_lost_session(spool, served):
     )
     assert result.timed_out and result.returncode == RC_WALL_LIMIT
     assert result.infrastructure == ""
+
+
+def test_a_campaigns_job_never_ages_ahead_of_the_onboardings_nor_holds_one_back(spool, clock):
+    """Background work (``priority=-1``) waits behind every other job, however long it waited."""
+    sched = make(spool, clock)
+    submit(spool, "holder", blocking(spool, "holder"), header="gpus=1 wall=8h")
+    pump(sched, lambda: "holder" in running(sched))
+    # The campaign's whole-node measurement cannot place beside the holder, and waits.
+    submit(spool, "tune-measure", "echo measured", header="gpus=4 priority=-1")
+    sched.tick()
+    clock.advance(3 * scheduler.AGING_S)
+    # A check queued hours later still ranks first, and starts on the free devices.
+    submit(spool, "boot", "echo started", header="gpus=1 priority=1", submitted=clock.now)
+    pump(sched, lambda: rc(spool, "boot") is not None)
+    assert rc(spool, "boot") == 0 and rc(spool, "tune-measure") is None
+    pending = {p["name"]: p for p in sched.snapshot(clock.now)["pending"]}
+    assert pending["tune-measure"]["effective_priority"] == -1
+    release(spool, "holder")
+    pump(sched, lambda: rc(spool, "tune-measure") is not None)
+
+
+def test_a_cancelled_job_measured_nothing_and_says_so(spool, served):
+    """Cancelled through the spool (by the operator, say): no verdict, and no lost session."""
+    results = []
+    executor = SpoolCommandExecutor(spool, poll_s=0.05)
+    thread = threading.Thread(
+        target=lambda: results.append(executor.execute(CommandSpec(argv="sleep 30", timeout_s=60)))
+    )
+    thread.start()
+    running = SpoolPaths(spool).running
+    deadline = time.time() + 10
+    while not list(running.glob("*.sh")) and time.time() < deadline:
+        time.sleep(0.05)
+    (job,) = running.glob("*.sh")
+    spoolctl.cancel_job(spool, job.stem)
+    thread.join(timeout=20)
+    (result,) = results
+    assert result.returncode == RC_CANCELLED and not result.timed_out
+    assert result.infrastructure.startswith(CANCELLED)

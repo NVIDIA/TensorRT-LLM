@@ -37,4 +37,5 @@ def test_the_first_units_inner_checks_go_ahead_of_every_other():
         ("mtp:boot@tp1", priority.FEATURE),
         ("mtp:acceptance@tp1", priority.FEATURE),
     ]
-    assert priority.current_job_priority() == priority.PERF
+    # Outside a check: the scheduler's default, never the campaign's background class.
+    assert priority.current_job_priority() == 0 > priority.PERF

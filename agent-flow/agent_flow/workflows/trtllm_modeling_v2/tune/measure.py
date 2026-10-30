@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Sequence
 import yaml
 
 from ..infra.compute import placement, spoolctl
+from ..infra.compute.executor import PERF
 from ..infra.compute.scheduler import (
     RC_LAUNCH_FAILED,
     RC_NODE_LOST,
@@ -429,7 +430,8 @@ class SpoolRunner:
         gpus: str = "all",
     ) -> str:
         name = f"{self.prefix}-{label}"
-        header = {"gpus": gpus, "wall": wall}
+        # Background work: below every job of the onboarding, which it never holds back.
+        header = {"gpus": gpus, "wall": wall, "priority": PERF}
         if tree:
             header["tree"] = tree
         script = spoolctl.render_job(command, header=header)

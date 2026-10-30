@@ -13,8 +13,8 @@ PERF_KEYS = {
     "enabled", "model", "target", "identity_configs", "workload", "spools", "dev_spools",
     "env_script", "campaign", "source_embargo", "sister_engines", "wall", "configs", "goal", "sol",
 }  # fmt: skip
-#: Keys the campaign no longer reads: it starts once onboarding is complete and measures one
-#: baseline, with no stock reference beside it and no repeat of it.
+#: Keys the campaign no longer reads: it starts once the core holds and measures one baseline,
+#: with no stock reference beside it and no repeat of it.
 REMOVED_PERF_KEYS = {
     "reference": "no stock reference is measured; a goal is a ratio to the baseline",
     "noise_repeats": "the baseline is measured once",

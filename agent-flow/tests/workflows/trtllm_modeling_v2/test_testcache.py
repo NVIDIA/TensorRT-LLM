@@ -234,3 +234,43 @@ def test_a_change_to_one_entry_runs_the_tests_that_reach_it(tmp_path):
     shared = _commit(repo, head, {f"{catalog}/__init__.py": ""}, message="shared")
     assert regression.affected_files(repo, head, shared, listed)[0] == listed
     assert regression.affected_files(repo, None, head, listed)[0] == listed
+
+
+def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):
+    """``catalog/_op.py`` reaches a test through the entry that imports it, or the helper that does."""
+    repo = tmp_path / "repo"
+    catalog, tests = regression.CATALOG_DIR, regression.CATALOG_TESTS_DIR
+    dotted = catalog.replace("/", ".")
+    files = {
+        f"{catalog}/_op.py": "class OpWrapper:\n    pass\n",
+        f"{catalog}/gemm/mm.py": "from .._op import OpWrapper\n",
+        f"{catalog}/norm/rms.py": "X = 1\n",
+        f"{tests}/_validating.py": f"from {dotted}._op import OpWrapper\n",
+        f"{tests}/gemm/test_mm.py": f"from {dotted}.gemm import mm\n",
+        f"{tests}/norm/test_rms.py": f"from _validating import validating\nfrom {dotted}.norm.rms import X\n",
+        f"{tests}/norm/test_untouched.py": f"from {dotted}.norm.rms import X\n",
+        # A rank matrix the test starts by file path, through a launcher it imports.
+        f"{tests}/comm/_rank_job.py": "import subprocess\n",
+        f"{tests}/comm/_mm_matrix.py": f"def body():\n    from {dotted}.gemm import mm\n",
+        f"{tests}/comm/test_mm_matrix.py": "import _rank_job\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if "/test_" in p)
+    head = _commit(repo, base, {f"{catalog}/_op.py": "class OpWrapper:\n    x = 1\n"})
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [
+        f"{tests}/comm/test_mm_matrix.py",
+        f"{tests}/gemm/test_mm.py",
+        f"{tests}/norm/test_rms.py",
+        f"{tests}/test_modeling_v2_claims.py",
+    ]
+    assert why == "4 of 5 test files reach what changed"

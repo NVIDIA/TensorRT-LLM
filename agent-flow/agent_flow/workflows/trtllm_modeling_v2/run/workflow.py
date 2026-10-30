@@ -14,8 +14,11 @@ dispatch and close:
 2. ``execution`` -- the planner's task graph, driven until the contract holds
    (``run/execution/tasks.py``, ``orchestrator.py``), then delivery. With
    ``perf.enabled`` the graph holds a ``tune`` task, which starts once the
-   core is correct and runs beside the remaining work.
-3. ``tune``      -- only for ``trtllm-modeling-v2 tune``: a target onboarded
+   core is correct and runs beside the remaining work. The onboarding's
+   verdict never waits for it: the run closes on that verdict, and a campaign
+   still running goes on past the close as the tune stage
+   (:meth:`_campaign_after_onboarding`), whose outcome changes no verdict of it.
+3. ``tune``      -- for ``trtllm-modeling-v2 tune``: a target onboarded
    elsewhere, tuned on its own.
 
 Every stage checkpoints before advancing, so a crash resumes where it was.
@@ -29,6 +32,7 @@ import os
 import shutil
 import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Collection, Iterator, Mapping, Sequence
@@ -89,8 +93,8 @@ DEFAULT_MAX_PARALLEL_TASKS = orchestrator_mod.DEFAULT_MAX_PARALLEL_TASKS
 DEFAULT_REVISION_CAP = 6
 #: While tasks, checks or a planner turn are in flight, how long a task that finished
 #: with its checks green waits to reach the planner with the events after it. A
-#: failure, a worker's report, an operator's message, a failed re-check, or nothing left to run
-#: or start wakes the planner at once.
+#: failure, a worker's report, an operator's message sent ``--now``, a failed re-check, or nothing
+#: left to run or start wakes the planner at once.
 DEFAULT_EVENT_WINDOW_S = 900.0
 #: Where the run's skills go under the workspace, each agent session's cwd:
 #: Claude Code reads `.claude/skills`, Codex `.agents/skills`.
@@ -566,7 +570,7 @@ class TrtllmModelingV2Workflow:
         re-running the same command proves the substrate again and resumes.
         """
         self._state = state
-        beside = stop if state.stage != STAGE_TUNE else None
+        beside = stop if state.stage != STAGE_TUNE and not state.done else None
         if state.stage == STAGE_PREFLIGHT:
             if not bootstrap._run_preflight(self, state, log, stop=beside):
                 return
@@ -592,13 +596,20 @@ class TrtllmModelingV2Workflow:
                 )
                 return
 
+        if state.done:
+            # A closed onboarding whose campaign did not end (`campaign_owed`): only it goes on.
+            self._campaign_after_onboarding(state, log)
+            return
+
         if state.stage == STAGE_EXECUTION:
             self.journal.mark_started()
             _start_with_the_survey(self)
-            if not ExecutionStage(self).run_execution(state, log):
-                return
-            tuned = state.tune.get("phase") == "done"
-            self._close_run(state, log, verdict="tuned" if tuned else "delivered")
+            execution = ExecutionStage(self)
+            if execution.run_execution(state, log):
+                # The onboarding's verdict; a campaign's is `state.tune["verdict"]`.
+                self._close_run(state, log, verdict="delivered")
+            if state.done and execution.campaign is not None:
+                self._campaign_after_onboarding(state, log, execution.campaign)
             return
 
         if state.stage == STAGE_TUNE:
@@ -779,6 +790,21 @@ class TrtllmModelingV2Workflow:
 
         if self.resume:
             state = load_state(self.state_path)
+            if (
+                state.done
+                and campaign_owed(state)
+                and (self.entry_stage == STAGE_TUNE or not is_remediable(state.verdict))
+            ):
+                # The onboarding closed beside a campaign that did not end: only the
+                # campaign goes on. A re-run after a repair re-enters the onboarding
+                # instead, where the campaign's task resumes it.
+                print_message(
+                    f"[bold cyan]→ the run closed '{state.verdict}'; its campaign goes on "
+                    f"as the tune stage[/bold cyan]",
+                    log,
+                )
+                self._refresh_workspace_spec(source, log)
+                return state
             if state.done and is_remediable(state.verdict):
                 # The run closed on something the operator fixes outside it,
                 # and re-running its own checks is the only way to see the fix.
@@ -799,6 +825,7 @@ class TrtllmModelingV2Workflow:
                 # re-enter at tune, keep the campaign's history, reset its misses.
                 state.done, state.verdict, state.stage = False, "", STAGE_TUNE
                 state.tune = {**state.tune, "misses": 0, "entry": "re-entered"}
+                state.tune.pop("verdict", None)
                 if state.tune.get("phase") == "done":
                     state.tune["phase"] = "campaign"
             elif state.done:
@@ -1046,6 +1073,44 @@ class TrtllmModelingV2Workflow:
         assert self.environment is not None, "preflight must run before any gate"
         return self.environment
 
+    def _campaign_after_onboarding(
+        self, state: WorkflowState, log, campaign: Future | None = None
+    ) -> None:
+        """The tune stage past the onboarding's close: its campaign, which changes no verdict of it.
+
+        ``campaign`` is the campaign's thread, still running when the onboarding's
+        verdict came; without one, the campaign resumes from its checkpoint
+        (``state.tune``) in a later process. Its outcome goes to
+        ``state.tune["verdict"]`` and the journal; ``state.verdict`` stays the
+        onboarding's.
+        """
+        state.tune["onboarded"] = state.verdict
+        self._checkpoint(state)
+        note = (
+            f"the onboarding closed `{state.verdict}`; its campaign goes on, and its "
+            f"outcome changes no verdict of the onboarding"
+        )
+        self.journal.event("tune stage", note)
+        print_message(f"[bold cyan]→ tune stage: {escape_markup(note)}[/bold cyan]", log)
+        if campaign is not None:
+            try:
+                decision, _ = campaign.result()
+            except Exception as exc:  # the campaign's own failure: a later process resumes it
+                decision = f"raised {type(exc).__name__}: {exc}"
+            verdict = tune_stage.campaign_verdict(decision)
+        else:
+            verdict = tune_stage.resume_campaign(self, state)
+        if verdict is None:
+            self.journal.event(
+                "tune stage", "the campaign did not end; the same command resumes it"
+            )
+            return
+        state.tune["verdict"] = verdict
+        self._checkpoint(state)
+        said = f"ended `{verdict}`; the onboarding's verdict stays `{state.verdict}`"
+        self.journal.event("tune stage", said)
+        print_message(f"[bold]tune stage {escape_markup(said)}[/bold]", log)
+
     def _close_run(self, state: WorkflowState, log, *, verdict: str) -> None:
         state.done = True
         state.verdict = verdict
@@ -1082,6 +1147,11 @@ class TrtllmModelingV2Workflow:
             f"[bold]run closed — verdict {verdict}[/bold]",
             log,
         )
+
+
+def campaign_owed(state: WorkflowState) -> bool:
+    """Whether the onboarding closed beside a campaign that has not ended yet."""
+    return bool(state.tune.get("onboarded")) and not state.tune.get("verdict")
 
 
 @dataclass

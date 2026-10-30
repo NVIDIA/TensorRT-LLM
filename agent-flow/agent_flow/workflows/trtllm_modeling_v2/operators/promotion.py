@@ -276,9 +276,6 @@ def is_promote(task: Any) -> bool:
     return task.kind == "kernel" and str(task.ref).startswith(f"{MODE_PROMOTE}:")
 
 
-_is_promote = is_promote
-
-
 def _live(task: Any, status: Mapping[str, str]) -> bool:
     """Running, or pending with every dependency done: it is working or about to start."""
     if task.status == "running":
@@ -288,7 +285,7 @@ def _live(task: Any, status: Mapping[str, str]) -> bool:
 
 def _variant_entries(task: Any, target_rel: str) -> set[str]:
     """The shared entries a (non-promote) kernel task lands a local variant of, by its files."""
-    if task.kind != "kernel" or _is_promote(task):
+    if task.kind != "kernel" or is_promote(task):
         return set()
     target = target_rel.strip().rstrip("/")
     found = set()
@@ -342,7 +339,7 @@ def plan(
         return Promotion()
     covering: dict[str, Any] = {}
     for task in tasks:
-        if _is_promote(task):
+        if is_promote(task):
             for entry in _promoted_entries(task):
                 covering[entry] = task
     landing = {

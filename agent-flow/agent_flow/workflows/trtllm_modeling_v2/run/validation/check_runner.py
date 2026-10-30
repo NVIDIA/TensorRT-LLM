@@ -23,6 +23,7 @@ from ...checks.accuracy import resolve_model_key
 from ...infra.compute.environment import RunEnvironment
 from ...infra.compute.executor import (
     ACCURACY,
+    CANCELLED,
     FEATURE,
     current_job_priority,
     job_priority,
@@ -52,7 +53,7 @@ SESSION_LOSS_RERUNS = 3
 
 
 class _SessionLost(RuntimeError):
-    """A gate was lost to its session and no session came back: the check has no verdict."""
+    """A gate measured nothing (lost to its session, none back; or cancelled): no verdict."""
 
 
 class CheckRunner:
@@ -154,6 +155,11 @@ class CheckRunner:
         A loss is what the gate says (`GateResult.infrastructure`) or what the
         runner saw while it ran (`_noting_session_loss`). A gate that passed is
         a verdict whatever happened along the way.
+
+        A gate whose job was cancelled through the spool measured nothing either,
+        but its session is fine: it raises `_SessionLost` at once, so the check
+        has no verdict (it is missing, not failed) and runs again later, as a
+        re-check, not straight back into the queue it was taken out of.
         """
         lost_in_a_row = 0
         while True:
@@ -166,8 +172,11 @@ class CheckRunner:
             reason = result.infrastructure or self._session.loss
             if result.passed or not reason:
                 return result
-            lost_in_a_row += 1
             label = f"{result.name}@{result.member}" if result.member else result.name
+            if CANCELLED in reason:
+                self.journal.event("gate cancelled", f"{label}: {reason}")
+                raise _SessionLost(f"{label} measured nothing: {reason}")
+            lost_in_a_row += 1
             self.journal.event("gate lost to its session", f"{label}: {reason}")
             print_message(
                 f"[bold yellow]⚠ {escape_markup(label)} did not run to a verdict: "

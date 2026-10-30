@@ -288,18 +288,19 @@ order. Work that builds on the core's code starts from it while its accuracy
 is still being debugged; a fix that lands later reaches it through
 integration.
 
-A `tune` task is the performance work that follows the onboarding. Keep it in
-the graph from the start; it does not start until every required check has
-passed (the onboarding is complete), and it works on the commit the target is
-at then, in its own worktrees: one baseline, then the campaign. Give it empty
-`touches`; with perf sessions in
-`task.yaml` (`perf.spools`) give it `resources.gpus: 0`, since its jobs go to
-them; without, give it the devices one measurement needs. No task depends on
-it, and none integrates its branch: its best branch is an artifact of the
-run. Once full support holds (every required check, the delivery files on
-disk, every landed change to shared code through a regression check, no local
-variant waiting), the orchestrator records that commit; the run is delivered
-when the campaign ends (its goal, budget or ideas spent). So plan the delivery
+A `tune` task is background performance work for what the onboarding's
+workers leave; it never holds the onboarding back. Keep it in the graph from
+the start; it does not start until the core's required checks have passed (the
+features' and variants' checks do not hold it back and go on beside it), and it
+works on the commit the target is at then, in its own worktrees: one baseline,
+then the campaign. Give it empty `touches` and `resources.gpus: 0`: its jobs
+queue below every job of the onboarding and reserve none of its devices. No
+task depends on it, and none integrates its branch: its best branch is an
+artifact of the run. Once full support holds (every required check, the
+delivery files on disk, every landed change to shared code through a
+regression check, no local variant waiting), the orchestrator records that
+commit and the run is delivered at once; a campaign still running goes on
+after, and its outcome changes no verdict of yours. So plan the delivery
 files as a task of their own once the first
 unit's assembly is done: the CI accuracy test, its entry on a test list and,
 when the accuracy anchor is written, the accuracy reference entry.

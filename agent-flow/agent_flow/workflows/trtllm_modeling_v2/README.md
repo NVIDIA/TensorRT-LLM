@@ -84,9 +84,16 @@ planner's next turn; `--now` wakes it, for what must change before that.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    the operator handles cluster allocations and session renewal.
-5. **Tune optionally:** tuning starts once onboarding is complete (every required check has passed),
-   or runs on its own (`trtllm-modeling-v2 tune`). It measures one baseline, with no smoke, stock
-   reference or repeat, then starts the campaign; the run is delivered when the campaign ends. Tuner
+5. **Tune optionally:** tuning is background work for what the onboarding's workers leave, and
+   never holds the onboarding back. It starts once the core's required checks have passed (the
+   features' and variants' checks go on beside it; delivery still owes them), or runs on its own
+   (`trtllm-modeling-v2 tune`). Its spool jobs queue below every job of the onboarding and never
+   rise above them while they wait; it reserves none of the run's devices; its turns take at most
+   two agent slots while the onboarding has work open. The onboarding's verdict (delivered,
+   escalated, ...) closes the run when it comes; a campaign still running goes on past it as the
+   tune stage, and ends in `state.tune["verdict"]`, never in the run's verdict; a process that
+   stops meanwhile resumes it with the same command, or `tune`. It measures one baseline, with no
+   smoke, stock reference or repeat, then starts the campaign. Tuner
    proposals run in parallel; verification and keeps serialize. A micro-bench speedup is projected
    to end-to-end through the share of the step its kernels take, its outputs held roughly to the
    control's, and a win keeps at once. Every few keeps a checkpoint measures end-to-end, the first

@@ -15,6 +15,8 @@ the gates' policy over the spool:
   not run work nobody waits for. A spool whose heartbeat is already stale gets nothing queued.
 - **A lost session is not a failed command**: the result says so in ``infrastructure``, and
   :meth:`SpoolCommandExecutor.wait_for_session` waits for one to come back before a re-run.
+- **Nor is a cancelled job**: its ``infrastructure`` begins with :data:`CANCELLED`; the gate it
+  ran for has no verdict, and is not re-run at once against whoever cancelled it.
 """
 
 from __future__ import annotations
@@ -37,15 +39,27 @@ from .commands import (
     LocalCommandExecutor,
 )
 from .environment import RunEnvironment
-from .scheduler import SESSION_LOSS_REASONS, WATCHER_STALE_S, SpoolPaths, watcher_age
+from .scheduler import (
+    CANCELLED_REASON,
+    SESSION_LOSS_REASONS,
+    WATCHER_STALE_S,
+    SpoolPaths,
+    watcher_age,
+)
+
+#: How a command's ``infrastructure`` begins when its job was withdrawn through the spool
+#: (by the operator, or by a caller that gave up on it): no verdict, and not a lost session.
+CANCELLED = "the job was cancelled through the spool"
 
 #: The classes a job queues at; the spool scheduler starts a waiting job of a
 #: higher one first. Checks on the way to the first unit's accuracy: its boot and benchmark.
 ACCURACY = 2
 #: Every other check: the feature units, the variants, the proofs, delivery.
 FEATURE = 1
-#: The tune campaign's measurements and candidates.
-PERF = 0
+#: The tune campaign's measurements and candidates: background work, below every job of the
+#: onboarding (a worker's own jobs queue at 0). A negative class never ages (``scheduler``), so a
+#: campaign's job, however long it waits, never ranks ahead of the onboarding's or holds one back.
+PERF = -1
 
 _local = threading.local()
 
@@ -66,9 +80,9 @@ def job_priority(priority: int) -> Iterator[None]:
 
 
 def current_job_priority() -> int:
-    """The class this thread's jobs queue at; :data:`PERF` (the scheduler's 0) by default."""
+    """The class this thread's jobs queue at; the scheduler's 0 by default (never :data:`PERF`)."""
     priority = getattr(_local, "priority", None)
-    return PERF if priority is None else int(priority)
+    return 0 if priority is None else int(priority)
 
 
 class SpoolCommandExecutor(CommandExecutor):
@@ -231,19 +245,22 @@ class SpoolCommandExecutor(CommandExecutor):
                 timed_out=True,
                 infrastructure=reason if lost else "",
             )
-        lost = ""
+        lost = cancelled = ""
         if record.get("reason") in SESSION_LOSS_REASONS:
             lost = (
                 f"the session that ran it stopped heart-beating and the job was closed "
                 f"out as {record['reason']}: {record.get('detail') or 'no detail recorded'}"
             )
+        elif record.get("reason") == CANCELLED_REASON:
+            cancelled = f"{CANCELLED}: {record.get('detail') or 'no detail recorded'}"
         return CommandResult(
             returncode=int(record["rc"]),
             stdout=self._log(root, name),
             # The scheduler stops a job at its wall limit or when it stops making
             # progress, and a job whose session died under it measured nothing.
             timed_out=bool(record.get("timed_out")) or bool(lost),
-            infrastructure=lost,
+            # A cancelled job measured nothing either, whatever its exit code says.
+            infrastructure=lost or cancelled,
         )
 
 
@@ -304,6 +321,7 @@ def shell_runner_for(executor: CommandExecutor, *, default_timeout: int = 1800) 
 
 __all__ = [
     "ACCURACY",
+    "CANCELLED",
     "FEATURE",
     "PERF",
     "SESSION_LOSS_REASONS",
