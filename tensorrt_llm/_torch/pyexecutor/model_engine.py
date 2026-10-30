@@ -118,6 +118,7 @@ from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .sampler import SampleStateTensors
+from .sampler.beam_search import PendingBeamHistories
 from .sampler.ops.flashinfer import (warmup_sample_from_logits_op,
                                      warmup_sampling_module)
 from .sampler.sampler_common import SampleType
@@ -377,6 +378,11 @@ class PyTorchModelEngine(ModelEngine):
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
+        # Starts rebuilding each live beam's generated tokens for beam-search
+        # requests, registered by PyExecutor from the sampler. Logits
+        # post-processors read the result instead of the per-slot token lists
+        # (see _start_beam_histories). Left None when the sampler has none.
+        self.start_beam_histories_callable = None
         self._cleanup_done = False
         self._runner: Optional[Union[ModelRunner, PackedModelRunner]] = None
         # Transitional snapshot for decoder capture and encoder scheduling.
@@ -1094,6 +1100,10 @@ class PyTorchModelEngine(ModelEngine):
     def register_sample_in_graph_callable(self, callable: Optional[Callable]):
         """Register the hook that samples at the tail of the forward graph."""
         self.sample_in_graph_callable = callable
+
+    def register_beam_histories_callable(self, callable: Optional[Callable]):
+        """Register where logits post-processors get live beam histories."""
+        self.start_beam_histories_callable = callable
 
     def register_sample_type_resolver(self,
                                       resolver: Optional[Callable],
@@ -6476,6 +6486,9 @@ class PyTorchModelEngine(ModelEngine):
             self._prepare_inputs_event = torch.cuda.Event()
             self._prepare_inputs_event.record()
 
+            pending_beam_histories = self._start_beam_histories(
+                scheduled_requests)
+
             breakable_runner = self.breakable_cuda_graph_runner
 
             with with_shared_pool(self.cuda_graph_runner.get_graph_pool()):
@@ -6551,7 +6564,8 @@ class PyTorchModelEngine(ModelEngine):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            self._execute_logit_post_processors(scheduled_requests, outputs)
+            self._execute_logit_post_processors(scheduled_requests, outputs,
+                                                pending_beam_histories)
 
             return outputs
 
@@ -6698,10 +6712,42 @@ class PyTorchModelEngine(ModelEngine):
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
 
-    def _execute_logit_post_processors(self,
-                                       scheduled_requests: ScheduledRequests,
-                                       outputs: dict):
-        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+    def _start_beam_histories(
+        self, scheduled_requests: ScheduledRequests
+    ) -> Optional[Tuple[List[LlmRequest], PendingBeamHistories]]:
+        """Start copying the live beam histories that logits post-processors will read.
+
+        Under beam search, request.get_tokens(beam_idx) is the list of tokens
+        appended to slot beam_idx, which stops matching the hypothesis that slot
+        holds as soon as the search reorders its beams; the corrected paths are
+        only written back when the request finishes. Processors get each live
+        beam's real history instead, gathered for all such requests in one pass.
+        The gather and its copy are queued before the forward pass, so the
+        processors wait for the copy rather than for the forward pass.
+        """
+        if (self.start_beam_histories_callable is None
+                or not self.mapping.is_last_pp_rank()):
+            return None
+        beam_requests = [
+            request for request in scheduled_requests.generation_requests
+            if getattr(request, "py_logits_post_processors", None)
+            and request.get_beam_width_by_iter(for_next_iteration=False) > 1
+        ]
+        if not beam_requests:
+            return None
+        return beam_requests, self.start_beam_histories_callable(beam_requests)
+
+    def _execute_logit_post_processors(
+        self,
+        scheduled_requests: ScheduledRequests,
+        outputs: dict,
+        pending_beam_histories: Optional[Tuple[List[LlmRequest],
+                                               PendingBeamHistories]] = None):
+        """Apply logit post processors (in-place modify outputs Tensors) if any.
+
+        pending_beam_histories is what _start_beam_histories returned for this
+        step.
+        """
 
         if not (self.mapping.is_last_pp_rank()):
             return
@@ -6711,6 +6757,14 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         logits_tensor = outputs["logits"]
+
+        beam_histories: Dict[int, List[List[int]]] = {}
+        if pending_beam_histories is not None:
+            beam_requests, pending = pending_beam_histories
+            beam_histories = {
+                id(request): histories
+                for request, histories in zip(beam_requests, pending.wait())
+            }
 
         logits_row_offset = 0
         request_groups = (
@@ -6737,11 +6791,17 @@ class PyTorchModelEngine(ModelEngine):
                 logits_processors = getattr(request,
                                             "py_logits_post_processors", None)
                 if logits_processors:
-                    token_ids = ([request.get_tokens(0)]
-                                 if is_context_request else [
-                                     request.get_tokens(beam_idx)
-                                     for beam_idx in range(beam_width)
-                                 ])
+                    if is_context_request:
+                        token_ids = [request.get_tokens(0)]
+                    elif (histories :=
+                          beam_histories.get(id(request))) is not None:
+                        prompt = request.get_tokens(0)[:request.py_prompt_len]
+                        token_ids = [prompt + history for history in histories]
+                    else:
+                        token_ids = [
+                            request.get_tokens(beam_idx)
+                            for beam_idx in range(beam_width)
+                        ]
                     if (is_context_request
                             and request.py_orig_prompt_len < len(token_ids[0])):
                         # Skip as we only need to apply logit processor on the last context request

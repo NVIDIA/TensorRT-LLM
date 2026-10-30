@@ -311,6 +311,7 @@ def _make_forward_only_engine(
     engine.get_runtime_tokens_per_gen_step = Mock(return_value=1)
     engine.iter_states = {}
     engine.forward_pass_callable = None
+    engine.start_beam_histories_callable = None
     engine._stage_in_graph_sampling = None
     engine.moe_load_balancer = None
     engine._is_encoder_decoder_model = Mock(return_value=False)
@@ -1086,7 +1087,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         runner.replay.assert_called_once_with(key, prepared_inputs)
         engine._forward_step.assert_not_called()
         engine._execute_logit_post_processors.assert_called_once_with(
-            batch, outputs)
+            batch, outputs, None)
         self.assertEqual(engine.iter_states['num_ctx_requests'], 1)
         self.assertEqual(engine.iter_states['num_ctx_tokens'], 1)
         self.assertEqual(engine.iter_states['num_generation_tokens'], 1)
@@ -1116,7 +1117,7 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
         engine._forward_step.assert_called_once()
         runner.replay.assert_not_called()
         engine._execute_logit_post_processors.assert_called_once_with(
-            batch, outputs)
+            batch, outputs, None)
 
     def test_zero_runtime_draft_speculation_commits_graph_candidate(
             self) -> None:

@@ -143,7 +143,11 @@ class LogitsProcessor(ABC):
             req_id (int): Request id.
             logits (torch.Tensor): Logits tensor to be modified.
             token_ids (List[List[int]]): Token ids produced by the request so far.
-                The shape is beam_width * sequence_length.
+                The shape is beam_width * sequence_length. Under beam search on the
+                PyTorch backend, row ``i`` is the prompt plus the hypothesis held by the
+                beam whose logits are row ``i`` of ``logits``; beams that already
+                finished are not included. With the overlap scheduler the history
+                trails the beam's newest token by one step, as for every request.
             stream_ptr (int, optional): The operation stream used by the logits tensor.
                 Not required for PyTorch backend.
             client_id (int, optional): An optional client id.
