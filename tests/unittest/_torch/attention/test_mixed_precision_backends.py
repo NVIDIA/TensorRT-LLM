@@ -843,7 +843,7 @@ def test_draft_forward_swaps_in_draft_staging():
     assert meta.mixed_precision_staging is target
 
 
-@pytest.mark.cpu_only
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     """DeepSeek-V4: the second native scatter only writes rows whose page the twin holds."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
@@ -861,8 +861,11 @@ def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     # last row falls in page 4, beyond the table.
     table = torch.tensor([[10, -1, 11, -1], [-1, -1, -1, 12]], dtype=torch.int32)
     mask = _retained_compressed_row_mask(
-        table, rows_per_page, num_comp, cu, start_pos, compressed_mask, 2, 9
-    )
+        *(
+            t.cuda() if isinstance(t, torch.Tensor) else t
+            for t in (table, rows_per_page, num_comp, cu, start_pos, compressed_mask, 2, 9)
+        )
+    ).cpu()
     expected = []
     for row in range(9):
         req = 0 if row < 6 else 1
@@ -876,6 +879,53 @@ def test_retained_compressed_row_mask_drops_pages_the_twin_released():
     # request 0: positions 2, 3 -> page 0 held; 4, 5, 6 -> page 1 released; row 5 is padding.
     # request 1: position 14 -> page 3 held; 15 masked; 16 -> page 4 beyond the table.
     assert expected == [True, True, False, False, False, False, True, False, False]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("shared_rows", [False, True])
+def test_overlay_retained_rows_copies_held_rows(shared_rows):
+    """The overlay replaces exactly the scratch rows whose token the twin holds."""
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
+        overlay_retained_rows,
+    )
+
+    torch.manual_seed(0)
+    tokens_per_block, width, queries, topk = 4, 656, 5, 150
+    # Twin pool of 6 pages; two requests hold pages for blocks 0 and 3 / block 1 only.
+    pool = torch.randint(
+        0, 255, (6, 1, tokens_per_block, 1, width), dtype=torch.uint8, device="cuda"
+    )
+    table = torch.tensor([[2, -1, -1, 5], [-1, 0, -1, -1]], dtype=torch.int32, device="cuda")
+    requests = torch.tensor([0, 0, 1, 1, 0], dtype=torch.int32, device="cuda")
+    topk_indices = torch.randint(-1, 16, (queries, topk), dtype=torch.int32, device="cuda")
+    if shared_rows:
+        # Context gather: one scratch row per distinct (request, position).
+        compact = (requests[:, None] * 16 + topk_indices).where(topk_indices >= 0, -1)
+        rows = 32
+    else:
+        compact = torch.arange(queries * topk, dtype=torch.int32, device="cuda").view(queries, topk)
+        rows = queries * topk
+    scratch = torch.zeros(rows, width, dtype=torch.uint8, device="cuda")
+    owner = SimpleNamespace(layer_idx=0, kv_scale_orig_quant=None)
+    manager = SimpleNamespace(
+        layer_offsets={0: 0},
+        high_layers={0: 1},
+        _get_mixed_precision_buffers=lambda *args: pool,
+    )
+    meta = SimpleNamespace(retained_block_table=table, kv_cache_manager=manager)
+    overlay_retained_rows(owner, meta, topk_indices, requests, compact, scratch, shared_rows)
+
+    expected = torch.zeros_like(scratch)
+    flat = pool.view(-1, width)
+    for q in range(queries):
+        for k in range(topk):
+            pos, row = int(topk_indices[q, k]), int(compact[q, k])
+            if pos < 0 or row < 0:
+                continue
+            page = int(table[int(requests[q]), pos // tokens_per_block])
+            if page >= 0:
+                expected[row] = flat[page * tokens_per_block + pos % tokens_per_block]
+    assert torch.equal(scratch, expected)
 
 
 @pytest.mark.cpu_only

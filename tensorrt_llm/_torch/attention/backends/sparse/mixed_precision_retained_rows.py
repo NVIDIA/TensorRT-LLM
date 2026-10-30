@@ -102,7 +102,8 @@ def _store_retained_rows_kernel(
         )
 
 
-@triton.jit
+# The epoch changes every call: keep it out of the specialization key.
+@triton.jit(do_not_specialize=["claim_epoch"])
 def _overlay_retained_rows_kernel(
     topk_ptr,
     topk_stride,
@@ -117,44 +118,85 @@ def _overlay_retained_rows_kernel(
     num_blocks,
     scratch_ptr,
     scratch_rows,
+    claim_ptr,
+    claim_epoch,
     tokens_per_block,
     topk,
     scale_ptr,
     APPLY_SCALE: tl.constexpr,
+    DEDUP: tl.constexpr,
     ROW_WIDTH: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_W: tl.constexpr,
 ):
-    """One program per (query row, selected token): replace the scratch row if the twin holds it."""
-    pair = tl.program_id(0)
-    query = pair // topk
-    position = tl.load(topk_ptr + query.to(tl.int64) * topk_stride + pair % topk)
-    scratch_row = tl.load(compact_ptr + query.to(tl.int64) * compact_stride + pair % topk)
+    """One program per (query row, BLOCK_K selected tokens): copy the rows the twin holds."""
+    query = tl.program_id(0)
+    ks = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    in_row = ks < topk
     request = tl.load(request_ptr + query)
+    position = tl.load(topk_ptr + query.to(tl.int64) * topk_stride + ks, mask=in_row, other=-1)
+    scratch_row = tl.load(
+        compact_ptr + query.to(tl.int64) * compact_stride + ks, mask=in_row, other=-1
+    )
     # Padded entries of the index tensors hold stale values; bound them like the backends do.
     block = position // tokens_per_block
-    valid = (
-        (position >= 0) & (block < max_blocks) & (scratch_row >= 0) & (scratch_row < scratch_rows)
-    )
+    valid = in_row & (position >= 0) & (block < max_blocks)
+    valid = valid & (scratch_row >= 0) & (scratch_row < scratch_rows)
     valid = valid & (request >= 0) & (request < num_requests)
-    if valid:
-        page = tl.load(block_table_ptr + request * block_table_stride + block)
-        if (page >= 0) & (page < num_blocks):
-            slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
-            _copy_kv_row(
-                kv_cache_ptr,
-                slot,
-                scratch_ptr,
-                scratch_row,
-                scale_ptr,
-                kv_cache_ptr,
-                0,
-                scratch_row,
-                APPLY_SCALE,
-                False,
-                ROW_WIDTH,
-                0,
-                BLOCK_SIZE,
-            )
+    page = tl.load(block_table_ptr + request * block_table_stride + block, mask=valid, other=-1)
+    valid = valid & (page >= 0) & (page < num_blocks)
+    slot = page.to(tl.int64) * tokens_per_block + position % tokens_per_block
+    if DEDUP:
+        # Context scratch rows are shared by every query that selected the token: record the
+        # row's twin slot (same value from every pair, no atomics); a per-row pass copies it once.
+        # Most pairs find the row already recorded and skip the store.
+        record = (claim_epoch.to(tl.int64) << 32) | slot
+        current = tl.load(claim_ptr + scratch_row, mask=valid, other=0)
+        tl.store(claim_ptr + scratch_row, record, mask=valid & (current != record))
+        return
+    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
+    dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
+    if APPLY_SCALE:
+        scale = tl.load(scale_ptr)
+    for start in range(0, ROW_WIDTH, BLOCK_W):
+        cols = start + tl.arange(0, BLOCK_W)
+        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
+        row = tl.load(src + cols[None, :], mask=mask)
+        if APPLY_SCALE:
+            row = row.to(tl.float32) * scale
+        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
+
+
+# The epoch changes every call: keep it out of the specialization key.
+@triton.jit(do_not_specialize=["claim_epoch"])
+def _copy_recorded_rows_kernel(
+    claim_ptr,
+    claim_epoch,
+    kv_cache_ptr,
+    scratch_ptr,
+    scratch_rows,
+    scale_ptr,
+    APPLY_SCALE: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_W: tl.constexpr,
+):
+    """One program per BLOCK_R scratch rows: copy the twin row recorded for this call's epoch."""
+    rows = tl.program_id(0) * BLOCK_R + tl.arange(0, BLOCK_R)
+    recorded = tl.load(claim_ptr + rows, mask=rows < scratch_rows, other=0)
+    valid = (rows < scratch_rows) & ((recorded >> 32) == claim_epoch.to(tl.int64))
+    slot = recorded & 0xFFFFFFFF
+    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
+    dst = scratch_ptr + rows.to(tl.int64)[:, None] * ROW_WIDTH
+    if APPLY_SCALE:
+        scale = tl.load(scale_ptr)
+    for start in range(0, ROW_WIDTH, BLOCK_W):
+        cols = start + tl.arange(0, BLOCK_W)
+        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
+        row = tl.load(src + cols[None, :], mask=mask)
+        if APPLY_SCALE:
+            row = row.to(tl.float32) * scale
+        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
 
 
 def _retained_block_table(metadata, owner) -> Optional[torch.Tensor]:
@@ -277,6 +319,46 @@ def store_retained_generation_rows(
     )
 
 
+@triton.jit
+def _retained_compressed_row_mask_kernel(
+    out_ptr,
+    block_table_ptr,
+    block_table_stride,
+    max_blocks,
+    tokens_per_block,
+    num_comp_tokens_ptr,
+    cu_new_comp_kv_ptr,
+    start_pos_ptr,
+    compressed_mask_ptr,
+    batch_size,
+    total_rows,
+    SEARCH_STEPS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    in_range = rows < total_rows
+    # request = number of cu_new_comp_kv[1:batch_size + 1] entries <= row (binary search).
+    lo = tl.zeros([BLOCK], dtype=tl.int32)
+    hi = tl.zeros([BLOCK], dtype=tl.int32) + batch_size
+    for _ in tl.static_range(SEARCH_STEPS):
+        mid = (lo + hi) // 2
+        searching = lo < hi
+        bound = tl.load(cu_new_comp_kv_ptr + 1 + mid, mask=searching & (mid < batch_size), other=0)
+        right = searching & (bound <= rows)
+        lo = tl.where(right, mid + 1, lo)
+        hi = tl.where(searching & ~right, mid, hi)
+    request = tl.minimum(lo, batch_size - 1)
+    local = rows - tl.load(cu_new_comp_kv_ptr + request)
+    position = tl.load(start_pos_ptr + request) + local
+    block = position // tokens_per_block
+    # Blocks past the table's width are pages the twin never held.
+    in_table = in_range & (position >= 0) & (block < max_blocks)
+    page = tl.load(block_table_ptr + request * block_table_stride + block, mask=in_table, other=-1)
+    selected = tl.load(compressed_mask_ptr + rows, mask=in_range, other=0) != 0
+    keep = selected & (local < tl.load(num_comp_tokens_ptr + request)) & in_table & (page >= 0)
+    tl.store(out_ptr + rows, keep, mask=in_range)
+
+
 def _retained_compressed_row_mask(
     block_table: torch.Tensor,
     tokens_per_block: int,
@@ -292,19 +374,24 @@ def _retained_compressed_row_mask(
     The native scatter addresses pages straight from the table it is given and does not
     understand -1, so the rows of pages the twin released must be masked out.
     """
-    row = torch.arange(total_rows, device=block_table.device, dtype=torch.int32)
-    request = torch.searchsorted(cu_new_comp_kv[1 : batch_size + 1], row, right=True)
-    request = request.clamp_(max=batch_size - 1)
-    local = row - cu_new_comp_kv[request]
-    position = start_pos[request] + local
-    block = torch.div(position, tokens_per_block, rounding_mode="floor")
-    # Blocks past the table's width are pages the twin never held.
-    in_table = (position >= 0) & (block < block_table.shape[1])
-    page = block_table[
-        request.clamp(max=block_table.shape[0] - 1),
-        block.clamp(min=0, max=block_table.shape[1] - 1),
-    ]
-    return compressed_mask & (local < num_comp_tokens[request]) & in_table & (page >= 0)
+    mask = torch.empty(total_rows, dtype=torch.bool, device=block_table.device)
+    block = 256
+    _retained_compressed_row_mask_kernel[(triton.cdiv(total_rows, block),)](
+        mask,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[1],
+        tokens_per_block,
+        num_comp_tokens,
+        cu_new_comp_kv,
+        start_pos,
+        compressed_mask,
+        batch_size,
+        total_rows,
+        SEARCH_STEPS=max(1, batch_size.bit_length()),
+        BLOCK=block,
+    )
+    return mask
 
 
 def store_retained_compressed_rows(
@@ -366,6 +453,22 @@ def store_retained_compressed_rows(
     )
 
 
+_OVERLAY_BLOCK_K = 64
+# Per-device scratch-row records for context overlays, and the epoch of the last overlay.
+_overlay_claims = {}
+
+
+def _overlay_claim(device: torch.device, rows: int):
+    """Per-row records covering ``rows`` scratch rows and a fresh epoch (no per-call clearing)."""
+    claims, epoch = _overlay_claims.get(device, (None, 0))
+    epoch += 1
+    if claims is None or claims.numel() < rows or epoch >= 2**31 - 1:
+        claims = torch.zeros(max(rows, 1 << 16), dtype=torch.int64, device=device)
+        epoch = 1
+    _overlay_claims[device] = (claims, epoch)
+    return claims, epoch
+
+
 def overlay_retained_rows(
     attention,
     metadata,
@@ -373,11 +476,13 @@ def overlay_retained_rows(
     requests: torch.Tensor,
     compact_indices: torch.Tensor,
     scratch: torch.Tensor,
+    shared_rows: bool = False,
 ) -> None:
     """After the gather: copy the retained rows over the dequantized scratch rows.
 
     ``topk_indices``: selected positions per query row (-1 = none); ``requests``: that row's
     request; ``compact_indices``: the scratch row the gather used for each pair (-1 = none).
+    ``shared_rows``: the context gather deduplicates, so many pairs point at one scratch row.
     """
     kv_cache = _retained_kv_cache(metadata, attention)
     if kv_cache is None:
@@ -387,9 +492,13 @@ def overlay_retained_rows(
         return
     assert topk_indices.stride(1) == 1 and compact_indices.stride(1) == 1
     row_width = kv_cache.shape[-1]
+    scratch_rows = scratch.numel() // row_width
     block_table = _retained_block_table(metadata, attention)
     apply_scale = kv_cache.dtype != scratch.dtype
-    _overlay_retained_rows_kernel[(num_rows * topk,)](
+    # A captured graph would replay one epoch; there every pair copies its row instead.
+    dedup = shared_rows and not torch.cuda.is_current_stream_capturing()
+    claims, epoch = _overlay_claim(scratch.device, scratch_rows) if dedup else (block_table, 0)
+    _overlay_retained_rows_kernel[(num_rows, triton.cdiv(topk, _OVERLAY_BLOCK_K))](
         topk_indices,
         topk_indices.stride(0),
         compact_indices,
@@ -402,11 +511,29 @@ def overlay_retained_rows(
         kv_cache,
         kv_cache.shape[0],
         scratch,
-        scratch.numel() // row_width,
+        scratch_rows,
+        claims,
+        epoch,
         kv_cache.shape[1],
         topk,
         attention.kv_scale_orig_quant if apply_scale else kv_cache,
         APPLY_SCALE=apply_scale,
+        DEDUP=dedup,
         ROW_WIDTH=row_width,
-        BLOCK_SIZE=_block_size(row_width),
+        BLOCK_K=_OVERLAY_BLOCK_K,
+        BLOCK_W=128,
     )
+    if dedup:
+        block_rows = 32
+        _copy_recorded_rows_kernel[(triton.cdiv(scratch_rows, block_rows),)](
+            claims,
+            epoch,
+            kv_cache,
+            scratch,
+            scratch_rows,
+            attention.kv_scale_orig_quant if apply_scale else kv_cache,
+            APPLY_SCALE=apply_scale,
+            ROW_WIDTH=row_width,
+            BLOCK_R=block_rows,
+            BLOCK_W=128,
+        )

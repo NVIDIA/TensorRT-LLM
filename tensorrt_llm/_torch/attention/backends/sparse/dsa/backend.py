@@ -238,6 +238,7 @@ class DSATrtllmAttention(TrtllmAttention):
                     metadata._cached_req_idx_ctx,
                     compact_indices,
                     scratch,
+                    shared_rows=True,
                 )
             metadata.nvfp4_mla_context_fp8_scratch = scratch
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
