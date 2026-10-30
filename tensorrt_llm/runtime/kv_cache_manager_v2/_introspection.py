@@ -241,6 +241,16 @@ def force_rebalance_precondition(manager: Any, skew: float = 2.0) -> None:
     set_target_ratio_list_gpu(manager, [x / total for x in skewed])
 
 
+def set_target_ratio_list_cold(manager: Any, ratios: list[float]) -> None:
+    """Set the target pool-group ratio list shared by every cold (host/disk) level."""
+    _cpp().set_target_ratio_list_cold(manager, list(ratios))
+
+
+def slot_windows(manager: Any, level: int) -> list[tuple[int, int]]:
+    """Current slot window ``[begin, end)`` of each pool group at cache level ``level``."""
+    return [tuple(window) for window in _cpp().slot_windows(manager, level)]
+
+
 def gpu_slot_windows(manager: Any) -> list[tuple[int, int]]:
     """Current GPU slot window ``[begin, end)`` of each pool group (arena-relative under copy-based rebalancing)."""
     return [tuple(window) for window in _cpp().gpu_slot_windows(manager)]

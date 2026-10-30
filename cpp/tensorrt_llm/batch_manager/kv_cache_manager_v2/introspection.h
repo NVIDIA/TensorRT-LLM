@@ -168,6 +168,11 @@ public:
     static void setNumSampledKvCaches(KvCacheManager& manager, int value);
     static void setLastAdjustmentTime(KvCacheManager& manager, double value);
     static void setTargetRatioListGpu(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+    //! Target ratio list shared by every cold level (cold pool-group order).
+    static void setTargetRatioListCold(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value);
+
+    //! Current slot window [begin, end) of each pool group at `level` (arena-relative in an arena).
+    static std::vector<std::pair<SlotCount, SlotCount>> slotWindows(KvCacheManager& manager, CacheLevel level);
 
     //! Current GPU slot window [begin, end) of each pool group. Arena-relative under copy-based
     //! rebalancing; [0, numSlots) otherwise.

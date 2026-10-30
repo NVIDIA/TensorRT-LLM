@@ -703,8 +703,8 @@ private:
     bool _needAdjustment(CacheLevel level) const;
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLastLevelPersistentPages() const;
-    //! In-place relocation: the hot-level pages locked by ACTIVE caches, per pool group, each once.
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLockedHotPages() const;
+    //! In-place relocation: the pages at `level` locked by ACTIVE caches, per pool group, each once.
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherLockedPages(CacheLevel level) const;
     //! In-place relocation: the SWA scratch slots ACTIVE caches hold, per pool group.
     TypedVec<PoolGroupIndex, ScratchSlotLockList> _gatherActiveScratchSlots() const;
 

@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/batchedPageCopy.h"
 
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
@@ -445,14 +446,25 @@ Address GpuSlotPool::slotAddress(SlotId slot) const
 // ArenaGpuSlotPool
 // ---------------------------------------------------------------------------
 
-ArenaGpuSlotPool::ArenaGpuSlotPool(
-    size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity)
+ArenaGpuSlotPool::ArenaGpuSlotPool(size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window,
+    size_t granularity, CacheTier medium, HostMem const* fill)
     : SlotPoolBase(slotSize)
     , mArenaBase(arenaBase)
     , mArenaBytes(arenaBytes)
     , mGranularity(granularity)
+    , mMedium(medium)
+    , mFill(fill)
 {
     setWindow(window);
+}
+
+void ArenaGpuSlotPool::waitSlotUsable(SlotId slot) const
+{
+    if (mFill != nullptr)
+    {
+        // Arena-relative ids: the slot ends (slot + 1) slots after the arena start.
+        mFill->waitUsable(mSlotSize * (toSizeT(slot) + 1));
+    }
 }
 
 void ArenaGpuSlotPool::destroy()
@@ -991,6 +1003,16 @@ HostPoolGroup::HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> con
     }
 }
 
+HostPoolGroup::HostPoolGroup(
+    SlotWindow window, SlotAllocator::Growth growth, size_t slotSize, HostMem const& arena, size_t unitBytes)
+    : PoolGroupBase(window, growth)
+{
+    // The arena is filled from its start in the background; the pool waits for the fill to pass a slot's end
+    // before the slot is handed out (PoolGroupBase::allocate).
+    mPools.push_back(std::make_unique<ArenaGpuSlotPool>(
+        slotSize, arena.address(), arena.vmSize(), window, unitBytes, CacheTier::HOST_MEM, &arena));
+}
+
 // ---------------------------------------------------------------------------
 // DiskPoolGroup
 // ---------------------------------------------------------------------------
@@ -1425,6 +1447,87 @@ HostCacheLevelStorage::HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> 
         mPoolGroups.push_back(std::make_unique<HostPoolGroup>(
             slotCountList[pgIdx], slotDescList[pgIdx].slotSizeList(), mMaxQuota, mOptions));
     }
+}
+
+// ---------------------------------------------------------------------------
+// ArenaHostCacheLevelStorage
+// ---------------------------------------------------------------------------
+
+ArenaHostCacheLevelStorage::ArenaHostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
+    size_t arenaBytes, size_t unitBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
+    TypedVec<PoolGroupIndex, SlotCount> const& minSlots, HostMemBackingOptions const& options)
+    : mArenaBytes(arenaBytes)
+    , mUnitBytes(unitBytes)
+    // Committed in full now, in the background like a host pool; never resized.
+    , mArena(arenaBytes, arenaBytes, HostMemBackingOptions{unitBytes, options.allowRemoteNumaFallback},
+          /*waitForFill=*/false)
+{
+    TLLM_CHECK_WITH_INFO(arenaBytes > 0 && unitBytes > 0 && arenaBytes % unitBytes == 0,
+        "Host arena size %zu must be a positive multiple of %zu", arenaBytes, unitBytes);
+    TypedVec<PoolGroupIndex, size_t> sizes;
+    for (auto const& slotDesc : slotDescList)
+    {
+        auto const sizeList = slotDesc.slotSizeList();
+        TLLM_CHECK_WITH_INFO(sizeList.size() == PoolIndex{1}, "A host arena holds groups of one pool");
+        sizes.push_back(sizeList[PoolIndex{0}]);
+    }
+    auto const windows = ArenaGpuCacheLevelStorage::computeArenaWindows(arenaBytes, sizes, ratioList, minSlots);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < slotDescList.size(); ++pgIdx)
+    {
+        mPoolGroups.push_back(std::make_unique<HostPoolGroup>(windows[pgIdx],
+            ArenaGpuCacheLevelStorage::growthFor(pgIdx, slotDescList.size()), sizes[pgIdx], mArena, unitBytes));
+    }
+    addHostCopySplitRange(mArena.address(), arenaBytes, unitBytes);
+    mSplitRangeAdded = true;
+}
+
+ArenaHostCacheLevelStorage::~ArenaHostCacheLevelStorage()
+{
+    KVCM2_POISON_ON_EXCEPT([this]() { destroy(); });
+}
+
+void ArenaHostCacheLevelStorage::destroy()
+{
+    CacheLevelStorage::destroy();
+    if (mSplitRangeAdded)
+    {
+        removeHostCopySplitRange(mArena.address());
+        mSplitRangeAdded = false;
+    }
+    mArena.destroy();
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> ArenaHostCacheLevelStorage::windows() const
+{
+    TypedVec<PoolGroupIndex, SlotWindow> result;
+    result.reserve(mPoolGroups.size());
+    for (auto const& pg : mPoolGroups)
+        result.push_back(pg->slotAllocator().window());
+    return result;
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> ArenaHostCacheLevelStorage::computeWindows(
+    TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+{
+    TypedVec<PoolGroupIndex, size_t> sizes;
+    for (auto const& pg : mPoolGroups)
+        sizes.push_back(pg->slotSize()[PoolIndex{0}]);
+    return ArenaGpuCacheLevelStorage::computeArenaWindows(mArenaBytes, sizes, ratioList, minSlots);
+}
+
+size_t ArenaHostCacheLevelStorage::arenaUnitBytes(size_t tierUnitBytes) noexcept
+{
+    // 1 GiB: a 100 GiB arena takes 100 registrations, and a 44 MB page straddles a unit with odds of 4%. Host tier
+    // units are powers of two up to 32 MiB, so this is a multiple of any of them.
+    constexpr size_t kArenaUnit = 1ULL << 30;
+    // TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES (tests): a small unit makes many pages straddle one. Rounded to the host
+    // memory alignment.
+    if (char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_HOST_ARENA_UNIT_BYTES"); value != nullptr && value[0] != '\0')
+    {
+        size_t const unit = std::strtoull(value, nullptr, 10);
+        return std::max(roundUp(unit, hostMemSizeGranularity()), hostMemSizeGranularity());
+    }
+    return std::max(tierUnitBytes, kArenaUnit);
 }
 
 // ---------------------------------------------------------------------------

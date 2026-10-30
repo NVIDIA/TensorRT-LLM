@@ -220,6 +220,9 @@ public:
         return mGpuArena;
     }
 
+    //! Whether `level` is a copy-based rebalancing arena (the GPU level, or a host level built with it).
+    [[nodiscard]] bool isArenaLevel(CacheLevel level) const;
+
     //! Whether adjust() relocates the blocks of ACTIVE caches instead of requiring them suspended.
     [[nodiscard]] bool isInPlaceRelocation() const noexcept
     {
@@ -233,6 +236,9 @@ public:
 
     //! Current hot-level window of each pool group.
     [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> hotWindows() const;
+
+    //! Current window of each pool group at `level` (arena-relative in an arena, [0, numSlots) otherwise).
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> levelWindows(CacheLevel level) const;
 
     //! Current hot-level window of every pool, in its own ids (bound pools have their own).
     [[nodiscard]] TypedVec<PoolGroupIndex, TypedVec<PoolIndex, SlotWindow>> hotPoolWindows() const;
@@ -518,14 +524,15 @@ private:
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
-    //! Copy-based rebalancing of the GPU arena: move the window boundaries to `ratioList`.
-    void adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
+    //! Copy-based rebalancing of an arena level (GPU or host): move the window boundaries to `ratioList`.
+    void adjustArenaLevel(CacheLevel level, std::optional<size_t> newQuota,
+        TypedVec<PoolGroupIndex, float> const& ratioList,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
         TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
         TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots);
     //! Move one arena pool group from `from` to `to`: grow over any space gained, then shrink off
     //! any space lost. Space gained must already have been vacated by its previous owner.
-    void moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
+    void moveArenaWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
         std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages,
         ScratchSlotLockList const& scratchSlots);
     //! In-place relocation: copy locked pages and scratch slots (of ACTIVE caches) into free slots of

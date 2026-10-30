@@ -2682,8 +2682,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "set_target_ratio_list_cold",
+        [](kv::KvCacheManager& manager, std::vector<float> ratios)
+        {
+            kv::KvCacheIntrospection::setTargetRatioListCold(
+                manager, kv::TypedVec<kv::PoolGroupIndex, float>{std::move(ratios)});
+        },
+        nb::arg("manager"), nb::arg("ratios"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "gpu_slot_windows", [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuSlotWindows(manager); },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "slot_windows",
+        [](kv::KvCacheManager& manager, int level)
+        { return kv::KvCacheIntrospection::slotWindows(manager, kv::CacheLevel{level}); },
+        nb::arg("manager"), nb::arg("level"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "gpu_pool_windows",
         [](kv::KvCacheManager& manager) { return kv::KvCacheIntrospection::gpuPoolWindows(manager); },

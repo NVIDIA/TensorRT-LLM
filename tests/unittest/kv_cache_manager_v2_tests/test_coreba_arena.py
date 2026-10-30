@@ -72,7 +72,8 @@ def _scratch_pattern(seed: int, j: int, lc: int) -> int:
 class _Arena:
     """A manager plus the bookkeeping needed to check its arena."""
 
-    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False, scratch: bool = False):
+    def __init__(self, drop_unreferenced: bool, ratio: list[float], in_place: bool = False, scratch: bool = False,
+                 host_quota: int = 0):
         torch.zeros(1, device="cuda")  # the manager needs a current CUDA context
         self.in_place = in_place
         self.scratch = scratch
@@ -95,7 +96,8 @@ class _Arena:
         ]
         config = kvm.KVCacheManagerConfig(
             tokens_per_block=TOKENS_PER_BLOCK,
-            cache_tiers=[kvm.GpuCacheTierConfig(quota=QUOTA)],
+            cache_tiers=[kvm.GpuCacheTierConfig(quota=QUOTA)]
+            + ([kvm.HostCacheTierConfig(quota=host_quota)] if host_quota else []),
             layers=layers,
             initial_pool_ratio=ratio,
             enable_partial_reuse=False,
