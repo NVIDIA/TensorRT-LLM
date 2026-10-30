@@ -173,10 +173,30 @@ Reduce creation of new branches and worktrees if you can and suggest cleanups to
 is done. This includes branches and worktrees both on the local computer and on the remote cluster.
 
 - If user's conversation shows the work belongs to an existing branch, keep commits to that branch.
-- When reporting your work to user, also specify your created new branches, worktrees and build artifacts
-  to keep user informed on resource usage.
-- Once work is done, ask user if they want to clean up the worktree, branch and whatever built. If you find
-  past container images and worktrees that are 30+ days old, ask user if they want to clean them up as well.
+- When reporting your work to user, also list the items you created (see the list below) to keep user
+  informed on resource usage.
+
+#### Cleanup when work is done
+Ask user a direct yes/no question about cleanup when you report the task's results, and again after
+the task's last step (for example, after you open a PR). Do not drop this question to make room for a
+question about the next step. A note such as "you can delete it later" does not count.
+
+In the question, list every item the task left on the local computer and on each cluster it used. Say
+which items to keep and why, for example the PR branch until the PR merges.
+
+- Local and remote branches.
+- New worktrees including build outputs: `cpp/build*`, `build/` and venvs inside them.
+- Container images: `.sqsh` files and Docker images.
+- Job folders, Slurm logs and other temporary files.
+- Jobs that are still running.
+
+Before you ask, also look for worktrees that are 30+ days old via `git worktree list` and add them
+to the list.
+If you have visited container image folders during your work, also look for container images that
+are 30+ days old, and add them to the list.
+
+If user has not previously granted you the permission to delete, do not delete any item on the
+list until user says yes.
 
 #### Automatic Dev Loop
 If user tasks you with an automatic develop/optimization/debugging loop where each iteration involves trying
