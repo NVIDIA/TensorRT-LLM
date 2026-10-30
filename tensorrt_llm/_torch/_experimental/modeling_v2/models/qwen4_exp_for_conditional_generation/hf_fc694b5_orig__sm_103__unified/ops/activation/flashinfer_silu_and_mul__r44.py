@@ -1,6 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Gated SiLU activation via the flashinfer silu_and_mul kernel."""
+"""Gated SiLU activation via the flashinfer silu_and_mul kernel.
+
+This target's local variant r44 of `catalog/activation/flashinfer_silu_and_mul`,
+certified at the MTP layer's shared-expert width (2 x 640). Tier 1: the entry
+wraps `torch.ops.trtllm.flashinfer_silu_and_mul`.
+"""
 
 from __future__ import annotations
 
@@ -43,6 +48,29 @@ class FlashinferSiluAndMul(OpWrapper):
 
     fp16 and fp32 are accepted by the op. No shipped target uses them here, so
     they are not cells.
+
+    Source: `trtllm::flashinfer_silu_and_mul` is a Python `torch.library`
+    custom op (`_torch/custom_ops/flashinfer_custom_ops.py`) calling
+    `flashinfer.activation.silu_and_mul(x, enable_pdl=get_env_enable_pdl())`;
+    PDL follows `TRTLLM_ENABLE_PDL` (default on) and changes scheduling, not
+    results. FlashInfer JIT-compiles the kernel on the first call in a process
+    (`flashinfer.jit.gen_act_and_mul_module("silu")`): this installation has no
+    AOT artifact for it, and on GB300 the build ran for the device's own
+    architecture, `-gencode=arch=compute_103a,code=sm_103a`
+    (`FLASHINFER_CUDA_ARCH_LIST` unset).
+
+    Numerics: the kernel's SiLU is `g / (1 + __expf(-g))` in fp32, times `up`,
+    rounded once to the input dtype. Measured against `reference` at width 1280
+    (40 draws per row count, randn at scale 1 and 4): bitwise at 1 and 128 rows;
+    1 of 26.2M elements at 1024 rows and 4 of 209.7M at 8192 rows differ, each by
+    one bf16 step (relative L2 at most 6.6e-12). Torch's bf16 default band holds
+    that and refuses swapped halves and GELU-tanh (the test's negative control).
+    Gates at or above 20 give `g * up` exactly; at -100 `__expf` overflows and
+    the output is a signed zero, as the reference's denormal rounds to in bf16.
+
+    The qwen4_exp MTP shared-expert cells (width 1280, rows 1, 128, 1024, 8192)
+    and their CUDA-graph replay at 1, 128 and 1024 rows were driven on sm_103
+    only; width 1280 is unmeasured on sm_100.
     """
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
