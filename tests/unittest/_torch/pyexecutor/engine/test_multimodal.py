@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from _torch.executor.multimodal_utils import (
+from _torch.pyexecutor.multimodal_utils import (
     bare_mm_item_scheduler,
     make_llm_request,
     make_mm_request,

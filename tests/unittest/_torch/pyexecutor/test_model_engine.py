@@ -15,7 +15,7 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
-from _torch.executor.engine_test_utils import (
+from _torch.pyexecutor.engine_test_utils import (
     DummyModel,
     DummyModelEngine,
     _AttentionBackend,

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _torch.executor.engine.runners.utils import _config, _make_runner, _model
+from _torch.pyexecutor.engine.runners.utils import _config, _make_runner, _model
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PreparedInputs, ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner

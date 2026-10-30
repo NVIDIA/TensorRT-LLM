@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import torch
-from _torch.executor.engine_test_utils import _make_request_stub
+from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.cuda_graph_runner as cuda_graph_runner_module
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (

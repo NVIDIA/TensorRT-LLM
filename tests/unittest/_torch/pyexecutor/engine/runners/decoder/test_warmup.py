@@ -18,12 +18,12 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
-from _torch.executor.engine.runners.decoder.utils import (
+from _torch.pyexecutor.engine.runners.decoder.utils import (
     decoder_config,
     decoder_graphs,
     decoder_warmup,
 )
-from _torch.executor.engine_test_utils import (
+from _torch.pyexecutor.engine_test_utils import (
     DummyModel,
     _agreement,
     _capture_tllm_logs,

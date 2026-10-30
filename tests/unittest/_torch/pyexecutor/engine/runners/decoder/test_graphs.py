@@ -10,8 +10,8 @@ from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
-from _torch.executor.engine.runners.decoder.utils import decoder_config, decoder_graphs
-from _torch.executor.engine_test_utils import _create_request_with_tokens, _make_request_stub
+from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, decoder_graphs
+from _torch.pyexecutor.engine_test_utils import _create_request_with_tokens, _make_request_stub
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (

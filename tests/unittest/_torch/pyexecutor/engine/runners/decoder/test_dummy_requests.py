@@ -4,8 +4,8 @@
 
 import pytest
 import torch
-from _torch.executor.engine.runners.decoder.utils import decoder_config
-from _torch.executor.engine_test_utils import DummyModel, kv_cache_manager
+from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config
+from _torch.pyexecutor.engine_test_utils import DummyModel, kv_cache_manager
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType

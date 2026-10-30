@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import pytest
-from _torch.executor.engine_test_utils import _agreement
+from _torch.pyexecutor.engine_test_utils import _agreement
 
 
 @pytest.mark.cpu_only

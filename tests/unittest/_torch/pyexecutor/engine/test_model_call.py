@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
-from _torch.executor.engine_test_utils import _AttentionMetadata
+from _torch.pyexecutor.engine_test_utils import _AttentionMetadata
 
 from tensorrt_llm._torch.compilation.backend import Backend
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
-from _torch.executor.engine_test_utils import _AttentionBackend
+from _torch.pyexecutor.engine_test_utils import _AttentionBackend
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers

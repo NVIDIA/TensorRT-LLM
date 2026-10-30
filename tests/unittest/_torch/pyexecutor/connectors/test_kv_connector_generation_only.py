@@ -18,7 +18,7 @@ spelling the guard happens to use. Only a real request pins the two together.
 from unittest.mock import MagicMock
 
 import pytest
-from _torch.executor.llm_request_factory import make_llm_request
+from _torch.pyexecutor.llm_request_factory import make_llm_request
 
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import KvCacheConnectorManager
 from tensorrt_llm.bindings import executor as trtllm

@@ -15,8 +15,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from _torch.executor.engine.runners.decoder.utils import decoder_config
-from _torch.executor.engine_test_utils import _make_request_stub
+from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config
+from _torch.pyexecutor.engine_test_utils import _make_request_stub
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner as decoder_runner_module

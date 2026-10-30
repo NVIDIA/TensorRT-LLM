@@ -13,7 +13,7 @@ property are exercised together.
 from types import SimpleNamespace
 
 import pytest
-from _torch.executor.llm_request_factory import make_llm_request
+from _torch.pyexecutor.llm_request_factory import make_llm_request
 
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType

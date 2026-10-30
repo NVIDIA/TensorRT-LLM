@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import torch
-from _torch.executor.engine_test_utils import DummyModel, _create_request
-from _torch.executor.engine_test_utils import kv_cache_manager as managed_kv_cache
+from _torch.pyexecutor.engine_test_utils import DummyModel, _create_request
+from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
 
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (

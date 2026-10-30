@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from _torch.executor.engine.runners.utils import _make_runner
+from _torch.pyexecutor.engine.runners.utils import _make_runner
 
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.llm_request import PyResult

@@ -12,14 +12,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from _torch.executor.engine.runners.decoder.utils import decoder_config, input_preparer
-from _torch.executor.engine_test_utils import (
+from _torch.pyexecutor.engine.runners.decoder.utils import decoder_config, input_preparer
+from _torch.pyexecutor.engine_test_utils import (
     DummyModel,
     _create_request,
     _create_request_with_tokens,
     _make_request_stub,
 )
-from _torch.executor.engine_test_utils import kv_cache_manager as managed_kv_cache
+from _torch.pyexecutor.engine_test_utils import kv_cache_manager as managed_kv_cache
 from utils.util import skip_pre_blackwell_unittest, skip_ray
 
 from tensorrt_llm._torch.attention.backends.interface import (
