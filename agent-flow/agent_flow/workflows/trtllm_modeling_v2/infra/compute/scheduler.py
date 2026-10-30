@@ -74,8 +74,9 @@ HAND-OVER
 ``handover_lead`` before its allocation ends a watcher is in hand-over (its status record's
 ``handover``): it holds each GPU job that would not finish in time, and the operator loop asks
 for a successor until an ack names one. An ack is keyed by the allocation it follows, so a later
-ack for the next allocation never replaces it. Once a successor's watcher is up, the ending
-watcher admits nothing more and exits when its jobs are done.
+ack for the next allocation never replaces it. A ready successor also starts hand-over before
+the alert window, so long jobs can use a fresh allocation. The old watcher admits nothing more
+and exits when its existing jobs are done.
 
 ADMISSION
 =========
@@ -807,7 +808,7 @@ class Scheduler:
         self.pending_reasons: dict[str, str] = {}
         self._spec_cache: dict[str, tuple[float, JobSpec]] = {}
         self._last_pending: list[JobSpec] = []
-        #: Set once the allocation is within ``handover_lead_s`` of its end: since when,
+        #: Set when ending or a later-ending successor is ready: since when,
         #: and the successor's watcher once one is up.
         self.handover: dict = {}
         #: Free device -> when a reading first found it over ``DEVICE_MAX_USED_MIB``.
@@ -1230,27 +1231,29 @@ class Scheduler:
     # -------------------------------------------------------------- hand-over
 
     def _plan_handover(self, now: float) -> None:
-        """Within ``handover_lead_s`` of the allocation's end: say so, and notice a successor.
-
-        A successor is a live watcher of this spool whose allocation outlasts this one.
-        """
+        """Drain when the allocation is ending or a later-ending successor is ready."""
         ends_at = self.config.ends_at
-        if ends_at is None or ends_at - now > self.config.handover_lead_s:
+        if ends_at is None:
+            return
+        peers = [
+            peer
+            for peer in self.paths.live_watchers(WATCHER_STALE_S, now)
+            if peer.get("watcher") != self.watcher_id and _ends_after(peer, ends_at)
+        ]
+        if ends_at - now > self.config.handover_lead_s and not peers:
             return
         if not self.handover:
             self.handover["since"] = utc_iso(now)
             self._append_status(f"watcher: allocation ends {utc_iso(ends_at)}; in hand-over")
-        for peer in self.paths.live_watchers(WATCHER_STALE_S, now):
-            if peer.get("watcher") == self.watcher_id or not _ends_after(peer, ends_at):
-                continue
-            if self.handover.get("successor") != peer.get("watcher"):
-                self._append_status(f"watcher: successor {peer.get('watcher')} is up")
-            self.handover["successor"] = peer.get("watcher")
-            return
+        if peers:
+            successor = peers[0].get("watcher")
+            if self.handover.get("successor") != successor:
+                self._append_status(f"watcher: successor {successor} is up")
+            self.handover["successor"] = successor
 
     def _handover_hold(self, spec: JobSpec, now: float) -> "Hold | None":
         ends_at = self.config.ends_at
-        if ends_at is None or ends_at - now > self.config.handover_lead_s:
+        if ends_at is None:
             return None
         successor = self.handover.get("successor")
         if successor:
@@ -1358,6 +1361,15 @@ class Scheduler:
         self._reserved_for = ""
         live: set[str] | None = None
         for root in sorted(p for p in self.paths.gangs.iterdir() if p.is_dir()):
+            name = root.name
+            if (
+                (self.paths.done / f"{name}.rc").exists()
+                and not (root / GANG_GO).exists()
+                and not (self.paths.pending / f"{name}.sh").exists()
+                and not (self.paths.running / f"{name}.sh").exists()
+            ):
+                shutil.rmtree(root, ignore_errors=True)
+                continue
             record = read_json(root / GANG_RECORD)
             members = list((record or {}).get("members") or [])
             if self.watcher_id not in members[1:]:

@@ -53,6 +53,9 @@ BLOCK = "block"
 WARN = "warn"
 INFO = "info"
 
+#: Blocks a request may still keep on purpose, accepted in notes like a warn: a combination
+#: of non-core features the request names, which the contract otherwise refuses to multiply.
+ACCEPTABLE_BLOCKS: frozenset[str] = frozenset({"variants-cross-product"})
 #: A contract past this many required checks is worth a second look before it is paid for:
 #: every check loads the model, and every change to the target runs the stale ones again.
 CONTRACT_REVIEW_SIZE = 30
@@ -112,11 +115,18 @@ class LintReport:
     constraints: list[str] = field(default_factory=list)
 
     def open(self) -> list[Finding]:
-        """Findings that still stand: every block, and every warn the notes do not accept."""
+        """Findings that still stand: every block and every warn the notes do not accept.
+
+        An :data:`ACCEPTABLE_BLOCKS` block the notes accept no longer stands.
+        """
         return [
             f
             for f in self.findings
-            if f.severity == BLOCK or (f.severity == WARN and f.rule not in self.accepted)
+            if (
+                f.severity == BLOCK
+                and not (f.rule in ACCEPTABLE_BLOCKS and f.rule in self.accepted)
+            )
+            or (f.severity == WARN and f.rule not in self.accepted)
         ]
 
     def summary(self) -> str:
@@ -216,12 +226,6 @@ def _as_member(name: Any) -> bool:
         return False
 
 
-def _ranks_sharing_batch(member: str) -> int:
-    """How many ranks split one engine's requests: attention-DP ranks do, TP ranks do not."""
-    kind, size = parse_parallel_segment(member)
-    return (size or 1) if kind == "dep" else 1
-
-
 _gpus_per_node = gpus_per_node
 
 
@@ -256,6 +260,10 @@ def _variant_axes(entry: Mapping[str, Any]) -> set[str]:
         options.get("kv_cache_config") or {}
     ):
         axes.add("block reuse")
+    if options.get("speculative_config") or flags.get("speculative_config"):
+        axes.add("speculative decoding")
+    if "mamba_ssm_cache_dtype" in flags or "mamba_ssm_cache_dtype" in options:
+        axes.add("ssm dtype")
     return axes
 
 
@@ -372,21 +380,32 @@ def runtime_rules(ctx: LintContext) -> Iterator[Finding]:
     seq = flags.get("max_seq_len") or ctx.accuracy.get("max_seq_len")
     chunk = flags.get("max_num_tokens")
     targets = _perf_targets(task)
-    short: dict[str, tuple[int, int]] = {}
+    # A batch size and a concurrency are both global totals: an attention-DP rank serves
+    # its share of each (``check_config.share_batch``), so they compare as they stand.
+    short: dict[str, int] = {}
     for member, concurrency, _, _ in targets:
         for name in [member] if _as_member(member) else members_for(task, "core", ctx.world):
-            need = math.ceil(concurrency / _ranks_sharing_batch(name))
-            if isinstance(batch, int) and batch < need and need > short.get(name, (0, 0))[0]:
-                short[name] = (need, concurrency)
-    for name, (need, concurrency) in short.items():
+            if isinstance(batch, int) and batch < concurrency > short.get(name, 0):
+                short[name] = concurrency
+    for name, concurrency in short.items():
         yield Finding(
             "runtime-batch-below-concurrency",
             WARN,
-            f"max_batch_size {batch} is below what {name} needs per rank at concurrency "
-            f"{concurrency} ({need}): the perf points queue instead of measuring, and the "
-            f"CUDA-graph capture list stops at {batch}",
-            f"size max_batch_size to the largest per-rank concurrency ({need}), or drop the "
+            f"max_batch_size {batch} is below the concurrency {name} is measured at "
+            f"({concurrency}, a global total like the batch): the perf points queue instead of "
+            f"measuring, and the CUDA-graph capture list stops short",
+            f"size max_batch_size to the largest concurrency ({concurrency}), or drop the "
             "concurrencies the target is not meant to serve",
+        )
+    on = [name for name in ("chunked_prefill", "kv_cache_reuse") if runtime.get(name)]
+    if on:
+        yield Finding(
+            "runtime-non-core-in-core",
+            WARN,
+            f"the core configuration turns on {' and '.join(on)}: a non-core feature in core is "
+            "in every check, so a failure no longer says which feature it belongs to",
+            "keep core to CUDA graphs and the overlap scheduler; turn it off in `runtime` and "
+            "prove it with its own variant on core (`chunked`, `reuse`)",
         )
     # One workload decides the envelope: the first that states both lengths.
     workloads = [(i, o) for _, _, i, o in targets if isinstance(i, int) and isinstance(o, int)]
@@ -470,7 +489,8 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
     if not per_node:
         return
     nodes = _session_nodes(task)
-    if nodes > 1:
+    disagg_spec = disagg_checks.DisaggSpec.from_task(task)
+    if nodes > 1 and not (disagg_spec and disagg_spec.nodes > 1):
         yield Finding(
             "session-nodes-unneeded",
             INFO,
@@ -499,7 +519,7 @@ def placement_rules(ctx: LintContext) -> Iterator[Finding]:
         )
         return
     devices = spec.device_count(member)
-    if width is not None and devices and 2 * width > devices:
+    if width is not None and devices and 2 * width > devices * spec.nodes:
         yield Finding(
             "disagg-placement",
             WARN,
@@ -530,12 +550,13 @@ def scope_rules(ctx: LintContext) -> Iterator[Finding]:
     if crossed:
         yield Finding(
             "variants-cross-product",
-            WARN,
+            BLOCK,
             f"{len(crossed)} variant{'s combine' if len(crossed) > 1 else ' combines'} two or more axes "
             f"({', '.join(crossed[:6])}{', ...' if len(crossed) > 6 else ''}): each pays its own "
             "checks and proves no axis a one-axis variant does not",
-            "one variant per axis (a KV dtype, `chunked`, `no_reuse`) proves each feature; add "
-            "a combination only when the request names it",
+            "one variant per non-core feature (a KV dtype, `chunked`, `reuse`) proves each; a "
+            "combination the request names goes in notes with `intake-accept: "
+            "variants-cross-product -- <why>`",
         )
     if profile_of(task) == "certified":
         yield Finding(

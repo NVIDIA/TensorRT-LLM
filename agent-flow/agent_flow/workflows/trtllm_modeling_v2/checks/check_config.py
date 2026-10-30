@@ -222,6 +222,41 @@ class EngineLimits:
         return ""
 
 
+def share_batch(options: dict[str, Any], member: str | None, ranks: int | None = None) -> None:
+    """Turn ``options``' batch sizes, global totals, into each attention-DP rank's share.
+
+    A run states a batch size (and a concurrency) as the global total across the
+    ranks. Under attention DP every rank schedules its own batch, so the engine's
+    ``max_batch_size`` and its CUDA graphs' are the total over the ranks, rounded up;
+    the captured batch sizes stop at that share.
+    """
+    if not member:
+        return
+    kind, size = parse_parallel_segment(member)
+    ranks = ranks or size or 1
+    if kind != "dep" or ranks <= 1:
+        return
+
+    def share(value: Any) -> int:
+        return max(1, -(-int(value) // ranks))
+
+    if options.get("max_batch_size"):
+        options["max_batch_size"] = share(options["max_batch_size"])
+    graphs = options.get("cuda_graph_config")
+    if not isinstance(graphs, dict):
+        return
+    limit = share(graphs["max_batch_size"]) if graphs.get("max_batch_size") else None
+    if options.get("max_batch_size"):
+        limit = min(limit or options["max_batch_size"], options["max_batch_size"])
+    if limit is None:
+        return
+    if graphs.get("max_batch_size"):
+        graphs["max_batch_size"] = limit
+    if isinstance(graphs.get("batch_sizes"), list):
+        kept = sorted({int(b) for b in graphs["batch_sizes"] if int(b) <= limit} | {limit})
+        graphs["batch_sizes"] = kept
+
+
 def member_llm_api_overlay(member: str | None) -> dict[str, Any]:
     """The LLM-API settings a member needs that its gate command cannot carry: attention DP."""
     if not member:
@@ -652,7 +687,8 @@ def launch_kv_caches(task_data: Mapping[str, Any]) -> list[LaunchKvCache]:
                 unit,
                 source,
                 kv,
-                bool(kv.get("enable_block_reuse", True)),
+                # Block reuse is a non-core feature: off unless asked for.
+                bool(kv.get("enable_block_reuse", False)),
                 has_snapshot_policy(kv),
             )
         )
@@ -709,7 +745,8 @@ def check_configuration(
     if "kv_cache_reuse" in runtime:
         kv["enable_block_reuse"] = bool(runtime["kv_cache_reuse"])
     else:
-        kv.setdefault("enable_block_reuse", True)
+        # Block reuse is a non-core feature: the core configuration keeps it off.
+        kv.setdefault("enable_block_reuse", False)
     if runtime.get("cuda_graph") is False:
         options["cuda_graph_config"] = None
     elif "cuda_graph_config" not in options:
@@ -730,6 +767,7 @@ def check_configuration(
         moe_expert_parallel_size=size if kind in ("tep", "dep") else 1,
         enable_attention_dp=kind == "dep",
     )
+    share_batch(options, member or str(task_data["parallel"]), size)
     if features is None:
         actual_unit = base_unit(task_data, unit) if is_variant(task_data, unit) else unit
         features = (

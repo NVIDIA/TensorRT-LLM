@@ -81,6 +81,7 @@ class SpoolCommandExecutor(CommandExecutor):
         poll_s: float = 3.0,
         name_prefix: str = "gate",
         gpus: str = "all",
+        nodes: int = 1,
         priority: int = 0,
         tree: str | Path | None = None,
         pool: Sequence[str | Path] = (),
@@ -91,7 +92,11 @@ class SpoolCommandExecutor(CommandExecutor):
         self._pick_lock = threading.Lock()
         self.poll_s = poll_s
         self.name_prefix = name_prefix
-        self.gpus = gpus
+        # Gang execution reserves every device of each participating node.
+        self.gpus = "all" if nodes > 1 else gpus
+        if nodes < 1:
+            raise ValueError("nodes must be positive")
+        self.nodes = nodes
         #: The class each job queues at (:data:`ACCURACY`, :data:`FEATURE`, :data:`PERF`).
         self.priority = priority
         #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
@@ -179,6 +184,7 @@ class SpoolCommandExecutor(CommandExecutor):
         submitted = time.time()
         header = {
             "gpus": self.gpus,
+            "nodes": self.nodes if self.nodes > 1 else None,
             "wall": int(spec.timeout_s) if spec.timeout_s and spec.timeout_s > 0 else None,
             "owner": self.name_prefix,
             "token": token,
@@ -247,6 +253,7 @@ def select_command_executor(
     name_prefix: str = "gate",
     tree: Path | str | None = None,
     gpus: str = "all",
+    nodes: int = 1,
     priority: int = 0,
 ) -> CommandExecutor:
     """The executor this run's commands go through.
@@ -263,9 +270,12 @@ def select_command_executor(
             name_prefix=name_prefix,
             tree=tree,
             gpus=gpus,
+            nodes=nodes,
             priority=priority,
             pool=pool,
         )
+    if nodes > 1:
+        raise ValueError("multi-node commands require session_spool gang execution")
     return LocalCommandExecutor()
 
 

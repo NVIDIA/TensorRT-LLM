@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 
+import pytest
 import yaml
 
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import sessions
@@ -18,7 +20,7 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute.scheduler import (
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.monitor import status
 
-from .test_spool_scheduler import pump, rc
+from .test_spool_scheduler import FakeClock, blocking, make, pump, rc, release, submit
 
 HOUR = 3600.0
 
@@ -83,3 +85,83 @@ def test_an_ending_session_is_handed_over_to_the_successor_the_operator_acknowle
         old.pending_reasons["free-short"]
         == f"this session is handing over to {successor.watcher_id}"
     )
+
+
+@pytest.mark.parametrize(
+    "wall, fits", [(0, False), (7200, False), (3479, True), (3480, True), (3481, False)]
+)
+def test_admission_respects_allocation_end_before_the_handover_window(tmp_path, wall, fits):
+    spool, clock = tmp_path / "spool", FakeClock()
+    SpoolPaths(spool).ensure()
+    ending = make(
+        spool,
+        clock,
+        watcher_id="ending",
+        ends_at=clock() + 3600,
+        handover_lead_s=1200,
+    )
+    submit(spool, "bounded", header=f"gpus=1 wall={wall}s")
+    ending.tick()
+    assert not ending.handover, "this allocation is outside its handover window"
+    if fits:
+        pump(ending, lambda: rc(spool, "bounded") is not None)
+        assert rc(spool, "bounded") == 0
+        return
+    assert not ending.jobs
+    assert "waits for the successor" in ending.pending_reasons["bounded"]
+    assert rc(spool, "bounded") is None
+    successor = make(spool, clock, watcher_id="successor", ends_at=clock() + 14400)
+    if wall == 0:
+        # An unlimited GPU job cannot be bounded by either allocation.
+        successor.tick()
+        assert not successor.jobs
+        assert "waits for the successor" in successor.pending_reasons["bounded"]
+    else:
+        pump(successor, lambda: rc(spool, "bounded") is not None)
+        assert rc(spool, "bounded") == 0
+        receipt = json.loads((spool / "done/bounded.json").read_text())
+        assert receipt["watcher"] == "successor"
+
+
+def test_a_ready_successor_drains_the_old_session_before_its_alert_window(tmp_path):
+    spool = tmp_path / "spool"
+    old = _sched(spool, job="old", ends_in=2 * HOUR)
+    old.tick()
+    successor = _sched(spool, job="new", ends_in=3 * HOUR)
+    successor.tick()
+    old.tick()
+    assert old.handover["successor"] == successor.watcher_id
+    submit(spool, "later", header="gpus=1 wall=30s")
+    old.tick()
+    assert not old.jobs and "handing over" in old.pending_reasons["later"]
+    pump(successor, lambda: rc(spool, "later") is not None)
+    assert rc(spool, "later") == 0
+
+
+def test_early_handover_preserves_the_running_job_until_it_finishes(tmp_path):
+    spool = tmp_path / "spool"
+    old = _sched(spool, job="old", ends_in=2 * HOUR)
+    old.tick()
+    submit(spool, "busy", blocking(spool, "busy"), header="gpus=1 wall=60s")
+    pump(old, lambda: "busy" in old.jobs)
+    successor = _sched(spool, job="new", ends_in=3 * HOUR)
+    successor.tick()
+    old.tick()
+    assert "busy" in old.jobs and old.handover["successor"] == successor.watcher_id
+    submit(spool, "later", header="gpus=1 wall=30s")
+    old.tick()
+    assert "later" not in old.jobs
+    pump(successor, lambda: rc(spool, "later") is not None)
+    release(spool, "busy")
+    pump(old, lambda: rc(spool, "busy") is not None)
+    assert rc(spool, "busy") == 0 and rc(spool, "later") == 0
+
+
+def test_nodes_with_the_same_allocation_end_do_not_handover_to_each_other(tmp_path):
+    spool, clock = tmp_path / "spool", FakeClock()
+    a = make(spool, clock, watcher_id="nodeA", ends_at=clock() + 2 * HOUR)
+    b = make(spool, clock, watcher_id="nodeB", ends_at=clock() + 2 * HOUR)
+    a.tick()
+    b.tick()
+    a.tick()
+    assert not a.handover and not b.handover

@@ -12,6 +12,12 @@ results (``checks/test_results.py``), which hold at the exact commit they ran at
    base), the tests that fail at the head and have no result there;
 3. the results at the head against those at the base.
 
+It runs only the test files the change can reach (:func:`affected_files`):
+those it changed, those that import a module it changed, and the claims gates.
+A change to code the whole package shares (outside the catalog's and the
+targets' own directories, an ``__init__.py``, a ``conftest.py``) reaches every
+file. With no base to compare with, every file runs.
+
 A test that passed at the base and fails now, or a new one that fails, is a
 regression, and so is a test with no result at the head: the check fails,
 naming each. The head it found clean is its receipt's ``cleared``, the next
@@ -30,7 +36,9 @@ from typing import Any, Callable, ContextManager, Sequence
 from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
 from ...infra.compute.executor import FEATURE, select_command_executor
-from ...operators.coverage import CATALOG_TESTS_DIR
+from ...infra.compute.scheduler import parse_duration
+from ...infra.git import git_output
+from ...operators.coverage import CATALOG_DIR, CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
 #: The declared list a regression check runs: the package's source-level gates,
 #: the catalog's entries and every target's own.
@@ -44,6 +52,11 @@ JOB_TIMEOUT_S = 2 * 3600
 #: Jobs :func:`record_at` runs at most: a job out of time keeps the files it
 #: finished, and the next runs the rest.
 MAX_JOBS = 3
+
+#: Where a change reaches only the files that import it: the catalog's entries, the targets.
+SCOPED_SOURCE_DIRS: tuple[str, ...] = (f"{CATALOG_DIR}/", f"{MODELING_V2_PACKAGE}/models/")
+#: Test files every check runs: the package's source-level gates read every entry.
+ALWAYS_RUN = re.compile(r"(?:^|/)test_modeling_v2_[a-z_]*claims[a-z_]*\.py$")
 
 #: Runs one command line in a tree on the run's devices; returns its exit code and output tail.
 RunJob = Callable[[str, Path], tuple[int, str]]
@@ -65,6 +78,8 @@ class RegressionResult:
     held: int = 0
     #: Test jobs this check ran.
     jobs: int = 0
+    #: Which test files it ran, and why (:func:`affected_files`).
+    scope: str = ""
 
     @property
     def passed(self) -> bool:
@@ -75,7 +90,21 @@ class RegressionResult:
         return (
             f"{self.verdict} at {self.head[:10]} against {base}: {self.held} test(s) did not "
             f"fail at the head, {self.jobs} test job(s) run"
+            + (f"; {self.scope}" if self.scope else "")
         )
+
+
+def _job_timeout(environment: Any) -> int:
+    """Respect the declared gate-session job budget without changing test scope."""
+    if getattr(environment, "kind", "") != "session_spool":
+        return JOB_TIMEOUT_S
+    budgets = [
+        parse_duration(str(session.scheduler["default_wall"]))
+        for session in environment.sessions
+        if session.role in ("gates", "any") and session.scheduler.get("default_wall")
+    ]
+    positive = [budget for budget in budgets if budget > 0]
+    return int(min(JOB_TIMEOUT_S, max(positive))) if positive else JOB_TIMEOUT_S
 
 
 def job_runner(workflow: Any, name: str) -> tuple[TreeAt, RunJob, str]:
@@ -95,7 +124,9 @@ def job_runner(workflow: Any, name: str) -> tuple[TreeAt, RunJob, str]:
         executor = select_command_executor(
             env, name_prefix=name, tree=tree, gpus="all", priority=FEATURE
         )
-        done = executor.execute(CommandSpec(argv=command, cwd=str(tree), timeout_s=JOB_TIMEOUT_S))
+        done = executor.execute(
+            CommandSpec(argv=command, cwd=str(tree), timeout_s=_job_timeout(env))
+        )
         return done.returncode, (done.stdout + done.stderr)[-2000:]
 
     python = str((workflow.task_data.get("environment") or {}).get("python") or "python3")
@@ -141,6 +172,59 @@ def record_at(
     return results, jobs, code, tail
 
 
+def _module_names(path: str) -> list[str]:
+    """How a test may name the module at ``path``: dotted from the root, and its last two parts."""
+    stem = path[: -len(".py")] if path.endswith(".py") else path
+    dotted = stem.replace("/", ".")
+    parts = dotted.split(".")
+    names = [dotted, stem]
+    if len(parts) >= 2:
+        names += [".".join(parts[-2:]), "/".join(parts[-2:])]
+    return names
+
+
+def affected_files(
+    repo: str | Path, base: str | None, head: str, files: Sequence[str]
+) -> tuple[list[str], str]:
+    """The test files of ``files`` the change from ``base`` to ``head`` can reach, and why.
+
+    Every file when there is no base, nothing changed since it, or the change
+    touches code the whole package shares (:data:`SCOPED_SOURCE_DIRS`); else the test files it changed,
+    those whose text names a module it changed (dotted, as a path, or by its last
+    two parts: an over-match only runs a test more), and :data:`ALWAYS_RUN`.
+    """
+    if base is None:
+        return list(files), "every test file (no base to compare with)"
+    changed = [
+        p for p in (git_output(repo, "diff", "--name-only", base, head) or "").splitlines() if p
+    ]
+    if not changed:
+        return list(files), "every test file (nothing changed since the base)"
+    known = set(files)
+    for path in changed:
+        if path in known:
+            continue
+        name = path.rsplit("/", 1)[-1]
+        scoped = path.endswith(".py") and any(path.startswith(d) for d in SCOPED_SOURCE_DIRS)
+        if not scoped or name in ("__init__.py", "conftest.py"):
+            return list(files), f"every test file ({path} is shared by the package)"
+    chosen = {f for f in files if f in changed or ALWAYS_RUN.search(f)}
+    names = sorted({n for p in changed if p.endswith(".py") for n in _module_names(p)})
+    if names and files:
+        args = ["grep", "-l", "-F"]
+        for name in names:
+            args += ["-e", name]
+        found = git_output(repo, *args, head, "--", *files) or ""
+        prefix = f"{head}:"
+        chosen |= {
+            line[len(prefix) :] if line.startswith(prefix) else line
+            for line in found.splitlines()
+            if line
+        } & known
+    picked = sorted(chosen)
+    return picked, f"{len(picked)} of {len(files)} test files reach what changed"
+
+
 def _named(lines: Sequence[str]) -> list[str]:
     shown = list(lines[:MAX_NAMED])
     if len(lines) > MAX_NAMED:
@@ -177,12 +261,13 @@ def run_regression_check(
     out = Path(workspace) / SELECTIONS_DIRNAME / name
     job = dict(cache_dir=cache_dir, out=out, tree_at=tree_at, run_job=run_job, python=python)
     base = test_results.default_base(workspace, repo, head)
-    files = test_results.list_test_files(repo, head, paths)
+    files, scope = affected_files(repo, base, head, test_results.list_test_files(repo, head, paths))
+    selected = set(files)
     results, ran, code, tail = record_at(head, files, **job)
     if files and not results.env_digest:
         # No session at the head: nothing the jobs ran can be read.
         failure = f"the test job recorded nothing (exit {code}): {tail[-500:]}"
-        return RegressionResult(head, base, "INCOMPLETE", [failure], 0, ran)
+        return RegressionResult(head, base, "INCOMPLETE", [failure], 0, ran, scope)
     if base is None:
         # Nothing landed before the head to compare with: each failure is the head's own.
         view = test_results.head_results(results, files)
@@ -190,8 +275,8 @@ def run_regression_check(
         failures += [f"{nodeid} (no result at the head)" for nodeid in view.not_run]
         verdict = "REGRESSED" if view.failing else "INCOMPLETE" if failures else "CLEAN"
         held = len(view.passed) + len(view.skipped)
-        return RegressionResult(head, base, verdict, _named(failures), held, ran)
-    base_files = test_results.list_test_files(repo, base, paths)
+        return RegressionResult(head, base, verdict, _named(failures), held, ran, scope)
+    base_files = [f for f in test_results.list_test_files(repo, base, paths) if f in selected]
 
     def against_base() -> test_results.CompareReport:
         at_base = test_results.recorded(cache_dir, base, results.env_digest)
@@ -211,7 +296,7 @@ def run_regression_check(
     failures += [
         f"{c.head.nodeid} (fails at the head; no result at the base)" for c in report.base_unknown
     ]
-    return RegressionResult(head, base, report.verdict, _named(failures), report.passed, ran)
+    return RegressionResult(head, base, report.verdict, _named(failures), report.passed, ran, scope)
 
 
 __all__ = [
@@ -221,6 +306,7 @@ __all__ = [
     "PACKAGE_TESTS",
     "SELECTIONS_DIRNAME",
     "RegressionResult",
+    "affected_files",
     "job_runner",
     "record_at",
     "run_regression_check",

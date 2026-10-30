@@ -26,7 +26,7 @@ def test_a_planner_turn_that_raised_is_asked_again_on_the_same_events(tmp_path):
         if len(turns) == 1:
             core = _task("core", "assemble", _KEYS, deps=["x"])
             return PlannerAnswer(
-                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("x", "investigate"), core])
+                "GRAPH_UPDATED", "plan", g.Graph(tasks=[_task("x", "kernel"), core])
             )
         if len(turns) == 2:
             raise TimeoutError("the turn ran past its bound")
@@ -80,3 +80,42 @@ def test_checks_that_raised_leave_the_work_landed_and_run_again(tmp_path):
     core = orchestrator.graph.by_id()["core"]
     assert core.status == "done" and core.attempts <= 1
     assert services.ran_checks.count("core:boot@tp1") == 1  # recorded once: the re-check
+
+
+def test_a_kernel_that_ends_macro_is_split_not_failed(tmp_path):
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) == 1:
+            graph = [
+                _task("k", "kernel", touches=["catalog/k.py"]),
+                _task("core", "assemble", _KEYS),
+            ]
+            return PlannerAnswer("GRAPH_UPDATED", "plan", g.Graph(tasks=graph))
+        return PlannerAnswer("DONE", "green")
+
+    orchestrator = _orchestrator(tmp_path, _services(plan, decisions={"k": "MACRO"}))
+    assert orchestrator.run() == "delivered"
+    assert orchestrator.graph.by_id()["k"].status == "split"
+    # A split task lands nothing and holds no dependent: the run is delivered past it.
+    assert g.Graph.load(tmp_path / g.GRAPH_FILENAME).by_id()["k"].status == "split"
+
+
+def test_a_planner_failing_on_its_environment_never_closes_the_run(tmp_path):
+    turns = []
+
+    def plan(turn):
+        turns.append(turn)
+        if len(turns) <= 7:
+            raise RuntimeError(
+                "TransportClosedError: Codex process closed stdout. stderr_tail=Error: failed to "
+                "initialize sqlite state runtime"
+            )
+        if len(turns) == 8:
+            return PlannerAnswer("GRAPH_UPDATED", "plan",
+                                 g.Graph(tasks=[_task("core", "assemble", _KEYS)]))  # fmt: skip
+        return PlannerAnswer("DONE", "green")
+
+    assert _orchestrator(tmp_path, _services(plan)).run() == "delivered"
+    assert len(turns) >= 8

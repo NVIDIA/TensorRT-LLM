@@ -49,11 +49,11 @@ goal words cannot say.
 | "Y only aggregate / text-only" | Y in `members.default` for core alone; its variant and feature cells in `coverage.accept` | |
 | "<feature> smoke" | the feature in `features`, `profile: {<feature>: smoke}`, its members narrowed | |
 | a KV cache dtype list | base `kv_cache_config.dtype: auto`; one variant per other dtype (`llm_api_options.kv_cache_config.dtype`, `gates: [accuracy]`) | |
-| chunked prefill, block reuse | `runtime.chunked_prefill: true`, `kv_cache_reuse: true` in **every** gate; one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split; `no_reuse` only if asked | features that are on everywhere are proven together, which is how they serve |
-| disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully, on **one node**: its context and generation workers share that node's devices (two engines of two on a 4-GPU node; `accuracy.disagg.devices` to say otherwise, never more than a node) | boot and accuracy run one aggregated engine and never cross the hop; the tree's launcher (`launch_disaggregated_llm`) starts every worker on one host; the lint's `disagg-placement` says whether two engines fit the node (`environment.gpu_memory_gib` lets it size them) |
+| chunked prefill, block reuse | off in core (`runtime.chunked_prefill: false`, `kv_cache_reuse: false`); one `chunked` variant (`gates: [accuracy]`) with a `max_num_tokens` below the benchmark's prompts (e.g. 512 for 8-shot GSM8K) so they are really split, one `reuse` variant with `kv_cache_config.enable_block_reuse: true`, each only when asked (`chunked_prefill`, `prefix_reuse` in `--goal`) | the core configuration is CUDA graphs and the overlap scheduler at TP/TEP/ADP, the KV and SSM caches in the checkpoint's own dtype; every other feature is one variant on core, never combined (the lint blocks a cross product unless the notes accept the one the request names) |
+| disagg | `accuracy.disagg.test`: the node id of the target's disaggregated-serving accuracy test, written beside the tree's own (the tests that serve through `trtllm-serve disaggregated`, configured, set up and launched as they are), with the environment it reads in `accuracy.disagg.env` (`LLM_MODELS_ROOT` ...); it runs once, at the member the request validates fully. Derive sizes it from the checkpoint: **one node** when a context and a generation engine both fit (`accuracy.disagg.devices`, two engines of two on a 4-GPU node), else `accuracy.disagg.nodes` with one engine per node, as the tree's multi-node disaggregated tests place them | boot and accuracy run one aggregated engine and never cross the hop; a multi-node test runs one pytest process per node of one gates allocation (`MV2FLOW_JOB_NODE_RANK/HOSTS/NODES`), so the gates session must hold that many nodes |
 | any other feature (MTP, speculative, offload ...) | name it in `--goal`; `derive.report.md` and `task.example.yaml` say what its unit owes | the same one-variant-per-axis rule applies |
-| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the per-rank concurrency (attention-DP ranks split it); `max_num_tokens` = isl (or 8192); `perf.workload` | |
-| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point x its attention-DP ranks | it starts once the onboarding contract holds and measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
+| workload isl / osl / concurrency | `max_seq_len = isl + osl`; `max_batch_size` >= the concurrency; both are **global totals**: under attention DP each rank serves its share (`max_batch_size / ranks`, rounded up); `max_num_tokens` = isl (or 8192); `perf.workload` | |
+| "perf tune" | `perf.enabled: true`; `perf.workload.concurrency` 1/32/128 unless the goal names it; a `dep` member only the high point, a global total | it starts once the onboarding contract holds and measures one baseline (no stock reference, no repeats); a goal is `ratio_to_baseline` or `pct_of_sol` |
 
 **The smallest contract that covers the request.** Every check loads the model (minutes on a
 large checkpoint), and every change to the target runs the stale checks again, so the contract's
@@ -61,7 +61,7 @@ size is paid once per fix, not once per run. Prove each requested feature **once
 the request validates fully, and accept the rest in `coverage.accept`, where the delivery report
 states it:
 
-- A storage or scheduling variant (a KV dtype, `chunked`, `no_reuse`) takes `gates: [accuracy]`.
+- A storage or scheduling variant (a KV dtype, `chunked`, `reuse`) takes `gates: [accuracy]`.
   The accuracy check loads the same engine and fails unless each rank reports the variant's
   setting (its KV dtype, its chunking); a variant that boots, boots at **every** member of its
   unit.
@@ -82,8 +82,8 @@ than two engines at its member's width.
 
 ## 4. Runtime
 
-`cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: true`, `kv_cache_reuse: true`,
-`--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
+`cuda_graph: true`, `overlap_scheduler: true`, `chunked_prefill: false`, `kv_cache_reuse: false`
+(the core configuration; chunking and reuse are variants), `--kv_cache_fraction` around 0.7. Every accuracy gate runs a full benchmark with CUDA graphs: eager
 is 10-50x slower, each fix-and-recheck pays it, and it scores a path the target does not serve.
 The lint blocks a unit or variant whose accuracy runs eager, and the same holds for a benchmark
 you start by hand.
@@ -94,14 +94,33 @@ you start by hand.
   `--apply_chat_template`) unless the model only works chat-formatted. A chat-template protocol on
   a model that reasons first needs `--max_output_length` >= 1024 and its stop strings, or it scores
   truncation.
+- **What fails a check.** Output that is wrong (nothing generated, a boot keyword missing) or a
+  benchmark under its floor. Everything stricter is recorded, not gated: the golden rule is the
+  benchmark score close to its reference. A model-level reference, when the run has one
+  (`accuracy.reference_logits.path`: first-token top-k log-probs per prompt, written by
+  `checks/harness/hf_reference.py` where `transformers` loads the checkpoint natively), is
+  compared at every boot: the first token the reference's (a flip within `tie_margin`, 0.15
+  nats, is a near-tie) and the distribution not diverged (Jensen-Shannon <= `max_js`, 0.20 nats;
+  centered cosine >= `min_cosine`, 0.98). A divergence past them is written into the verdict
+  with its prompts and numbers, and the verdict stands: loosen the bounds there if they are too
+  tight; the user judges the record. Kernel entries are judged by their output distribution
+  against their reference the same way (`trtllm-modeling-v2-entry`).
 - **Anchors.** Each unit's anchor is a row of `reference_yaml` under `accuracy.model_key`, which
-  the spec states (`org/model`; the checkpoint path's last two components are no model's name).
-  Without a written or measured score, record a **low placeholder** (e.g. 10 on GSM8K, in
-  percent): it catches an engine that answers nothing and fails no working one. Commit the row to
-  the run's branch: each check measures a snapshot of a commit and reads its anchor table there,
-  and preflight refuses an uncommitted one. Replace the row (committed) when a measured anchor is
-  known, the user's, the reference implementation's on the target hardware, or one the onboarding
-  measures; every accuracy check then runs again.
+  the spec states (`org/model`; the checkpoint path's last two components are no model's name):
+  the user's score, else the reference implementation's (HuggingFace `transformers`, where it
+  runs the checkpoint natively), else an earlier run's. Without any, record a **low
+  placeholder** (e.g. 10 on GSM8K, in percent): it lets a working target integrate and catches an
+  engine that answers nothing. The first benchmark that passes on the placeholder at a member
+  keeps its score as the unit's anchor there (`anchors.json`), and every later benchmark of the
+  unit at that member is held to it, as a variant is to its unit's score. Commit the row to the
+  run's branch: each check measures a snapshot of a commit and reads its anchor table there, and
+  preflight refuses an uncommitted one.
+- **Datasets.** Staged from preflight on, beside the first turns: the spec's
+  `accuracy.dataset_path`, else the copy under `$LLM_MODELS_ROOT/datasets/` (where the tree's
+  `accuracy_core.py` reads it), else a download into the workspace. A gate waits for one being
+  staged and runs as before without one that could not be; `datasets/status.json` says which.
+  The benchmark itself is the tree's (`trtllm-eval` runs the task `accuracy_core.py` defines: for
+  GSM8K, 1319 questions, 4096 input and 256 output tokens, seed 0).
 - **Variant anchors.** A configuration variant that names no row of its own (`discriminators`,
   `reference_yaml`, `model_key`, `benchmark`) is judged against its unit's own score at the same
   member, on the same target (`anchor: relative`): a KV dtype against `auto`, the chunked variant

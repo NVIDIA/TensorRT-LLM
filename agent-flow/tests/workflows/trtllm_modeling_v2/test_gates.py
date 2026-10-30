@@ -209,3 +209,76 @@ def test_the_draft_depth_comes_from_the_options_yaml(tmp_path):
 
 def test_members_are_ordered_cheapest_first():
     assert check_config.order_members_by_cost(["tp4", "dep4", "tep4"]) == ["tep4", "dep4", "tp4"]
+
+
+@pytest.mark.parametrize(
+    "declared,explicit,expected",
+    [
+        (None, None, 14400),
+        (5400, None, 5400),
+        (5400, 800, 800),
+        (None, 30, 30),
+    ],
+)
+def test_accuracy_deadline_honors_task_and_explicit_override(
+    tmp_path, declared, explicit, expected
+):
+    task = {**_TASK, "accuracy": {**_TASK["accuracy"]}}
+    if declared is not None:
+        task["accuracy"]["timeout"] = declared
+    seen = []
+
+    def run(command, env, timeout):
+        seen.append(timeout)
+        return CommandResult(returncode=0, stdout="lm-eval gsm8k average accuracy: 95\n")
+
+    result = accuracy_checks.run_accuracy_gate(
+        _env(),
+        task_data=task,
+        reference=95.0,
+        runner=run,
+        timeout=explicit,
+        workdir=tmp_path,
+    )
+    assert result.passed and seen == [expected]
+
+
+def test_requested_gsm8k_transcripts_survive_in_unique_gate_output_directories(tmp_path):
+    task = {**_TASK, "accuracy": {**_TASK["accuracy"], "benchmark_args": ["--log_samples"]}}
+    config = {"llm": {"model": "/model", "dtype": "bfloat16"}}
+    destinations = []
+    for _ in range(2):
+        parts = accuracy_checks.eval_command(
+            task, config, "gsm8k", unit="core", member="dep4", workdir=tmp_path / "with spaces"
+        )
+        arguments = shlex.split(" ".join(parts))
+        output = next(arg.split("=", 1)[1] for arg in arguments if arg.startswith("--output_path="))
+        destinations.append(Path(output))
+        assert Path(output).parent == tmp_path / "with spaces"
+        assert "--log_samples" in arguments
+        assert f"--output_dir={Path(output) / 'inference'}" in arguments
+    assert destinations[0] != destinations[1]
+
+
+@pytest.mark.parametrize("output_argument", ["--output_path=/chosen", "--output_path"])
+def test_a_declared_transcript_destination_is_preserved(tmp_path, output_argument):
+    arguments = ["--log_samples", output_argument]
+    if output_argument == "--output_path":
+        arguments.append("/chosen with spaces")
+    task = {**_TASK, "accuracy": {**_TASK["accuracy"], "benchmark_args": arguments}}
+    result = accuracy_checks.eval_command(
+        task, {"llm": {"model": "/model"}}, "gsm8k", workdir=tmp_path
+    )
+    parsed = shlex.split(" ".join(result))
+    assert sum(arg.startswith("--output_path") for arg in parsed) == 1
+    assert all(arg in parsed for arg in arguments)
+
+
+def test_an_explicit_inference_token_destination_is_preserved(tmp_path):
+    args = ["--log_samples", "--output_dir=/tokens"]
+    task = {**_TASK, "accuracy": {**_TASK["accuracy"], "benchmark_args": args}}
+    parts = accuracy_checks.eval_command(
+        task, {"llm": {"model": "/model"}}, "gsm8k", workdir=tmp_path
+    )
+    parsed = shlex.split(" ".join(parts))
+    assert [arg for arg in parsed if arg.startswith("--output_dir=")] == ["--output_dir=/tokens"]

@@ -123,3 +123,14 @@ def test_a_check_measures_one_commit_while_integrations_move_the_checkout(
     assert "[VOID] boot@tp1" in result.summary()
     rendered = contract_mod.evaluate(contract_mod.Contract(checks=(check,)), status).render()
     assert f"- VOID {check.key}: " in rendered
+
+
+def test_native_disagg_server_helpers_are_present_in_read_only_snapshots(tmp_path, repo):
+    helper = "tests/unittest/llmapi/apps/openai_server.py"
+    head = _commit(repo, helper, "SERVER_HELPER = 'native'\n")
+    snapshots = snapshots_mod.Snapshots(repo, tmp_path / "ws" / "snapshots")
+    with snapshots.lease(head) as tree:
+        assert (tree / helper).read_text() == "SERVER_HELPER = 'native'\n"
+        assert not os.stat(tree / helper).st_mode & 0o222
+        assert not (tree / "cpp").exists()
+        assert _git(tree, "rev-parse", "HEAD").strip() == head

@@ -73,6 +73,11 @@ planner's next turn; `--now` wakes it, for what must change before that.
 2. **Plan and execute:** the planner proposes a dependency graph; Python admits and schedules it.
    Workers use separate worktrees. Kernel tasks certify or add operators; assemblers build the
    target. Commits are audited and integrated; shared-code changes require regression coverage.
+   A regression check runs only when no contract check runs or waits, and only on the test files
+   the change can reach (those it changed, those importing a module it changed, the claims
+   gates; every file when it touches code the whole package shares). Promoting the target's
+   local entries into the catalog is the last change: it starts once the contract holds, its one
+   check is a boot of the core, and the verdicts from before it hold after it.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
    Evidence is reused only while its relevant code, inputs and environment remain valid. Missing
    engine facts stay unknown. Delivery requires the contract, tests, files and promotion to agree.
@@ -115,3 +120,25 @@ an internal rank hook where public APIs provide no resolved facts.
 | `infra/compute/`, `infra/monitor/` | Execution, sessions, scheduler and provenance; status and heartbeat |
 | `infra/git.py`, `infra/files.py` | Shared Git/worktree operations and atomic file I/O |
 | `tune/`, `tune/harness/` | Campaign, measurement and keep policy; standalone benchmark programs |
+
+
+For a native disaggregated test spanning multiple nodes, set
+`accuracy.disagg.nodes` and declare a gate session with at least that many nodes.
+`accuracy.disagg.devices` is the GPU count per node. The session spool reserves
+whole nodes of one allocation and runs one pytest process on each, exposing
+`MV2FLOW_JOB_NODE_RANK`, `MV2FLOW_JOB_HOSTS`, and `MV2FLOW_JOB_NODES` for the
+native test's role placement. Every node must write a fresh passing JUnit report
+and exit successfully; missing, skipped, or failed parts reject the gate. Engine
+TP/EP/attention-DP mappings remain the native test's explicit contract.
+
+`accuracy.timeout` bounds a complete benchmark command (default four hours).
+Set it and `accuracy.disagg.timeout` below the compute allocation's remaining
+lifetime, including loading and teardown margin. These time limits do not
+change the evaluator's sample count or request protocol.
+
+For GSM8K, `--log_samples` also gets a unique `--output_path` below that gate's
+work directory unless the task explicitly supplies one. The saved lm-eval JSON
+retains prompts, responses, labels and both scoring filters for independent audit.
+
+The same GSM8K runs also save inference text and token IDs under `inference/`
+so prompt/output token counts can be audited; an explicit `--output_dir` is preserved.

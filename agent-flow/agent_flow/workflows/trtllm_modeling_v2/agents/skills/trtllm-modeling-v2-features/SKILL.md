@@ -74,11 +74,11 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 
 | feature | on in `task.yaml` by | proof that it ran | judged by |
 |---|---|---|---|
-| block reuse | `runtime.kv_cache_reuse` (default on) | reuse probe: a repeated prompt reports `cached_tokens` > 0 | boot (probe), accuracy |
-| chunked prefill | `runtime.chunked_prefill` + a `chunked` variant with a small `max_num_tokens` | a prompt longer than `max_num_tokens` past the cache, served | boot (chunk probe), variant accuracy |
+| block reuse | a `reuse` variant (`kv_cache_config.enable_block_reuse: true`); off in core | reuse probe: a repeated prompt reports `cached_tokens` > 0 | variant accuracy |
+| chunked prefill | a `chunked` variant with a small `max_num_tokens`; off in core | a prompt longer than `max_num_tokens` past the cache, served | variant accuracy |
 | KV-cache dtype | a variant setting `llm_api_options.kv_cache_config.dtype` | each rank's resolved `kv_cache_quant_algo` | variant accuracy |
 | CUDA graphs | `runtime.cuda_graph` | each rank's graph settings and capture plan (not replays) | accuracy (graphs always on) |
-| overlap scheduler | `runtime.overlap_scheduler` (default on) | the argument only | nothing of its own |
+| overlap scheduler | `runtime.overlap_scheduler` (default on, core) | the argument only | nothing of its own |
 | disaggregation | feature `disagg` + `accuracy.disagg.test` | a benchmark scored through `trtllm-serve disaggregated` | the tree's disaggregated-serving test |
 | multimodal | feature `multimodal` | an image prompt answered | boot image, image benchmark |
 | speculative | features `mtp`, `eagle3`, `dflash`, `dspark` | each rank's algorithm and depth; accepted tokens per iteration | acceptance gate |
@@ -96,10 +96,28 @@ Climb only as far as the claim needs. Each rung says what it cannot see.
 - A result that moves only with reuse, chunking or drafts on is the
   paged-context path, not the model: all three turn on `use_paged_context_fmha`
   and make a context call attend to KV it did not compute in this step.
-- Serve with features on in every gate, and prove each one once, at the member
-  the request validates fully (`spec/INTAKE.md`); disaggregation there too, its
-  test's two engines on one node (the tree's launcher starts every worker on
-  one host).
+- The core configuration is CUDA graphs and the overlap scheduler at TP, TEP
+  and ADP, with the KV and SSM caches in the checkpoint's own dtype; block reuse
+  and chunked prefill are off there. Prove every other feature once, as one
+  variant on core at the member the request validates fully (`spec/INTAKE.md`),
+  never two at once.
+- **Write the disaggregated test the way the tree's own are written,** in
+  `tests/integration/defs/accuracy/test_disaggregated_serving.py`: a
+  `LlmapiAccuracyTestHarness` class with context and generation server configs,
+  `launch_disaggregated_llm`, the benchmark task of `accuracy_core.py` (GSM8K
+  and its dataset under `$LLM_MODELS_ROOT/datasets/`), the CI list's timeout.
+  Its layout is `accuracy.disagg` (derived from the checkpoint's size): on
+  `devices` of one node, a context and a generation engine of half each, as
+  `TestDeepSeekV4Flash` puts TP2/EP2 and TP2/EP2+ADP on four GPUs; with `nodes`,
+  one engine per node, its role from `MV2FLOW_JOB_NODE_RANK`. Never hand-roll a
+  launcher, a server or a transport. What the test keeps for after it (HTTP
+  records, continuations, transfer logs) goes under `$MV2FLOW_GATE_ARTIFACTS`:
+  the snapshot the gate runs in is pruned once it ends.
+- A change outside the target is allowed where the target truly needs it (a
+  runtime, executor or serving file of the tree): follow the ModelingV2 design,
+  keep the model's own logic in the target, and make the shared change the
+  smallest general one, never a branch on this model. Name each such file and
+  why in your report; the regression check follows it.
 - A stock-path control (`--mode off`, `modeling_v2: off`) splits a target bug
   from an engine bug. A new architecture has none; say so instead of guessing.
 - Report each feature as *verified* (its proof passed), *configured* (on, not
@@ -115,7 +133,7 @@ check; how the flow proves it; blind spots):
    engine evidence
 1. Block reuse (prefix KV-cache reuse), including side state and recurrent snapshots
 2. Chunked prefill
-3. Disaggregated serving: what crosses the hop, transceiver, one-node launch
+3. Disaggregated serving: what crosses the hop, transceiver, one- and multi-node launch
 4. KV-cache dtype: fp8, nvfp4, mixed, and KV scales
 5. CUDA graphs and the overlap scheduler
 6. Multimodal inputs

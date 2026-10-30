@@ -73,6 +73,7 @@ SPARSE_CONE: tuple[str, ...] = (
     "tests/integration",
     "tests/test_common",
     "tests/unittest/_torch",
+    "tests/unittest/llmapi/apps",
     "tests/unittest/utils",
     "triton_kernels",
 )
@@ -602,7 +603,7 @@ def soft_dependency_block(states: Mapping[str, str], receipts: Path, repo: str) 
         receipt = receipts / f"{dep}.receipt.yaml"
         if status == "done":
             lines.append(f"- `{dep}` has landed; its receipt is `{receipt}`.")
-        elif status in ("failed", "abandoned"):
+        elif status in ("failed", "abandoned", "split"):
             lines.append(
                 f"- `{dep}` ended {status}: its change will not land. Go on without it, and say "
                 "in your report what of your work needed it."

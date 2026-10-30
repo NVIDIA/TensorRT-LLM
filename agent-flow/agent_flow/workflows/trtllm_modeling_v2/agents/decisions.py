@@ -53,7 +53,10 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
         ),
         Decision(
             "MACRO",
-            "the callable is more than one kernel-launching call; list `constituents`",
+            "the callable is more than one kernel-launching call and a better replacement "
+            "than the native PyTorch composition exists (a fused kernel to source); list "
+            "`constituents`. With nothing better, the composition is the entry: land it with "
+            "`macro`",
             f"{_TO_PLANNER} with the constituents, and it adds a kernel task per row",
             False,
         ),
@@ -189,7 +192,16 @@ EXTRA_KEYS_BY_AGENT: dict[str, tuple[str, ...]] = {
     # plans the fix.
     # `uncertified` is what a landed entry still does not certify of what the
     # target serves: the planner hears it with the task's end.
-    "kernel_writer": ("entry", "receipt", "constituents", "engine_defect", "uncertified"),
+    # `macro` is a landed entry that composes native PyTorch calls, nothing better existing:
+    # what it composes and where its writer looked.
+    "kernel_writer": (
+        "entry",
+        "receipt",
+        "constituents",
+        "engine_defect",
+        "uncertified",
+        "macro",
+    ),
     # `uncertified` names the calls a unit makes, correct, outside their entries'
     # CELLS: the planner hears them with the task's end and adds the certification.
     "assembler": ("blocked_reason", "missing_entry", "uncertified"),

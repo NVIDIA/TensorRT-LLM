@@ -134,9 +134,17 @@ def test_each_member_is_launched_and_scheduled_at_its_own_width(tmp_path):
     assert "mpirun" not in runner._member_env("tp1").command("python x.py")
     assert runner._member_runner("tp1") is runner._member_runner("tp1")
     runner._member_runner("tep2")
-    runner._member_runner("tep2", "all")
-    # One runner per width, and per class its jobs queue at (`priority.py`).
-    assert sorted(runner._member_runners) == [("1", 0), ("2", 0), ("all", 0)]
+    one = runner._member_runner("tep2", "all")
+    two = runner._member_runner("tep2", "all", nodes=2)
+    assert one is not two
+    assert two is runner._member_runner("tep2", "all", nodes=2)
+    # Keep node count separate when the per-node width and queue class match.
+    assert sorted(runner._member_runners) == [
+        ("1", 0, 1),
+        ("2", 0, 1),
+        ("all", 0, 1),
+        ("all", 0, 2),
+    ]
 
 
 def test_a_variant_without_a_row_is_judged_against_its_units_score_on_the_same_target(
@@ -178,3 +186,38 @@ def test_a_variant_without_a_row_is_judged_against_its_units_score_on_the_same_t
     calls.clear()
     runner._gate_call(check)(None)
     assert calls == [("core", 50.0, False), ("kv_fp8", 88.0, True)]
+
+
+def test_a_unit_on_a_placeholder_is_anchored_to_its_first_measured_score(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import RunEnvironment
+    from agent_flow.workflows.trtllm_modeling_v2.run.validation import anchors
+    from agent_flow.workflows.trtllm_modeling_v2.run.workflow import TrtllmModelingV2Workflow
+
+    data = _load(tmp_path, _spec(tmp_path))
+    contract = contract_mod.compile_contract(data, world_size=4)
+    check = next(c for c in contract.checks if c.key == "core:accuracy[gsm8k]@tp1")
+    workflow = TrtllmModelingV2Workflow(workspace=tmp_path / "ws")
+    workflow.environment = RunEnvironment(kind="local", python="python3", world_size=1)
+    workflow.task_data, workflow._contract = data, contract
+    runner = CheckRunner(workflow)
+    runner._reference_score = lambda unit, spec=None: 10.0  # a placeholder
+    calls = []
+
+    def gate(env, *, reference, unit, relative=False, **kwargs):
+        calls.append((reference, relative))
+        return SimpleNamespace(passed=True, measured=93.3, infrastructure="", detail="d",
+                               tree_state="abc", summary=str)  # fmt: skip
+
+    monkeypatch.setattr(accuracy_checks, "run_accuracy_gate", gate)
+    runner._gate_call(check)(None)
+    assert anchors.measured(workflow.workspace, "core", check.gate, "tp1").score == 93.3
+    # The next benchmark of core at tp1 is held to that score, not to the placeholder.
+    monkeypatch.setattr(
+        "agent_flow.workflows.trtllm_modeling_v2.run.validation.check_runner.replace",
+        lambda result, **changes: {**vars(result), **changes},
+    )
+    second = runner._gate_call(check)(None)
+    assert calls == [(10.0, False), (93.3, True)]
+    assert "replaced the placeholder 10" in second["detail"]

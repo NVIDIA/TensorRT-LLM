@@ -317,7 +317,7 @@ class ExecutionStage:
         transport = self.workflow._turns
         tasks = self._tasks_on_disk()
         transport.consume(
-            t.id for t in tasks.values() if t.status in ("done", "failed", "abandoned")
+            t.id for t in tasks.values() if t.status in ("done", "failed", "abandoned", "split")
         )
         task = tasks.get(what)
         answered = None
@@ -465,9 +465,19 @@ class ExecutionStage:
             if not records:
                 continue
             live = True
-            # The newest watcher's devices: a session and its successor are one session.
-            newest = max(records, key=lambda r: float(r["alive_epoch"]))
-            capacity += len(set(newest.get("devices") or []) - set(newest.get("quarantined") or []))
+            # Count every node of the latest allocation; its retiring predecessor
+            # contributes no additional capacity during handover.
+            newest = max(
+                records, key=lambda r: (float(r.get("ends_at_epoch") or 0), float(r["alive_epoch"]))
+            )
+            hosts = {}
+            for record in sorted(records, key=lambda r: float(r["alive_epoch"])):
+                if record.get("slurm_job") == newest.get("slurm_job"):
+                    hosts[record.get("host") or record.get("watcher")] = record
+            capacity += sum(
+                len(set(r.get("devices") or []) - set(r.get("quarantined") or []))
+                for r in hosts.values()
+            )
         return capacity if live else None
 
     # ---------------------------------------------------------------- planner

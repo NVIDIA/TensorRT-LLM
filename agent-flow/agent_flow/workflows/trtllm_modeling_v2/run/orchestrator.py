@@ -24,6 +24,7 @@ import contextlib
 import copy
 import errno
 import json
+import re
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -35,10 +36,12 @@ from ..agents import decisions as decision_table
 from ..agents.slots import AgentGate, Priority, run_at, turn_priority
 from ..infra.files import write_text_atomic
 from ..operators import coverage as vocab_mod
+from ..operators.promotion import is_promote
 from . import graph as graph_mod
 from . import inbox as inbox_mod
 from .records import metrics as metrics_mod
 from .validation import contract as contract_mod
+from .validation import promotions as promotions_mod
 from .validation.completion import Completion, assess
 from .workspace.integration import INTEGRATED_KINDS, TaskNotStarted
 
@@ -51,6 +54,17 @@ MAX_REFUSALS = 3
 MAX_PLANNER_FAILURES = 5
 #: The wait before the planner is asked again after its turn raised, doubled per failure.
 PLANNER_RETRY_S = 60.0
+#: The longest wait between asks while the planner's turns fail on their environment.
+PLANNER_ENVIRONMENT_WAIT_S = 15 * 60.0
+#: What marks a turn that raised as its environment's failure, not the planner's: the agent
+#: CLI's transport or state, the provider's capacity, the network. Such a turn never counts
+#: towards :data:`MAX_PLANNER_FAILURES`: the run waits and asks again, it does not close.
+ENVIRONMENT_FAILURE = re.compile(
+    r"TransportClosed|closed stdout|sqlite|state (?:db|runtime)|serverOverloaded|overloaded|"
+    r"rate.?limit|\b(?:429|502|503|504)\b|Connection(?:Error| reset| refused| aborted)|"
+    r"ECONNRESET|Broken pipe|not logged in|authenticat",
+    re.IGNORECASE,
+)
 #: What happened since the planner's last turn, kept across a restart.
 EVENTS_FILENAME = "planner_events.json"
 #: How many tasks run at once, and how many checks, unless the caller says otherwise.
@@ -103,7 +117,7 @@ class _Outcome:
 
     task: str
     attempt: int
-    #: The status the run left the task in: ``done``, ``failed`` or ``abandoned``.
+    #: The status the run left the task in: ``done``, ``failed``, ``abandoned`` or ``split``.
     status: str
 
 
@@ -389,6 +403,8 @@ class GraphOrchestrator:
         self._inconclusive: dict[str, str] = {}
         #: Planner turns that raised in a row, and when the planner may be asked again.
         self._planner_failures = 0
+        #: Planner turns that raised on their environment in a row (:data:`ENVIRONMENT_FAILURE`).
+        self._planner_environment = 0
         self._planner_retry_at = 0.0
         #: Running tasks whose thread needs no agent now: waiting on soft dependencies
         #: or running its checks. They take no task slot and hold no devices meanwhile.
@@ -928,6 +944,7 @@ class GraphOrchestrator:
         except Exception as exc:  # a turn that raised costs a retry, not the run
             return self._planner_raised(exc)
         self._planner_failures = 0
+        self._planner_environment = 0
         self._done_said = answer.decision == DONE
         self._escalated = answer.summary if answer.decision == ESCALATE else ""
         if answer.decision in (ESCALATE, CEILING, DONE):
@@ -999,10 +1016,27 @@ class GraphOrchestrator:
         Its events stay unread, and the planner is asked again after a wait
         that doubles with each failure in a row; the run goes on meanwhile.
         After :data:`MAX_PLANNER_FAILURES` in a row the run stops with
-        ``planner-failed``.
+        ``planner-failed``. A turn that failed on its environment
+        (:data:`ENVIRONMENT_FAILURE`: the agent CLI's transport or state, the
+        provider) counts towards none of them: the run waits, up to
+        :data:`PLANNER_ENVIRONMENT_WAIT_S` between asks, and asks again for as long
+        as it takes the operator to repair it, the checks running meanwhile.
         """
-        self._planner_failures += 1
         what = f"{type(exc).__name__}: {exc}"
+        if ENVIRONMENT_FAILURE.search(what):
+            self._planner_environment += 1
+            wait_s = min(
+                PLANNER_RETRY_S * 2 ** (self._planner_environment - 1), PLANNER_ENVIRONMENT_WAIT_S
+            )
+            self._planner_retry_at = time.monotonic() + wait_s
+            self.s.log(
+                f"[planner] the turn failed on its environment ({self._planner_environment} in a "
+                f"row; not the planner's failure, the run goes on and asks again in "
+                f"{wait_s:.0f}s): {what}"
+            )
+            self._save_events()
+            return None
+        self._planner_failures += 1
         self.s.log(f"[planner] the turn raised ({self._planner_failures} in a row): {what}")
         if self._planner_failures >= MAX_PLANNER_FAILURES:
             return f"planner-failed: {what}"
@@ -1121,7 +1155,13 @@ class GraphOrchestrator:
             self.s.log(f"[retry] {event}")
             self._note(event)
         else:
-            ended = "done" if decision in FINISHED and not failed else "failed"
+            ended = (
+                "split"
+                if decision == "MACRO"
+                else "done"
+                if decision in FINISHED and not failed
+                else "failed"
+            )
             if decision.startswith(f"raised {TaskNotStarted.__name__}:"):
                 unstarted = self.not_started_attempts.setdefault(task.id, [])
                 if task.attempts not in unstarted:
@@ -1146,7 +1186,8 @@ class GraphOrchestrator:
                     report=True,
                 )
             if decision not in FINISHED:
-                task.status = "failed"
+                # A MACRO hands its work on to its constituents: split, not failed.
+                task.status = "split" if decision == "MACRO" else "failed"
                 said = f"task {task.id} ({task.kind}) ended {decision or 'with no decision'}"
                 if task.kind in INTEGRATED_KINDS and self.s.landed(task):
                     self._landings[task.id] = (time.time(), task.attempts)
@@ -1179,11 +1220,15 @@ class GraphOrchestrator:
             if task.status == "failed" and task.priority == "nice_to_have":
                 task.status = "abandoned"
                 self._note(f"nice_to_have task {task.id} abandoned", outcome=outcome)
-            if task.status in ("failed", "abandoned"):
+            if task.status in ("failed", "abandoned", "split"):
                 self._note_soft_dependents(task)
             if task.kind == "survey" and task.status == "done":
                 self._add_kernel_tasks(task)
-            self._promote()
+            if is_promote(task):
+                # Done means integrated and its boot passed on the promoted tree.
+                promotions_mod.ended(
+                    self.workspace, task.id, self.s.marker() if task.status == "done" else None
+                )
         # Progress is a task done, a change landed on the target (a failed
         # receipt's included) or a check turning green. The task's own checks
         # already ran in its thread, so they count against what was passing the
@@ -1393,26 +1438,34 @@ class GraphOrchestrator:
         """The ready regression checks to keep waiting; those with nothing to check close.
 
         Only while the run has shared code to check (its own paths are
-        known). One regression check runs at a time: while one runs, the
-        others wait and what lands meanwhile joins the next batch. With none
-        running, a check whose batch is empty closes at once
+        known). A regression check runs when the gates are idle: while a
+        task that owes contract checks (a check task, or one that ``satisfies``
+        some) runs or is ready to, it waits, so it never holds the devices a
+        gate needs. One regression check runs at a time: while one
+        runs, the others wait and what lands meanwhile joins the next batch.
+        With none running, a check whose batch is empty closes at once
         (:meth:`_close_reviewed`), and of the rest the one on the longest
         chain starts.
         """
         own = self.validation["own_paths"]
         if not own:
             return set()
-        reviews = [
-            t
-            for t in graph_mod.ready(self.graph, self._receipts_landed)
-            if graph_mod.is_regression_check(t)
-        ]
+        ready_now = graph_mod.ready(self.graph, self._receipts_landed)
+        reviews = [t for t in ready_now if graph_mod.is_regression_check(t)]
         if not reviews:
             return set()
         held = {t.id for t in reviews}
         if any(
             t.status == "running" and graph_mod.is_regression_check(t) for t in self.graph.tasks
         ):
+            return held
+        gating = [
+            t
+            for t in [*ready_now, *(t for t in self.graph.tasks if t.status == "running")]
+            if (t.kind == graph_mod.CHECK_KIND or t.satisfies)
+            and not graph_mod.is_regression_check(t)
+        ]
+        if gating:
             return held
         batch = graph_mod.regression_batch(self.graph, own, self._landed_attempts())
         if not batch:
@@ -1641,22 +1694,29 @@ class GraphOrchestrator:
         )
         self._save_graph()
 
-    def _promote(self, promotion=None) -> str:
-        """Add a promote task when one is due; what keeps the target from delivery, or "".
+    def _promote(self, promotion=None, *, add: bool = True) -> str:
+        """Add a promote task when one is due and ``add``; what keeps the target from delivery, or "".
 
-        Entry by entry, once its local variants have landed and the target
-        imports them, a promote merges them into the catalog
-        (``operators/promotion.py``). A check task that has not started waits for
-        it, so it measures the merged entries rather than the variants.
+        A promote merges the target's local variants into the catalog
+        (``operators/promotion.py``). It runs last, once the contract holds
+        (``add``), so it interrupts no check: its own check is one boot of the
+        core, and once it is done every verdict the contract held before it
+        holds after it (``validation/promotions.py``).
         """
         if self.s.promotion is None:
             return ""
         promotion = promotion if promotion is not None else self.s.promotion(self.graph)
         if not promotion.entries:
             return ""
-        if promotion.task is None:
-            return promotion.waiting
+        if promotion.task is None or not add:
+            return promotion.waiting or (
+                f"{', '.join(promotion.entries)} (promoted once the contract holds)"
+            )
         task = graph_mod.Task.from_dict(promotion.task)
+        boot = next((c.key for c in self.contract.required() if c.gate == "boot"), None)
+        if boot and boot not in task.satisfies:
+            task.satisfies.append(boot)
+        promotions_mod.started(self.workspace, task.id, self.s.marker())
         self.graph.tasks.append(task)
         # A check that has not started would measure the variants the promote
         # is about to replace, and be stale once it lands: it waits for it.
@@ -1677,9 +1737,9 @@ class GraphOrchestrator:
         if self._planner is not None:
             self._added_in_turn.add(task.id)
         self._note(
-            f"the orchestrator added {task.id} ({task.ref}), which starts now: it merges the "
-            f"target's local variants into the shared catalog, and a regression check "
-            f"follows it",
+            f"the orchestrator added {task.id} ({task.ref}), which starts now that the contract "
+            f"holds: it merges the target's local variants into the shared catalog, one boot "
+            f"({boot or 'none owed'}) checks the promoted tree, and a regression check follows it",
             added=(task.id,),
         )
         self._save_graph()
@@ -1866,7 +1926,7 @@ class GraphOrchestrator:
                 marker, evaluation = self._evaluated()
                 promotion = self.s.promotion(self.graph) if self.s.promotion else None
                 holds = evaluation.holds and not self._required_open(campaign=False)
-                unpromoted = self._promote(promotion)
+                unpromoted = self._promote(promotion, add=holds)
                 if holds and unpromoted:
                     if unpromoted != self._unpromoted_said:
                         self._unpromoted_said = unpromoted
@@ -1960,11 +2020,10 @@ class GraphOrchestrator:
     def _wait(self, running: dict[str, Future], timeout: float | None) -> None:
         """Until something in flight ends, the run is stopped, or ``timeout`` passes.
 
-        With nothing in flight, the timeout (the poll interval when there is none).
+        A bounded wait lets pending interpreter signals run during long turns.
         """
         in_flight = self._in_flight(running)
-        if not in_flight and timeout is None:
-            timeout = self.poll_s
+        timeout = self.poll_s if timeout is None else min(timeout, self.poll_s)
         wait([*in_flight, self._stop], timeout=timeout, return_when=FIRST_COMPLETED)
 
     def _in_flight(self, running: dict[str, Future]) -> list[Future]:
@@ -2064,7 +2123,10 @@ def _answered(
         return True
     if outcome.status == "abandoned":
         return task is not None and task.status == "pending"
-    return outcome.status == "done" and written[outcome.task] == ("done", outcome.attempt)
+    return outcome.status in ("done", "split") and written[outcome.task] == (
+        outcome.status,
+        outcome.attempt,
+    )
 
 
 @contextlib.contextmanager

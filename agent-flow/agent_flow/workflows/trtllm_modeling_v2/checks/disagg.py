@@ -6,11 +6,11 @@
 Disaggregation is proven the way the engine's CI proves it: a test in the
 tree that serves the model through ``trtllm-serve disaggregated`` (context and
 generation workers, the KV hand-off between them) and scores a benchmark
-across that hop. The run writes that test beside the ones that already do it
-for other models, and ``accuracy.disagg.test`` names it; this gate runs it as
-CI does, from the pytest root above it, on one node: the tree's launcher
-(``launch_disaggregated_llm``) starts every worker on one host. The flow
-deploys nothing of its own.
+across that hop. ``accuracy.disagg.test`` names the native test. The default
+runs its one-host launcher from the tree's pytest root. With ``nodes > 1``,
+the spool runs one native pytest process per node of one allocation, publishing
+``MV2FLOW_JOB_NODE_RANK/HOSTS/NODES``. Each node writes its own report and all
+reports and process exit codes must pass. The flow deploys no serving stack.
 
 The gate passes when every test the node id selects passed. A test that
 skipped (too few devices, a missing model root) proves nothing and fails it,
@@ -28,10 +28,13 @@ from typing import Any, Mapping
 
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import ACCURACY_FIELD, gpus_per_node, parse_parallel_segment
-from .check_runtime import ShellRunner, default_shell_runner, gate_workdir
+from .check_runtime import MODE_REQUIRE, ShellRunner, default_shell_runner, gate_workdir, with_mode
 from .verdict import GateResult, inspect_tree, lost_session, verdict_factory
 
 GATE_NAME = "disagg"
+#: Where the test keeps what it writes for after it: under the gate's work directory, never
+#: in the read-only snapshot it runs in, which is pruned once the gate ends.
+ARTIFACTS_ENV = "MV2FLOW_GATE_ARTIFACTS"
 #: Seconds the test may take: two engines to start and a benchmark to score.
 DEFAULT_TIMEOUT_S = 7200
 #: What marks the directory pytest runs a test from, as pytest itself decides its root.
@@ -52,6 +55,14 @@ class DisaggSpec:
     env: Mapping[str, str] | None = None
     #: The devices one node of the run holds (``task_schema.gpus_per_node``); None unknown.
     node_gpus: int | None = None
+    #: Nodes running one native pytest process each; devices is per node.
+    nodes: int = 1
+    #: Explicit refinements run in separate jobs, each with its own timeout and node reports.
+    tests: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.nodes < 1:
+            raise ValueError("disagg nodes must be positive")
 
     @classmethod
     def from_task(cls, task_data: Mapping[str, Any]) -> "DisaggSpec | None":
@@ -64,21 +75,24 @@ class DisaggSpec:
             timeout=int(block.get("timeout") or DEFAULT_TIMEOUT_S),
             env={str(k): str(v) for k, v in (block.get("env") or {}).items()},
             node_gpus=gpus_per_node(task_data),
+            nodes=int(block.get("nodes", 1)),
+            tests=tuple(block.get("tests") or ()),
         )
 
     def device_count(self, member: str | None) -> int | None:
         """The devices the test runs on: declared, else two engines at ``member``'s width.
 
-        The default is at most one node's: the test's workers share one host, so
-        at a member wider than half a node it lays its two engines out on the
-        node (``dep4`` on a 4-GPU node: two engines of two).
+        Devices are per node. Multi-node native tests place one full engine on
+        each node; the default single-node test shares that node's devices.
+        The native test must attest its actual engine mappings.
         """
         if self.devices:
             return self.devices
         width = parse_parallel_segment(member)[1] if member else None
         if not width:
             return None
-        return min(2 * width, self.node_gpus) if self.node_gpus else 2 * width
+        count = width if self.nodes > 1 else 2 * width
+        return min(count, self.node_gpus) if self.node_gpus else count
 
 
 def pytest_root(repo: str | Path, test_file: str) -> Path:
@@ -103,9 +117,24 @@ def disagg_command(
     file, _, rest = spec.test.partition("::")
     root = pytest_root(repo, file)
     node = (Path(repo) / file).relative_to(root).as_posix() + (f"::{rest}" if rest else "")
-    env = replace(environment, env={**environment.env, **(spec.env or {})})
-    argv = ["-m", "pytest", node, "-q", "-rs", "-p", "no:cacheprovider", f"--junitxml={report}"]
-    return f"cd {shlex.quote(str(root))} && {env.python_command(argv, single_process=True)}"
+    # What the test keeps goes beside the report, outside the snapshot it runs in (pruned after).
+    kept = {ARTIFACTS_ENV: str(report.parent / f"{report.stem}.artifacts")}
+    env = with_mode(
+        replace(environment, env={**environment.env, **kept, **(spec.env or {})}), MODE_REQUIRE
+    )
+    argv = ["-m", "pytest", node, "-q", "-rs", "-p", "no:cacheprovider"]
+    if spec.nodes == 1:
+        argv.append(f"--junitxml={report}")
+        return f"cd {shlex.quote(str(root))} && {env.python_command(argv, single_process=True)}"
+    report_arg = (
+        shlex.quote(str(report.with_suffix("")))
+        + '.node"${MV2FLOW_JOB_NODE_RANK:?missing gang node rank}".xml'
+    )
+    invocation = shlex.join(argv) + f" --junitxml={report_arg}"
+    return (
+        f'test "${{MV2FLOW_JOB_NODES:?missing gang node count}}" -eq {spec.nodes} && '
+        f"cd {shlex.quote(str(root))} && {env.python_command(invocation, single_process=True)}"
+    )
 
 
 def judge_report(report: Path) -> tuple[bool, str]:
@@ -154,9 +183,39 @@ def run_disagg_gate(
             "accuracy test beside the tree's own (the tests that serve through "
             "`trtllm-serve disaggregated`) and name its node id there",
         )
+    if spec.tests:
+        parts = []
+        for index, test in enumerate(spec.tests):
+            part = run_disagg_gate(
+                environment,
+                task_data=task_data,
+                workdir=workdir,
+                runner=runner,
+                unit=f"{unit or 'unit'}.part{index}",
+                member=member,
+                spec=replace(spec, test=test, tests=()),
+            )
+            parts.append(part)
+            if not part.passed:
+                break
+        last = parts[-1]
+        return replace(
+            last,
+            command="\n".join(part.command for part in parts),
+            duration_s=sum(part.duration_s for part in parts),
+            stdout_tail="\n".join("\n".join(part.stdout_tail for part in parts).splitlines()[-40:]),
+            detail=f"{len(parts)}/{len(spec.tests)} native jobs: "
+            + "; ".join(part.detail for part in parts),
+        )
     directory = gate_workdir(workdir)
     report = directory / f"disagg.{unit or 'unit'}.{member or 'member'}.xml"
-    report.unlink(missing_ok=True)
+    reports = (
+        [report.with_name(f"{report.stem}.node{rank}.xml") for rank in range(spec.nodes)]
+        if spec.nodes > 1
+        else [report]
+    )
+    for item in reports:
+        item.unlink(missing_ok=True)
     command = disagg_command(environment, task_data["trtllm_repo_path"], spec, report)
     started = time.monotonic()
     result = runner(command, None, spec.timeout)
@@ -172,7 +231,15 @@ def run_disagg_gate(
         return _verdict(**lost_session(result), **ran)
     if result.timed_out:
         return _verdict(passed=False, detail=f"timed out after {spec.timeout}s", **ran)
-    passed, detail = judge_report(report)
+    if result.returncode != 0:
+        return _verdict(
+            passed=False, detail=f"native disagg command exited {result.returncode}", **ran
+        )
+    outcomes = [judge_report(item) for item in reports]
+    passed = all(ok for ok, _ in outcomes)
+    detail = "; ".join(
+        f"node{rank}: {said}" if spec.nodes > 1 else said for rank, (_, said) in enumerate(outcomes)
+    )
     return _verdict(passed=passed, detail=f"{spec.test}: {detail}", **ran)
 
 

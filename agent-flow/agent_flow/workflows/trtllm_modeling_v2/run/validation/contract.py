@@ -682,8 +682,7 @@ def evaluate(
         latest = {
             k: v
             for k, v in latest.items()
-            if v.marker == marker
-            or (marker and holds is not None and v.reads and v.reads_marker and holds(v))
+            if v.marker == marker or (marker and holds is not None and holds(v))
         }
     checks = {c.key: c for c in contract.checks}
     latest = {
@@ -723,9 +722,7 @@ def verdict_on(
     verdict = status.latest().get(key)
     if verdict is None:
         return None
-    if verdict.marker == marker or (
-        marker and holds is not None and verdict.reads and verdict.reads_marker and holds(verdict)
-    ):
+    if verdict.marker == marker or (marker and holds is not None and holds(verdict)):
         return verdict
     return None
 

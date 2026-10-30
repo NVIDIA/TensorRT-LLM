@@ -507,13 +507,27 @@ def check_variant_anchors(task_data: Mapping[str, Any], world_size: int) -> list
 
 
 def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
-    """The disaggregated-serving test asks for no more devices than one node holds.
-
-    The tree's launcher (``launch_disaggregated_llm``) starts every worker on one
-    host; a job asking for more devices than a node has is refused by the spool.
-    """
+    """The native test's per-node device request fits the allocation geometry."""
     spec = disagg_checks.DisaggSpec.from_task(task_data)
-    if spec is None or not spec.devices or not spec.node_gpus:
+    if spec is None:
+        return []
+    if spec.nodes > 1:
+        environment = task_data.get("environment") or {}
+        sessions = environment.get("sessions") or ()
+        available = max(
+            [
+                int(session.get("nodes", 1))
+                for session in sessions
+                if session.get("role", "any") in ("gates", "any")
+            ]
+            or [1]
+        )
+        if environment.get("kind") != "session_spool" or available < spec.nodes:
+            raise PreflightError(
+                f"disagg needs {spec.nodes} nodes in one session_spool allocation; "
+                f"the declared gate sessions provide {available}"
+            )
+    if not spec.devices or not spec.node_gpus:
         return []
     if spec.devices > spec.node_gpus:
         raise PreflightError(
@@ -522,7 +536,48 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
             f"host, so the test runs on one node. Write it for {spec.node_gpus} devices or fewer "
             f"(its context and generation workers between them) and set `devices` to match."
         )
-    return [f"disagg: the test {spec.test} runs on {spec.devices} devices of one node"]
+    return [
+        f"disagg: the test {spec.test} runs on {spec.devices} devices per node across {spec.nodes} node(s)"
+    ]
+
+
+def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
+    """Every gate's time limit fits in one allocation of the sessions that run the gates.
+
+    The spool admits a job only where it can finish before its allocation ends, so a
+    gate whose limit is longer than a whole allocation is never admitted: it would wait
+    for ever. The benchmark's limit is ``accuracy.timeout`` (default four hours), the
+    disaggregated test's ``accuracy.disagg.timeout``.
+    """
+    from ...infra.compute.sessions import sessions_from_task
+
+    sessions = [
+        s for s in sessions_from_task(task_data) if s.role in ("gates", "any") and s.time_limit_s
+    ]
+    if not sessions:
+        return []
+    budget = int(max(s.time_limit_s for s in sessions))
+    accuracy = task_data.get("accuracy") or {}
+    limits = {
+        "accuracy.timeout": int(accuracy.get("timeout") or accuracy_checks.ACCURACY_TIMEOUT_S)
+    }
+    disagg = disagg_checks.DisaggSpec.from_task(task_data)
+    if disagg is not None:
+        limits["accuracy.disagg.timeout"] = int(disagg.timeout)
+    over = {key: limit for key, limit in limits.items() if limit > budget}
+    if over:
+        raise PreflightError(
+            "; ".join(f"{key} is {limit}s" for key, limit in over.items())
+            + f", longer than one gates allocation ({budget}s): the spool never admits a job "
+            f"that cannot finish in its allocation, so it would wait for ever. Set it below "
+            f"{budget}s (with room for loading the model), or give the gates sessions a longer "
+            "time_limit."
+        )
+    return [
+        "gate time limits within one gates allocation ("
+        + ", ".join(f"{key} {limit}s" for key, limit in limits.items())
+        + f" <= {budget}s)"
+    ]
 
 
 #: Public LLM configuration schema, read without importing the GPU runtime.
@@ -929,6 +984,7 @@ def run_preflight(
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data))
+    notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
     notes.extend(check_kv_cache_configs(task_data, checkpoint_config))
@@ -1035,6 +1091,7 @@ __all__ = [
     "UnsupportedSpeculationError",
     "check_capture_lists",
     "check_disagg_placement",
+    "check_gate_budgets",
     "check_variant_anchors",
     "check_kv_cache_configs",
     "check_speculation_support",

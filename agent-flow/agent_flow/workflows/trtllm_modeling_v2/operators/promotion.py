@@ -271,8 +271,12 @@ class Promotion:
     waiting: str = ""
 
 
-def _is_promote(task: Any) -> bool:
+def is_promote(task: Any) -> bool:
+    """Whether ``task`` is a promote (a ``kernel`` task whose ``ref`` is ``promote:...``)."""
     return task.kind == "kernel" and str(task.ref).startswith(f"{MODE_PROMOTE}:")
+
+
+_is_promote = is_promote
 
 
 def _live(task: Any, status: Mapping[str, str]) -> bool:
@@ -411,6 +415,7 @@ def plan(
 __all__ = [
     "KEEP_LOCAL_KEY",
     "catalog_callers",
+    "is_promote",
     "PROMOTE_TASK_ID",
     "Promotion",
     "Variant",

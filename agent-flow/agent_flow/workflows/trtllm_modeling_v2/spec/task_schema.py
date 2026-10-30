@@ -98,11 +98,12 @@ MTP_NAMESPACE_FEATURES: tuple[str, ...] = ("mtp", "dspark")
 #
 #   test     REQUIRED with the disagg feature: its repository-relative pytest node id, e.g.
 #            `tests/integration/defs/accuracy/test_disaggregated_serving.py::TestX::test_y`
+#   tests    optional refinements of test, each run as a separate native job
 #   devices  the devices it starts its engines on (default two engines at the member's width)
 #   timeout  seconds (default 7200)
 #   env      the environment the test runs under (`LLM_MODELS_ROOT`, ...)
 DISAGG_FEATURE = "disagg"
-DISAGG_KEYS: tuple[str, ...] = ("test", "devices", "timeout", "env")
+DISAGG_KEYS: tuple[str, ...] = ("test", "tests", "devices", "nodes", "timeout", "env")
 
 # Workload and field documentation lives in task.example.yaml. These key sets
 # close the accepted blocks; cross-field constraints are validated below.
@@ -223,8 +224,12 @@ ACCURACY_KEYS: tuple[str, ...] = (
     "reference_yaml",
     "model_key",
     "tolerance",
+    "timeout",
     "dataset_path",
     "llm_api_options",
+    # A reference's first-token log-probs per prompt, and the bounds a divergence from
+    # them is recorded past (``checks/divergence.py``): never a failure by itself.
+    "reference_logits",
     # Which ROW of reference_yaml this run anchors to. The references key a
     # model to a list discriminated by quant_algo / kv_cache_quant_algo /
     # spec_dec_algo, and the match is exact.
@@ -262,7 +267,8 @@ ANCHOR_STATES: tuple[str, ...] = (ANCHOR_RECORDED, ANCHOR_RELATIVE)
 #   <member> at that member (`dep4`, ...), for each unit that has it.
 BENCHMARK_MEMBERS_EVERY = "every"
 #: The concurrencies a perf campaign measures when nothing says: low latency, middle, high
-#: throughput. An attention-DP member measures only the last, times its ranks.
+#: throughput. An attention-DP member measures only the last. A concurrency, like a batch
+#: size, is the global total across the ranks (``check_config.share_batch``).
 DEFAULT_PERF_CONCURRENCY: tuple[int, ...] = (1, 32, 128)
 BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 
@@ -772,7 +778,30 @@ def _validate_disagg(block: Any, errors: list[str]) -> None:
             f"'{where}.test' must be a repository-relative pytest node id "
             f"(`tests/.../test_x.py::TestY::test_z`), got {test!r}"
         )
-    _validate_fields(block, {"devices": _POS_INT, "timeout": _POS_INT}, errors, where)
+    tests = block.get("tests")
+    if tests is not None:
+        if not isinstance(tests, list) or not tests:
+            errors.append(f"'{where}.tests' must be a nonempty list of native node ids")
+        else:
+            seen = set()
+            for selected in tests:
+                if (
+                    not isinstance(selected, str)
+                    or not isinstance(test, str)
+                    or not (
+                        selected == test
+                        or selected.startswith(test + "[")
+                        or selected.startswith(test + "::")
+                    )
+                ):
+                    errors.append(f"'{where}.tests' must refine '{where}.test', got {selected!r}")
+                elif selected in seen:
+                    errors.append(f"'{where}.tests' repeats {selected!r}")
+                else:
+                    seen.add(selected)
+    _validate_fields(
+        block, {"devices": _POS_INT, "nodes": _POS_INT, "timeout": _POS_INT}, errors, where
+    )
     env = block.get("env")
     if env is not None:
         if not isinstance(env, dict):
@@ -1291,11 +1320,28 @@ def _validate_accuracy(block: Any, errors: list[str]) -> None:
             )
 
     _validate_fields(
-        block, dict.fromkeys(("max_seq_len", "max_batch_size"), _POS_INT), errors, ACCURACY_FIELD
+        block,
+        dict.fromkeys(("max_seq_len", "max_batch_size", "timeout"), _POS_INT),
+        errors,
+        ACCURACY_FIELD,
     )
 
     if block.get("acceptance") is not None:
         _validate_acceptance(block["acceptance"], errors)
+
+    reference = block.get("reference_logits")
+    if reference is not None:
+        where = f"{ACCURACY_FIELD}.reference_logits"
+        if not isinstance(reference, dict) or not _text(reference.get("path")):
+            errors.append(f"'{where}' must be a mapping with a `path` to the reference's file")
+        else:
+            from ..checks.divergence import REFERENCE_KEYS
+
+            reject_unknown_keys(reference, REFERENCE_KEYS, errors, where=where)
+            for key in ("tie_margin", "max_js", "min_cosine"):
+                value = reference.get(key)
+                if value is not None and (not _number(value) or value < 0):
+                    errors.append(f"'{where}.{key}' must be a number >= 0")
 
     _validate_floor(block, errors)
 

@@ -33,15 +33,27 @@ assigned paths and cells; this checklist supplies the additional rules.
 - `is_valid` guards metadata only, for **measured silent wrong answers**;
   do not duplicate the op's loud validation. Record preconditions, arch
   quirks, measurements and hard limits in `note`.
-- If Python must compose several calls, report `MACRO` and its missing
-  constituents/tiers instead of writing an entry. No torch fallback wrapper.
+- If Python must compose several calls, first look for a better replacement:
+  one fused kernel in the tree (`torch.ops.trtllm.*`, the catalog, another
+  model's ops), FlashInfer, or another engine's kernel. If one exists, report
+  `MACRO` and the constituents/tiers to source it instead of writing an entry.
+  If nothing better than the native PyTorch implementation exists, write the
+  entry as that composition (a **macro entry**): `__call__` composes the native
+  calls, `note` says so and lists what you searched, and the decision is
+  `LANDED` with `macro:` (below). Never a fallback that hides a faster path.
 
 ## Test and certify
 
 - Parametrize `op.CELLS`; use `_validating.py`'s `certifying` fixture so the
   entry's own `__call__` and `reference` both run. Derive the comparison band;
   bands wider than torch's dtype-aware default need wrong-variant negative
-  controls, with measured separation. Test each `is_valid` refusal with
+  controls, with measured separation. Judge a cell by its output
+  **distribution** against `reference` (cosine similarity, relative L2, a high
+  percentile of the absolute error), not by the worst element alone: a cell
+  whose distribution matches but whose worst element is past a strict
+  `allclose` is certified, with the measured numbers in `note` and the report.
+  A cell whose output is wrong (a different result, NaN, a diverged
+  distribution) fails. Test each `is_valid` refusal with
   `validating(op)` and `pytest.raises` after demonstrating the unguarded error.
   Unsafe probes run in a subprocess or are recorded only in `note`.
 - Use real stateful metadata/caches. **Pool slots are a `spec` axis sized from

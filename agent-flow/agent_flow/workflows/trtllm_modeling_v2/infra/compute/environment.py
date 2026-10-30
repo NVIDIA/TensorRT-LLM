@@ -42,12 +42,27 @@ SINGLE_PROCESS_WORKER_ENV = "TLLM_WORKER_USE_SINGLE_PROCESS"
 # case because `trtllm-bench` and the LLM API import mpi4py at load, which initializes MPI
 # whenever PMI variables are present (in a PMIx-managed step, always); the process then dies
 # spawning a worker, which pyxis forbids. `SLURM_PROCID` and `SLURM_LOCALID` survive the scrub:
-# they name the rank rather than bootstrap MPI, and code downstream reads them.
-SINGLE_TASK_MPI_SCRUB = (
-    "for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do "
-    '[ "$v" != SLURM_PROCID ] && [ "$v" != SLURM_LOCALID ] && unset "$v"; '
-    "done"
+# they name the rank rather than bootstrap MPI, and code downstream reads them. So do the
+# MPI *settings* (:data:`MPI_SETTINGS_KEPT`, and every MPI variable the run's environment
+# declares): they bootstrap nothing, and a one-task process that starts `mpirun` itself (the
+# tree's disaggregated launcher does) needs them -- a container running as root, for one,
+# cannot start its workers without `OMPI_ALLOW_RUN_AS_ROOT`.
+MPI_SETTINGS_KEPT: tuple[str, ...] = (
+    "OMPI_ALLOW_RUN_AS_ROOT",
+    "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM",
 )
+#: The prefixes of MPI variables a run's environment may declare and keep through the scrub.
+_DECLARED_MPI_PREFIXES: tuple[str, ...] = ("OMPI_MCA_", "PMIX_MCA_", "OMPI_ALLOW_")
+
+
+def single_task_scrub(keep: Sequence[str] = ()) -> str:
+    """The shell loop that unsets the MPI bootstrap environment, but ``keep`` and the settings."""
+    kept = ["SLURM_PROCID", "SLURM_LOCALID", *MPI_SETTINGS_KEPT, *sorted(set(keep))]
+    tests = " && ".join(f'[ "$v" != {name} ]' for name in dict.fromkeys(kept))
+    return f'for v in ${{!PMI@}} ${{!PMIX@}} ${{!MPI@}} ${{!OMPI@}} ${{!SLURM@}}; do {tests} && unset "$v"; done'
+
+
+SINGLE_TASK_MPI_SCRUB = single_task_scrub()
 
 # Above one task, under `mpirun`, the misleading variables are the Slurm task ones:
 # `trtllm-llmapi-launch` reads `SLURM_PROCID` before `OMPI_COMM_WORLD_RANK` for its rank and
@@ -109,7 +124,8 @@ class RunEnvironment:
 
     def _scrub_and_exec(self, argv: str) -> str:
         """``argv`` behind a scrub of the MPI environment, in this process."""
-        return f"bash -c {shlex.quote(f'{SINGLE_TASK_MPI_SCRUB}; exec {argv}')}"
+        declared = [k for k in self.env if str(k).startswith(_DECLARED_MPI_PREFIXES)]
+        return f"bash -c {shlex.quote(f'{single_task_scrub(declared)}; exec {argv}')}"
 
     def _mpirun_launch(self, argv: str) -> str:
         """``argv`` behind an ``mpirun`` that creates the ranks here.
@@ -120,7 +136,12 @@ class RunEnvironment:
         slots against one and dies before any Python runs. Raising the session's
         ``ntasks_per_node`` instead would start four spool watchers racing for every job.
         """
-        return f"{shlex.join(rank_launch(self.ntasks, LLMAPI_LAUNCH))} {argv}"
+        launch = f"{shlex.join(rank_launch(self.ntasks, LLMAPI_LAUNCH))} {argv}"
+        # The launcher is installed beside the interpreter; a session's PATH need not hold it
+        # (`mpirun` reports `trtllm-llmapi-launch` not found), so its directory goes first.
+        if os.path.isabs(self.python):
+            return f'PATH={shlex.quote(os.path.dirname(self.python))}:"$PATH" {launch}'
+        return launch
 
     def command(self, argv: str | Sequence[str], *, single_process: bool = False) -> str:
         """Return the command line ``argv`` prefixed for this environment.
@@ -411,7 +432,9 @@ __all__ = [
     "MULTI_TASK_SLURM_SCRUB",
     "MULTI_TASK_SLURM_VARS",
     "RunEnvironment",
+    "MPI_SETTINGS_KEPT",
     "SINGLE_TASK_MPI_SCRUB",
+    "single_task_scrub",
     "image_import_warning",
     "resolve_environment",
     "scheduler_owns_devices",

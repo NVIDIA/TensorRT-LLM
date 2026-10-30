@@ -124,9 +124,10 @@ def test_a_goal_that_names_its_features_gets_those_and_what_derive_cannot_know_i
         )
     assert "accuracy.model_key" in str(excinfo.value) and "concurrency" not in str(excinfo.value)
     spec = yaml.safe_load((tmp_path / "ws" / derive.SPEC_FILENAME).read_text())
-    # Concurrency is not asked: 1/32/128 by default, attention DP only at the high point per rank.
+    # Concurrency is not asked: 1/32/128 by default, attention DP only at the high point, a
+    # global total its ranks share.
     loads = {c["name"]: c["workload"]["concurrency"] for c in spec["perf"]["configs"]}
-    assert loads == {"tp1": [1, 32, 128], "tep4": [1, 32, 128], "dep4": [512]}
+    assert loads == {"tp1": [1, 32, 128], "tep4": [1, 32, 128], "dep4": [128]}
     # The checkpoint's drafter is left out: the goal names its features and not it.
     assert spec["features"] == ["multimodal"]
     assert "features (left out)" in (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
@@ -163,3 +164,40 @@ def test_a_spec_the_checkpoint_cannot_meet_is_refused_with_every_reason(tmp_path
     assert "8 attention heads do not split 3 ways" in message
     assert "nvfp4 weights need sm_100" in message
     assert "config.json states none" in message
+
+
+def test_core_keeps_reuse_and_chunking_off_and_each_named_one_is_its_own_variant(tmp_path):
+    spec = load_and_validate_task_yaml(
+        _derive(tmp_path, "chunked_prefill prefix_reuse kv=bf16/fp8 chunk=256 concurrency=1/128")
+    )
+    runtime = spec["runtime"]
+    assert runtime["cuda_graph"] and runtime["overlap_scheduler"]
+    assert not runtime["chunked_prefill"] and not runtime["kv_cache_reuse"]
+    core = yaml.safe_load(Path(spec["accuracy"]["llm_api_options"]["core"]).read_text())
+    assert core["kv_cache_config"]["enable_block_reuse"] is False
+    assert core["enable_chunked_prefill"] is False and "max_num_tokens" not in core
+    variants = spec["variants"]
+    assert set(variants) == {"kv_fp8", "chunked", "reuse"}
+    assert variants["chunked"]["llm_api_options"] == {
+        "enable_chunked_prefill": True,
+        "max_num_tokens": 256,
+    }
+    assert variants["reuse"]["llm_api_options"] == {"kv_cache_config": {"enable_block_reuse": True}}
+    # Each changes one non-core feature, gated by its benchmark alone.
+    assert all(v["unit"] == "core" and v["gates"] == ["accuracy"] for v in variants.values())
+    report = (tmp_path / "ws" / derive.REPORT_FILENAME).read_text()
+    # The batch the spec carries, raised to the concurrency, not the default it started from.
+    assert "| `workload.max_batch_size` | concurrency | `128` |" in report
+    with pytest.raises(derive.DeriveError):
+        derive.parse_goal("chunked_prefill:smoke")
+
+
+@pytest.mark.parametrize(
+    "weights_gib, layout",
+    [(100, (2, 1)), (300, (4, 1)), (500, (4, 2)), (2000, (4, 8)), (None, None)],
+)
+def test_the_disaggregated_test_takes_one_node_unless_its_two_engines_do_not_fit(
+    weights_gib, layout
+):
+    weights = None if weights_gib is None else weights_gib * 2**30
+    assert derive.disagg_layout(weights, 277, 4) == layout

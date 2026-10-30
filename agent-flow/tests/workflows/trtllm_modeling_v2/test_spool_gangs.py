@@ -136,3 +136,44 @@ def test_a_session_of_several_nodes_runs_a_watcher_on_each(tmp_path):
     # A job submitted with --nodes holds that many nodes.
     args = spoolctl.build_parser().parse_args(["submit", "--nodes", "2", "pair", "true"])
     assert spoolctl.job_header(args, None, "t")["nodes"] == 2
+
+
+def test_canceling_an_unstarted_gang_releases_the_drained_node(spool):
+    a, b = _node(spool, time.time, "nodeA"), _node(spool, time.time, "nodeB")
+    submit(spool, "busy", blocking(spool, "busy"), header="gpus=all wall=60s")
+    _pump([a], lambda: "busy" in a.jobs)
+    submit(spool, "pair", "true", header="nodes=2 wall=60s")
+    _pump([a, b], lambda: b._reserved_for == "pair")
+    paths = SpoolPaths(spool)
+    assert not (paths.gangs / "pair/go.json").exists()
+    (paths.cancel / "pair").touch()
+    _pump([a, b], lambda: rc(spool, "pair") is not None)
+    assert record(spool, "pair")["reason"] == "cancelled"
+    assert "busy" in a.jobs
+    submit(spool, "after", "true", header="gpus=all wall=30s")
+    _pump([b, a], lambda: rc(spool, "after") is not None)
+    assert rc(spool, "after") == 0 and record(spool, "after")["host"] == "nodeB"
+    release(spool, "busy")
+    _pump([a, b], lambda: rc(spool, "busy") is not None)
+    assert rc(spool, "busy") == 0 and not (paths.gangs / "pair").exists()
+
+
+def test_late_readiness_for_a_terminal_unstarted_gang_is_pruned(spool):
+    node = _node(spool, time.time, "nodeA")
+    paths = SpoolPaths(spool)
+    root = paths.gangs / "cancelled"
+    (root / "ready").mkdir(parents=True)
+    (paths.done / "cancelled.rc").write_text("216\n")
+    node.tick()
+    assert not root.exists()
+
+
+def test_a_go_marker_protects_an_active_gang_from_terminal_cleanup(spool):
+    node = _node(spool, time.time, "nodeA")
+    paths = SpoolPaths(spool)
+    root = paths.gangs / "active"
+    root.mkdir()
+    (root / "go.json").write_text("{}")
+    (paths.done / "active.rc").write_text("216\n")
+    node.tick()
+    assert root.exists()

@@ -42,8 +42,8 @@ _GOOD = {
     "features": ["disagg"],
     "runtime": {
         "cuda_graph": True,
-        "chunked_prefill": True,
-        "kv_cache_reuse": True,
+        "chunked_prefill": False,
+        "kv_cache_reuse": False,
         "extra_flags": ["--max_seq_len=9216", "--max_batch_size=128", "--max_num_tokens=8192"],
     },
     # Each feature proven once, at the member the request validates fully (dep4).
@@ -71,6 +71,7 @@ _GOOD = {
 def _slow():
     task = copy.deepcopy(_GOOD)
     task["runtime"]["cuda_graph"] = False
+    task["runtime"]["chunked_prefill"] = True
     task["runtime"]["extra_flags"] = [
         "--max_seq_len=16384",
         "--max_batch_size=32",
@@ -125,13 +126,27 @@ def test_slow_and_stalling_choices_are_named():
     } <= rules
 
 
-def test_attention_dp_splits_the_batch_across_ranks():
+def test_a_batch_and_a_concurrency_are_both_global_totals():
     task = copy.deepcopy(_GOOD)
     task["members"] = {"default": ["dep4"]}
     task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=32"]
-    assert "runtime-batch-below-concurrency" not in _rules(lint.lint_task(task))
-    task["members"] = {"default": ["tp4"]}
+    # Attention DP splits both alike: 32 in all is below 128 in all, whatever the ranks.
     assert "runtime-batch-below-concurrency" in _rules(lint.lint_task(task))
+    task["runtime"]["extra_flags"] = ["--max_seq_len=9216", "--max_batch_size=128"]
+    assert "runtime-batch-below-concurrency" not in _rules(lint.lint_task(task))
+
+
+def test_a_non_core_feature_in_core_is_named_and_a_named_combination_can_be_kept():
+    task = copy.deepcopy(_GOOD)
+    task["runtime"]["kv_cache_reuse"] = True
+    assert "runtime-non-core-in-core" in _rules(lint.lint_task(task))
+    task = _slow()
+    report = lint.lint_task(task)
+    assert any(
+        f.rule == "variants-cross-product" and f.severity == lint.BLOCK for f in report.open()
+    )
+    task["notes"] += "\nintake-accept: variants-cross-product -- the request names fp8 with chunks"
+    assert "variants-cross-product" not in {f.rule for f in lint.lint_task(task).open()}
 
 
 def test_notes_accept_a_finding_with_its_reason():

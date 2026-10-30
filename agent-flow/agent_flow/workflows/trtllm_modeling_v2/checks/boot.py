@@ -19,7 +19,7 @@ from ..spec.task_schema import (
     parse_parallel_segment,
 )
 from ..spec.variants import is_variant
-from . import check_config, feature_evidence
+from . import check_config, divergence, feature_evidence
 from .check_config import (
     EngineLimits,
     check_configuration,
@@ -492,6 +492,20 @@ def run_boot_gate(
                 f"leave no room for a prompt the engine would have to split",
             )
         requests.append({"id": "chunk", "probe_tokens": length, "max_tokens": 1})
+    # The reference's prompts, one token each with its top-k, on the same engine: the
+    # model-level divergence is recorded with the verdict, never a failure by itself.
+    reference, unread = None, ""
+    if mode == MODE_REQUIRE:
+        try:
+            reference = divergence.load_reference(task_data)
+        except (OSError, ValueError) as exc:
+            unread = f"the reference logits cannot be read ({exc}): divergence UNKNOWN"
+    reference_at = len(requests)
+    if reference is not None:
+        requests.extend(
+            {"id": f"reference:{key}", "prompt": text, "max_tokens": 1, "logprobs": reference.top_k}
+            for key, text in reference.prompts.items()
+        )
     boundary = BootBoundarySpec.from_task(task_data)
     phases = []
     if (
@@ -598,6 +612,22 @@ def run_boot_gate(
             f"{missing}. Keywords are matched against generated text only",
             **ran,
         )
+    compared, warnings = "", []
+    if reference is not None:
+        measured = {}
+        for n in range(reference_at, len(requests)):
+            steps = (records.get(n) or {}).get("top_logprobs") or [[]]
+            row = {int(e[0]): float(e[1]) for e in steps[0] or () if e and e[0] is not None}
+            measured[str(requests[n]["id"]).partition(":")[2]] = row
+        found = divergence.assess(reference.first_tokens, measured, reference.bounds)
+        compared = f"; {found.describe()}"
+        if not found.within:
+            warnings.append(
+                f"divergence from the reference recorded: {len(found.crossed)} of "
+                f"{found.prompts} prompt(s) past a bound (the verdict stands)"
+            )
+    elif unread:
+        compared, warnings = f"; {unread}", [unread]
     images = sum(len(r.get("images") or ()) for r in requests)
     checked = (
         f"{len(spec.keywords) + sum(1 for i in spec.items if i.keywords or i.keywords_any)} "
@@ -616,7 +646,10 @@ def run_boot_gate(
             f"({'; '.join(boundary_ties)})"
             if boundary_ties
             else ""
-        ),
+        )
+        + compared,
+        warnings=tuple(warnings),
+        explained=bool(compared),
         **ran,
     )
 

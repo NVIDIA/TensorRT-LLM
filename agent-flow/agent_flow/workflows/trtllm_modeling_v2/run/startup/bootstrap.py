@@ -188,6 +188,15 @@ def _run_preflight(
         ],
     )
     workflow.journal.section("preflight", f"```\n{format_preflight_report(result)}\n```")
+    # The benchmarks' datasets, staged beside the first turns: never a blocker.
+    from . import datasets as datasets_mod
+
+    datasets_mod.start(
+        workflow.task_data,
+        workflow.workspace,
+        python=getattr(result.environment, "python", None),
+        note=lambda said: workflow.journal.event("datasets", said),
+    )
     print_message(f"[bold green]✔ preflight[/bold green]\n{format_preflight_report(result)}", log)
 
     # Where this run's commands land, decided once, from the resolved

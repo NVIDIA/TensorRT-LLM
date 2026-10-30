@@ -46,6 +46,12 @@ work and write.
   fails comes back to the planner. Run a gate yourself to debug.
 - **Stay inside the goal.** A defect you meet outside it, in another model or
   a path this target does not take, goes in your report, not into your work.
+- **The rest of the tree when the target needs it.** Any TensorRT-LLM file
+  (the runtime, the executor, serving, a test) may change where the target
+  truly cannot work without it. Follow the ModelingV2 design: the model's own
+  logic stays in the target, and a change outside it is the smallest general
+  one, never a branch on this model. It must be in your `touches`; when it is
+  not, report the path and why, and the planner widens them.
 - **Finish the repair in this task.** Ordinary build, import and launch
   failures inside your goal and `touches` are yours to fix before you return.
 - A command longer than a few minutes is launched and polled, never blocked
@@ -107,8 +113,19 @@ The orchestrator adds a task that fixes it, and this task is retried once the
 fix lands. Leave the remaining cells to the re-certification that follows the
 fix.
 
-A `MACRO` lists its constituents; a row without `target` and `tier` is
-dropped:
+A `MACRO` lists its constituents, the better replacement it names (a fused
+kernel to source); a row without `target` and `tier` is dropped. When nothing
+better than the native PyTorch implementation exists, the composition is the
+entry: write it, and land it with what you searched:
+
+```yaml
+decision: LANDED
+macro:
+  calls: [torch.nn.functional.silu, torch.clamp, torch.mul]   # what __call__ composes
+  searched: in-tree torch.ops.trtllm, the catalog, FlashInfer, vLLM, SGLang   # where you looked
+```
+
+Otherwise, a `MACRO`:
 
 ```yaml
 decision: MACRO

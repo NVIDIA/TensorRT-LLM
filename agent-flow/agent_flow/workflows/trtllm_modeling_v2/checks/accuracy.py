@@ -82,9 +82,20 @@ def eval_command(
     ]
     if accuracy.get("dataset_path"):
         parts.append(shlex.quote(f"--dataset_path={accuracy['dataset_path']}"))
-    parts.extend(
-        shlex.quote(str(arg)) for arg in resolve_per_unit(accuracy, "benchmark_args", unit) or ()
-    )
+    arguments = [str(arg) for arg in resolve_per_unit(accuracy, "benchmark_args", unit) or ()]
+    if benchmark == "gsm8k" and "--log_samples" in arguments:
+        output = None
+        for index, argument in enumerate(arguments):
+            if argument.startswith("--output_path="):
+                output = argument.split("=", 1)[1]
+            elif argument == "--output_path" and index + 1 < len(arguments):
+                output = arguments[index + 1]
+        if output is None:
+            output = str(target.parent / f"{target.stem}.samples.{time.time_ns()}")
+            arguments.append(f"--output_path={output}")
+        if not any(arg == "--output_dir" or arg.startswith("--output_dir=") for arg in arguments):
+            arguments.append(f"--output_dir={Path(output) / 'inference'}")
+    parts.extend(shlex.quote(arg) for arg in arguments)
     return parts
 
 
@@ -184,7 +195,7 @@ def run_accuracy_gate(
     reference: float,
     workdir: str | Path,
     runner: ShellRunner = default_shell_runner,
-    timeout: int = ACCURACY_TIMEOUT_S,
+    timeout: int | None = None,
     unit: str | None = None,
     member: str | None = None,
     relative: bool = False,
@@ -199,6 +210,7 @@ def run_accuracy_gate(
     (:func:`engine_declaration`).
     """
     accuracy = dict(task_data.get("accuracy") or {})
+    timeout = int(accuracy.get("timeout", ACCURACY_TIMEOUT_S)) if timeout is None else timeout
     benchmark = str(resolve_per_unit(accuracy, "benchmark", unit) or "gsm8k")
     tolerance = float(accuracy.get("tolerance", 0.0))
     env = with_mode(environment, MODE_REQUIRE)
@@ -224,6 +236,9 @@ def run_accuracy_gate(
     for key in ("max_seq_len", "max_batch_size"):
         if accuracy.get(key) is not None:
             config["llm"][key] = accuracy[key]
+    if accuracy.get("max_batch_size") is not None:
+        # The benchmark's batch is a global total too: each attention-DP rank serves its share.
+        check_config.share_batch(config["llm"], member, config["llm"].get("tensor_parallel_size"))
     parts = eval_command(task_data, config, benchmark, unit=unit, member=member, workdir=workdir)
     command = eval_harness_command(env, parts)
 

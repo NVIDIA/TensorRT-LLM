@@ -26,6 +26,8 @@ IN_CONE = (
     "tests/conftest.py",
     "tests/unittest/conftest.py",
     "tests/unittest/_torch/test_modeling.py",
+    "tests/unittest/llmapi/apps/openai_server.py",
+    "tests/unittest/llmapi/test_llm_args.py",
     "tests/unittest/utils/util.py",
     "tests/test_common/hooks.py",
     "tests/integration/defs/conftest.py",
@@ -40,7 +42,7 @@ OUTSIDE = (
     "docs/guide/page.md",
     "docs/other/notes.md",
     "scripts/build.py",
-    "tests/unittest/llmapi/test_llm_args.py",
+    "tests/unittest/llmapi/other/test_unrelated.py",
 )
 
 

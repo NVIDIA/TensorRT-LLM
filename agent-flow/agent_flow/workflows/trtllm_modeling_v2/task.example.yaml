@@ -95,7 +95,8 @@ trtllm_repo_path: /path/to/TensorRT-LLM
 #                              # make every accuracy run 10-50x slower
 #   chunked_prefill: false     # default false
 #   overlap_scheduler: true    # default true  (--disable_overlap_scheduler)
-#   kv_cache_reuse: true       # default true  (--disable_kv_cache_reuse)
+#   kv_cache_reuse: false      # default false: block reuse is a non-core feature, proven by a
+#                              # `reuse` variant (kv_cache_config.enable_block_reuse: true)
 #   # Anything else the gate command needs, verbatim. Without --max_seq_len the engine sizes its
 #   # cache for `max_position_embeddings` (`Impossible to fit in any sequence in kvCache`).
 #   # max_seq_len = isl + osl; max_batch_size >= the per-rank concurrency the perf block claims.
@@ -338,7 +339,8 @@ accuracy:
 # perf:
 #   enabled: true
 #   workload: {isl: 8192, osl: 1024, concurrency: [1, 32, 128]}   # default 1024, 1024, [1, 32, 128]
-#                                  # derive gives a dep member only the high point x its ranks
+#                                  # derive gives a dep member only the high point; a concurrency
+#                                  # and a batch size are global totals across attention-DP ranks
 #   identity_configs: [<LLM-API yaml>]   # default: derived from the workload
 #   configs:                       # instead of `workload`: serving validation workloads
 #     - name: chat                 # system-wide candidates and final cumulative e2e cover all

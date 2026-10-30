@@ -164,3 +164,19 @@ def test_a_planner_retries_a_failed_task_in_place_until_its_last_attempt(tmp_pat
     # Leaving it failed, or dropping it, is admissible.
     assert g.apply_revision(current, _graph(_t("a", status="failed"), _t("b")), "r")[1] == []
     assert g.apply_revision(current, _graph(_t("b")), "drop a")[1] == []
+
+
+def test_an_investigation_never_gates_a_check_and_a_check_never_gates_a_kernel():
+    probe = g.Task(id="probe", kind="investigate", goal="find out why")
+    extra = g.Task(id="extra", kind="feature", goal="nice", priority="nice_to_have")
+    gate = g.Task(id="gate", kind="check", goal="run", satisfies=["core:boot@tp1"])
+    core = g.Task(id="core", kind="assemble", goal="core", satisfies=["core:boot@tp1"],
+                  depends_on=["probe", "extra"])  # fmt: skip
+    kernel = g.Task(id="k1", kind="kernel", goal="entry", depends_on=["gate"])
+    errors = g.validate(g.Graph(tasks=[probe, extra, gate, core, kernel]))
+    assert any("'core': depends on 'probe', an `investigate` task" in e for e in errors)
+    assert any("'core': depends on 'extra', a nice_to_have task" in e for e in errors)
+    assert any("'k1': depends on 'gate', a `check` task" in e for e in errors)
+    core.depends_on, kernel.depends_on = [], []
+    assert not [e for e in g.validate(g.Graph(tasks=[probe, extra, gate, core, kernel]))
+                if "informs" in e or "never waits" in e]  # fmt: skip

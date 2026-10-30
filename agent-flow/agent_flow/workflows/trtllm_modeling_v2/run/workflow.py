@@ -80,6 +80,7 @@ from .startup import bootstrap
 from .startup import primers as primers_mod
 from .startup.bootstrap import HOST_FACTS_FILENAME, TROUBLESHOOTING_HINT
 from .validation import contract as contract_mod
+from .validation import promotions as promotions_mod
 
 #: How many tasks run at once: the CLI's --max-parallel-tasks default.
 DEFAULT_MAX_PARALLEL_TASKS = orchestrator_mod.DEFAULT_MAX_PARALLEL_TASKS
@@ -696,11 +697,18 @@ class TrtllmModelingV2Workflow:
         return (ident, marker) if marker else ("", "")
 
     def _verdict_holds(self, verdict: contract_mod.Verdict) -> bool:
-        """Whether ``verdict`` holds on the target as it is: what it read of the tree is unchanged.
+        """Whether ``verdict`` holds on the target as it is.
 
+        What it read of the tree is unchanged, or only a done promote changed it since.
         Its narrowed marker (:meth:`_commit_marker` with ``reads``) on the checkout's ``HEAD``
         is the one it recorded. Asked once per head and list.
         """
+        if verdict.marker and verdict.marker in promotions_mod.carried(
+            self.workspace, self._target_marker()
+        ):
+            # Measured before a done promote: the promote moved the kernels it ran, and its
+            # boot passed on the tree it left (``validation/promotions.py``).
+            return True
         head = self._head()
         if not head or not verdict.reads or not verdict.reads_marker:
             return False

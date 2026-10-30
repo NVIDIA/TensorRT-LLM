@@ -174,3 +174,25 @@ def test_the_run_is_not_delivered_while_a_landed_change_is_in_no_checks_batch(tm
     assert orchestrator.run() == "delivered"
     assert reviewed == ["r1", "r1"]
     assert orchestrator.graph.by_id()["r1"].covers == ["k1@1"]
+
+
+def test_a_regression_check_waits_while_the_gates_are_busy(tmp_path):
+    orchestrator, order = None, []
+
+    def check(chk):
+        _wait_for(lambda: orchestrator.graph.by_id()["k1"].status == "done")
+        time.sleep(0.2)  # long enough for a regression check to have started beside it
+        assert orchestrator.graph.by_id()["r1"].status == "pending"
+        order.append(chk.key if hasattr(chk, "key") else "gate")
+        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="")
+
+    def regression(task):
+        order.append(task.id)
+        return []
+
+    plan = _plan(_graph(_shared("k1"), _core(), _review("r1", ["k1"])))
+    orchestrator = _orchestrator(tmp_path, plan, lambda task: "LANDED" if task.kind == "kernel"
+                                 else "UNIT_READY", regression=regression)  # fmt: skip
+    orchestrator.s.check = check
+    assert orchestrator.run() == "delivered"
+    assert order[-1] == "r1" and len(order) >= 2

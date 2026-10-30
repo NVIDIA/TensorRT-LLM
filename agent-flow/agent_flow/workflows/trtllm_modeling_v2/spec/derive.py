@@ -8,7 +8,14 @@ says every value the goal did not state and where it came from. What cannot be
 derived is an open question: the run stops before it starts and names each, and
 the operator answers it in the spec. A feature the checkpoint carries (draft
 layers, a vision or audio tower) is built unless the goal puts it out of scope;
-anything else is built only when the goal names it. The goal is one line of
+anything else is built only when the goal names it.
+
+The core configuration is what every unit is gated under: CUDA graphs and the
+overlap scheduler on, the KV cache in the checkpoint's own format, block reuse
+and chunked prefill off. A non-core runtime feature the goal names
+(``chunked_prefill``, ``prefix_reuse``) and each extra KV dtype (``kv=``) is one
+configuration variant of core, judged at one member against core's own score:
+each non-core feature on its own, never a cross product. The goal is one line of
 words, separated by spaces, commas or semicolons; :func:`parse_goal` defines
 the accepted features, members, profiles and key=value settings.
 """
@@ -66,13 +73,21 @@ DEFAULT_BOOT: dict[str, Any] = {
 }
 DEFAULT_BENCHMARK = "gsm8k"
 
-#: Goal word -> the runtime switch ``-<word>`` turns off.
+#: Goal word -> its runtime switch: ``-<word>`` turns a core one off; naming a non-core
+#: one (:data:`NON_CORE_SWITCHES`) adds its configuration variant.
 RUNTIME_WORDS: dict[str, str] = {
     "cuda_graph": "cuda_graph",
     "overlap_scheduler": "overlap_scheduler",
     "chunked_prefill": "chunked_prefill",
     "prefix_reuse": "kv_cache_reuse",
 }
+#: The runtime switches of the core configuration: on unless the goal turns them off.
+CORE_SWITCHES: frozenset[str] = frozenset({"cuda_graph", "overlap_scheduler"})
+#: Non-core runtime switch -> the configuration variant that turns it on: off in core.
+NON_CORE_SWITCHES: dict[str, str] = {"chunked_prefill": "chunked", "kv_cache_reuse": "reuse"}
+#: Tokens per prefill chunk in the ``chunked`` variant when the goal names none: below the
+#: benchmark's few-shot prompts, so their prefill is split.
+DEFAULT_CHUNK_TOKENS = 512
 #: The units a goal may name: every feature of the spec.
 UNIT_WORDS: frozenset[str] = frozenset(FEATURE_FAMILIES)
 #: ``<feature>:<depth>`` -> the profile the feature's checks follow.
@@ -149,6 +164,8 @@ class Goal:
     speculative: bool | None = None
     #: Runtime switch -> off (``-cuda_graph``).
     switches_off: set[str] = field(default_factory=set)
+    #: Non-core runtime switches the goal names (``chunked_prefill``): one variant each.
+    switches_on: set[str] = field(default_factory=set)
     members: list[str] = field(default_factory=list)
     workload: dict[str, Any] = field(default_factory=dict)
     params: dict[str, Any] = field(default_factory=dict)
@@ -193,6 +210,10 @@ def parse_goal(text: str | None) -> Goal:
             goal.speculative = not out
         elif name in RUNTIME_WORDS and out:
             goal.switches_off.add(RUNTIME_WORDS[name])
+        elif name in RUNTIME_WORDS:
+            # A core switch is on already; a non-core one is tested as its own variant.
+            if RUNTIME_WORDS[name] in NON_CORE_SWITCHES:
+                goal.switches_on.add(RUNTIME_WORDS[name])
         elif name in UNIT_WORDS:
             goal.units[name] = not out
             if members and not out:
@@ -440,7 +461,7 @@ def derive_spec(
             workload["osl"] = min(workload["osl"], reach // 4)
             workload["isl"] = reach - workload["osl"]
     for key, value in workload.items():
-        if key not in goal.workload:
+        if key not in goal.workload and key != "max_batch_size":
             note(f"workload.{key}", value, source)
     workload.update(goal.workload)
     if goal.tune and not workload.get("concurrency"):
@@ -455,6 +476,13 @@ def derive_spec(
     if concurrency and "max_batch_size" not in goal.workload:
         # A default batch below the goal's concurrency would queue the perf points it names.
         max_batch_size = max(int(max_batch_size or 0), max(concurrency))
+    if max_batch_size and "max_batch_size" not in goal.workload:
+        # The value the spec carries, not the default it was raised from.
+        note(
+            "workload.max_batch_size",
+            max_batch_size,
+            source if max_batch_size == workload.get("max_batch_size") else "concurrency",
+        )
 
     # The units: the checkpoint's own drafter and towers unless the goal says otherwise. A
     # goal that names its features asks for those: what else the checkpoint carries is left out.
@@ -491,11 +519,15 @@ def derive_spec(
         u for u, on in goal.units.items() if on and u not in SPECULATORS and u != "multimodal"
     ]
 
-    # The runtime: every switch on unless the goal turns it off.
+    # The runtime: the core switches on unless the goal turns them off, the rest off.
     runtime: dict[str, Any] = {
-        name: name not in goal.switches_off for name in RUNTIME_WORDS.values()
+        name: name in CORE_SWITCHES and name not in goal.switches_off
+        for name in RUNTIME_WORDS.values()
     }
-    reuse = runtime["kv_cache_reuse"]
+    for switch in sorted(set(NON_CORE_SWITCHES) - goal.switches_on - goal.switches_off):
+        note(f"runtime.{switch}", False, "core configuration: a non-core feature")
+    reuse = "kv_cache_reuse" in goal.switches_on
+    chunked = "chunked_prefill" in goal.switches_on
     snapshot = goal.params.get("snapshot_interval")
     if facts.hybrid and reuse and not snapshot:
         snapshot = note("snapshot_interval", DEFAULT_SNAPSHOT_INTERVAL, "default")
@@ -510,7 +542,7 @@ def derive_spec(
         flags.append(f"--max_batch_size={max_batch_size}")
     if kv_dtype in _KV_DTYPES:
         flags.append(f"--kv_cache_dtype={kv_dtype}")
-    if goal.params.get("chunk_tokens"):
+    if goal.params.get("chunk_tokens") and not chunked:
         flags.append(f"--max_num_tokens={goal.params['chunk_tokens']}")
     if goal.params.get("kv_fraction"):
         flags.append(f"--kv_cache_fraction={goal.params['kv_fraction']}")
@@ -553,7 +585,7 @@ def derive_spec(
     else:
         accuracy["boot"] = note("accuracy.boot", json.loads(json.dumps(DEFAULT_BOOT)), "default")
     if DISAGG_FEATURE in built:
-        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions)
+        accuracy["disagg"] = _disagg(defaults, facts, site, note, questions, checkpoint)
 
     spec: dict[str, Any] = {
         "checkpoint_path": str(checkpoint),
@@ -575,6 +607,25 @@ def derive_spec(
         }
         for dtype in goal.params.get("kv_variants") or ()
     }
+    for switch in sorted(goal.switches_on):
+        name = NON_CORE_SWITCHES[switch]
+        if switch == "chunked_prefill":
+            tokens = int(goal.params.get("chunk_tokens") or DEFAULT_CHUNK_TOKENS)
+            overlay: dict[str, Any] = {"enable_chunked_prefill": True, "max_num_tokens": tokens}
+            said = f"chunked prefill on, in chunks of {tokens} tokens"
+        else:
+            cache: dict[str, Any] = {"enable_block_reuse": True}
+            if snapshot:
+                cache["mamba_state_config"] = {"periodic_snapshot_interval": int(snapshot)}
+            overlay = {"kv_cache_config": cache}
+            said = "KV-cache block reuse on"
+        kv_variants[name] = {
+            "unit": "core",
+            "gates": ["accuracy"],
+            "runtime": {switch: True},
+            "llm_api_options": overlay,
+            "note": f"{said}, judged against the unit's own score",
+        }
     if kv_variants:
         spec["variants"] = kv_variants
     if site.get("commit_policy"):
@@ -597,7 +648,9 @@ def derive_spec(
     if left_out:
         # Where the goal gates a unit on fewer members, the rest is its choice, not a gap.
         spec["coverage"] = {"accept": left_out}
-    options = _llm_api_options(runtime, built, kv_dtype, goal.params, snapshot, max_batch_size)
+    # The chunk size is the chunked variant's, not core's.
+    params = {k: v for k, v in goal.params.items() if not (chunked and k == "chunk_tokens")}
+    options = _llm_api_options(runtime, built, kv_dtype, params, snapshot, max_batch_size)
     if goal.tune:
         draft = options[built[-1]].get("speculative_config") if built else None
         spec["perf"] = _perf(site, workload, members, draft)
@@ -605,7 +658,7 @@ def derive_spec(
         if adp:
             note(
                 f"perf ({', '.join(adp)})",
-                "the high concurrency point x attention-DP ranks",
+                "the high concurrency point, a global total across the attention-DP ranks",
                 "default",
             )
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -714,21 +767,63 @@ def _tree_path(site: Mapping[str, Any], key: str) -> str:
     return found.paths[0] if found.found else tree_anchors.ANCHORS[key].hint
 
 
+def disagg_layout(
+    weight_bytes: int | None, gpu_memory_gib: Any, gpus_per_node: Any
+) -> tuple[int, int] | None:
+    """``(devices per node, nodes)`` the disaggregated-serving test needs; ``None`` unknown.
+
+    One context and one generation engine, each on the fewest devices that hold
+    the checkpoint's weights (``lint.engine_width``): on one node when both fit,
+    as the tree's own disaggregated accuracy tests run (context and generation
+    sharing a node); else one engine per node, or as many nodes as an engine needs.
+    """
+    from .lint import engine_width
+
+    width = engine_width(weight_bytes, gpu_memory_gib)
+    if width is None or not isinstance(gpus_per_node, int) or gpus_per_node <= 0:
+        return None
+    if 2 * width <= gpus_per_node:
+        return 2 * width, 1
+    if width <= gpus_per_node:
+        return width, 2
+    per_engine = -(-width // gpus_per_node)
+    return gpus_per_node, 2 * per_engine
+
+
 def _disagg(
     defaults: Mapping[str, Any],
     facts: CheckpointFacts,
     site: Mapping[str, Any],
     note,
     questions: list[str],
+    checkpoint: Path | None = None,
 ) -> dict[str, Any]:
-    """The disaggregated-serving test the run writes: the site's settings, and its node id.
+    """The disaggregated-serving test the run writes: the site's settings, its node id, its layout.
 
     The node id defaults to a class named for the architecture, in the file whose
     tests share the tree's disaggregated launcher (``launch_disaggregated_llm``).
+    The layout (:func:`disagg_layout`) is derived from the checkpoint's size:
+    one node when a context and a generation engine fit it, more only when they
+    do not.
     """
     block = dict(defaults.get("disagg") or {})
     if block:
         note("accuracy.disagg", dict(block), "site")
+    if "devices" not in block and "nodes" not in block and checkpoint is not None:
+        from .lint import checkpoint_weight_bytes
+
+        environment = site.get("environment") or {}
+        per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get(
+            "gpus_per_node"
+        )
+        layout = disagg_layout(
+            checkpoint_weight_bytes(checkpoint), environment.get("gpu_memory_gib"), per_node
+        )
+        if layout is not None:
+            devices, nodes = layout
+            block["devices"] = note("accuracy.disagg.devices", devices, "checkpoint size")
+            if nodes > 1:
+                block["nodes"] = note("accuracy.disagg.nodes", nodes, "checkpoint size")
     if block.get("test"):
         return block
     launcher = tree_anchors.resolve(site.get("trtllm_repo_path"), "disagg_launcher")
@@ -781,10 +876,11 @@ def _perf(
         if draft:
             options["speculative_config"] = dict(draft)
         load = dict(shared)
-        kind, ranks = parse_parallel_segment(member)
+        kind, _ = parse_parallel_segment(member)
         if kind == "dep":
-            # Attention DP serves throughput: only its high point, each rank at that load.
-            load["concurrency"] = [max(shared["concurrency"]) * (ranks or 1)]
+            # Attention DP serves throughput: only its high point. A concurrency (and a batch
+            # size) is always the global total; each rank serves its share of it.
+            load["concurrency"] = [max(shared["concurrency"])]
         configs.append({"name": member, "workload": load, "llm_api_options": options})
     return {
         "enabled": True,

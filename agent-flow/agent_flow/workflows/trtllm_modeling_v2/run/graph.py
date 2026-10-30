@@ -59,7 +59,9 @@ KINDS: tuple[str, ...] = (
 #: on one more kind of work (``agents/prompts/tags.py``).
 WORKER_TAGS: tuple[str, ...] = tuple(k for k in KINDS if k != CHECK_KIND)
 PRIORITIES: tuple[str, ...] = ("required", "nice_to_have")
-STATUSES: tuple[str, ...] = ("pending", "running", "done", "failed", "abandoned")
+#: ``split``: a kernel task that ended ``MACRO``, its work handed on to its constituents'
+#: tasks; it lands nothing, as a failed one, and is not a failure.
+STATUSES: tuple[str, ...] = ("pending", "running", "done", "failed", "abandoned", "split")
 GRAPH_FILENAME = "graph.yaml"
 
 
@@ -453,6 +455,7 @@ def validate(
                     "an artifact of the run that no task builds on or integrates"
                 )
         errors += [f"{where}: {e}" for e in _soft_errors(t, tasks)]
+        errors += [f"{where}: {e}" for e in _gating_errors(t, tasks)]
         if t.kind == CHECK_KIND:
             errors += [f"{where}: {e}" for e in _check_task_errors(t, known_checks)]
         unknown = [tag for tag in t.tags if tag not in WORKER_TAGS]
@@ -479,6 +482,37 @@ def validate(
     for kind in required_kinds:
         if kind not in kinds:
             errors.append(f"the task asks for `{kind}` work and the graph has no `{kind}` task")
+    return errors
+
+
+def _gating_errors(task: Task, tasks: Mapping[str, Task]) -> list[str]:
+    """Why ``task``'s hard dependencies would let an investigation or a check gate it.
+
+    A task that owes contract checks (a ``check``, or one that ``satisfies`` some)
+    never waits for an ``investigate`` task or a ``nice_to_have`` one: an
+    investigation informs the checks, it does not gate them, and a strict
+    diagnosis held as a precondition kept every benchmark of a run from running.
+    A ``kernel`` task never waits for a ``check``: kernel certification runs on
+    its own, whatever an integration check is doing.
+    """
+    errors = []
+    owes = task.kind == CHECK_KIND or bool(task.satisfies)
+    for dep in task.depends_on:
+        other = tasks.get(dep)
+        if other is None or other.regression:
+            continue
+        if owes and (other.kind == "investigate" or other.priority == "nice_to_have"):
+            what = "an `investigate`" if other.kind == "investigate" else "a nice_to_have"
+            errors.append(
+                f"depends on {dep!r}, {what} task: what it finds informs the checks and never "
+                "gates them. Drop the edge (its findings reach the planner); a fix it calls for "
+                "is a task of its own"
+            )
+        elif task.kind == "kernel" and other.kind == CHECK_KIND:
+            errors.append(
+                f"depends on {dep!r}, a `check` task: kernel certification never waits for an "
+                "integration check; drop the edge"
+            )
     return errors
 
 
@@ -678,7 +712,7 @@ def next_to_start(
 
 
 #: Statuses only the orchestrator sets: it starts, finishes and fails tasks.
-ORCHESTRATOR_STATUSES = frozenset({"running", "done", "failed"})
+ORCHESTRATOR_STATUSES = frozenset({"running", "done", "failed", "split"})
 #: How many worker runs one task id gets: the first, and each retry the planner asks for.
 MAX_ATTEMPTS = 3
 #: The longest goal a planner may write or rewrite: what to do and how it is

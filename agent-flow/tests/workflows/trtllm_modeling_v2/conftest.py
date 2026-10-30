@@ -91,3 +91,11 @@ def _no_parent_codex_session(monkeypatch):
 def _no_agent_probe(monkeypatch):
     """Keep preflight's agent probe from starting a real agent turn; its own tests unset this."""
     monkeypatch.setenv("MV2FLOW_SKIP_AGENT_PROBE", "1")
+
+
+@pytest.fixture(autouse=True)
+def _no_dataset_downloads(monkeypatch):
+    """Keep the run's dataset staging off the network; ``test_datasets.py`` calls it itself."""
+    from agent_flow.workflows.trtllm_modeling_v2.run.startup import datasets
+
+    monkeypatch.setattr(datasets, "start", lambda *args, **kwargs: None)

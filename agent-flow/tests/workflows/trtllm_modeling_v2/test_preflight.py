@@ -251,3 +251,22 @@ def test_a_relative_variant_needs_its_units_benchmark_and_disagg_one_node(tmp_pa
     task["accuracy"]["disagg"] = {"test": "tests/test_d.py::TestM::test_auto_dtype", "devices": 8}
     with pytest.raises(PreflightError, match="more than the 4 devices one node holds"):
         preflight.check_disagg_placement(task)
+
+
+def test_a_gate_longer_than_one_gates_allocation_is_refused_before_it_waits_for_ever():
+    task = {
+        "environment": {
+            "kind": "session_spool",
+            "sessions": [
+                {"name": "gates", "spool": "/g", "role": "gates", "time_limit": "02:00:00"},
+                {"name": "work", "spool": "/w", "role": "work", "time_limit": "08:00:00"},
+            ],
+        },
+        "accuracy": {},
+    }
+    with pytest.raises(preflight.PreflightError, match="accuracy.timeout is 14400s"):
+        preflight.check_gate_budgets(task)
+    task["accuracy"]["timeout"] = 5400
+    (note,) = preflight.check_gate_budgets(task)
+    assert "accuracy.timeout 5400s" in note and "7200s" in note
+    assert preflight.check_gate_budgets({"environment": {"kind": "local"}}) == []

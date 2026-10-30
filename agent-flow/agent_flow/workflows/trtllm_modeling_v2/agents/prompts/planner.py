@@ -88,7 +88,11 @@ It refuses a graph that breaks any of these, and tells you why:
 - every required check in the contract is in some task's `satisfies`;
 - ids are unique, dependencies exist and form no cycle;
 - `touches` stays inside the paths the commit policy allows, and no task asks
-  for more devices than the site has;
+  for more devices than the site has. Within them, a task may reach any file
+  of the tree the target truly needs (the runtime, the executor, serving, a
+  test): widen its `touches` to that file when a worker reports the need, for
+  the smallest general change by the ModelingV2 design; a regression check
+  follows every change outside the target;
 - `tags` are kinds of worker work, never on a `check` task;
 - a revision states its reason;
 - a goal you write or change is at most {MAX_GOAL_CHARS} characters;
@@ -99,6 +103,10 @@ It refuses a graph that breaks any of these, and tells you why:
 - `depends_on_soft` names tasks that land on the target (`kernel`, `assemble`,
   `feature`, `integrate`), from a task that lands on it too, never one also
   in `depends_on`; soft and hard edges together form no cycle;
+- a task that owes contract checks (a `check`, or one with `satisfies`) never
+  `depends_on` an `investigate` or `nice_to_have` task, and a `kernel` task never
+  `depends_on` a `check`: investigations and integration checks inform, they do
+  not gate;
 - a `check` task names contract checks in `satisfies`, an empty `touches`
   and `resources.gpus: 0`. A `check` with `regression: true` is the
   orchestrator's: it adds one after changes to shared code (below).

@@ -227,7 +227,7 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         # A worker's own gate run queues after the run's checks and before perf work.
         executor = select_command_executor(
             environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
-            priority=FEATURE,
+            priority=FEATURE, nodes=spec.nodes if spec else 1,
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)

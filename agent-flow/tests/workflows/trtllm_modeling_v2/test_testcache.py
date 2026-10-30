@@ -203,3 +203,34 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
     )
     assert not results.env_digest and results.unrun(["tests/test_a.py"])
     assert jobs == 0 and code == 1 and "environment probe failed" in tail
+
+
+def test_a_change_to_one_entry_runs_the_tests_that_reach_it(tmp_path):
+    repo = tmp_path / "repo"
+    catalog = f"{regression.CATALOG_DIR}/attention"
+    tests = regression.CATALOG_TESTS_DIR
+    files = {
+        f"{catalog}/thop.py": "X = 1\n",
+        f"{catalog}/other.py": "Y = 1\n",
+        f"{tests}/attention/test_thop.py": "from tensorrt_llm._torch._experimental.modeling_v2"
+        ".catalog.attention.thop import X\n",
+        f"{tests}/attention/test_other.py": "from ...attention.other import Y\n",
+        f"{tests}/test_modeling_v2_claims.py": "",
+    }
+    for path, content in files.items():
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(content, encoding="utf-8")
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    listed = sorted(p for p in files if "/test_" in p)
+    head = _commit(repo, base, {f"{catalog}/thop.py": "X = 2\n"}, message="entry")
+    picked, why = regression.affected_files(repo, base, head, listed)
+    assert picked == [f"{tests}/attention/test_thop.py", f"{tests}/test_modeling_v2_claims.py"]
+    assert why == "2 of 3 test files reach what changed"
+    shared = _commit(repo, head, {f"{catalog}/__init__.py": ""}, message="shared")
+    assert regression.affected_files(repo, head, shared, listed)[0] == listed
+    assert regression.affected_files(repo, None, head, listed)[0] == listed
