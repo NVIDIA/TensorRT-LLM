@@ -257,6 +257,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                  default=None,
                                                  repr=False,
                                                  compare=False)
+    # FP4 state of the draft layers when they live in a lifecycle of their own
+    # (single-copy target layers); their attention runs with it swapped in.
+    fp4_mla_draft_state: Optional[Fp4MlaState] = field(init=False,
+                                                       default=None,
+                                                       repr=False,
+                                                       compare=False)
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -625,6 +631,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
                         None)):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
+            draft_layer_ids = getattr(self.kv_cache_manager,
+                                      "fp4_mla_draft_lifecycle_layer_ids", None)
+            if callable(draft_layer_ids) and draft_layer_ids():
+                self.fp4_mla_draft_state = Fp4MlaState.create(
+                    self, buffers, draft_lifecycle=True)
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
@@ -693,17 +704,39 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
-        state = getattr(self, "fp4_mla_state", None)
-        if state is not None:
+        for state in self._fp4_mla_states():
             state.on_update_kv_lens(self)
 
     def update_for_spec_dec(self) -> None:
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
-        state = getattr(self, "fp4_mla_state", None)
-        if state is not None:
+        for state in self._fp4_mla_states():
             state.update_for_spec_dec(self)
+
+    def _fp4_mla_states(self) -> List[Fp4MlaState]:
+        return [
+            state for state in (getattr(self, "fp4_mla_state", None),
+                                getattr(self, "fp4_mla_draft_state", None))
+            if state is not None
+        ]
+
+    @contextlib.contextmanager
+    def use_fp4_mla_state(self, state: Fp4MlaState) -> Iterator[None]:
+        """Present ``state`` as ``fp4_mla_state`` to the FP4 MLA code within."""
+        saved = self.fp4_mla_state
+        self.fp4_mla_state = state
+        try:
+            yield
+        finally:
+            self.fp4_mla_state = saved
+
+    def fp4_mla_state_for_layer(self, layer_idx: int) -> Optional[Fp4MlaState]:
+        """The draft-lifecycle FP4 state if it serves ``layer_idx``, else None."""
+        state = self.fp4_mla_draft_state
+        if state is not None and layer_idx in state.layer_ids:
+            return state
+        return None
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -714,8 +747,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
-        if self.fp4_mla_state is not None:
-            self.fp4_mla_state.restore_from_spec_dec(self)
+        for state in self._fp4_mla_states():
+            state.restore_from_spec_dec(self)
 
     def update_helix_param(
         self,
@@ -1152,6 +1185,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
+        if self.fp4_mla_draft_state is not None:
+            # The page-table setup reads and writes ``self.fp4_mla_state``.
+            with self.use_fp4_mla_state(self.fp4_mla_draft_state):
+                self.fp4_mla_draft_state.prepare(self, kv_lens)
 
         if self._has_mixed_precision_kv():
             # Native BF16 paged-context FMHA reads 32-token pages.

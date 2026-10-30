@@ -572,7 +572,13 @@ The FMHA package is split by role:
   and the disaggregated launcher publish) keeps a single-copy cache without
   those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
   only K, K scales, and the HP ring, runs context attention only, and skips
-  generation warmup shapes. Hybrid
+  generation warmup shapes. One-model draft layers appended to a dense
+  manager keep the sidecars, because the drafter runs its later draft steps
+  as generation steps inside every context step. They live in a second
+  full-history lifecycle with a page table of its own
+  (`fp4_mla_draft_lifecycle_layer_ids`), whose FP4 state
+  (`TrtllmAttentionMetadata.fp4_mla_draft_state`) MLA swaps in for those
+  layers. Hybrid
   linear-attention models (Kimi K3)
   keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
   `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy

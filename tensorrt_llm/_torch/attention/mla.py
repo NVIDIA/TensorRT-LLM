@@ -1004,7 +1004,14 @@ class MLA(nn.Module):
             staging = nullcontext()
         else:
             staging = attn_metadata.mixed_precision_kv_staging(self.layer_idx)
-        with staging:
+        # FP4 MLA draft layers with a lifecycle of their own use its page table.
+        draft_state = None
+        if getattr(attn_metadata, "fp4_mla_draft_state", None) is not None:
+            draft_state = attn_metadata.fp4_mla_state_for_layer(self.layer_idx)
+        fp4_mla_state = (
+            nullcontext() if draft_state is None else attn_metadata.use_fp4_mla_state(draft_state)
+        )
+        with staging, fp4_mla_state:
             self._forward_impl(
                 position_ids,
                 hidden_states,

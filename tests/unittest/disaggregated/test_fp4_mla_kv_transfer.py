@@ -277,11 +277,22 @@ def _verify_cache(
                 )
 
     # Rebuilding the sidecars from the imported K and K scales reproduces what
-    # the context side derives from its own cache.
+    # the context side derives from its own cache. A single-copy context
+    # cache keeps sidecars on its draft layers only, so only the generation
+    # side rebuilds them, from the canonical bytes checked above.
+    ctx_context_only = any(manager.fp4_mla_context_only_cache for manager in ctx_managers)
     for managers, tp, enable_dp, request_ids in (
         (ctx_managers, ctx_tp, ctx_enable_dp, ctx_request_ids),
         (gen_managers, gen_tp, gen_enable_dp, gen_request_ids),
     ):
+        if ctx_context_only and managers is ctx_managers:
+            for manager in managers:
+                draft_layers = set(manager._fp4_mla_draft_local_layers())
+                for compact_layer, local_layer in enumerate(manager._fp4_mla_compact_to_local):
+                    assert manager.fp4_mla_compact_layer_has_decode_views(compact_layer) == (
+                        local_layer in draft_layers
+                    )
+            continue
         for manager in managers:
             manager.get_mla_v_scale_pool_base().zero_()
             v_packed_base = manager.get_mla_v_packed_pool_base()
@@ -320,12 +331,15 @@ def _verify_cache(
                 ctx_layer = _compact_layer(ctx_manager, layer_idx)
                 gen_v_scale = _v_scale_pages(gen_manager, gen_layer, gen_pages)
                 assert gen_v_scale.any()
-                assert torch.equal(gen_v_scale, _v_scale_pages(ctx_manager, ctx_layer, ctx_pages))
                 gen_v_packed = _v_packed_pages(gen_manager, gen_layer, gen_pages)
+                if gen_v_packed is not None:
+                    assert gen_v_packed.any()
+                if ctx_context_only:
+                    continue
+                assert torch.equal(gen_v_scale, _v_scale_pages(ctx_manager, ctx_layer, ctx_pages))
                 ctx_v_packed = _v_packed_pages(ctx_manager, ctx_layer, ctx_pages)
                 assert (gen_v_packed is None) == (ctx_v_packed is None)
                 if gen_v_packed is not None:
-                    assert gen_v_packed.any()
                     assert torch.equal(gen_v_packed, ctx_v_packed)
 
 
@@ -414,3 +428,53 @@ def test_fp4_mla_kv_transfer(
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )
+
+
+@pytest.mark.timeout(300)
+@pytest.mark.parametrize("backend", ["triton", "cutedsl"])
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,ctx_enable_dp,gen_tp,gen_pp,gen_enable_dp",
+    [topology[:6] for topology in TOPOLOGIES],
+    ids=[topology[6] for topology in TOPOLOGIES],
+)
+@pytest.mark.parametrize("speculative", [False, True], ids=["no-draft", "mtp"])
+def test_fp4_mla_kv_transfer_from_context_only_cache(
+    monkeypatch,
+    backend: str,
+    ctx_tp: int,
+    ctx_pp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_pp: int,
+    gen_enable_dp: bool,
+    speculative: bool,
+) -> None:
+    """A single-copy context cache sends the canonical state a decoding cache sends.
+
+    With a one-model drafter, its draft layer keeps the decode views in a
+    lifecycle of its own; the decoding peer holds every layer in one lifecycle.
+    """
+    _requires_fp4_mla_backend(backend)
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+    created_sides = []
+
+    def create_managers(tp: int, pp: int, enable_dp: bool) -> list[Fp4MlaKVCacheManagerV2]:
+        # The harness creates the context side first, then the generation side.
+        context_side = not created_sides
+        created_sides.append(context_side)
+        monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context" if context_side else "generation")
+        return _create_managers(tp, pp, enable_dp, speculative=speculative)
+
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=True,
+        manager_factory=create_managers,
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+    assert created_sides == [True, False]
