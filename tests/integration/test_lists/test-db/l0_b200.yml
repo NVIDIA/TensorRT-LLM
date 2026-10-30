@@ -148,6 +148,8 @@ l0_b200:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/disaggregated/test_csa2_kv_transfer.py
+  # GLM-5.3-Flash modeling_v2 target: its in-model MTP step against the stock MTP-Eagle worker.
+  - unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default/spec/test_modeling_v2_mtp_step.py
   # ------------- Kimi K3 (KimiLinear) unit tests ---------------
   - unittest/_torch/modeling/test_kimi_k3_checkpoint.py TIMEOUT (15)
   - unittest/_torch/modeling/test_kimi_k3_mla.py TIMEOUT (15)
