@@ -43,10 +43,63 @@ _DECODE = ((0, 1), (31, 1), (32, 1), (33, 1), (100, 1), (255, 1), (7, 1), (64, 1
 #: page edge and some inside one.
 _MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
 
+#: One rank's QSA K/V pool as the stock `Qwen4ExpHybridCacheManager` lays it out at this target's
+#: members: a page holds the K and V role planes of all 12 attention layers (24 role pages of
+#: `[hkv, 32, 256]`), so a layer's `get_buffers(i, kv_layout="HND")` view steps 24 role pages a
+#: page. `pool="engine"` cells drive layer 47's view (`layer_slot` 11, the page's last planes) at
+#: an engine's own page count. `slots` x `width` is the engine's `qsa_block_table`:
+#: `max_num_sequences` 128 by `max_blocks_per_seq` 292 at `max_seq_len` 9216 (516 at 16384).
+_ENGINE = dict(_CKPT, pool="engine", role_pages=24, layer_slot=11, slots=128, width=292)
+
+#: A tp4 / tep4 rank: one KV head, k and v at heads 6 and 7 of the fused projection row
+#: `[q 6 | k 1 | v 1 | gate 6 | index 3]` (17 heads of 256, row stride 4352).
+_TP4 = dict(_ENGINE, hkv=1, heads_q=6, row_pad_heads=9, row_stride=4352)
+
+#: A dep4 rank (attention DP, every head): the tp1 row `[q 24 | k 2 | v 2 | gate 24 | index 3]`
+#: (55 heads, row stride 14080) over the kv_fp8 variant's e4m3 pool.
+_DEP4_FP8 = dict(_ENGINE, row_pad_heads=27, row_stride=14080, cache_dtype=torch.float8_e4m3fn)
+
+#: Attention pool pages of a final engine at core's runtime (KV fraction 0.6, bf16 recurrent
+#: state, `max_batch_size` 128, `max_seq_len` 9216), measured on the stock engine: its reported
+#: `maxNumBlocks` less the recurrent pool's slots, which that total also counts. tep4, bf16 KV:
+#: 258983 - 1874. dep4, kv_fp8: 172579 - 1217.
+PAGES_TEP4 = 257109
+PAGES_DEP4_FP8 = 171362
+
+#: 128 decode rows, one a request: page-aligned, mid-page, page-crossing and the last position
+#: `max_seq_len` 9216 admits, then a stride-577 walk over the rest.
+_DECODE_128 = ((0, 1), (31, 1), (32, 1), (9215, 1)) + tuple(
+    ((i * 577 + 45) % 9216, 1) for i in range(124)
+)
+
+#: 32 decode rows, one a request, the last at position 9215.
+_DECODE_32 = tuple(((i * 293 + 5) % 9216, 1) for i in range(31)) + ((9215, 1),)
+
+#: 128 requests of one MTP7 verify block each (8 rows, 1024), the last ending at position 16383
+#: (`max_seq_len` 16384 under MTP); starts at every offset in a page, so blocks straddle pages.
+_MTP7_128 = tuple(((29 + 127 * i) % 16376, 8) for i in range(127)) + ((16376, 8),)
+
+#: An 8192-row (`max_num_tokens`) context step: a chunk continuing from mid-page to position
+#: 9215, and a request's first 1023 tokens.
+_PREFILL_8192 = ((2047, 7169), (0, 1023))
+
 
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
+
+
+def _engine(base: dict, member: str, segments, pages: int, **overrides) -> dict:
+    """An engine-pool cell: `rows` is the step's row count, `member` whose pool `pages` is."""
+    rows = sum(n for _, n in segments)
+    return {
+        **base,
+        "member": member,
+        "segments": segments,
+        "pages": pages,
+        "rows": rows,
+        **overrides,
+    }
 
 
 def _bits(tensor: torch.Tensor) -> torch.Tensor:
@@ -100,9 +153,37 @@ class QsaPagedKvStore(OpWrapper):
             why="fp8 decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8),
         ),
+        # This target's members over the engine's own pool: one rank's page count, the
+        # 24-role-page stride, layer 47's view, a 128-row table.
+        Cell(
+            why="tep4 decode, 1 row: hkv 1 off the 4352-wide row, position 9215, "
+            "257109-page bf16 pool",
+            spec=_engine(_TP4, "tep4", ((9215, 1),), PAGES_TEP4),
+        ),
+        Cell(
+            why="tep4 decode, 128 rows (max_batch_size), aligned, mid and page-crossing",
+            spec=_engine(_TP4, "tep4", _DECODE_128, PAGES_TEP4),
+        ),
+        Cell(
+            why="tep4 MTP7 verify, 128 requests x 8 rows (1024) to position 16383, table width 516",
+            spec=_engine(_TP4, "tep4", _MTP7_128, PAGES_TEP4, width=516),
+        ),
+        Cell(
+            why="tp4 context, 8192 rows (max_num_tokens): a mid-page chunk to 9215 and a "
+            "request's first 1023",
+            spec=_engine(_TP4, "tp4", _PREFILL_8192, PAGES_TEP4),
+        ),
+        Cell(
+            why="dep4 kv_fp8 decode, 32 rows: hkv 2 off the 14080-wide row into a "
+            "171362-page e4m3 pool",
+            spec=_engine(_DEP4_FP8, "dep4", _DECODE_32, PAGES_DEP4_FP8),
+        ),
     )
 
     note = """
+    Source: the in-tree Triton kernel `_qsa_paged_kv_store_kernel`, JIT-compiled
+    on its first call; `ARCHS` is the architecture it compiled for and ran on.
+
     Metadata consumed: none -- every input is an argument. The target passes
     `qsa_req_idx_per_token` (int32, the row's batch index) and
     `qsa_logical_positions` (int64) sliced to the step's rows,
@@ -126,22 +207,42 @@ class QsaPagedKvStore(OpWrapper):
     table (not pinned by a test). `rows == 0` returns before launching.
 
     Strides and the pool/table extents are Triton constexprs: each distinct
-    layout or pool size compiles its own kernel. CUDA-graph capturable
-    (captured at 256 rows, 32 MTP7 verify blocks); a replay follows positions
-    rewritten in place.
+    layout or pool size compiles its own kernel (once per engine, at its
+    pool's page count). CUDA-graph capturable (captured at 256 rows, 32 MTP7
+    verify blocks, and at 128 tep4 decode rows over the 257109-page pool); a
+    replay follows positions rewritten in place.
+
+    The engine's pool, as the stock manager lays it out at tp4 / tep4 / dep4
+    (measured on the manager the engine builds): one page holds the K and V
+    planes of all 12 attention layers, so a layer's K view steps 24 role
+    pages a page -- 196608 elements at one KV head, 393216 at two, bf16 and
+    fp8 alike -- and its page count is the engine's (`PAGES_TEP4`,
+    `PAGES_DEP4_FP8`). The `pool="engine"` cells drive layer 47's view with
+    the pool's last page among the touched ones: its planes lie at byte
+    101099339776 of a 101 GB range at tep4 and 67382247424 of 67 GB at dep4
+    kv_fp8, past 2^32 elements of the view's base. The kernel loads the page
+    id as int64 before its stride product, and every such row lands bitwise.
 
     Hard limits: both metadata values are cast to int32 inside the kernel
     (`.to(tl.int32)`); an int64 position at `2^32 + 5` was probed once (not
     pinned by a test) and lands on slot 5 of page column 0 -- written, not
-    skipped. The engine's positions stay below 2^14.
+    skipped. The engine's positions stay below 2^14 at the gates' envelope
+    (`max_seq_len` 16384 with MTP).
 
     Not certified: duplicate destinations, multiple devices, a scaled fp8
     pool (there is no scale argument), fp8 conversion of values past 448, the
-    packed-QKV-row (MTP) layout over a bf16 pool, fp16 rows, head geometry other than
-    this checkpoint's (D 256, Hkv 2, 32-token pages), int32 positions or
-    int64 request indices, head-major rows, sliced or transposed tables,
-    `rows == 0`, and of the rows that resolve to no slot any but an
-    unallocated (`-1`) table entry (the reference skips each).
+    packed-QKV-row (MTP draft layer) layout over a bf16 pool or at one KV head,
+    fp16 rows, head geometry other than D 256 with Hkv 1 or 2 and 32-token
+    pages, int32 positions or int64 request indices, head-major rows, sliced
+    or transposed tables, `rows == 0`, and of the rows that resolve to no slot
+    any but an unallocated (`-1`) table entry (the reference skips each).
+    Pools at a page count not driven here: tp4's own engine (tep4's count
+    stands in: a tp4 rank's pool has the same per-page shape, and the stock
+    engine cannot boot tp4), the MTP engine's at tep4 (its draft layer has a
+    separate cache, so its trunk count differs from core's, which stands in),
+    and dep4's bf16 core pool (119680 pages measured, not driven). Positions
+    past 16383 (the tune's `max_seq_len` 262144) and tables wider than 516
+    columns.
     """
 
     def __call__(
