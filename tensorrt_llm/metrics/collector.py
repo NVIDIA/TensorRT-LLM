@@ -16,9 +16,17 @@
 
 import math
 import time
-from typing import Dict, List, Optional, Union
+from functools import partial
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
+from tensorrt_llm.logger import logger
 
 from .enums import MetricNames
+
+if TYPE_CHECKING:
+    from prometheus_client import CollectorRegistry, Counter
+
+    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
 
 # Upper bound on distinct ``token_position`` label values for the per-position
 # speculative-decoding counters. Each position is one Prometheus time series per
@@ -115,6 +123,37 @@ class MetricsCollector:
     labelname_finish_reason = "finished_reason"
     labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
+    labelname_dp_rank = "dp_rank"
+
+    @classmethod
+    def from_args(
+        cls,
+        args: "BaseLlmArgs",
+        model: str,
+        *,
+        registry: "Optional[CollectorRegistry]" = None,
+        gauge_multiprocess_mode: str = "all",
+    ) -> "MetricsCollector":
+        """Build a collector using the shared serving labels and bucket configuration."""
+        config = getattr(args, "prometheus_metrics_config", None)
+        buckets = {
+            name: getattr(config, name, None)
+            for name in ("e2e_request_latency_buckets",
+                         "time_to_first_token_buckets",
+                         "time_per_output_token_buckets",
+                         "request_queue_time_buckets",
+                         "request_prefill_time_buckets",
+                         "request_decode_time_buckets",
+                         "request_inference_time_buckets")
+        }
+        return cls(
+            {
+                "model_name": model,
+                "engine_type": args.backend or "unknown"
+            },
+            **buckets,
+            registry=registry,
+            gauge_multiprocess_mode=gauge_multiprocess_mode)
 
     def __init__(
         self,
@@ -126,8 +165,17 @@ class MetricsCollector:
         request_prefill_time_buckets: Optional[List[float]] = None,
         request_decode_time_buckets: Optional[List[float]] = None,
         request_inference_time_buckets: Optional[List[float]] = None,
+        registry: "Optional[CollectorRegistry]" = None,
+        gauge_multiprocess_mode: str = "all",
     ) -> None:
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import REGISTRY, Counter, Gauge, Histogram
+        self._registry = REGISTRY if registry is None else registry
+        self._gauge_multiprocess_mode = gauge_multiprocess_mode
+        Counter = partial(Counter, registry=self._registry)
+        Histogram = partial(Histogram, registry=self._registry)
+        Gauge = partial(Gauge,
+                        registry=self._registry,
+                        multiprocess_mode=gauge_multiprocess_mode)
         _bucket_params = {
             "e2e_request_latency_buckets": e2e_request_latency_buckets,
             "time_to_first_token_buckets": time_to_first_token_buckets,
@@ -147,6 +195,7 @@ class MetricsCollector:
                     f"{name} must be strictly increasing, got {buckets}.")
         self.last_log_time = time.time()
         self.labels = labels
+        iteration_labelnames = (*self.labels, self.labelname_dp_rank)
         self.metric_prefix = "trtllm_"
 
         self.finish_reason_label = {
@@ -247,51 +296,51 @@ class MetricsCollector:
         self.kv_cache_hit_rate = Gauge(name=self.metric_prefix +
                                        "kv_cache_hit_rate",
                                        documentation="KV cache hit rate",
-                                       labelnames=self.labels.keys())
+                                       labelnames=iteration_labelnames)
         self.kv_cache_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_reused_blocks",
             documentation=
             "Cumulative number of KV cache blocks reused (cache hits)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_missed_blocks = Counter(
             name=self.metric_prefix + "kv_cache_missed_blocks",
             documentation=
             "Cumulative number of KV cache blocks missed (cache misses)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_utilization = Gauge(name=self.metric_prefix +
                                           "kv_cache_utilization",
                                           documentation="KV cache utilization",
-                                          labelnames=self.labels.keys())
-        self._prev_reused_blocks = 0
-        self._prev_missed_blocks = 0
+                                          labelnames=iteration_labelnames)
+        self._prev_reused_blocks: dict[str, int] = {}
+        self._prev_missed_blocks: dict[str, int] = {}
 
         # Per-iteration KV cache gauges
         self.kv_cache_host_utilization = Gauge(
             name=self.metric_prefix + "kv_cache_host_utilization",
             documentation="KV cache host (secondary) pool utilization",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_iter_reuse_rate = Gauge(
             name=self.metric_prefix + "kv_cache_iter_reuse_rate",
             documentation="Per-iteration KV cache block reuse rate",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
 
         # Per-iteration KV cache counters (monotonically increasing via accumulated deltas)
         self.kv_cache_iter_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_reused_blocks",
             documentation="Total reused KV cache blocks (full + partial)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_iter_full_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_full_reused_blocks",
             documentation="Total fully reused KV cache blocks",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_iter_partial_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_partial_reused_blocks",
             documentation="Total partially reused KV cache blocks",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_iter_missed_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_missed_blocks",
             documentation="Total missed KV cache blocks (context phase)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_iter_connector_reused_blocks = Counter(
             name=self.metric_prefix + "kv_cache_iter_connector_reused_blocks",
             documentation=
@@ -299,31 +348,31 @@ class MetricsCollector:
             "from an external store (a subset of the reused blocks). Counted "
             "when the load is accepted, before an asynchronous transfer "
             "completes.",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_gen_alloc_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_gen_alloc_blocks_total",
             documentation="Total blocks allocated during generation phase",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_onboard_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_onboard_bytes_total",
             documentation="Total bytes transferred from host to GPU (onboard)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_offload_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_offload_bytes_total",
             documentation="Total bytes transferred from GPU to host (offload)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_disk_prefetch_blocks_total = Counter(
             name=self.metric_prefix + "kv_cache_disk_prefetch_blocks_total",
             documentation=(
                 "Process-lifetime total V2 KV-cache blocks migrated from disk "
                 "to host by the prefetch mechanism. "
                 "Resets only when the serving process restarts."),
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_intra_device_copy_bytes_total = Counter(
             name=self.metric_prefix + "kv_cache_intra_device_copy_bytes_total",
             documentation=
             "Total bytes copied within GPU (intra-device block copies)",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
 
         # Queue & load metrics
         self.num_requests_running = Gauge(
@@ -381,41 +430,41 @@ class MetricsCollector:
         self.kv_cache_max_blocks = Gauge(
             name=self.metric_prefix + "kv_cache_max_blocks",
             documentation="Maximum number of KV cache blocks",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_free_blocks = Gauge(
             name=self.metric_prefix + "kv_cache_free_blocks",
             documentation="Number of free KV cache blocks",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_used_blocks = Gauge(
             name=self.metric_prefix + "kv_cache_used_blocks",
             documentation="Number of used KV cache blocks",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.kv_cache_tokens_per_block = Gauge(
             name=self.metric_prefix + "kv_cache_tokens_per_block",
             documentation="Number of tokens per KV cache block",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
 
         # Inflight batching metrics
         self.num_context_requests = Gauge(
             name=self.metric_prefix + "num_context_requests",
             documentation="Number of context (prefill) requests",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.num_generation_requests = Gauge(
             name=self.metric_prefix + "num_generation_requests",
             documentation="Number of generation (decode) requests",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.num_paused_requests = Gauge(
             name=self.metric_prefix + "num_paused_requests",
             documentation="Number of paused requests",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.num_scheduled_requests = Gauge(
             name=self.metric_prefix + "num_scheduled_requests",
             documentation="Number of scheduled requests",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.total_context_tokens = Gauge(
             name=self.metric_prefix + "total_context_tokens",
             documentation="Total number of context tokens",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.avg_decoded_tokens_per_iter = Gauge(
             name=self.metric_prefix + "avg_decoded_tokens_per_iter",
             documentation="Average number of decoded tokens per iteration",
@@ -451,6 +500,7 @@ class MetricsCollector:
         self.counter_tokens_cached_prompt.labels(**self.labels)
         self.labels_with_cache_level = {
             **self.labels,
+            self.labelname_dp_rank: "0",
             self.labelname_cache_level: "",
             self.labelname_cache_tier: "",
         }
@@ -472,8 +522,8 @@ class MetricsCollector:
             labelnames=self.labels_with_cache_level.keys())
         # The configured levels are only known once stats arrive; children are created then so
         # that zero-valued levels are still visible before their first cache hit.
-        self._registered_cache_levels = False
-        self._registered_connector_cache_tier = False
+        self._registered_cache_levels: set[str] = set()
+        self._registered_connector_cache_tier: set[str] = set()
         self.histogram_tokens_cached_prompt = Histogram(
             name=self.metric_prefix + "prompt_cached_tokens_per_request",
             documentation="Histogram of cached prompt tokens per request.",
@@ -513,12 +563,12 @@ class MetricsCollector:
             name=self.metric_prefix + "prefill_batch_occupancy",
             documentation=
             "Fraction of max active slots occupied by context requests.",
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
         self.histogram_prefill_batch_tokens = Histogram(
             name=self.metric_prefix + "prefill_batch_tokens",
             documentation="Histogram of total context tokens per iteration.",
             buckets=[64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768],
-            labelnames=self.labels.keys())
+            labelnames=iteration_labelnames)
 
         # HTTP error counter
         self.labelname_http_code = "http_code"
@@ -529,6 +579,95 @@ class MetricsCollector:
             name=self.metric_prefix + "request_error_total",
             documentation="Total request errors, labeled by HTTP status code.",
             labelnames=self.labels_with_http_code.keys())
+
+    def log_config_from_args(self, args: "BaseLlmArgs", model: str) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        from tensorrt_llm.logger import logger
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(
+                quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
+
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size",
+                                 tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
+        }
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_config_obj is not None:
+            kv_cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config_obj, field, None)
+                if val is not None:
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
+            if kv_dtype is not None:
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
+        )
 
     def log_config_info(
             self,
@@ -548,6 +687,9 @@ class MetricsCollector:
             kv_cache_config: KV cache configuration labels (page_size, enable_block_reuse, etc.)
         """
         from prometheus_client import Gauge
+        Gauge = partial(Gauge,
+                        registry=self._registry,
+                        multiprocess_mode=self._gauge_multiprocess_mode)
 
         if model_config:
             info_labels = {**self.labels, **model_config}
@@ -588,9 +730,12 @@ class MetricsCollector:
         # Convenience function for logging to counter.
         counter.labels(**self._label_merge(labels)).inc(data)
 
-    def _log_histogram(self, histogram, data: Union[int, float]) -> None:
+    def _log_histogram(self,
+                       histogram,
+                       data: Union[int, float],
+                       labels: dict[str, str] | None = None) -> None:
         # Convenience function for logging to histogram.
-        histogram.labels(**self.labels).observe(data)
+        histogram.labels(**self._label_merge(labels)).observe(data)
 
     def _cache_level_labels(self, level: int,
                             level_tiers: Optional[List[str]]) -> Dict[str, str]:
@@ -602,7 +747,8 @@ class MetricsCollector:
         }
 
     def _log_cached_tokens_by_level(self, counts: Optional[List[int]],
-                                    level_tiers: Optional[List[str]]) -> None:
+                                    level_tiers: Optional[List[str]],
+                                    rank: str) -> None:
         """Log cached prompt tokens for each configured cache level.
 
         The level count comes from the engine's tier list, so the series are created on the
@@ -610,19 +756,22 @@ class MetricsCollector:
         """
         if not counts:
             return
-        if not self._registered_cache_levels:
+        rank_labels = {self.labelname_dp_rank: rank}
+        if rank not in self._registered_cache_levels:
             for level in range(len(counts)):
                 self.counter_tokens_cached_prompt_by_tier.labels(
-                    **self.labels,
+                    **self.labels, **rank_labels,
                     **self._cache_level_labels(level, level_tiers))
-            self._registered_cache_levels = True
+            self._registered_cache_levels.add(rank)
         for level, count in enumerate(counts):
             if count > 0:
-                self._log_counter(self.counter_tokens_cached_prompt_by_tier,
-                                  self._cache_level_labels(level, level_tiers),
-                                  count)
+                self._log_counter(self.counter_tokens_cached_prompt_by_tier, {
+                    **rank_labels,
+                    **self._cache_level_labels(level, level_tiers)
+                }, count)
 
-    def _log_connector_cached_tokens(self, count: Optional[int]) -> None:
+    def _log_connector_cached_tokens(self, count: Optional[int],
+                                     rank: str) -> None:
         """Log cached prompt tokens a KV cache connector loaded from an external store.
 
         Reported only when a connector can serve tokens, so the series appears only then.
@@ -630,20 +779,50 @@ class MetricsCollector:
         if count is None:
             return
         labels = {
+            self.labelname_dp_rank: rank,
             self.labelname_cache_level: "",
             self.labelname_cache_tier: "connector",
         }
-        if not self._registered_connector_cache_tier:
+        if rank not in self._registered_connector_cache_tier:
             self.counter_tokens_cached_prompt_by_tier.labels(
                 **self._label_merge(labels))
-            self._registered_connector_cache_tier = True
+            self._registered_connector_cache_tier.add(rank)
         if count > 0:
             self._log_counter(self.counter_tokens_cached_prompt_by_tier, labels,
                               count)
 
-    def _log_gauge(self, gauge, data: Union[int, float]) -> None:
+    def _log_gauge(self,
+                   gauge,
+                   data: Union[int, float],
+                   labels: dict[str, str] | None = None) -> None:
         # Convenience function for logging to gauge.
-        gauge.labels(**self.labels).set(data)
+        gauge.labels(**self._label_merge(labels)).set(data)
+
+    def _log_cumulative_kv_counter(self, counter: "Counter", value: int,
+                                   previous: dict[str, int], rank: str, *,
+                                   field_name: str) -> None:
+        """Accumulate positive deltas from one rank's ordered snapshots.
+
+        A decrease emits a warning and updates the baseline without incrementing
+        the counter. This does not make stale or reordered snapshots safe.
+
+        Args:
+            counter: Prometheus counter receiving positive increments.
+            value: Current cumulative value from this rank's cache manager.
+            previous: Per-rank baselines, updated after processing the snapshot.
+            rank: Normalized data-parallel rank label.
+            field_name: Source KV statistics field named in decrease warnings.
+        """
+        previous_value = previous.get(rank, 0)
+        delta = value - previous_value
+        if delta < 0:
+            logger.warning(
+                f"Cumulative KV cache {field_name} decreased for dp_rank={rank} "
+                f"from {previous_value} to {value}; "
+                "skipping increment and updating baseline.")
+        elif delta > 0:
+            self._log_counter(counter, {self.labelname_dp_rank: rank}, delta)
+        previous[rank] = value
 
     def log_request_metrics_dict(self, metrics_dict: dict) -> None:
         """Log per-request metrics from TRTLLM engine responses.
@@ -777,6 +956,30 @@ class MetricsCollector:
         Note:
             - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
             - inflightBatchingStats and specDecodingStats are only present when applicable.
+            - KV and local scheduling metrics use the dp_rank label, resolved from
+              attentionDpRank, then rank, then 0 for unranked rows. Other iteration
+              metrics are rank-0-owned measurements, not global aggregates.
+            - Rows must arrive once, in producer order within each rank. A decrease
+              in a rank's cumulative KV count emits a warning and updates its baseline
+              without incrementing the counter. Stale or reordered rows are unsupported.
+        """
+        # PyExecutor's TLLM_METRICS_ALL_RANKS path is gated on attention DP,
+        # so its TP `rank` also identifies the attention-DP rank.
+        rank = str(
+            int(
+                iteration_stats.get("attentionDpRank",
+                                    iteration_stats.get("rank", 0))))
+
+        if rank == "0":
+            self._log_rank0_iteration_stats(iteration_stats)
+
+        self._log_rank_iteration_stats(iteration_stats, rank)
+
+    def _log_rank0_iteration_stats(self, iteration_stats: dict) -> None:
+        """Log fields owned by rank 0 using the existing model labels.
+
+        Args:
+            iteration_stats: Serialized iteration measurements from rank 0.
         """
         # Top-level queue & load metrics
         if "numActiveRequests" in iteration_stats:
@@ -821,73 +1024,12 @@ class MetricsCollector:
             self._log_gauge(self.max_num_tokens_runtime,
                             iteration_stats["maxNumTokensRuntime"])
 
-        # KV cache stats
-        if kv_stats := iteration_stats.get("kvCacheStats"):
-            cache_hit_rate = kv_stats.get("cacheHitRate")
-            if cache_hit_rate is not None:
-                self._log_gauge(self.kv_cache_hit_rate, cache_hit_rate)
-            reused_blocks = kv_stats.get("reusedBlocks")
-            if reused_blocks is not None:
-                delta = reused_blocks - self._prev_reused_blocks
-                if delta > 0:
-                    self._log_counter(self.kv_cache_reused_blocks, None, delta)
-                self._prev_reused_blocks = reused_blocks
-            missed_blocks = kv_stats.get("missedBlocks")
-            if missed_blocks is not None:
-                delta = missed_blocks - self._prev_missed_blocks
-                if delta > 0:
-                    self._log_counter(self.kv_cache_missed_blocks, None, delta)
-                self._prev_missed_blocks = missed_blocks
-            if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
-                max_num_blocks = kv_stats["maxNumBlocks"]
-                if max_num_blocks:
-                    utilization = kv_stats["usedNumBlocks"] / max_num_blocks
-                    self._log_gauge(self.kv_cache_utilization, utilization)
-            if "maxNumBlocks" in kv_stats:
-                self._log_gauge(self.kv_cache_max_blocks,
-                                kv_stats["maxNumBlocks"])
-            if "freeNumBlocks" in kv_stats:
-                self._log_gauge(self.kv_cache_free_blocks,
-                                kv_stats["freeNumBlocks"])
-            if "usedNumBlocks" in kv_stats:
-                self._log_gauge(self.kv_cache_used_blocks,
-                                kv_stats["usedNumBlocks"])
-            if "tokensPerBlock" in kv_stats:
-                self._log_gauge(self.kv_cache_tokens_per_block,
-                                kv_stats["tokensPerBlock"])
-
-        # Inflight batching stats
         if ifb_stats := iteration_stats.get("inflightBatchingStats"):
-            if "numContextRequests" in ifb_stats:
-                self._log_gauge(self.num_context_requests,
-                                ifb_stats["numContextRequests"])
-            if "numGenRequests" in ifb_stats:
-                self._log_gauge(self.num_generation_requests,
-                                ifb_stats["numGenRequests"])
-            if "numPausedRequests" in ifb_stats:
-                self._log_gauge(self.num_paused_requests,
-                                ifb_stats["numPausedRequests"])
-            if "numScheduledRequests" in ifb_stats:
-                self._log_gauge(self.num_scheduled_requests,
-                                ifb_stats["numScheduledRequests"])
-            if "numCtxTokens" in ifb_stats:
-                num_ctx_tokens = ifb_stats["numCtxTokens"]
-                self._log_gauge(self.total_context_tokens, num_ctx_tokens)
-                if num_ctx_tokens > 0:
-                    self._log_histogram(self.histogram_prefill_batch_tokens,
-                                        num_ctx_tokens)
             if "avgNumDecodedTokensPerIter" in ifb_stats:
                 self._log_gauge(self.avg_decoded_tokens_per_iter,
                                 ifb_stats["avgNumDecodedTokensPerIter"])
 
-            # Prefill batch occupancy: context_requests / max_active_requests
-            num_context = ifb_stats.get("numContextRequests", 0)
-            max_active = iteration_stats.get("maxNumActiveRequests", 0)
-            if max_active and max_active > 0:
-                self._log_gauge(self.gauge_prefill_batch_occupancy,
-                                num_context / max_active)
-
-        # Speculative decoding stats
+        # Speculative decoding stats are copied from rank 0 by ADP fanout.
         if spec_stats := iteration_stats.get("specDecodingStats"):
             if "numDraftTokens" in spec_stats:
                 draft_tokens = spec_stats["numDraftTokens"]
@@ -907,18 +1049,108 @@ class MetricsCollector:
                 self._log_gauge(self.spec_decode_draft_overhead,
                                 spec_stats["draftOverhead"])
 
+    def _log_rank_iteration_stats(self, iteration_stats: dict,
+                                  rank: str) -> None:
+        """Log local KV and scheduling measurements for one rank.
+
+        Args:
+            iteration_stats: Serialized iteration measurements for this rank.
+            rank: Normalized data-parallel rank label.
+        """
+        rank_labels = {self.labelname_dp_rank: rank}
+
+        # KV cache stats
+        if kv_stats := iteration_stats.get("kvCacheStats"):
+            cache_hit_rate = kv_stats.get("cacheHitRate")
+            if cache_hit_rate is not None:
+                self._log_gauge(self.kv_cache_hit_rate,
+                                cache_hit_rate,
+                                labels=rank_labels)
+            reused_blocks = kv_stats.get("reusedBlocks")
+            if reused_blocks is not None:
+                self._log_cumulative_kv_counter(self.kv_cache_reused_blocks,
+                                                reused_blocks,
+                                                self._prev_reused_blocks,
+                                                rank,
+                                                field_name="reusedBlocks")
+            missed_blocks = kv_stats.get("missedBlocks")
+            if missed_blocks is not None:
+                self._log_cumulative_kv_counter(self.kv_cache_missed_blocks,
+                                                missed_blocks,
+                                                self._prev_missed_blocks,
+                                                rank,
+                                                field_name="missedBlocks")
+            if "usedNumBlocks" in kv_stats and "maxNumBlocks" in kv_stats:
+                max_num_blocks = kv_stats["maxNumBlocks"]
+                if max_num_blocks:
+                    utilization = kv_stats["usedNumBlocks"] / max_num_blocks
+                    self._log_gauge(self.kv_cache_utilization,
+                                    utilization,
+                                    labels=rank_labels)
+            if "maxNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_max_blocks,
+                                kv_stats["maxNumBlocks"],
+                                labels=rank_labels)
+            if "freeNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_free_blocks,
+                                kv_stats["freeNumBlocks"],
+                                labels=rank_labels)
+            if "usedNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_used_blocks,
+                                kv_stats["usedNumBlocks"],
+                                labels=rank_labels)
+            if "tokensPerBlock" in kv_stats:
+                self._log_gauge(self.kv_cache_tokens_per_block,
+                                kv_stats["tokensPerBlock"],
+                                labels=rank_labels)
+
+        # Inflight batching stats
+        if ifb_stats := iteration_stats.get("inflightBatchingStats"):
+            if "numContextRequests" in ifb_stats:
+                self._log_gauge(self.num_context_requests,
+                                ifb_stats["numContextRequests"],
+                                labels=rank_labels)
+            if "numGenRequests" in ifb_stats:
+                self._log_gauge(self.num_generation_requests,
+                                ifb_stats["numGenRequests"],
+                                labels=rank_labels)
+            if "numPausedRequests" in ifb_stats:
+                self._log_gauge(self.num_paused_requests,
+                                ifb_stats["numPausedRequests"],
+                                labels=rank_labels)
+            if "numScheduledRequests" in ifb_stats:
+                self._log_gauge(self.num_scheduled_requests,
+                                ifb_stats["numScheduledRequests"],
+                                labels=rank_labels)
+            if "numCtxTokens" in ifb_stats:
+                num_ctx_tokens = ifb_stats["numCtxTokens"]
+                self._log_gauge(self.total_context_tokens,
+                                num_ctx_tokens,
+                                labels=rank_labels)
+                if num_ctx_tokens > 0:
+                    self._log_histogram(self.histogram_prefill_batch_tokens,
+                                        num_ctx_tokens,
+                                        labels=rank_labels)
+            # Prefill batch occupancy: context_requests / max_active_requests
+            num_context = ifb_stats.get("numContextRequests", 0)
+            max_active = iteration_stats.get("maxNumActiveRequests", 0)
+            if max_active and max_active > 0:
+                self._log_gauge(self.gauge_prefill_batch_occupancy,
+                                num_context / max_active,
+                                labels=rank_labels)
+
         # Per-iteration KV cache stats. V2 reports reuse/miss by lifecycle and
         # storage/transfer counters by pool group; legacy V1 uses window stats.
         disk_prefetch_blocks = iteration_stats.get("iterDiskPrefetchBlocks", 0)
         if disk_prefetch_blocks > 0:
-            self._log_counter(self.kv_cache_disk_prefetch_blocks_total, {},
-                              disk_prefetch_blocks)
+            self._log_counter(self.kv_cache_disk_prefetch_blocks_total,
+                              rank_labels, disk_prefetch_blocks)
 
         self._log_cached_tokens_by_level(
             iteration_stats.get("iterCachedTokensByLevel"),
-            iteration_stats.get("kvCacheLevelTiers"))
+            iteration_stats.get("kvCacheLevelTiers"), rank)
         self._log_connector_cached_tokens(
-            iteration_stats.get("iterConnectorCachedTokens"))
+            iteration_stats.get("iterConnectorCachedTokens"), rank)
 
         kv_iter = iteration_stats.get("kvCacheIterationStats")
         kv_iter_by_lifecycle = iteration_stats.get(
@@ -980,40 +1212,42 @@ class MetricsCollector:
             # Gauges
             if total_secondary_max > 0:
                 self._log_gauge(self.kv_cache_host_utilization,
-                                total_secondary_used / total_secondary_max)
+                                total_secondary_used / total_secondary_max,
+                                labels=rank_labels)
             iter_total = total_reused + total_missed
             if iter_total > 0:
                 self._log_gauge(self.kv_cache_iter_reuse_rate,
-                                total_reused / iter_total)
+                                total_reused / iter_total,
+                                labels=rank_labels)
 
             # Counters (increment by delta)
             if total_reused > 0:
-                self._log_counter(self.kv_cache_iter_reused_blocks, {},
+                self._log_counter(self.kv_cache_iter_reused_blocks, rank_labels,
                                   total_reused)
             if total_full_reused > 0:
-                self._log_counter(self.kv_cache_iter_full_reused_blocks, {},
-                                  total_full_reused)
+                self._log_counter(self.kv_cache_iter_full_reused_blocks,
+                                  rank_labels, total_full_reused)
             if total_partial_reused > 0:
-                self._log_counter(self.kv_cache_iter_partial_reused_blocks, {},
-                                  total_partial_reused)
+                self._log_counter(self.kv_cache_iter_partial_reused_blocks,
+                                  rank_labels, total_partial_reused)
             if total_missed > 0:
-                self._log_counter(self.kv_cache_iter_missed_blocks, {},
+                self._log_counter(self.kv_cache_iter_missed_blocks, rank_labels,
                                   total_missed)
             if total_connector_reused > 0:
                 self._log_counter(self.kv_cache_iter_connector_reused_blocks,
-                                  {}, total_connector_reused)
+                                  rank_labels, total_connector_reused)
             if total_gen_alloc > 0:
-                self._log_counter(self.kv_cache_gen_alloc_blocks_total, {},
-                                  total_gen_alloc)
+                self._log_counter(self.kv_cache_gen_alloc_blocks_total,
+                                  rank_labels, total_gen_alloc)
             if total_onboard_bytes > 0:
-                self._log_counter(self.kv_cache_onboard_bytes_total, {},
-                                  total_onboard_bytes)
+                self._log_counter(self.kv_cache_onboard_bytes_total,
+                                  rank_labels, total_onboard_bytes)
             if total_offload_bytes > 0:
-                self._log_counter(self.kv_cache_offload_bytes_total, {},
-                                  total_offload_bytes)
+                self._log_counter(self.kv_cache_offload_bytes_total,
+                                  rank_labels, total_offload_bytes)
             if total_intra_device_copy_bytes > 0:
                 self._log_counter(self.kv_cache_intra_device_copy_bytes_total,
-                                  {}, total_intra_device_copy_bytes)
+                                  rank_labels, total_intra_device_copy_bytes)
 
     def log_request_error(self, http_code: Union[int, str] = "") -> None:
         """Increment the error counter, labeled by HTTP status code."""

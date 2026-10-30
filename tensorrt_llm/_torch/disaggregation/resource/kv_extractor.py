@@ -332,6 +332,15 @@ def _build_pool_views_for_variant(
                     "in separate views"
                 )
             num_kv_heads = layer_heads.pop() if layer_heads else None
+        if layout.ring_slot_bytes is not None and (
+            mapper_kind != MapperKind.REPLICATED
+            or layout.ring_slot_bytes <= 0
+            or bytes_per_layer % layout.ring_slot_bytes != 0
+        ):
+            raise ValueError(
+                f"{context} ring_slot_bytes={layout.ring_slot_bytes} needs a REPLICATED view "
+                f"whose bytes_per_layer={bytes_per_layer} is a positive multiple of it"
+            )
         pool_views.append(
             PoolView(
                 pool_idx=pool_idx,
@@ -344,6 +353,7 @@ def _build_pool_views_for_variant(
                 ),
                 bytes_per_head=layout.bytes_per_head,
                 num_kv_heads=num_kv_heads,
+                ring_slot_bytes=layout.ring_slot_bytes,
             )
         )
 

@@ -52,11 +52,9 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
-                                          ExecutorMemoryType,
-                                          ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          ExecutorMemoryType, KvCacheConfig,
+                                          MambaStateConfig, MoeConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -3375,21 +3373,6 @@ class TestStrictBaseModelArbitraryArgs:
             KvCacheConfig(enable_block_reuse=True,
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
-
-    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
-        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
-        # Valid arguments should work
-        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                               cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                          bogus_setting="should_fail")
-        assert "bogus_setting" in str(exc_info.value)
 
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""

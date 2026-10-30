@@ -69,11 +69,29 @@ Set `failureThreshold * periodSeconds` to cover the longest expected model start
 
 OpenEngine gRPC does not yet expose sleep or weight updates. When those operations are added, they must publish `inference=NOT_SERVING` for their duration while keeping `liveness=SERVING`; the current executor health predicate alone does not detect those admission states. A sidecar that loses `Watch` or sees a new engine identity must validate health again.
 
+For models that do not accept token-ID input, including Whisper, the optional
+`Health(include_inference_probe=True)` check reports the inference probe as not
+applicable. It does not submit inference and does not establish inference liveness;
+the ordinary lifecycle and executor health checks still apply.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
 
-Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, multimodal media, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+Features without a faithful TensorRT-LLM mapping return `UNIMPLEMENTED`: prefix-cache bypass, LoRA lifecycle selection, explicit-token or all-vocabulary log-probability selection, nonzero prompt-logprob offsets, per-request grammar-backend selection, and priority metadata. Attention-DP rank hints are validated and used for first-turn placement. With conversation affinity on, the first hint establishes the conversation's rank, and later turns retain that rank even if their hints differ; the request must carry a stable conversation ID. `ServerInfo.extra.trtllm_supports_dp_rank_targeting` advertises this support. The AutoDeploy backend is rejected at startup until it supports request cancellation. `Control` implements `GetServerInfo`, `GetModelInfo`, `GetLoad`, `GetKvEventSources`, `Health` and `Abort`; its LoRA lifecycle and `SubscribeKvEvents` RPCs return `UNIMPLEMENTED`.
+
+### Media capability discovery
+
+`GetModelInfo.supports_multimodal` and `extra.trtllm_supported_modalities` reflect
+the loaded processor's read-only `supported_modalities` property, intersected
+with registered placeholders and implemented OpenEngine handlers. Both discovery
+and request validation use this result. `InputProcessor` defaults to text-only;
+`BaseMultimodalInputProcessor` defaults to its registered modalities. Processors
+with checkpoint-dependent encoders override the property to narrow that set.
+Gemma4 excludes audio without `audio_config` and images/video without
+`vision_config`. Nemotron excludes audio without an
+initialized audio extractor, and Whisper declares audio only. Registered custom
+processors must declare the property to advertise media support.
 
 ### Disaggregated serving
 
@@ -133,6 +151,68 @@ Events report full-block radix-cache residency; the streaming sink does not repo
 Consumers must track rank-local sequence numbers and resynchronize on gaps. Publisher queue drops and failed sends leave sequence gaps, but native capture overflow is logged without a wire gap. Replay retains only the configured number of batches; a slow replay client can lose its replay response and must retry. Replay is sent in bounded, nonblocking chunks so it cannot stall live publication. The upstream publisher emits no idle heartbeat, so source health cannot be inferred from silence alone. A reset or restart does not reconstruct already-resident cache contents, and recovery can temporarily under-report cache affinity.
 
 Direct ZMQ sockets are unauthenticated. Keep them on a trusted network and restrict access to intended subscribers.
+
+## Prometheus metrics
+
+OpenEngine serves metrics on a separate HTTP port, using the same collection settings and `trtllm_*` metric families as the HTTP server.
+
+Save this as `metrics.yaml` to collect request timing, token counts, and engine statistics such as KV-cache usage:
+
+```yaml
+return_perf_metrics: true
+enable_iter_perf_stats: true
+```
+
+Start the server and check the metrics endpoint:
+
+```bash
+trtllm-serve Qwen/Qwen3-0.6B \
+  --config metrics.yaml \
+  --grpc --grpc-protocol openengine --host 127.0.0.1 --port 50051
+
+curl --fail http://127.0.0.1:8001/prometheus/metrics
+```
+
+Metrics use port `8001` and inherit `--host`. Override them with `--openengine-metrics-port` and `--openengine-metrics-host`; the metrics port must differ from the gRPC port. These options change the address, not whether collection is enabled.
+
+Monitoring tools scrape each service's metrics endpoint directly. Configure the engine endpoint as its own target; another service does not need to re-export these metrics. Metrics endpoint discovery through `GetServerInfo` is deferred, so configure the metrics host, port, and path in your monitoring setup.
+
+For Prometheus, add a separate scrape target:
+
+```yaml
+scrape_configs:
+  - job_name: trtllm-openengine
+    scrape_interval: 15s
+    metrics_path: /prometheus/metrics
+    static_configs:
+      - targets: ["engine-host:8001"]
+```
+
+Replace `engine-host` with an address Prometheus can reach. For remote scraping, bind metrics to a reachable interface. The endpoint has no authentication; restrict access to a trusted network. Use `Control.Health` to check inference health; a successful scrape only checks the exporter.
+
+### Collection settings
+
+- `return_perf_metrics: true` enables the endpoint and request metrics. Both collection settings default to `false`.
+- `enable_iter_perf_stats: true` adds engine statistics. Set it to `false` for request-only collection; it does not enable the endpoint by itself.
+- `perf_metrics_output_dir` also enables collection and the endpoint, matching HTTP enablement, but OpenEngine does not write HTTP per-request JSONL files.
+- KV events and routing load remain separate: metrics do not enable event publishing or `--openengine-enable-load-metrics`.
+
+### Reading the metrics
+
+- `trtllm_request_success_total` counts completed output candidates by finish reason. One successful request with `num_sequences=2` contributes two candidates.
+- `trtllm_prompt_tokens_total` counts the prompt once per request; `trtllm_generation_tokens_total` sums tokens across outputs.
+- `trtllm_openengine_rpc_outcomes_total{phase,outcome}` counts one outcome per `Generate` call, including rejection, cancellation, and engine errors. Use this to distinguish RPC outcomes from candidate completion. Completion means the server consumed the response stream, not that the client acknowledged receipt.
+- `trtllm_openengine_metrics_errors_total{source}` reports collection failures without failing inference.
+
+Request latency histograms measure this worker's execution phase. For separate prefill and decode workers, they do not measure the client's full request latency. Rejected or interrupted requests may have no candidate timing observations. Health probes are excluded from request metrics, but their engine work can appear in iteration statistics.
+
+Engine statistics are collected approximately once per second. Gauges retain the last engine sample when no new sample is available. Served-model labels and `prometheus_metrics_config` histogram buckets match HTTP; OpenEngine's engine gauges omit `pid` labels.
+
+### Performance and deployment notes
+
+- Measure overhead with your workload and scrape interval. To sample KV statistics less often, increase `kv_cache_config.iteration_stats_interval`; this can delay updates. Keep `iter_perf_stats_interval: 1` for complete iteration counters, including speculative-decoding counts.
+- With multiple frontends, one process serves metrics and collects engine statistics; request metrics are combined across all frontends.
+- Metrics storage is managed automatically. If setting `PROMETHEUS_MULTIPROC_DIR`, use an existing writable parent directory; the server creates and cleans up a private child. Forced termination can leave that child behind. When embedding the server, initialize the environment before importing `prometheus_client`.
 
 ## Transport security
 
