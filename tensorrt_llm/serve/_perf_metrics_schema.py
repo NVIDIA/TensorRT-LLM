@@ -64,6 +64,7 @@ class SpeculativeDecodingMetrics(TypedDict):
 
 class PerfMetrics(TypedDict):
     timing_metrics: TimingMetrics
+    input_processing_metrics: NotRequired[dict[str, float]]
     first_iter: NotRequired[int]
     last_iter: NotRequired[int]
     kv_cache_metrics: NotRequired[KvCacheMetrics]

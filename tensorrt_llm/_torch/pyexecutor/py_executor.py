@@ -71,8 +71,8 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
-from ..models.modeling_multimodal_mixin import \
-    maybe_prefetch_mm_encoder_for_next_iter
+from ..models.modeling_multimodal_mixin import (
+    MultimodalModelMixin, maybe_prefetch_mm_encoder_for_next_iter)
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..moe.expert_statistic import ExpertStatistic
@@ -1013,6 +1013,9 @@ class PyExecutor:
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
+        # Install only after warmup/capture so dummy encoder work is excluded.
+        self._setup_encoder_perf_metrics()
+
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
@@ -1259,6 +1262,15 @@ class PyExecutor:
 
         if start_worker:
             self.start_worker()
+
+    def _setup_encoder_perf_metrics(self) -> None:
+        """Install optional encoder timing on the module that owns encoder methods."""
+        # torch.compile delegates encoder methods with self bound to _orig_mod.
+        model = getattr(self.model_engine.model, "_orig_mod",
+                        self.model_engine.model)
+        if (self.enable_iter_perf_stats and self.dist.rank == 0
+                and isinstance(model, MultimodalModelMixin)):
+            model._encoder_forward_context = self.perf_manager.record_encoder_forward
 
     @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
@@ -3006,6 +3018,16 @@ class PyExecutor:
                            or self.dist.pp_size > 1)
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
+        # These are completed rank-0 encoder calls, including side-stream
+        # prefetch. They can finish after the iteration that launched them.
+        # Attach them once, rather than copying them to every ADP fanout row.
+        encoder_gpu_times_ms = (self.perf_manager.take_encoder_gpu_times_ms()
+                                if attention_dp_rank in (None, 0) else [])
+
+        mm_encoder_stats = {
+            "gpuTimesMS": encoder_gpu_times_ms
+        } if encoder_gpu_times_ms else None
+
         tp_size = getattr(self.dist, "tp_size", 1)
         gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
         if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
@@ -3023,6 +3045,8 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            if mm_encoder_stats is not None:
+                local_dict["multimodalEncoderStats"] = mm_encoder_stats
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -3041,6 +3065,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] mm_encoder_stats: optional completed rank-0 encoder observations
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3048,7 +3073,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, mm_encoder_stats))
 
     def _process_iter_stats(
         self,
