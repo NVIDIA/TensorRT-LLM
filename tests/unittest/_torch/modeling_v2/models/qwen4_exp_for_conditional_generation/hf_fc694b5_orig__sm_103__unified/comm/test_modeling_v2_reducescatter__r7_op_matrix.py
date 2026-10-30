@@ -6,7 +6,8 @@ The matrix is ``_reducescatter__r7_op_matrix.py`` beside this file, a copy of
 the shared ``comm/_reducescatter_op_matrix.py`` driving this target's variant
 ``ops/comm/reducescatter__r7``. It is its own launcher; ``_rank_job`` (in the
 shared comm test directory) starts it in a fresh interpreter and turns its exit
-code into an assertion.
+code into an assertion. It runs once per world size the variant's cells name:
+4 (dep4) and 2 (dep2, the disaggregated engines).
 """
 
 from pathlib import Path
@@ -24,5 +25,9 @@ assert torch.cuda.is_available(), "reducescatter requires CUDA devices"
 # xdist several workers would fight for the same GPUs, so this must run
 # alone, like the shared collective entries.
 @pytest.mark.no_xdist
-def test_reducescatter_op_matrix() -> None:
-    _rank_job.run("reducescatter__r7", directory=Path(__file__).resolve().parent)
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_reducescatter_op_matrix(world_size: int) -> None:
+    if world_size > torch.cuda.device_count():
+        # The single-GPU modeling_v2 stage collects this directory too.
+        pytest.skip(f"{world_size} ranks in one node need {world_size} visible GPUs")
+    _rank_job.run("reducescatter__r7", world_size, directory=Path(__file__).resolve().parent)
