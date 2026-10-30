@@ -1723,6 +1723,69 @@ class TestCtxFrontendAffinity:
         # Router bookkeeping keeps the routed server's shared address.
         hooks.on_ctx_resp.assert_called_once_with("localhost:8000", response_body)
 
+    @pytest.mark.asyncio
+    async def test_refused_frontend_port_falls_back_to_shared_port(self, mock_router, mock_session):
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.CONTEXT,
+            max_retries=0,
+            session=mock_session,
+            frontend_affinity=(8, 10),
+        )
+        response_body = TestOpenAIHttpClient().dummy_response()
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json = AsyncMock(return_value=response_body.model_dump())
+        http_response.__aenter__ = AsyncMock(return_value=http_response)
+        http_response.__aexit__ = AsyncMock()
+        refused = aiohttp.ClientConnectorError(Mock(), OSError(111, "Connection refused"))
+        mock_session.post.side_effect = [refused] + [http_response] * 3
+        affinity_port = 8000 + 10 * (zlib.crc32(b"conv-a") % 8 + 1)
+        now = 100.0
+
+        def ports():
+            return [
+                int(call.args[0].split("/")[2].rpartition(":")[2])
+                for call in mock_session.post.call_args_list
+            ]
+
+        with patch(
+            "tensorrt_llm.serve.openai_client.get_steady_clock_now_in_seconds",
+            side_effect=lambda: now,
+        ):
+            # The refused attempt is not a retry: it succeeds with max_retries=0.
+            await client.send_request(self._request("conv-a"))
+            assert ports() == [affinity_port, 8000]
+            mock_router.renew_request.assert_not_called()
+            # Later turns of the conversation skip the refused port for a while ...
+            now += 1.0
+            await client.send_request(self._request("conv-a"))
+            assert ports()[2:] == [8000]
+            # ... and try it again once that window has passed.
+            now += 60.0
+            await client.send_request(self._request("conv-a"))
+            assert ports()[3:] == [affinity_port]
+
+    @pytest.mark.asyncio
+    async def test_refused_shared_port_is_not_retried_elsewhere(self, mock_router, mock_session):
+        """Without a conversation id the request already uses the shared port."""
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.CONTEXT,
+            max_retries=0,
+            session=mock_session,
+            frontend_affinity=(8, 10),
+        )
+        refused = aiohttp.ClientConnectorError(Mock(), OSError(111, "Connection refused"))
+        mock_session.post.side_effect = [refused]
+
+        with pytest.raises(aiohttp.ClientConnectorError):
+            await client.send_request(self._request(None))
+        assert mock_session.post.call_count == 1
+
 
 class TestGenerationLegRetry:
     """A generation leg is retried only while it cannot have reached the server.

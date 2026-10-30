@@ -2647,6 +2647,16 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         config_file,
         telemetry=telemetry,
     )
+    disagg_cfg = parse_disagg_config_file(config_file)
+    # The servers launched here run a single frontend each, so they bind no
+    # affinity ports for the disaggregated server to send conversations to.
+    if disagg_cfg.ctx_frontend_affinity is not None:
+        raise ValueError(
+            "disaggregated_mpi_worker runs one serving frontend per server; "
+            "remove num_serve_frontends and serve_frontend_affinity_port_stride "
+            "from context_servers, or launch the context servers with trtllm-serve."
+        )
+
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2656,8 +2666,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
 
     from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
-
-    disagg_cfg = parse_disagg_config_file(config_file)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

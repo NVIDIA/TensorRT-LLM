@@ -33,6 +33,7 @@ from typing import (
     Type,
     TypeVar,
 )
+from urllib.parse import urlsplit
 
 import aiohttp
 import msgspec
@@ -133,6 +134,10 @@ _GENERATION_LEG_RETRYABLE_ERRORS = (
     aiohttp.ClientConnectorError,
     ConnectionResetError,
 )
+
+# How long a context frontend affinity port that refused a connection is
+# bypassed in favor of the server's shared port.
+_REFUSED_AFFINITY_PORT_BYPASS_SECS = 10.0
 
 
 class OpenAIClient(ABC):
@@ -277,6 +282,8 @@ class OpenAIHttpClient(OpenAIClient):
                 "Context requests with a conversation id go to per-conversation "
                 f"frontend ports ({num_frontends} frontends, port stride {stride})"
             )
+        # Affinity host:port -> steady-clock time it last refused a connection.
+        self._refused_affinity_ports: dict[str, float] = {}
 
     def _url_server(self, server: str, request: UCompletionRequest) -> str:
         """host:port to send a request routed to server to.
@@ -284,6 +291,9 @@ class OpenAIHttpClient(OpenAIClient):
         With frontend affinity, a request carrying a conversation id goes to
         the affinity port of the frontend picked by crc32(conversation_id) % K;
         every orchestrator process picks the same frontend for a conversation.
+        An affinity port that refused a connection is bypassed for
+        _REFUSED_AFFINITY_PORT_BYPASS_SECS: its conversations use the shared
+        port meanwhile.
         """
         if self._frontend_affinity is None:
             return server
@@ -293,7 +303,13 @@ class OpenAIHttpClient(OpenAIClient):
         num_frontends, stride = self._frontend_affinity
         host, _, port = server.rpartition(":")
         frontend = zlib.crc32(conversation_id.encode()) % num_frontends
-        return f"{host}:{int(port) + stride * (frontend + 1)}"
+        affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
+        refused_at = self._refused_affinity_ports.get(affinity_server)
+        if refused_at is not None:
+            if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
+                return server
+            del self._refused_affinity_ports[affinity_server]
+        return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:
         headers = build_subagent_affinity_headers(
@@ -382,14 +398,19 @@ class OpenAIHttpClient(OpenAIClient):
             pinned_dp = request.disaggregated_params
             if pinned_dp is not None:
                 req_id = pinned_dp.disagg_request_id
-        url = f"http://{self._url_server(server, request)}/{endpoint}"
+        url_server = self._url_server(server, request)
+        url = f"http://{url_server}/{endpoint}"
+        # The routed server's shared port, used if the affinity port refuses.
+        fallback_url = f"http://{server}/{endpoint}" if url_server != server else None
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
         _ctx_rid = _dp.ctx_request_id if _dp is not None else None
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         self._metrics_collector.total_requests.inc()
         if request.stream:
-            resp_generator = self._stream_with_cleanup(server, url, request, hooks, req_id)
+            resp_generator = self._stream_with_cleanup(
+                server, url, request, hooks, req_id, fallback_url
+            )
             # Enter its cleanup scope before returning: aclose() on an unstarted
             # async generator would otherwise leave the router reservation live.
             await resp_generator.__anext__()
@@ -398,7 +419,7 @@ class OpenAIHttpClient(OpenAIClient):
         try:
             response = None
             async with aclosing(
-                self._post_with_retry(server, url, request, hooks, req_id)
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for resp_json in response_generator:
                     response = response_type(**resp_json)
@@ -422,13 +443,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
     ) -> AsyncGenerator[Any, None]:
         success = False
         try:
             # Consumed by _send_request, before the caller sees this generator.
             yield None
             async with aclosing(
-                self._post_with_retry(server, url, request, hooks, req_id)
+                self._post_with_retry(server, url, request, hooks, req_id, fallback_url)
             ) as response_generator:
                 async for chunk in response_generator:
                     yield chunk
@@ -447,7 +469,14 @@ class OpenAIHttpClient(OpenAIClient):
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
         req_id: Optional[int] = None,
+        fallback_url: Optional[str] = None,
     ) -> AsyncGenerator[Any, None]:
+        """POST request to url, retrying within the retry budget.
+
+        If url is a context frontend affinity port that refuses the connection,
+        the request moves to fallback_url, the shared port, without using the
+        retry budget: it never reached a server.
+        """
         is_stream = request.stream
         disagg_params = request.disaggregated_params
         is_remote_tail_handoff = disagg_params is not None and (
@@ -488,13 +517,15 @@ class OpenAIHttpClient(OpenAIClient):
             and disagg_params is not None
             and disagg_params.request_type == "generation_only"
         )
-        for attempt in range(loop_max):
-            if attempt > 0:
+        affinity_refusals = 0
+        for attempt in range(loop_max + (fallback_url is not None)):
+            retry = attempt - affinity_refusals
+            if retry > 0:
                 await self._router.renew_request(request, req_id=req_id)
             # A retried request gets a new disagg_request_id so it cannot collide
             # with the abandoned attempt on the worker. A generation leg keeps its
             # id: a new one could never be paired with the context KV cache.
-            if attempt > 0 and self._disagg_id_generator is not None and not is_generation_leg:
+            if retry > 0 and self._disagg_id_generator is not None and not is_generation_leg:
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = await self._disagg_id_generator()
@@ -586,6 +617,17 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if fallback_url is not None and isinstance(e, aiohttp.ClientConnectorError):
+                    logger.warning(
+                        f"Context frontend affinity port of {url} refused the connection: "
+                        f"{e} - sending to the shared port {fallback_url}"
+                    )
+                    self._refused_affinity_ports[urlsplit(url).netloc] = (
+                        get_steady_clock_now_in_seconds()
+                    )
+                    url, fallback_url = fallback_url, None
+                    affinity_refusals = 1
+                    continue
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",
@@ -619,15 +661,14 @@ class OpenAIHttpClient(OpenAIClient):
                 effective_max = max_retries
                 if is_transient_tcp:
                     effective_max = max(max_retries, _TRANSIENT_TCP_BUDGET)
-                if attempt >= effective_max:
+                if retry >= effective_max:
                     logger.error(
-                        f"Client error to {url}: {e} - last retry {attempt} of {effective_max}"
-                        "failed",
+                        f"Client error to {url}: {e} - last retry {retry} of {effective_max}failed",
                         traceback.format_exc(),
                     )
                     raise
                 logger.error(
-                    f"{self._role} client error to {url}: {e} - retry {attempt} of {effective_max}",
+                    f"{self._role} client error to {url}: {e} - retry {retry} of {effective_max}",
                     traceback.format_exc(),
                 )
                 await self._router.renew_request(request, req_id=req_id)
