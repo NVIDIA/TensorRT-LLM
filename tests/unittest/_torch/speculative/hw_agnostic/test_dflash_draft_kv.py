@@ -50,25 +50,39 @@ def test_eagle3_one_model_still_gets_a_separate_draft_kv_cache():
 
 
 @pytest.mark.parametrize(
-    ("bound_to_pool", "cur", "first_pos", "expected"),
+    ("bound_to_pool", "reuse_addressable", "reads_rebased_view", "cur", "first_pos", "expected"),
     [
         # Managed pool: the block table is indexed by target position, so a
         # tail that reuse let the target start at first_pos is stored there.
-        (True, 0, 8192, 8192),
+        (True, False, True, 0, 8192, 8192),
+        (True, True, True, 0, 8192, 8192),
+        # A pool paired with the target's reuse holds the prefix below the
+        # tail, so the tail goes on top of it even for a worker that reads
+        # from position 0 (the Kimi K3 workers).
+        (True, True, False, 0, 8192, 8192),
+        # An unpaired pool read from position 0 numbers the tail from 0.
+        (True, False, False, 0, 8192, 0),
         # A continuing chunk keeps the slot's stored length.
-        (True, 4096, 4096, 4096),
+        (True, False, True, 4096, 4096, 4096),
         # Private arena: every request numbers from 0.
-        (False, 0, 8192, 0),
-        (False, 0, 0, 0),
+        (False, False, True, 0, 8192, 0),
+        (False, False, True, 0, 0, 0),
     ],
 )
 def test_dflash_ctx_store_start_follows_the_pool_numbering(
-    bound_to_pool: bool, cur: int, first_pos: int, expected: int
+    bound_to_pool: bool,
+    reuse_addressable: bool,
+    reads_rebased_view: bool,
+    cur: int,
+    first_pos: int,
+    expected: int,
 ) -> None:
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     worker = object.__new__(DFlashWorker)
     worker._ctx_block_tables = object() if bound_to_pool else None
+    worker._ctx_reuse_addressable = reuse_addressable
+    worker._ctx_reads_rebased_view = reads_rebased_view
     assert worker._ctx_store_start(cur, first_pos) == expected
 
 
