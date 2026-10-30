@@ -33,6 +33,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm._torch.pyexecutor.model_loader import validate_encoder_decoder_kv_cache_config
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager, ResourceManagerType
@@ -124,13 +125,13 @@ def _make_model_config(
 
 def _make_mock_model_engine(model_config: ModelConfig) -> Mock:
     """Mock ModelEngine shell; a real engine needs GPU + loaded weights."""
-    engine = Mock()
+    engine = Mock(spec=ModelEngine, model=Mock())
     engine.model.model_config = model_config
     engine.model.config.torch_dtype = model_config.torch_dtype
-    engine.dtype = model_config.torch_dtype
     engine.input_processor = SimpleNamespace(requires_encoder_features=False)
     engine.cuda_graph_batch_sizes = []
     engine.cuda_graph_padding_enabled = False
+    engine.max_cuda_graph_batch_size = None
     return engine
 
 
@@ -651,7 +652,6 @@ class TestCrossKvCacheConstruction:
         )
         creator._skip_est = False
         creator._execution_stream = _FakeCudaStream()
-        creator._model_engine.max_cuda_graph_batch_size = None
 
         distributed = Mock()
         distributed.allreduce.side_effect = lambda value, op: value

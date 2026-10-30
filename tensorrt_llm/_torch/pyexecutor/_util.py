@@ -3045,7 +3045,7 @@ class KvCacheCreator:
         model_config = self._model_engine.model.model_config
         cross_model_config = self._get_unquantized_kv_model_config(model_config)
         if cross_model_config is not model_config and not estimating_kv_cache:
-            model_dtype = torch_dtype_to_str(self._model_engine.dtype)
+            model_dtype = torch_dtype_to_str(model_config.torch_dtype)
             kv_quant_algo = model_config.quant_config.kv_cache_quant_algo
             logger.info_once(
                 f"Cross-attention KV cache uses model dtype {model_dtype} "
