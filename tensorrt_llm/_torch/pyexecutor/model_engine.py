@@ -824,15 +824,13 @@ class ModelEngine:
 
     @property
     def _dspark_confidence_enabled(self) -> bool:
-        return isinstance(
-            self._runner,
-            DecoderRunner) and self._runner._dspark_confidence_enabled
+        return isinstance(self._runner, DecoderRunner) and self._runner._dspark_confidence_enabled
 
     @property
     def _dspark_trims_submitted_tokens(self) -> bool:
-        return isinstance(
-            self._runner,
-            DecoderRunner) and self._runner._dspark_trims_submitted_tokens
+        return (
+            isinstance(self._runner, DecoderRunner) and self._runner._dspark_trims_submitted_tokens
+        )
 
     @property
     def _dspark_sps_cost_table(self):
@@ -849,7 +847,7 @@ class ModelEngine:
     @property
     def _dspark_exact_identity_words(self):
         if not isinstance(self._runner, DecoderRunner):
-            return (0, ) * 8
+            return (0,) * 8
         return self._runner._dspark_exact_identity_words
 
     @property

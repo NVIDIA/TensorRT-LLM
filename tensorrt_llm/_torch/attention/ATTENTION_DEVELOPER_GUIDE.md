@@ -543,11 +543,57 @@ The FMHA package is split by role:
   for non-MLA mixed batches.
 - `fmha/fp4_mla.py` implements FP4 MLA using FP8 context attention with FP4
   cache updates and FP4 no-dequant decode. It uses KV Cache Manager V2;
-  batch state, cache storage, and kernels live in `fp4_mla/`. Disaggregated
-  serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
+  batch state, cache storage, and kernels live in `fp4_mla/`. The absorption
+  weights follow `kv_b_proj`: BF16, or FP8 with 128x128 block scales as in
+  Kimi K3 checkpoints. The only context parallelism FP4 MLA accepts is Helix
+  on generation ranks: each rank keeps rank-local cache positions, while
+  RoPE and the BF16 HP ring use the global position
+  (`helix_position_offsets`). Chunked
+  prefill (`MLA.forward_context_with_chunked_prefill_fp4`) appends the chunk
+  to the FP4 cache, gathers each cached prefix partition back from it, and
+  attends every partition through `Fp4MlaFmha.forward_context_partition`;
+  non-final chunks must cover whole 16-token FP4 tiles, which the scheduler
+  keeps by rounding them to the 128-token chunk unit. A prefix reused from
+  the block cache is attended the same way, so FP4 MLA block reuse requires
+  chunked prefill; the cached-KV path (`forward_context_with_cached_kv`)
+  rejects FP4 MLA layers. Reuse must also resume on a full FP4 tile, which
+  holds for hybrid linear-attention models (reuse ends on a recurrent-state
+  snapshot that the hybrid manager aligns to a cache block) but not for dense
+  FP4 MLA, whose reuse match can back off into a tile by the one-model
+  draft's prompt lookahead; dense FP4 MLA therefore keeps block reuse off.
+  Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache
-  (`rebuild_disagg_imported_cache`).
+  (`rebuild_disagg_imported_cache`). A disaggregated context worker
+  (`TRTLLM_DISAGG_ROLE=context`, which `trtllm-serve --server_role CONTEXT`
+  and the disaggregated launcher publish) keeps a single-copy cache without
+  those sidecars (`fp4_mla_context_only_cache`), so it sizes and allocates
+  only K, K scales, and the HP ring, runs context attention only, and skips
+  generation warmup shapes. Hybrid
+  linear-attention models (Kimi K3)
+  keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
+  `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
+  owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
+  manager keeps the SSM, convolution, and KDA replay state. For disaggregated
+  serving the hybrid manager owns the transfer declarations and merges the
+  policy's MLA roles into them: K and K scales map to `NHD` and the HP ring to
+  `REPLICATED` per role, so SSM state keeps the `INDEXED` `Role.ALL` fallback
+  and convolution state stays `SECTIONED`; V scales, packed V, and the KDA
+  replay buffers are not transferred; MLA latent and HP-ring layers take the
+  policy's `2 * L` / `2 * L + 1` transfer IDs and recurrent layers `2 * L`.
+  With an NVFP4 KV cache, Kimi K3 keeps the last two MLA layers of the global
+  `linear_attn_config.full_attn_layers` schedule in an FP8 KV cache. The model,
+  the cache allocation, and the memory estimator share this policy
+  (`kimi_k3_cache_policy.py`) and pass it the same `Mapping`; KDA state is
+  unaffected. The FP4 MLA layout needs at least one NVFP4 MLA layer on every
+  pipeline stage that owns MLA layers, so the default leaves a stage whose
+  MLA layers are all in that tail with its earlier one (or its only one) in
+  NVFP4. `TLLM_KIMI_K3_FP8_KV_LAYERS` replaces the default with a
+  comma-separated list of zero-based global MLA layer IDs, rejected if it
+  selects every MLA layer of a stage, and an empty value keeps every MLA
+  layer in NVFP4. The FP8 layers use their own non-evicting lifecycle with
+  the FP4 MLA page size, and `fmha/cute_dsl_mla.py` serves their generation
+  phase, including in mixed batches.
 - `fmha/triton_custom_mask.py` implements the Triton custom-mask context phase.
   Custom-mask data applies to context requests; for mixed batches,
   `TrtllmAttention` can pair it with a later causal-generation provider through
@@ -555,7 +601,19 @@ The FMHA package is split by role:
 - `fmha/cute_dsl_mla.py` implements the CuTe DSL MLA decode FMHA library.
   With an FP8 KV cache it passes `mla_bmm1_scale` / `mla_bmm2_scale` to the
   kernel as device tensors (element 0 of each), so the scales need no host
-  read and stay valid under CUDA graph replay.
+  read and stay valid under CUDA graph replay. The kernel is compiled with a
+  16-byte `assumed_align` for the page table and the KV lengths; slices of
+  `kv_cache_block_offsets` or `sequence_lengths` that start past the context
+  requests or in a non-first pool can break it, so such slices are copied
+  (`_aligned_kernel_input`) while aligned ones launch in place. It serves
+  mixed context/generation batches, and skips its batch-size performance
+  gate, only on the FP4 MLA 128-token KV pages when no other MLA
+  generation library reads them (`_page_size_exclusive_to_cute_dsl`): the
+  fallback thop op has TRTLLM-Gen MLA generation kernels for 32-token pages
+  only, FlashInfer TRTLLM-Gen reads 128-token pages only when the KV cache
+  manager lists them in `trtllm_gen_extra_tokens_per_block`, and the opt-in
+  PrimTS library reads them on SM100/SM103 from an FP8 or BF16 KV cache
+  manager. Every other page size keeps the default routing.
 - `fmha/prims_ts_sparse_mla.py` runs DeepSeek-V4 generation on the vendored
   PrimTS two-source sparse MLA kernel (SM100 only; SM103 stays on TRTLLM-Gen);
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`

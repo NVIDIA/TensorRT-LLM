@@ -100,6 +100,14 @@ class InputProcessor(Protocol):
         - Register the inherited class to the model class using @register_input_processor(...)
     """
 
+    supports_token_ids_input: bool = True
+    """Whether pre-tokenized prompts are accepted; encoder-driven processors may opt out."""
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Media accepted by this processor instance; text-only by default."""
+        return frozenset()
+
     model_path: any
     config: any
     tokenizer: any
@@ -155,6 +163,15 @@ class BaseMultimodalInputProcessor(ABC):
     If the flag is False, the pipeline detokenizes the text prompt first and then
     processes the multimodal inputs.
     """
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Registered modalities, narrowed by checkpoint-specific overrides."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return frozenset()
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(
+            resolve_top_level_model_type(config))
 
     # Whether multimodal soft-token runs need bidirectional attention spanning
     # the full block. When True, the chunked-prefill scheduler must keep each
@@ -898,6 +915,13 @@ class MultimodalPlaceholderRegistry:
         if model_type not in self._multimodal_placeholder_by_model_type:
             raise ValueError(f"Model type '{model_type}' is not registered")
         del self._multimodal_placeholder_by_model_type[model_type]
+
+    def get_registered_modalities(self, model_type: str) -> frozenset[str]:
+        """Return registered media types, or an empty set for an unknown model."""
+        self._ensure_provider_imported(model_type)
+        metadata = self._multimodal_placeholder_by_model_type.get(model_type)
+        return frozenset(
+            metadata.placeholder_map) if metadata is not None else frozenset()
 
     def is_valid(self, model_type: str, modality: str) -> bool:
         self._ensure_provider_imported(model_type)
