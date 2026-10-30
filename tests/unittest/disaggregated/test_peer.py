@@ -1849,3 +1849,35 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
 
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
+
+
+@pytest.mark.parametrize(
+    ("peer_tp_size", "peer_kv_heads", "peer_attention_dp"),
+    [(4, 1, False), (2, 2, True)],
+    ids=["tp_mismatch", "attention_dp_mismatch"],
+)
+def test_peer_registrar_reshards_unified_draft_layers(
+    peer_tp_size: int, peer_kv_heads: int, peer_attention_dp: bool
+) -> None:
+    """Draft layers of a unified KV cache reshard with the target's across TP and attention DP."""
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = 1
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        tp_size=peer_tp_size,
+        kv_heads_per_rank=peer_kv_heads,
+        enable_attention_dp=peer_attention_dp,
+        layer_num_per_pp=[2],
+        # Same bytes per KV head as the local side's 2 heads in 1024-byte blocks.
+        page_table=make_page_table(
+            block_bytes=[512 * peer_kv_heads],
+            mamba_tp=1 if peer_attention_dp else peer_tp_size,
+            kv_heads=peer_kv_heads,
+        ),
+    )
+    peer_ri.num_draft_layers = 1
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri
