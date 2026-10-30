@@ -206,7 +206,7 @@ class HfWeightLoader(BaseWeightLoader):
             return 0
 
     @staticmethod
-    def _weight_cache_admits(weight_files: List[str]) -> bool:
+    def _can_cache_weights(weight_files: List[str]) -> bool:
         """Whether host memory can keep these checkpoint files resident.
 
         SafeTensors weights are read from the file pages when a tensor is
@@ -225,7 +225,7 @@ class HfWeightLoader(BaseWeightLoader):
         available_bytes = effective_available_host_memory()
         admitted, headroom = memory_admission(checkpoint_bytes, available_bytes)
         if not admitted:
-            logger.info(
+            logger.warning(
                 "Not using the raw HF weight cache for this load: checkpoint "
                 f"bytes ({checkpoint_bytes}) exceed available host memory "
                 f"({available_bytes}) after startup headroom ({headroom}).")
@@ -363,7 +363,7 @@ class HfWeightLoader(BaseWeightLoader):
         """
         cache_key = None
         if self._is_weight_cache_enabled():
-            if self._weight_cache_admits(weight_files):
+            if self._can_cache_weights(weight_files):
                 cache_key = self._weight_files_cache_key(
                     weight_files, use_consolidated)
             else:
