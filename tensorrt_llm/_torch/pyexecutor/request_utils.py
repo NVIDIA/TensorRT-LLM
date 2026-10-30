@@ -5,6 +5,7 @@
 
 import os
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
@@ -17,6 +18,7 @@ from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
+from .idle_notification import IdleRequestNotification
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
 
 # Type alias for request queue items (to avoid circular import)
@@ -390,9 +392,14 @@ class RequestBroadcaster:
         self.rank0_now: Optional[float] = None
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
+        self.idle_notification: IdleRequestNotification | None = None
 
     def broadcast(
-        self, new_requests: List, prefer_cpu: bool = False
+        self,
+        new_requests: List,
+        prefer_cpu: bool = False,
+        *,
+        idle_fetch: Callable[[], list] | None = None,
     ) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks.
 
@@ -404,14 +411,26 @@ class RequestBroadcaster:
                 GPU-staged probe holds a spinning NCCL kernel on the device for
                 the whole park and puts the wait under the NCCL watchdog. Must
                 be passed with the same value on all ranks.
+            idle_fetch: Leader-only blocking queue fetch, deferred until the
+                shared idle notification protocol has parked the followers.
         """
+        if idle_fetch is not None and (self.idle_notification is None or not prefer_cpu):
+            raise ValueError("Deferred queue fetch requires the idle notification path")
         if self._single_round(prefer_cpu):
             return self._broadcast_single_round(new_requests)
         request_count = len(new_requests) if self.dist.rank == 0 else 0
         # Idle non-root ranks can wait here while rank 0 blocks in the
         # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
         with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
+            if prefer_cpu and self.idle_notification is not None:
+                new_requests, request_count = self.idle_notification.count(
+                    self.dist.rank,
+                    new_requests,
+                    lambda count: self._broadcast_request_count(count, prefer_cpu=True),
+                    idle_fetch,
+                )
+            else:
+                request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
 
         if request_count == 0:
             return [], None
