@@ -8,6 +8,7 @@ carrying the tp4/tep4 and dep4 cells until the promotion merges the two into the
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -58,6 +59,61 @@ def _spec(**overrides) -> dict:
 def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     base = dict(segments=segments, slots=32, prefill_pair=False, launches=launches)
     return _spec(**{**base, **overrides})
+
+
+#: The engine's trunk layout (`Qwen4ExpHybridCacheManager.get_buffers`): a lifecycle slot
+#: holds the 24 role pages of the 12 attention layers, K then V each, and a layer's
+#: `k_cache` / `v_cache` are its two planes, so one pool page advances 24 role pages.
+#: Layer 11's planes are the slot's last.
+_TRUNK = dict(slot_pages=24, layer=11)
+
+#: The element offset the unified target's cells straddle: the requests' pages lie on both
+#: sides of it in the layer's K and V planes. An engine's pool reaches far past it (tep4's
+#: bf16 engine measured 245835 pages, 4.8e10 elements of trunk).
+_OFFSET_EDGE = 2**31
+
+#: One tp4 / tep4 rank (attention TP 4): 6 q heads and one of the 2 KV heads, q the first 6
+#: heads of the packed [T, 6 + 1 + 1, 256] QKV buffer; a `max_batch_size` 128-row table,
+#: `ceil((max_seq_len + 1) / 32)` padded to a multiple of 4 columns: 292 at max_seq_len 9216,
+#: 516 at MTP's 16384.
+_TP4 = dict(q_heads=6, kv_heads=1, slots=128, pages=292, **_TRUNK)
+_TP4_MTP = dict(_TP4, pages=516)
+#: One dep4 rank (attention DP): tp1's 24 / 2 heads, a 32-row table (128 requests over 4
+#: ranks), the kv_fp8 variant's e4m3 pool.
+_DEP4_FP8 = dict(
+    q_heads=24, kv_heads=2, slots=32, pages=292, cache_dtype=torch.float8_e4m3fn, **_TRUNK
+)
+
+
+def _straddling(segments, kv_heads: int) -> int:
+    """The pool page count that puts a cell's requests -- the pool's last pages, as the
+    test lays them out -- on both sides of `_OFFSET_EDGE` elements of the K plane (half
+    of them below it, or the whole pool when they need more than twice the pages below)."""
+    tpb, d, slot_pages, layer = 32, 256, _TRUNK["slot_pages"], _TRUNK["layer"]
+    needed = sum(math.ceil((s + n) / tpb) for s, n in segments) + 7
+    role_page = kv_heads * tpb * d
+    edge_page = math.ceil((_OFFSET_EDGE - 2 * layer * role_page) / (slot_pages * role_page))
+    return max(edge_page + needed // 2, needed)
+
+
+def _unified(segments, member: dict, launches, **overrides) -> dict:
+    """A cell of this target's call: `member`'s heads, table and trunk layout, its pool
+    straddling `_OFFSET_EDGE`."""
+    return _decode(
+        segments,
+        launches=launches,
+        rows=sum(n for _, n in segments),
+        pool_pages=_straddling(segments, member["kv_heads"]),
+        offset_edge=_OFFSET_EDGE,
+        **{**member, **overrides},
+    )
+
+
+def _spread(count: int, rows: int, last_start: int) -> tuple:
+    """`count` requests of `rows` rows: one starting at `last_start` (its last row at the
+    envelope's last position), the others spread from position 0 up."""
+    span = last_start + 1
+    return tuple(((5 + 1129 * g) % span, rows) for g in range(count - 1)) + ((last_start, rows),)
 
 
 class QsaPagedSparseGqa(OpWrapper):
@@ -130,6 +186,33 @@ class QsaPagedSparseGqa(OpWrapper):
             why="q off the fused projection row (55 x 256), 8191-row prefill",
             spec=_decode(((0, 8191),), launches=_PREFILL, prefill_pair=True, q_layout="fused_row"),
         ),
+        # ---- the unified target: one rank's heads, table and trunk-layout pool ------
+        Cell(
+            why="tp4/tep4 decode, 1 row at position 9215 (max_seq_len, table column 287): "
+            "6 q / 1 kv heads, 64-way split-K + merge with PDL, [128, 292] table",
+            spec=_unified(_spread(1, 1, 9215), _TP4, _SPLIT_K, pdl=True),
+        ),
+        Cell(
+            why="tp4/tep4 decode, 128 requests x 1 row (the largest captured batch): "
+            "6 q / 1 kv heads, 8-way split-K + merge, [128, 292] table",
+            spec=_unified(_spread(128, 1, 9215), _TP4, _SPLIT_K),
+        ),
+        Cell(
+            why="tep4 MTP7 verify, 128 requests x 8 rows = 1024: 6 q / 1 kv heads, one split "
+            "and no merge, [128, 516] table (max_seq_len 16384), rows to position 16383",
+            spec=_unified(_spread(128, 8, 16376), _TP4_MTP, ("splitk",), rows_per_request=8),
+        ),
+        Cell(
+            why="tp4/tep4 8192-row step (max_num_tokens) with the prefill pair: a context "
+            "request 0..8064 and 127 generation rows to position 9215, all on the prefill "
+            "kernel, 6 q / 1 kv heads",
+            spec=_unified(((0, 8065),) + _spread(127, 1, 9215), _TP4, _PREFILL, prefill_pair=True),
+        ),
+        Cell(
+            why="dep4 kv_fp8 decode, 32 requests x 1 row (a rank's batch): 24 q / 2 kv heads "
+            "over an e4m3 pool, 8-way split-K + merge, [32, 292] table",
+            spec=_unified(_spread(32, 1, 9215), _DEP4_FP8, _SPLIT_K),
+        ),
     )
 
     note = """
@@ -150,8 +233,8 @@ class QsaPagedSparseGqa(OpWrapper):
         is not an `is_valid` guard.
       - The prefill pair is a property of the launch: passed because some
         rows are context, it puts the generation rows on the prefill kernel
-        too, and the bound applies to them (measured with a planted index; not
-        pinned by a test).
+        too, and the bound applies to them (measured with a planted index;
+        the unified 8192-row cell drives 127 generation rows through it).
       - There is no KV scale argument: an fp8 pool is read at face value (each code
         widens exactly to bf16 under a bf16 q), so it must hold K/V written at unit scale.
       - `D` must be a power of two (192 is refused); `Hq % Hkv == 0`.
@@ -163,24 +246,44 @@ class QsaPagedSparseGqa(OpWrapper):
     tensor (not certified).
 
     PDL: `TRTLLM_ENABLE_PDL` (default on) enables programmatic dependent
-    launch for multi-split launches of 4 rows or fewer; no cell runs one (the
-    target sends gated decode batches that small to
-    `qsa_paged_sparse_gqa_decode`). Calls are bitwise deterministic (pinned
+    launch for multi-split launches of 4 rows or fewer; the unified 1-row
+    cell runs one (split-K and merge both launched with PDL, asserted). The
+    tp1 target sends gated decode batches that small to
+    `qsa_paged_sparse_gqa_decode`. Calls are bitwise deterministic (pinned
     on a 32-split launch and its merge).
 
     The decode site carries up to 8 rows per request (max_draft_len 7): the
     decode cell runs 32 requests of 8 rows, 512 `rows * Hkv` programs and a
     4-way split-K launch with the output gate in its merge.
 
+    The unified target (tp4 / tep4 / dep4). A tp4 or tep4 rank holds 6 q heads
+    and one KV head (`Hkv` 1, a group of 6 padded to 16 MMA rows), so its
+    launch follows `rows`: 64-way split-K up to 4 rows, 32-way below 32,
+    8-way to 256, 4-way to 512, then one split and no merge (the 1024-row
+    MTP7 verify step, where the output gate cannot ride a merge and
+    `fuses_output_gate` is False); with the prefill pair, the prefill kernel
+    past 512 rows. A dep4 rank holds tp1's 24 / 2 heads, 32 requests, and
+    under kv_fp8 an e4m3 pool, read on the split-K kernel. Its cells drive
+    the engine's trunk layout (a page advances 24 role pages; layer 11's
+    planes) over `[128, 292]`, `[128, 516]` (MTP's max_seq_len 16384) and
+    `[32, 292]` tables, with pools whose mapped pages straddle 2^31 elements of
+    the K and V planes: both kernels widen the page id to int64 before its
+    stride product. Measured against `reference` on GB300 over the five
+    cells: at most 2.00 bf16 ulp of the row scale (p99.9 1.31), relative RMS
+    at most 0.572 ulp, cosine at least 0.9999975.
+
     Not certified: capture in a CUDA graph (the split-K path allocates its
-    partials inside the call); PDL launches; head geometries other than 24/2
-    x 256; `tokens_per_block` other than 32; more than 8191 rows; the split-K
-    kernel above 256 rows, with one split (no merge) or without the gate; an
-    fp8 pool on the split-K kernel; rows whose selection resolves no token
-    (all padding, a foreign request, unmapped pages); an fp16 pool or q;
-    standalone contiguous K/V buffers; int64 request indices.
-    Hard limits: not probed; the largest certified extent is 8191 rows x 2051
-    selected tokens through a [32, 260] table.
+    partials inside the call); head geometries other than 24/2 and 6/1 x 256;
+    `tokens_per_block` other than 32; more than 8192 rows; the output gate at
+    6/1 heads (the gate is certified at 24/2 only, in the merge of a 4-way
+    split); q off the fused projection row at tp4's 17-head (4352-wide) row;
+    an fp8 pool on the prefill kernel at 24/2 beyond 272 rows, and at 6/1;
+    rows whose selection resolves no token (all padding, a foreign request,
+    unmapped pages); an fp16 pool or q; standalone contiguous K/V buffers;
+    int64 request indices; a measured dep4 pool page count (its cell's pool
+    is sized to straddle 2^31 elements, not to an engine's allocation).
+    Hard limits: not probed; the largest certified extent is 8192 rows x 2051
+    selected tokens, a [128, 516] table and a 33167-page trunk pool.
     """
 
     def __call__(
@@ -269,8 +372,11 @@ class QsaPagedSparseGqa(OpWrapper):
                 & (physical < num_pages)
             )
             physical = physical.clamp(0, num_pages - 1)
-            keys = k_cache[physical, :, in_page, :].float()
-            values = v_cache[physical, :, in_page, :].float()
+            # What a non-resident column gathers (a clamped page) is not part of the answer:
+            # zeroed, so a pool holding NaN outside the mapped pages cannot reach the sum.
+            absent = ~resident[:, :, None, None]
+            keys = k_cache[physical, :, in_page, :].float().masked_fill(absent, 0.0)
+            values = v_cache[physical, :, in_page, :].float().masked_fill(absent, 0.0)
             grouped = q[start:stop].reshape(-1, num_kv_heads, groups, head_dim).float()
             scores = torch.einsum("bhgd,bkhd->bhgk", grouped, keys) * softmax_scale
             scores = scores.masked_fill(~resident[:, None, None, :], float("-inf"))

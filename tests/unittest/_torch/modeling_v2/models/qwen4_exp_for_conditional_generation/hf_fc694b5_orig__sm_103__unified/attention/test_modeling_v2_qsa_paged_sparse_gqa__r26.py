@@ -2,16 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for this target's qsa_paged_sparse_gqa variant (`__r26`).
 
-The paged state is real: one `[pages, 2, kv, tpb, D]` HND pool sized from the
-pages its requests map, and the engine's slot table -- a row per request slot,
-more slots than requests, assigned by a seeded permutation, `-1` past each
-sequence. Selection rows are built the way QSA's top-k + expansion lay them
-out: complete groups expanded to tokens, then the trailing partial group, then
+The paged state is real: one `[pages, slot_pages, kv, tpb, D]` HND pool whose
+layer planes are the call's K and V -- tp1's cells one layer's adjacent pair,
+the unified target's cells the engine's 24-role-page trunk, sized so the
+requests' pages straddle 2^31 elements -- and the engine's slot table: a row
+per request slot, assigned by a seeded permutation, `-1` past each sequence.
+Selection rows are built the way QSA's top-k + expansion lay them out:
+complete groups expanded to tokens, then the trailing partial group, then
 `-1`, all packed at the front.
 
 The call has two kernels behind it (and a merge). The `launches` fixture
-records which ones a call indexed with a grid, so every cell asserts its
-branch.
+records which ones a call indexed with a grid, and whether each launched with
+PDL, so every cell asserts its branch.
 """
 
 import math
@@ -45,6 +47,13 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     and at most 0.62 ulp RMS: 2x and 3.2x margin. Six wrong references (no
     scale, interleaved heads, padding attended, identity pages, K/V
     swapped, page/slot transposed) were each measured more than 0.1 off.
+
+    The unified target's five cells (6/1 heads at 1, 128, 1024 and 8192 rows,
+    24/2 over an e4m3 pool at 32) measured at most 2.00 element ulp (p99.9
+    1.31) and 0.572 ulp RMS, cosine at least 0.9999975 -- the same band. Three
+    wrong references sit outside it at every one of them: the table shifted
+    by one page (at least 414 ulp), the softmax scale dropped (at least 254),
+    and one selected token dropped a row (at least 12.5, the single-row cell).
     """
     assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -63,19 +72,27 @@ _KERNELS = {
 
 
 class _LaunchRecorder:
-    """Records a Triton kernel's grid indexing, then delegates to the kernel."""
+    """Records a Triton kernel's grid indexing and whether it launched with PDL, then
+    delegates to the kernel."""
 
     def __init__(self, inner, name, log):
         self._inner, self._name, self._log = inner, name, log
 
     def __getitem__(self, grid):
-        self._log.append((self._name, tuple(grid)))
-        return self._inner[grid]
+        entry = [self._name, tuple(grid), False]
+        self._log.append(entry)
+        launch = self._inner[grid]
+
+        def run(*args, **kwargs):
+            entry[2] = bool(kwargs.get("launch_pdl", False))
+            return launch(*args, **kwargs)
+
+        return run
 
 
 @pytest.fixture
 def launches(monkeypatch):
-    """Which branch kernels the next call launches, in order, with grids."""
+    """Which branch kernels the next call launches, in order: [name, grid, PDL]."""
     log: list = []
     for name, tag in _KERNELS.items():
         inner = getattr(_qsa_kernels, name)
@@ -120,8 +137,25 @@ def _selected_tokens(positions, seed, compress_ratio, token_topk):
     return selected.to(torch.int32)
 
 
+#: NaN's bit pattern per pool dtype: filled through an integer view, since not every fill
+#: kernel takes an e4m3 tensor.
+_NAN_BITS = {torch.bfloat16: (torch.int16, 0x7FC0), torch.float8_e4m3fn: (torch.uint8, 0x7F)}
+
+
+def _nan_pool(shape, dtype):
+    bits_dtype, nan = _NAN_BITS[dtype]
+    return torch.full(shape, nan, dtype=bits_dtype, device=DEV).view(dtype)
+
+
 def _build(spec, seed):
-    """Real paged state for one spec, keyed by `__call__`'s parameter names."""
+    """Real paged state for one spec, keyed by `__call__`'s parameter names.
+
+    The pool is `[pool_pages, slot_pages, kv, tpb, D]` and the call's K and V are layer
+    `layer`'s two role planes: tp1's cells keep one layer's adjacent pair (2 role pages a
+    page), the unified target's cells the engine's trunk (24). The requests sit on the
+    pool's last pages; every other page, and every other plane, is NaN, so an address that
+    strayed could not come back finite.
+    """
     gen = torch.Generator(device=DEV).manual_seed(seed)
     tpb, kv, d, q_heads = (
         spec["tokens_per_block"],
@@ -138,16 +172,24 @@ def _build(spec, seed):
     slot_of = torch.randperm(slots, generator=torch.Generator().manual_seed(seed))[: len(segments)]
     mapped = [math.ceil((s + n) / tpb) for s, n in segments]
     assert max(mapped) <= spec["pages"]
-    pool_pages = sum(mapped) + 7
-    page_ids = torch.randperm(pool_pages, generator=gen, device=DEV).to(torch.int32)
+    needed = sum(mapped) + 7
+    pool_pages = spec.get("pool_pages", needed)
+    assert pool_pages >= needed
+    first = pool_pages - needed
+    page_ids = first + torch.randperm(needed, generator=gen, device=DEV).to(torch.int32)
     block_table = torch.full((slots, spec["pages"]), -1, dtype=torch.int32, device=DEV)
     cursor = 0
     for slot, count in zip(slot_of.tolist(), mapped):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
 
-    pool = torch.randn(pool_pages, 2, kv, tpb, d, generator=gen, device=DEV).to(spec["cache_dtype"])
-    k_cache, v_cache = pool[:, 0], pool[:, 1]
+    slot_pages, layer = spec.get("slot_pages", 2), spec.get("layer", 0)
+    planes = slice(2 * layer, 2 * layer + 2)
+    pool = _nan_pool((pool_pages, slot_pages, kv, tpb, d), spec["cache_dtype"])
+    pool[first:, planes] = torch.randn(needed, 2, kv, tpb, d, generator=gen, device=DEV).to(
+        spec["cache_dtype"]
+    )
+    k_cache, v_cache = pool[:, 2 * layer], pool[:, 2 * layer + 1]
 
     q_dtype = spec["q_dtype"]
     row_heads = q_heads + 2 * kv if spec["q_layout"] == "qkv_slice" else 55
@@ -188,6 +230,18 @@ def _bound(positions, spec):
     return (visible // cr).clamp(max=spec["token_topk"] // cr) * cr + visible % cr
 
 
+def _assert_straddles(args, edge: int) -> None:
+    """The pages the cell's rows map put the K and V planes' element offsets on both sides
+    of `edge`: what the cell claims about its pool."""
+    table = args["block_table"]
+    pages = table[table >= 0].long()
+    for name in ("k_cache", "v_cache"):
+        plane = args[name]
+        ends = plane.storage_offset() + pages * plane.stride(0) + plane[0].numel() - 1
+        assert bool((ends >= edge).any()), f"{name}: no mapped page lies past {edge}"
+        assert bool((ends < edge).any()), f"{name}: every mapped page lies past {edge}"
+
+
 def _is_prefix_packed(table):
     valid = table >= 0
     columns = torch.arange(table.shape[1], device=table.device)[None, :]
@@ -200,6 +254,11 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     spec = cell.spec
     args = _build(spec, seed=sum(map(ord, cell.why)))
     rows = args["q"].shape[0]
+    assert rows == spec.get("rows", rows)
+    if "rows_per_request" in spec:
+        assert {n for _, n in spec["segments"]} == {spec["rows_per_request"]}
+    if "offset_edge" in spec:
+        _assert_straddles(args, spec["offset_edge"])
     if spec["prefill_pair"]:
         # The precondition the op cannot check: front-packed, and exactly as
         # many valid entries as the prefill kernel will scan.
@@ -209,8 +268,9 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
         assert torch.equal(valid, _bound(args["query_positions"], spec))
 
     out = op(**args)
-    assert [name for name, _ in launches] == list(spec["launches"])
+    assert [name for name, _, _ in launches] == list(spec["launches"])
     assert launches[0][1][:2] == (rows, spec["kv_heads"])
+    assert all(pdl == spec.get("pdl", False) for _, _, pdl in launches), launches
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == args["q"].dtype and out.is_contiguous()
     assert not bool(out.isnan().any())
