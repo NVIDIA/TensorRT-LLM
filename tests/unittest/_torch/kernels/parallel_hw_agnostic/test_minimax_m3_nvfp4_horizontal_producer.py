@@ -4,6 +4,12 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.index_k_nvfp4 import (
+    INDEX_K_NVFP4_PAGE_BYTES,
+    INDEX_K_NVFP4_SCALE_OFFSET,
+    quantize_index_k_nvfp4_reference,
+)
+
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 
@@ -67,6 +73,60 @@ def _fp8_caches(num_pages, num_kv_heads):
     return main_backing[::3], index_backing[::7]
 
 
+def _nvfp4_index_pool(num_pages: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a sentinel-filled pool and its NVFP4-E index-K page view.
+
+    As in production, each 9216 B page starts a wider pool row, and a guard row
+    on either side catches stores from skipped slots.
+    """
+    pool = torch.full(
+        (num_pages + 2, 2 * INDEX_K_NVFP4_PAGE_BYTES), 0xA5, dtype=torch.uint8, device="cuda"
+    )
+    return pool, pool[1:-1, :INDEX_K_NVFP4_PAGE_BYTES]
+
+
+def _expected_nvfp4_index_pool(
+    index_k: torch.Tensor, slots: torch.Tensor, num_pages: int
+) -> torch.Tensor:
+    """Return the pool holding the reference NVFP4-E rows of `index_k` at their valid slots."""
+    expected, pages = _nvfp4_index_pool(num_pages)
+    valid = (slots >= 0) & (slots < num_pages * 128)
+    page, row = slots[valid].long() // 128, slots[valid].long() % 128
+    data, scales = quantize_index_k_nvfp4_reference(index_k[valid])
+    pages[:, :INDEX_K_NVFP4_SCALE_OFFSET].view(num_pages, 128, 64)[page, row] = data
+    pages[:, INDEX_K_NVFP4_SCALE_OFFSET:].view(num_pages, 128, 8)[page, row] = scales
+    return expected
+
+
+def _generic_index_k(rows: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Normalize index-K rows [T, 128] with the generic BF16 kernel at position 0."""
+    qk = torch.cat([rows, rows], dim=1)  # The first copy fills the unused Q head.
+    torch.ops.trtllm.fused_qk_norm_rope(
+        qk,
+        1,
+        1,
+        0,
+        128,
+        64,
+        1e-5,
+        weight,
+        weight,
+        5_000_000.0,
+        True,  # is_neox
+        torch.zeros(rows.shape[0], dtype=torch.int32, device="cuda"),
+        1.0,
+        0.0,
+        0.0,
+        1.0,
+        True,  # is_qk_norm
+        True,  # use_gemma
+        False,  # use_mrope
+        0,
+        0,
+    )
+    return qk[:, 128:]
+
+
 def _run_nvfp4(
     packed,
     data_cache,
@@ -82,6 +142,7 @@ def _run_nvfp4(
     index_k_weight,
     rope_cache,
     position_ids,
+    index_k_nvfp4=False,
 ):
     return torch.ops.trtllm.minimax_m3_nvfp4_qkv_indexer_norm_rope_kv_insert(
         packed,
@@ -102,6 +163,7 @@ def _run_nvfp4(
         index_k_weight,
         rope_cache,
         position_ids,
+        index_k_nvfp4=index_k_nvfp4,
     )
 
 
@@ -291,6 +353,51 @@ def test_minimax_m3_nvfp4_horizontal_producer_matches_production_quantize(
         expected_k_scale,
         expected_v_scale,
     )
+
+
+@pytest.mark.parametrize("num_tokens", [16, 300, 600])
+def test_minimax_m3_nvfp4_horizontal_producer_stores_bit_exact_nvfp4_index_k(num_tokens):
+    """NVFP4-E index-K gets the reference bytes; other outputs match the E4M3 index-K launch.
+
+    Position 0 makes RoPE the identity and integer inputs make every sum of
+    squares exact, so the producer's index-K equals the generic BF16 kernel's.
+    The 16-dim groups span all-zero to 255 and a large weight scales the
+    loudest one, so the stored scales reach both clamps.
+    """
+    from tensorrt_llm._utils import get_sm_version
+
+    if get_sm_version() not in (100, 103):
+        pytest.skip("NVFP4 quantization requires Blackwell")
+
+    torch.manual_seed(1357)
+    num_heads_q, num_kv_heads, num_pages = 16, 2, 6
+    total_heads = num_heads_q + 3 * num_kv_heads + 1
+    bound = torch.tensor([0, 1, 2, 4, 15, 15, 64, 255], device="cuda").repeat_interleave(16)
+    noise = torch.rand(num_tokens, total_heads, 128, device="cuda") * 2 - 1
+    packed = (noise * bound).round().to(torch.bfloat16).flatten(1)
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    weights[3][-16:] = 127.0
+    inv_scales = torch.tensor([1.0, 1.75, 0.625], dtype=torch.float32, device="cuda")
+    positions = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    slots = torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 53 % (num_pages * 128)
+    slots[1] = -1
+    slots[3] = num_pages * 128 + 5
+    args = (slots, inv_scales, num_heads_q, num_kv_heads, *weights, _rope_cache(1), positions)
+
+    baseline_data, baseline_scale, baseline_index = _nvfp4_caches(num_pages, num_kv_heads)
+    baseline_q, baseline_index_q = _run_nvfp4(
+        packed, baseline_data, baseline_scale, baseline_index, *args
+    )
+    data_cache, scale_cache, _ = _nvfp4_caches(num_pages, num_kv_heads)
+    pool, index_cache = _nvfp4_index_pool(num_pages)
+    q, index_q = _run_nvfp4(packed, data_cache, scale_cache, index_cache, *args, index_k_nvfp4=True)
+
+    assert torch.equal(q.view(torch.uint8), baseline_q.view(torch.uint8))
+    assert torch.equal(index_q.view(torch.uint8), baseline_index_q.view(torch.uint8))
+    assert torch.equal(data_cache, baseline_data)
+    assert torch.equal(scale_cache, baseline_scale)
+    index_k = _generic_index_k(packed[:, -128:], weights[3])
+    assert torch.equal(pool, _expected_nvfp4_index_pool(index_k, slots, num_pages))
 
 
 @pytest.mark.parametrize(

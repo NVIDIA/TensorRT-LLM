@@ -1093,9 +1093,10 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
     At runtime one of the MiniMax-M3 sparse attention backends under
     tensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The
     chosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a
-    paged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel
-    to the main K/V cache. The M3 checkpoint sets disable_index_value=True on
-    every sparse layer, so no index V cache is allocated.
+    paged side index-K cache parallel to the main K/V cache, holding one
+    sparse_index_dim row per token in the indexer_kv_dtype format. The M3
+    checkpoint sets disable_index_value=True on every sparse layer, so no index
+    V cache is allocated.
     """
 
     algorithm: Literal["minimax_m3"] = "minimax_m3"
@@ -1135,12 +1136,14 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description="If True, skip the index V branch (M3 checkpoint default).",
     )
-    indexer_kv_dtype: Literal["bf16", "fp8"] = Field(
+    indexer_kv_dtype: Literal["bf16", "fp8", "nvfp4"] = Field(
         default="bf16",
         description=
         "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses "
-        "unscaled E4M3 values with FP32 score accumulation and is supported only "
-        "by the MSA implementation.",
+        "unscaled E4M3 values with FP32 score accumulation. 'nvfp4' keeps index "
+        "Q in E4M3 and stores index K as E2M1 values with one E4M3 scale per 16 "
+        "dims, chosen so that every dequantized value is an E4M3 value. Both are "
+        "supported only by the MSA implementation.",
         status="prototype",
     )
     fuse_qkv_index_projection: bool = Field(
@@ -1150,8 +1153,8 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
         "is sharded with the KV heads and index-K is replicated. MSA batches "
         "also use a horizontal norm/RoPE/cache-insertion producer for prefill, "
         "mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path "
-        "requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 "
-        "or NVFP4 main KV cache.",
+        "requires the MSA implementation, indexer_kv_dtype='fp8' or 'nvfp4', "
+        "and an FP8 or NVFP4 main KV cache.",
         status="prototype",
     )
     num_attention_heads: Optional[int] = Field(
@@ -1182,21 +1185,23 @@ class MiniMaxM3SparseAttentionConfig(BaseSparseAttentionConfig):
             raise ValueError(
                 "MiniMax-M3 'msa' implementation requires sparse_block_size == "
                 f"128, got {self.sparse_block_size}.")
-        if self.indexer_kv_dtype == "fp8" and self.implementation != "msa":
+        quantized_indexer = self.indexer_kv_dtype in ("fp8", "nvfp4")
+        if quantized_indexer and self.implementation != "msa":
             raise ValueError(
-                "MiniMax-M3 indexer_kv_dtype='fp8' currently requires the "
-                "'msa' implementation.")
-        if self.indexer_kv_dtype == "fp8" and not self.sparse_disable_index_value:
-            raise ValueError("MiniMax-M3 indexer_kv_dtype='fp8' requires "
-                             "sparse_disable_index_value=True.")
+                f"MiniMax-M3 indexer_kv_dtype={self.indexer_kv_dtype!r} "
+                "currently requires the 'msa' implementation.")
+        if quantized_indexer and not self.sparse_disable_index_value:
+            raise ValueError(
+                f"MiniMax-M3 indexer_kv_dtype={self.indexer_kv_dtype!r} "
+                "requires sparse_disable_index_value=True.")
         if self.fuse_qkv_index_projection and self.implementation != "msa":
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
                 "the 'msa' implementation.")
-        if self.fuse_qkv_index_projection and self.indexer_kv_dtype != "fp8":
+        if self.fuse_qkv_index_projection and not quantized_indexer:
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True currently requires "
-                "indexer_kv_dtype='fp8'.")
+                "indexer_kv_dtype='fp8' or 'nvfp4'.")
         return self
 
     def supports_backend(self, backend: str) -> bool:

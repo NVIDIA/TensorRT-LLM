@@ -143,6 +143,28 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_last_n": -1}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"mixed_precision_config": {}}}, False),
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "sparse_attention_config": {
+                    "algorithm": "minimax_m3",
+                    "implementation": "msa",
+                    "indexer_kv_dtype": "nvfp4",
+                }
+            },
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {
+                "sparse_attention_config": {
+                    "algorithm": "minimax_m3",
+                    "implementation": "msa",
+                    "indexer_kv_dtype": "mxfp4",
+                }
+            },
+            False,
+        ),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),

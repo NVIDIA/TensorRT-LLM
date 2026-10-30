@@ -1500,8 +1500,11 @@ class DecoderWarmup:
         params = sparse_config.to_sparse_metadata_params(
             pretrained_config=self.model.model_config.pretrained_config
         )
+        # The proxy reads an NVFP4-E cache's pages from an E4M3 copy.
         index_dtype = (
-            torch.float8_e4m3fn if kv_cache_manager.indexer_kv_dtype == "fp8" else torch.bfloat16
+            torch.float8_e4m3fn
+            if kv_cache_manager.indexer_kv_dtype in ("fp8", "nvfp4")
+            else torch.bfloat16
         )
         with torch.inference_mode():
             prewarm_split_proxy_variants(

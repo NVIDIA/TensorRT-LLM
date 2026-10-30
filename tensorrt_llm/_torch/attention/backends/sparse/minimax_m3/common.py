@@ -96,7 +96,7 @@ class MiniMaxM3SparseParams(SparseParams):
     score_type: str = "max"
     disable_index_value: bool = True
     implementation: Literal["triton", "msa"] = "triton"
-    indexer_kv_dtype: Literal["bf16", "fp8"] = "bf16"
+    indexer_kv_dtype: Literal["bf16", "fp8", "nvfp4"] = "bf16"
     fuse_qkv_index_projection: bool = False
 
     @property

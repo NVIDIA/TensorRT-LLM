@@ -9407,9 +9407,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """Runner for the MiniMax-M3 indexer decode block-scoring kernel.
 
         Caches compiled kernels keyed on the static params
-        (dtype, num_heads, max_decode_query_len, head_dim); batch, query-token
-        count, page count and block-table width stay symbolic, so one compile
-        covers every decode step of a given model shape.
+        (q dtype, K format, num_heads, max_decode_query_len, head_dim); batch,
+        query-token count, page count and block-table width stay symbolic, so
+        one compile covers every decode step of a given model shape.
         """
 
         kernel_cache = dict()
@@ -9421,6 +9421,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         SUPPORTED_PAGE_SIZE = IndexDecodeScoreKernel.BLOCK_K
         # BLOCK_Q must fit one warp's worth of epilogue lanes.
         MAX_BLOCK_Q = 32
+        # K formats: None stores K in the dtype of Q; "nvfp4" is the packed
+        # NVFP4 page described in IndexDecodeScoreKernel (E2M1 codes, then an
+        # E4M3 scale per 16 dims, per row), scored with FP8 Q.
+        NVFP4_PAGE_BYTES = SUPPORTED_PAGE_SIZE * (SUPPORTED_HEAD_DIM // 2 +
+                                                  SUPPORTED_HEAD_DIM // 16)
 
         @classmethod
         def is_supported(
@@ -9431,22 +9436,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
             head_dim: int,
             page_size: int,
             max_decode_query_len: int,
+            k_format: Optional[str] = None,
         ) -> bool:
             """Whether this kernel can serve the given decode geometry.
 
             Callers use this to pick between the CuTe DSL scorer and the
             fallback rather than catching an exception on the hot path.
             """
-            return (is_sm_100f() and q_dtype in _M3_TORCH_TO_CUTE_DTYPE
+            if k_format == "nvfp4":
+                format_ok = q_dtype == torch.float8_e4m3fn
+            else:
+                format_ok = k_format is None and q_dtype in _M3_TORCH_TO_CUTE_DTYPE
+            return (is_sm_100f() and format_ok
                     and head_dim == cls.SUPPORTED_HEAD_DIM
                     and page_size == cls.SUPPORTED_PAGE_SIZE
                     and num_heads * max_decode_query_len <= cls.MAX_BLOCK_Q
                     and max_decode_query_len >= 1)
 
         @classmethod
-        def _compile(cls, q_dtype: torch.dtype, num_heads: int,
-                     max_decode_query_len: int, head_dim: int):
-            key = (q_dtype, num_heads, max_decode_query_len, head_dim)
+        def _compile(cls, q_dtype: torch.dtype, k_format: Optional[str],
+                     num_heads: int, max_decode_query_len: int, head_dim: int):
+            key = (q_dtype, k_format, num_heads, max_decode_query_len, head_dim)
             if key in cls.kernel_cache:
                 return
 
@@ -9465,12 +9475,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cute_dtype, (sym_total_tokens, num_heads, head_dim),
                 stride=(_sym_stride(), _sym_stride(), 1))
 
-            # The index-K pool may be coalesced with the main K/V cache, in
-            # which case the per-page stride exceeds page_size * head_dim, so
-            # dim 0 is read at runtime.
-            k_fake = cute.runtime.make_fake_tensor(
-                cute_dtype, (cute.sym_int(), page_size, head_dim),
-                stride=(_sym_stride(), _sym_stride(), 1))
+            if k_format == "nvfp4":
+                # [num_pages, page_stride] bytes; the TMA descriptors take the
+                # page stride at runtime and need 16-byte aligned pages.
+                k_fake = cute.runtime.make_fake_tensor(
+                    cutlass.Uint8, (cute.sym_int(), cute.sym_int()),
+                    stride=(_sym_stride(), 1),
+                    assumed_align=16)
+            else:
+                # The index-K pool may be coalesced with the main K/V cache, in
+                # which case the per-page stride exceeds page_size * head_dim,
+                # so dim 0 is read at runtime.
+                k_fake = cute.runtime.make_fake_tensor(
+                    cute_dtype, (cute.sym_int(), page_size, head_dim),
+                    stride=(_sym_stride(), _sym_stride(), 1))
 
             bt_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_batch, cute.sym_int()), stride_order=(1, 0))
@@ -9495,6 +9513,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 max_decode_query_len,
                 cls.SPLIT_K,
                 head_dim,
+                k_format,
             )
             cls.kernel_cache[key] = cute.compile(
                 kernel,
@@ -9518,6 +9537,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens: torch.Tensor,
             score: torch.Tensor,
             max_decode_query_len: int,
+            k_format: Optional[str] = None,
         ) -> None:
             """Score one decode step, compiling the kernel on first use.
 
@@ -9526,11 +9546,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
             forwards first, and those cover every geometry the graphs it then
             captures will replay.
             """
+            # The kernel reads whole pages, so a short row would read past the
+            # pool; the compiled call checks dtype, rank and stride itself.
+            if (k_format == "nvfp4" and index_k_cache.dim() == 2
+                    and index_k_cache.shape[1] < cls.NVFP4_PAGE_BYTES):
+                raise ValueError(
+                    f"NVFP4 index-K pages need {cls.NVFP4_PAGE_BYTES} bytes, "
+                    f"got index_k_cache of shape {tuple(index_k_cache.shape)}")
             _, num_heads, head_dim = idx_q.shape
-            key = (idx_q.dtype, num_heads, max_decode_query_len, head_dim)
+            key = (idx_q.dtype, k_format, num_heads, max_decode_query_len,
+                   head_dim)
             if key not in cls.kernel_cache:
-                cls._compile(idx_q.dtype, num_heads, max_decode_query_len,
-                             head_dim)
+                cls._compile(idx_q.dtype, k_format, num_heads,
+                             max_decode_query_len, head_dim)
             cls.kernel_cache[key](idx_q, index_k_cache, block_table, score,
                                   seq_lens)
 
@@ -9544,6 +9572,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        k_format: Optional[str] = None,
     ) -> None:
         """Write per-block max index scores for one decode step, in place.
 
@@ -9552,7 +9581,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 total_q must be batch * decode_query_len with a uniform
                 decode_query_len, which the kernel infers.
             index_k_cache: [num_pages, page_size, head_dim], same dtype as
-                idx_q. May be a strided view of a coalesced pool.
+                idx_q. May be a strided view of a coalesced pool. With
+                k_format="nvfp4", uint8 [num_pages, page_stride] NVFP4 pages
+                (page_stride >= 9216 and a multiple of 16, 16-byte aligned).
             block_table: [batch, max_blocks_per_seq] int32 page table.
             seq_lens: [batch] int32 attended KV length per request.
             score: [num_index_heads, total_q, max_blocks] float32, mutated in
@@ -9562,6 +9593,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 passed without a copy.
             max_decode_query_len: compile-time bound on decode_query_len;
                 num_index_heads * max_decode_query_len must not exceed 32.
+            k_format: None for K stored in idx_q's dtype, or "nvfp4" for the
+                packed NVFP4 cache, which needs FP8 idx_q.
         """
         if not is_sm_100f():
             raise ValueError(
@@ -9576,7 +9609,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             f"block_table shape={tuple(block_table.shape)} stride={block_table.stride()}; "
             f"seq_lens shape={tuple(seq_lens.shape)}; "
             f"score dtype={score.dtype} shape={tuple(score.shape)} stride={score.stride()}; "
-            f"max_decode_query_len={max_decode_query_len}",
+            f"max_decode_query_len={max_decode_query_len}; k_format={k_format}",
             key="cute_dsl_minimax_m3_index_decode_score_inputs",
         )
         CuteDSLMiniMaxM3IndexDecodeScoreRunner.forward(
@@ -9586,6 +9619,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             seq_lens,
             score,
             max_decode_query_len,
+            k_format,
         )
 
     @torch.library.register_fake(
@@ -9597,6 +9631,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         seq_lens: torch.Tensor,
         score: torch.Tensor,
         max_decode_query_len: int,
+        k_format: Optional[str] = None,
     ) -> None:
         return None
 

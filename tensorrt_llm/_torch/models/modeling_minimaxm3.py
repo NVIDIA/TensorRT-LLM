@@ -423,9 +423,10 @@ def _validate_sparse_attention_runtime_config(
             raise ValueError(
                 "MiniMax-M3 fuse_qkv_index_projection=True requires the 'msa' implementation."
             )
-        if getattr(sparse_config, "indexer_kv_dtype", None) != "fp8":
+        if getattr(sparse_config, "indexer_kv_dtype", None) not in ("fp8", "nvfp4"):
             raise ValueError(
-                "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8'."
+                "MiniMax-M3 fuse_qkv_index_projection=True requires indexer_kv_dtype='fp8' "
+                "or 'nvfp4'."
             )
         if (
             quant_config is None
@@ -1488,14 +1489,15 @@ class MiniMaxM3Attention(Attention):
         """Produce raw-E4M3 index-Q and insert index-K in one M3-only kernel.
 
         This path is deliberately narrower than the general fused QK kernel:
-        it is enabled only for the MSA FP8-indexer configuration and the exact
-        M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel rounds the
-        normalized/RoPE values through BF16 before E4M3 conversion, matching
-        the former fused-BF16-kernel followed by ``Tensor.to(E4M3)`` contract.
+        it is enabled only for the MSA FP8 or NVFP4 indexer configuration and
+        the exact M3 Gemma-RMSNorm + NeoX partial-RoPE geometry. The kernel
+        rounds the normalized/RoPE values through BF16 before E4M3 conversion,
+        matching the former fused-BF16-kernel followed by ``Tensor.to(E4M3)``
+        contract, and before NVFP4-E quantization of an NVFP4 index-K cache.
         """
         if not isinstance(self.attn, MiniMaxM3MsaSparseAttention):
             return None
-        if self.attn.indexer_kv_dtype != "fp8":
+        if self.attn.indexer_kv_dtype not in ("fp8", "nvfp4"):
             return None
         if position_ids is None or idx_qk.dtype != torch.bfloat16:
             raise NotImplementedError(
@@ -1518,11 +1520,13 @@ class MiniMaxM3Attention(Attention):
             )
 
         rotary_dim = int(self.pos_embd_params.rope.dim)
+        index_k_nvfp4 = self.attn.indexer_kv_dtype == "nvfp4"
         index_k_cache = attn_metadata.msa_idx_k_cache(self.layer_idx)
-        if index_k_cache.dtype != torch.float8_e4m3fn:
+        expected_cache_dtype = torch.uint8 if index_k_nvfp4 else torch.float8_e4m3fn
+        if index_k_cache.dtype != expected_cache_dtype:
             raise ValueError(
-                "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
-                f"got {index_k_cache.dtype}."
+                f"MiniMax-M3 fused {self.attn.indexer_kv_dtype} indexer requires a "
+                f"{expected_cache_dtype} index-K cache, got {index_k_cache.dtype}."
             )
         num_tokens = int(idx_qk.shape[0])
         return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
@@ -1537,6 +1541,7 @@ class MiniMaxM3Attention(Attention):
             self.index_k_norm.weight,
             self.pos_embd_params.rope.theta,
             position_ids.reshape(-1).contiguous().to(torch.int32),
+            index_k_nvfp4=index_k_nvfp4,
         ).flatten(1)
 
     def _fused_fp8_qkv_indexer_norm_rope_kv_insert(
@@ -1555,13 +1560,14 @@ class MiniMaxM3Attention(Attention):
         positions and cache slots cover pure prefill, mixed aggregate batches,
         and CUDA-graph decode.  FP8 caches receive FP8 K/V directly.  NVFP4
         caches receive packed E2M1 K/V plus their E4M3 SF16 scale bytes while
-        Q, index-Q, and index-K remain FP8.
+        Q and index-Q remain FP8.  Index-K is stored as FP8 or, for
+        indexer_kv_dtype='nvfp4', as NVFP4-E pages.
         """
         if (
             not self.enable_fused_qkv_index_projection
             or not isinstance(self.attn, MiniMaxM3MsaSparseAttention)
             or not (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
-            or self.attn.indexer_kv_dtype != "fp8"
+            or self.attn.indexer_kv_dtype not in ("fp8", "nvfp4")
         ):
             return None
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
@@ -1642,20 +1648,35 @@ class MiniMaxM3Attention(Attention):
                 and buffers.stride(0) % 4 == 0
                 and buffers.stride(1) % 4 == 0
             )
-        supported_index_cache = (
-            index_k_cache.is_cuda
-            and index_k_cache.dtype == torch.float8_e4m3fn
-            and index_k_cache.dim() == 4
-            and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
-            and index_k_cache.stride(3) == 1
-            and index_k_cache.stride(2) == 128
-            and index_k_cache.stride(1) >= 128 * 128
-            and index_k_cache.stride(0) >= index_k_cache.stride(1)
-            and index_k_cache.stride(0) % 4 == 0
-            and index_k_cache.stride(1) % 4 == 0
-            and buffers is not None
-            and index_k_cache.shape[0] == buffers.shape[0]
-        )
+        index_k_nvfp4 = self.attn.indexer_kv_dtype == "nvfp4"
+        if index_k_nvfp4:
+            # NVFP4-E pages: 128 rows of 64 B E2M1 data, then 128 rows of 8 B E4M3 scales.
+            supported_index_cache = (
+                index_k_cache.is_cuda
+                and index_k_cache.dtype == torch.uint8
+                and index_k_cache.dim() == 2
+                and index_k_cache.shape[1] >= 128 * (64 + 8)
+                and index_k_cache.stride(1) == 1
+                and index_k_cache.stride(0) >= index_k_cache.shape[1]
+                and index_k_cache.stride(0) % 2 == 0
+                and buffers is not None
+                and index_k_cache.shape[0] == buffers.shape[0]
+            )
+        else:
+            supported_index_cache = (
+                index_k_cache.is_cuda
+                and index_k_cache.dtype == torch.float8_e4m3fn
+                and index_k_cache.dim() == 4
+                and tuple(index_k_cache.shape[1:]) == (1, 128, 128)
+                and index_k_cache.stride(3) == 1
+                and index_k_cache.stride(2) == 128
+                and index_k_cache.stride(1) >= 128 * 128
+                and index_k_cache.stride(0) >= index_k_cache.stride(1)
+                and index_k_cache.stride(0) % 4 == 0
+                and index_k_cache.stride(1) % 4 == 0
+                and buffers is not None
+                and index_k_cache.shape[0] == buffers.shape[0]
+            )
         rotary_cos_sin = self.rotary_emb.rotary_cos_sin
         supported_rope_cache = (
             rotary_cos_sin.is_cuda
@@ -1700,6 +1721,7 @@ class MiniMaxM3Attention(Attention):
                 common_args[0],
                 kv_quant_scale,
                 *common_args[1:],
+                index_k_nvfp4=index_k_nvfp4,
             )
         else:
             q, index_q = torch.ops.trtllm.minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert(
@@ -1707,6 +1729,7 @@ class MiniMaxM3Attention(Attention):
                 buffers,
                 index_k_cache,
                 *common_args,
+                index_k_nvfp4=index_k_nvfp4,
             )
         return q.flatten(1), index_q.flatten(1)
 
@@ -2223,7 +2246,7 @@ class MiniMaxM3Attention(Attention):
                 and is_torch_compiling()
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
                 and (self.main_kv_is_fp8 or self.main_kv_is_nvfp4)
-                and self.attn.indexer_kv_dtype == "fp8"
+                and self.attn.indexer_kv_dtype in ("fp8", "nvfp4")
             ):
                 # Metadata stages these zero-copy views before compilation;
                 # tracing the cache manager's native pointer access is unsafe.
@@ -2316,13 +2339,13 @@ class MiniMaxM3Attention(Attention):
             idx_qk = (
                 packed_idx_qk if packed_idx_qk is not None else self.index_qk_proj(hidden_states)
             )
-            graph_fp8_indexer = (
+            graph_indexer = (
                 self.register_to_config
                 and is_torch_compiling()
                 and isinstance(self.attn, MiniMaxM3MsaSparseAttention)
-                and self.attn.indexer_kv_dtype == "fp8"
             )
-            if not graph_fp8_indexer:
+            graph_fp8_indexer = graph_indexer and self.attn.indexer_kv_dtype == "fp8"
+            if not graph_indexer:
                 fp8_idx_q = self._fused_fp8_index_qk_norm_rope(idx_qk, position_ids, attn_metadata)
                 if fp8_idx_q is not None:
                     # Index-K was inserted directly into the paged side cache.

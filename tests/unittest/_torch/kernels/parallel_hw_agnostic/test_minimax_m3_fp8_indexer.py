@@ -4,6 +4,12 @@
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.index_k_nvfp4 import (
+    INDEX_K_NVFP4_PAGE_BYTES,
+    INDEX_K_NVFP4_SCALE_OFFSET,
+    quantize_index_k_nvfp4_reference,
+)
+
 CUDA_AVAILABLE = torch.cuda.is_available()
 FP8_AVAILABLE = CUDA_AVAILABLE and torch.cuda.get_device_capability() >= (8, 9)
 pytestmark = pytest.mark.skipif(
@@ -35,8 +41,9 @@ def _reference(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
     position_ids: torch.Tensor,
+    dtype: torch.dtype = torch.float8_e4m3fn,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the established BF16 fused-kernel-then-E4M3-cast result."""
+    """Compute the established BF16 fused-kernel result, cast to `dtype`."""
     reference = qk.clone()
     torch.ops.trtllm.fused_qk_norm_rope(
         reference,
@@ -62,7 +69,7 @@ def _reference(
         0,
     )
     q, k = reference.split([num_heads_q * 128, 128], dim=-1)
-    return q.view(q.shape[0], num_heads_q, 128).to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn)
+    return q.view(q.shape[0], num_heads_q, 128).to(dtype), k.to(dtype)
 
 
 def _strided_cache(num_pages: int, page_size: int = 128, stride_scale: int = 7) -> torch.Tensor:
@@ -109,6 +116,31 @@ def _assert_all_zero(*regions: torch.Tensor) -> None:
         assert torch.count_nonzero(region.reshape(-1).view(torch.uint8)).item() == 0
 
 
+def _nvfp4_index_pool(num_pages: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return a sentinel-filled pool and its NVFP4-E index-K page view.
+
+    As in production, each 9216 B page starts a wider pool row, and a guard row
+    on either side catches stores from skipped slots.
+    """
+    pool = torch.full(
+        (num_pages + 2, 2 * INDEX_K_NVFP4_PAGE_BYTES), 0xA5, dtype=torch.uint8, device="cuda"
+    )
+    return pool, pool[1:-1, :INDEX_K_NVFP4_PAGE_BYTES]
+
+
+def _expected_nvfp4_index_pool(
+    index_k: torch.Tensor, slots: torch.Tensor, num_pages: int
+) -> torch.Tensor:
+    """Return the pool holding the reference NVFP4-E rows of `index_k` at their valid slots."""
+    expected, pages = _nvfp4_index_pool(num_pages)
+    valid = (slots >= 0) & (slots < num_pages * 128)
+    page, row = slots[valid].long() // 128, slots[valid].long() % 128
+    data, scales = quantize_index_k_nvfp4_reference(index_k[valid])
+    pages[:, :INDEX_K_NVFP4_SCALE_OFFSET].view(num_pages, 128, 64)[page, row] = data
+    pages[:, INDEX_K_NVFP4_SCALE_OFFSET:].view(num_pages, 128, 8)[page, row] = scales
+    return expected
+
+
 def _run(
     qk: torch.Tensor,
     cache: torch.Tensor,
@@ -121,6 +153,7 @@ def _run(
     rotary_dim: int = 64,
     eps: float = 1e-5,
     base: float = 10000.0,
+    index_k_nvfp4: bool = False,
 ) -> torch.Tensor:
     """Invoke the specialized indexer operator with overridable geometry."""
     return torch.ops.trtllm.minimax_m3_fp8_indexer_qk_norm_rope(
@@ -135,6 +168,7 @@ def _run(
         k_weight,
         base,
         position_ids,
+        index_k_nvfp4=index_k_nvfp4,
     )
 
 
@@ -243,6 +277,42 @@ def test_minimax_m3_fp8_indexer_ignores_a_padded_slot_tail(
     _assert_all_zero(cache[:, 0][~written])
 
 
+@pytest.mark.parametrize("num_tokens", [16, 300, 600])
+def test_minimax_m3_fp8_indexer_stores_bit_exact_nvfp4_index_k(num_tokens: int) -> None:
+    """An NVFP4-E cache receives the reference quantization of K; Q is unchanged.
+
+    Position 0 makes RoPE the identity and integer inputs make every sum of
+    squares exact, so the kernel's K equals the generic BF16 kernel's. The
+    16-dim groups span all-zero to 255 and a large weight scales the loudest
+    one, so the stored scales reach both clamps.
+    """
+    torch.manual_seed(3579)
+    num_heads_q = 4
+    num_pages = 6
+    bound = torch.tensor([0, 1, 2, 4, 15, 15, 64, 255], device="cuda").repeat_interleave(16)
+    noise = torch.rand(num_tokens, num_heads_q + 1, 128, device="cuda") * 2 - 1
+    qk = (noise * bound).round().to(torch.bfloat16).flatten(1)
+    q_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    k_weight = torch.randn(128, dtype=torch.bfloat16, device="cuda")
+    k_weight[-16:] = 127.0
+    position_ids = torch.zeros(num_tokens, dtype=torch.int32, device="cuda")
+    slots = torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 53 % (num_pages * 128)
+    slots[1] = -1
+    slots[3] = num_pages * 128 + 5
+    pool, cache = _nvfp4_index_pool(num_pages)
+
+    q_out = _run(
+        qk, cache, slots, q_weight, k_weight, position_ids, num_heads_q, index_k_nvfp4=True
+    )
+    baseline_q_out = _run(
+        qk, _strided_cache(num_pages), slots, q_weight, k_weight, position_ids, num_heads_q
+    )
+    _, k_ref = _reference(qk, num_heads_q, q_weight, k_weight, position_ids, torch.bfloat16)
+
+    assert torch.equal(q_out.view(torch.uint8), baseline_q_out.view(torch.uint8))
+    assert torch.equal(pool, _expected_nvfp4_index_pool(k_ref, slots, num_pages))
+
+
 def test_minimax_m3_fp8_indexer_cuda_graph_replay_updates_outputs() -> None:
     torch.manual_seed(5678)
     num_tokens = 16
@@ -325,7 +395,7 @@ def test_minimax_m3_fp8_indexer_rejects_unsupported_geometry(
 
 
 def test_minimax_m3_fp8_indexer_rejects_bad_cache_contracts() -> None:
-    """Cache dtype, rank, and slot-vector length are validated before launch."""
+    """E4M3 and NVFP4-E cache dtype, shape, and slot-vector length are validated before launch."""
     qk = torch.empty(2, 5 * 128, dtype=torch.bfloat16, device="cuda")
     slots = torch.zeros(2, dtype=torch.int32, device="cuda")
     weights = torch.ones(128, dtype=torch.bfloat16, device="cuda")
@@ -358,6 +428,11 @@ def test_minimax_m3_fp8_indexer_rejects_bad_cache_contracts() -> None:
             weights,
             positions,
         )
+    with pytest.raises(RuntimeError, match=r"NVFP4 index-K cache must use torch\.uint8"):
+        _run(qk, _strided_cache(1), slots, weights, weights, positions, index_k_nvfp4=True)
+    short_pages = torch.zeros(1, INDEX_K_NVFP4_PAGE_BYTES - 16, dtype=torch.uint8, device="cuda")
+    with pytest.raises(RuntimeError, match="page_bytes >= 9216"):
+        _run(qk, short_pages, slots, weights, weights, positions, index_k_nvfp4=True)
 
 
 @pytest.mark.parametrize(

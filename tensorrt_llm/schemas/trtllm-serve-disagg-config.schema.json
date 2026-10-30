@@ -5378,7 +5378,7 @@
     },
     "MiniMaxM3SparseAttentionConfig": {
       "additionalProperties": false,
-      "description": "Configuration for MiniMax-M3 block-sparse attention.\n\nDrives the two-step sparse attention used by MiniMax-M3 layers 3..N:\n\n  1. An index attention branch projects a per-head Q vector and a single\n     replicated K vector, scores main K/V cache blocks, and selects the\n     top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced\n     at the head and local_blocks forced at the tail.\n  2. A sparse GQA attention runs only over the selected blocks.\n\nAt runtime one of the MiniMax-M3 sparse attention backends under\ntensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The\nchosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a\npaged side index-K cache of shape [num_slots, 1, sparse_index_dim] parallel\nto the main K/V cache. The M3 checkpoint sets disable_index_value=True on\nevery sparse layer, so no index V cache is allocated.",
+      "description": "Configuration for MiniMax-M3 block-sparse attention.\n\nDrives the two-step sparse attention used by MiniMax-M3 layers 3..N:\n\n  1. An index attention branch projects a per-head Q vector and a single\n     replicated K vector, scores main K/V cache blocks, and selects the\n     top-k blocks per (num_kv_heads, q_token) pair, with init_blocks forced\n     at the head and local_blocks forced at the tail.\n  2. A sparse GQA attention runs only over the selected blocks.\n\nAt runtime one of the MiniMax-M3 sparse attention backends under\ntensorrt_llm._torch.attention.backends.sparse.minimax_m3 is selected. The\nchosen backend runs on top of a MiniMaxM3KVCacheManagerV2 that allocates a\npaged side index-K cache parallel to the main K/V cache, holding one\nsparse_index_dim row per token in the indexer_kv_dtype format. The M3\ncheckpoint sets disable_index_value=True on every sparse layer, so no index\nV cache is allocated.",
       "properties": {
         "algorithm": {
           "const": "minimax_m3",
@@ -5388,7 +5388,7 @@
         },
         "fuse_qkv_index_projection": {
           "default": false,
-          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8', and an FP8 or NVFP4 main KV cache.",
+          "description": "Fuse Q/K/V and index-Q/index-K into one quantized projection. Index-Q is sharded with the KV heads and index-K is replicated. MSA batches also use a horizontal norm/RoPE/cache-insertion producer for prefill, mixed, and CUDA-graph decode execution. The MiniMax-M3-specific path requires the MSA implementation, indexer_kv_dtype='fp8' or 'nvfp4', and an FP8 or NVFP4 main KV cache.",
           "status": "prototype",
           "title": "Fuse Qkv Index Projection",
           "type": "boolean"
@@ -5406,10 +5406,11 @@
         },
         "indexer_kv_dtype": {
           "default": "bf16",
-          "description": "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses unscaled E4M3 values with FP32 score accumulation and is supported only by the MSA implementation.",
+          "description": "Storage and score-compute dtype for normalized index Q/K. 'fp8' uses unscaled E4M3 values with FP32 score accumulation. 'nvfp4' keeps index Q in E4M3 and stores index K as E2M1 values with one E4M3 scale per 16 dims, chosen so that every dequantized value is an E4M3 value. Both are supported only by the MSA implementation.",
           "enum": [
             "bf16",
-            "fp8"
+            "fp8",
+            "nvfp4"
           ],
           "status": "prototype",
           "title": "Indexer Kv Dtype",

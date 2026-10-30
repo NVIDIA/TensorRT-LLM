@@ -19,9 +19,10 @@ Provides:
     algorithm-only unit tests (no pyexecutor dependency required for
     construction).
   * :class:`MiniMaxM3KVCacheManagerV2` — :class:`KVCacheManagerV2`
-    subclass that registers a per-sparse-layer ``Role.INDEX_KEY`` paged
-    buffer alongside the standard K/V buffers; shared Eagle3 draft layers get
-    their own virtual attention-op pools.
+    subclass that registers a per-sparse-layer paged index-K buffer
+    (``Role.INDEX_KEY``, or ``INDEX_KEY_NVFP4`` for NVFP4-E pages) alongside
+    the standard K/V buffers; shared Eagle3 draft layers get their own
+    virtual attention-op pools.
   * :class:`MiniMaxM3DraftKVCacheView` — FP8/P128 view of the shared Eagle3
     draft layer when the target KV cache is NVFP4.
 """
@@ -64,6 +65,12 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
+# NVFP4-E index-K pages (see MiniMaxM3KVCacheManagerV2.index_k_page_bytes) use
+# their own role rather than Role.INDEX_KEY, so a disaggregated peer storing
+# another index-K format fails the replicated-role handshake instead of
+# receiving pages it would misread.
+INDEX_KEY_NVFP4 = DataRole("index_key_nvfp4")
 
 
 class MiniMaxM3SparseIndexCache:
@@ -295,10 +302,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
     """KVCacheManagerV2 subclass with a V2-managed paged index-K cache
     per sparse layer.
 
-    Each sparse local layer registers a ``Role.INDEX_KEY``
-    :class:`BufferConfig` via :meth:`_extra_buffers_per_layer` so the
-    index-K cache participates in the V2 paged lifecycle (allocation,
-    free, prefix reuse) and shares ``life_cycle_id`` with main K/V.
+    Each sparse local layer registers an index-K :class:`BufferConfig`
+    (``Role.INDEX_KEY``, or ``INDEX_KEY_NVFP4`` for NVFP4-E pages) via
+    :meth:`_extra_buffers_per_layer` so the index-K cache participates in
+    the V2 paged lifecycle (allocation, free, prefix reuse) and shares
+    ``life_cycle_id`` with main K/V.
 
     The optional index-V branch is kept as a plain CUDA tensor for the
     rare ``disable_index_value=False`` test path. M3 production sets
@@ -326,6 +334,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     _main_kv_mapper_kind = MapperKind.HND
     _main_kv_view_layout = "NHD"
+    _index_k_role: DataRole = Role.INDEX_KEY
     _dense_native_layer_ids: Tuple[int, ...] = ()
     # Virtual attention-op pools for dense target and shared draft layers:
     # (attention_op_pool_id, source_storage_pool_id) plus their copy parameters.
@@ -395,11 +404,26 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = sparse_index_dim
         self.indexer_kv_dtype = str(getattr(sparse_attention_config, "indexer_kv_dtype", "bf16"))
-        if self.indexer_kv_dtype not in ("bf16", "fp8"):
+        if self.indexer_kv_dtype not in ("bf16", "fp8", "nvfp4"):
             raise ValueError(
-                "MiniMax M3 indexer_kv_dtype must be 'bf16' or 'fp8', got "
+                "MiniMax M3 indexer_kv_dtype must be 'bf16', 'fp8' or 'nvfp4', got "
                 f"{self.indexer_kv_dtype!r}."
             )
+        if self.indexer_kv_dtype == "nvfp4":
+            # The NVFP4-E page format is defined only for 128 tokens of 128 dims.
+            tokens_per_block = kwargs.get("tokens_per_block")
+            if sparse_index_dim != 128 or tokens_per_block != 128:
+                raise ValueError(
+                    "MiniMax M3 indexer_kv_dtype='nvfp4' requires sparse_index_dim=128 and "
+                    f"tokens_per_block=128, got {sparse_index_dim} and {tokens_per_block}."
+                )
+            # The test-only index-V cache has no NVFP4-E form.
+            if not self.disable_index_value_layer_ids.issuperset(self.sparse_layer_ids):
+                raise ValueError(
+                    "MiniMax M3 indexer_kv_dtype='nvfp4' requires disable_index_value=True "
+                    "for every sparse layer."
+                )
+            self._index_k_role = INDEX_KEY_NVFP4
         # Filled at the end of __init__; the base __init__ may already call get_buffers.
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
@@ -445,13 +469,16 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         for layer_idx in self.sparse_layer_ids:
             if layer_idx not in self.layer_offsets:
                 continue
-            self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
-                layer_idx,
-                num_heads=1,
-                head_dim=self.sparse_index_dim,
-                dtype=torch_dtype,
-                kv_layout=kv_layout,
-            )
+            if self.indexer_kv_dtype == "nvfp4":
+                self._index_k_buffers[layer_idx] = self._index_k_nvfp4_pages(layer_idx)
+            else:
+                self._index_k_buffers[layer_idx] = super().get_index_k_buffer(
+                    layer_idx,
+                    num_heads=1,
+                    head_dim=self.sparse_index_dim,
+                    dtype=torch_dtype,
+                    kv_layout=kv_layout,
+                )
             if layer_idx not in self.disable_index_value_layer_ids:
                 self._index_v_buffers[layer_idx] = torch.zeros(
                     (num_total_slots, 1, self.sparse_index_dim),
@@ -731,20 +758,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
     def _extra_buffers_per_layer(self, *, tokens_per_block):
-        """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
+        """Register a per-sparse-layer index-K :class:`BufferConfig`.
 
-        ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_base_config`` iterates local ids, so keying
-        by global ids would silently skip registration on non-trivial
-        PP ranks.
+        ``size`` is bytes per **block** (:meth:`index_k_page_bytes`). Keyed
+        by **local** layer id — the base ``_build_base_config`` iterates
+        local ids, so keying by global ids would silently skip registration
+        on non-trivial PP ranks.
         """
-        torch_dtype = self._torch_dtype_for_index_cache()
-        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-        bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        size_per_block = self.index_k_page_bytes(tokens_per_block)
         return {
-            self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
+            self.layer_offsets[layer_id]: [
+                BufferConfig(role=self._index_k_role, size=size_per_block)
+            ]
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
@@ -753,7 +778,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Declare the backend's main K/V layout and replicated index-K."""
         return {
             Role.ALL: self._main_kv_mapper_kind,
-            Role.INDEX_KEY: MapperKind.REPLICATED,
+            self._index_k_role: MapperKind.REPLICATED,
         }
 
     def _main_kv_layout_name(self) -> str:
@@ -764,7 +789,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         """Total token slots across all blocks in the main K pool.
 
         Sizes the plain-tensor index-V cache only; the V2-managed
-        index-K cache pulls its slot count from ``Role.INDEX_KEY``'s
+        index-K views take their slot count from the index-K role's
         page upper bound.
         """
         if not self.layer_offsets:
@@ -780,20 +805,65 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return torch.float8_e4m3fn
         return torch.bfloat16
 
+    def index_k_page_bytes(self, tokens_per_block: int) -> int:
+        """Bytes of one sparse layer's index-K page of ``tokens_per_block`` tokens.
+
+        An NVFP4-E page holds every token's E2M1 data row (two dims per byte),
+        then every token's E4M3 scale row (one byte per 16 dims).
+        """
+        if self.indexer_kv_dtype == "nvfp4":
+            bytes_per_token = self.sparse_index_dim // 2 + self.sparse_index_dim // 16
+        else:
+            bytes_per_token = self.sparse_index_dim * self._torch_dtype_for_index_cache().itemsize
+        return bytes_per_token * tokens_per_block
+
+    def _index_k_nvfp4_pages(self, layer_idx: int) -> torch.Tensor:
+        """Resolve one layer's NVFP4-E index-K pages as uint8 ``[num_slots, page_bytes]``.
+
+        Row ``s`` is slot ``s``'s page. The pool slot also holds the other
+        sparse layers' pages, so the page stride is ``stride(0)`` (the whole
+        slot), not ``page_bytes``.
+        """
+        layer_offset = self.layer_offsets[layer_idx]
+        page_bytes = self.index_k_page_bytes(self.tokens_per_block)
+        page_stride = self.impl.get_page_stride(layer_offset, INDEX_KEY_NVFP4)
+        assert page_stride == page_bytes, (
+            f"NVFP4 index-K page stride mismatch for layer {layer_idx}: "
+            f"V2 reports {page_stride}, expected {page_bytes}."
+        )
+        converter = self.impl.get_page_index_converter(layer_offset, INDEX_KEY_NVFP4)
+        scale = int(converter.scale)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, INDEX_KEY_NVFP4)
+        num_slots_total = page_upper + int(converter.layer_offset)
+        assert num_slots_total % scale == 0, (
+            "NVFP4 index-K storage inconsistency: page_upper + layer_offset = "
+            f"{num_slots_total} is not divisible by scale={scale}."
+        )
+        addr = self.impl.get_mem_pool_base_address(layer_offset, INDEX_KEY_NVFP4)
+        full_slot_shape = [num_slots_total // scale, scale, page_bytes]
+        full_view = convert_to_torch_tensor(TensorWrapper(addr, torch.uint8, full_slot_shape))
+        return full_view[:, 0]
+
     def get_index_k_buffer(
         self, layer_idx: int, kv_layout: Optional[str] = None
     ) -> Optional[torch.Tensor]:
         """Return the V2-managed index-K view in the selected backend's layout.
 
-        Views are resolved during initialization so compiled forwards only
-        read tensors, without entering the C++ pool-address accessors.
+        NVFP4-E pages are the same uint8 ``[num_slots, page_bytes]`` view in
+        either layout. Views are resolved during initialization so compiled
+        forwards only read tensors, without entering the C++ pool-address
+        accessors.
         """
         if kv_layout is None:
             kv_layout = self._main_kv_view_layout
         if kv_layout not in ("NHD", "HND"):
             raise ValueError(f"Unsupported kv_layout: {kv_layout}")
         buffer = self._index_k_buffers.get(layer_idx)
-        if buffer is not None and kv_layout != self._main_kv_view_layout:
+        if (
+            buffer is not None
+            and self._index_k_role == Role.INDEX_KEY
+            and kv_layout != self._main_kv_view_layout
+        ):
             return buffer.transpose(1, 2)
         return buffer
 
@@ -1238,6 +1308,7 @@ def get_minimax_m3_kv_cache_manager_cls():
 
 
 __all__ = [
+    "INDEX_KEY_NVFP4",
     "MiniMaxM3DraftKVCacheView",
     "MiniMaxM3KVCacheManagerV2",
     "MiniMaxM3SparseIndexCache",

@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
+#include "tensorrt_llm/kernels/minimaxM3IndexKNvfp4.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cmath>
 #include <cuda_bf16.h>
@@ -567,6 +568,8 @@ __global__ void minimaxM3Fp8QKNormRopeKVInsertKernel(__nv_bfloat16 const* qkvInp
 // Horizontal sparse producer for a packed [Q|K|V|index-Q|index-K] row.
 // One warp owns one (token, head slot). All four norm/RoPE branches share the
 // model's precomputed FP32 RoPE table, eliminating per-head powf/sincos work.
+// kNvfp4EIndexK stores index-K as NVFP4-E pages instead of FP8 HND pages, with kIndexKWarps warps per token.
+template <bool kNvfp4EIndexK, int kIndexKWarps>
 __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
     __nv_fp8_e4m3* indexQOutput, __nv_fp8_e4m3* kvCache, __nv_fp8_e4m3* indexKCache, int const* outCacheLoc,
     int64_t kvPageStride, int64_t kvPlaneStride, int64_t kvHeadStride, int64_t kvTokenStride, int64_t indexPageStride,
@@ -578,9 +581,11 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
     int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    // NVFP4-E index-K may take kIndexKWarps warps per token, all reading the index-K head.
     int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
-    int const tokenIdx = globalWarp / totalHeads;
-    int const localHead = globalWarp % totalHeads;
+    int const warpsPerToken = totalHeads + kIndexKWarps - 1;
+    int const tokenIdx = globalWarp / warpsPerToken;
+    int const localWarp = globalWarp % warpsPerToken;
     if (tokenIdx >= numTokens)
     {
         return;
@@ -590,6 +595,7 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const vBegin = kBegin + numHeadsKV;
     int const indexQBegin = vBegin + numHeadsKV;
     int const indexKHead = indexQBegin + numHeadsIndex;
+    int const localHead = kIndexKWarps > 1 ? min(localWarp, indexKHead) : localWarp;
     bool const isQ = localHead < kBegin;
     bool const isK = localHead >= kBegin && localHead < vBegin;
     bool const isV = localHead >= vBegin && localHead < indexQBegin;
@@ -693,9 +699,25 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
     int const withinPage = slot & (kMinimaxM3PageSize - 1);
     if (isIndexK)
     {
-        int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
-            + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
-        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        if constexpr (kNvfp4EIndexK)
+        {
+            uint8_t* const pageBase
+                = reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride;
+            if constexpr (kIndexKWarps == 1)
+            {
+                minimaxM3StoreNvfp4EIndexK(elements, pageBase, withinPage, laneId);
+            }
+            else
+            {
+                minimaxM3StoreNvfp4EIndexKQuarter(elements, pageBase, withinPage, laneId, localWarp - indexKHead);
+            }
+        }
+        else
+        {
+            int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
+                + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+            storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        }
         return;
     }
 
@@ -708,11 +730,12 @@ __global__ void minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const
 }
 
 // NVFP4-cache counterpart of the horizontal sparse producer above.  Q,
-// index-Q, and index-K retain the exact FP8 register epilogue.  Main K/V are
+// index-Q, and index-K are stored as in that producer.  Main K/V are
 // rounded to BF16 (matching the existing materialized producer), quantized in
 // four-lane SF16 groups, and written directly to the packed-data and scale
 // pools.  K scales are token-major; V scales use the runtime's 4x4 token-quad
 // swizzle.
+template <bool kNvfp4EIndexK, int kIndexKWarps>
 __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 const* packedInput, __nv_fp8_e4m3* qOutput,
     __nv_fp8_e4m3* indexQOutput, uint8_t* kvDataCache, uint8_t* kvScaleCache, __nv_fp8_e4m3* indexKCache,
     int const* outCacheLoc, float const* kvQuantScale, int64_t dataPageStride, int64_t dataPlaneStride,
@@ -726,9 +749,11 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const warpId = threadIdx.x / 32;
     int const laneId = threadIdx.x % 32;
     int const globalWarp = blockIdx.x * warpsPerBlock + warpId;
+    // NVFP4-E index-K may take kIndexKWarps warps per token, all reading the index-K head.
     int const totalHeads = numHeadsQ + 2 * numHeadsKV + numHeadsIndex + 1;
-    int const tokenIdx = globalWarp / totalHeads;
-    int const localHead = globalWarp % totalHeads;
+    int const warpsPerToken = totalHeads + kIndexKWarps - 1;
+    int const tokenIdx = globalWarp / warpsPerToken;
+    int const localWarp = globalWarp % warpsPerToken;
     if (tokenIdx >= numTokens)
     {
         return;
@@ -738,6 +763,7 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const vBegin = kBegin + numHeadsKV;
     int const indexQBegin = vBegin + numHeadsKV;
     int const indexKHead = indexQBegin + numHeadsIndex;
+    int const localHead = kIndexKWarps > 1 ? min(localWarp, indexKHead) : localWarp;
     bool const isQ = localHead < kBegin;
     bool const isK = localHead >= kBegin && localHead < vBegin;
     bool const isV = localHead >= vBegin && localHead < indexQBegin;
@@ -837,9 +863,25 @@ __global__ void minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel(__nv_bfloat16 con
     int const withinPage = slot & (kMinimaxM3PageSize - 1);
     if (isIndexK)
     {
-        int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
-            + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
-        storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        if constexpr (kNvfp4EIndexK)
+        {
+            uint8_t* const pageBase
+                = reinterpret_cast<uint8_t*>(indexKCache) + static_cast<int64_t>(page) * indexPageStride;
+            if constexpr (kIndexKWarps == 1)
+            {
+                minimaxM3StoreNvfp4EIndexK(elements, pageBase, withinPage, laneId);
+            }
+            else
+            {
+                minimaxM3StoreNvfp4EIndexKQuarter(elements, pageBase, withinPage, laneId, localWarp - indexKHead);
+            }
+        }
+        else
+        {
+            int64_t const outputOffset = static_cast<int64_t>(page) * indexPageStride
+                + static_cast<int64_t>(withinPage) * indexTokenStride + laneId * kMinimaxM3ElemsPerThread;
+            storeFp8HeadElements64<kMinimaxM3ElemsPerThread>(indexKCache, outputOffset, elements);
+        }
         return;
     }
 
@@ -999,9 +1041,10 @@ void launchMinimaxM3Fp8QKNormRopeKVInsert(void const* qkv_input, void* q_output,
 void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void* q_output, void* index_q_output,
     void* kv_cache, void* index_k_cache, int const* out_cache_loc, int64_t kv_page_stride, int64_t kv_plane_stride,
     int64_t kv_head_stride, int64_t kv_token_stride, int64_t index_page_stride, int64_t index_token_stride,
-    int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index,
-    int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight, void const* index_q_weight,
-    void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
+    bool index_k_nvfp4, int64_t num_pages, int page_size, int num_tokens, int num_heads_q, int num_heads_kv,
+    int num_heads_index, int head_dim, int rotary_dim, float eps, void const* q_weight, void const* k_weight,
+    void const* index_q_weight, void const* index_k_weight, float const* rotary_cos_sin, int const* position_ids,
+    cudaStream_t stream)
 {
     TLLM_CHECK_WITH_INFO(head_dim == kMinimaxM3HeadDim, "MiniMax-M3 horizontal producer requires head_dim=128");
     TLLM_CHECK_WITH_INFO(rotary_dim == kMinimaxM3RotaryDim, "MiniMax-M3 horizontal producer requires rotary_dim=64");
@@ -1013,11 +1056,15 @@ void launchMinimaxM3Fp8QKVIndexerNormRopeKVInsert(void const* packed_input, void
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    bool const splitIndexK = index_k_nvfp4 && num_tokens <= kMinimaxM3Nvfp4EIndexKSplitMaxTokens;
+    int const slotsPerToken
+        = num_heads_q + 2 * num_heads_kv + num_heads_index + (splitIndexK ? kMinimaxM3Nvfp4EIndexKWarps : 1);
     int const totalWarps = num_tokens * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
-    common::launchWithPdlWhenEnabled("minimaxM3Fp8QKVIndexerNormRopeKVInsert",
-        minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel, gridSize, kBlockSize, 0, stream,
+    auto* const kernel = !index_k_nvfp4 ? &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<false, 1>
+        : splitIndexK ? &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<true, kMinimaxM3Nvfp4EIndexKWarps>
+                      : &minimaxM3Fp8QKVIndexerNormRopeKVInsertKernel<true, 1>;
+    common::launchWithPdlWhenEnabled("minimaxM3Fp8QKVIndexerNormRopeKVInsert", kernel, gridSize, kBlockSize, 0, stream,
         static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
         static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<__nv_fp8_e4m3*>(kv_cache),
         static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc, kv_page_stride, kv_plane_stride, kv_head_stride,
@@ -1031,8 +1078,8 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
     void* kv_data_cache, void* kv_scale_cache, void* index_k_cache, int const* out_cache_loc,
     float const* kv_quant_scale, int64_t data_page_stride, int64_t data_plane_stride, int64_t data_head_stride,
     int64_t data_token_stride, int64_t scale_page_stride, int64_t scale_plane_stride, int64_t scale_head_stride,
-    int64_t index_page_stride, int64_t index_token_stride, int64_t num_pages, int page_size, int num_tokens,
-    int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
+    int64_t index_page_stride, int64_t index_token_stride, bool index_k_nvfp4, int64_t num_pages, int page_size,
+    int num_tokens, int num_heads_q, int num_heads_kv, int num_heads_index, int head_dim, int rotary_dim, float eps,
     void const* q_weight, void const* k_weight, void const* index_q_weight, void const* index_k_weight,
     float const* rotary_cos_sin, int const* position_ids, cudaStream_t stream)
 {
@@ -1048,7 +1095,9 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
 
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32;
-    int const slotsPerToken = num_heads_q + 2 * num_heads_kv + num_heads_index + 1;
+    bool const splitIndexK = index_k_nvfp4 && num_tokens <= kMinimaxM3Nvfp4EIndexKSplitMaxTokens;
+    int const slotsPerToken
+        = num_heads_q + 2 * num_heads_kv + num_heads_index + (splitIndexK ? kMinimaxM3Nvfp4EIndexKWarps : 1);
     int const totalWarps = num_tokens * slotsPerToken;
     int const gridSize = common::divUp(totalWarps, kWarpsPerBlock);
     cudaLaunchConfig_t config{};
@@ -1061,15 +1110,18 @@ void launchMinimaxM3Nvfp4QKVIndexerNormRopeKVInsert(void const* packed_input, vo
     attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel,
-        static_cast<__nv_bfloat16 const*>(packed_input), static_cast<__nv_fp8_e4m3*>(q_output),
-        static_cast<__nv_fp8_e4m3*>(index_q_output), static_cast<uint8_t*>(kv_data_cache),
-        static_cast<uint8_t*>(kv_scale_cache), static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc,
-        kv_quant_scale, data_page_stride, data_plane_stride, data_head_stride, data_token_stride, scale_page_stride,
-        scale_plane_stride, scale_head_stride, index_page_stride, index_token_stride, num_pages, num_tokens,
-        num_heads_q, num_heads_kv, num_heads_index, eps, static_cast<__nv_bfloat16 const*>(q_weight),
-        static_cast<__nv_bfloat16 const*>(k_weight), static_cast<__nv_bfloat16 const*>(index_q_weight),
-        static_cast<__nv_bfloat16 const*>(index_k_weight), rotary_cos_sin, position_ids));
+    auto* const kernel = !index_k_nvfp4 ? &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<false, 1>
+        : splitIndexK ? &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<true, kMinimaxM3Nvfp4EIndexKWarps>
+                      : &minimaxM3Nvfp4QKVIndexerNormRopeKVInsertKernel<true, 1>;
+    TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel, static_cast<__nv_bfloat16 const*>(packed_input),
+        static_cast<__nv_fp8_e4m3*>(q_output), static_cast<__nv_fp8_e4m3*>(index_q_output),
+        static_cast<uint8_t*>(kv_data_cache), static_cast<uint8_t*>(kv_scale_cache),
+        static_cast<__nv_fp8_e4m3*>(index_k_cache), out_cache_loc, kv_quant_scale, data_page_stride, data_plane_stride,
+        data_head_stride, data_token_stride, scale_page_stride, scale_plane_stride, scale_head_stride,
+        index_page_stride, index_token_stride, num_pages, num_tokens, num_heads_q, num_heads_kv, num_heads_index, eps,
+        static_cast<__nv_bfloat16 const*>(q_weight), static_cast<__nv_bfloat16 const*>(k_weight),
+        static_cast<__nv_bfloat16 const*>(index_q_weight), static_cast<__nv_bfloat16 const*>(index_k_weight),
+        rotary_cos_sin, position_ids));
 }
 } // namespace kernels
 
