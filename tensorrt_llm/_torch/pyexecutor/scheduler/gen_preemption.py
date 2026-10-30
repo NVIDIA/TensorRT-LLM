@@ -49,6 +49,9 @@ lowest cost of pausing:
 ``long``
     The request that holds the most KV (prompt + generated tokens).
 
+``TLLM_GEN_PREEMPT_LATE_TRIGGER=1`` also pauses for a next pop that is
+already late, not only for one that can still make the target.
+
 Preemption needs the ``auto`` GEN admission policy, whose target X and rank
 0's admission -> first token estimate decide when a waiting request is at
 risk.  Every input to a decision is identical on all ranks of the
@@ -91,6 +94,10 @@ class GenPreemptionConfig:
     # A waiting request is at risk once its slack, X - (age + s2f), is in
     # [0, slack_s]: a slot now still brings it in on time, but barely.
     slack_s: float = 5.0
+    # 1: the next pop also triggers when it is already late (slack < 0) or
+    # popped by another tier (guard, breaker); its slack must still be at
+    # most slack_s.  0: only an on-time next pop of the slack tier.
+    late_trigger: int = 0
     # Time since the first token before a request is preemptible.
     min_run_s: float = 2.0
     # A request paused this long resumes even without a free slot.

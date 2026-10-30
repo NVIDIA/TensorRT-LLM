@@ -7277,7 +7277,9 @@ class PyExecutor:
 
         if (free_slots <= 0 and waiting_queue
                 and isinstance(waiting_queue, GenAdmissionWaitingQueue)):
-            num_at_risk = waiting_queue.num_at_risk(preemption.config.slack_s)
+            num_at_risk = waiting_queue.num_at_risk(
+                preemption.config.slack_s,
+                late_trigger=bool(preemption.config.late_trigger))
             for req in preemption.select_victims(active_requests, num_at_risk):
                 preemption.on_paused(req)
                 num_active_requests -= 1

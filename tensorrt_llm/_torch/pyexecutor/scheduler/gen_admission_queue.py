@@ -420,10 +420,13 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             self._order = self._build_order()[::-1]
         return self._order[-1]
 
-    def num_at_risk(self, slack_s: float) -> int:
+    def num_at_risk(self, slack_s: float, late_trigger: bool = False) -> int:
         """Waiting requests that a free slot now would still bring in on time,
         but with at most ``slack_s`` to spare: ``X - (age + s2f)`` in
         ``[0, slack_s]``.  0 unless the next pop is one of them.
+
+        With ``late_trigger`` the lower bound goes: a late waiter (slack < 0)
+        is at risk too, and the next pop counts whatever tier popped it.
 
         Only the ``auto`` policy has a target; rank-identical like the pops.
         """
@@ -432,13 +435,15 @@ class GenAdmissionWaitingQueue(WaitingQueue):
         if ada is None or ada.X is None or now is None or not self:
             return 0
 
+        lo = -math.inf if late_trigger else 0.0
+
         def at_risk(entry) -> bool:
             orig, _, _, keyed, _ = entry
             slack = ada.X - (now - orig + ada.s2f_s)
-            return keyed and 0.0 <= slack <= slack_s
+            return keyed and lo <= slack <= slack_s
 
         entry, tier = self._next()
-        if tier != TIER_SLACK or not at_risk(entry):
+        if (tier != TIER_SLACK and not late_trigger) or not at_risk(entry):
             return 0
         return sum(1 for e in self._entries if e[1] not in self._popped and at_risk(e))
 

@@ -165,6 +165,21 @@ class TestConfig:
             log_gen_preemption_config(cfg)
         assert "enabled" in log.info.call_args.args[0]
 
+    def test_late_trigger_knob_and_startup_log(self):
+        assert GenPreemptionConfig.from_env(ON).late_trigger == 0
+        cfg = GenPreemptionConfig.from_env(
+            {
+                **ON,
+                "TLLM_GEN_PREEMPT_MAX_PER_REQUEST": "2",
+                "TLLM_GEN_PREEMPT_LATE_TRIGGER": "1",
+            }
+        )
+        assert cfg.enabled and (cfg.late_trigger, cfg.max_per_request) == (1, 2)
+        with patch(LOGGER) as log:
+            log_gen_preemption_config(cfg)
+        msg = log.info.call_args.args[0]
+        assert "enabled" in msg and "max_per_request=2" in msg and "late_trigger=1" in msg
+
     def test_off_logs_nothing(self):
         with patch(LOGGER) as log:
             log_gen_preemption_config(GenPreemptionConfig())
@@ -320,6 +335,18 @@ class TestGuardrails:
         assert victim_ids(p, [req], now=1.0) == []
         assert p.num_pauses(1) == 1
 
+    def test_two_pauses_per_request(self):
+        p = make_preemption(max_per_request=2, hysteresis_iters=0)
+        req = make_req(1)
+        for n in (1, 2):
+            assert victim_ids(p, [req], now=float(n)) == [1]
+            p.on_paused(req)
+            assert p.victim_order([req]) == []  # paused
+            p.on_resumed(req)
+            assert p.num_pauses(1) == n
+        assert victim_ids(p, [req], now=3.0) == []  # a third pause is refused
+        assert p.totals["paused"] == p.totals["resumed"] == 2
+
     def test_hysteresis_after_resume(self):
         p = make_preemption(max_per_request=2, hysteresis_iters=10)
         req = make_req(1)
@@ -405,6 +432,26 @@ class TestAtRisk:
         q = slack_queue(g=5.0, items=[make_item(2, 99.9, 90.8), make_item(1, 94.0, 94.0)])
         assert q.num_at_risk(slack_s=5.0) == 0
 
+    def test_late_head_triggers_with_late_trigger(self):
+        # No waiter can make X = 10 any more: 1 has slack -10.5, 2 has -5.5,
+        # so the next pop (1) is from the late tier.
+        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(2, 99.0, 85.0)])
+        assert q.num_at_risk(slack_s=5.0) == 0
+        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 2
+        # A waiter that can still make X is popped first (slack tier), so a
+        # late one triggers only when nobody on time is waiting.
+        q = slack_queue(items=[make_item(1, 99.0, 80.0), make_item(3, 99.9, 100.0)])
+        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 0  # 3: slack 9.5
+
+    def test_late_trigger_keeps_the_head_only_and_the_slack_bound(self):
+        # The next pop has 9.5 s of slack: not at risk, whatever the flag.
+        q = slack_queue(items=[make_item(3, 99.9, 100.0)])
+        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 0
+        # A guard-tier next pop triggers with the flag (sim late_ok).
+        q = slack_queue(g=5.0, items=[make_item(2, 99.9, 90.8), make_item(1, 94.0, 94.0)])
+        assert q.num_at_risk(slack_s=5.0) == 0
+        assert q.num_at_risk(slack_s=5.0, late_trigger=True) == 2
+
     def test_no_target_no_risk(self):
         q = GenAdmissionWaitingQueue(AUTO)  # warming up
         q.add_requests([make_item(1, 99.0, 91.0)])
@@ -455,6 +502,36 @@ class TestExecutorPass:
         q = slack_queue(items=[make_item(1000, 99.0, 99.0)])  # 9 s of slack
         assert ex.run(q, reqs, 4) == 4
         assert paused_ids(ex) == set()
+
+    def test_late_waiter_pauses_only_with_late_trigger(self):
+        reqs = [make_req(i) for i in range(4)]
+        for flag, expect in ((0, set()), (1, {3})):
+            ex = make_executor(make_preemption("newest", late_trigger=flag), capacity=4)
+            late = slack_queue(items=[make_item(1000, 99.0, 80.0)])  # slack -10.5
+            assert ex.run(late, reqs, 4) == 4 - len(expect)
+            assert paused_ids(ex) == expect, flag
+
+    def test_a_request_is_paused_twice_then_refused(self):
+        # One waiter at risk on every pass; the batch is full (4 resident) and
+        # one request finishes between passes.
+        reqs = [make_req(i) for i in range(4)]
+        p = make_preemption("newest", max_paused=1, max_per_request=2, hysteresis_iters=10)
+        ex = make_executor(p, capacity=4)
+        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {3}
+        # 0 finishes: 3 resumes first, then 2 is paused (3 is in hysteresis).
+        reqs.pop(0)
+        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {2}
+        # 10 decode steps later 1 finishes: 2 resumes, 3 is paused again.
+        step(reqs, iters=10)
+        reqs.pop(0)
+        assert ex.run(at_risk_queue(), reqs, 4) == 3 and paused_ids(ex) == {3}
+        assert p.num_pauses(3) == 2
+        # 10 more steps, 2 finishes: 3 resumes and stays, it had its two pauses.
+        step(reqs, iters=10)
+        reqs.pop(0)
+        assert ex.run(at_risk_queue(), reqs, 4) == 4 and paused_ids(ex) == set()
+        assert p.num_pauses(3) == 2 and p.window["no_victim"] == 1
+        assert p.totals["paused"] == p.totals["resumed"] == 3
 
     def test_resume_lane_goes_before_new_admissions(self):
         reqs = [make_req(i) for i in range(4)]
