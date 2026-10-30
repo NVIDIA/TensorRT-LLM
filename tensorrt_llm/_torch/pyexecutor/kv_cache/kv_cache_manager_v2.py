@@ -3587,8 +3587,8 @@ class KVCacheManagerV2(BaseResourceManager):
                             # sub-pages would pair bytes of different sub-pages. A rank's own
                             # share pairs only with the same rank's, whole.
                             raise ValueError(
-                                f"buffer ({lid}, {role}): {expansion} sub-pages per block are "
-                                "declarable only alike on every rank (replicated)"
+                                f"buffer ({lid}, {role}): {expansion} sub-pages per block that "
+                                "move are declarable only replicated or as each rank's own share"
                             )
                         owner = named.setdefault((global_of.get(lid, lid), role), lid)
                         if owner != lid:
