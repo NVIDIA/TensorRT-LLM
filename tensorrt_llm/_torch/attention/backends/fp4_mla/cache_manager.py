@@ -74,6 +74,17 @@ def is_fp4_mla_context_only_cache(is_disagg: bool) -> bool:
     return bool(is_disagg) and os.getenv(_DISAGG_ROLE_ENV) == "context"
 
 
+def _fp4_mla_num_appended_spec_layers(
+    spec_config: Optional["DecodingBaseConfig"], layer_mask: Optional[list]
+) -> int:
+    """Number of one-model draft layers appended after the target layers of a KV cache."""
+    if spec_config is None or layer_mask is not None:
+        return 0
+    from tensorrt_llm._torch.speculative.utils import get_num_spec_layers
+
+    return int(get_num_spec_layers(spec_config))
+
+
 @dataclass(frozen=True)
 class Fp4MlaPageTableSpec:
     """Stable page-table conversion contract consumed by FP4 MLA kernels."""
@@ -93,6 +104,12 @@ class Fp4MlaV2CacheLayoutPolicy:
     a compact ``16 + max_rewind`` BF16 ring. The HP role therefore follows V2
     allocation, rewind, prefix, and disaggregated-transfer lifecycles without
     storing BF16 values for the full sequence.
+
+    On a disaggregated context worker the target layers keep only K and K
+    block scales. One-model draft layers appended to a pure MLA manager keep
+    all four roles in a second full-history lifecycle with a page table of
+    its own, because the drafter runs its later draft steps as generation
+    steps inside every context step.
 
     ``Fp4MlaKVCacheManagerV2`` applies this policy directly for pure MLA
     models. Its block reuse claims only whole ``tokens_per_block`` prefixes,
@@ -123,6 +140,16 @@ class Fp4MlaV2CacheLayoutPolicy:
     # Set by configure_manager: a disaggregated context worker keeps neither
     # V scales nor packed V (see is_fp4_mla_context_only_cache).
     fp4_mla_context_only_cache: bool = False
+    # Set by configure_manager on such a worker: the one-model draft layers
+    # appended after the target layers, which keep the decode views.
+    _fp4_mla_num_spec_layers: int = 0
+    # Set by _build_cache_config: the FP4 layers that keep V scales (and
+    # packed V with the unfused CuTe DSL backend), the compact index of the
+    # first of them, which index 0 of the V-scale pool view belongs to, and
+    # the draft layers that live in a lifecycle of their own.
+    _fp4_mla_v_layer_ids: tuple = ()
+    fp4_mla_v_layer_base: int = 0
+    _fp4_mla_draft_lifecycle_layers: tuple = ()
     # A one-model draft layer at position i reads prompt token i + 1, and the
     # generic reuse-match backoff recomputes that many tokens past a matched
     # block boundary. The resulting context start is not tile aligned, which
@@ -146,6 +173,9 @@ class Fp4MlaV2CacheLayoutPolicy:
             spec_config=kwargs.get("spec_config"),
             is_disagg=kwargs.get("is_disagg", False),
             mapping=kwargs.get("mapping"),
+            num_spec_layers=_fp4_mla_num_appended_spec_layers(
+                kwargs.get("spec_config"), kwargs.get("layer_mask")
+            ),
         )
         if args:
             args = (kv_cache_config, *args[1:])
@@ -168,8 +198,13 @@ class Fp4MlaV2CacheLayoutPolicy:
         spec_config=None,
         is_disagg: bool = False,
         mapping: Optional[Mapping] = None,
+        num_spec_layers: int = 0,
     ):
-        """Validate and install FP4 MLA layout state before V2 construction."""
+        """Validate and install FP4 MLA layout state before V2 construction.
+
+        ``num_spec_layers`` counts the one-model draft layers appended after the
+        target layers of this manager.
+        """
         if dtype != DataType.NVFP4 or kv_cache_type != CacheTypeCpp.SELFKONLY:
             raise ValueError("Fp4MlaKVCacheManagerV2 requires NVFP4 SELFKONLY cache storage.")
         if kv_cache_config is None or kv_cache_config.dtype not in ("auto", "nvfp4"):
@@ -229,16 +264,26 @@ class Fp4MlaV2CacheLayoutPolicy:
             else 0
         )
         manager.fp4_mla_context_only_cache = is_fp4_mla_context_only_cache(is_disagg)
+        # The drafter runs its later draft steps as generation steps inside
+        # every context step, so draft layers keep the decode views.
+        manager._fp4_mla_num_spec_layers = (
+            int(num_spec_layers) if manager.fp4_mla_context_only_cache else 0
+        )
         if manager.fp4_mla_context_only_cache:
             logger.info(
                 "FP4 MLA KV cache on a disaggregated context worker: omitting "
-                "the generation-only V scales and packed V."
+                "the generation-only V scales and packed V"
+                + (
+                    " from the target layers; the draft layers keep them."
+                    if manager._fp4_mla_num_spec_layers
+                    else "."
+                )
             )
         manager.mla_v_head_dim = (
             manager.mla_v_scale_head_dim
             if manager._fp4_mla_storage_backend == _FP4_MLA_CUTEDSL_BACKEND
             and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
-            and not manager.fp4_mla_context_only_cache
+            and (not manager.fp4_mla_context_only_cache or manager._fp4_mla_num_spec_layers)
             else None
         )
         max_rewind_len = int(spec_config.tokens_per_gen_step - 1) if spec_config else 0
@@ -258,6 +303,12 @@ class Fp4MlaV2CacheLayoutPolicy:
             "_fp8_mla_local_layer_indices",
             "_fp4_mla_local_layer_indices",
             "_fp4_mla_compact_layer_idx",
+            "_fp4_mla_draft_local_layers",
+            "_fp4_mla_decode_view_local_layers",
+            "_fp4_mla_layer_has_decode_views",
+            "fp4_mla_compact_layer_has_decode_views",
+            "_require_fp4_mla_decode_views",
+            "fp4_mla_draft_lifecycle_layer_ids",
             "_fp8_mla_bytes_per_token",
             "_get_buffer_roles_for_layer",
             "_storage_head_dim",
@@ -346,6 +397,60 @@ class Fp4MlaV2CacheLayoutPolicy:
                 f"Local layer {local_layer} is not an FP4 MLA attention layer."
             ) from error
 
+    def _fp4_mla_draft_local_layers(self) -> list[int]:
+        """FP4 MLA local layers that hold one-model draft layers.
+
+        Draft layers are appended after the target layers on the last pipeline
+        stage, so they are the local layers with the highest global indices.
+        """
+        num_spec_layers = getattr(self, "_fp4_mla_num_spec_layers", 0)
+        if num_spec_layers <= 0:
+            return []
+        first_draft_layer = self.num_layers - num_spec_layers
+        return [
+            local_layer
+            for local_layer in self._fp4_mla_local_layer_indices()
+            if self.pp_layers[local_layer] >= first_draft_layer
+        ]
+
+    def _fp4_mla_decode_view_local_layers(self) -> frozenset[int]:
+        """FP4 MLA local layers that keep V scales and packed V."""
+        cached = getattr(self, "_fp4_mla_decode_view_local_layer_set", None)
+        if cached is None:
+            cached = frozenset(
+                self._fp4_mla_draft_local_layers()
+                if self.fp4_mla_context_only_cache
+                else self._fp4_mla_local_layer_indices()
+            )
+            self._fp4_mla_decode_view_local_layer_set = cached
+        return cached
+
+    def _fp4_mla_layer_has_decode_views(self, local_layer: int) -> bool:
+        return local_layer in self._fp4_mla_decode_view_local_layers()
+
+    def fp4_mla_compact_layer_has_decode_views(self, compact_layer: int) -> bool:
+        """Whether a compact FP4 MLA layer keeps V scales and packed V."""
+        return self._fp4_mla_layer_has_decode_views(self._fp4_mla_compact_to_local[compact_layer])
+
+    def _require_fp4_mla_decode_views(self, compact_layer: int) -> None:
+        if not 0 <= compact_layer < len(self._cache_manager_layer_ids):
+            raise IndexError(f"Invalid compact FP4 MLA layer {compact_layer}.")
+        # Only a single-copy cache leaves layers without decode views.
+        if self.fp4_mla_context_only_cache and not self.fp4_mla_compact_layer_has_decode_views(
+            compact_layer
+        ):
+            raise RuntimeError(
+                "FP4 MLA context-only cache keeps no V scales or packed V on target "
+                f"layer {compact_layer}, so it cannot execute generation."
+            )
+
+    def fp4_mla_draft_lifecycle_layer_ids(self) -> list[int]:
+        """Global layers whose FP4 MLA pages live in the separate draft lifecycle."""
+        return [
+            int(self.pp_layers[local_layer])
+            for local_layer in getattr(self, "_fp4_mla_draft_lifecycle_layers", ())
+        ]
+
     def _fp8_mla_bytes_per_token(self, local_layer_idx: int) -> int:
         return (
             self.num_kv_heads_per_layer[local_layer_idx]
@@ -423,7 +528,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         return self.head_dim_per_layer[local_layer_idx] + self.fp4_mla_k_residual_dim
 
     def _v_scale_bytes_per_page(self) -> int:
-        if self.fp4_mla_context_only_cache:
+        if self.fp4_mla_context_only_cache and not getattr(self, "_fp4_mla_num_spec_layers", 0):
             return 0
         return get_fp4_mla_v_scale_pool_size(self.mla_v_scale_head_dim, self.tokens_per_block)
 
@@ -458,10 +563,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         }
         if data_role == Role.ALL:
             roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
-            if not self.fp4_mla_context_only_cache:
+            if self._fp4_mla_layer_has_decode_views(local_layer_idx):
                 roles.append(Role.MLA_V_SCALE)
-            if self.mla_v_head_dim is not None:
-                roles.append(Role.MLA_V_PACKED)
+                if self.mla_v_head_dim is not None:
+                    roles.append(Role.MLA_V_PACKED)
             return sum(role_sizes[role] for role in roles)
         if data_role not in role_sizes or role_sizes[data_role] <= 0:
             raise ValueError(f"Invalid FP4 MLA V2 data role: {data_role}")
@@ -473,20 +578,20 @@ class Fp4MlaV2CacheLayoutPolicy:
         result = {}
         for local_layer in self._fp4_mla_local_layer_indices():
             buffers = []
-            if not self.fp4_mla_context_only_cache:
+            if self._fp4_mla_layer_has_decode_views(local_layer):
                 buffers.append(
                     BufferConfig(
                         role=Role.MLA_V_SCALE,
                         size=self._v_scale_bytes_per_page(),
                     )
                 )
-            if self.mla_v_head_dim is not None:
-                buffers.append(
-                    BufferConfig(
-                        role=Role.MLA_V_PACKED,
-                        size=self._v_packed_bytes_per_page(),
+                if self.mla_v_head_dim is not None:
+                    buffers.append(
+                        BufferConfig(
+                            role=Role.MLA_V_PACKED,
+                            size=self._v_packed_bytes_per_page(),
+                        )
                     )
-                )
             result[local_layer] = buffers
         return result
 
@@ -520,6 +625,44 @@ class Fp4MlaV2CacheLayoutPolicy:
         }
         self._fp4_mla_compact_to_local = fp4_local_layers
         self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
+        decode_view_layers = [
+            local_layer
+            for local_layer in fp4_local_layers
+            if self._fp4_mla_layer_has_decode_views(local_layer)
+        ]
+        self._fp4_mla_v_layer_ids = tuple(
+            LayerId(local_layer) for local_layer in decode_view_layers
+        )
+        # Decode-view layers are either all FP4 layers or the trailing draft
+        # layers, so their compact indices are contiguous from this base.
+        self.fp4_mla_v_layer_base = (
+            self._fp4_mla_local_to_compact[decode_view_layers[0]] if decode_view_layers else 0
+        )
+        if [self._fp4_mla_local_to_compact[layer] for layer in decode_view_layers] != list(
+            range(self.fp4_mla_v_layer_base, self.fp4_mla_v_layer_base + len(decode_view_layers))
+        ):
+            raise RuntimeError("FP4 MLA decode-view layers must be contiguous compact layers.")
+        # Every role of an FP4 lifecycle shares one coalesced page geometry, so
+        # the kernels index all of them with one page table. Draft layers that
+        # keep the decode views next to single-copy target layers therefore get
+        # a lifecycle of their own, whose window outlasts any sequence, and a
+        # page table of their own.
+        self._fp4_mla_draft_lifecycle_layers = (
+            tuple(decode_view_layers) if self.fp4_mla_context_only_cache else ()
+        )
+        if self._fp4_mla_draft_lifecycle_layers:
+            # One token past the FP8 fallback window keeps the two
+            # non-evicting lifecycles distinct.
+            draft_lifecycle_window = (
+                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 2
+            )
+            for local_layer in self._fp4_mla_draft_lifecycle_layers:
+                cache_layers[local_layer] = AttentionLayerConfig(
+                    layer_id=LayerId(local_layer),
+                    buffers=list(cache_layers[local_layer].buffers),
+                    sliding_window_size=draft_lifecycle_window,
+                    num_sink_tokens=None,
+                )
         # The pure MLA manager resumes a reused prefix only on a block
         # boundary, where no HP ring content is needed. A hybrid manager
         # composing this policy keeps the HP ring with its recurrent snapshots.
@@ -561,6 +704,16 @@ class Fp4MlaV2CacheLayoutPolicy:
             fp8_pool_id = int(self.impl.get_layer_group_id(fp8_layer))
             if fp8_pool_id in (cache_pool_id, hp_pool_id):
                 raise RuntimeError("FP4 MLA, FP8 MLA, and HP state must use distinct lifecycles.")
+        draft_layer = None
+        draft_pool_id = None
+        draft_lifecycle_layers = getattr(self, "_fp4_mla_draft_lifecycle_layers", ())
+        if draft_lifecycle_layers:
+            draft_layer = LayerId(draft_lifecycle_layers[0])
+            draft_pool_id = int(self.impl.get_layer_group_id(draft_layer))
+            if draft_pool_id in (cache_pool_id, hp_pool_id, fp8_pool_id):
+                raise RuntimeError(
+                    "FP4 MLA draft layers with decode views need a lifecycle of their own."
+                )
 
         num_pools = len(self.impl.layer_grouping)
         pool_pointers = [[[0, 0], [0, 0]] for _ in range(num_pools)]
@@ -575,6 +728,14 @@ class Fp4MlaV2CacheLayoutPolicy:
             [int(self.impl.get_mem_pool_base_address(hp_layer, Role.MLA_HP_TAIL)), 0],
             [0, 0],
         ]
+        if draft_pool_id is not None:
+            pool_pointers[draft_pool_id] = [
+                [
+                    int(self.impl.get_mem_pool_base_address(draft_layer, Role.KEY)),
+                    int(self.impl.get_mem_pool_base_address(draft_layer, Role.KEY_BLOCK_SCALE)),
+                ],
+                [0, 0],
+            ]
         if fp8_pool_id is not None:
             pool_pointers[fp8_pool_id] = [
                 [
@@ -598,7 +759,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
             converter = self.impl.get_page_index_converter(layer_id, Role.KEY)
             local_layer = self._fp4_mla_compact_to_local[compact_layer]
-            mapping[local_layer] = [cache_pool_id, int(converter.layer_offset)]
+            mapping[local_layer] = [
+                int(self.impl.get_layer_group_id(layer_id)),
+                int(converter.layer_offset),
+            ]
         if fp8_pool_id is not None:
             for layer_id in self._fp8_mla_manager_layer_ids:
                 converter = self.impl.get_page_index_converter(layer_id, Role.KEY)
@@ -622,6 +786,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         self.index_scales[hp_pool_id] = int(
             self.impl.get_page_index_converter(hp_layer, Role.MLA_HP_TAIL).scale
         )
+        if draft_pool_id is not None:
+            self.index_scales[draft_pool_id] = int(
+                self.impl.get_page_index_converter(draft_layer, Role.KEY).scale
+            )
         if fp8_pool_id is not None:
             self.index_scales[fp8_pool_id] = int(
                 self.impl.get_page_index_converter(
@@ -650,9 +818,11 @@ class Fp4MlaV2CacheLayoutPolicy:
         self._prepare_page_table_materializer(index_mapper_capacity)
 
     def _validate_fp4_mla_layer_groups(self) -> None:
+        draft_lifecycle_layers = set(getattr(self, "_fp4_mla_draft_lifecycle_layers", ()))
         cache_groups = {
             int(self.impl.get_layer_group_id(layer_id))
             for layer_id in self._cache_manager_layer_ids
+            if int(layer_id) not in draft_lifecycle_layers
         }
         hp_groups = {
             int(self.impl.get_layer_group_id(layer_id)) for layer_id in self._hp_manager_layer_ids
@@ -662,24 +832,38 @@ class Fp4MlaV2CacheLayoutPolicy:
                 "FP4 MLA V2 requires one full-history and one HP sliding layer group; "
                 f"got cache={sorted(cache_groups)}, hp={sorted(hp_groups)}."
             )
+        draft_groups = {
+            int(self.impl.get_layer_group_id(LayerId(local_layer)))
+            for local_layer in draft_lifecycle_layers
+        }
+        if draft_lifecycle_layers and (
+            len(draft_groups) != 1 or draft_groups == cache_groups or draft_groups == hp_groups
+        ):
+            raise RuntimeError(
+                "FP4 MLA draft layers with decode views require one lifecycle distinct from "
+                f"the target and HP layers; got draft={sorted(draft_groups)}."
+            )
         fp8_groups = {
             int(self.impl.get_layer_group_id(layer_id))
             for layer_id in self._fp8_mla_manager_layer_ids
         }
         if self._fp8_mla_manager_layer_ids and (
-            len(fp8_groups) != 1 or fp8_groups == cache_groups or fp8_groups == hp_groups
+            len(fp8_groups) != 1
+            or fp8_groups == cache_groups
+            or fp8_groups == hp_groups
+            or fp8_groups == draft_groups
         ):
             raise RuntimeError(
                 "FP8 MLA fallback layers require one lifecycle distinct from "
                 f"FP4 and HP; got fp8={sorted(fp8_groups)}."
             )
-        cache_roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
-        if not self.fp4_mla_context_only_cache:
-            cache_roles.append(Role.MLA_V_SCALE)
-        if self.mla_v_head_dim is not None:
-            cache_roles.append(Role.MLA_V_PACKED)
         for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
             local_layer = self._fp4_mla_compact_to_local[compact_layer]
+            cache_roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
+            if self._fp4_mla_layer_has_decode_views(local_layer):
+                cache_roles.append(Role.MLA_V_SCALE)
+                if self.mla_v_head_dim is not None:
+                    cache_roles.append(Role.MLA_V_PACKED)
             converters = [
                 self.impl.get_page_index_converter(layer_id, role) for role in cache_roles
             ]
@@ -846,20 +1030,24 @@ class Fp4MlaV2CacheLayoutPolicy:
     def _iter_fp4_mla_physical_pool_views(self) -> Iterable[torch.Tensor]:
         """Yield page-major views spanning each physical MLA pool once."""
         local_layer = self._fp4_mla_compact_to_local[0]
-        cache_layer = self._cache_manager_layer_ids[0]
         storage_head_dim = self._storage_head_dim(local_layer)
-        yield self._role_pool_base_view(
-            cache_layer,
-            Role.KEY,
-            torch.uint8,
-            (self.kv_factor, self.tokens_per_block, 1, storage_head_dim // 2),
-        )
-        yield self._role_pool_base_view(
-            cache_layer,
-            Role.KEY_BLOCK_SCALE,
-            torch.uint8,
-            (self.tokens_per_block, storage_head_dim // FP4_BLOCK_SIZE),
-        ).view(torch.float8_e4m3fn)
+        lifecycle_layers = [self._cache_manager_layer_ids[0]]
+        draft_lifecycle_layers = getattr(self, "_fp4_mla_draft_lifecycle_layers", ())
+        if draft_lifecycle_layers:
+            lifecycle_layers.append(LayerId(draft_lifecycle_layers[0]))
+        for cache_layer in lifecycle_layers:
+            yield self._role_pool_base_view(
+                cache_layer,
+                Role.KEY,
+                torch.uint8,
+                (self.kv_factor, self.tokens_per_block, 1, storage_head_dim // 2),
+            )
+            yield self._role_pool_base_view(
+                cache_layer,
+                Role.KEY_BLOCK_SCALE,
+                torch.uint8,
+                (self.tokens_per_block, storage_head_dim // FP4_BLOCK_SIZE),
+            ).view(torch.float8_e4m3fn)
         if self._fp8_mla_manager_layer_ids:
             fp8_layer = self._fp8_mla_manager_layer_ids[0]
             fp8_local_layer = int(fp8_layer)
@@ -874,11 +1062,12 @@ class Fp4MlaV2CacheLayoutPolicy:
                     self.head_dim_per_layer[fp8_local_layer],
                 ),
             )
-        if not self.fp4_mla_context_only_cache:
-            yield self.get_mla_v_scale_pool_base().view(torch.float8_e4m3fn)
-        if self.mla_v_head_dim is not None:
+        v_scale_pool = self.get_mla_v_scale_pool_base()
+        if v_scale_pool is not None:
+            yield v_scale_pool.view(torch.float8_e4m3fn)
+        if self.mla_v_head_dim is not None and self._fp4_mla_v_layer_ids:
             yield self._role_pool_base_view(
-                cache_layer,
+                self._fp4_mla_v_layer_ids[0],
                 Role.MLA_V_PACKED,
                 torch.uint8,
                 (self.mla_v_head_dim, self.tokens_per_block // 2),
@@ -968,36 +1157,35 @@ class Fp4MlaV2CacheLayoutPolicy:
         return pool
 
     def get_mla_v_scale_pool(self) -> Optional[torch.Tensor]:
-        if self.fp4_mla_context_only_cache:
+        """V scales of the decode-view layers, indexed from ``fp4_mla_v_layer_base``."""
+        if not self._fp4_mla_v_layer_ids:
             return None
         return self._all_layer_role_view(
-            self._cache_manager_layer_ids,
+            list(self._fp4_mla_v_layer_ids),
             Role.MLA_V_SCALE,
             torch.uint8,
             (self._v_scale_bytes_per_page(),),
         ).view(torch.float8_e4m3fn)
 
     def get_mla_v_scale_pool_base(self) -> Optional[torch.Tensor]:
-        if self.fp4_mla_context_only_cache:
+        if not self._fp4_mla_v_layer_ids:
             return None
         return self._role_pool_base_view(
-            self._cache_manager_layer_ids[0],
+            self._fp4_mla_v_layer_ids[0],
             Role.MLA_V_SCALE,
             torch.uint8,
             (self._v_scale_bytes_per_page(),),
         )
 
     def get_mla_v_scale_page_offset(self, local_layer: int) -> int:
-        if not 0 <= local_layer < len(self._cache_manager_layer_ids):
-            raise IndexError(f"Invalid compact FP4 MLA layer {local_layer}.")
+        self._require_fp4_mla_decode_views(local_layer)
         layer_id = self._cache_manager_layer_ids[local_layer]
         return int(self.impl.get_page_index_converter(layer_id, Role.MLA_V_SCALE).layer_offset)
 
     def get_mla_v_packed_pool(self, local_layer: int) -> Optional[torch.Tensor]:
         if self.mla_v_head_dim is None:
             return None
-        if not 0 <= local_layer < len(self._cache_manager_layer_ids):
-            raise IndexError(f"Invalid compact FP4 MLA layer {local_layer}.")
+        self._require_fp4_mla_decode_views(local_layer)
         pool = self._role_view(
             self._cache_manager_layer_ids[local_layer],
             Role.MLA_V_PACKED,
@@ -1007,10 +1195,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         return pool.reshape(pool.shape[0] * pool.shape[1], pool.shape[2])
 
     def get_mla_v_packed_pool_base(self) -> Optional[torch.Tensor]:
-        if self.mla_v_head_dim is None:
+        if self.mla_v_head_dim is None or not self._fp4_mla_v_layer_ids:
             return None
         pool = self._role_pool_base_view(
-            self._cache_manager_layer_ids[0],
+            self._fp4_mla_v_layer_ids[0],
             Role.MLA_V_PACKED,
             torch.uint8,
             (self.mla_v_head_dim, self.tokens_per_block // 2),
@@ -1018,8 +1206,7 @@ class Fp4MlaV2CacheLayoutPolicy:
         return pool.reshape(pool.shape[0] * pool.shape[1], pool.shape[2])
 
     def get_mla_v_packed_page_offset(self, local_layer: int) -> int:
-        if not 0 <= local_layer < len(self._cache_manager_layer_ids):
-            raise IndexError(f"Invalid compact FP4 MLA layer {local_layer}.")
+        self._require_fp4_mla_decode_views(local_layer)
         layer_id = self._cache_manager_layer_ids[local_layer]
         return int(self.impl.get_page_index_converter(layer_id, Role.MLA_V_PACKED).layer_offset)
 

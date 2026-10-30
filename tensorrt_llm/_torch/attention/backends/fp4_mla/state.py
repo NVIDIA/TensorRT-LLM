@@ -67,6 +67,14 @@ class Fp4MlaState:
     full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
+    # Global layer whose lifecycle provides this state's page table; None
+    # selects the first FP4 layer.
+    page_table_layer_idx: int | None = None
+    # Compact FP4 layer that index 0 of ``v_scale_pool`` belongs to.
+    v_layer_base: int = 0
+    # Global layers served by this state; None means every FP4 layer that no
+    # other state claims.
+    layer_ids: frozenset[int] | None = None
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -81,7 +89,19 @@ class Fp4MlaState:
         return self._paged_kv_indptr[: self.num_sequences + 1]
 
     @classmethod
-    def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
+    def create(
+        cls,
+        metadata: TrtllmAttentionMetadata,
+        buffers: Buffers | None,
+        *,
+        draft_lifecycle: bool = False,
+    ) -> Fp4MlaState:
+        """Create the state of the target layers, or of the draft-layer lifecycle.
+
+        On a disaggregated context worker only one-model draft layers keep the
+        decode views, and they live in a lifecycle of their own with a page
+        table of their own; ``draft_lifecycle`` selects the state for them.
+        """
         manager = metadata.kv_cache_manager
         hp_ring_size = manager.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
@@ -106,18 +126,43 @@ class Fp4MlaState:
                 f"{getattr(hp_pool, 'shape', None)}."
             )
 
+        prefix = "fp4_mla_draft_" if draft_lifecycle else "fp4_mla_"
+
         def allocate(
             name: str, shape: tuple[int, ...], dtype: torch.dtype = torch.int32
         ) -> torch.Tensor:
             return metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"fp4_mla_{name}",
+                cache_name=f"{prefix}{name}",
                 dtype=dtype,
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        v_layer_base = int(getattr(manager, "fp4_mla_v_layer_base", 0))
+        if draft_lifecycle:
+            layer_ids = manager.fp4_mla_draft_lifecycle_layer_ids()
+            if not layer_ids:
+                raise RuntimeError("FP4 MLA has no draft-layer lifecycle to create a state for.")
+            state = cls(
+                hp_pool=hp_pool,
+                v_scale_pool=manager.get_mla_v_scale_pool(),
+                page_table_layer_idx=layer_ids[0],
+                v_layer_base=v_layer_base,
+                layer_ids=frozenset(layer_ids),
+            )
+        else:
+            # Single-copy target layers keep no V scales, so their state
+            # exposes none even when draft layers keep some.
+            state = cls(
+                hp_pool=hp_pool,
+                v_scale_pool=(
+                    None
+                    if getattr(manager, "fp4_mla_context_only_cache", False)
+                    else manager.get_mla_v_scale_pool()
+                ),
+                v_layer_base=v_layer_base,
+            )
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)
