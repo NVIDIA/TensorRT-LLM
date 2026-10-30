@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Local config for cosmos3_edge checkpoints. Registered with AutoConfig only
-# when the installed transformers does not provide the model type natively.
+# Local config for cosmos3_edge checkpoints, including TRT-LLM's required
+# rotary and projector normalization for AutoConfig and model loading.
 
 import torch
 from transformers.configuration_utils import PreTrainedConfig
