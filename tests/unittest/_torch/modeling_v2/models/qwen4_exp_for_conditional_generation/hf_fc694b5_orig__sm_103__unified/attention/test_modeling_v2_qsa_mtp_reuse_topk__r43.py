@@ -37,10 +37,10 @@ DEV = "cuda"
 CR = 4
 #: The engine's `max_num_tokens`: height of the request-map and Top-K buffers.
 ENGINE_MAX_NUM_TOKENS = 8192
-ENGINE_MAX_SEQ_LEN = 8192
 #: Captured positions for the first requests of a "mixed" batch: empty (0
 #: groups), 1, 100, 255, 511 and 512 groups, rows that gain a group and rows
-#: that do not, up to the last position the 8192-token envelope allows.
+#: that do not, up to the last position an 8192-token sequence allows. A cell
+#: with a longer `max_seq_len` also anchors its own last position.
 ANCHORS = (2, 3, 402, 2046, 2050, 8188, 2051, 2047, 1022, 4095, 5998, 7001, 37, 2044, 3001, 6143)
 
 
@@ -53,21 +53,25 @@ def _captured_row(visible: int, block_topk: int, gen: torch.Generator) -> torch.
     return row
 
 
-def _requests(contexts, drafted, gen) -> list[tuple[int, int]]:
+def _requests(contexts, drafted, gen, max_seq_len: int) -> list[tuple[int, int]]:
     """(captured_visible, current_visible) per request."""
     kind = contexts[0]
     if kind == "explicit":
         positions = list(contexts[1])
     else:
         count = contexts[1]
-        low, high = {"mixed": (0, 8188), "full": (2047, 8188)}[kind]
-        fixed = {"mixed": ANCHORS, "full": (2047, 2050, 8188, 2051)}[kind]
+        top = max_seq_len - CR
+        low, high = {"mixed": (0, top), "full": (2047, top)}[kind]
+        fixed = {
+            "mixed": ANCHORS if top in ANCHORS else (*ANCHORS, top),
+            "full": (2047, 2050, top, 2051),
+        }[kind]
         positions = list(fixed[:count])
         positions += torch.randint(low, high + 1, (count - len(positions),), generator=gen).tolist()
     out = []
     for q, position in enumerate(positions):
         d = drafted[q % len(drafted)]
-        position = min(position, ENGINE_MAX_SEQ_LEN - 1 - d)
+        position = min(position, max_seq_len - 1 - d)
         out.append(((position + 1) // CR, (position + d + 1) // CR))
     return out
 
@@ -83,7 +87,7 @@ def _build(spec, seed: int, requests: int | None = None) -> dict:
     contexts = spec["contexts"]
     if requests is not None:
         contexts = (contexts[0], requests)
-    pairs = _requests(contexts, spec["drafted"], gen)
+    pairs = _requests(contexts, spec["drafted"], gen, spec["max_seq_len"])
     num_requests = len(pairs)
     per_request = spec["rows_per_request"]
     rows = num_requests * per_request
@@ -146,6 +150,21 @@ def _assert_legal_selection(out: torch.Tensor, kwargs: dict) -> None:
     assert bool((ids >= -1).all())
 
 
+def _assert_widest_displacement_driven(spec, kwargs: dict) -> None:
+    """The cell reaches the riskiest path its offsets allow: a full row (every slot a
+    valid id) gaining `(CR - 1 + max(drafted)) // CR` fresh groups, which displaces that
+    many of its oldest ids. Seeds are fixed, so this holds the cell's coverage, not luck."""
+    block_topk = spec["block_topk"]
+    requests = kwargs["request_indices"].long()
+    filled = (kwargs["shared_indices"].long()[requests] >= 0).sum(dim=1)
+    captured = kwargs["shared_visible_blocks"].long()[requests]
+    fresh = (kwargs["visible_blocks"].long() - captured).clamp(0, block_topk)
+    widest = (CR - 1 + max(spec["drafted"])) // CR
+    assert bool(((filled == block_topk) & (fresh == widest)).any()), (
+        f"no full row gains {widest} fresh groups: the cell misses its displacement path"
+    )
+
+
 def _check_cell(spec, seed: int, requests: int | None = None) -> torch.Tensor:
     built = _build(spec, seed, requests)
     kwargs, buffers, rows = built["kwargs"], built["buffers"], built["rows"]
@@ -156,6 +175,8 @@ def _check_cell(spec, seed: int, requests: int | None = None) -> torch.Tensor:
     assert out.dtype == torch.int32 and tuple(out.shape) == (rows, spec["block_topk"])
     _compare(out, op.reference(**kwargs))
     _assert_legal_selection(out, kwargs)
+    if requests is None:
+        _assert_widest_displacement_driven(spec, kwargs)
     for name, tensor in buffers.items():
         if name == "output":
             assert torch.equal(tensor[rows:], before[name][rows:]), "rows past the view moved"
@@ -203,12 +224,13 @@ def _check_graph(spec, seed: int) -> None:
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying):  # noqa: F811
+    """Eager at the cell's own request count (bitwise, legal selection, nothing outside
+    the views moved), then each of its CUDA-graph request counts."""
     certifying(op)
     seed = zlib.crc32(cell.why.encode())
+    _check_cell(cell.spec, seed)
     if cell.spec["graph_batches"]:
         _check_graph(cell.spec, seed)
-    else:
-        _check_cell(cell.spec, seed)
 
 
 def _spec_of(prefix: str) -> dict:

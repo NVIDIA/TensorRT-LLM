@@ -17,7 +17,20 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_ke
 _BLOCK_TOPK = 512
 #: `(slots, this layer's slot)` of the shared buffers: with the MTP layer in the
 #: target's cache manager, 12 trunk full-attention layers plus the MTP layer.
+#: This is dep4's layout (attention DP keeps the draft layer in the trunk's manager).
 _COMBINED_SLOTS = (13, 12)
+#: tp4 / tep4's layout: attention TP puts the draft layer in a separate draft KV
+#: cache, so the metadata sizes the buffers by the larger manager (the trunk's 12
+#: sparse layers) and the draft loop reads the draft manager's only slot, 0.
+_SEPARATE_DRAFT_SLOTS = (12, 0)
+
+#: The engines' `max_batch_size` at every member and variant, and so the requests
+#: one draft step carries (one row each) and the shared buffers' height
+#: (`max_num_sequences` = `max_batch_size * max_beam_width`, beam width 1).
+_MAX_BATCH = 128
+#: The longest sequence the unified target serves: the tune's perf configs run
+#: `max_seq_len` 262144 (the MTP gates 16384).
+_ENVELOPE_SEQ_LEN = 262144
 
 
 def _spec(contexts, **overrides) -> dict:
@@ -25,12 +38,14 @@ def _spec(contexts, **overrides) -> dict:
 
     `contexts` says what each request's captured row and current row are:
       ("mixed", B)        B requests; the first 16 at fixed boundary positions
-                          (empty, short, 511, 512 and full rows), the rest seeded
+                          (empty, short, 511, 512 and full rows), plus one at the
+                          last position `max_seq_len` allows, the rest seeded
       ("full", B)         captured positions >= 2047: all 512 slots valid
       ("explicit", P)     one request per captured position in P
     A request captured at position `p` (its last accepted row) holds
     `(p + 1) // 4` complete groups; its draft row `d` positions later sees
-    `(p + d + 1) // 4`. `drafted` cycles over the requests.
+    `(p + d + 1) // 4`. `drafted` cycles over the requests. Positions stay below
+    `max_seq_len - d`.
     """
     base = dict(
         contexts=contexts,
@@ -41,8 +56,22 @@ def _spec(contexts, **overrides) -> dict:
         block_topk=_BLOCK_TOPK,
         metadata_dtype=torch.int32,
         graph_batches=(),
+        max_seq_len=8192,
     )
     return {**base, **overrides}
+
+
+def _unified(drafted, shared_rows) -> dict:
+    """The unified target's draft step: 128 requests, tp4 / tep4's separate-draft
+    slots, positions over the 262144 envelope, captured at 1 and 128 requests."""
+    return _spec(
+        ("mixed", _MAX_BATCH),
+        drafted=drafted,
+        shared_rows=shared_rows,
+        slots=_SEPARATE_DRAFT_SLOTS,
+        graph_batches=(1, _MAX_BATCH),
+        max_seq_len=_ENVELOPE_SEQ_LEN,
+    )
 
 
 class QsaMtpReuseTopk(OpWrapper):
@@ -105,6 +134,24 @@ class QsaMtpReuseTopk(OpWrapper):
             why="CUDA graph, drafted 1..6: captured at 1, 8 and 32 requests, new-data replay",
             spec=_spec(("mixed", 32), drafted=(1, 2, 3, 4, 5, 6), graph_batches=(1, 8, 32)),
         ),
+        # ---- the unified target (tp4 / tep4 / dep4 alike: one selection row per
+        # request, no head or rank axis): its 128-request draft steps.
+        Cell(
+            why="128 requests 3 positions past the capture, 512-row shared buffer (tep4 slots)",
+            spec=_unified(drafted=(3,), shared_rows=512),
+        ),
+        Cell(
+            why="128 requests 1 position past the capture, 256-row shared buffer (tep4 slots)",
+            spec=_unified(drafted=(1,), shared_rows=256),
+        ),
+        Cell(
+            why="128 requests 7 positions past the capture, 1024-row shared buffer (tep4 slots)",
+            spec=_unified(drafted=(7,), shared_rows=1024),
+        ),
+        Cell(
+            why="served mtp7 step: 128 requests filling the engine's 128-row buffer, drafted 1..6",
+            spec=_unified(drafted=(1, 2, 3, 4, 5, 6), shared_rows=_MAX_BATCH),
+        ),
     )
 
     note = """
@@ -149,11 +196,41 @@ class QsaMtpReuseTopk(OpWrapper):
     a 2-D `shared_visible_blocks` (the whole `[slots, seqs]` buffer is read as
     slot 0's counts). The test pins the last.
 
-    Certified: int32 ids and metadata, `block_topk` 512, up to 32 requests, the
-    identity request map over the target cache manager's 13-slot buffers, CUDA
-    graph capture at 1, 8 and 32 requests with a new-data replay.
-    Not certified: a permuted request map, a separate draft manager's one-slot
-    buffers.
+    Source: tier 2, an in-tree Triton kernel in the QSA attention backend,
+    JIT-compiled on first call for the device it runs on; the cells were driven
+    through that JIT path on sm_103 (GB300). One program per output row, no
+    autotune, no PDL.
+
+    The unified target (tp4 / tep4 / dep4) calls it with the same geometry on every
+    rank: one selection row per request, no head or rank axis (the indexer is
+    replicated). Under attention TP (tp4, tep4: the MTP unit's member) every rank
+    runs the whole batch and the draft layer sits in a separate draft KV cache, so
+    the buffers have the trunk's 12 slots and the draft loop reads slot 0
+    (`_SEPARATE_DRAFT_SLOTS`); under attention DP the draft layer is a trunk layer,
+    13 slots, slot 12 (`_COMBINED_SLOTS`). The buffers are `max_num_sequences` rows
+    tall, `max_batch_size * max_beam_width` (`build_attention_metadata`): 128 at
+    every member. The 256-, 512- and 1024-row cells are taller than any engine
+    allocates and are certified as stated. A draft step carries at most 128
+    requests, one row each.
+
+    The `drafted` axis is the offset past the capture (above), not
+    `max_draft_len`: mtp7's offsets 1..6 are the "served mtp7 step" cell, and the
+    offset-7 cell is beyond any served draft step. Every cell holds a full row
+    gaining the widest fresh count its offsets allow.
+
+    Hard limits (read from the kernel, not probed): both row offsets are int64
+    (`request.to(tl.int64) * BLOCK_TOPK`, `row.to(tl.int64) * BLOCK_TOPK`), so no
+    buffer size the envelope reaches wraps them. Ids and visible counts are int32;
+    positions below `max_seq_len` 262144 give at most 65536 groups. `block_topk`
+    must be a power of two (`tl.arange`).
+
+    Certified: int32 ids and metadata, `block_topk` 512, the identity request map,
+    up to 128 requests in 8- to 1024-row shared buffers (128 requests filling a
+    128-row buffer included), slots (13, 12) and (12, 0), captured positions up to
+    the 262144 envelope, CUDA graph capture at 1, 8, 32 and 128 requests with a
+    new-data replay.
+    Not certified: a permuted request map, more than one row per request, int64
+    metadata, 128 requests at dep4's (13, 12) slots (MTP is served at tep4).
     """
 
     def __call__(
