@@ -169,9 +169,14 @@ class Fp4MlaFmha(PhasedFmha):
             setattr(kv_cache_manager, _FP8_CONTEXT_SCRATCH_ATTR, scratch)
         else:
             assert isinstance(scratch, _Fp8MlaContextScratch)
-            assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
-                "FP8 MLA context scratch geometry must be shared by all layers of its KV manager."
-            )
+            # The step's FP8 metadata view is built only after this check, so a
+            # view of this scratch means an earlier layer already passed it.
+            fp8_context_state = metadata.fp4_mla_state.fp8_context_state
+            if fp8_context_state is None or fp8_context_state[0] is not scratch:
+                assert scratch.matches(metadata, device=q.device, head_dim=scratch_head_dim), (
+                    "FP8 MLA context scratch geometry must be shared by all layers of its "
+                    "KV manager."
+                )
 
         fp8_attention = self._fp8_attention
         if fp8_attention is None:
