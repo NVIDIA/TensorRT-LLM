@@ -138,7 +138,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
 from . import weights as _weights
-from .ops.activation.flashinfer_silu_and_mul__r44 import flashinfer_silu_and_mul
 from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
     fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
 )
@@ -1304,9 +1303,10 @@ class _MtpWeights(NamedTuple):
     fc1_s: torch.Tensor
     fc2_w: torch.Tensor
     fc2_s: torch.Tensor
-    sh_gu: torch.Tensor
+    # `[gate | up | gate logit | pad]` (`weights._cat_rows`), as the trunk's, and the down
+    # projection.
+    sh_gug: torch.Tensor
     sh_dn: torch.Tensor
-    sh_gate: torch.Tensor
     fhc_norm: tuple
     fhc_down: torch.Tensor
     fhc_up: torch.Tensor
@@ -1319,7 +1319,6 @@ def _mtp_views(core: Qwen4ExpUnifiedModelingV2) -> _MtpWeights:
     def slices(key: str) -> tuple:
         return tuple(torch.split(w[key], core.hidden, dim=0))
 
-    shared = 2 * core.shared_inter
     return _MtpWeights(
         pre_e_norm=w[f"{p}pre_e_norm"],
         pre_h_norm=slices(f"{p}pre_h_norm"),
@@ -1347,11 +1346,8 @@ def _mtp_views(core: Qwen4ExpUnifiedModelingV2) -> _MtpWeights:
         fc1_s=w[f"{p}fc1_s"],
         fc2_w=w[f"{p}fc2_w"],
         fc2_s=w[f"{p}fc2_s"],
-        # The shared expert's gate|up rows, and its per-token gate logit row, of the one
-        # `[gate | up | gate logit | pad]` operand (`weights._cat_rows`).
-        sh_gu=w[f"{p}sh_gu"][:shared].t(),
+        sh_gug=w[f"{p}sh_gu"].t(),
         sh_dn=w[f"{p}sh_dn"].t(),
-        sh_gate=w[f"{p}sh_gu"][shared : shared + 1].t(),
         fhc_norm=slices(f"{p}fhc_norm"),
         fhc_down=w[f"{p}fhc_down"],
         fhc_up=w[f"{p}fhc_up"],
@@ -1625,10 +1621,11 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
 def _mtp_moe_block(core, M: _MtpWeights, x) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
     block-scale routed experts over this rank's window (1x128 activation scales, pre-routed;
-    the window partials summed over the TP group), and the replicated bf16 shared expert
-    gated by its own sigmoid logit. The activation scales come back transposed
+    the window partials summed over the TP group), and the replicated bf16 shared expert in
+    the trunk's form -- one GEMM forms gate|up and the per-token gate logit -- combined as
+    `routed + sigmoid(gate logit) * shared`. The activation scales come back transposed
     `[hidden / 128, tokens]` and go straight to the runner."""
-    logits = mtp_cublas_mm(x, M.router)
+    logits = cublas_mm(x, M.router)
     topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=x.dtype)
     xq, xsf = fp8_quantize_1x128(x, use_ue8m0=_MTP_MOE_USE_UE8M0)
     routed = fp8_block_scale_moe_runner(
@@ -1656,8 +1653,9 @@ def _mtp_moe_block(core, M: _MtpWeights, x) -> torch.Tensor:
         gemm1_clamp_limit=None,
     )
     routed = core.tp_sum(routed)
-    shared = mtp_cublas_mm(flashinfer_silu_and_mul(mtp_cublas_mm(x, M.sh_gu)), M.sh_dn)
-    gate_logits = mtp_cublas_mm(x, M.sh_gate)
+    gug = cublas_mm(x, M.sh_gug)
+    shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), M.sh_dn)
+    gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
     return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
 
@@ -1665,7 +1663,7 @@ def _mtp_tail(core, M: _MtpWeights, x, attn, inject) -> torch.Tensor:
     """The draft layer after its attention core: the gated output projection's partial summed
     over the TP group and injected, the MoE-side hyper-connection, the MoE and its injection.
     `attn` is the `[T, q_width]` gated attention output."""
-    x = qwen4_exp_post_inject(x, core.tp_sum(mtp_cublas_mm(attn, M.o)), inject)
+    x = qwen4_exp_post_inject(x, core.tp_sum(cublas_mm(attn, M.o)), inject)
     mixed, inject = qwen4_exp_gated_residual(
         _grouped_norm(core, x, M.mhc_norm), M.mhc_down, M.mhc_up, M.mhc_inject, core.hc_count
     )

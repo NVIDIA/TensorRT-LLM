@@ -436,10 +436,10 @@ def test_a_tep4_rank_holds_its_share_of_the_draft_layer(rank) -> None:
     assert tuple(w[f"{p}fc2_s"].shape) == (128, 2560 // 128, 640 // 128)
 
 
-def test_the_draft_layer_views_split_the_fused_shared_expert() -> None:
-    """`_mtp_views` reads the shared expert's gate|up rows and its gate-logit row out of the
-    one `[gate | up | gate logit | pad]` operand as column-major GEMM operands, and the grouped
-    norms as one slice a stream."""
+def test_the_draft_layer_views_are_the_trunks_gemm_operands() -> None:
+    """`_mtp_views` hands the GEMMs column-major views: the shared expert's one
+    `[gate | up | gate logit | pad]` operand (the trunk layers' 2560 -> 1288 shape), the q
+    projection with its interleaved gate, and the grouped norms as one slice a stream."""
     core = _core(0, _TEP4, MTPDecodingConfig(max_draft_len=3))
     with torch.device("cpu"):
         for key, t in core.w.items():
@@ -447,8 +447,9 @@ def test_the_draft_layer_views_split_the_fused_shared_expert() -> None:
                 torch.empty(t.shape, dtype=t.dtype, device="cpu"), requires_grad=False
             )
     M_ = M._mtp_views(core)
-    assert tuple(M_.sh_gu.shape) == (2560, 1280) and M_.sh_gu.stride() == (1, 2560)
-    assert tuple(M_.sh_gate.shape) == (2560, 1) and M_.sh_gate.stride() == (1, 2560)
+    assert tuple(M_.sh_gug.shape) == (2560, 1288) and M_.sh_gug.stride() == (1, 2560)
+    assert tuple(M_.sh_dn.shape) == (640, 2560) and M_.sh_dn.stride() == (1, 640)
+    assert tuple(M_.o.shape) == (1536, 2560) and M_.o.stride() == (1, 1536)
     assert tuple(M_.q.shape) == (2560, 3072) and M_.q.stride() == (1, 2560)
     assert len(M_.pre_h_norm) == len(M_.ahc_norm) == len(M_.fhc_norm) == 4
     assert all(tuple(s.shape) == (2560,) for s in M_.mhc_norm)
