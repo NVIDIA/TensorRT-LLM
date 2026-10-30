@@ -744,13 +744,22 @@ class TestRenderConversation:
         assert rendered.text is not None
         assert (rendered.token_ids is not None) == tokenize
 
-    def test_python_renderer_with_a_jinja_template_keeps_the_text_path(self) -> None:
-        tokenizer = make_tokenizer(name=KIMI_K3, chat_template=SERVER_TEMPLATE)
+    @pytest.mark.parametrize("template_source", ["tokenizer", "request"])
+    def test_python_renderer_with_a_jinja_template_keeps_the_text_path(
+        self, template_source
+    ) -> None:
+        tokenizer = make_tokenizer(
+            name=KIMI_K3, chat_template=SERVER_TEMPLATE if template_source == "tokenizer" else None
+        )
+        overrides = {"chat_template": SERVER_TEMPLATE} if template_source == "request" else {}
 
-        rendered = self._render_kimi_k3_tool_result(tokenizer, self.K3_PLAIN, tokenize=True)
+        rendered = self._render_kimi_k3_tool_result(
+            tokenizer, self.K3_PLAIN, tokenize=True, **overrides
+        )
 
         assert rendered.text is not None
-        assert rendered.token_ids is not None
+        assert rendered.text.startswith("SERVER:")
+        assert rendered.token_ids == tokenizer.encode(rendered.text, add_special_tokens=False)
 
     def test_the_forced_prefix_is_appended_and_reported(self, tokenizer) -> None:
         from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines

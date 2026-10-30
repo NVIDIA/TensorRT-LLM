@@ -4,6 +4,7 @@
 import asyncio
 import base64
 from collections import defaultdict
+from functools import partial
 from io import BytesIO
 from pathlib import Path
 from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
@@ -841,7 +842,15 @@ def apply_chat_template(
                                                         mm_placeholder_count)
     # STRING path: placeholders already inserted in content by caller
 
-    result = tokenizer.apply_chat_template(
+    template_renderer = tokenizer.apply_chat_template
+    if isinstance(
+            tokenizer,
+            PreTrainedTokenizerBase) and _has_python_chat_template(tokenizer):
+        # A selected Jinja template must not be ignored by a native renderer.
+        template_renderer = partial(PreTrainedTokenizerBase.apply_chat_template,
+                                    tokenizer)
+
+    result = template_renderer(
         conversation=conversation,
         tokenize=enable_tokenize,
         return_dict=False,
