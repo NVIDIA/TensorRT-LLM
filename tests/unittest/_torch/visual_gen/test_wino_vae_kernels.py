@@ -1,20 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused RMSNorm+SiLU kernel vs the eager WanRMSNorm + SiLU chain."""
+"""WinoVae kernels against their eager references: the runtime-compiled norm kernels, the
+temporal / spatial Winograd pieces, the compiled frame ops and the sm100 pipeline."""
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-    can_fuse_rms_norm_silu,
-    rms_norm_silu,
+    add_rms_norm_silu_cuda,
+    add_rms_norm_silu_reference,
+    can_use_cuda_rms_norm_silu,
+    cuda_op_available,
+    rms_norm_silu_cuda,
     rms_norm_silu_reference,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel")
 
-# Decoder/encoder channel counts of the Cosmos3 VAE plus a few odd ones.
-CHANNELS = [48, 96, 160, 256, 320, 512, 640, 1024, 12, 7, 16, 24, 32]
+# Decoder/encoder channel counts of the Cosmos3 VAE plus a few small ones.
+CHANNELS = [48, 96, 160, 256, 320, 512, 640, 1024, 16, 24, 32]
 
 
 def _inputs(
@@ -26,83 +30,6 @@ def _inputs(
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(dtype)
     b = (0.05 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(dtype) if bias else None
     return x, gamma, b
-
-
-@pytest.mark.parametrize("C", CHANNELS)
-@pytest.mark.parametrize("bias", [False, True])
-def test_reference_rounding_matches_eager(C: int, bias: bool) -> None:
-    x, gamma, b = _inputs(C, bias=bias)
-    assert can_fuse_rms_norm_silu(x)
-    scale = C**0.5
-    expected = rms_norm_silu_reference(x, gamma, b if b is not None else 0.0, scale)
-    actual = rms_norm_silu(x, gamma, b, scale, reference_rounding=True)
-    assert actual.is_contiguous(memory_format=torch.channels_last_3d)
-    # Only the fp32 reduction order can differ: allow one bf16 ulp on a handful of elements.
-    diff = (actual.float() - expected.float()).abs()
-    ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
-    mismatched = (diff > ulp).float().mean().item()
-    assert mismatched < 1e-3, f"C={C}: {mismatched:.2e} of elements differ by more than 1 bf16 ulp"
-    assert torch.equal(actual, expected) or diff.max().item() <= 2 * ulp.max().item()
-
-
-@pytest.mark.parametrize("C", CHANNELS)
-def test_fp32_mode_is_closer_to_fp32_than_eager(C: int) -> None:
-    x, gamma, b = _inputs(C, bias=True)
-    scale = C**0.5
-    truth = rms_norm_silu_reference(x.float(), gamma.float(), b.float(), scale)
-    eager = rms_norm_silu_reference(x, gamma, b, scale).float()
-    fused = rms_norm_silu(x, gamma, b, scale, reference_rounding=False).float()
-    err_eager = (eager - truth).norm() / truth.norm()
-    err_fused = (fused - truth).norm() / truth.norm()
-    assert torch.isfinite(fused).all()
-    assert err_fused <= err_eager * 1.05, f"C={C}: fused {err_fused:.3e} vs eager {err_eager:.3e}"
-    assert err_fused < 1e-2
-
-
-def test_zero_rows_and_small_norms() -> None:
-    C = 64
-    x, gamma, _ = _inputs(C)
-    x[0, :, 0, 0, 0] = 0  # all-zero channel vector -> F.normalize divides by eps -> 0
-    x[1, :, 1, 2, 3] = 1e-20
-    for mode in (True, False):
-        out = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=mode)
-        assert torch.isfinite(out.float()).all()
-        assert out[0, :, 0, 0, 0].abs().max().item() == 0.0
-
-
-def test_fallback_conditions() -> None:
-    x = torch.randn(1, 32, 2, 4, 4, device="cuda", dtype=torch.bfloat16)  # NCTHW, not channels-last
-    assert not can_fuse_rms_norm_silu(x)
-    assert can_fuse_rms_norm_silu(x.to(memory_format=torch.channels_last_3d))
-    assert not can_fuse_rms_norm_silu(x.float().to(memory_format=torch.channels_last_3d))
-    assert not can_fuse_rms_norm_silu(x.cpu())
-
-
-def test_4d_images_layout() -> None:
-    C = 96
-    gen = torch.Generator(device="cuda").manual_seed(0)
-    x = (
-        torch.randn(3, C, 8, 8, generator=gen, device="cuda")
-        .to(torch.bfloat16)
-        .to(memory_format=torch.channels_last)
-    )
-    gamma = torch.ones(C, 1, 1, device="cuda", dtype=torch.bfloat16)
-    expected = rms_norm_silu_reference(x, gamma, 0.0, C**0.5)
-    actual = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=True)
-    assert (actual.float() - expected.float()).abs().max().item() < 2e-2
-
-
-# ---------------------------------------------------------------------------
-# CUDA norm kernel against the Triton prototype and eager
-# ---------------------------------------------------------------------------
-
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    add_rms_norm_silu_cuda,
-    add_rms_norm_silu_reference,
-    can_use_cuda_rms_norm_silu,
-    cuda_op_available,
-    rms_norm_silu_cuda,
-)
 
 
 def _built(available: bool, what: str) -> pytest.MarkDecorator:
@@ -124,11 +51,50 @@ def _require_sm100() -> None:
 
 
 cuda_op = _built(cuda_op_available(), "runtime compilation of the norm kernels (nvcc, cuda-python)")
-CUDA_CHANNELS = [c for c in CHANNELS if c % 8 == 0]  # 7 and 12 take the Triton/eager path
 
 
 @cuda_op
-@pytest.mark.parametrize("C", CUDA_CHANNELS)
+@pytest.mark.parametrize("C", CHANNELS)
+def test_cuda_fp32_mode_is_closer_to_fp32_than_eager(C: int) -> None:
+    x, gamma, b = _inputs(C, bias=True)
+    scale = C**0.5
+    truth = rms_norm_silu_reference(x.float(), gamma.float(), b.float(), scale)
+    eager = rms_norm_silu_reference(x, gamma, b, scale).float()
+    fused = rms_norm_silu_cuda(x, gamma, b, scale).float()
+    err_eager = (eager - truth).norm() / truth.norm()
+    err_fused = (fused - truth).norm() / truth.norm()
+    assert torch.isfinite(fused).all()
+    assert err_fused <= err_eager * 1.05, f"C={C}: fused {err_fused:.3e} vs eager {err_eager:.3e}"
+    assert err_fused < 1e-2
+
+
+def test_cuda_norm_eligibility() -> None:
+    x = torch.randn(1, 32, 2, 4, 4, device="cuda", dtype=torch.bfloat16)  # NCTHW, not channels-last
+    assert not can_use_cuda_rms_norm_silu(x)
+    assert can_use_cuda_rms_norm_silu(x.to(memory_format=torch.channels_last_3d))
+    assert not can_use_cuda_rms_norm_silu(x.float().to(memory_format=torch.channels_last_3d))
+    assert not can_use_cuda_rms_norm_silu(x.cpu())
+    odd = torch.randn(1, 12, 2, 4, 4, device="cuda", dtype=torch.bfloat16)
+    assert not can_use_cuda_rms_norm_silu(odd.to(memory_format=torch.channels_last_3d))
+
+
+@cuda_op
+def test_cuda_4d_images_layout() -> None:
+    C = 96
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    x = (
+        torch.randn(3, C, 8, 8, generator=gen, device="cuda")
+        .to(torch.bfloat16)
+        .to(memory_format=torch.channels_last)
+    )
+    gamma = torch.ones(C, 1, 1, device="cuda", dtype=torch.bfloat16)
+    expected = rms_norm_silu_reference(x, gamma, 0.0, C**0.5)
+    actual = rms_norm_silu_cuda(x, gamma, None, C**0.5, reference_rounding=True)
+    assert (actual.float() - expected.float()).abs().max().item() < 2e-2
+
+
+@cuda_op
+@pytest.mark.parametrize("C", CHANNELS)
 @pytest.mark.parametrize("bias", [False, True])
 def test_cuda_reference_mode_matches_eager(C: int, bias: bool) -> None:
     x, gamma, b = _inputs(C, frames=5, hw=(9, 13), bias=bias)
@@ -141,20 +107,6 @@ def test_cuda_reference_mode_matches_eager(C: int, bias: bool) -> None:
     ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
     mismatched = (diff > ulp).float().mean().item()
     assert mismatched < 1e-3, f"C={C}: {mismatched:.2e} of elements differ by more than 1 bf16 ulp"
-
-
-@cuda_op
-@pytest.mark.parametrize("C", CUDA_CHANNELS)
-@pytest.mark.parametrize("reference", [False, True])
-def test_cuda_matches_triton(C: int, reference: bool) -> None:
-    x, gamma, b = _inputs(C, frames=5, hw=(9, 13), bias=True)
-    scale = C**0.5
-    cuda = rms_norm_silu_cuda(x, gamma, b, scale, reference_rounding=reference)
-    tri = rms_norm_silu(x, gamma, b, scale, reference_rounding=reference)
-    diff = (cuda.float() - tri.float()).abs()
-    ulp = tri.float().abs().clamp_min(1e-3) * 2**-7
-    # Only the fp32 reduction order can differ between the two implementations.
-    assert (diff > ulp).float().mean().item() < 1e-3
 
 
 @cuda_op
@@ -179,7 +131,7 @@ def test_cuda_tail_rows_and_zero_rows() -> None:
 
 @cuda_op
 @pytest.mark.parametrize("C", [256, 512, 160, 48])
-def test_cuda_large_tensor_matches_triton(C: int) -> None:
+def test_cuda_large_tensor_matches_eager(C: int) -> None:
     # ~300k rows: every persistent block streams many shared-memory stages.
     gen = torch.Generator(device="cuda").manual_seed(C + 1)
     x = (
@@ -189,12 +141,9 @@ def test_cuda_large_tensor_matches_triton(C: int) -> None:
     )
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
-    cuda = rms_norm_silu_cuda(x, gamma, None, scale)
-    tri = rms_norm_silu(x, gamma, None, scale)
-    ulp = tri.float().abs().clamp_min(1e-3) * 2**-7
-    assert ((cuda.float() - tri.float()).abs() > ulp).float().mean().item() < 1e-3
     ref = rms_norm_silu_cuda(x, gamma, None, scale, reference_rounding=True)
     expected = rms_norm_silu_reference(x, gamma, 0.0, scale)
+    ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
     assert ((ref.float() - expected.float()).abs() > ulp).float().mean().item() < 1e-3
 
 
@@ -408,14 +357,18 @@ wino_op = cuda_op
 def test_wino_norm_silu_reference_mode_is_bitwise(
     C: int, cache_frames: int, source: str, extras: str, order_dtype: tuple[int, str]
 ) -> None:
-    order, slab = order_dtype
-    slab_dtype = torch.float16 if slab == "fp16" else torch.bfloat16
+    order, dtype_name = order_dtype
+    winograd_dtype = torch.float16 if dtype_name == "fp16" else torch.bfloat16
     gen = torch.Generator(device="cuda").manual_seed(C + cache_frames)
     T, P = (4 if order == 2 else 8), 9 * 13
     bf = torch.bfloat16
     rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
     x = rnd(T, P, C) if source == "x" else None
-    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source == "m" else None
+    m = (
+        [rnd(T // order, P, C).to(winograd_dtype) for _ in range(order + 2)]
+        if source == "m"
+        else None
+    )
     residual = rnd(T, P, C) if extras == "residual_bias" else None
     in_bias = (
         (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf)
@@ -426,7 +379,7 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     scale = C**0.5
     s_ref, tail_ref, d_ref = wino_norm_silu_reference(
-        x, m, residual, in_bias, cache, gamma, 0.0, scale, order, slab_dtype
+        x, m, residual, in_bias, cache, gamma, 0.0, scale, order, winograd_dtype
     )
     s, tail, d = wino_norm_silu_cuda(
         x,
@@ -440,12 +393,12 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
         T,
         reference_rounding=True,
         order=order,
-        half_slabs=slab == "fp16",
+        fp16_inputs=dtype_name == "fp16",
     )
-    assert d.dtype == slab_dtype and d.shape[0] == order + 2
+    assert d.dtype == winograd_dtype and d.shape[0] == order + 2
     if residual is not None:
         assert torch.equal(s, s_ref), "sum must be bit-identical to the eager adds"
-    # The normalized frames (cache) and the slabs match eager up to the fp32 reduction
+    # The normalized frames (cache) and the Winograd inputs match eager up to the fp32 reduction
     # order of the sum of squares: at most 1 bf16 ulp on a tiny fraction of elements.
     for name, a, b in [
         ("cache", tail, tail_ref),
@@ -466,9 +419,9 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
     x = torch.randn(T, P, C, generator=gen, device="cuda").to(bf)
     cache = torch.randn(2, P, C, generator=gen, device="cuda").to(bf)
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
-    slab_dtype = torch.float16 if order == 4 else torch.bfloat16
+    winograd_dtype = torch.float16 if order == 4 else torch.bfloat16
     _, tail_ref, d_ref = wino_norm_silu_reference(
-        x, None, None, None, cache, gamma, 0.0, C**0.5, order, slab_dtype
+        x, None, None, None, cache, gamma, 0.0, C**0.5, order, winograd_dtype
     )
     _, tail, d = wino_norm_silu_cuda(
         x,
@@ -481,7 +434,7 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
         C**0.5,
         T,
         order=order,
-        half_slabs=order == 4,
+        fp16_inputs=order == 4,
     )
     for a, b in [(tail, tail_ref), *zip(d, d_ref)]:
         rel = ((a.float() - b.float()).norm() / b.float().norm().clamp_min(1e-6)).item()
@@ -490,8 +443,8 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
 
 @wino_op
 @pytest.mark.parametrize("order", [2, 4])
-def test_wino_norm_slabs_reproduce_conv3d(order: int) -> None:
-    """Slabs from the kernel, one conv2d per component filter, combine: the causal 3x3x3 conv
+def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
+    """Winograd inputs from the kernel, one conv2d per component filter, combine: the causal 3x3x3 conv
     of the normalized frames (fp32 reference on the same 16-bit inputs)."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
         TEMPORAL_WINO,
@@ -507,7 +460,7 @@ def test_wino_norm_slabs_reproduce_conv3d(order: int) -> None:
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
     weight = (0.1 * torch.randn(Co, C, 3, 3, 3, generator=gen, device="cuda")).to(torch.bfloat16)
     _, _, d = wino_norm_silu_cuda(
-        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, half_slabs=order == 4
+        x, None, None, None, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=order == 4
     )
     g = winograd_weights(weight, order, torch.float32)
     comps = order + 2
@@ -545,78 +498,6 @@ from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa
     wino_combine_reference,
 )
 
-
-@upsample_op
-@cuda_op
-@pytest.mark.parametrize("mode", ["rows", "slabs"])
-@pytest.mark.parametrize("with_bias", [False, True])
-# (factor_t, cin -> cout): no shortcut; repeats 8 (one element per channel, up0); repeats 4
-# and 2 (two elements per channel, up1 / up2); first-chunk crop.
-@pytest.mark.parametrize(
-    "shortcut_spec",
-    [None, (2, 64, 64, False), (2, 128, 64, False), (1, 128, 64, False), (2, 64, 64, True)],
-)
-def test_upsample_norm_matches_gather_then_norm(
-    mode: str, with_bias: bool, shortcut_spec: tuple[int, int, int, bool] | None
-) -> None:
-    """The norm kernel forming the upsampled frames while reading is bit-identical to the
-    gather kernel followed by the norm, in the row mode and the Winograd slab mode."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        frames_view,
-        rms_norm_silu_cuda,
-        upsample_rms_norm_silu_cuda,
-        upsample_source,
-        wino_norm_silu_cuda,
-    )
-
-    factor_t, cin, cout, first_chunk = shortcut_spec or (1, 64, 64, False)
-    tr, h, w = 2, 5, 6
-    frames = tr * factor_t - (factor_t - 1 if first_chunk else 0)
-    if mode == "slabs" and frames % 2:
-        # The first-chunk crop leaves an odd frame count, which the model routes through the
-        # row mode; the pair walk never sees it.
-        pytest.skip("odd frame count after the first-chunk crop: row mode only")
-    gen = torch.Generator(device="cuda").manual_seed(cin + cout + factor_t)
-    temp = torch.randn(frames, 4 * cout, h + 1, w + 1, generator=gen, device="cuda")
-    temp = temp.to(torch.bfloat16).contiguous(memory_format=torch.channels_last)
-    bias = (
-        (0.1 * torch.randn(cout, generator=gen, device="cuda")).to(torch.bfloat16)
-        if with_bias
-        else None
-    )
-    residual = None
-    repeats, crop = 1, 0
-    if shortcut_spec is not None:
-        frames_r = (frames + (factor_t - 1 if first_chunk else 0)) // factor_t
-        residual = torch.randn(1, cin, frames_r, h, w, generator=gen, device="cuda").to(
-            torch.bfloat16
-        )
-        residual = residual.to(memory_format=torch.channels_last_3d)
-        dup = DupUp3D(cin, cout, factor_t=factor_t, factor_s=2)
-        repeats = dup.repeats
-        crop = factor_t - 1 if first_chunk else 0
-    gamma = (1 + 0.1 * torch.randn(cout, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
-    nbias = (0.05 * torch.randn(cout, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
-    scale = cout**0.5
-    x = upsample_gather_cuda(temp, residual, 1, frames, factor_t, repeats, crop, bias=bias)
-    up = upsample_source(temp, residual, bias, factor_t, repeats, crop)
-    if mode == "rows":
-        want = rms_norm_silu_cuda(x, gamma, nbias, scale)
-        s, got = upsample_rms_norm_silu_cuda(up, gamma, nbias, scale)
-        assert torch.equal(s, x)
-        assert torch.equal(got, want)
-        return
-    cache = torch.randn(1, cout, 2, 2 * h, 2 * w, generator=gen, device="cuda").to(torch.bfloat16)
-    cache = frames_view(cache.to(memory_format=torch.channels_last_3d))
-    args = (cache, gamma.reshape(-1), nbias.reshape(-1), scale, frames)
-    kw = dict(order=2, half_slabs=True)
-    _, tail_want, d_want = wino_norm_silu_cuda(frames_view(x), None, None, None, *args, **kw)
-    s, tail, d = wino_norm_silu_cuda(None, None, None, None, *args, upsample=up, **kw)
-    assert torch.equal(s.view(frames, -1, cout), frames_view(x))
-    assert torch.equal(tail, tail_want)
-    assert torch.equal(d, d_want)
-
-
 frame_ops = _built(cuda_frame_ops_available(), "trtllm::vae_interleave_bias")
 
 
@@ -629,10 +510,14 @@ def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
     order = 4 if source == "m4h" else 2
     T, P = 2 * order, 7 * 11
     bf = torch.bfloat16
-    slab_dtype = torch.float16 if source.endswith("h") else bf
+    winograd_dtype = torch.float16 if source.endswith("h") else bf
     rnd = lambda *s: torch.randn(*s, generator=gen, device="cuda").to(bf)  # noqa: E731
     x = rnd(T, P, C) if source == "x" else None
-    m = [rnd(T // order, P, C).to(slab_dtype) for _ in range(order + 2)] if source != "x" else None
+    m = (
+        [rnd(T // order, P, C).to(winograd_dtype) for _ in range(order + 2)]
+        if source != "x"
+        else None
+    )
     bias = (0.3 * torch.randn(C, generator=gen, device="cuda")).to(bf) if "bias" in extras else None
     residual = rnd(T, P, C) if "residual" in extras else None
     ref = x if x is not None else wino_combine_reference(m)
@@ -1287,7 +1172,7 @@ def test_unpatchify_clamp_into_matches_eager(patch: int, shape: tuple[int, int, 
 
 
 # ---------------------------------------------------------------------------
-# Frame geometry: products read from, and slabs / rows written to, frames with halo rows
+# Frame geometry: products read from, and Winograd inputs / rows written to, frames with halo rows
 # or columns (the spatially sharded model exchanges the halos)
 # ---------------------------------------------------------------------------
 
@@ -1326,7 +1211,7 @@ def _interior(phys: torch.Tensor, geo) -> torch.Tensor:
 @pytest.mark.parametrize("axis", ["h", "w"])
 @pytest.mark.parametrize("order", [2, 4])
 def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None:
-    """Producer: slabs into halo frames; consumer: products from halo frames; both bitwise."""
+    """Producer: Winograd inputs into halo frames; consumer: products from halo frames; both bitwise."""
     from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
 
     gen = torch.Generator(device="cuda").manual_seed(C)
@@ -1341,9 +1226,9 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(bf)
     geo = _halo_geometry(H, W, axis)
 
-    # Producer with a slab geometry.
+    # Producer with a Winograd-input geometry.
     s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        x, None, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, half_slabs=True
+        x, None, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=True
     )
     d_phys = torch.full(
         (order + 2, T // order, geo.frame, C), 7.0, dtype=torch.float16, device="cuda"
@@ -1359,8 +1244,8 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         C**0.5,
         T,
         order=order,
-        half_slabs=True,
-        slab_geometry=geo,
+        fp16_inputs=True,
+        inputs_geometry=geo,
     )
     assert d.shape == d_phys.shape
     assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref)
@@ -1369,7 +1254,7 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
     # Consumer with a products geometry (halo positions hold a sentinel).
     m_ref = [rnd(T // order, P, C).to(torch.float16) for _ in range(order + 2)]
     s_ref, tail_ref, d_ref = jit_norm.wino_norm_silu(
-        None, m_ref, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, half_slabs=True
+        None, m_ref, residual, in_bias, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=True
     )
     m_phys = list(_embed(torch.stack(m_ref), geo).unbind(0))
     s, tail, d = jit_norm.wino_norm_silu(
@@ -1383,12 +1268,12 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         C**0.5,
         T,
         order=order,
-        half_slabs=True,
+        fp16_inputs=True,
         products_geometry=geo,
     )
     assert torch.equal(s, s_ref) and torch.equal(tail, tail_ref) and torch.equal(d, d_ref)
 
-    # Both at once: products with halos in, slabs with halos out.
+    # Both at once: products with halos in, Winograd inputs with halos out.
     s, tail, d = jit_norm.wino_norm_silu(
         None,
         m_phys,
@@ -1400,9 +1285,9 @@ def test_wino_norm_geometry_matches_plain(C: int, axis: str, order: int) -> None
         C**0.5,
         T,
         order=order,
-        half_slabs=True,
+        fp16_inputs=True,
         products_geometry=geo,
-        slab_geometry=geo,
+        inputs_geometry=geo,
     )
     assert torch.equal(s, s_ref) and torch.equal(_interior(d, geo), d_ref)
 
@@ -1483,7 +1368,7 @@ def _untouched(buf: torch.Tensor, axis: str, line: int) -> bool:
 @pytest.mark.parametrize("order", [2, 4])
 @pytest.mark.parametrize("one_line", [False, True])
 def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line: bool) -> None:
-    """The kernel stores the border lines of its slab / row output into the neighbours'
+    """The kernel stores the border lines of its Winograd / row output into the neighbours'
     buffers (here: local stand-ins with their own layout) and nothing else; the host-side
     copy writes the same lines. ``one_line``: the shard is a single line along the split
     axis, so the same line goes to both neighbours."""
@@ -1503,7 +1388,7 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
     x = rnd(T, P, C)
     cache = rnd(2, P, C)
 
-    # Slabs: [order + 2, T / order, positions, C] fp16.
+    # Winograd inputs: [order + 2, T / order, positions, C] fp16.
     comps, groups = order + 2, T // order
     bl, left, got_l, line_l = _peer(comps, groups, H, W, axis, C, torch.float16, lower=True)
     br, right, got_r, line_r = _peer(comps, groups, H, W, axis, C, torch.float16, lower=False)
@@ -1520,8 +1405,8 @@ def test_halo_push_lands_in_peer_buffers(C: int, axis: str, order: int, one_line
         C**0.5,
         T,
         order=order,
-        half_slabs=True,
-        slab_geometry=replace(geo, push=push),
+        fp16_inputs=True,
+        inputs_geometry=replace(geo, push=push),
     )
     phys = d.view(comps, groups, geo.rows, geo.cols, C)
     if axis == "h":

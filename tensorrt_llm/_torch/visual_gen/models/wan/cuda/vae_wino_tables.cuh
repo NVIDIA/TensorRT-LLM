@@ -24,7 +24,7 @@ namespace vaewino
 namespace vae_wino
 {
 
-// Temporal Winograd F(R,3) tables. BT[k][i]: slab k from frame i of the group's R + 2
+// Temporal Winograd F(R,3) tables. BT[k][i]: input k from frame i of the group's R + 2
 // frames; AT[j][k]: output frame j of the group from product k. Only the nonzero AT
 // entries are read, in index order (the summation order the reference reproduces).
 template <int R>
@@ -70,7 +70,7 @@ struct Wino<4>
     }
 };
 
-// Index of the last frame slab k reads; the slab is emitted while that frame is normalized.
+// Index of the last frame input k reads; the input is emitted while that frame is normalized.
 template <int R>
 __host__ __device__ constexpr int lastFrameOf(int k)
 {

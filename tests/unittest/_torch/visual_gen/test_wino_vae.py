@@ -1,12 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""WinoVae component tests: baseline equals the native WanVAE; each option stays within tolerance."""
+"""WinoVae component tests: random weights on a tiny Cosmos3-shaped config, against WanVAE."""
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.wan import wino_vae as wino_vae_module
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae, WinoVaeOptions
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
+    WinoVae,
+    WinoVaeCausalConv3d,
+    WinoVaeOptions,
+)
 
 # Cosmos3-shaped (residual blocks, patch 2, 12 in/out channels) but tiny.
 SMALL_CONFIG = {
@@ -26,13 +31,10 @@ SMALL_CONFIG = {
     "scale_factor_spatial": 16,
 }
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="WinoVae runs on CUDA")
 
-
-def test_rejects_temporal_factor_mismatch():
-    with pytest.raises(ValueError, match="scale_factor_temporal=8"):
-        WinoVae({**SMALL_CONFIG, "scale_factor_temporal": 8})
+DEVICE = "cuda"
+DTYPE = torch.bfloat16
 
 
 def _pair(options: WinoVaeOptions | None = None) -> tuple[WanVAE, WinoVae]:
@@ -55,19 +57,36 @@ def _inputs(frames: int) -> tuple[torch.Tensor, torch.Tensor]:
     return pixels, latents
 
 
-@pytest.mark.parametrize("frames", [1, 5, 9])
-def test_wino_vae_baseline_matches_native_exactly(frames: int) -> None:
-    native, fast = _pair()
+def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    actual, expected = actual.float(), expected.float()
+    return ((actual - expected).norm() / expected.norm().clamp_min(1e-12)).item()
+
+
+def _check_encode_decode(native: WanVAE, fast: WinoVae, frames: int, chunk: int = 1) -> None:
     pixels, latents = _inputs(frames)
     with torch.inference_mode():
-        assert torch.equal(
-            fast.encode(pixels, return_dict=False)[0].mode(),
-            native.encode(pixels, return_dict=False)[0].mode(),
+        pairs = (
+            (
+                fast.encode(pixels, return_dict=False)[0].mode(),
+                native.encode(pixels, return_dict=False)[0].mode(),
+            ),
+            (
+                fast.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0],
+                native.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0],
+            ),
         )
-        assert torch.equal(
-            fast.decode(latents, return_dict=False)[0],
-            native.decode(latents, return_dict=False)[0],
-        )
+    for actual, expected in pairs:
+        assert torch.isfinite(actual.float()).all()
+        # The fused paths drift from native only through last-bit effects (fewer roundings,
+        # fp32 reduction order, Winograd transforms), amplified by the random-weight network.
+        # Bitwise equality of each kernel against its reference is in test_wino_vae_kernels.
+        rel = _rel_l2(actual, expected)
+        assert rel < 2e-2, f"rel_l2={rel:.3e}"
+
+
+def test_rejects_temporal_factor_mismatch():
+    with pytest.raises(ValueError, match="scale_factor_temporal=8"):
+        WinoVae({**SMALL_CONFIG, "scale_factor_temporal": 8})
 
 
 def test_wino_vae_state_dict_keys_match_native() -> None:
@@ -80,193 +99,54 @@ def test_wino_vae_options_reject_unknown() -> None:
         WinoVaeOptions.from_dict({"nope": True})
 
 
-OPTION_SETS = [
-    {"fused_norm": True, "norm_mode": "fp32"},
-    {"fused_norm": True, "norm_mode": "reference"},
-    {"fused_norm": True, "fused_residual": True},
-    {"fused_norm": True, "fused_residual": True, "norm_mode": "reference"},
-    {"fused_upsample": True},
-    {"fused_norm": True, "fused_residual": True, "fused_upsample": True},
-    {"fused_norm": True, "fused_residual": True, "fused_bias": True},
-    {"fused_norm": True, "fused_residual": True, "fused_bias": True, "norm_mode": "reference"},
-    {"fused_norm": True, "fused_residual": True, "fused_upsample": True, "fused_bias": True},
-    {"fused_norm": True, "fused_upsample": True, "fused_upsample_norm": True},
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "norm_mode": "reference",
-    },
-    {
-        "fused_norm": True,
-        "winograd_temporal": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-    },
-    {"conv_out_frame_split": 3},
-    {"first_frame_conv2d": True},
-    {"fold_encoder_tail": True},
-    {"encoder_chunk_frames": 8},
-    {"fused_output": True},
-    {"fused_norm": True, "fused_residual": True, "fold_encoder_tail": True, "fused_output": True},
-    {
-        "fused_norm": True,
-        "first_frame_conv2d": True,
-        "conv_slabs": True,
-        "conv_out_frame_split": 3,
-        "fold_encoder_tail": True,
-    },
-    {"fused_norm": True, "winograd_temporal": True},
-    {"fused_norm": True, "winograd_temporal": True, "fused_upsample": True},
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "first_frame_conv2d": True,
-        "winograd_temporal": True,
-        "winograd_spatial": "all",
-        "conv_slabs": True,
-        "fused_attention": True,
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_bias": True,
-        "winograd_temporal": True,
-        "norm_mode": "reference",
-    },
-    {"fused_norm": True, "conv_slabs": True, "cudnn_frontend": True},
-    {"fused_norm": True, "winograd_temporal": True, "winograd_temporal_order": 2},
-    {
-        "fused_norm": True,
-        "winograd_temporal": True,
-        "winograd_temporal_order": 2,
-        "winograd_slab_dtype": "bf16",
-    },
-    {"fused_norm": True, "winograd_temporal": True, "winograd_spatial": "all"},
-    {
-        "fused_norm": True,
-        "winograd_temporal": True,
-        "winograd_temporal_order": 2,
-        "winograd_slab_dtype": "bf16",
-        "winograd_spatial": "all",
-    },
-    {
-        "fused_norm": True,
-        "winograd_temporal": True,
-        "winograd_spatial": "all",
-        "winograd_spatial_kernel": "sm100",
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "first_frame_conv2d": True,
-        "winograd_temporal": True,
-        "winograd_spatial": "all",
-        "conv_slabs": True,
-        "fused_attention": True,
-    },
-    {"fused_norm": True, "conv_slabs": True},
-    {"fused_norm": True, "fused_attention": True},
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_bias": True,
-        "fused_attention": True,
-        "norm_mode": "reference",
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_bias": True,
-        "conv_slabs": True,
-        "first_frame_conv2d": True,
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "first_frame_conv2d": True,
-        "winograd_temporal": True,
-        "conv_slabs": True,
-        "cudnn_benchmark": "auto",
-        "conv_out_frame_split": 3,
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_bias": True,
-        "winograd_temporal": True,
-        "norm_mode": "reference",
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "first_frame_conv2d": True,
-        "winograd_temporal": True,
-    },
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_upsample_norm": True,
-        "fused_bias": True,
-        "first_frame_conv2d": True,
-    },
-    {"cudnn_benchmark": "auto"},
-    {
-        "fused_norm": True,
-        "fused_residual": True,
-        "fused_upsample": True,
-        "fused_bias": True,
-        "conv_out_frame_split": 3,
-        "cudnn_benchmark": "auto",
-    },
-]
+@pytest.mark.parametrize("frames,chunk", [(1, 1), (5, 1), (9, 1), (9, 2), (17, 4)])
+def test_matches_native(frames: int, chunk: int) -> None:
+    _check_encode_decode(*_pair(), frames, chunk)
 
 
-@pytest.mark.parametrize(
-    "option", OPTION_SETS, ids=lambda o: ",".join(f"{k}={v}" for k, v in o.items())
-)
-@pytest.mark.parametrize("frames", [1, 9])
-def test_each_option_stays_close_to_native(option: dict, frames: int) -> None:
-    native, fast = _pair(WinoVaeOptions(**option))
-    pixels, latents = _inputs(frames)
+@pytest.mark.parametrize("kernel", ["auto", "portable"])
+@pytest.mark.parametrize("frames,chunk", [(1, 1), (9, 1), (9, 2)])
+def test_spatial_winograd_matches_native(
+    monkeypatch: pytest.MonkeyPatch, kernel: str, frames: int, chunk: int
+) -> None:
+    """Spatial Winograd forced onto every eligible residual-block conv (the tiny config's
+    layers are below the production selection thresholds); "portable" also turns the sm100
+    pipeline off so the cuBLAS path runs on Blackwell."""
+    monkeypatch.setattr(WinoVaeCausalConv3d, "_spatial_selected", lambda *args: True)
+    if kernel == "portable":
+        monkeypatch.setattr(wino_vae_module, "sm100_wino_available", lambda: False)
+    native, fast = _pair()
+    assert fast.decoder.mid_block.resnets[0].conv1.spatial_winograd
+    _check_encode_decode(native, fast, frames, chunk)
+
+
+def test_encoder_chunk_frames() -> None:
+    native, fast = _pair(WinoVaeOptions(encoder_chunk_frames=8))
+    _check_encode_decode(native, fast, 17)
+
+
+def test_frame_buffer_chunks_do_not_change_the_result() -> None:
+    """The frame-buffer depth only decides when the history frames move to the front; a
+    one-chunk buffer (a wrap after every chunk) gives the same bits as the default."""
+    _, deep = _pair()
+    _, shallow = _pair(WinoVaeOptions(frame_buffer_chunks=1))
+    pixels, latents = _inputs(21)
     with torch.inference_mode():
-        for actual, expected in (
-            (
-                fast.encode(pixels, return_dict=False)[0].mode(),
-                native.encode(pixels, return_dict=False)[0].mode(),
-            ),
-            (
-                fast.decode(latents, return_dict=False)[0],
-                native.decode(latents, return_dict=False)[0],
-            ),
-        ):
-            diff = actual.float() - expected.float()
-            rel_l2 = diff.norm() / expected.float().norm().clamp_min(1e-12)
-            assert torch.isfinite(actual.float()).all()
-            # Both modes drift from native only through last-bit effects (fp32 mode: fewer
-            # roundings; reference mode: fp32 reduction order), amplified by the random-weight
-            # network. Bitwise equality of the kernel itself is checked in test_wino_vae_kernels.
-            assert rel_l2.item() < 2e-2, f"{option}: rel_l2={rel_l2.item():.3e}"
+        for chunk in (1, 2, 3):
+            assert torch.equal(
+                deep.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0],
+                shallow.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0],
+            )
+        assert torch.equal(
+            deep.encode(pixels, return_dict=False)[0].mode(),
+            shallow.encode(pixels, return_dict=False)[0].mode(),
+        )
+    with pytest.raises(ValueError, match="frame_buffer_chunks"):
+        WinoVaeOptions(frame_buffer_chunks=0)
 
 
 def test_encode_mode_matches_posterior_mode() -> None:
-    _, fast = _pair(WinoVaeOptions(fold_encoder_tail=True))
+    _, fast = _pair()
     pixels, _ = _inputs(9)
     with torch.inference_mode():
         mean_only = fast.encode_mode(pixels)
@@ -278,7 +158,7 @@ def test_encode_mode_matches_posterior_mode() -> None:
 
 
 def test_fold_latent_affine_matches_eager() -> None:
-    _, fast = _pair(WinoVaeOptions())
+    _, fast = _pair()
     _, latents = _inputs(5)
     z = SMALL_CONFIG["z_dim"]
     gen = torch.Generator().manual_seed(3)
@@ -293,88 +173,65 @@ def test_fold_latent_affine_matches_eager() -> None:
         folded = fast.decode(latents, return_dict=False)[0]
         fast.clear_latent_affine()
         again = fast.decode(latents, return_dict=False)[0]
-    diff = (folded.float() - eager.float()).norm() / eager.float().norm().clamp_min(1e-12)
-    assert diff.item() < 2e-2, f"rel_l2={diff.item():.3e}"
+    rel = _rel_l2(folded, eager)
+    assert rel < 2e-2, f"rel_l2={rel:.3e}"
     assert not torch.equal(again.float(), folded.float())  # the fold is really off again
 
 
-@pytest.mark.skipif(DEVICE != "cuda", reason="frame buffers need the CUDA norm kernel")
 def test_frame_buffer_grows_for_a_longer_chunk_in_a_new_clip() -> None:
     """A clip decoded in short chunks sizes the convs' frame buffers; the next clip's longer
     chunk must get a deeper buffer, not a window clipped at the end of the old one."""
-    native, fast = _pair(
-        WinoVaeOptions(
-            fused_norm=True,
-            fused_residual=True,
-            conv_slabs=True,
-            conv_out_frame_split=3,
-            first_frame_conv2d=True,
-        )
-    )
-    assert fast.options.use_slabs
+    native, fast = _pair()
     _, latents = _inputs(21)
     with torch.inference_mode():
-        expected = native.decode(latents, return_dict=False)[0].float()
+        expected = native.decode(latents, return_dict=False)[0]
         fast.decode(latents, return_dict=False, temporal_chunk_size=1)
-        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=5)[0].float()
-    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
-    assert torch.isfinite(actual).all()
-    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=5)[0]
+    assert torch.isfinite(actual.float()).all()
+    rel = _rel_l2(actual, expected)
+    assert rel < 2e-2, f"rel_l2={rel:.3e}"
 
 
-@pytest.mark.skipif(DEVICE != "cuda", reason="frame buffers and Winograd need the CUDA norm kernel")
-@pytest.mark.parametrize("ffc2d,frames,chunk", [(False, 9, 2), (True, 21, 3), (False, 17, 4)])
-def test_frame_buffer_to_winograd_chunk_transition(ffc2d: bool, frames: int, chunk: int) -> None:
+@pytest.mark.parametrize("frames,chunk", [(9, 2), (21, 3), (17, 4)])
+def test_frame_buffer_to_winograd_chunk_transition(frames: int, chunk: int) -> None:
     """Odd-length chunks (the first one, a tail) run the frame-buffer convs, even-length chunks
     the temporal Winograd convs; the history frames must carry over in both directions."""
-    native, fast = _pair(
-        WinoVaeOptions(
-            fused_norm=True, conv_slabs=True, winograd_temporal=True, first_frame_conv2d=ffc2d
-        )
-    )
-    assert fast.options.use_slabs and fast.options.use_winograd
+    native, fast = _pair()
     _, latents = _inputs(frames)
     with torch.inference_mode():
-        expected = native.decode(latents, return_dict=False)[0].float()
-        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0].float()
-    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
-    assert torch.isfinite(actual).all()
-    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+        expected = native.decode(latents, return_dict=False)[0]
+        actual = fast.decode(latents, return_dict=False, temporal_chunk_size=chunk)[0]
+    assert torch.isfinite(actual.float()).all()
+    rel = _rel_l2(actual, expected)
+    assert rel < 2e-2, f"rel_l2={rel:.3e}"
 
 
-@pytest.mark.skipif(DEVICE != "cuda", reason="the deferred bias needs the CUDA frame ops")
 def test_non_residual_encoder_keeps_downsample_bias() -> None:
     """Without residual down blocks nothing consumes a deferred downsample bias, so the conv
     must keep it."""
     cfg = {**SMALL_CONFIG, "is_residual": False}
     torch.manual_seed(0)
     native = WanVAE(cfg)
-    fast = WinoVae(cfg, WinoVaeOptions(fused_norm=True, fused_residual=True, fused_bias=True))
+    fast = WinoVae(cfg)
     fast.load_state_dict(native.state_dict(), strict=True)
     native = native.to(DEVICE, DTYPE).eval()
     fast = fast.to(DEVICE, DTYPE).eval()
     pixels, _ = _inputs(9)
     with torch.inference_mode():
-        expected = native.encode(pixels, return_dict=False)[0].mode().float()
-        actual = fast.encode(pixels, return_dict=False)[0].mode().float()
-    rel_l2 = (actual - expected).norm() / expected.norm().clamp_min(1e-12)
-    assert rel_l2.item() < 2e-2, f"rel_l2={rel_l2.item():.3e}"
+        expected = native.encode(pixels, return_dict=False)[0].mode()
+        actual = fast.encode(pixels, return_dict=False)[0].mode()
+    rel = _rel_l2(actual, expected)
+    assert rel < 2e-2, f"rel_l2={rel:.3e}"
 
 
-@pytest.mark.skipif(DEVICE != "cuda", reason="the dtype contract applies to the CUDA kernels")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-def test_optimized_paths_reject_non_bf16(dtype: torch.dtype) -> None:
-    """The optimized kernels read and write bf16; any other dtype is refused up front instead
-    of being reinterpreted. The all-off model stays dtype-agnostic."""
-    _, fast = _pair(WinoVaeOptions(fused_norm=True, winograd_temporal=True))
+def test_rejects_non_bf16(dtype: torch.dtype) -> None:
+    """The kernels read and write bf16; any other dtype is refused up front instead of being
+    reinterpreted."""
+    _, fast = _pair()
     fast = fast.to(dtype)
     pixels, latents = _inputs(5)
     with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
         fast.decode(latents.to(dtype), return_dict=False)
     with torch.inference_mode(), pytest.raises(TypeError, match="bf16"):
         fast.encode(pixels.to(dtype), return_dict=False)
-    _, plain = _pair()
-    plain = plain.to(dtype)
-    with torch.inference_mode():
-        out = plain.decode(latents.to(dtype), return_dict=False)[0]
-    assert out.dtype is dtype

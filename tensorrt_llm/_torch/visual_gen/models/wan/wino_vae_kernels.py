@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel wrappers for WinoVae: the Triton norm prototypes and their eager references, the
-runtime-compiled CUDA norm kernels (:mod:`jit_norm`), the compiled ``trtllm::vae_*`` ops and
+"""Kernel wrappers for WinoVae: the runtime-compiled CUDA norm kernels (:mod:`jit_norm`) and
+their eager references, the compiled ``trtllm::vae_*`` ops and
 the sm100 CuTe DSL pipeline. Each wrapper states its layout, dtype and shape preconditions;
 choosing a fallback when they do not hold is the caller's job (``can_*`` / ``*_available``
 predicates), not the wrapper's."""
@@ -12,21 +12,15 @@ import functools
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
     FrameGeometry,
-    UpsampleSource,
     combine,
     rms_norm_silu_rows,
     wino_norm_silu,
 )
 
 from .wino_tables import SPATIAL_WINO
-
-_NORM_EPS = 1e-12  # F.normalize default
-_MAX_TILE_ELEMENTS = 4096
 
 
 def cuda_op_available() -> bool:
@@ -55,64 +49,6 @@ def _channel_rows(x: torch.Tensor) -> torch.Tensor | None:
             return None
         return x.permute(0, 2, 3, 1).reshape(-1, x.shape[1])
     return None
-
-
-def can_fuse_rms_norm_silu(x: torch.Tensor) -> bool:
-    return (
-        x.is_cuda
-        and x.dtype in (torch.bfloat16, torch.float16)
-        and x.dim() in (4, 5)
-        and x.shape[1] <= _MAX_TILE_ELEMENTS
-        and _channel_rows(x) is not None
-    )
-
-
-@triton.jit
-def _rms_norm_silu_kernel(
-    x_ptr,
-    y_ptr,
-    gamma_ptr,
-    bias_ptr,
-    n_rows,
-    scale,
-    eps,
-    C: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    REFERENCE_ROUNDING: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_C: tl.constexpr,
-):
-    # One program normalizes BLOCK_M positions; channels are contiguous per position.
-    row0 = tl.program_id(0).to(tl.int64) * BLOCK_M
-    rows = row0 + tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, BLOCK_C)
-    row_ok = rows < n_rows
-    col_ok = cols < C
-    mask = row_ok[:, None] & col_ok[None, :]
-    offs = rows[:, None] * C + cols[None, :]
-
-    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-    xf = x.to(tl.float32)
-    sumsq = tl.sum(xf * xf, axis=1)
-    denom = tl.maximum(tl.sqrt(sumsq), eps)
-    n = xf / denom[:, None]
-    gamma = tl.load(gamma_ptr + cols, mask=col_ok, other=0.0)
-    if REFERENCE_ROUNDING:
-        # Reference rounding reproduces the eager chain: round to the activation dtype after
-        # normalize, after each multiply and after the bias add; SiLU in fp32 on that value.
-        n = n.to(x.dtype).to(tl.float32)
-        r = (n * scale).to(x.dtype).to(tl.float32)
-        r = (r * gamma.to(tl.float32)).to(x.dtype).to(tl.float32)
-        if HAS_BIAS:
-            b = tl.load(bias_ptr + cols, mask=col_ok, other=0.0)
-            r = (r + b.to(tl.float32)).to(x.dtype).to(tl.float32)
-    else:
-        r = n * scale * gamma.to(tl.float32)
-        if HAS_BIAS:
-            b = tl.load(bias_ptr + cols, mask=col_ok, other=0.0)
-            r = r + b.to(tl.float32)
-    y = r * tl.sigmoid(r)
-    tl.store(y_ptr + offs, y.to(x.dtype), mask=mask)
 
 
 def rms_norm_silu_cuda(
@@ -211,82 +147,6 @@ def add_rms_norm_silu_cuda(
     return _rows_to_like(s_rows, x), (out if out is not None else _rows_to_like(a_rows, x))
 
 
-def upsample_source(
-    temp: torch.Tensor,
-    shortcut: torch.Tensor | None,
-    bias: torch.Tensor | None,
-    factor_t: int,
-    repeats: int,
-    crop: int,
-) -> UpsampleSource:
-    """The kernel-side description of a fused upsample input from the model's tensors: ``temp``
-    ``[T, 4C, H+1, W+1]`` channels-last (the packed 2x2 conv output), ``shortcut`` ``[1, Cin,
-    Tr, H, W]`` channels-last or None (the DupUp3D input), ``bias`` ``[C]`` or None."""
-    rows = _channel_rows(temp)
-    if rows is None:
-        raise ValueError("temp must be a channels-last CUDA tensor")
-    t, c4, hp1, wp1 = temp.shape
-    sc = None
-    if shortcut is not None:
-        sc = frames_view(_channels_last_3d_if_needed_rows(shortcut))
-    if sc is None:
-        factor_t, repeats, crop = 1, 1, 0
-    return UpsampleSource(
-        rows.view(t, hp1 * wp1, c4),
-        sc,
-        bias.reshape(-1) if bias is not None else None,
-        factor_t,
-        repeats,
-        crop,
-        hp1 - 1,
-        wp1 - 1,
-    )
-
-
-def _channels_last_3d_if_needed_rows(x: torch.Tensor) -> torch.Tensor:
-    return (
-        x
-        if x.is_contiguous(memory_format=torch.channels_last_3d)
-        else x.contiguous(memory_format=torch.channels_last_3d)
-    )
-
-
-def upsample_rms_norm_silu_cuda(
-    up: UpsampleSource,
-    gamma: torch.Tensor,
-    bias: torch.Tensor | None,
-    scale: float,
-    *,
-    reference_rounding: bool = False,
-    out: torch.Tensor | None = None,
-    out_geometry: FrameGeometry | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """The upsample gather fused into the row-mode norm: returns ``(x, SiLU(RMSNorm(x)))`` with
-    ``x`` the gathered frames as channels-last ``[1, C, T, 2H, 2W]``; ``out`` is an optional
-    channels-last destination for the activation (with ``out_geometry``: frames with halo
-    lines, logical positions written)."""
-    dst = _channel_rows(out) if out is not None else None
-    if out is not None and dst is None:
-        raise ValueError("out must be a channels-last CUDA tensor")
-    s_rows, a_rows = rms_norm_silu_rows(
-        None,
-        gamma.reshape(-1),
-        bias.reshape(-1) if bias is not None else None,
-        float(scale),
-        reference_rounding=reference_rounding,
-        out=dst,
-        out_geometry=out_geometry,
-        upsample=up,
-    )
-    h, w = 2 * up.height, 2 * up.width
-    x = frames_to_video(s_rows.view(up.frames, h * w, up.channels), h, w)
-    return x, (
-        out
-        if out is not None
-        else frames_to_video(a_rows.view(up.frames, h * w, up.channels), h, w)
-    )
-
-
 def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor:
     """Eager form of the deferred convolution bias: ``x + bias`` broadcast over channels."""
     if in_bias is None:
@@ -304,56 +164,6 @@ def add_rms_norm_silu_reference(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     s = apply_in_bias(x, in_bias) + residual
     return s, rms_norm_silu_reference(s, gamma, bias, scale)
-
-
-def rms_norm_silu(
-    x: torch.Tensor,
-    gamma: torch.Tensor,
-    bias: torch.Tensor | None,
-    scale: float,
-    *,
-    reference_rounding: bool = False,
-    block_m: int | None = None,
-    num_warps: int | None = None,
-    enable_fp_fusion: bool | None = None,
-) -> torch.Tensor:
-    """SiLU(RMSNorm(x)) for a channels-last tensor, one memory pass (Triton prototype).
-
-    ``gamma``/``bias`` are the module parameters in their stored dtype with any
-    broadcast dims; ``scale`` is ``sqrt(C)``. ``reference_rounding`` reproduces
-    the eager path's intermediate roundings; otherwise everything stays in fp32
-    until the single store.
-    """
-    rows = _channel_rows(x)
-    if rows is None:
-        raise ValueError("rms_norm_silu needs a channels-last CUDA tensor")
-    n_rows, C = rows.shape
-    out = torch.empty_like(x)
-    out_rows = _channel_rows(out)
-    gamma_flat = gamma.reshape(-1)
-    bias_flat = bias.reshape(-1) if bias is not None else gamma_flat  # dummy pointer when unused
-    block_c = triton.next_power_of_2(C)
-    block_m = block_m or max(1, min(64, _MAX_TILE_ELEMENTS // block_c))
-    grid = (triton.cdiv(n_rows, block_m),)
-    _rms_norm_silu_kernel[grid](
-        rows,
-        out_rows,
-        gamma_flat,
-        bias_flat,
-        n_rows,
-        float(scale),
-        _NORM_EPS,
-        C=C,
-        HAS_BIAS=bias is not None,
-        REFERENCE_ROUNDING=reference_rounding,
-        BLOCK_M=block_m,
-        BLOCK_C=block_c,
-        num_warps=num_warps or (4 if block_c <= 512 else 8),
-        # FMA contraction would merge `r * gamma + b` across the intermediate rounding
-        # that reference mode exists to reproduce.
-        enable_fp_fusion=(not reference_rounding) if enable_fp_fusion is None else enable_fp_fusion,
-    )
-    return out
 
 
 def rms_norm_reference(x: torch.Tensor, gamma: torch.Tensor, scale: float) -> torch.Tensor:
@@ -604,7 +414,7 @@ def wino_spatial_conv_sm100(
 def wino_spatial_conv_cuda(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
-    """3x3 conv (padding 1) of each of the ``order + 2`` slabs (4 or 6) by its filter as
+    """3x3 conv (padding 1) of each of the ``order + 2`` Winograd inputs (4 or 6) by its filter as
     spatial Winograd: ``D [comps, pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [comps, pairs, H*W,
     Cout]`` in ``D``'s dtype (bias-free, fp32 accumulate).
     Input transform and output transform are CUDA kernels; the batched GEMMs are one cuBLAS
@@ -751,19 +561,16 @@ def wino_norm_silu_cuda(
     *,
     reference_rounding: bool = False,
     order: int = 2,
-    half_slabs: bool = False,
+    fp16_inputs: bool = False,
     products_geometry: FrameGeometry | None = None,
-    slab_geometry: FrameGeometry | None = None,
-    upsample: UpsampleSource | None = None,
-    slabs: torch.Tensor | None = None,
+    inputs_geometry: FrameGeometry | None = None,
+    inputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """All tensors in frame layout ``[T, P, C]`` (``m``/``D`` as ``[T/order, P, C]``, cache
     ``[0..2, P, C]``). Returns ``(sum or None, y_tail [2, P, C], D [order+2, T/order, P, C])``;
-    ``D[k]`` is slab k, fp16 when ``half_slabs`` (required for order 4) else bf16. The
-    geometries describe products / slabs that carry halo rows or columns (sharded decode);
-    ``slabs`` is an optional preallocated ``D``. ``upsample`` replaces ``x``: the frames are
-    formed from the packed upsample conv output while reading (:func:`upsample_source`) and
-    returned as the sum."""
+    ``D[k]`` is input k, fp16 when ``fp16_inputs`` (required for order 4) else bf16. The
+    geometries describe products / Winograd inputs that carry halo rows or columns (sharded decode);
+    ``inputs`` is an optional preallocated ``D``."""
     return wino_norm_silu(
         x,
         m,
@@ -775,12 +582,11 @@ def wino_norm_silu_cuda(
         float(scale),
         frames,
         order=order,
-        half_slabs=half_slabs,
+        fp16_inputs=fp16_inputs,
         reference_rounding=reference_rounding,
         products_geometry=products_geometry,
-        slab_geometry=slab_geometry,
-        upsample=upsample,
-        slabs=slabs,
+        inputs_geometry=inputs_geometry,
+        inputs=inputs,
     )
 
 
@@ -810,10 +616,10 @@ def wino_norm_silu_reference(
     bias: torch.Tensor | float,
     scale: float,
     order: int = 2,
-    slab_dtype: torch.dtype = torch.bfloat16,
+    winograd_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor | None, torch.Tensor, list[torch.Tensor]]:
     """Eager form of the kernel, same rounding points (bf16 after every add of the combine,
-    the slabs formed in fp32 and rounded once to ``slab_dtype``)."""
+    the Winograd inputs formed in fp32 and rounded once to ``winograd_dtype``)."""
     if x is None:
         assert m is not None
         x = wino_combine_reference(m)
@@ -834,7 +640,7 @@ def wino_norm_silu_reference(
     f = torch.cat([hist, y], 0).float()  # frames -2 .. T-1
     bt = torch.tensor(TEMPORAL_WINO[order]["BT"], dtype=torch.float32, device=x.device)
     groups = f.unfold(0, order + 2, order)  # [groups, P, C, order+2]
-    d = torch.einsum("ki,gpci->kgpc", bt, groups).to(slab_dtype)
+    d = torch.einsum("ki,gpci->kgpc", bt, groups).to(winograd_dtype)
     return s, y[-2:].contiguous(), [d[k] for k in range(order + 2)]
 
 

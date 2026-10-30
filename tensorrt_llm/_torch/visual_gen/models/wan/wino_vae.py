@@ -15,16 +15,17 @@
 
 """WinoVae: optimized Wan VAE.
 
-``WinoVae`` mirrors ``WanVAE`` module for module and loads the same state
-dict. Every optimization is a flag in ``WinoVaeOptions``; with all flags off
-the computation is the unmodified native path, which is the baseline the
-benchmark compares against.
+``WinoVae`` mirrors ``WanVAE`` module for module and loads the same state dict. On CUDA it
+runs the fused norm kernels, temporal and spatial Winograd convolutions, frame buffers for
+the causal history and the fused frame operations, in bf16 on CUDA; where a kernel cannot
+run (no CUDA toolkit for the runtime-compiled kernels, an unsupported shape or batch) the
+module falls back to the eager computation of ``WanVAE``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, replace
-from typing import Any, Literal, TypeAlias
+from typing import Any, Callable, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
@@ -33,13 +34,15 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
 from .cudnn_conv import conv_frontend, cudnn_frontend_available
-from .jit_norm import FrameGeometry, UpsampleSource
+from .jit_norm import FrameGeometry
 from .wan_vae import (
     CACHE_T,
     AvgDown3D,
     DupUp3D,
     WanAttentionBlock,
+    WanCausalConv3d,
     WanConv2d,
+    WanRMSNorm,
     WanUpsample,
     WanVAEConfig,
     _activation,
@@ -56,7 +59,6 @@ from .wino_vae_kernels import (
     add_rms_norm_silu_cuda,
     apply_in_bias,
     avg_down_add_cuda,
-    can_fuse_rms_norm_silu,
     can_use_cuda_rms_norm_silu,
     can_use_cuda_upsample_gather,
     cuda_frame_ops_available,
@@ -66,10 +68,8 @@ from .wino_vae_kernels import (
     frames_view,
     images_to_pairs,
     interleave_bias_cuda,
-    jit_norm_available,
     pack_upsample_weights,
     pairs_to_images,
-    rms_norm_silu,
     rms_norm_silu_cuda,
     sm100_fused_eligible,
     sm100_fused_filters,
@@ -80,8 +80,6 @@ from .wino_vae_kernels import (
     unpatchify_clamp_into,
     upsample_gather_cuda,
     upsample_gather_reference,
-    upsample_rms_norm_silu_cuda,
-    upsample_source,
     wino_combine_cuda,
     wino_combine_reference,
     wino_norm_silu_cuda,
@@ -97,124 +95,28 @@ from .wino_vae_shard import DirectFrames, Shard, push_border
 
 # One slot of the causal-conv cache list threaded through a chunked encode / decode: the
 # conv's history frames ``[B, C, 0..2, H, W]``; the conv itself when it keeps them in its
-# frame buffer (``WinoVaeCausalConv3d.slab_history`` hands them over); the ``"Rep"``
+# frame buffer (``WinoVaeCausalConv3d.buffer_history`` hands them over); the ``"Rep"``
 # sentinel of the resampler's time conv; None before the first chunk.
 CacheEntry: TypeAlias = "torch.Tensor | WinoVaeCausalConv3d | Literal['Rep'] | None"
 
 
 @dataclass(frozen=True)
 class WinoVaeOptions:
-    """Optimization switches. All off reproduces the native ``WanVAE`` exactly.
+    """Run-time settings of a WinoVae model.
 
-    Frozen: a model copies some values into its modules at construction and reads the rest
-    live, so the options are fixed for the model's lifetime. Build another model (with
+    Frozen: the options are fixed for the model's lifetime. Build another model (with
     ``dataclasses.replace`` for a variant) to run with different ones."""
 
-    # RMSNorm + SiLU in one kernel. ``norm_mode`` picks the numerics: "fp32" keeps
-    # everything in fp32 until the store; "reference" reproduces the eager path's
-    # intermediate roundings for a bitwise-style gate.
-    fused_norm: bool = False
-    norm_mode: str = "fp32"
-    # "cuda": the runtime-compiled norm kernel (falls back to Triton when it cannot be
-    # compiled or the shape is unsupported); "triton": the prototype kernel.
-    norm_kernel: str = "cuda"
-    # A residual block hands its ``conv2 + residual`` add to the next
-    # block's norm kernel instead of running it as a separate pass. Needs fused_norm and
-    # the CUDA op; consumers that are not a norm materialize the add themselves.
-    fused_residual: bool = False
-    # Nearest-2x upsample + 3x3 conv as one 2x2 conv on the low-res
-    # grid followed by a phase gather that also adds the DupUp3D shortcut.
-    fused_upsample: bool = False
-    # The upsample gather folded into the next block's norm kernel, which forms the upsampled
-    # frames (phase gather + conv bias + DupUp3D shortcut) while reading and writes them as the
-    # block input; the separate gather pass and its re-read go. Bit-identical to the two
-    # kernels. Needs fused_upsample + fused_norm with the CUDA kernel; batch 1, unsharded.
-    fused_upsample_norm: bool = False
-    # A convolution runs without its bias and the consumer kernel adds
-    # it (the fused norm, or the upsample gather). Needs fused_norm + fused_residual (the
-    # bias rides on the same PendingAdd) and the CUDA op. In "fp32" norm mode a
-    # channel-changing block merges its shortcut conv's bias into the same vector; in
-    # "reference" mode that shortcut bias stays eager so the result is still bitwise.
-    fused_bias: bool = False
-    # ``cudnn_benchmark``: "off" uses cuDNN's heuristics everywhere, "on" runs
-    # cudnn.benchmark for every conv, "auto" benchmarks the encoder and single-frame (image)
-    # decodes and keeps the heuristics for video decodes.
-    cudnn_benchmark: str = "off"
-    # ``conv_out_frame_split``: run the decoder's narrow conv_out (256 -> 12 channels) on
-    # at most this many input frames per call (0 = off); the outputs are concatenated.
-    conv_out_frame_split: int = 0
-    # On a chunk with no causal history (the first chunk of a video,
-    # every image) a 3x3x3 causal conv on one frame equals a 3x3 conv2d with the
-    # current-frame weight slice; the two zero-history taps are skipped (cuDNN conv2d, or
-    # spatial Winograd with ``winograd_spatial_first_frame``).
-    first_frame_conv2d: bool = False
-    # Temporal Winograd on the residual-block convs of chunks with an
-    # even number (>= 2) of frames. The norm kernel emits the transformed frame slabs, the
-    # conv runs as one 3x3 conv2d per slab, and the next norm kernel combines the results
-    # while reading. Needs fused_norm with the CUDA op.
-    winograd_temporal: bool = False
-    # The temporal order. 4 = F(4,3) where a call has a multiple of four
-    # frames (six conv2d per four frames instead of eight, a quarter less slab traffic), on
-    # the points (0, 1, -1, 2, -1/2, inf); calls with 2 mod 4 frames fall back to F(2,3).
-    # 2 = F(2,3) everywhere. Order 4 needs fp16 slabs.
-    winograd_temporal_order: int = 4
-    # Storage type of the transformed slabs and the conv products between the norm kernels:
-    # "fp16" (three more mantissa bits than bf16 for the transformed values; required by
-    # order 4) or "bf16".
-    winograd_slab_dtype: str = "fp16"
-    # The convs still on cuDNN (the frame-buffer 3D convs, the direct 3D convs) go through
-    # the cuDNN graph API with the fastest of every engine plan the heuristics offer for the
-    # shape. The plan search runs once per new shape (seconds) and is remembered on disk.
-    cudnn_frontend: bool = False
-    # Spatial Winograd on top of the temporal one: each 3x3 conv2d of a slab becomes an input
-    # transform, one batched GEMM per transform point and an output transform. Single-frame
-    # calls (the first frame of a clip, every image, and the one-frame chunks of a streaming
-    # decode at the low-resolution levels) run spatial Winograd alone: the three temporal
-    # taps are summed inside the GEMM (K = 3 * Cin), the zero-history first frame keeps one
-    # tap. It pays where cuDNN's implicit GEMM is weak (few output pixels per channel):
-    # "auto" uses it on the layers listed in ``spatial_eligible``, "all" on every eligible
-    # conv (tests), "off" never.
-    winograd_spatial: str = "off"
-    # Spatial-Winograd kernel for the frame-pair path: "sm100" = the Blackwell CuTe DSL
-    # F(4x4, 3x3) pipeline (Cin % 64 == 0, Cout % 256 == 0, width % 4 == 0; the portable path
-    # elsewhere); "cublas" = the portable path (transform kernels + cuBLAS batched GEMMs).
-    # Single-frame calls always use the portable path.
-    winograd_spatial_kernel: str = "sm100"
-    # The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel convs
-    # under the "sm100" kernel; off = those convs stay on cuDNN.
-    winograd_spatial_fused: bool = True
-    # Spatial tile of the portable path: 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (fewer GEMM FLOPs
-    # and transformed bytes per output, larger transform coefficients).
-    winograd_spatial_tile: int = 4
-    # Tile for the single-frame calls with a causal history (spatial Winograd alone, the three
-    # taps summed in the GEMM): 2 = F(2x2, 3x3), 4 = F(4x4, 3x3) (fewer multiplies per output,
-    # larger transform coefficients).
-    winograd_spatial_single_tile: int = 2
-    # Run the zero-history first frame (and every image) as spatial Winograd on the
-    # current-frame tap instead of cuDNN conv2d.
-    winograd_spatial_first_frame: bool = False
-    # The convs that still run as 3D with a causal cache (one frame per
-    # chunk at the low-res levels, conv_out) read a per-conv frame buffer the norm kernel
-    # writes into, so the cache is two frames already in place: no cat, no F.pad, no memset.
-    conv_slabs: bool = False
-    # Attention block: fused RMSNorm (no activation), the two 1x1 convs as GEMMs with the
-    # bias in the epilogue on the row view (no permute/contiguous copy), and the residual
-    # add handed to the next block's norm as a PendingAdd.
-    fused_attention: bool = False
-    # The encoder's conv_out (3x3x3) and quant_conv (1x1x1) have no
-    # activation between them, so quant_conv folds into conv_out's weights (composed in
-    # fp32, rounded once); ``encode_mode`` then runs only the mean half of the folded conv.
-    # Off in "reference" mode, where every rounding of the eager path is reproduced.
-    fold_encoder_tail: bool = False
     # Pixel frames per encoder pass after the first one-frame pass. Must be a multiple of 4
     # so every pass ends at the same temporal-downsampler parity. Larger passes give the
     # convs more rows and fewer launches at the price of peak memory; from 8 frames up the
     # deepest levels see frame pairs and take the Winograd pair path.
     encoder_chunk_frames: int = 24
-    # The decoder writes each chunk's unpatchified, clamped frames
-    # straight into the preallocated output (one kernel per chunk) instead of
-    # cat + unpatchify + clamp over the whole video. Needs the CUDA op; bf16, batch 1.
-    fused_output: bool = False
+    # Chunks a conv's frame buffer holds after its two causal-history frames before it wraps
+    # (the history moves to the front: a copy of two frames). Fewer chunks: less memory, more
+    # wraps. ``decode``'s ``temporal_chunk_size`` and ``encoder_chunk_frames`` move peak
+    # memory further.
+    frame_buffer_chunks: int = 4
     # Spatially sharded runs: how the halo lines reach the neighbouring ranks. "direct": the
     # norm kernels store the border lines straight into the neighbours' buffers (symmetric
     # memory over NVLink) and one barrier per exchange replaces the pack copy, the NCCL
@@ -223,47 +125,14 @@ class WinoVaeOptions:
     halo_exchange: str = "auto"
 
     def __post_init__(self) -> None:
-        if self.norm_mode not in ("fp32", "reference"):
-            raise ValueError(f"norm_mode must be 'fp32' or 'reference', got {self.norm_mode!r}")
         if self.halo_exchange not in ("auto", "nccl", "direct"):
             raise ValueError(
                 f"halo_exchange must be 'auto', 'nccl' or 'direct', got {self.halo_exchange!r}"
             )
-        if self.norm_kernel not in ("cuda", "triton"):
-            raise ValueError(f"norm_kernel must be 'cuda' or 'triton', got {self.norm_kernel!r}")
-        if self.cudnn_benchmark not in ("off", "on", "auto"):
+        if self.frame_buffer_chunks < 1:
             raise ValueError(
-                f"cudnn_benchmark must be 'off', 'on' or 'auto', got {self.cudnn_benchmark!r}"
+                f"frame_buffer_chunks must be at least 1, got {self.frame_buffer_chunks!r}"
             )
-        if self.winograd_spatial not in ("off", "auto", "all"):
-            raise ValueError(
-                f"winograd_spatial must be 'off', 'auto' or 'all', got {self.winograd_spatial!r}"
-            )
-        if self.winograd_spatial_single_tile not in (2, 4):
-            raise ValueError(
-                f"winograd_spatial_single_tile must be 2 or 4, got {self.winograd_spatial_single_tile!r}"
-            )
-        if self.winograd_spatial_tile not in (2, 4):
-            raise ValueError(
-                f"winograd_spatial_tile must be 2 or 4, got {self.winograd_spatial_tile!r}"
-            )
-        if self.winograd_temporal_order not in (2, 4):
-            raise ValueError(
-                f"winograd_temporal_order must be 2 or 4, got {self.winograd_temporal_order!r}"
-            )
-        if self.winograd_slab_dtype not in ("bf16", "fp16"):
-            raise ValueError(
-                f"winograd_slab_dtype must be 'bf16' or 'fp16', got {self.winograd_slab_dtype!r}"
-            )
-        if self.winograd_temporal_order == 4 and self.winograd_slab_dtype != "fp16":
-            raise ValueError("winograd_temporal_order 4 needs winograd_slab_dtype 'fp16'")
-        if self.winograd_spatial_kernel not in ("sm100", "cublas"):
-            raise ValueError(
-                "winograd_spatial_kernel must be 'sm100' or 'cublas', "
-                f"got {self.winograd_spatial_kernel!r}"
-            )
-        if self.conv_out_frame_split < 0 or self.conv_out_frame_split in (1, 2):
-            raise ValueError("conv_out_frame_split must be 0 (off) or at least 3 input frames")
         if self.encoder_chunk_frames < 4 or self.encoder_chunk_frames % 4:
             raise ValueError(
                 f"encoder_chunk_frames must be a positive multiple of 4, got {self.encoder_chunk_frames!r}"
@@ -277,123 +146,41 @@ class WinoVaeOptions:
             raise ValueError(f"Unknown WinoVaeOptions: {sorted(unknown)}; valid: {sorted(valid)}")
         return cls(**values)
 
-    @property
-    def use_attention(self) -> bool:
-        return (
-            self.fused_attention
-            and self.fused_norm
-            and self.norm_kernel == "cuda"
-            and cuda_op_available()
-        )
 
-    @property
-    def use_slabs(self) -> bool:
-        return (
-            self.conv_slabs
-            and self.fused_norm
-            and self.norm_kernel == "cuda"
-            and cuda_op_available()
-        )
-
-    def temporal_order_for(self, frames: int) -> int:
-        """The temporal Winograd order of a call with ``frames`` output frames."""
-        return 4 if self.winograd_temporal_order == 4 and frames % 4 == 0 else 2
-
-    @property
-    def use_winograd(self) -> bool:
-        return (
-            self.winograd_temporal
-            and self.fused_norm
-            and self.norm_kernel == "cuda"
-            and cuda_op_available()
-        )
-
-    @property
-    def use_winograd_spatial(self) -> bool:
-        return (
-            self.winograd_spatial != "off" and self.use_winograd and cuda_wino_spatial_available()
-        )
-
-    @property
-    def defer_conv_bias(self) -> bool:
-        return (
-            self.fused_bias
-            and self.fused_norm
-            and self.fused_residual
-            and self.norm_kernel == "cuda"
-        )
-
-    def enabled(self) -> list[str]:
-        return [field.name for field in fields(self) if getattr(self, field.name) is True]
-
-    def benchmark_convs(self, *, encoder: bool, frames: int) -> bool:
-        if self.cudnn_benchmark == "on":
-            return True
-        if self.cudnn_benchmark == "auto":
-            return encoder or frames == 1
-        return False
+# The decoder's narrow conv_out (256 -> 12 channels) runs on at most this many input frames
+# per cuDNN call (the outputs are concatenated): beyond three frames cuDNN picks a much
+# slower kernel for that shape.
+_CONV_OUT_MAX_IN_FRAMES = 3
+# Storage type of the temporal Winograd inputs and conv products between the norm kernels:
+# three more mantissa bits than bf16 for the transformed values (required by F(4,3)).
+_WINOGRAD_DTYPE = torch.float16
+# Spatial Winograd tiles of the portable path: F(4x4, 3x3) for frame pairs, F(2x2, 3x3) for
+# single frames with a causal history (the three temporal taps summed in the GEMM).
+_SPATIAL_TILE = 4
+_SPATIAL_SINGLE_TILE = 2
 
 
-@dataclass
-class UpsampleInput:
-    """A fused upsample not yet gathered: ``temp`` ``[T, 4C, H+1, W+1]`` channels-last (the
-    packed 2x2 conv output), the optional DupUp3D ``shortcut`` ``[1, Cin, Tr, H, W]`` with its
-    mapping, and the conv ``bias`` the conv left out. The consumer norm kernel forms the
-    ``[1, C, T, 2H, 2W]`` frames while reading; :meth:`materialize` runs the gather kernel."""
+def temporal_order_for(frames: int) -> int:
+    """The temporal Winograd order of a call with ``frames`` output frames: F(4,3) on the
+    points (0, 1, -1, 2, -1/2, inf) for a multiple of four frames, else F(2,3)."""
+    return 4 if frames % 4 == 0 else 2
 
-    temp: torch.Tensor
-    shortcut: torch.Tensor | None
-    bias: torch.Tensor | None
-    factor_t: int
-    repeats: int
-    crop: int
-    frames: int
 
-    @property
-    def channels(self) -> int:
-        return self.temp.shape[1] // 4
-
-    @property
-    def spatial(self) -> tuple[int, int]:
-        return 2 * (self.temp.shape[2] - 1), 2 * (self.temp.shape[3] - 1)
-
-    @property
-    def fusable(self) -> bool:
-        """The norm kernel maps one or two shortcut elements per output channel."""
-        return (
-            self.shortcut is None
-            or (4 * self.factor_t) % self.repeats == 0
-            and (4 * self.factor_t // self.repeats in (1, 2))
-        )
-
-    def source(self) -> UpsampleSource:
-        return upsample_source(
-            self.temp, self.shortcut, self.bias, self.factor_t, self.repeats, self.crop
-        )
-
-    def materialize(self) -> torch.Tensor:
-        return upsample_gather_cuda(
-            self.temp,
-            self.shortcut,
-            1,
-            self.frames,
-            self.factor_t,
-            self.repeats,
-            self.crop,
-            bias=self.bias,
-        )
+def _benchmark_convs(*, encoder: bool, frames: int) -> bool:
+    """cuDNN autotuning for the encoder and single-frame (image) decodes; video decodes keep
+    cuDNN's heuristics."""
+    return encoder or frames == 1
 
 
 @dataclass
 class PendingAdd:
     """``(a + bias) + b`` not yet computed: the next fused norm adds it while reading.
 
-    Exactly one source holds the frames: ``a`` (a tensor), ``wino`` (the temporal Winograd
+    Exactly one source holds the frames: ``a`` (a tensor) or ``wino`` (the temporal Winograd
     combine of the ``order + 2`` conv2d results, each ``[groups, C, H, W]`` channels-last, bf16
-    or fp16: frame ``g*order + j`` is ``sum_k AT[j][k] m_k``, :data:`TEMPORAL_WINO`), or ``up``
-    (a packed upsample the consumer norm kernel gathers while reading). ``bias`` is a
-    per-channel convolution bias the conv did not apply; ``b`` is a residual; either may be
-    absent with ``a`` or ``wino``, neither may accompany ``up``.
+    or fp16: frame ``g*order + j`` is ``sum_k AT[j][k] m_k``, :data:`TEMPORAL_WINO`). ``bias``
+    is a per-channel convolution bias the conv did not apply; ``b`` is a residual; either may
+    be absent.
     """
 
     a: torch.Tensor | None
@@ -402,21 +189,31 @@ class PendingAdd:
     wino: list[torch.Tensor] | None = None
     # Frame layout of the products when they carry halo lines (sharded decode).
     geometry: FrameGeometry | None = None
-    # When set, ``a``, ``b``, ``bias`` and ``wino`` are None: the frames are an upsample not
-    # yet gathered, formed by the consumer norm kernel while reading.
-    up: UpsampleInput | None = None
 
     def __post_init__(self) -> None:
-        sources = (self.a is not None) + (self.wino is not None) + (self.up is not None)
-        if sources != 1:
-            raise ValueError("PendingAdd needs exactly one of a, wino, up")
-        if self.up is not None and (self.b is not None or self.bias is not None):
-            raise ValueError("an upsample source carries its own bias and residual")
+        if (self.a is None) == (self.wino is None):
+            raise ValueError("PendingAdd needs exactly one of a and wino")
+
+    @property
+    def shape(self) -> torch.Size:
+        """The logical ``[B, C, T, H, W]`` of the frames once added."""
+        src = self.a if self.a is not None else self.b
+        batch = src.shape[0] if src is not None else 1
+        channels = (src if src is not None else self.wino[0]).shape[1]
+        return torch.Size((batch, channels, self.frames, *self.spatial))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype of the frames once added (the combine kernel writes bf16)."""
+        src = self.a if self.a is not None else self.b
+        return src.dtype if src is not None else torch.bfloat16
+
+    @property
+    def device(self) -> torch.device:
+        return (self.a if self.a is not None else self.wino[0]).device
 
     @property
     def frames(self) -> int:
-        if self.up is not None:
-            return self.up.frames
         if self.a is not None:
             return self.a.shape[2]
         return (len(self.wino) - 2) * self.wino[0].shape[0]
@@ -424,8 +221,6 @@ class PendingAdd:
     @property
     def spatial(self) -> tuple[int, int]:
         """The logical frame size (H, W)."""
-        if self.up is not None:
-            return self.up.spatial
         if self.geometry is not None:
             return self.geometry.height, self.geometry.width
         src = self.a if self.a is not None else self.wino[0]
@@ -444,8 +239,6 @@ class PendingAdd:
 
     def combined(self) -> torch.Tensor:
         """``a`` as a tensor (eager Winograd combine when needed)."""
-        if self.up is not None:
-            return self.up.materialize()
         if self.a is not None:
             return self.a
         h, w = self.spatial
@@ -453,8 +246,6 @@ class PendingAdd:
 
     def materialize(self) -> torch.Tensor:
         """The frames as a tensor: one fused pass when the op is built, else the eager chain."""
-        if self.up is not None:
-            return self.up.materialize()
         if self.can_fuse():
             h, w = self.spatial
             return frames_to_video(self._combine_cuda(0, 0), h, w)
@@ -484,11 +275,7 @@ class PendingAdd:
     def can_fuse(self) -> bool:
         """Whether the CUDA kernels can consume this pending add directly (a bf16 tensor
         source or a bf16 / fp16 Winograd-product source, batch 1, on CUDA): the consumer norm
-        adds it while reading
-        and ``materialize`` uses the combine kernel. An upsample source is handled by its own
-        path and answers False."""
-        if self.up is not None:
-            return False
+        adds it while reading and ``materialize`` uses the combine kernel."""
         src = self.a if self.a is not None else self.wino[0]
         batch_one = (self.a is None or self.a.shape[0] == 1) and (
             self.b is None or self.b.shape[0] == 1
@@ -499,8 +286,6 @@ class PendingAdd:
     def materialize_padded_2d(self) -> torch.Tensor:
         """The frames with one zero row and column appended, as ``[T, C, H+1, W+1]`` channels-last
         (the downsampler's input), in one pass."""
-        if self.up is not None:
-            return PendingAdd(self.up.materialize()).materialize_padded_2d()
         src = self.a if self.a is not None else self.wino[0]
         h, w = self.spatial
         c = src.shape[1]
@@ -509,8 +294,8 @@ class PendingAdd:
 
 
 @dataclass
-class WinoSlabs:
-    """The ``order + 2`` transformed input slabs of a temporal Winograd conv, each
+class WinogradInputs:
+    """The ``order + 2`` transformed inputs of a temporal Winograd conv, each
     ``[groups, C, H, W]`` channels-last (bf16 or fp16), plus the buffer they are views of as
     ``[order + 2, groups, H*W, C]``. With ``geometry`` the frames carry halo lines (physical
     ``rows x cols``; the logical ``H x W`` sits inside)."""
@@ -531,26 +316,7 @@ class WinoSlabs:
 def _cache_frames(entry: CacheEntry) -> torch.Tensor | Literal["Rep"] | None:
     """A ``feat_cache`` entry as the history-frame tensor the eager and Winograd paths read:
     a conv that left itself there (frame-buffer path) hands over its two history frames."""
-    return entry.slab_history() if isinstance(entry, WinoVaeCausalConv3d) else entry
-
-
-def _pending_like(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
-    """A tensor with the frames' batch/channel shape (and the spatial shape when the frames
-    carry no halo lines), without materializing."""
-    if not isinstance(x, PendingAdd):
-        return x
-    if x.up is not None:
-        return x.up.temp[:1]
-    if x.a is not None:
-        return x.a
-    return x.b if x.b is not None else x.wino[0]
-
-
-def _pending_spatial(x: "torch.Tensor | PendingAdd") -> tuple[int, int]:
-    """The logical frame size (H, W) of a tensor or PendingAdd."""
-    if isinstance(x, PendingAdd):
-        return x.spatial
-    return x.shape[-2], x.shape[-1]
+    return entry.buffer_history() if isinstance(entry, WinoVaeCausalConv3d) else entry
 
 
 def _frames_physical(window: torch.Tensor) -> torch.Tensor:
@@ -558,7 +324,7 @@ def _frames_physical(window: torch.Tensor) -> torch.Tensor:
     return window.permute(0, 2, 3, 4, 1)[0]
 
 
-def _into(
+def _copy_into(
     out: torch.Tensor | None, value: torch.Tensor, geometry: FrameGeometry | None = None
 ) -> torch.Tensor:
     """Copy ``value`` into ``out`` when a destination was requested (into the logical
@@ -575,69 +341,85 @@ def _into(
     return out
 
 
-def _tensor(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
+def _as_tensor(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
     return x.materialize() if isinstance(x, PendingAdd) else x
 
 
-class WinoVaeRMSNorm(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        channel_first: bool = True,
-        images: bool = True,
-        bias: bool = False,
-        options: WinoVaeOptions | None = None,
-    ) -> None:
-        super().__init__()
-        broadcastable_dims = (1, 1, 1) if not images else (1, 1)
-        shape = (dim, *broadcastable_dims) if channel_first else (dim,)
+class WinoVaeRMSNorm(WanRMSNorm):
+    """``WanRMSNorm`` with the fused CUDA entry points: ``norm_silu`` (rows) and
+    ``norm_silu_winograd`` (the temporal Winograd inputs of the conv that follows)."""
 
-        self.channel_first = channel_first
-        self.scale = dim**0.5
-        self.gamma = nn.Parameter(torch.ones(shape))
-        self.bias = nn.Parameter(torch.zeros(shape)) if bias else 0.0
-        self.options = options or WinoVaeOptions()
+    def __init__(
+        self, dim: int, channel_first: bool = True, images: bool = True, bias: bool = False
+    ) -> None:
+        super().__init__(dim, channel_first, images, bias)
         self.shard: Shard | None = None
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm_dim = 1 if self.channel_first else -1
-        needs_fp32_normalize = x.dtype in (torch.float16, torch.bfloat16) or any(
-            t in str(x.dtype) for t in ("float4_", "float8_")
-        )
-        normalized = F.normalize(x.float() if needs_fp32_normalize else x, dim=norm_dim).to(x.dtype)
-        return normalized * self.scale * self.gamma + self.bias
-
-    def forward_silu(
+    def norm_silu(
         self,
         x: "torch.Tensor | PendingAdd",
+        *,
         out: torch.Tensor | None = None,
         out_geometry: FrameGeometry | None = None,
-    ) -> torch.Tensor:
-        """SiLU(norm(x)); one fused pass when enabled and supported, else the eager chain.
-        ``out``: optional channels-last destination (a conv frame-buffer window; with
-        ``out_geometry`` its frames carry halo lines and the logical positions are written)."""
+        return_sum: bool = False,
+    ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
+        """``SiLU(norm(s))`` with ``s`` = ``x`` (a tensor, or a pending add computed while
+        reading where the kernel supports it). ``out``: optional channels-last destination (a
+        conv frame-buffer window; with ``out_geometry`` its frames carry halo lines and the
+        logical positions are written). ``return_sum``: return ``(s, SiLU(norm(s)))``."""
+        bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+        in_bias = None
         if isinstance(x, PendingAdd):
-            if x.wino is not None:
-                return self._forward_silu(x.materialize(), None, out, out_geometry)
-            if x.b is not None:
-                return self.forward_silu_pending(x, out, out_geometry)[1]
-            return self._forward_silu(x.a, x.bias, out, out_geometry)
-        return self._forward_silu(x, None, out, out_geometry)
+            if (
+                x.a is not None
+                and x.b is not None
+                and self.channel_first
+                and can_use_cuda_rms_norm_silu(x.a)
+                and can_use_cuda_rms_norm_silu(x.b)
+            ):
+                s, y = add_rms_norm_silu_cuda(
+                    x.a,
+                    x.b,
+                    self.gamma,
+                    bias,
+                    self.scale,
+                    in_bias=x.bias,
+                    out=out,
+                    out_geometry=out_geometry,
+                )
+                return (s, y) if return_sum else y
+            if x.a is not None and x.b is None and not return_sum:
+                x, in_bias = x.a, x.bias  # the kernel adds the deferred bias while reading
+            else:
+                x = x.materialize()
+        if self.channel_first and can_use_cuda_rms_norm_silu(x):
+            y = rms_norm_silu_cuda(
+                x,
+                self.gamma,
+                bias,
+                self.scale,
+                in_bias=in_bias,
+                out=out,
+                out_geometry=out_geometry,
+            )
+        else:
+            y = _copy_into(out, F.silu(self.forward(apply_in_bias(x, in_bias))), out_geometry)
+        return (x, y) if return_sum else y
 
-    def forward_silu_wino(
+    def norm_silu_winograd(
         self,
         x: "torch.Tensor | PendingAdd",
         cache: torch.Tensor | None,
         frames: int,
-        slab_geometry: FrameGeometry | None = None,
-        slabs: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor | None, torch.Tensor, WinoSlabs]:
-        """Norm + SiLU that writes the Winograd slabs for the conv that follows.
+        inputs_geometry: FrameGeometry | None = None,
+        inputs: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, WinogradInputs]:
+        """Norm + SiLU that writes the Winograd inputs for the conv that follows.
 
         ``cache`` holds the last 0..2 normalized frames of the previous chunk as
-        ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], slabs)``.
-        ``slab_geometry``: write the slabs into frames with halo lines (sharded decode);
-        ``slabs``: a preallocated destination for them."""
+        ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], inputs)``.
+        ``inputs_geometry``: write the Winograd inputs into frames with halo lines (sharded decode);
+        ``inputs``: a preallocated destination for them."""
         pending = x if isinstance(x, PendingAdd) else PendingAdd(x)
         h, w = pending.spatial
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
@@ -651,109 +433,27 @@ class WinoVaeRMSNorm(nn.Module):
             bias,
             self.scale,
             frames,
-            reference_rounding=self.options.norm_mode == "reference",
-            order=self.options.temporal_order_for(frames),
-            half_slabs=self.options.winograd_slab_dtype == "fp16",
+            order=temporal_order_for(frames),
+            fp16_inputs=_WINOGRAD_DTYPE == torch.float16,
             products_geometry=pending.geometry,
-            slab_geometry=slab_geometry,
-            upsample=pending.up.source() if pending.up is not None else None,
-            slabs=slabs,
+            inputs_geometry=inputs_geometry,
+            inputs=inputs,
         )
-        if slab_geometry is None:
-            slabs = WinoSlabs([pairs_to_images(dk, h, w) for dk in d], d)
+        if inputs_geometry is None:
+            inputs = WinogradInputs([pairs_to_images(dk, h, w) for dk in d], d)
         else:
-            g = slab_geometry
-            slabs = WinoSlabs([pairs_to_images(dk, g.rows, g.cols) for dk in d], d, g)
+            g = inputs_geometry
+            inputs = WinogradInputs([pairs_to_images(dk, g.rows, g.cols) for dk in d], d, g)
         return (
             (frames_to_video(s, h, w) if s is not None else None),
             frames_to_video(y_tail, h, w),
-            slabs,
+            inputs,
         )
 
-    def _forward_silu(
-        self,
-        x: torch.Tensor,
-        in_bias: torch.Tensor | None,
-        out: torch.Tensor | None = None,
-        out_geometry: FrameGeometry | None = None,
-    ) -> torch.Tensor:
-        if not (self.options.fused_norm and self.channel_first):
-            return _into(out, F.silu(self.forward(apply_in_bias(x, in_bias))), out_geometry)
-        bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-        reference = self.options.norm_mode == "reference"
-        if self.options.norm_kernel == "cuda" and can_use_cuda_rms_norm_silu(x):
-            return rms_norm_silu_cuda(
-                x,
-                self.gamma,
-                bias,
-                self.scale,
-                reference_rounding=reference,
-                in_bias=in_bias,
-                out=out,
-                out_geometry=out_geometry,
-            )
-        x = apply_in_bias(x, in_bias)
-        if can_fuse_rms_norm_silu(x):
-            return _into(
-                out,
-                rms_norm_silu(x, self.gamma, bias, self.scale, reference_rounding=reference),
-                out_geometry,
-            )
-        return _into(out, F.silu(self.forward(x)), out_geometry)
 
-    def forward_silu_pending(
-        self,
-        pending: PendingAdd,
-        out: torch.Tensor | None = None,
-        out_geometry: FrameGeometry | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns ``(s, SiLU(norm(s)))`` with ``s = (a + bias) + b``, added inside the kernel when possible."""
-        bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-        reference = self.options.norm_mode == "reference"
-        if pending.up is not None:
-            if (
-                self.options.fused_norm
-                and self.channel_first
-                and self.options.norm_kernel == "cuda"
-            ):
-                return upsample_rms_norm_silu_cuda(
-                    pending.up.source(),
-                    self.gamma,
-                    bias,
-                    self.scale,
-                    reference_rounding=reference,
-                    out=out,
-                    out_geometry=out_geometry,
-                )
-            s = pending.materialize()
-            return s, self._forward_silu(s, None, out, out_geometry)
-        if pending.wino is not None:
-            s = pending.materialize()
-            return s, self._forward_silu(s, None, out, out_geometry)
-        if (
-            pending.b is not None
-            and self.options.fused_norm
-            and self.channel_first
-            and self.options.norm_kernel == "cuda"
-            and can_use_cuda_rms_norm_silu(pending.a)
-            and can_use_cuda_rms_norm_silu(pending.b)
-        ):
-            return add_rms_norm_silu_cuda(
-                pending.a,
-                pending.b,
-                self.gamma,
-                bias,
-                self.scale,
-                reference_rounding=reference,
-                in_bias=pending.bias,
-                out=out,
-                out_geometry=out_geometry,
-            )
-        s = pending.materialize()
-        return s, self.forward_silu(s, out, out_geometry)
+class WinoVaeCausalConv3d(WanCausalConv3d):
+    """``WanCausalConv3d`` with the frame-buffer, temporal and spatial Winograd paths."""
 
-
-class WinoVaeCausalConv3d(nn.Conv3d):
     def __init__(
         self,
         in_channels: int,
@@ -762,93 +462,79 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         stride: int | tuple[int, int, int] = 1,
         padding: int | tuple[int, int, int] = 0,
     ) -> None:
-        super().__init__(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-        )
-        self._padding = (0, 0, 0, 0, 2 * self.padding[0], 0)
-        self.padding = (0, self.padding[1], self.padding[2])
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding)
         # When set, forward() leaves the bias out; the caller hands it to the consumer kernel.
         self.defer_bias = False
+        # Chunks the frame buffer holds after the two history frames (WinoVaeOptions).
+        self.buffer_chunks = 4
         # When set, a stride-1 temporal conv runs on at most this many input frames per
-        # cuDNN call and concatenates the output frames (see WinoVaeOptions.conv_out_frame_split).
+        # cuDNN call and concatenates the output frames.
         self.max_in_frames: int | None = None
-        # When set, a single-frame call with no cache runs as conv2d on the last temporal
-        # weight slice (see WinoVaeOptions.first_frame_conv2d).
-        self.first_frame_conv2d = False
-        self._weight_2d: tuple[int, int, torch.Tensor] | None = None
-        self._wino_w: dict[int, tuple[int, int, list[torch.Tensor]]] = {}
-        # Spatial Winograd mode for forward_winograd ("off", "auto", "all"), set by the block.
-        self.winograd_spatial = "off"
-        self.winograd_spatial_kernel = "cublas"
-        self.winograd_spatial_fused = True
-        self.winograd_slab_dtype = torch.bfloat16
+        # Tensors derived from the weight (transformed filters, the current-frame slice).
+        self._derived: dict[tuple, tuple[tuple[int, int], Any]] = {}
+        # Set by the residual block for its two convs: spatial Winograd where selected, and
+        # the cuDNN graph API (per-shape plan choice) for the convs that stay direct. Every
+        # other conv runs through torch's cuDNN path.
+        self.spatial_winograd = False
         self.cudnn_frontend = False
-        self.winograd_spatial_tile = 2
-        self.winograd_spatial_single_tile = 2
-        self.winograd_spatial_first_frame = False
-        self._wino_u_sm100: dict[int, tuple[int, int, torch.Tensor]] = {}
-        self._wino_u_fused: dict[int, tuple[int, int, list[torch.Tensor]]] = {}
-        self._wino_u: dict[int, tuple[int, int, int, torch.Tensor]] = {}
-        self._wino_u_taps: dict[tuple[int, int, str], tuple[int, int, torch.Tensor]] = {}
         # Spatial sharding: this rank's slice and the halo exchanges (None: whole frames).
         self.shard: Shard | None = None
-        self._slab: torch.Tensor | None = None
-        self._slab_key: tuple | None = None
-        self._slab_pos = 0
-        self._slab_geo: FrameGeometry | None = None
+        self._buffer: torch.Tensor | None = None
+        self._buffer_key: tuple | None = None
+        self._buffer_pos = 0
+        self._buffer_geo: FrameGeometry | None = None
         # The frame buffer as a symmetric-memory allocation (direct halo exchange).
-        self._slab_direct: DirectFrames | None = None
+        self._buffer_direct: DirectFrames | None = None
 
-    # ---- frame buffer ("slab") for the causal history -------------------------------
+    # ---- frame buffer for the causal history -------------------------------
     # The buffer holds [1, C, S, H, W] channels-last frames; frames [pos-2, pos) are the
     # causal history (zeros before the first chunk), the producer writes the chunk's T
     # frames at [pos, pos+T), the conv reads the window [pos-2, pos+T) with no copy. When
     # the window would run off the end, the two history frames move to the front. The
     # buffer outlives the clip: a new clip starts at the front again over zeroed history.
-    kSlabChunks = 4
 
-    def slab_reset(self) -> None:
-        self._slab_pos = 0
+    def buffer_reset(self) -> None:
+        self._buffer_pos = 0
 
-    def slab_begin(
-        self, cache_entry: CacheEntry, frames: int, like: torch.Tensor, spatial: tuple[int, int]
+    def buffer_begin(
+        self,
+        cache_entry: CacheEntry,
+        frames: int,
+        like: "torch.Tensor | PendingAdd",
+        spatial: tuple[int, int],
     ) -> torch.Tensor:
         """Start a chunk: reset on the first chunk, adopt a cache tensor left by the eager
         first-chunk path (the frame history), and return the writable window. ``spatial`` is
         the logical frame size (H, W)."""
         adopt = cache_entry if isinstance(cache_entry, torch.Tensor) else None
         if cache_entry is None or adopt is not None:
-            self.slab_reset()
-        window = self.slab_window(frames, like, spatial)
+            self.buffer_reset()
+        window = self.buffer_window(frames, like, spatial)
         if adopt is not None:
             n = adopt.shape[2]
             if self.shard is not None:
                 adopt = self.shard.pad_frames(_channels_last_3d_if_needed(adopt))
-            self._slab[:, :, 2 - n : 2].copy_(adopt)
+            self._buffer[:, :, 2 - n : 2].copy_(adopt)
         return window
 
     @property
-    def slab_geometry(self) -> FrameGeometry | None:
+    def buffer_geometry(self) -> FrameGeometry | None:
         """Frame layout of the frame buffer (halo lines under sharding)."""
-        return self._slab_geo
+        return self._buffer_geo
 
-    def slab_history(self) -> torch.Tensor | None:
+    def buffer_history(self) -> torch.Tensor | None:
         """The frame buffer's two history frames as a logical channels-last ``[1, C, 2, H, W]``
         tensor (the cache entry the other conv paths read), or ``None`` before the first chunk."""
-        if self._slab is None or self._slab_pos < 2:
+        if self._buffer is None or self._buffer_pos < 2:
             return None
-        hist = self._slab[:, :, self._slab_pos - 2 : self._slab_pos]
-        geo = self._slab_geo
+        hist = self._buffer[:, :, self._buffer_pos - 2 : self._buffer_pos]
+        geo = self._buffer_geo
         if geo is not None:
             hist = hist[:, :, :, geo.row0 : geo.row0 + geo.height, geo.col0 : geo.col0 + geo.width]
         return hist.contiguous(memory_format=torch.channels_last_3d)
 
-    def slab_window(
-        self, frames: int, like: torch.Tensor, spatial: tuple[int, int]
+    def buffer_window(
+        self, frames: int, like: "torch.Tensor | PendingAdd", spatial: tuple[int, int]
     ) -> torch.Tensor:
         """A writable channels-last ``[1, C, frames, rows, cols]`` view for the chunk's frames
         (``rows x cols`` = the logical ``spatial`` plus the halo lines under sharding)."""
@@ -859,17 +545,17 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         # The buffer's identity in terms every rank agrees on (an unequal split can change
         # one rank's extent and not another's, and the direct allocation is collective).
         key = (c, like.dtype, self.shard.frame_key(h, w) if self.shard is not None else (h, w))
-        slab = self._slab
+        buf = self._buffer
 
         def allocate() -> torch.Tensor:
             # Zeros: the history frames and (sharded) the outer halo of the edge ranks.
-            depth = 2 + self.kSlabChunks * frames
-            if self._slab_direct is not None:
-                self.shard.retire(self._slab_direct)
+            depth = 2 + self.buffer_chunks * frames
+            if self._buffer_direct is not None:
+                self.shard.retire(self._buffer_direct)
             if self.shard is not None and self.shard.direct:
-                self._slab_direct = self.shard.direct_frames(1, depth, geo, 1, c, like.dtype)
-                return self._slab_direct.frames[0].unsqueeze(0).permute(0, 4, 1, 2, 3)
-            self._slab_direct = None
+                self._buffer_direct = self.shard.direct_frames(1, depth, geo, 1, c, like.dtype)
+                return self._buffer_direct.frames[0].unsqueeze(0).permute(0, 4, 1, 2, 3)
+            self._buffer_direct = None
             return torch.empty(
                 1,
                 c,
@@ -881,70 +567,68 @@ class WinoVaeCausalConv3d(nn.Conv3d):
                 memory_format=torch.channels_last_3d,
             ).zero_()
 
-        if slab is None or self._slab_key != key:
-            slab = allocate()
-            self._slab, self._slab_key, self._slab_pos = slab, key, 2
-        elif self._slab_pos == 0:
+        if buf is None or self._buffer_key != key:
+            buf = allocate()
+            self._buffer, self._buffer_key, self._buffer_pos = buf, key, 2
+        elif self._buffer_pos == 0:
             # A new clip: zero history in front of the first window, in the existing buffer
             # when the chunk fits (its depth was set by an earlier clip's chunk length).
-            if slab.shape[2] < 2 + frames:
-                slab = allocate()
-                self._slab = slab
+            if buf.shape[2] < 2 + frames:
+                buf = allocate()
+                self._buffer = buf
             else:
-                slab[:, :, :2].zero_()
-            self._slab_pos = 2
-        elif self._slab_pos + frames > slab.shape[2]:
+                buf[:, :, :2].zero_()
+            self._buffer_pos = 2
+        elif self._buffer_pos + frames > buf.shape[2]:
             # Wrap: the two history frames move to the front (through a copy, the ranges
             # may overlap). A new buffer instead when this chunk is longer than the buffer
             # holds, or when the neighbours push into this one: they run up to one exchange
             # ahead and store their border lines into the new window [2, 2 + frames) as soon
             # as they reach it, which must not overtake this copy of the history frames.
-            hist = slab[:, :, self._slab_pos - 2 : self._slab_pos].clone()
-            if slab.shape[2] < 2 + frames or (
-                self._slab_direct is not None and self._slab_pos - 2 < 2 + frames
+            hist = buf[:, :, self._buffer_pos - 2 : self._buffer_pos].clone()
+            if buf.shape[2] < 2 + frames or (
+                self._buffer_direct is not None and self._buffer_pos - 2 < 2 + frames
             ):
-                slab = allocate()
-                self._slab = slab
-            slab[:, :, :2].copy_(hist)
-            self._slab_pos = 2
-        if self._slab_direct is not None:
-            geo = replace(geo, push=self._slab_direct.push(self._slab_pos, frames))
-        self._slab_geo = geo
-        return slab[:, :, self._slab_pos : self._slab_pos + frames]
+                buf = allocate()
+                self._buffer = buf
+            buf[:, :, :2].copy_(hist)
+            self._buffer_pos = 2
+        if self._buffer_direct is not None:
+            geo = replace(geo, push=self._buffer_direct.push(self._buffer_pos, frames))
+        self._buffer_geo = geo
+        return buf[:, :, self._buffer_pos : self._buffer_pos + frames]
 
-    def slab_exchange(self, window: torch.Tensor) -> None:
+    def buffer_exchange(self, window: torch.Tensor) -> None:
         """Complete the halo lines of a just-written window: wait for the neighbours' direct
         stores, or trade the border lines over NCCL."""
         if self.shard is None:
             return
-        if self._slab_direct is not None:
-            self._slab_direct.barrier()
+        if self._buffer_direct is not None:
+            self._buffer_direct.barrier()
         else:
-            self.shard.exchange(_frames_physical(window), self._slab_geo)
+            self.shard.exchange(_frames_physical(window), self._buffer_geo)
 
-    def slab_conv(self, frames: int) -> torch.Tensor:
+    def buffer_conv(self, frames: int) -> torch.Tensor:
         """Run the conv on ``[pos-2, pos+frames)`` and advance; the next two history frames stay in place."""
-        slab = self._slab
-        pos = self._slab_pos
+        buf = self._buffer
+        pos = self._buffer_pos
         bias = None if self.defer_bias else self.bias
         padding = self.padding if self.shard is None else self.shard.conv_padding(self.padding)
         if (
             frames == 1
             and self.shard is None
-            and self.spatial_eligible(
-                slab.shape[3], slab.shape[4], self.winograd_spatial_single_tile
-            )
+            and self.spatial_eligible(buf.shape[3], buf.shape[4], _SPATIAL_SINGLE_TILE)
         ):
             y = self._forward_spatial_taps(
-                [frames_view(slab[:, :, pos - 2 : pos + 1])], 0, slab.shape[3], slab.shape[4], bias
+                [frames_view(buf[:, :, pos - 2 : pos + 1])], 0, buf.shape[3], buf.shape[4], bias
             )
-            self._slab_pos = pos + 1
+            self._buffer_pos = pos + 1
             return y
         if self.max_in_frames is not None and frames + 2 > self.max_in_frames:
             per_call = self.max_in_frames - 2
             parts = [
                 F.conv3d(
-                    slab[:, :, pos - 2 + t : pos + min(t + per_call, frames)],
+                    buf[:, :, pos - 2 + t : pos + min(t + per_call, frames)],
                     self.weight,
                     bias,
                     self.stride,
@@ -956,16 +640,17 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             ]
             y = torch.cat(parts, dim=2)
         else:
-            window = slab[:, :, pos - 2 : pos + frames]
+            window = buf[:, :, pos - 2 : pos + frames]
             y = self._conv3d(window, bias, padding)
-        self._slab_pos = pos + frames
+        self._buffer_pos = pos + frames
         return _channels_last_3d_if_needed(y)
 
     def _conv3d(
         self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
     ) -> torch.Tensor:
-        """The direct 3D conv: cuDNN through torch, or through the graph API with the plan
-        selected for this shape when ``cudnn_frontend`` is on."""
+        """The direct 3D conv: through the cuDNN graph API with the plan selected for this shape
+        when ``cudnn_frontend`` is set (and the frontend is installed, the call unbatched), else
+        torch's cuDNN path."""
         if (
             self.cudnn_frontend
             and self.groups == 1
@@ -985,23 +670,30 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             )
         return F.conv3d(x, self.weight, bias, self.stride, padding, self.dilation, self.groups)
 
-    def slab_eligible(self, x_like: torch.Tensor) -> bool:
+    def buffer_eligible(self, x: "torch.Tensor | PendingAdd") -> bool:
         return (
-            x_like.shape[0] == 1
+            x.shape[0] == 1
             and self.kernel_size[0] == 3
             and self.stride == (1, 1, 1)
             and self.dilation == (1, 1, 1)
             and self.groups == 1
         )
 
-    def _winograd_weights(self, order: int = 2) -> list[torch.Tensor]:
-        """The ``order + 2`` temporal component filters, in the slab dtype."""
-        key = (self.weight.data_ptr(), self.weight._version)
-        cached = self._wino_w.get(order)
-        if cached is None or cached[:2] != key:
-            cached = (*key, winograd_weights(self.weight, order, self.winograd_slab_dtype))
-            self._wino_w[order] = cached
-        return cached[2]
+    def _derived_weight(self, key: tuple, build: Callable[[], Any]) -> Any:
+        """A tensor derived from the weight, built on first use and rebuilt when the weight
+        tensor changes identity or version."""
+        stamp = (self.weight.data_ptr(), self.weight._version)
+        cached = self._derived.get(key)
+        if cached is None or cached[0] != stamp:
+            cached = (stamp, build())
+            self._derived[key] = cached
+        return cached[1]
+
+    def _winograd_weights(self, order: int) -> list[torch.Tensor]:
+        """The ``order + 2`` temporal component filters, in the Winograd dtype."""
+        return self._derived_weight(
+            ("temporal", order), lambda: winograd_weights(self.weight, order, _WINOGRAD_DTYPE)
+        )
 
     def winograd_eligible(self, frames: int, batch: int) -> bool:
         return (
@@ -1014,79 +706,29 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             and self.groups == 1
         )
 
-    def _winograd_spatial_weights(self, order: int = 2) -> torch.Tensor:
-        key = (self.weight.data_ptr(), self.weight._version, self.winograd_spatial_tile)
-        cached = self._wino_u.get(order)
-        if cached is None or cached[:3] != key:
-            cached = (
-                *key,
-                winograd_spatial_weights(self.weight, self.winograd_spatial_tile, order),
-            )
-            self._wino_u[order] = cached
-        return cached[3]
-
-    def _winograd_spatial_weights_sm100(self, order: int = 2) -> torch.Tensor:
-        key = (self.weight.data_ptr(), self.weight._version)
-        cached = self._wino_u_sm100.get(order)
-        if cached is None or cached[:2] != key:
-            cached = (*key, sm100_spatial_filters(self._winograd_weights(order)))
-            self._wino_u_sm100[order] = cached
-        return cached[2]
-
-    def _fused_filters(self, order: int = 2) -> list[torch.Tensor]:
-        key = (self.weight.data_ptr(), self.weight._version)
-        cached = self._wino_u_fused.get(order)
-        if cached is None or cached[:2] != key:
-            cached = (*key, sm100_fused_filters(self._winograd_weights(order)))
-            self._wino_u_fused[order] = cached
-        return cached[2]
-
-    def _use_sm100_fused(self, height: int, width: int) -> bool:
-        """The fused F(2,3)-horizontal / direct-vertical conv for the 256-output-channel level
-        (``sm100_fused_eligible`` states its shapes)."""
-        return (
-            self.winograd_spatial_kernel == "sm100"
-            and self.winograd_spatial_fused
-            and sm100_wino_available()
-            and sm100_fused_eligible(self.in_channels, self.out_channels, height, width)
-        )
-
-    def _use_sm100_spatial(self, height: int, width: int) -> bool:
-        return (
-            self.winograd_spatial_kernel == "sm100"
-            and sm100_wino_available()
-            and sm100_spatial_eligible(self.in_channels, self.out_channels, width)
-        )
-
     def spatial_eligible(
-        self, height: int, width: int, tile: int | None = None, kernel: str = "cublas"
+        self, height: int, width: int, tile: int = _SPATIAL_TILE, kernel: str = "cublas"
     ) -> bool:
-        tile = self.winograd_spatial_tile if tile is None else tile
+        """Whether spatial Winograd runs this conv on ``height x width`` frames with ``kernel``
+        ("sm100" or the portable "cublas") and ``tile``."""
         if (
-            self.winograd_spatial == "off"
+            not self.spatial_winograd
             or self.padding[1:] != (1, 1)
             or self.in_channels % 8
             or self.out_channels % 8
         ):
             return False
-        if self.winograd_spatial == "all":
-            return True
-        # "auto" selection by kernel and tile: the sm100 F(4x4, 3x3) pipeline on convs with at
-        # least 512 input channels up to 360x640; the portable path with F(4x4, 3x3) from 512
-        # input channels up to 180x320, with F(2x2, 3x3) from 1024 input channels up to 90x160.
+        return self._spatial_selected(height, width, tile, kernel)
+
+    def _spatial_selected(self, height: int, width: int, tile: int, kernel: str) -> bool:
+        """The layers spatial Winograd is used on: the sm100 F(4x4, 3x3) pipeline on convs with
+        at least 512 input channels up to 360x640; the portable path with F(4x4, 3x3) from 512
+        input channels up to 180x320, with F(2x2, 3x3) from 1024 input channels up to 90x160."""
         if kernel == "sm100":
             return self.in_channels >= 512 and height * width <= 360 * 640
         if tile == 4:
             return self.in_channels >= 512 and height * width <= 180 * 320
         return self.in_channels >= 1024 and height * width <= 90 * 160
-
-    def _winograd_taps_weights(self, taps: int, tile: int) -> torch.Tensor:
-        key = (self.weight.data_ptr(), self.weight._version)
-        cached = self._wino_u_taps.get((taps, tile))
-        if cached is None or cached[:2] != key:
-            cached = (*key, winograd_spatial_taps_weights(self.weight, tile, taps))
-            self._wino_u_taps[(taps, tile)] = cached
-        return cached[2]
 
     def _forward_spatial_taps(
         self,
@@ -1100,36 +742,42 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         buffers (``[n, H*W, C]`` each, oldest first, ``zero_front`` zero frames before them):
         the new frame alone (zero history) or the causal history and the new frame."""
         n_taps = zero_front + sum(t.shape[0] for t in taps)
-        tile = self.winograd_spatial_tile if n_taps == 1 else self.winograd_spatial_single_tile
-        u = self._winograd_taps_weights(n_taps, tile)
+        tile = _SPATIAL_TILE if n_taps == 1 else _SPATIAL_SINGLE_TILE
+        u = self._derived_weight(
+            ("taps", n_taps, tile),
+            lambda: winograd_spatial_taps_weights(self.weight, tile, n_taps),
+        )
         y = wino_spatial_conv_taps(taps, zero_front, u, h, w, bias)
         return frames_to_video(y.unsqueeze(0), h, w)
 
     def _spatial_kernel(self, h: int, w: int) -> str:
-        """Which conv runs the Winograd slabs of a logical ``h x w`` frame: "fused" (the
+        """Which conv runs the Winograd inputs of a logical ``h x w`` frame: "fused" (the
         fused F(2,3)-horizontal / direct-vertical 256-channel conv), "sm100" (the Blackwell
         F(4x4) pipeline), "cublas" (the portable spatial Winograd) or "cudnn" (conv2d per
-        slab). On a shard the
+        Winograd input). On a shard the
         choice is made for the largest shard's frame, so every rank picks the same kernel and
-        the same slab layout."""
+        the same Winograd-input layout."""
         if self.shard is not None:
             if self.shard.axis == "h":
                 h = max(self.shard.output_extents(h))
             else:
                 w = max(self.shard.output_extents(w))
-        if self.winograd_spatial != "off" and self._use_sm100_fused(h, w):
+        sm100 = sm100_wino_available()
+        cin, cout = self.in_channels, self.out_channels
+        if self.spatial_winograd and sm100 and sm100_fused_eligible(cin, cout, h, w):
             return "fused"
-        if self._use_sm100_spatial(h, w) and self.spatial_eligible(h, w, kernel="sm100"):
+        if (
+            sm100
+            and sm100_spatial_eligible(cin, cout, w)
+            and self.spatial_eligible(h, w, kernel="sm100")
+        ):
             return "sm100"
         if self.spatial_eligible(h, w):
             return "cublas"
         return "cudnn"
 
-    def _slab_dtype(self) -> torch.dtype:
-        return torch.float16 if self.winograd_slab_dtype == torch.float16 else torch.bfloat16
-
-    def winograd_slab_align(self, h: int, w: int, order: int) -> int:
-        """Lines the physical extent of this conv's slab frames is a multiple of: the tile of
+    def winograd_inputs_align(self, h: int, w: int, order: int) -> int:
+        """Lines the physical extent of this conv's Winograd-input frames is a multiple of: the tile of
         the kernel that will read them (the fused 256-channel conv takes 8-row x 32-column
         tiles, the sm100 pipeline 4-wide columns), 1 otherwise."""
         kernel = self._spatial_kernel(h, w)
@@ -1139,59 +787,67 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             return 4
         return 1
 
-    def winograd_slab_geometry(self, h: int, w: int, order: int) -> FrameGeometry | None:
-        """The slab layout for a logical ``h x w`` frame under sharding: halo lines, with the
-        physical extent rounded up to :meth:`winograd_slab_align`. None without sharding."""
+    def winograd_inputs_geometry(self, h: int, w: int, order: int) -> FrameGeometry | None:
+        """The Winograd-input layout for a logical ``h x w`` frame under sharding: halo lines, with the
+        physical extent rounded up to :meth:`winograd_inputs_align`. None without sharding."""
         if self.shard is None:
             return None
-        return self.shard.geometry(h, w, self.winograd_slab_align(h, w, order))
+        return self.shard.geometry(h, w, self.winograd_inputs_align(h, w, order))
 
-    def winograd_slabs(
+    def winograd_inputs(
         self, h: int, w: int, order: int, frames: int
     ) -> tuple[FrameGeometry | None, torch.Tensor | None, DirectFrames | None]:
-        """What the norm kernel that feeds this conv writes its slabs into for a logical
-        ``h x w`` frame: the slab layout (None without sharding) and, with direct halo
+        """What the norm kernel that feeds this conv writes its Winograd inputs into for a logical
+        ``h x w`` frame: the Winograd-input layout (None without sharding) and, with direct halo
         exchange, the symmetric buffer ``[order + 2, frames / order, positions, C]`` to fill
         (the layout then carries the neighbours' halo lines as its push) and that buffer's
         handle for the barrier."""
         if self.shard is None:
             return None, None, None
-        align = self.winograd_slab_align(h, w, order)
+        align = self.winograd_inputs_align(h, w, order)
         geo = self.shard.geometry(h, w, align)
         if not self.shard.direct:
             return geo, None, None
         comps, groups = order + 2, frames // order
-        buf = self.shard.direct_slabs(
-            comps, groups, geo, align, self.in_channels, self._slab_dtype()
-        )
-        slabs = buf.frames.view(comps, groups, geo.frame, self.in_channels)
-        return replace(geo, push=buf.push()), slabs, buf
+        buf = self.shard.direct_inputs(comps, groups, geo, align, self.in_channels, _WINOGRAD_DTYPE)
+        inputs = buf.frames.view(comps, groups, geo.frame, self.in_channels)
+        return replace(geo, push=buf.push()), inputs, buf
 
-    def forward_winograd(self, slabs: WinoSlabs) -> tuple[list[torch.Tensor], FrameGeometry | None]:
-        """The ``order + 2`` 3x3 convs of the transformed slabs (bias left to the consumer):
-        cuDNN conv2d per slab, or spatial Winograd on all of them at once where that is faster.
+    def forward_winograd(
+        self, inputs: WinogradInputs
+    ) -> tuple[list[torch.Tensor], FrameGeometry | None]:
+        """The ``order + 2`` 3x3 convs of the transformed inputs (bias left to the consumer):
+        cuDNN conv2d per input, or spatial Winograd on all of them at once where that is faster.
         Returns the products and their frame layout: the spatial Winograd kernels work on the
         physical frames (halo lines included), cuDNN emits the logical frame."""
-        comps = len(slabs.d)
+        comps = len(inputs.d)
         order = comps - 2
-        geo = slabs.geometry
+        geo = inputs.geometry
         if geo is None:
-            _, _, h, w = slabs.d[0].shape
+            _, _, h, w = inputs.d[0].shape
             ph, pw = h, w
         else:
             h, w = geo.height, geo.width
             ph, pw = geo.rows, geo.cols
         kernel = self._spatial_kernel(h, w)
         if kernel == "fused":
-            m = wino_spatial_conv_fused(slabs.stacked, self._fused_filters(order), ph, pw)
+            u = self._derived_weight(
+                ("fused", order), lambda: sm100_fused_filters(self._winograd_weights(order))
+            )
+            m = wino_spatial_conv_fused(inputs.stacked, u, ph, pw)
             return [pairs_to_images(m[k], ph, pw) for k in range(comps)], geo
         if kernel == "sm100":
-            m = wino_spatial_conv_sm100(
-                slabs.stacked, self._winograd_spatial_weights_sm100(order), ph, pw
+            u = self._derived_weight(
+                ("sm100", order), lambda: sm100_spatial_filters(self._winograd_weights(order))
             )
+            m = wino_spatial_conv_sm100(inputs.stacked, u, ph, pw)
             return [pairs_to_images(m[k], ph, pw) for k in range(comps)], geo
         if kernel == "cublas":
-            m = wino_spatial_conv_cuda(slabs.stacked, self._winograd_spatial_weights(order), ph, pw)
+            u = self._derived_weight(
+                ("spatial", order),
+                lambda: winograd_spatial_weights(self.weight, _SPATIAL_TILE, order),
+            )
+            m = wino_spatial_conv_cuda(inputs.stacked, u, ph, pw)
             return [pairs_to_images(m[k], ph, pw) for k in range(comps)], geo
         g = self._winograd_weights(order)
         pad = (self.padding[1], self.padding[2])
@@ -1202,26 +858,19 @@ class WinoVaeCausalConv3d(nn.Conv3d):
         if self.cudnn_frontend and cudnn_frontend_available():
             # One stacked product buffer [comps, groups, H, W, Cout]: the consumer norm kernel
             # reads the components at one stride, and the graph API writes into the slices.
-            groups = slabs.d[0].shape[0]
+            groups = inputs.d[0].shape[0]
             out = torch.empty(
                 (comps, groups, h, w, self.out_channels),
-                dtype=slabs.d[0].dtype,
-                device=slabs.d[0].device,
+                dtype=inputs.d[0].dtype,
+                device=inputs.d[0].device,
             )
             views = [
                 out[k].permute(0, 3, 1, 2) for k in range(comps)
             ]  # [groups, Cout, H, W] channels-last
             for k in range(comps):
-                conv_frontend(slabs.d[k], g[k], None, (1, 1), pad, (1, 1), out=views[k])
+                conv_frontend(inputs.d[k], g[k], None, (1, 1), pad, (1, 1), out=views[k])
             return views, None
-        return [F.conv2d(slabs.d[k], g[k], None, 1, pad) for k in range(comps)], None
-
-    def _current_frame_weight(self) -> torch.Tensor:
-        key = (self.weight.data_ptr(), self.weight._version)
-        if self._weight_2d is None or self._weight_2d[:2] != key:
-            w2 = self.weight[:, :, -1].contiguous(memory_format=torch.channels_last)
-            self._weight_2d = (*key, w2)
-        return self._weight_2d[2]
+        return [F.conv2d(inputs.d[k], g[k], None, 1, pad) for k in range(comps)], None
 
     def forward(
         self,
@@ -1240,23 +889,14 @@ class WinoVaeCausalConv3d(nn.Conv3d):
                     _channels_last_3d_if_needed(_to_device_if_needed(cache_x, x.device))
                 )
             spatial_padding = self.shard.conv_padding(self.padding[1:])
-        if (
-            self.first_frame_conv2d
-            and cache_x is None
-            and self._padding[4] > 0
-            and x.shape[2] == 1
-            and self.stride[0] == 1
-        ):
+        if cache_x is None and self._padding[4] > 0 and x.shape[2] == 1 and self.stride[0] == 1:
             # Zero history: only the current-frame taps contribute.
-            if (
-                spatial_padding is None
-                and self.winograd_spatial_first_frame
-                and self.spatial_eligible(x.shape[3], x.shape[4])
-            ):
-                return self._forward_spatial_taps([frames_view(x)], 0, x.shape[3], x.shape[4], bias)
             y = F.conv2d(
                 x[:, :, 0],
-                self._current_frame_weight(),
+                self._derived_weight(
+                    ("current_frame",),
+                    lambda: self.weight[:, :, -1].contiguous(memory_format=torch.channels_last),
+                ),
                 bias,
                 self.stride[1:],
                 self.padding[1:] if spatial_padding is None else spatial_padding,
@@ -1275,7 +915,7 @@ class WinoVaeCausalConv3d(nn.Conv3d):
             and self.groups == 1
             and spatial_padding is None
             and (cache_x is None or cache_x.shape[2] <= 2)
-            and self.spatial_eligible(x.shape[3], x.shape[4], self.winograd_spatial_single_tile)
+            and self.spatial_eligible(x.shape[3], x.shape[4], _SPATIAL_SINGLE_TILE)
         ):
             # One new frame after its causal history: spatial Winograd alone, the three taps
             # summed inside the GEMM, the history read where the cache holds it.
@@ -1327,12 +967,10 @@ class WinoVaeResample(nn.Module):
         dim: int,
         mode: str,
         upsample_out_dim: int | None = None,
-        options: WinoVaeOptions | None = None,
     ) -> None:
         super().__init__()
         self.dim = dim
         self.mode = mode
-        self.options = options or WinoVaeOptions()
         self._packed: tuple[int, int, torch.Tensor, torch.Tensor | None] | None = None
         # Downsample conv bias left out of the conv (fused_bias): the time conv absorbs it
         # (downsample3d) or the owning block's shortcut-add kernel adds it (downsample2d).
@@ -1381,9 +1019,8 @@ class WinoVaeResample(nn.Module):
         batch_size: int,
         frames: int,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None,
-    ) -> "torch.Tensor | PendingAdd":
-        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut); with
-        ``fused_upsample_norm`` the gather is left to the next norm kernel as a ``PendingAdd``."""
+    ) -> torch.Tensor:
+        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut)."""
         packed, packed_bias = self._packed_weights()
         cout = packed.shape[0] // 4
         use_cuda = x_4d.dtype in (torch.bfloat16, torch.float16) and (
@@ -1392,7 +1029,7 @@ class WinoVaeResample(nn.Module):
             or shortcut is not None
             and can_use_cuda_upsample_gather(cout, shortcut[1].factor_t, shortcut[1].repeats)
         )
-        defer_bias = use_cuda and self.options.fused_bias and packed_bias is not None
+        defer_bias = use_cuda and packed_bias is not None
         if self.shard is not None:
             # One low-res line from each neighbour; the 2x2 conv then emits the H+1 (or W+1)
             # temp lines this rank's output rows read.
@@ -1407,29 +1044,11 @@ class WinoVaeResample(nn.Module):
         temp = _channels_last_2d_if_needed(temp)
         if use_cuda:
             gather_bias = self.resample[1].bias if defer_bias else None
-            fuse_norm = (
-                self.options.fused_upsample_norm
-                and self.options.fused_norm
-                and self.options.norm_kernel == "cuda"
-                and batch_size == 1
-                and self.shard is None
-                and jit_norm_available()
-            )
             if shortcut is None:
-                if fuse_norm:
-                    return PendingAdd(
-                        None, up=UpsampleInput(temp, None, gather_bias, 1, 1, 0, frames)
-                    )
                 return upsample_gather_cuda(temp, None, batch_size, frames, bias=gather_bias)
             residual, dup, first_chunk = shortcut
             residual = _channels_last_3d_if_needed(residual)
             crop = dup.factor_t - 1 if first_chunk else 0
-            if fuse_norm:
-                up = UpsampleInput(
-                    temp, residual, gather_bias, dup.factor_t, dup.repeats, crop, frames
-                )
-                if up.fusable:
-                    return PendingAdd(None, up=up)
             return upsample_gather_cuda(
                 temp,
                 residual,
@@ -1452,19 +1071,17 @@ class WinoVaeResample(nn.Module):
         feat_cache: list[CacheEntry] | None = None,
         feat_idx: list[int] | None = None,
         shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
-    ) -> "torch.Tensor | PendingAdd":
+    ) -> torch.Tensor:
         """Resample ``x`` ``[B, C, T, H, W]``: the upsample3d time step with its causal cache,
-        then the spatial step, then (downsample3d) the temporal downsample continuation.
-        ``shortcut`` = (residual, DupUp3D module, first_chunk): when given, the fused upsample
-        adds the expanded shortcut while writing and the caller skips its add. The fused
-        upsample may return a ``PendingAdd`` whose gather the next norm kernel performs."""
+        then the spatial step (upsampling as a 2x2 conv on the low-res grid plus a phase
+        gather), then (downsample3d) the temporal downsample continuation. ``shortcut`` =
+        (residual, DupUp3D module, first_chunk): when given, the upsample adds the expanded
+        shortcut while writing and the caller skips its add."""
         batch_size, channels, _, height, width = x.size()
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
-        if shortcut is not None and not (
-            self.options.fused_upsample and self.mode.startswith("upsample")
-        ):
-            raise ValueError("shortcut is only consumed by the fused upsample path")
+        if shortcut is not None and not self.mode.startswith("upsample"):
+            raise ValueError("shortcut is only consumed by the upsample modes")
 
         if self.mode == "upsample3d" and feat_cache is not None and feat_idx is not None:
             x = self._temporal_upsample(x, feat_cache, feat_idx)
@@ -1472,9 +1089,9 @@ class WinoVaeResample(nn.Module):
         frames = x.shape[2]
         x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
         x_4d = _channels_last_2d_if_needed(x_4d)
-        if self.options.fused_upsample and self.mode.startswith("upsample"):
+        if self.mode.startswith("upsample"):
             return self._fused_upsample(x_4d, batch_size, frames, shortcut)
-        y = self._spatial_resample(x_4d, batch_size)
+        y = self._downsample(x_4d, batch_size)
         return self._after_resample(y, batch_size, frames, feat_cache, feat_idx)
 
     def _temporal_upsample(
@@ -1528,50 +1145,33 @@ class WinoVaeResample(nn.Module):
         x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
         return x.reshape(batch_size, channels, frames * 2, height, width)
 
-    def _spatial_resample(self, x_4d: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """The eager spatial step on frames ``[B*T, C, H, W]``: the stride-2 downsample conv
-        after its zero pad (the shard's pad under sharding), or the nearest-2x upsample and
-        3x3 conv (with exchanged halo lines under sharding)."""
-        if self.mode.startswith("downsample"):
-            padded = (
-                self.resample[0](x_4d)
-                if self.shard is None
-                else self.shard.pad_for_downsample(_channels_last_2d_if_needed(x_4d))
-            )
-            return self._downsample_conv(padded, batch_size)
-        if self.shard is not None:
-            up = _channels_last_2d_if_needed(self.resample[0](x_4d))
-            conv = self.resample[1]
-            return F.conv2d(
-                self.shard.pad_frames(up),
-                conv.weight,
-                conv.bias,
-                conv.stride,
-                self.shard.conv_padding(conv.padding),
-            )
-        return self.resample(x_4d)
-
-    def _defer_downsample_bias(self, x: torch.Tensor, batch_size: int) -> bool:
+    def _downsample(
+        self, x_4d: torch.Tensor, batch_size: int, *, prepadded: bool = False
+    ) -> torch.Tensor:
+        """The stride-2 3x3 conv of the downsample modes on frames ``[B*T, C, H, W]``, after its
+        zero pad (the shard's pad under sharding), or on an input that already carries the zero
+        row and column (``prepadded``). When the owning residual down block consumes the bias
+        (``defer_bias_to_consumer``), the conv runs bias-free and leaves it in ``pending_bias``."""
+        if prepadded:
+            x_4d = _channels_last_2d_if_needed(x_4d)
+            if self.shard is not None:
+                self.shard.fill_pad_line(x_4d)
+        elif self.shard is None:
+            x_4d = self.resample[0](x_4d)
+        else:
+            x_4d = self.shard.pad_for_downsample(_channels_last_2d_if_needed(x_4d))
         conv = self.resample[1]
-        return (
+        defer = (
             self.defer_bias_to_consumer
-            and self.options.fused_bias
-            and self.options.norm_mode != "reference"
             and conv.bias is not None
             and cuda_frame_ops_available()
             and batch_size == 1
-            and x.is_cuda
-            and x.dtype == torch.bfloat16
+            and x_4d.is_cuda
+            and x_4d.dtype == torch.bfloat16
         )
-
-    def _downsample_conv(self, x_4d: torch.Tensor, batch_size: int) -> torch.Tensor:
-        """The stride-2 3x3 conv of the downsample modes; with a deferred bias the conv runs
-        bias-free and the bias is left in ``pending_bias`` for the consumer."""
-        conv = self.resample[1]
-        if self._defer_downsample_bias(x_4d, batch_size):
-            self.pending_bias = conv.bias
+        self.pending_bias = conv.bias if defer else None
+        if defer:
             return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding)
-        self.pending_bias = None
         return conv(x_4d)
 
     def take_pending_bias(self) -> torch.Tensor | None:
@@ -1604,10 +1204,7 @@ class WinoVaeResample(nn.Module):
         ``ZeroPad2d`` would add; ``x_4d`` is ``[T, C, H+1, W+1]`` channels-last, batch 1."""
         if not self.mode.startswith("downsample"):
             raise ValueError("forward_prepadded is for the downsample modes")
-        x_4d = _channels_last_2d_if_needed(x_4d)
-        if self.shard is not None:
-            self.shard.fill_pad_line(x_4d)
-        x = self._downsample_conv(x_4d, 1)
+        x = self._downsample(x_4d, 1, prepadded=True)
         return self._after_resample(x, 1, frames, feat_cache, feat_idx)
 
     def _after_resample(
@@ -1647,16 +1244,14 @@ class WinoVaeResidualBlock(nn.Module):
         out_dim: int,
         dropout: float = 0.0,
         non_linearity: str = "silu",
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.options = options or WinoVaeOptions()
         self.nonlinearity = _activation(non_linearity)
-        self.norm1 = WinoVaeRMSNorm(in_dim, images=False, options=self.options)
+        self.norm1 = WinoVaeRMSNorm(in_dim, images=False)
         self.conv1 = WinoVaeCausalConv3d(in_dim, out_dim, 3, padding=1)
-        self.norm2 = WinoVaeRMSNorm(out_dim, images=False, options=self.options)
+        self.norm2 = WinoVaeRMSNorm(out_dim, images=False)
         self.dropout = nn.Dropout(dropout)
         self.conv2 = WinoVaeCausalConv3d(out_dim, out_dim, 3, padding=1)
         self.conv_shortcut = (
@@ -1664,19 +1259,11 @@ class WinoVaeResidualBlock(nn.Module):
         )
         self._merged_bias: tuple[int, int, torch.Tensor] | None = None
         # Spatial Winograd applies to both convs on every path (frame pairs, cached single
-        # frames, the first frame), so the mode is fixed here, not when a path first runs.
-        spatial = self.options.winograd_spatial if self.options.use_winograd_spatial else "off"
+        # frames), so it is fixed here, not when a path first runs.
+        spatial = cuda_op_available() and cuda_wino_spatial_available()
         for conv in (self.conv1, self.conv2):
-            conv.winograd_spatial = spatial
-            conv.winograd_spatial_kernel = self.options.winograd_spatial_kernel
-            conv.winograd_spatial_fused = self.options.winograd_spatial_fused
-            conv.winograd_slab_dtype = (
-                torch.float16 if self.options.winograd_slab_dtype == "fp16" else torch.bfloat16
-            )
-            conv.cudnn_frontend = self.options.cudnn_frontend
-            conv.winograd_spatial_tile = self.options.winograd_spatial_tile
-            conv.winograd_spatial_single_tile = self.options.winograd_spatial_single_tile
-            conv.winograd_spatial_first_frame = self.options.winograd_spatial_first_frame
+            conv.spatial_winograd = spatial
+            conv.cudnn_frontend = True
 
     def _output_bias(self, with_shortcut: bool) -> torch.Tensor:
         """conv2's bias, plus the shortcut conv's when that one was deferred too."""
@@ -1702,16 +1289,11 @@ class WinoVaeResidualBlock(nn.Module):
         added here. ``return_input``: also return the materialized block input."""
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
-        defer = self.options.defer_conv_bias
-        defer_out = defer and defer_output_bias and self.options.fused_residual
+        defer_out = defer_output_bias
 
-        if isinstance(x, PendingAdd):
-            frames = x.frames
-            batch = 1 if x.a is None else x.a.shape[0]
-        else:
-            frames, batch = x.shape[2], x.shape[0]
+        batch, _, frames = x.shape[:3]
         if (
-            self.options.use_winograd
+            cuda_op_available()
             and feat_cache is not None
             and feat_idx is not None
             and self.conv1.winograd_eligible(frames, batch)
@@ -1720,38 +1302,31 @@ class WinoVaeResidualBlock(nn.Module):
             return self._forward_winograd(x, feat_cache, feat_idx, frames, return_input)
 
         if (
-            self.options.use_slabs
+            cuda_op_available()
             and feat_cache is not None
             and feat_idx is not None
-            and self.conv1.slab_eligible(_pending_like(x))
-            and self.conv2.slab_eligible(_pending_like(x))
-            and not (
-                self.conv1.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
-            )
+            and self.conv1.buffer_eligible(x)
+            and self.conv2.buffer_eligible(x)
+            and not (frames == 1 and feat_cache[feat_idx[0]] is None)
         ):
-            return self._forward_slabs(
-                x, feat_cache, feat_idx, frames, defer, defer_out, return_input
-            )
+            return self._forward_buffered(x, feat_cache, feat_idx, frames, defer_out, return_input)
 
         if feat_cache is not None and feat_idx is not None:
             for i in (feat_idx[0], feat_idx[0] + 1):
                 feat_cache[i] = _cache_frames(feat_cache[i])
-        if isinstance(x, PendingAdd):
-            x, h = self.norm1.forward_silu_pending(x)
-        else:
-            h = self.norm1.forward_silu(x)
+        x, h = self.norm1.norm_silu(x, return_sum=True)
         has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
-        defer_shortcut = defer_out and has_shortcut_conv and self.options.norm_mode != "reference"
+        defer_shortcut = defer_out and has_shortcut_conv
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x)
 
-        self.conv1.defer_bias = defer
+        self.conv1.defer_bias = True
         if feat_cache is not None and feat_idx is not None:
             h = _causal_conv_with_cache(self.conv1, h, feat_cache, feat_idx)
         else:
             h = self.conv1(h)
-        h = self.norm2.forward_silu(PendingAdd(h, None, self.conv1.bias) if defer else h)
+        h = self.norm2.norm_silu(PendingAdd(h, None, self.conv1.bias))
         h = self.dropout(h)
 
         self.conv2.defer_bias = defer_out
@@ -1759,59 +1334,48 @@ class WinoVaeResidualBlock(nn.Module):
             h = _causal_conv_with_cache(self.conv2, h, feat_cache, feat_idx)
         else:
             h = self.conv2(h)
-        if self.options.fused_residual:
-            out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
-        else:
-            out = _channels_last_3d_if_needed(h + residual)
+        out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
         return (out, x) if return_input else out
 
-    def _forward_slabs(
+    def _forward_buffered(
         self,
         x: "torch.Tensor | PendingAdd",
         feat_cache: list[CacheEntry],
         feat_idx: list[int],
         frames: int,
-        defer: bool,
         defer_out: bool,
         return_input: bool,
     ) -> "torch.Tensor | PendingAdd | tuple[torch.Tensor | PendingAdd, torch.Tensor]":
         """Plain 3D convs reading their frame buffers; the norm kernels write into them."""
-        like = _pending_like(x)
-        spatial = _pending_spatial(x)
+        spatial = tuple(x.shape[-2:])
         idx1 = feat_idx[0]
-        win1 = self.conv1.slab_begin(feat_cache[idx1], frames, like, spatial)
+        win1 = self.conv1.buffer_begin(feat_cache[idx1], frames, x, spatial)
         feat_cache[idx1] = self.conv1
         feat_idx[0] += 1
-        geo1 = self.conv1.slab_geometry
-        if isinstance(x, PendingAdd):
-            x, _ = self.norm1.forward_silu_pending(x, out=win1, out_geometry=geo1)
-        else:
-            self.norm1.forward_silu(x, out=win1, out_geometry=geo1)
-        self.conv1.slab_exchange(win1)
+        geo1 = self.conv1.buffer_geometry
+        x, _ = self.norm1.norm_silu(x, out=win1, out_geometry=geo1, return_sum=True)
+        self.conv1.buffer_exchange(win1)
         has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
-        defer_shortcut = defer_out and has_shortcut_conv and self.options.norm_mode != "reference"
+        defer_shortcut = defer_out and has_shortcut_conv
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x)
-        self.conv1.defer_bias = defer
-        h = self.conv1.slab_conv(frames)
+        self.conv1.defer_bias = True
+        h = self.conv1.buffer_conv(frames)
 
         idx2 = feat_idx[0]
-        win2 = self.conv2.slab_begin(feat_cache[idx2], frames, h, spatial)
+        win2 = self.conv2.buffer_begin(feat_cache[idx2], frames, h, spatial)
         feat_cache[idx2] = self.conv2
         feat_idx[0] += 1
-        self.norm2.forward_silu(
-            PendingAdd(h, None, self.conv1.bias) if defer else h,
+        self.norm2.norm_silu(
+            PendingAdd(h, None, self.conv1.bias),
             out=win2,
-            out_geometry=self.conv2.slab_geometry,
+            out_geometry=self.conv2.buffer_geometry,
         )
-        self.conv2.slab_exchange(win2)
+        self.conv2.buffer_exchange(win2)
         self.conv2.defer_bias = defer_out
-        h = self.conv2.slab_conv(frames)
-        if self.options.fused_residual:
-            out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
-        else:
-            out = _channels_last_3d_if_needed(h + residual)
+        h = self.conv2.buffer_conv(frames)
+        out = PendingAdd(h, residual, self._output_bias(defer_shortcut) if defer_out else None)
         return (out, x) if return_input else out
 
     def _forward_winograd(
@@ -1826,14 +1390,14 @@ class WinoVaeResidualBlock(nn.Module):
         frames exactly as the eager path stores them (a frame-buffer conv left by an
         odd-length chunk hands over its history frames); conv biases ride on the
         PendingAdd and are added by the consumer kernel (free there)."""
-        # norm1 -> slabs for conv1; the sum it writes is the block input (residual source).
-        h, w = _pending_spatial(x)
-        order = self.options.temporal_order_for(frames)
+        # norm1 -> inputs for conv1; the sum it writes is the block input (residual source).
+        h, w = x.shape[-2:]
+        order = temporal_order_for(frames)
         shard = self.conv1.shard
         idx = feat_idx[0]
-        geo1, into1, direct1 = self.conv1.winograd_slabs(h, w, order, frames)
-        s, cache1, slabs = self.norm1.forward_silu_wino(
-            x, _cache_frames(feat_cache[idx]), frames, geo1, slabs=into1
+        geo1, into1, direct1 = self.conv1.winograd_inputs(h, w, order, frames)
+        s, cache1, inputs = self.norm1.norm_silu_winograd(
+            x, _cache_frames(feat_cache[idx]), frames, geo1, inputs=into1
         )
         feat_cache[idx] = cache1
         feat_idx[0] += 1
@@ -1844,34 +1408,34 @@ class WinoVaeResidualBlock(nn.Module):
         else:
             x_in = x
         has_shortcut_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
-        defer_shortcut = has_shortcut_conv and self.options.norm_mode != "reference"
+        defer_shortcut = has_shortcut_conv
         if has_shortcut_conv:
             self.conv_shortcut.defer_bias = defer_shortcut
         residual = self.conv_shortcut(x_in)
         if direct1 is not None:
             direct1.barrier()
         elif shard is not None:
-            shard.zero_outside(slabs.physical(), slabs.geometry)
-            shard.exchange(slabs.physical(), slabs.geometry)
-        m1, geo_m1 = self.conv1.forward_winograd(slabs)
+            shard.zero_outside(inputs.physical(), inputs.geometry)
+            shard.exchange(inputs.physical(), inputs.geometry)
+        m1, geo_m1 = self.conv1.forward_winograd(inputs)
 
         idx = feat_idx[0]
-        geo2, into2, direct2 = self.conv2.winograd_slabs(h, w, order, frames)
-        _, cache2, slabs2 = self.norm2.forward_silu_wino(
+        geo2, into2, direct2 = self.conv2.winograd_inputs(h, w, order, frames)
+        _, cache2, inputs2 = self.norm2.norm_silu_winograd(
             PendingAdd(None, None, self.conv1.bias, wino=m1, geometry=geo_m1),
             _cache_frames(feat_cache[idx]),
             frames,
             geo2,
-            slabs=into2,
+            inputs=into2,
         )
         feat_cache[idx] = cache2
         feat_idx[0] += 1
         if direct2 is not None:
             direct2.barrier()
         elif shard is not None:
-            shard.zero_outside(slabs2.physical(), slabs2.geometry)
-            shard.exchange(slabs2.physical(), slabs2.geometry)
-        m2, geo_m2 = self.conv2.forward_winograd(slabs2)
+            shard.zero_outside(inputs2.physical(), inputs2.geometry)
+            shard.exchange(inputs2.physical(), inputs2.geometry)
+        m2, geo_m2 = self.conv2.forward_winograd(inputs2)
         out = PendingAdd(
             None, residual, self._output_bias(defer_shortcut), wino=m2, geometry=geo_m2
         )
@@ -1881,9 +1445,8 @@ class WinoVaeResidualBlock(nn.Module):
 class WinoVaeAttentionBlock(WanAttentionBlock):
     """The mid-block attention with the norm, projections and residual add fused."""
 
-    def __init__(self, dim: int, options: WinoVaeOptions | None = None) -> None:
+    def __init__(self, dim: int) -> None:
         super().__init__(dim)
-        self.options = options or WinoVaeOptions()
         self.shard: Shard | None = None
 
     def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
@@ -1906,9 +1469,9 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
         return torch.narrow(full, dim, sum(extents[: shard.rank]), x.shape[dim])
 
     def forward(self, x: "torch.Tensor | PendingAdd") -> "torch.Tensor | PendingAdd":  # type: ignore[override]
-        x = _tensor(x)
+        x = _as_tensor(x)
         if not (
-            self.options.use_attention
+            cuda_op_available()
             and x.shape[0] == 1
             and x.dtype == torch.bfloat16
             and x.is_cuda
@@ -1924,7 +1487,6 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
             self.norm.gamma,
             None,
             self.norm.scale,
-            reference_rounding=self.options.norm_mode == "reference",
             silu=False,
         )
         normed_rows = frames_view(normed).reshape(frames * positions, channels)
@@ -2002,14 +1564,13 @@ class WinoVaeMidBlock(nn.Module):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         num_layers: int = 1,
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        resnets = [WinoVaeResidualBlock(dim, dim, dropout, non_linearity, options)]
+        resnets = [WinoVaeResidualBlock(dim, dim, dropout, non_linearity)]
         attentions = []
         for _ in range(num_layers):
-            attentions.append(WinoVaeAttentionBlock(dim, options))
-            resnets.append(WinoVaeResidualBlock(dim, dim, dropout, non_linearity, options))
+            attentions.append(WinoVaeAttentionBlock(dim))
+            resnets.append(WinoVaeResidualBlock(dim, dim, dropout, non_linearity))
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
         self.gradient_checkpointing = False
@@ -2038,7 +1599,6 @@ class WinoVaeResidualDownBlock(nn.Module):
         num_res_blocks: int,
         temperal_downsample: bool = False,
         down_flag: bool = False,
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.avg_shortcut = AvgDown3D(
@@ -2049,13 +1609,13 @@ class WinoVaeResidualDownBlock(nn.Module):
         )
         resnets = []
         for _ in range(num_res_blocks):
-            resnets.append(WinoVaeResidualBlock(in_dim, out_dim, dropout, options=options))
+            resnets.append(WinoVaeResidualBlock(in_dim, out_dim, dropout))
             in_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.downsampler = None
         if down_flag:
             mode = "downsample3d" if temperal_downsample else "downsample2d"
-            self.downsampler = WinoVaeResample(out_dim, mode=mode, options=options)
+            self.downsampler = WinoVaeResample(out_dim, mode=mode)
             self.downsampler.defer_bias_to_consumer = True
 
     def forward(
@@ -2073,9 +1633,9 @@ class WinoVaeResidualDownBlock(nn.Module):
                     x.materialize_padded_2d(), x.frames, feat_cache=feat_cache, feat_idx=feat_idx
                 )
             else:
-                x = self.downsampler(_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
+                x = self.downsampler(_as_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
         else:
-            x = _tensor(x)
+            x = _as_tensor(x)
         x = _channels_last_3d_if_needed(x)
         # The downsample conv's bias, when it ran without one (downsample2d; the time conv
         # absorbs it in downsample3d).
@@ -2123,10 +1683,8 @@ class WinoVaeEncoder3d(nn.Module):
         dropout: float = 0.0,
         non_linearity: str = "silu",
         is_residual: bool = False,
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        self.options = options or WinoVaeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         attn_scales = [] if attn_scales is None else attn_scales
         temperal_downsample = (
@@ -2150,26 +1708,21 @@ class WinoVaeEncoder3d(nn.Module):
                         if i != len(dim_mult) - 1
                         else False,
                         down_flag=i != len(dim_mult) - 1,
-                        options=options,
                     )
                 )
             else:
                 for _ in range(num_res_blocks):
-                    self.down_blocks.append(
-                        WinoVaeResidualBlock(in_dim, out_dim, dropout, options=options)
-                    )
+                    self.down_blocks.append(WinoVaeResidualBlock(in_dim, out_dim, dropout))
                     if scale in attn_scales:
                         self.down_blocks.append(WanAttentionBlock(out_dim))
                     in_dim = out_dim
                 if i != len(dim_mult) - 1:
                     mode = "downsample3d" if temperal_downsample[i] else "downsample2d"
-                    self.down_blocks.append(WinoVaeResample(out_dim, mode=mode, options=options))
+                    self.down_blocks.append(WinoVaeResample(out_dim, mode=mode))
                     scale /= 2.0
 
-        self.mid_block = WinoVaeMidBlock(
-            out_dim, dropout, non_linearity, num_layers=1, options=options
-        )
-        self.norm_out = WinoVaeRMSNorm(out_dim, images=False, options=options)
+        self.mid_block = WinoVaeMidBlock(out_dim, dropout, non_linearity, num_layers=1)
+        self.norm_out = WinoVaeRMSNorm(out_dim, images=False)
         self.conv_out = WinoVaeCausalConv3d(out_dim, z_dim, 3, padding=1)
         # Temporary folded-tail submodule for one encode; assigned by WinoVae._encode_impl and
         # cleared in its finally. It contributes no state-dict entries after that encode returns.
@@ -2185,7 +1738,7 @@ class WinoVaeEncoder3d(nn.Module):
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
 
-        self.conv_in.defer_bias = self.options.defer_conv_bias
+        self.conv_in.defer_bias = True
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
@@ -2195,7 +1748,7 @@ class WinoVaeEncoder3d(nn.Module):
 
         for layer in self.down_blocks:
             if not isinstance(layer, (WinoVaeResidualBlock, WinoVaeResidualDownBlock)):
-                x = _tensor(x)
+                x = _as_tensor(x)
             if feat_cache is not None:
                 x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
             else:
@@ -2203,26 +1756,22 @@ class WinoVaeEncoder3d(nn.Module):
 
         x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
         conv_out = self.conv_out_override or self.conv_out
-        frames = x.frames if isinstance(x, PendingAdd) else x.shape[2]
-        like = _pending_like(x)
+        frames = x.shape[2]
         if (
-            self.options.use_slabs
+            cuda_op_available()
             and feat_cache is not None
             and feat_idx is not None
-            and like.shape[0] == 1
-            and conv_out.slab_eligible(like)
-            and not (
-                conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
-            )
+            and conv_out.buffer_eligible(x)
+            and not (frames == 1 and feat_cache[feat_idx[0]] is None)
         ):
             idx = feat_idx[0]
-            window = conv_out.slab_begin(feat_cache[idx], frames, like, _pending_spatial(x))
+            window = conv_out.buffer_begin(feat_cache[idx], frames, x, tuple(x.shape[-2:]))
             feat_cache[idx] = conv_out
             feat_idx[0] += 1
-            self.norm_out.forward_silu(x, out=window, out_geometry=conv_out.slab_geometry)
-            conv_out.slab_exchange(window)
-            return conv_out.slab_conv(frames)
-        x = self.norm_out.forward_silu(x)
+            self.norm_out.norm_silu(x, out=window, out_geometry=conv_out.buffer_geometry)
+            conv_out.buffer_exchange(window)
+            return conv_out.buffer_conv(frames)
+        x = self.norm_out.norm_silu(x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(conv_out, x, feat_cache, feat_idx)
         else:
@@ -2240,7 +1789,6 @@ class WinoVaeResidualUpBlock(nn.Module):
         temperal_upsample: bool = False,
         up_flag: bool = False,
         non_linearity: str = "silu",
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         self.avg_shortcut = None
@@ -2252,18 +1800,14 @@ class WinoVaeResidualUpBlock(nn.Module):
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
-            resnets.append(
-                WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
-            )
+            resnets.append(WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity))
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
 
         self.upsampler = None
         if up_flag:
             mode = "upsample3d" if temperal_upsample else "upsample2d"
-            self.upsampler = WinoVaeResample(
-                out_dim, mode=mode, upsample_out_dim=out_dim, options=options
-            )
+            self.upsampler = WinoVaeResample(out_dim, mode=mode, upsample_out_dim=out_dim)
         self.gradient_checkpointing = False
 
     def forward(
@@ -2279,9 +1823,9 @@ class WinoVaeResidualUpBlock(nn.Module):
             self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsampler is None
         )
         if self.upsampler is not None:
-            fuse_shortcut = self.avg_shortcut is not None and self.upsampler.options.fused_upsample
+            fuse_shortcut = self.avg_shortcut is not None
             x = self.upsampler(
-                _tensor(x),
+                _as_tensor(x),
                 feat_cache=feat_cache,
                 feat_idx=feat_idx,
                 shortcut=(residual, self.avg_shortcut, first_chunk) if fuse_shortcut else None,
@@ -2289,7 +1833,7 @@ class WinoVaeResidualUpBlock(nn.Module):
             if fuse_shortcut:
                 return x
         if self.avg_shortcut is not None:
-            x = _tensor(x) + self.avg_shortcut(residual, first_chunk=first_chunk)
+            x = _as_tensor(x) + self.avg_shortcut(residual, first_chunk=first_chunk)
         return x if isinstance(x, PendingAdd) else _channels_last_3d_if_needed(x)
 
 
@@ -2302,22 +1846,17 @@ class WinoVaeUpBlock(nn.Module):
         dropout: float = 0.0,
         upsample_mode: str | None = None,
         non_linearity: str = "silu",
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
         current_dim = in_dim
         resnets = []
         for _ in range(num_res_blocks + 1):
-            resnets.append(
-                WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity, options)
-            )
+            resnets.append(WinoVaeResidualBlock(current_dim, out_dim, dropout, non_linearity))
             current_dim = out_dim
         self.resnets = nn.ModuleList(resnets)
         self.upsamplers = None
         if upsample_mode is not None:
-            self.upsamplers = nn.ModuleList(
-                [WinoVaeResample(out_dim, mode=upsample_mode, options=options)]
-            )
+            self.upsamplers = nn.ModuleList([WinoVaeResample(out_dim, mode=upsample_mode)])
         self.gradient_checkpointing = False
 
     def forward(
@@ -2332,7 +1871,7 @@ class WinoVaeUpBlock(nn.Module):
             self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsamplers is None
         )
         if self.upsamplers is not None:
-            x = self.upsamplers[0](_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
+            x = self.upsamplers[0](_as_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
         return x if isinstance(x, PendingAdd) else _channels_last_3d_if_needed(x)
 
 
@@ -2349,10 +1888,8 @@ class WinoVaeDecoder3d(nn.Module):
         non_linearity: str = "silu",
         out_channels: int = 3,
         is_residual: bool = False,
-        options: WinoVaeOptions | None = None,
     ):
         super().__init__()
-        self.options = options or WinoVaeOptions()
         dim_mult = [1, 2, 4, 4] if dim_mult is None else dim_mult
         del attn_scales
         temperal_upsample = [False, True, True] if temperal_upsample is None else temperal_upsample
@@ -2360,9 +1897,7 @@ class WinoVaeDecoder3d(nn.Module):
 
         dims = [dim * value for value in [dim_mult[-1]] + dim_mult[::-1]]
         self.conv_in = WinoVaeCausalConv3d(z_dim, dims[0], 3, padding=1)
-        self.mid_block = WinoVaeMidBlock(
-            dims[0], dropout, non_linearity, num_layers=1, options=options
-        )
+        self.mid_block = WinoVaeMidBlock(dims[0], dropout, non_linearity, num_layers=1)
         self.up_blocks = nn.ModuleList([])
         for i, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
             if i > 0 and not is_residual:
@@ -2383,7 +1918,6 @@ class WinoVaeDecoder3d(nn.Module):
                     temperal_upsample=temperal_upsample[i] if up_flag else False,
                     up_flag=up_flag,
                     non_linearity=non_linearity,
-                    options=options,
                 )
             else:
                 up_block = WinoVaeUpBlock(
@@ -2393,11 +1927,10 @@ class WinoVaeDecoder3d(nn.Module):
                     dropout=dropout,
                     upsample_mode=upsample_mode,
                     non_linearity=non_linearity,
-                    options=options,
                 )
             self.up_blocks.append(up_block)
 
-        self.norm_out = WinoVaeRMSNorm(out_dim, images=False, options=options)
+        self.norm_out = WinoVaeRMSNorm(out_dim, images=False)
         self.conv_out = WinoVaeCausalConv3d(out_dim, out_channels, 3, padding=1)
         self.gradient_checkpointing = False
 
@@ -2411,7 +1944,7 @@ class WinoVaeDecoder3d(nn.Module):
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
 
-        self.conv_in.defer_bias = self.options.defer_conv_bias
+        self.conv_in.defer_bias = True
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_in, x, feat_cache, feat_idx)
         else:
@@ -2423,26 +1956,22 @@ class WinoVaeDecoder3d(nn.Module):
         for up_block in self.up_blocks:
             x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
 
-        frames = x.frames if isinstance(x, PendingAdd) else x.shape[2]
-        like = _pending_like(x)
+        frames = x.shape[2]
         if (
-            self.options.use_slabs
+            cuda_op_available()
             and feat_cache is not None
             and feat_idx is not None
-            and like.shape[0] == 1
-            and self.conv_out.slab_eligible(like)
-            and not (
-                self.conv_out.first_frame_conv2d and frames == 1 and feat_cache[feat_idx[0]] is None
-            )
+            and self.conv_out.buffer_eligible(x)
+            and not (frames == 1 and feat_cache[feat_idx[0]] is None)
         ):
             idx = feat_idx[0]
-            window = self.conv_out.slab_begin(feat_cache[idx], frames, like, _pending_spatial(x))
+            window = self.conv_out.buffer_begin(feat_cache[idx], frames, x, tuple(x.shape[-2:]))
             feat_cache[idx] = self.conv_out
             feat_idx[0] += 1
-            self.norm_out.forward_silu(x, out=window, out_geometry=self.conv_out.slab_geometry)
-            self.conv_out.slab_exchange(window)
-            return self.conv_out.slab_conv(frames)
-        x = self.norm_out.forward_silu(x)
+            self.norm_out.norm_silu(x, out=window, out_geometry=self.conv_out.buffer_geometry)
+            self.conv_out.buffer_exchange(window)
+            return self.conv_out.buffer_conv(frames)
+        x = self.norm_out.norm_silu(x)
         if feat_cache is not None and feat_idx is not None:
             x = _causal_conv_with_cache(self.conv_out, x, feat_cache, feat_idx)
         else:
@@ -2488,12 +2017,11 @@ class LazyDiagonalGaussianDistribution(DiagonalGaussianDistribution):
 class WinoVae(nn.Module):
     """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``.
 
-    On CUDA, any non-default ``WinoVaeOptions`` requires bf16 inputs and weights (the fused
-    kernels read and write bf16; ``encode`` / ``decode`` raise ``TypeError`` otherwise). The
-    default options, and any model on the CPU, run in any dtype like the native one.
+    The model and its inputs must be bf16 on CUDA (the fused kernels read and write bf16;
+    ``encode`` / ``decode`` raise ``TypeError`` otherwise).
 
     Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
-    directly (needs ``fold_encoder_tail``), and ``fold_latent_affine(mean, std)`` folds the
+    directly, and ``fold_latent_affine(mean, std)`` folds the
     latent de-normalization into ``post_quant_conv`` so ``decode`` takes the model's raw
     latents.
     """
@@ -2538,7 +2066,6 @@ class WinoVae(nn.Module):
             temperal_downsample=config.temperal_downsample,
             dropout=config.dropout,
             is_residual=config.is_residual,
-            options=options,
         )
         self.quant_conv = WinoVaeCausalConv3d(config.z_dim * 2, config.z_dim * 2, 1)
         self.post_quant_conv = WinoVaeCausalConv3d(config.z_dim, config.z_dim, 1)
@@ -2552,15 +2079,15 @@ class WinoVae(nn.Module):
             dropout=config.dropout,
             out_channels=config.out_channels,
             is_residual=config.is_residual,
-            options=options,
         )
 
         for module in self.modules():
             if module is not self:
                 _to_channels_last(module)
+        self.decoder.conv_out.max_in_frames = _CONV_OUT_MAX_IN_FRAMES
         for module in self.modules():
             if isinstance(module, WinoVaeCausalConv3d):
-                module.first_frame_conv2d = options.first_frame_conv2d
+                module.buffer_chunks = options.frame_buffer_chunks
         self._cached_conv_counts = {
             "decoder": sum(
                 isinstance(module, WinoVaeCausalConv3d) for module in self.decoder.modules()
@@ -2579,9 +2106,9 @@ class WinoVae(nn.Module):
         return next(self.parameters()).dtype
 
     def _benchmark_convs(self, *, frames: int, encoder: bool) -> bool:
-        """cuDNN autotuning per the options, except on a spatial shard, where the heuristics'
+        """cuDNN autotuning for the encoder and image decodes, except on a spatial shard, where the heuristics'
         choice is the same in every process (autotuning could pick different engines per rank)."""
-        return self.shard is None and self.options.benchmark_convs(encoder=encoder, frames=frames)
+        return self.shard is None and _benchmark_convs(encoder=encoder, frames=frames)
 
     def set_shard(self, shard: Shard | None) -> None:
         """Run on one spatial slice of the frames: every module exchanges the halo lines it
@@ -2607,14 +2134,11 @@ class WinoVae(nn.Module):
         self._enc_feat_map: list[CacheEntry] = [None] * self._enc_conv_num
 
     def _check_dtype(self, x: torch.Tensor) -> None:
-        """The optimized CUDA paths are bf16 only (their kernels read and write bf16); the
-        all-off model, and any model on the CPU, is dtype-agnostic like the native one."""
-        if self.options == WinoVaeOptions() or not x.is_cuda:
-            return
-        if x.dtype is not torch.bfloat16 or self.dtype is not torch.bfloat16:
+        """The kernels read and write bf16 CUDA tensors."""
+        if not x.is_cuda or x.dtype is not torch.bfloat16 or self.dtype is not torch.bfloat16:
             raise TypeError(
-                "WinoVae optimizations need bf16 inputs and weights; got input "
-                f"{x.dtype} and weights {self.dtype}. Use bf16 or the all-off WinoVaeOptions()."
+                "WinoVae needs bf16 CUDA inputs and weights; got input "
+                f"{x.dtype} on {x.device} and weights {self.dtype}"
             )
 
     def _encode(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
@@ -2625,9 +2149,6 @@ class WinoVae(nn.Module):
             return self._encode_impl(x, mode_only=mode_only)
         finally:
             torch.backends.cudnn.benchmark = prev_benchmark
-
-    def _use_folded_tail(self) -> bool:
-        return self.options.fold_encoder_tail and self.options.norm_mode != "reference"
 
     def _folded_tail_conv(self, rows: int | None) -> WinoVaeCausalConv3d:
         """conv_out with quant_conv folded in: ``W' = Q A``, ``b' = Q a + q`` (composed in
@@ -2674,8 +2195,8 @@ class WinoVae(nn.Module):
         folded.bias.copy_(b)
         folded.weight.requires_grad_(False)
         folded.bias.requires_grad_(False)
-        folded.first_frame_conv2d = conv_out.first_frame_conv2d
         folded.max_in_frames = conv_out.max_in_frames
+        folded.buffer_chunks = conv_out.buffer_chunks
         folded.shard = conv_out.shard
         return folded
 
@@ -2687,12 +2208,7 @@ class WinoVae(nn.Module):
             x = patchify(x, patch_size=self.config.patch_size)
         x = _channels_last_3d_if_needed(x)
 
-        folded = self._use_folded_tail()
-        if mode_only and not folded:
-            raise ValueError("encode_mode needs fold_encoder_tail (and norm_mode != 'reference')")
-        self.encoder.conv_out_override = (
-            self._folded_tail_conv(self.z_dim if mode_only else None) if folded else None
-        )
+        self.encoder.conv_out_override = self._folded_tail_conv(self.z_dim if mode_only else None)
         # The first pass is one frame; every later pass is a multiple of four frames so the
         # stride-2 temporal downsamplers see chunk boundaries at the same parity each time.
         step = self.options.encoder_chunk_frames
@@ -2718,8 +2234,7 @@ class WinoVae(nn.Module):
         else:
             out = torch.cat(out_chunks, dim=2)
 
-        enc = out if folded else self.quant_conv(out)
-        enc = _channels_last_3d_if_needed(enc)
+        enc = _channels_last_3d_if_needed(out)
         self.clear_cache()
         return enc
 
@@ -2736,9 +2251,7 @@ class WinoVae(nn.Module):
 
     def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
         """The posterior mean ``[B, z, T', H', W']`` of ``x`` without computing the
-        log-variance half. Needs ``fold_encoder_tail`` with ``norm_mode != "reference"``
-        (raises ``ValueError`` otherwise); ``encode(x).latent_dist.mode()`` is the general
-        form."""
+        log-variance half (the same values as ``encode(x).latent_dist.mode()``)."""
         return self._encode(x, mode_only=True)
 
     def _decode(
@@ -2752,7 +2265,6 @@ class WinoVae(nn.Module):
         _, _, num_frame, _, _ = z.shape
 
         self.clear_cache()
-        self.decoder.conv_out.max_in_frames = self.options.conv_out_frame_split or None
         prev_benchmark = torch.backends.cudnn.benchmark
         torch.backends.cudnn.benchmark = self._benchmark_convs(encoder=False, frames=num_frame)
         try:
@@ -2793,8 +2305,7 @@ class WinoVae(nn.Module):
 
     def _use_fused_output(self, x: torch.Tensor) -> bool:
         return (
-            self.options.fused_output
-            and self.config.patch_size is not None
+            self.config.patch_size is not None
             and x.shape[0] == 1
             and x.is_cuda
             and x.dtype == torch.bfloat16

@@ -3,8 +3,8 @@
 
 """Multi-GPU tests for the spatially sharded WinoVae (``ParallelWinoVae``).
 
-The sharded model must reproduce the single-GPU WinoVae with the same options: the fused
-norm / slab / Winograd paths exchange halo lines instead of recomputing the borders.
+The sharded model must reproduce the single-GPU WinoVae: the fused norm / frame-buffer /
+Winograd paths exchange halo lines instead of recomputing the borders.
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_parallel_wino_vae.py -v
@@ -23,7 +23,11 @@ import torch.multiprocessing as mp
 
 from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import shard_extents
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import WinoVae, WinoVaeOptions
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae import (
+    WinoVae,
+    WinoVaeCausalConv3d,
+    WinoVaeOptions,
+)
 from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
 
 
@@ -53,35 +57,13 @@ SMALL_CONFIG = {
 }
 
 # "direct" halo exchange is demanded, not left to "auto": a rendezvous failure must fail the
-# test rather than silently run the NCCL path.
-ALL_ON = {
-    "fused_norm": True,
-    "fused_residual": True,
-    "fused_upsample": True,
-    "fused_bias": True,
-    "first_frame_conv2d": True,
-    "winograd_temporal": True,
-    "winograd_spatial": "all",
-    "conv_slabs": True,
-    "fused_attention": True,
-    "fold_encoder_tail": True,
-    "fused_output": True,
-    "halo_exchange": "direct",
-}
-ALL_ON_NCCL = {**ALL_ON, "halo_exchange": "nccl"}
-ALL_OFF: dict = {}
-SLABS_ONLY = {
-    "fused_norm": True,
-    "fused_residual": True,
-    "fused_bias": True,
-    "conv_slabs": True,
-    "halo_exchange": "direct",
-}
+# test rather than silently run the NCCL path. ``spatial``: spatial Winograd forced onto every
+# eligible residual-block conv (the tiny config's layers are below the production selection
+# thresholds), else the production selection (none at this size: conv2d per input).
 OPTION_SETS = {
-    "all_on": ALL_ON,
-    "all_on_nccl": ALL_ON_NCCL,
-    "all_off": ALL_OFF,
-    "slabs": SLABS_ONLY,
+    "direct": ({"halo_exchange": "direct"}, True),
+    "nccl": ({"halo_exchange": "nccl"}, True),
+    "direct_no_spatial": ({"halo_exchange": "direct"}, False),
 }
 
 
@@ -121,9 +103,13 @@ def _run(world_size: int, test_fn: Callable, *args):
     )
 
 
-def _model(device: str, options: dict) -> tuple[WinoVae, WanVAE]:
+def _model(device: str, option_set: str) -> tuple[WinoVae, WanVAE]:
     """The bf16 WinoVae under test and the native model in fp32 on the same weights (the
     reference both the sharded and the single-GPU run are judged against)."""
+    options, spatial = OPTION_SETS[option_set]
+    if spatial:
+        # This worker process only: every eligible conv takes spatial Winograd.
+        WinoVaeCausalConv3d._spatial_selected = lambda *args: True
     torch.manual_seed(0)
     model = WinoVae(SMALL_CONFIG, WinoVaeOptions.from_dict(options)).to(device=device)
     for p in model.parameters():
@@ -191,8 +177,7 @@ def _logic_decode(
     latent_hw: tuple[int, int] = (8, 12),
 ):
     device = f"cuda:{rank}"
-    options = OPTION_SETS[option_set]
-    model, native = _model(device, options)
+    model, native = _model(device, option_set)
     gen = torch.Generator().manual_seed(1)
     # Latent 8 x 12 (pixels 128 x 192) divides by two and four along either axis; 9 x 13
     # divides along neither, exercising unequal shards.
@@ -223,8 +208,7 @@ def _logic_encode(
     pixel_hw: tuple[int, int] = (128, 192),
 ):
     device = f"cuda:{rank}"
-    options = OPTION_SETS[option_set]
-    model, native = _model(device, options)
+    model, native = _model(device, option_set)
     gen = torch.Generator().manual_seed(2)
     pixels = (torch.rand(1, 3, frames, *pixel_hw, generator=gen) * 2 - 1).to(device, torch.bfloat16)
     with torch.inference_mode():
@@ -253,30 +237,30 @@ class TestParallelWinoVaeDecode:
     # Four ranks: every rank but the edges has two neighbours, so both halo lines travel in
     # one exchange (the 8 x 12 latent divides by four along either axis).
     @pytest.mark.parametrize("split_dim", ["height", "width"])
-    @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
+    @pytest.mark.parametrize("option_set", ["direct", "direct_no_spatial"])
     def test_decode_4gpu(self, split_dim: str, option_set: str) -> None:
         _run(4, _logic_decode, split_dim, option_set, 5)
 
     # Unequal shards: a 9 x 13 latent over four ranks is 3/2/2/2 rows or 4/3/3/3 columns.
     @pytest.mark.parametrize("split_dim", ["height", "width"])
-    @pytest.mark.parametrize("option_set", ["all_on", "all_on_nccl", "all_off"])
+    @pytest.mark.parametrize("option_set", ["direct", "nccl", "direct_no_spatial"])
     def test_decode_4gpu_uneven(self, split_dim: str, option_set: str) -> None:
         _run(4, _logic_decode, split_dim, option_set, 5, (9, 13))
 
 
 class TestParallelWinoVaeEncode:
     @pytest.mark.parametrize("split_dim", ["height", "width"])
-    @pytest.mark.parametrize("option_set", ["all_on", "all_off"])
+    @pytest.mark.parametrize("option_set", ["direct", "direct_no_spatial"])
     def test_encode_2gpu(self, split_dim: str, option_set: str) -> None:
         _run(2, _logic_encode, split_dim, option_set, 9)
 
     def test_encode_4gpu(self) -> None:
-        _run(4, _logic_encode, "width", "all_on", 9)
+        _run(4, _logic_encode, "width", "direct", 9)
 
     # Unequal shards in 16-pixel units: 144 x 208 pixels is 9 x 13 units over four ranks.
     @pytest.mark.parametrize("split_dim", ["height", "width"])
     def test_encode_4gpu_uneven(self, split_dim: str) -> None:
-        _run(4, _logic_encode, split_dim, "all_on", 9, (144, 208))
+        _run(4, _logic_encode, split_dim, "direct", 9, (144, 208))
 
 
 def test_shard_extents() -> None:

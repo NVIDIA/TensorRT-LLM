@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Runtime compilation of the Wan VAE position-walk kernel (``cuda/vae_norm_kernel.cuh``).
 
-One kernel template covers the fused RMSNorm + SiLU, the temporal Winograd norm (slab
+One kernel template covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input
 producer and product consumer, order 2 or 4) and the Winograd combine; its parameters (dtypes,
 order, lane layout, mode flags, stages) are all known at the call site. Instead of
 instantiating every combination ahead of time, this module compiles the one a call needs on
@@ -35,7 +35,7 @@ _WARPS = _THREADS // 32
 _VEC = 8  # 16-byte vectors of 16-bit elements
 
 MID_NONE, MID_NORM, MID_NORM_SILU = 0, 1, 2
-OUT_SLABS, OUT_ROWS = 0, 1
+OUT_WINOGRAD, OUT_ROWS = 0, 1
 
 
 @dataclass(frozen=True)
@@ -99,70 +99,6 @@ class FrameGeometry:
     def __post_init__(self) -> None:
         if self.row0 + self.height > self.rows or self.col0 + self.width > self.cols:
             raise ValueError("the logical frame must fit inside the physical one")
-
-
-@dataclass(frozen=True)
-class UpsampleSource:
-    """Frames defined by the phase gather of a packed 2x2 upsample conv output, formed by the
-    kernel while reading: output pixel ``(2i+p, 2j+q)`` of frame ``t`` is
-    ``round(temp[t, phase 2p+q, i+p, j+q] + bias)`` plus, when a shortcut is given, the DupUp3D
-    element ``shortcut[(t + crop) // factor_t, i, j, (c * factor + S) // repeats]`` with
-    ``factor = 4 * factor_t`` and ``S = (((t + crop) % factor_t) * 2 + p) * 2 + q``, rounded to
-    bf16 after each add (the arithmetic of the standalone gather kernel). ``temp`` is
-    ``[T, (height+1) * (width+1), 4C]`` rows, ``shortcut`` ``[framesR, height * width, Cin]``
-    rows, ``bias`` ``[C]``; ``height`` and ``width`` are the low-resolution frame size."""
-
-    temp: torch.Tensor
-    shortcut: torch.Tensor | None
-    bias: torch.Tensor | None
-    factor_t: int
-    repeats: int
-    crop: int
-    height: int
-    width: int
-
-    @property
-    def frames(self) -> int:
-        return self.temp.shape[0]
-
-    @property
-    def channels(self) -> int:
-        return self.temp.shape[-1] // 4
-
-    @property
-    def positions(self) -> int:
-        return 4 * self.height * self.width
-
-    @property
-    def ratio(self) -> int:
-        """Shortcut elements per output channel (factor / repeats)."""
-        return 4 * self.factor_t // self.repeats if self.shortcut is not None else 1
-
-    def check(self) -> None:
-        if self.temp.dim() != 3 or self.temp.shape[1] != (self.height + 1) * (self.width + 1):
-            raise ValueError("temp must be [T, (height+1)*(width+1), 4C] rows")
-        if self.temp.shape[-1] % (4 * _VEC):
-            raise ValueError("temp channels must be 4 * (a multiple of 8)")
-        if self.shortcut is not None:
-            factor = 4 * self.factor_t
-            if self.factor_t not in (1, 2) or factor % self.repeats or self.ratio not in (1, 2):
-                raise ValueError("the shortcut mapping must give 1 or 2 elements per channel")
-            if self.shortcut.dim() != 3 or self.shortcut.shape[1] != self.height * self.width:
-                raise ValueError("shortcut must be [framesR, height*width, Cin] rows")
-            if self.shortcut.shape[0] * self.factor_t != self.frames + self.crop:
-                raise ValueError("shortcut frames do not match the output frames")
-            if self.shortcut.shape[-1] * self.repeats != self.channels * factor:
-                raise ValueError("shortcut channel repeat mismatch")
-        if self.bias is not None and self.bias.numel() != self.channels:
-            raise ValueError("bias must be [C]")
-
-
-def _up_variant(up: UpsampleSource | None) -> tuple[int, int]:
-    """The kernel's (UP_FT, UP_RATIO) template arguments: 0 without an upsample input, else the
-    shortcut's temporal factor (1 when there is no shortcut) and the elements per channel."""
-    if up is None:
-        return 0, 1
-    return (up.factor_t if up.shortcut is not None else 1), up.ratio
 
 
 def _map_args(geo: FrameGeometry | None) -> tuple[int, int, int]:
@@ -248,7 +184,7 @@ def blocks_per_sm(k: int, in_wino: bool, order: int, out: int) -> int:
 
 @dataclass(frozen=True, kw_only=True)
 class Variant:
-    slab_half: bool
+    fp16_winograd: bool
     order: int
     lanes: int
     k: int
@@ -262,29 +198,27 @@ class Variant:
     padded: bool
     in_map: bool = False
     out_map: bool = False
-    up_ft: int = 0
-    up_ratio: int = 1
     halo: bool = False
 
     def name(self) -> str:
         def b(v: bool) -> str:
             return "true" if v else "false"
 
-        td = "__half" if self.slab_half else "__nv_bfloat16"
+        td = "__half" if self.fp16_winograd else "__nv_bfloat16"
         return (
             f"vaewino::vaeNormKernel<__nv_bfloat16, {td}, {self.order}, {_VEC}, {self.lanes}, {self.k}, "
             f"{b(self.reference)}, {b(self.has_bias)}, {b(self.has_in_bias)}, {b(self.has_residual)}, "
             f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}, {b(self.in_map)}, "
-            f"{b(self.out_map)}, {self.up_ft}, {self.up_ratio}, {b(self.halo)}>"
+            f"{b(self.out_map)}, {b(self.halo)}>"
         )
 
     def signature(self) -> str:
-        t, td = "__nv_bfloat16", "__half" if self.slab_half else "__nv_bfloat16"
+        t, td = "__nv_bfloat16", "__half" if self.fp16_winograd else "__nv_bfloat16"
         return (
             f"({t} const*, {td} const*, {td}*, long long, long long, {t} const*, {t} const*, {t} const*, "
             f"{t} const*, "
             f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, long long, int, int, "
-            f"long long, int, int, int, int, int, int, float, float, "
+            f"long long, int, int, float, float, "
             f"void*, void*, long long, long long, long long, long long, int, int, int)"
         )
 
@@ -295,7 +229,7 @@ class Variant:
     def shared_bytes(self, channels: int) -> int:
         ring = (
             (self.order + 1) * self.positions_per_block * channels * 2
-            if self.out == OUT_SLABS
+            if self.out == OUT_WINOGRAD
             else 0
         )
         return 3 * channels * 4 + ring
@@ -405,7 +339,7 @@ _ARG_TYPES = (
     ctypes.c_int,
     ctypes.c_int,
     ctypes.c_longlong,
-    *(ctypes.c_int,) * 6,
+    *(ctypes.c_int,) * 2,
     ctypes.c_float,
     ctypes.c_float,
     *(ctypes.c_void_p,) * 2,
@@ -471,7 +405,6 @@ def _launch(
     scale: float,
     in_geo: FrameGeometry | None = None,
     out_geo: FrameGeometry | None = None,
-    up: UpsampleSource | None = None,
 ) -> None:
     from cuda.bindings import driver as cuda
 
@@ -519,11 +452,6 @@ def _launch(
         pad_w,
         *_map_args(in_geo),
         *_map_args(out_geo),
-        *(
-            (up.height, up.width, up.crop, up.shortcut.shape[-1] if up.shortcut is not None else 0)
-            if up is not None
-            else (0, 0, 0, 0)
-        ),
         float(scale),
         1e-12,
         *_halo_args(out_geo.push if out_geo is not None else None, channels),
@@ -537,15 +465,15 @@ def _launch(
     )
 
 
-def _stacked_products(m: list[torch.Tensor], slab_dtype: torch.dtype) -> tuple[int, int]:
+def _stacked_products(m: list[torch.Tensor], winograd_dtype: torch.dtype) -> tuple[int, int]:
     """(base pointer, component stride in elements) of the products, which the kernel reads as
-    one stacked buffer [comps, groups, P, C]: consecutive slices of the previous norm's slab
+    one stacked buffer [comps, groups, P, C]: consecutive slices of the previous norm's Winograd input
     buffer in the model; anything else is stacked here (a copy)."""
     comps = len(m)
     numel = m[0].numel()
     base = m[0].data_ptr()
-    if any(mk.dtype != slab_dtype or not mk.is_contiguous() for mk in m):
-        raise ValueError("m must be contiguous tensors in the slab dtype")
+    if any(mk.dtype != winograd_dtype or not mk.is_contiguous() for mk in m):
+        raise ValueError("m must be contiguous tensors in the Winograd dtype")
     if any(m[k].data_ptr() != base + k * numel * 2 for k in range(comps)):
         stacked = torch.stack(m)
         m[:] = list(stacked.unbind(0))
@@ -565,29 +493,21 @@ def wino_norm_silu(
     frames: int,
     *,
     order: int = 2,
-    half_slabs: bool = False,
+    fp16_inputs: bool = False,
     reference_rounding: bool = False,
     products_geometry: FrameGeometry | None = None,
-    slab_geometry: FrameGeometry | None = None,
-    upsample: UpsampleSource | None = None,
-    slabs: torch.Tensor | None = None,
+    inputs_geometry: FrameGeometry | None = None,
+    inputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Temporal Winograd norm: frame layout ``[T, P, C]`` (``m``/``D`` as
     ``[T/order, P, C]``, cache ``[0..2, P, C]``). Returns ``(sum or None, y_tail, D)``.
 
-    ``products_geometry`` / ``slab_geometry``: the products are read from, and the slabs
+    ``products_geometry`` / ``inputs_geometry``: the products are read from, and the Winograd inputs
     written to, frames with halo rows or columns (``[T/order, rows * cols, C]``); the kernel
-    touches the logical positions only (and, with ``slab_geometry.push``, stores the border
-    lines into the neighbours' buffers as well). ``slabs``: a preallocated destination for
-    ``D`` (``[order + 2, T/order, slab positions, C]``, contiguous) instead of a fresh one.
-    With ``upsample`` (instead of ``x`` or ``m``) the frames are formed from the packed
-    upsample conv output while reading and written as the sum."""
-    if upsample is not None:
-        if x is not None or m is not None or residual is not None or in_bias is not None:
-            raise ValueError("upsample replaces x, m, residual and in_bias")
-        upsample.check()
-        x, residual, in_bias = upsample.temp, upsample.shortcut, upsample.bias
-    elif (x is None) == (m is None):
+    touches the logical positions only (and, with ``inputs_geometry.push``, stores the border
+    lines into the neighbours' buffers as well). ``inputs``: a preallocated destination for
+    ``D`` (``[order + 2, T/order, input positions, C]``, contiguous) instead of a fresh one."""
+    if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     for name, t in (
         ("x", x),
@@ -599,31 +519,29 @@ def wino_norm_silu(
     ):
         if t is not None and t.dtype is not torch.bfloat16:
             raise TypeError(f"{name} must be bf16 (the kernel reads bf16 rows), got {t.dtype}")
-    if order not in (2, 4) or (order == 4 and not half_slabs):
-        raise ValueError("order must be 2 or 4; order 4 needs fp16 slabs")
+    if order not in (2, 4) or (order == 4 and not fp16_inputs):
+        raise ValueError("order must be 2 or 4; order 4 needs fp16 Winograd inputs")
     if frames < order or frames % order:
         raise ValueError("frames must be a positive multiple of order")
     comps = order + 2
-    slab_dtype = torch.float16 if half_slabs else torch.bfloat16
+    winograd_dtype = torch.float16 if fp16_inputs else torch.bfloat16
     if products_geometry is not None and products_geometry.identity:
         products_geometry = None
-    if slab_geometry is not None and slab_geometry.identity:
-        slab_geometry = None
+    if inputs_geometry is not None and inputs_geometry.identity:
+        inputs_geometry = None
     if products_geometry is not None and x is not None:
         raise ValueError("products_geometry applies to the products")
     src = x if x is not None else m[0]
-    channels = upsample.channels if upsample is not None else src.shape[-1]
+    channels = src.shape[-1]
     if products_geometry is not None:
         positions = products_geometry.height * products_geometry.width
         if m[0].shape[1] != products_geometry.frame:
             raise ValueError("the products do not match products_geometry")
-    elif upsample is not None:
-        positions = upsample.positions
     else:
         positions = src.shape[1]
     height, width = (
-        (slab_geometry.height, slab_geometry.width)
-        if slab_geometry is not None
+        (inputs_geometry.height, inputs_geometry.width)
+        if inputs_geometry is not None
         else (products_geometry.height, products_geometry.width)
         if products_geometry is not None
         else (0, 0)
@@ -634,27 +552,32 @@ def wino_norm_silu(
         raise ValueError("channels must be a multiple of 8")
     device = src.device.index
     opts = dict(device=src.device, dtype=torch.bfloat16)
-    want_sum = residual is not None or in_bias is not None or x is None or upsample is not None
+    want_sum = residual is not None or in_bias is not None or x is None
     out_sum = torch.empty((frames, positions, channels), **opts) if want_sum else None
     y_tail = torch.empty((2, positions, channels), **opts)
-    slab_positions = slab_geometry.frame if slab_geometry is not None else positions
-    d_shape = (comps, frames // order, slab_positions, channels)
-    if slabs is None:
-        d = torch.empty(d_shape, device=src.device, dtype=slab_dtype)
+    input_positions = inputs_geometry.frame if inputs_geometry is not None else positions
+    d_shape = (comps, frames // order, input_positions, channels)
+    if inputs is None:
+        d = torch.empty(d_shape, device=src.device, dtype=winograd_dtype)
     else:
-        if tuple(slabs.shape) != d_shape or slabs.dtype != slab_dtype or not slabs.is_contiguous():
-            raise ValueError(f"slabs must be a contiguous {slab_dtype} tensor of shape {d_shape}")
-        d = slabs
+        if (
+            tuple(inputs.shape) != d_shape
+            or inputs.dtype != winograd_dtype
+            or not inputs.is_contiguous()
+        ):
+            raise ValueError(
+                f"inputs must be a contiguous {winograd_dtype} tensor of shape {d_shape}"
+            )
+        d = inputs
     cache_frames = cache.shape[0] if cache is not None and cache.numel() else 0
     m_ptr, m_stride = 0, 0
     if m is not None:
         if len(m) != comps:
             raise ValueError("m must hold order + 2 tensors")
-        m_ptr, m_stride = _stacked_products(m, slab_dtype)
+        m_ptr, m_stride = _stacked_products(m, winograd_dtype)
     lanes, k = row_layout(channels, fold_single=True)
-    up_ft, up_ratio = _up_variant(upsample)
     variant = Variant(
-        slab_half=half_slabs,
+        fp16_winograd=fp16_inputs,
         order=order,
         lanes=lanes,
         k=k,
@@ -664,13 +587,11 @@ def wino_norm_silu(
         has_residual=residual is not None,
         in_wino=x is None,
         mid=MID_NORM_SILU,
-        out=OUT_SLABS,
+        out=OUT_WINOGRAD,
         padded=False,
         in_map=products_geometry is not None,
-        out_map=slab_geometry is not None,
-        up_ft=up_ft,
-        up_ratio=up_ratio,
-        halo=slab_geometry is not None and slab_geometry.push is not None,
+        out_map=inputs_geometry is not None,
+        halo=inputs_geometry is not None and inputs_geometry.push is not None,
     )
     _launch(
         variant,
@@ -698,8 +619,7 @@ def wino_norm_silu(
         pad_w=0,
         scale=scale,
         in_geo=products_geometry,
-        out_geo=slab_geometry,
-        up=upsample,
+        out_geo=inputs_geometry,
     )
     return out_sum, y_tail, d
 
@@ -717,7 +637,6 @@ def rms_norm_silu_rows(
     silu: bool = True,
     frames: int = 1,
     out_geometry: FrameGeometry | None = None,
-    upsample: UpsampleSource | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """RMSNorm (+ SiLU, + residual, + deferred bias) on rows ``[N, C]`` bf16: returns
     ``(sum or None, y)``; ``sum = round(x (+ in_bias) + residual)`` is written when a residual
@@ -725,20 +644,8 @@ def rms_norm_silu_rows(
 
     With ``out_geometry`` the rows are ``frames`` frames of ``height * width`` positions and
     ``out`` holds frames with halo rows / columns (``[frames * rows * cols, C]``); only the
-    logical positions are written.
-
-    With ``upsample`` (instead of ``x``) the rows are its ``frames`` frames of ``4 * height *
-    width`` positions, formed from the packed upsample conv output while reading; the sum is
-    always returned then."""
-    if upsample is not None:
-        if x is not None or residual is not None or in_bias is not None:
-            raise ValueError("upsample replaces x, residual and in_bias")
-        upsample.check()
-        x, residual, in_bias = upsample.temp, upsample.shortcut, upsample.bias
-        frames, channels = upsample.frames, upsample.channels
-        rows = frames * upsample.positions
-    else:
-        rows, channels = x.shape
+    logical positions are written."""
+    rows, channels = x.shape
     for name, t in (
         ("x", x),
         ("residual", residual),
@@ -760,20 +667,15 @@ def rms_norm_silu_rows(
             raise ValueError("out_geometry needs a destination and frames * height * width rows")
         if out.shape[0] != frames * out_geometry.frame:
             raise ValueError("out does not match out_geometry")
-    elif upsample is None:
+    else:
         frames = 1
     device = x.device.index
     opts = dict(device=x.device, dtype=torch.bfloat16)
     y = out if out is not None else torch.empty((rows, channels), **opts)
-    out_sum = (
-        torch.empty((rows, channels), **opts)
-        if residual is not None or upsample is not None
-        else None
-    )
+    out_sum = torch.empty((rows, channels), **opts) if residual is not None else None
     lanes, k = row_layout(channels, fold_single=True)
-    up_ft, up_ratio = _up_variant(upsample)
     variant = Variant(
-        slab_half=False,
+        fp16_winograd=False,
         order=1,
         lanes=lanes,
         k=k,
@@ -787,8 +689,6 @@ def rms_norm_silu_rows(
         padded=False,
         in_map=False,
         out_map=out_geometry is not None,
-        up_ft=up_ft,
-        up_ratio=up_ratio,
         halo=out_geometry is not None and out_geometry.push is not None,
     )
     _launch(
@@ -817,7 +717,6 @@ def rms_norm_silu_rows(
         pad_w=0,
         scale=scale,
         out_geo=out_geometry,
-        up=upsample,
     )
     return out_sum, y
 
@@ -855,14 +754,14 @@ def combine(
         raise ValueError("height * width must equal the position count")
     device = src.device.index
     order, m_ptr, stride = 1, 0, 0
-    slab_half = False
+    fp16_winograd = False
     if m is not None:
         order = len(m) - 2
         if order not in (2, 4) or frames % order:
             raise ValueError(
                 "m must hold order + 2 tensors (order 2 or 4) and T must be divisible by the order"
             )
-        slab_half = m[0].dtype == torch.float16
+        fp16_winograd = m[0].dtype == torch.float16
         m_ptr, stride = _stacked_products(m, m[0].dtype)
     padded = pad_h > 0 or pad_w > 0
     y = torch.empty(
@@ -872,7 +771,7 @@ def combine(
     )
     lanes, k = row_layout(channels, fold_single=True)
     variant = Variant(
-        slab_half=slab_half,
+        fp16_winograd=fp16_winograd,
         order=order,
         lanes=lanes,
         k=k,

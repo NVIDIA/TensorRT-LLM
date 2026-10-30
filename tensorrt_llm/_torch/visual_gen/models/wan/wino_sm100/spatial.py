@@ -52,7 +52,7 @@ def spatial_eligible(cin: int, cout: int) -> bool:
 
 
 def wino_spatial_conv(d: torch.Tensor, u: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    """3x3 conv (padding 1) of the component slabs by their filters: ``D [components, pairs,
+    """3x3 conv (padding 1) of the component inputs by their filters: ``D [components, pairs,
     H*W, Cin]`` (bf16 or fp16) -> ``M [components, pairs, H*W, Cout]`` (bias-free, in ``D``'s
     dtype), ``u`` from :func:`spatial_filters`. ``width`` must be a multiple of 4."""
     comps, pairs, positions, cin = d.shape

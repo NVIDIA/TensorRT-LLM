@@ -3,7 +3,7 @@
 """Spatial sharding of WinoVae: one rank per slice of the frame along the height or the width.
 
 Every buffer a spatial 3x3 convolution reads carries one halo line on each side of the split
-axis (:class:`FrameGeometry`): the norm kernels write their slabs and frame-buffer rows into
+axis (:class:`FrameGeometry`): the norm kernels write their Winograd inputs and frame-buffer rows into
 that layout, the sm100 convolutions return their products in it, and only the border
 lines travel between neighbouring ranks. Edge ranks keep zeros in their outer halo (the global
 zero padding of the convolution).
@@ -151,8 +151,8 @@ class Shard:
         # Every rank's extent along the split axis in latent units (set by the wrapper at each
         # split); None means equal shards.
         self.extents: list[int] | None = None
-        # Direct halo exchange: the symmetric-memory group, the slab buffer rings (two
-        # buffers per layout, see ``direct_slabs``) and each ring's next buffer.
+        # Direct halo exchange: the symmetric-memory group, the input-buffer rings (two
+        # buffers per layout, see ``direct_inputs``) and each ring's next buffer.
         self._group_name: str | None = None
         self.direct = halo != "nccl" and self._enable_direct(required=halo == "direct")
         self._rings: dict[tuple, list[DirectFrames]] = {}
@@ -179,7 +179,7 @@ class Shard:
         return True
 
     def begin_call(self) -> None:
-        """Start of a model call: every slab ring hands out its buffers from the first again,
+        """Start of a model call: every input-buffer ring hands out its buffers from the first again,
         so a captured call replays the same buffer sequence; retired buffers whose last use
         has completed are released."""
         self._turn.clear()
@@ -251,7 +251,7 @@ class Shard:
             peer(self.rank + 1, False) if self.rank + 1 < self.world_size else None,
         )
 
-    def direct_slabs(
+    def direct_inputs(
         self,
         comps: int,
         groups: int,
@@ -260,7 +260,7 @@ class Shard:
         channels: int,
         dtype: torch.dtype,
     ) -> DirectFrames:
-        """The next slab buffer for a Winograd conv's input of this layout, from a ring of two
+        """The next input buffer for a Winograd conv's input of this layout, from a ring of two
         per layout. Two suffice: with a barrier per exchange a neighbour runs at most one
         exchange ahead, so the buffer it writes is never the one this rank's conv still
         reads. The ring index resets at every model call (``begin_call``); the output gather

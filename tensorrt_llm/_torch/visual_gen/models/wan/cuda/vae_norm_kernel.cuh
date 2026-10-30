@@ -23,7 +23,7 @@
 //                      conv bias (inBias) and the residual; the pre-norm row goes to ``sum``
 //                      when that pointer is set.
 //   middle (MID)       0: nothing (the combine kernel); 1: RMSNorm; 2: RMSNorm + SiLU.
-//   output (OUT)       0: the temporal Winograd slabs of order R (D_k = sum_i BT[k][i] f_i over
+//   output (OUT)       0: the temporal Winograd inputs of order R (D_k = sum_i BT[k][i] f_i over
 //                      the group's R + 2 normalized frames, two of them the cache), with the
 //                      last two normalized frames written to ``yTail`` for the next chunk;
 //                      1: plain rows to ``y`` ([T, P', C], P' the padded position count when
@@ -31,7 +31,7 @@
 //
 // Numerics: fp32 throughout, one rounding per output unless REF (reference rounding), which
 // reproduces the eager bf16 rounding after every add, normalize, multiply and bias. The
-// order-2 bf16 slab path adds no rounding beyond the F(2,3) arithmetic itself. Compiled at run
+// order-2 bf16 Winograd path adds no rounding beyond the F(2,3) arithmetic itself. Compiled at run
 // time per instantiation (jit_norm.py builds the launch); the tables live in vae_wino_tables.cuh.
 
 #pragma once
@@ -65,7 +65,7 @@ enum Mid : int
 
 enum Out : int
 {
-    kOutSlabs = 0,
+    kOutWinograd = 0,
     kOutRows = 1
 };
 
@@ -74,12 +74,12 @@ struct VaeNormParams
     int64_t positions; // P: source positions (H * W)
     int channels;      // C (multiple of 8)
     int frames;        // T, a positive multiple of the walk's group size
-    int cacheFrames;   // 0, 1 or 2 (slab output only)
+    int cacheFrames;   // 0, 1 or 2 (Winograd output only)
     int height;        // H and W of a frame (padded row output only)
     int width;
     int padH;          // extra zero rows at the bottom of the row output (0 or 1)
     int padW;          // extra zero columns at the right (0 or 1)
-    // Physical frame geometry of the products (IN_MAP) and of the slab / row output (OUT_MAP)
+    // Physical frame geometry of the products (IN_MAP) and of the Winograd / row output (OUT_MAP)
     // when they carry halo rows or columns: logical position (i, j) of a W-wide frame sits at
     // i * physW + j + physOff inside a frame of physFrame positions.
     long long inFrame;
@@ -88,13 +88,6 @@ struct VaeNormParams
     long long outFrame;
     int outW;
     int outOff;
-    // Upsample input (UP_FT > 0): the frames are the phase gather of the packed 2x2 upsample
-    // conv output ``x`` [T, (upHeight+1) * (upWidth+1), 4C] plus the DupUp3D shortcut
-    // ``residual`` [framesR, upHeight * upWidth, upCin] (upCrop leading frames dropped).
-    int upHeight;
-    int upWidth;
-    int upCrop;
-    int upCin;
     float scale;
     float eps;
     // Halo push (HALO): the output's first and last logical line along the split axis are
@@ -103,7 +96,7 @@ struct VaeNormParams
     // (columns travel). Per side (L: the lower rank, R: the higher; null without a
     // neighbour): the peer's address of the destination line's first position (frame 0,
     // component 0), its positions per frame, the positions between consecutive line
-    // positions and the elements between its slab components.
+    // positions and the elements between its input components.
     void* haloL;
     void* haloR;
     long long haloFrameL;
@@ -115,7 +108,7 @@ struct VaeNormParams
     int haloAxis;
 };
 
-// T: activations (x, residual, cache, sum, yTail, y, gamma, bias); TD: slabs d and products m,
+// T: activations (x, residual, cache, sum, yTail, y, gamma, bias); TD: Winograd inputs d and products m,
 // each one stacked buffer [components, groups, P, C] with compStride elements per component.
 template <typename T, typename TD>
 struct Ptrs
@@ -131,7 +124,7 @@ struct Ptrs
     T* yTail;
     T* y;
     TD* d;
-    int64_t compStride;   // elements between the slab components of d
+    int64_t compStride;   // elements between the input components of d
     int64_t inCompStride; // elements between the product components of m
 };
 
@@ -146,9 +139,9 @@ __device__ __forceinline__ float addR(float a, float b)
 // Resident blocks per SM the register budget is sized for. Per-thread state is bounded
 // independently of K: the row being normalized (K vectors) plus two vector slices of
 // inputs in flight; the frame history lives in shared memory. Order 4 holds up to five
-// products per slice and emits five slabs from one frame: at the order-2 budgets it spills
+// products per slice and emits five Winograd inputs from one frame: at the order-2 budgets it spills
 // (measured: 11-19 M local loads per launch, DRAM 44-62%), so it runs two blocks per SM.
-// The row-output modes carry no ring and no slabs and keep four blocks up to K = 2.
+// The row-output modes carry no ring and no Winograd inputs and keep four blocks up to K = 2.
 #ifndef VAEWINO_IN_BLOCKS
 #define VAEWINO_IN_BLOCKS 0 // 0: the default below; else blocks per SM for the order-4 product combine
 #endif
@@ -187,7 +180,7 @@ __host__ __device__ constexpr int sliceDepth()
     return K >= 4 ? 3 : 2;
 }
 
-// History ring: a group needs frames t-2 .. t+R-1; frame t-2 is dead once the slabs that
+// History ring: a group needs frames t-2 .. t+R-1; frame t-2 is dead once the Winograd inputs that
 // read it are out (while frame t+R-2 is normalized), so frame t+R-1 can take its slot:
 // R + 1 slots suffice. slot(frame) = (frame + 2) mod (R + 1); the cached frames -2, -1
 // start in slots 0 and 1.
@@ -212,7 +205,7 @@ __host__ __device__ constexpr int positionsPerBlock()
 template <int L, int R, int OUT>
 __host__ __device__ constexpr int sharedBytes(int channels)
 {
-    return 3 * channels * 4 + (OUT == kOutSlabs ? ringSlots<R>() * positionsPerBlock<L>() * channels * 2 : 0);
+    return 3 * channels * 4 + (OUT == kOutWinograd ? ringSlots<R>() * positionsPerBlock<L>() * channels * 2 : 0);
 }
 
 #ifndef VAEWINO_XF_IN
@@ -220,23 +213,17 @@ __host__ __device__ constexpr int sharedBytes(int channels)
 #endif
 
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO,
-    bool HALO>
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, bool HALO>
 __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormParams const& p)
 {
-    constexpr bool SLABS = OUT == kOutSlabs;
+    constexpr bool WINOGRAD_OUT = OUT == kOutWinograd;
     static_assert(!HALO || (OUT_MAP && !PADDED), "the halo push needs the output's frame geometry");
-    // The frames come from the phase gather of a packed 2x2 upsample conv output (plus the
-    // DupUp3D shortcut as the residual): UP_FT is the shortcut's temporal factor, UP_RATIO the
-    // number of shortcut elements per output channel (factor / repeats).
-    constexpr bool IN_UP = UP_FT > 0;
-    static_assert(!IN_UP || (!IN_WINO && !IN_MAP && !PADDED), "the upsample input is a plain-frame source");
-    static_assert(UP_FT >= 0 && UP_FT <= 2 && (UP_RATIO == 1 || UP_RATIO == 2), "unsupported upsample mapping");
-    static_assert(!SLABS || MID == kMidNormSilu, "slabs are formed from normalized, activated frames");
+    static_assert(!WINOGRAD_OUT || MID == kMidNormSilu, "Winograd inputs are formed from normalized, activated frames");
     static_assert(!PADDED || OUT == kOutRows, "padding applies to the row output");
     static_assert(!(PADDED && OUT_MAP), "the padded row output has its own position map");
     static_assert(!IN_MAP || IN_WINO, "the input map applies to the products");
-    static_assert(IN_WINO || SLABS || R == 1, "R is 1 unless products are combined or slabs are emitted");
+    static_assert(
+        IN_WINO || WINOGRAD_OUT || R == 1, "R is 1 unless products are combined or Winograd inputs are emitted");
     using Vec = PackedAligned<T, V>;
     using VecD = PackedAligned<TD, V>;
     using VecIn = cuda::std::conditional_t<IN_WINO, VecD, Vec>;
@@ -247,9 +234,9 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     constexpr bool CONST_REGS = (K == 1); // per-channel constants in registers
     constexpr bool ACT = MID == kMidNormSilu;
     // The standalone norm op rounds the deferred-bias add and the residual add to bf16 in
-    // every mode (the sum row must be the eager ``x + residual`` bit for bit); the slab modes
+    // every mode (the sum row must be the eager ``x + residual`` bit for bit); the Winograd modes
     // keep fp32 there unless REF.
-    constexpr bool ROUND1 = REF || OUT == kOutRows || IN_UP;
+    constexpr bool ROUND1 = REF || OUT == kOutRows;
     constexpr int kPosPerWarp = 32 / L;
     constexpr int kPosPerBlock = kPosPerWarp * kWarps;
 
@@ -383,7 +370,6 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     {
         cuda::std::conditional_t<IN_WINO, TD, T> const* in;
         T const* res;
-        int resOff; // upsample input: the shortcut element of the lane's first output channel
     };
 
     // ``sposSrc``: the position's physical index inside a product frame (inIndex(spos)).
@@ -391,28 +377,6 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
     {
         FrameSrc f{};
         int64_t const frow = static_cast<int64_t>(t) * P + spos;
-        if constexpr (IN_UP)
-        {
-            // Output pixel (2i+pp, 2j+qq) of frame t reads temp[t, phase 2pp+qq, i+pp, j+qq]
-            // and shortcut element (c * factor + S) / repeats = c * UP_RATIO + S / repeats of
-            // low-res pixel (i, j) of frame (t + crop) / UP_FT, S = ((a*2+pp)*2+qq).
-            int const w2 = 2 * p.upWidth;
-            int const oi = static_cast<int>(spos / w2);
-            int const oj = static_cast<int>(spos - static_cast<int64_t>(oi) * w2);
-            int const i = oi >> 1, pp = oi & 1, j = oj >> 1, qq = oj & 1;
-            int64_t const trow = (static_cast<int64_t>(t) * (p.upHeight + 1) + i + pp) * (p.upWidth + 1) + j + qq;
-            f.in = ptrs.x + trow * (4 * C) + (2 * pp + qq) * C + laneChunkOff;
-            if constexpr (HAS_RESIDUAL)
-            {
-                constexpr int REPEATS = 4 * UP_FT / UP_RATIO;
-                int const ft = t + p.upCrop;
-                int const tr = ft / UP_FT, a = ft - tr * UP_FT;
-                int64_t const srow = (static_cast<int64_t>(tr) * p.upHeight + i) * p.upWidth + j;
-                f.res = ptrs.residual + srow * p.upCin + static_cast<int64_t>(laneChunkOff) * UP_RATIO;
-                f.resOff = ((a * 2 + pp) * 2 + qq) / REPEATS;
-            }
-            return f;
-        }
         if constexpr (IN_WINO)
         {
             f.in = gRow(ptrs.m, static_cast<int64_t>(t / R) * inFrame + sposSrc);
@@ -448,22 +412,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
         {
             dst[0] = loadVec(f.in, k);
         }
-        if constexpr (HAS_RESIDUAL && IN_UP && UP_RATIO == 2)
-        {
-            // Output channel c reads shortcut element 2c + resOff: two vectors, every other
-            // element, both parities built with constant indices and one selected.
-            Vec const lo = *reinterpret_cast<Vec const*>(f.res + 2 * k * L * V);
-            Vec const hi = *reinterpret_cast<Vec const*>(f.res + 2 * k * L * V + V);
-            Vec even, odd;
-#pragma unroll
-            for (int e = 0; e < V; ++e)
-            {
-                even.val[e] = 2 * e < V ? lo.val[(2 * e) % V] : hi.val[(2 * e) % V];
-                odd.val[e] = 2 * e + 1 < V ? lo.val[(2 * e + 1) % V] : hi.val[(2 * e + 1) % V];
-            }
-            dres = f.resOff == 0 ? even : odd;
-        }
-        else if constexpr (HAS_RESIDUAL)
+        if constexpr (HAS_RESIDUAL)
         {
             dres = loadVec(f.res, k);
         }
@@ -530,7 +479,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                 continue;
             }
         }
-        if constexpr (SLABS)
+        if constexpr (WINOGRAD_OUT)
         {
             // Cached frames -2 and -1 into slots 0 and 1 (zeros where the cache is shorter).
 #pragma unroll
@@ -641,7 +590,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                         v.y += ib.val[2 * i + 1];
                     }
                     // Reference mode (and the row modes) reproduce eager's bf16 roundings of the
-                    // conv output and of the residual sum; the slab modes' fp32 mode keeps the fp32
+                    // conv output and of the residual sum; the Winograd modes' fp32 mode keeps the fp32
                     // values. The bf16 row is rounded once either way.
                     if constexpr (ROUND1)
                     {
@@ -786,13 +735,13 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                     invDenom = rsqrtf(fmaxf(ss, p.eps * p.eps));
                 }
 
-                // Pass 2: normalize from registers into the ring slot (and emit the slabs this
-                // frame completes: slab k with lastFrameOf(k) == J + 2 reads the group's frames
+                // Pass 2: normalize from registers into the ring slot (and emit the Winograd inputs this
+                // frame completes: input k with lastFrameOf(k) == J + 2 reads the group's frames
                 // f_0 .. f_{J+1} from the ring and f_{J+2}, this frame, from registers) or into
                 // the output row.
                 int const t0 = t - J; // first output frame of the group; f_i is frame t0 - 2 + i
                 int64_t const drow = static_cast<int64_t>(t / R) * outFrame + posOut;
-                T* const ySlot = SLABS ? slotPtr(ringSlot<R>(t)) : gRowW(ptrs.y, orow);
+                T* const ySlot = WINOGRAD_OUT ? slotPtr(ringSlot<R>(t)) : gRowW(ptrs.y, orow);
 #pragma unroll
                 for (int k = 0; k < K; ++k)
                 {
@@ -811,7 +760,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                         setPair(yk, i, r);
                     }
                     storeVec(ySlot, k, yk);
-                    if constexpr (HALO && !SLABS)
+                    if constexpr (HALO && !WINOGRAD_OUT)
                     {
                         if (haloBaseL != nullptr)
                         {
@@ -826,15 +775,15 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                                 yk);
                         }
                     }
-                    if constexpr (SLABS)
+                    if constexpr (WINOGRAD_OUT)
                     {
                         auto emit = [&](auto sTag)
                         {
                             constexpr int s = decltype(sTag)::value;
                             if constexpr (s < W::kComps && lastFrameOf<R>(s) == J + 2)
                             {
-                                // Each slab reloads the ring frames it reads (the barrier stops the
-                                // compiler from hoisting them across slabs): a few extra LDS keep
+                                // Each input reloads the ring frames it reads (the barrier stops the
+                                // compiler from hoisting them across Winograd inputs): a few extra LDS keep
                                 // the live set small enough not to spill.
                                 asm volatile("" ::: "memory");
                                 Vec hs[J + 2];
@@ -851,7 +800,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                                 for (int i = 0; i < V / 2; ++i)
                                 {
                                     // Products of 16-bit values and multiples of 1/2 are exact in
-                                    // fp32, so fma and separate multiply-add agree; the slab rounds
+                                    // fp32, so fma and separate multiply-add agree; the input rounds
                                     // once.
                                     float2 acc = make_float2(0.0f, 0.0f);
                                     bool first = true;
@@ -949,7 +898,7 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
                 frame(cuda::std::integral_constant<int, 3>{}, t + 3);
             }
         }
-        if constexpr (SLABS)
+        if constexpr (WINOGRAD_OUT)
         {
             // The last two normalized frames are the next chunk's cache.
             T const* const sa = slotPtr(ringSlot<R>(T_ - 2));
@@ -969,15 +918,13 @@ __device__ __forceinline__ void vaeNormBody(Ptrs<T, TD> const& ptrs, VaeNormPara
 // Entry point for the runtime-compiled kernel: every argument a scalar (the launcher passes a
 // typed argument list).
 template <typename T, typename TD, int R, int V, int L, int K, bool REF, bool HAS_BIAS, bool HAS_IN_BIAS,
-    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, int UP_FT, int UP_RATIO,
-    bool HALO>
-__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
-    vaeNormKernel(T const* x, TD const* m, TD* d, long long compStride, long long inCompStride, T const* residual,
-        T const* inBias, T const* cache, T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions,
-        int channels, int frames, int cacheFrames, int height, int width, int padH, int padW, long long inFrame,
-        int inW, int inOff, long long outFrame, int outW, int outOff, int upHeight, int upWidth, int upCrop, int upCin,
-        float scale, float eps, void* haloL, void* haloR, long long haloFrameL, long long haloFrameR,
-        long long haloCompL, long long haloCompR, int haloStepL, int haloStepR, int haloAxis)
+    bool HAS_RESIDUAL, bool IN_WINO, int MID, int OUT, bool PADDED, bool IN_MAP, bool OUT_MAP, bool HALO>
+__global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>()) vaeNormKernel(T const* x, TD const* m,
+    TD* d, long long compStride, long long inCompStride, T const* residual, T const* inBias, T const* cache,
+    T const* gamma, T const* bias, T* sum, T* yTail, T* y, long long positions, int channels, int frames,
+    int cacheFrames, int height, int width, int padH, int padW, long long inFrame, int inW, int inOff,
+    long long outFrame, int outW, int outOff, float scale, float eps, void* haloL, void* haloR, long long haloFrameL,
+    long long haloFrameR, long long haloCompL, long long haloCompR, int haloStepL, int haloStepR, int haloAxis)
 {
     Ptrs<T, TD> ptrs{};
     ptrs.x = x;
@@ -1008,10 +955,6 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
     p.outFrame = outFrame;
     p.outW = outW;
     p.outOff = outOff;
-    p.upHeight = upHeight;
-    p.upWidth = upWidth;
-    p.upCrop = upCrop;
-    p.upCin = upCin;
     p.scale = scale;
     p.eps = eps;
     p.haloL = haloL;
@@ -1024,7 +967,7 @@ __global__ void __launch_bounds__(kThreads, blocksPerSm<K, IN_WINO, R, OUT>())
     p.haloStepR = haloStepR;
     p.haloAxis = haloAxis;
     vaeNormBody<T, TD, R, V, L, K, REF, HAS_BIAS, HAS_IN_BIAS, HAS_RESIDUAL, IN_WINO, MID, OUT, PADDED, IN_MAP, OUT_MAP,
-        UP_FT, UP_RATIO, HALO>(ptrs, p);
+        HALO>(ptrs, p);
 }
 
 } // namespace vaewino

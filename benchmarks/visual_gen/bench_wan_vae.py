@@ -7,7 +7,7 @@ inputs or a real clip. CUDA-graph replay timed with CUPTI kernel timestamps, L2 
 replays; accuracy against the native model run in fp32. Writes one JSON per run.
 
     python benchmarks/visual_gen/bench_wan_vae.py --label wino --out-dir /tmp/wan_vae
-        --shapes t2v_720p_189f --winovae-opts fused_norm=1,fused_residual=1,...
+        --shapes t2v_720p_189f --winovae-opts encoder_chunk_frames=24
     python benchmarks/visual_gen/bench_wan_vae.py ... --world-size 2 --split-dim width
 """
 
@@ -444,7 +444,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--label", required=True, help="run name, e.g. baseline, fused_norm")
+    parser.add_argument("--label", required=True, help="run name, e.g. baseline, chunk8")
     parser.add_argument(
         "--backends",
         default="native,winovae",
@@ -459,7 +459,11 @@ def _parse_args() -> argparse.Namespace:
         choices=["float32", "none"],
         help="dtype of the native model used as the accuracy reference; none skips",
     )
-    parser.add_argument("--winovae-opts", default="", help="comma list, e.g. fused_norm=1")
+    parser.add_argument(
+        "--winovae-opts",
+        default="",
+        help="WinoVaeOptions as a comma list, e.g. encoder_chunk_frames=8,halo_exchange=nccl",
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
