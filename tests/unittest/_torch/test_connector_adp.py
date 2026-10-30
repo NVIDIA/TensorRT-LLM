@@ -103,6 +103,9 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.enable_early_first_token_response = False
     executor.gather_all_responses = False
     executor.kv_connector_manager = None
+    executor._fetch_hint_enabled = False
+    executor._packed_sync_enabled = False
+    executor._stage_timing = False
     executor.kv_cache_transceiver = None
     executor.dwdp_manager = None
     executor._is_kv_manager_v2 = False
@@ -1299,8 +1302,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         else:
             # Only the existing routing allgather runs when no transfers exist.
             for executor in executors:
-                executor.dist.tp_allgather_int64.assert_not_called()
-                assert executor.dist.tp_allgather.call_count == 3
+                executor.dist.tp_allgather.assert_not_called()
+                assert executor.dist.tp_allgather_int64.call_count == 3
 
 
 def test_ready_owner_polls_save_during_peer_recovery() -> None:
