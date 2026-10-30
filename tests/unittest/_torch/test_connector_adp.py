@@ -81,6 +81,9 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
+    executor._closed = False
+    executor._resources_released = False
+    executor.worker_started = True
     executor.dist = MagicMock(
         spec_set=Distributed,
         tp_size=1,
