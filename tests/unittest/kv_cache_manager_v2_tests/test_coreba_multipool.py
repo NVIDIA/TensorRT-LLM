@@ -215,8 +215,36 @@ class _Arena:
                 tc.assertTrue(own and all(own[0][0] <= i < own[0][1] for i in ids),
                               f"layer {layer} {role}: bound outside its pool's window")
 
+    def page_range(self, layer: int, role: str) -> tuple[int, int]:
+        """get_page_index_range, shifted for a PER_LAYER view as the DeepSeek-V4 cache manager does."""
+        first, last = self.mgr.get_page_index_range(layer, role)
+        converter = self.mgr.get_page_index_converter(layer, role)
+        if converter.layer_offset is not None:
+            first += converter.layer_offset * converter.expansion
+            last += converter.layer_offset * converter.expansion
+        return first, last
+
     def check_live(self, tc: unittest.TestCase) -> None:
         windows = intro.gpu_slot_windows(self.mgr)
+        pool_windows = intro.gpu_pool_windows(self.mgr)
+        # The page range a scan of the pool window covers holds every live page, and no more than the window.
+        for layer, lc in self.lcs.items():
+            pg = self.pg_of_lc[lc]
+            for role in BUFFERS[layer]:
+                first, last = self.page_range(layer, role)
+                tc.assertLessEqual(last, self.mgr.get_page_index_upper_bound(layer, role))
+                pool = 0 if self.bindings(layer, role) is None else 1  # two pools per group; the second is bound
+                b, e = pool_windows[pg][pool]
+                per_slot = self.pool_bytes[pg][pool] // self.mgr.get_page_stride(layer, role)
+                tc.assertLessEqual(last - first, (e - b) * per_slot, f"layer {layer} {role}: range wider than the window")
+                converter = self.mgr.get_page_index_converter(layer, role)
+                for seed, (kv, _) in self.live.items():
+                    for slot in self.indices(kv)[lc]:
+                        bindings = self.bindings(layer, role)
+                        index = bindings[slot] if bindings is not None else slot
+                        page = converter([index], PER_LAYER)[0]
+                        tc.assertTrue(first <= page < last,
+                                      f"layer {layer} {role}: page {page} outside the scanned range [{first}, {last})")
         for seed, (kv, _) in self.live.items():
             for layer, lc in self.lcs.items():
                 idx = self.indices(kv)[lc]

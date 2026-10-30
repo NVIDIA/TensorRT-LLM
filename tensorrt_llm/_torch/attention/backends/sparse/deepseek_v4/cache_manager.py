@@ -653,6 +653,23 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
 
         return convert_to_torch_tensor(TensorWrapper(addr, dtype, shape))
 
+    def _buffer_page_range(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> tuple[int, int]:
+        """Rows [first, last) of get_buffers(layer_idx, attn_type) that lie in its pool's current window.
+
+        The view extends to get_page_index_upper_bound, which under copy-based rebalancing is the arena end,
+        so it covers every pool of the arena; this is the part its own pool owns.
+        """
+        layer_id = self._layer_attn_to_layer_id[(layer_idx, attn_type)]
+        data_role = attn_type.role
+        first, last = self.impl.get_page_index_range(layer_id, data_role)
+        if _get_index_mode(attn_type) == PageIndexMode.PER_LAYER:
+            # The same shift get_buffers applies to the upper bound.
+            converter = self.impl.get_page_index_converter(layer_id, data_role)
+            if converter.layer_offset is not None:
+                first += converter.layer_offset * converter.expansion
+                last += converter.layer_offset * converter.expansion
+        return first, last
+
     def get_compress_scale_buffers(self, layer_idx: int) -> torch.Tensor:
         """Return E4M3 per-16 scales from the NVFP4 COMPRESS storage pool.
 
@@ -2185,8 +2202,15 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             f">1 attn buffer)"
         )
 
-    def _iter_cache_cleanup_buffers(self) -> Iterable[tuple[torch.Tensor, int | None]]:
-        """Yield device storage and arena views with their optional storage guard-page index.
+    def _iter_cache_cleanup_buffers(
+        self,
+    ) -> Iterable[tuple[torch.Tensor, torch.Tensor, int | None]]:
+        """Yield (rows to scan, full view, guard-page index) for device storage and arena views.
+
+        The rows are the part of the view in its pool's current window: under copy-based
+        rebalancing a buffer's view reaches the arena end, and scanning it whole per buffer reads
+        the arena once per buffer (minutes at startup). The guard-page index is relative to the
+        full view.
 
         Host-backed sparse history is left out. Nothing reads a row of it before
         a transfer or a write-back fills it, and walking it would cross PCIe for
@@ -2197,21 +2221,23 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         # Handle each attention buffer from start to end to traverse the whole
         # KV cache. Multiple attention buffers can now share one cache layer.
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
-            buffers = [((layer_id, attn.role), self.get_buffers(layer, attn))]
+            first, last = self._buffer_page_range(layer, attn)
+            buffers = [((layer_id, attn.role), self.get_buffers(layer, attn), first, last)]
             if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
                 buffers.append(
                     (
                         (layer_id, COMPRESS_BLOCK_SCALE_ROLE),
                         self.get_compress_scale_buffers(layer),
+                        *self.impl.get_page_index_range(layer_id, COMPRESS_BLOCK_SCALE_ROLE),
                     )
                 )
-            for buffer_key, buffer in buffers:
+            for buffer_key, buffer, first, last in buffers:
                 if buffer_key in buffers_handled:
                     continue
                 buffers_handled.add(buffer_key)
                 if self._enable_kv_cache_offload and self.impl.is_sparse(*buffer_key):
                     continue
-                yield buffer, self._guard_page_by_layer.get(buffer_key)
+                yield buffer[first:last], buffer, self._guard_page_by_layer.get(buffer_key)
 
         # Arena views span complete GPU pools and can be shared by several layers.
         # Their physical row indices are independent of the host storage guard pages.
@@ -2221,7 +2247,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
                 if arena is None or arena.data_ptr() in arenas_handled:
                     continue
                 arenas_handled.add(arena.data_ptr())
-                yield arena, None
+                yield arena, arena, None
 
     @torch.inference_mode()
     def check_invalid_values_in_kv_cache(self, fill_with_zero: bool = False) -> bool:
@@ -2233,13 +2259,22 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         has_invalid_values = torch.tensor(
             [False], dtype=torch.bool, device=torch.cuda.current_device()
         )
-        for buffer, guard_page in self._iter_cache_cleanup_buffers():
-            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+        guarded = []  # (full view, guard page) of every buffer zeroed
+        for rows, buffer, guard_page in self._iter_cache_cleanup_buffers():
+            if scan_kv_buffer_for_invalid_values(rows, has_invalid_values):
                 some_checks_unavailable = True
             if fill_with_zero:
-                buffer.zero_()
-                if guard_page is not None and self._guard_page_value is not None:
-                    _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
+                rows.zero_()
+                if guard_page is not None:
+                    guarded.append((buffer, guard_page))
+        # Warmup scrubs the cache with fill_with_zero before inference; restore
+        # every guard-page sentinel once all buffers are zeroed, so the startup
+        # warning does not claim a guard that was just wiped (mirrors the base
+        # check_invalid_values_in_kv_cache). Buffers of one pool share its rows, so
+        # zeroing a later buffer would wipe an earlier one's sentinel.
+        if self._guard_page_value is not None:
+            for buffer, guard_page in guarded:
+                _fill_kv_pages(buffer, [guard_page], self._guard_page_value)
         torch.cuda.synchronize()
 
         if some_checks_unavailable:
