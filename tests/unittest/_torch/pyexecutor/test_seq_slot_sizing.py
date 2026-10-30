@@ -669,7 +669,7 @@ def test_resolve_max_num_sequences_prefers_the_published_pool(explicit, engine_s
     """
     engine = SimpleNamespace(
         max_num_seq_slots=engine_seats,
-        _enable_overlap_headroom=True,
+        enable_overlap_headroom=True,
     )
     mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=True)
     llm_args = SimpleNamespace(disable_overlap_scheduler=False)
@@ -790,7 +790,7 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_sc
     which is the nvbug 6627795 shortfall.
     """
     creator = _make_kv_cache_creator(disable_overlap_scheduler)
-    model_engine = SimpleNamespace(
+    creator._model_engine = SimpleNamespace(
         model=SimpleNamespace(model_config=SimpleNamespace(is_generation=True)),
     )
 
@@ -798,7 +798,7 @@ def test_kv_cache_manager_receives_the_overlap_scheduler_flag(disable_overlap_sc
         "tensorrt_llm._torch.pyexecutor._util._create_kv_cache_manager",
         return_value=None,
     ) as create:
-        creator._create_kv_cache_manager(model_engine)
+        creator._create_kv_cache_manager()
 
     assert create.call_args.kwargs["disable_overlap_scheduler"] is disable_overlap_scheduler
 

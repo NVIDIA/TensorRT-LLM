@@ -28,7 +28,8 @@ from PIL import Image
 from tensorrt_llm._torch.models.checkpoints import NemotronHHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm.inputs.multimodal import (
-    DisaggPrefillMultimodalInputs,
+    MultimodalItemMetadata,
+    MultimodalItemPartition,
     MultimodalParams,
     _as_cpu_tensor,
     _compute_mm_masks,
@@ -57,6 +58,7 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
+from ..peft.lora.ownership import DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -282,18 +284,9 @@ class DynamicResolutionParams:
 def _get_vision_encoder_cuda_graph_config(
     mm_config: Optional["MultimodalConfig"],
 ) -> Optional["MultimodalEncoderCudaGraphConfig"]:
+    """Select the vision tower's graph config from the model-wide modality mapping."""
     if mm_config is None or mm_config.encoder_cuda_graph is None:
         return None
-
-    # TODO: Add support for audio encoder CUDA graphs.
-    supported_modalities = {"vision"}
-    unknown_modalities = set(mm_config.encoder_cuda_graph) - supported_modalities
-    if unknown_modalities:
-        raise ValueError(
-            f"Unsupported multimodal encoder CUDA graph modalities: {sorted(unknown_modalities)}. "
-            f"Supported modalities: {sorted(supported_modalities)}."
-        )
-
     return mm_config.encoder_cuda_graph.get("vision")
 
 
@@ -1158,6 +1151,36 @@ class NemotronHMultimodalInputProcessor(
     BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder
 ):
     supports_token_id_mm_expansion: ClassVar[bool] = True
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        audio = multimodal_data.get("audio")
+        # EVS merge also carries full prompt IDs for image/audio requests.
+        # Selecting individual items would require rebuilding that prompt stream.
+        if metadata is not None and isinstance(audio, dict) and audio.get("evs_ids") is None:
+            # One audio item can contain several clips. Video's embedded audio
+            # stays in its video bucket and retains the model's AV interleave.
+            clip_counts = audio.get("audio_num_clips")
+            if clip_counts is None:
+                return metadata
+            clip_counts = clip_counts.cpu()
+            audio["audio_num_clips"] = clip_counts
+            clips = tuple(clip_counts.tolist())
+            item_count = sum(m == "audio" for m, _ in metadata.item_refs)
+            if len(clips) == item_count:
+                packed = MultimodalItemPartition(item_lengths=clips)
+                metadata.input_partitions["audio"] = {
+                    "input_audio_features": packed,
+                    "feature_attention_mask": packed,
+                    "audio_output_lengths": packed,
+                    "audio_num_clips": MultimodalItemPartition(),
+                }
+        return metadata
 
     def __init__(
         self,
@@ -2485,8 +2508,12 @@ class NemotronHMultimodalInputProcessor(
         return input_ids[0].to(torch.int32).tolist(), {"multimodal_data": multimodal_data}
 
     def build_disagg_prefill_multimodal_inputs(
-        self, inputs: Union[TextPrompt, TokensPrompt], mm_handles: List[Dict[str, Any]]
-    ) -> DisaggPrefillMultimodalInputs:
+        self,
+        inputs: Union[TextPrompt, TokensPrompt],
+        mm_handles: List[Dict[str, Any]],
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         text_prompt = inputs.get("prompt")
         prompt_token_ids = inputs.get("prompt_token_ids")
         if prompt_token_ids is None and not text_prompt:
@@ -2602,11 +2629,15 @@ class NemotronHMultimodalInputProcessor(
             mm_mask, num_mm_tokens
         )
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids,
+        return expanded_ids, MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [(modalities[0], i) for i in range(len(mm_handles))],
+                output_embedding_lengths=multimodal_embedding_lengths,
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=num_mm_tokens,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=multimodal_embedding_lengths,
             multimodal_item_run_cu_offsets=item_run_cu_offsets,
             multimodal_run_positions=run_positions,
             multimodal_run_lengths=run_lengths,
@@ -2865,6 +2896,7 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
+    lora_owner = DecoderLoraOwner(module_path="language_model")
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
@@ -2947,7 +2979,6 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         # Load vision encoder weights.
         if self.vision_encoder is not None:
             self.vision_encoder.load_weights(weights)
-            self.vision_encoder.enable_radio_cuda_graph()
 
         # Free vision encoder weights from the dict so the backing mmap pages can be released.
         if hasattr(weights, "mark_consumed"):
@@ -3256,9 +3287,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         padded_features: List[torch.Tensor] = []
         padded_masks: List[torch.Tensor] = []
         clips_per_input: List[int] = []
+        valid_output_lens: List[int] = []
+        has_output_lengths = all(
+            ad.get("audio_output_lengths") is not None for ad in audio_data_list
+        )
         for audio_data in audio_data_list:
             features = audio_data["input_audio_features"].to(dtype=self.model_dtype)
             mask = audio_data["feature_attention_mask"]
+            if has_output_lengths:
+                valid_output_lens.extend(audio_data["audio_output_lengths"].tolist())
             pad_amount = max_time - features.shape[1]
             if pad_amount > 0:
                 features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
@@ -3272,10 +3309,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         sound_embeds = self.sound_encoder(all_features, all_masks)
 
-        valid_input_lens = all_masks.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
-        ).tolist()
+        if not has_output_lengths:
+            # Compatibility for feature dicts not built by ParakeetExtractor.
+            # Keep one batched readback rather than synchronizing per input.
+            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+                all_masks.sum(dim=1)
+            ).tolist()
 
         per_clip_embeds: List[torch.Tensor] = []
         per_clip_counts: List[int] = []

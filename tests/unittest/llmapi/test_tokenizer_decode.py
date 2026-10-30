@@ -202,3 +202,16 @@ def test_hf_decode_incrementally_flush_with_no_new_tokens(
     text, _ = tokenizer.decode_incrementally([], text, states, flush=True, skip_special_tokens=True)
 
     assert text == tokenizer.decode(held_ids, skip_special_tokens=True)
+
+
+def test_num_special_tokens_to_add_delegates_to_the_wrapped_tokenizer() -> None:
+    """The wrapper answers from the tokenizer it wraps.
+
+    ``PreTrainedTokenizerBase.num_special_tokens_to_add`` raises NotImplementedError; the MiniMax-M3 input
+    processor's tokenization-cache check calls it on the wrapper.
+    """
+    tokenizer = _byte_fallback_tokenizer()
+    assert tokenizer.num_special_tokens_to_add() == tokenizer.tokenizer.num_special_tokens_to_add()
+    assert tokenizer.num_special_tokens_to_add(
+        pair=True
+    ) == tokenizer.tokenizer.num_special_tokens_to_add(True)

@@ -176,6 +176,19 @@ class CoverageSelector:
                 iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
+            if dependencies.new_class_bindings:
+                # Every method of an added data class is reached through a
+                # consumer of that new class binding. Its declaration has no
+                # old rows; resolve the class and its methods through those
+                # consumers together with the other module-level changes.
+                qualnames = {
+                    qualname
+                    for qualname in qualnames
+                    if not any(
+                        qualname == name or qualname.startswith(name + ".")
+                        for name in dependencies.new_class_bindings
+                    )
+                } | {"<module>"}
             import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
@@ -204,15 +217,16 @@ class CoverageSelector:
                                 why,
                             )
                         impacted |= target_tests
-                        # A binding that did not exist in the pre-image cannot
-                        # be an existing external dependency.  Keep the
-                        # repository-wide fail-closed check for every removed
-                        # or rebound name, while bounding pure imports and
-                        # declarations through their targets and consumers.
+                        # Bound new imports and functions through their targets
+                        # and consumers. New class names also retain the external
+                        # reference check, including reflective module consumers.
                         checked_bindings = (
                             dependencies.changed_bindings
                             - dependencies.new_import_bindings
-                            - dependencies.new_declaration_bindings
+                            - (
+                                dependencies.new_declaration_bindings
+                                - dependencies.new_class_bindings
+                            )
                         )
                         external_paths: dict[str, set[str]] = {}
                         if self._external_reference_paths is not None:

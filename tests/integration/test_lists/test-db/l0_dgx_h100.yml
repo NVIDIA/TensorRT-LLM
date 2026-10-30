@@ -17,6 +17,12 @@ l0_dgx_h100:
       auto_trigger: others
       orchestrator: mpi
   tests:
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_persistent_pool[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_async_without_dummy[True]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[False]
+  - llmapi/test_llm_api_connector.py::test_connector_adp_transfer_timeout[True]
   - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu2"
   - unittest/_torch/multi_gpu -m "not post_merge" TIMEOUT (90)
@@ -266,6 +272,7 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mooncake_kvcache-90] ISOLATION
   - cpp/test_multi_gpu.py::test_user_buffer[2proc-90]
+  - cpp/test_multi_gpu.py::test_nccl_utils[2proc-90]
 - condition:
     ranges:
       system_gpu_count:
@@ -293,7 +300,7 @@ l0_dgx_h100:
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[tep2]
-    - examples/test_ray.py::test_ray_disaggregated_serving_python[tp1]
+    - examples/test_ray.py::test_ray_disaggregated_serving[tp1]
 - condition:
     ranges:
       system_gpu_count:

@@ -67,6 +67,9 @@ def make_stub_manager(
     mgr.enable_stats = False
     mgr.is_estimating_kv_cache = False
     mgr._request_stats_enabled_ids = set()
+    mgr._allocation_stream = None
+    mgr._on_allocation_stream = set()
+    mgr._allocation_ready = {}
     mgr._stream = Mock()
     mgr.impl = Mock()
     mgr.impl.probe_first_new_block_key.return_value = b"probed-block-key"
@@ -99,6 +102,7 @@ class StubRequest:
         self.is_dummy = False
         self.lora_task_id = lora_task_id
         self.cache_salt = cache_salt
+        self.kv_cache_retention_config = None
         # LlmRequest's own default; a truthy value here turns on the
         # per-request stats branch of _create_kv_cache.
         self.return_perf_metrics = return_perf_metrics

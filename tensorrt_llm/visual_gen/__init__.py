@@ -94,7 +94,18 @@ _LAZY_ATTRS = {
 def __getattr__(name):
     module_name = _LAZY_ATTRS.get(name)
     if module_name is not None:
-        value = getattr(importlib.import_module(module_name), name)
+        try:
+            module = importlib.import_module(module_name)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing {module_name} raised {e!r}",
+                name=__name__,
+            ) from e
+        value = getattr(module, name)
         globals()[name] = value  # cache: subsequent access skips __getattr__
         return value
     # Fall back to plain submodules (tensorrt_llm.visual_gen.sparse_attention,
@@ -108,6 +119,12 @@ def __getattr__(name):
         if e.name != f"{__name__}.{name}":
             raise
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing {__name__}.{name} raised {e!r}",
+            name=__name__,
+        ) from e
 
 
 def __dir__():

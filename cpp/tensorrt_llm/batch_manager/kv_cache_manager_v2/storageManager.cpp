@@ -21,9 +21,9 @@
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/copyEngine.h"
 #include "kv_cache_manager_v2/exceptions.h"
-#include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "tensorrt_llm/common/logger.h"
@@ -105,13 +105,14 @@ PoolGroupIndex LifeCyclePoolGroupMapping::numPoolGroups() const noexcept
 CacheLevelManager::CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cl,
     CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
     TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator,
-    HostMemBackingOptions const& options)
+    HostMemBackingOptions const& options, std::optional<size_t> sparseReservation)
     : cacheLevel(cl)
     , cacheTier(CacheTier(tierConfig.index()))
     , controller(lifeCycleGrouping, cl)
 {
     TLLM_CHECK((cacheTier == CacheTier::GPU_MEM) == (gpuPhysMemAllocator != nullptr));
-    storage = createCacheLevelStorage(tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options);
+    storage = createCacheLevelStorage(
+        tierConfig, slotDescList, slotCountList, gpuPhysMemAllocator, options, sparseReservation);
 }
 
 // ---------------------------------------------------------------------------
@@ -124,6 +125,23 @@ namespace
 bool isGpuAccessibleMemory(CacheTier tier) noexcept
 {
     return tier == CacheTier::GPU_MEM || tier == CacheTier::HOST_MEM;
+}
+
+// The host sparse pool quota an unset configuration gets: 80% of the host memory the host
+// tiers' quotas leave. Host tiers configured past physical memory leave none.
+size_t defaultHostSparsePoolQuota(TypedVec<CacheLevel, CacheTierConfig> const& cacheTiers)
+{
+    size_t hostTierQuota = 0;
+    for (auto const& tier : cacheTiers)
+    {
+        if (cacheTierOf(tier) == CacheTier::HOST_MEM)
+        {
+            hostTierQuota += cacheTierQuota(tier);
+        }
+    }
+    size_t const total = hostTotalMemory();
+    size_t const remaining = total > hostTierQuota ? total - hostTierQuota : 0;
+    return remaining / 5 * 4;
 }
 
 // Compute the slot-to-page-indices scale factors.
@@ -162,8 +180,8 @@ void sortFallenPagesByPriority(TypedVec<LifeCycleId, std::deque<SharedPtr<Page>>
 {
     for (auto& pages : fallenPages)
     {
-        std::stable_sort(
-            pages.begin(), pages.end(), [](auto const& lhs, auto const& rhs) { return lhs->priority < rhs->priority; });
+        std::stable_sort(pages.begin(), pages.end(),
+            [](auto const& lhs, auto const& rhs) { return lhs->priority() < rhs->priority(); });
     }
 }
 
@@ -194,8 +212,7 @@ bool StorageManager::submitColdPageCodec(
         TLLM_CHECK_DEBUG(chunkPages > 0);
         // The index vector is ephemeral. The helper captures it before returning while the device update remains
         // asynchronous.
-        detail::copyPageIndicesToDevice(
-            static_cast<CUdeviceptr>(device.address()), pageIndices + offset, chunkPages, stream);
+        copyToDeviceSyncSource(static_cast<CUdeviceptr>(device.address()), pageIndices + offset, chunkPages, stream);
 
         if (!submit(reinterpret_cast<PageIndexPair const*>(device.address()), chunkPages, stream))
         {
@@ -214,9 +231,10 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     std::unique_ptr<IKvCacheColdPageCodec> coldPageCodec, std::optional<SwaScratchReuseConfig> swaScratchReuse,
     std::optional<BatchDesc> const& typicalBatch, std::vector<BatchDesc> const& constraints,
     std::optional<std::vector<float>> const& initialPoolRatio, std::shared_ptr<EventSink> eventSink,
-    float maxUtilForResume)
+    float maxUtilForResume, Priority coldTierOffloadMinPriority)
     : mLifeCycles(lifeCycles)
     , mEventSink(std::move(eventSink))
+    , mColdTierOffloadMinPriority(coldTierOffloadMinPriority)
     , mHotPoolGroupMapping(config.lifeCycleGrouping())
     , mSwaScratchReuse(std::move(swaScratchReuse))
     , mColdPageCodec(coldPageCodec ? std::move(coldPageCodec) : createDefaultKvCacheColdPageCodec())
@@ -257,12 +275,35 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     TLLM_CHECK_DEBUG_WITH_INFO(
         std::holds_alternative<GpuCacheTierConfig>(config.cacheTiers[kHotLevel]), "First cache tier must be GPU");
 
-    // Compute slot size lists for all pool groups.
+    // Every pool's size, and which of them are sparse. One array of sizes, so the two budgets
+    // cannot disagree about what a pool costs; the selector only says who pays.
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> slotSizeLists;
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> sparsePools;
     slotSizeLists.reserve(hotSlotDescList.size());
+    sparsePools.reserve(hotSlotDescList.size());
     for (auto const& sd : hotSlotDescList)
     {
-        slotSizeLists.push_back(sd.slotSizeList());
+        auto const all = sd.slotSizeList();
+        std::vector<PoolIndex> sparse;
+        size_t dense = 0;
+        for (PoolIndex p{0}; p < all.size(); ++p)
+        {
+            if (sd.isSparse(p))
+            {
+                sparse.push_back(p);
+            }
+            else
+            {
+                ++dense;
+            }
+        }
+        // Only the GPU tier needs this: sparsity exists at the hot level alone, so a cold
+        // level's groups size entirely from their own quota.
+        TLLM_CHECK_WITH_INFO(dense > 0,
+            "A pool group must hold at least one non-sparse pool; a wholly sparse group has no device "
+            "bytes from which to size its slots");
+        slotSizeLists.push_back(all);
+        sparsePools.push_back(std::move(sparse));
     }
 
     size_t const gpuQuota = cacheTierQuota(config.cacheTiers[kHotLevel]);
@@ -273,7 +314,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // Constraints are hot-level feasibility floors. They are scaled by
     // 1/maxUtilForResume because KvCache::resume rejects a pool group above that
     // utilization. Other levels need only the structural one-slot floor.
-    mMinSlots
+    mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
@@ -301,29 +342,38 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     else if (typicalBatch.has_value())
     {
-        lifeCycleRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        lifeCycleRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity, sparsePools);
     }
     else if (!constraints.empty())
     {
         auto lifeCycleSlots
             = computeSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
-        lifeCycleRatio = normalizeToRatio(slotsToBytes(lifeCycleSlots, gpuGranularity));
+        lifeCycleRatio = normalizeToRatio(slotsToBytes(lifeCycleSlots, gpuGranularity, sparsePools));
     }
     else
     {
         // Fallback: average history length 2048.
         BatchDesc fallback;
         fallback.kvCaches.push_back(KVCacheDesc{2049, 2048});
-        lifeCycleRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
+        lifeCycleRatio = ratioFromBatch(fallback, tokensPerBlock, mSwaScratchReuse, gpuGranularity, sparsePools);
     }
 
     auto const hotRatio = toPoolGroupRatio(kHotLevel, lifeCycleRatio);
 
     mLevels.reserve(config.cacheTiers.size());
 
-    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mMinSlots);
+    // A sparse pool's hot pages are host memory. Its bytes are excluded from the GPU quota
+    // rather than sized from it: a slot spans every pool of its group, so a sparse pool's
+    // row count follows from the group's device-backed pools, which the quota does size.
+    // Those pages still need host memory, so an unset quota is filled in here and kept: it
+    // bounds the slot counts and each sparse pool's address-space reservation alike.
+    mHostSparsePoolQuota = config.hostSparsePoolQuota.has_value() ? *config.hostSparsePoolQuota
+                                                                  : defaultHostSparsePoolQuota(config.cacheTiers);
+    // From the descriptors: the level's storage does not exist yet.
+    auto gpuSlotCounts = computeSlotCountForLevel(config.cacheTiers[kHotLevel], slotSizeLists, hotRatio, mHotMinSlots,
+        gpuGranularity, _secondaryBudget(sparsePools, hostMemSizeGranularity(), mHostSparsePoolQuota));
     mLevels.emplace_back(lifeCycleGrouping(kHotLevel), kHotLevel, config.cacheTiers[kHotLevel], slotDescList(kHotLevel),
-        gpuSlotCounts, mGpuPhysMemAllocator.get(), tierBackingOptions(config.cacheTiers[kHotLevel]));
+        gpuSlotCounts, mGpuPhysMemAllocator.get(), HostMemBackingOptions{}, mHostSparsePoolQuota);
 
     auto const gpuDescs = poolGroupDescs();
     TLLM_CHECK_WITH_INFO(
@@ -429,7 +479,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         {
             continue;
         }
-        size_t const granularity = tierCommitUnit(tierConfig);
+        size_t const granularity = tierCommitUnit(tierConfig, gpuGranularity);
         if (size_t const minQuota = minQuotaForLevel(coldSlotSizeLists, granularity, coldMinSlots);
             *maxQuota < minQuota)
         {
@@ -443,12 +493,14 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         TLLM_CHECK(appendLevelSlotDescList(coldSlotDescList) == level);
         auto const coldRatio = projectPoolGroupRatio(kHotLevel, level, lifeCycleRatio);
-        auto slotCounts
-            = computeSlotCountForLevel(config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots);
+        // No second budget: a cold group is a single pool holding whatever the codec packs
+        // into it, dense and sparse buffers alike, so its quota pays for all of it.
+        auto slotCounts = computeSlotCountForLevel(
+            config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots, gpuGranularity);
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
-            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level]));
+            gpuPhysMemAllocator, tierBackingOptions(config.cacheTiers[level], gpuGranularity));
     }
 
     for (CacheLevel level{0}; level < mLevels.size(); ++level)
@@ -592,8 +644,6 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
     TLLM_CHECK_DEBUG(pageIndices != nullptr && numPages > 0);
     PoolGroupIndex const srcPgIdx = getPoolGroupIndex(srcLevel, batchingLayerGroupId);
     PoolGroupIndex const dstPgIdx = getPoolGroupIndex(dstLevel, batchingLayerGroupId);
-    CacheTier const srcTier = cacheTier(srcLevel);
-    CacheTier const dstTier = cacheTier(dstLevel);
     bool const srcIsHot = srcLevel == kHotLevel;
     bool const dstIsHot = dstLevel == kHotLevel;
     auto& srcPoolGroup = poolGroup(srcLevel, srcPgIdx);
@@ -618,14 +668,22 @@ void StorageManager::submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLev
                 tasks.push_back({dstPoolGroup.slotAddress(toSlotId(pageIndices[index].dst)).at(poolIdx),
                     srcPoolGroup.slotAddress(toSlotId(pageIndices[index].src)).at(poolIdx)});
             }
-            mCopyEngine->transfer(dstTier, srcTier, srcSizes.at(poolIdx), tasks, stream);
+            // Per pool, not per group: a GPU-tier group holds device-backed pools beside
+            // host-backed sparse ones, and the copy engine picks its implementation from
+            // the medium. Taking the group's tier would run a device-to-device kernel over
+            // host pointers -- legal, since the host memory is registered, but tuned for a
+            // bandwidth it does not have.
+            mCopyEngine->transfer(poolMedium(dstLevel, dstPgIdx, poolIdx), poolMedium(srcLevel, srcPgIdx, poolIdx),
+                srcSizes.at(poolIdx), tasks, stream);
         }
         return;
     }
 
     CacheLevel const coldLevel = srcIsHot ? dstLevel : srcLevel;
     PoolGroupIndex const coldPgIdx = srcIsHot ? dstPgIdx : srcPgIdx;
-    CacheTier const coldTier = srcIsHot ? dstTier : srcTier;
+    // Only a GPU-tier pool is ever host-backed, so for a cold level cacheTier() and
+    // poolMedium() agree.
+    CacheTier const coldTier = cacheTier(coldLevel);
     size_t const coldPageBytes = slotSize(coldLevel, coldPgIdx).at(PoolIndex{0});
     PageIndexLocation const pageIndexLocation = mPageIndexLocations.at(batchingLayerGroupId);
     auto encodeBatch = [this, batchingLayerGroupId, pageIndexLocation](
@@ -739,6 +797,21 @@ CacheTier StorageManager::cacheTier(CacheLevel level) const
     return mLevels.at(level).cacheTier;
 }
 
+CacheTier StorageManager::poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const
+{
+    return mLevels.at(level).storage->poolGroup(pgIdx).poolMedium(poolIdx);
+}
+
+size_t StorageManager::getNumBytes(CacheLevel level, CacheTier medium) const
+{
+    return mLevels.at(level).storage->roundedNumBytes(medium);
+}
+
+std::optional<CacheTier> StorageManager::sparseBackingMedium() const
+{
+    return mLevels.at(kHotLevel).storage->secondaryMedium();
+}
+
 void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 {
     PoolGroupIndex pg = getPoolGroupIndex(level, lc);
@@ -770,7 +843,76 @@ bool StorageManager::isEvictable(Page const& page, std::optional<CacheLevel> lev
 void StorageManager::scheduleForEviction(Page& page)
 {
     if (isEvictable(page))
+    {
         mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
+        scheduleRetentionExpiry(page);
+    }
+}
+
+void StorageManager::updatePriority(Page& page, Priority priority)
+{
+    TLLM_CHECK_WITH_INFO(
+        kPriorityMin <= priority && priority <= kPriorityMax, "Retention priority must be between 0 and 100");
+    if (priority == page.mPriority)
+    {
+        return;
+    }
+    // Keep ownership across removal: a droppable page may be owned only by its queue.
+    auto const keepAlive = page.sharedFromThis();
+    bool const queued = page.scheduledForEviction();
+    if (queued)
+    {
+        excludeFromEviction(page);
+    }
+    auto const oldPriority = page.mPriority;
+    page.mPriority = priority;
+    if (queued)
+    {
+        mLevels.at(page.cacheLevel).controller.scheduleForEviction(page);
+    }
+    if (mEventSink && page.isCommitted())
+    {
+        auto const& committed = static_cast<CommittedPage const&>(page);
+        if (committed.block != nullptr && committed.block->holdsPage(committed))
+        {
+            mEventSink->addPriorityUpdated(committed.block->key, oldPriority, priority, page.lifeCycle);
+        }
+    }
+}
+
+void StorageManager::cancelRetentionExpiry(Page& page)
+{
+    if (page.mRetentionExpiry.has_value())
+    {
+        mRetentionExpiries.erase(*page.mRetentionExpiry);
+        page.mRetentionExpiry.reset();
+    }
+}
+
+void StorageManager::scheduleRetentionExpiry(Page& page)
+{
+    if (page.status() == PageStatus::DROPPABLE && page.mRetentionDuration.has_value()
+        && page.priority() != kPriorityDefault && !page.mRetentionExpiry.has_value())
+    {
+        page.mRetentionExpiry = mRetentionExpiries.emplace(
+            std::chrono::steady_clock::now() + *page.mRetentionDuration, page.sharedFromThis());
+    }
+}
+
+void StorageManager::refreshRetention()
+{
+    auto const now = std::chrono::steady_clock::now();
+    while (!mRetentionExpiries.empty() && mRetentionExpiries.begin()->first <= now)
+    {
+        auto const page = mRetentionExpiries.begin()->second.lock();
+        mRetentionExpiries.erase(mRetentionExpiries.begin());
+        if (page)
+        {
+            page->mRetentionExpiry.reset();
+            // A prefetch may hold storage without claiming or extending its retention interval.
+            updatePriority(*page, kPriorityDefault);
+        }
+    }
 }
 
 void StorageManager::excludeFromEviction(Page& page)
@@ -808,6 +950,13 @@ void StorageManager::excludeFromEviction(Page& page)
 // ---------------------------------------------------------------------------
 
 void StorageManager::prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
+{
+    refreshRetention();
+    _prepareFreeSlots(level, requirements, migrationRecorder, dropRecorder);
+}
+
+void StorageManager::_prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
     MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
 {
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> goals(numCacheLevels());
@@ -883,6 +1032,37 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
     CacheLevel lvlId, PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder,
     DropRecorder const& dropRecorder)
 {
+    TypedVec<LifeCycleId, std::vector<SharedPtr<Page>>> belowOffloadThreshold(numLifeCycles());
+    auto restoreBelowThreshold = FuncGuard(
+        [&]()
+        {
+            for (auto const& pages : belowOffloadThreshold)
+            {
+                for (auto iter = pages.rbegin(); iter != pages.rend(); ++iter)
+                {
+                    auto const& page = *iter;
+                    if (page->hasValidSlot() && !page->scheduledForEviction() && isEvictable(*page))
+                        mLevels.at(page->cacheLevel).controller.scheduleForEviction(*page, /*evictFirst=*/true);
+                }
+            }
+        });
+    for (auto& pages : fallenPages)
+    {
+        for (auto iter = pages.begin(); iter != pages.end();)
+        {
+            auto const& page = *iter;
+            if (page->cacheLevel == kHotLevel && page->status() == PageStatus::DROPPABLE
+                && page->priority() < mColdTierOffloadMinPriority)
+            {
+                belowOffloadThreshold.at(page->lifeCycle).push_back(std::move(*iter));
+                iter = pages.erase(iter);
+            }
+            else
+            {
+                ++iter;
+            }
+        }
+    }
     if (TLLM_UNLIKELY(gDebug))
     {
         TLLM_CHECK_WITH_INFO(goals.size() == numCacheLevels(), "goals.rows must equal numCacheLevels");
@@ -976,7 +1156,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         auto backPriority = [&](LifeCycleId lifeCycle) -> std::optional<Priority>
         {
             auto const& fallen = fallenPages.at(lifeCycle);
-            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority};
+            return fallen.empty() ? std::nullopt : std::optional<Priority>{fallen.back()->priority()};
         };
         while (count > 0)
         {
@@ -988,7 +1168,7 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             {
                 auto& fallen = fallenPages.at(lifeCycle);
                 auto matchingBegin = std::lower_bound(fallen.begin(), fallen.end(), bestPriority,
-                    [](auto const& page, Priority priority) { return page->priority < priority; });
+                    [](auto const& page, Priority priority) { return page->priority() < priority; });
                 SlotCount const numAccepted
                     = std::min(count, slotCountValueFromSize(std::distance(matchingBegin, fallen.end())));
                 matchingBegin = fallen.end() - numAccepted;
@@ -1095,11 +1275,21 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
             for (auto const& page : pages)
             {
+                if (srcLevel == kHotLevel && page->status() == PageStatus::DROPPABLE)
+                {
+                    // Offloading an unreferenced page ends its released retention interval.
+                    page->claimRetention(std::nullopt, std::nullopt);
+                }
                 scheduleForEviction(*page);
             }
         }
     }
     rescheduleEvictedPagesOnFailure.cancel();
+    if (dropRecorder)
+        for (auto const& pages : belowOffloadThreshold)
+            if (!pages.empty())
+                dropRecorder(pages, kHotLevel);
+    restoreBelowThreshold.cancel();
 }
 
 // ---------------------------------------------------------------------------
@@ -1277,196 +1467,6 @@ void StorageManager::batchedMigrate(
     }
 }
 
-void StorageManager::offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
-{
-    if (requestingCache.storageManager() != this)
-    {
-        throw LogicError("Offload pages and requesting cache must belong to the same manager");
-    }
-    _migrateLockedSparsePages(
-        requestingCache.cudaStream(), kSparseHistoryLevel, pages, &requestingCache, migrationRecorder, dropRecorder);
-}
-
-void StorageManager::promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
-{
-    _migrateLockedSparsePages(stream, kHotLevel, pages, nullptr, migrationRecorder, dropRecorder);
-}
-
-void StorageManager::_migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel,
-    std::vector<SharedPtr<Page>> const& pages, KvCache const* offloadingCache,
-    MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder)
-{
-    CacheLevel const srcLevel = dstLevel == kHotLevel ? kSparseHistoryLevel : kHotLevel;
-
-    struct MigrationBatch
-    {
-        std::vector<SharedPtr<Page>> srcPages;
-        std::vector<SharedPtr<UniqPageLock>> srcPageLocks;
-        std::vector<Slot> dstSlots;
-        std::vector<PageIndexPair> srcDstPageIndices;
-    };
-
-    std::map<LayerGroupId, MigrationBatch> batches;
-    std::set<Page*> seen;
-    std::set<CUstream> ownerStreams;
-    for (auto const& page : pages)
-    {
-        if (!page || page->manager != this)
-        {
-            throw LogicError("Sparse migration pages must belong to the same manager");
-        }
-        if (!seen.insert(page.get()).second)
-        {
-            continue;
-        }
-        auto holder = page->holder.lock();
-        auto lock = holder ? holder->uniqLock.lock() : nullptr;
-        if (!lock)
-        {
-            throw LogicError("Sparse migration requires a locked page");
-        }
-        if (offloadingCache)
-        {
-            lock->prepareSparseOffload(*offloadingCache);
-        }
-        else
-        {
-            lock->prepareSparsePromotion();
-        }
-        if (page->cacheLevel == dstLevel)
-        {
-            continue;
-        }
-        auto& batch = batches[getMigrationBatchingLayerGroupId(dstLevel, srcLevel, page->lifeCycle)];
-        batch.srcPages.push_back(page);
-        for (auto const& owner : lock->owners())
-        {
-            ownerStreams.insert(owner.kvCache->cudaStream());
-        }
-        batch.srcPageLocks.push_back(std::move(lock));
-    }
-    if (batches.empty())
-    {
-        return;
-    }
-
-    TypedVec<PoolGroupIndex, SlotCount> requirements(numPoolGroups(dstLevel), 0);
-    for (auto const& [layerGroup, batch] : batches)
-    {
-        requirements[getPoolGroupIndex(dstLevel, layerGroup)] += slotCountValueFromSize(batch.srcPages.size());
-    }
-    prepareFreeSlots(dstLevel, requirements, migrationRecorder, dropRecorder);
-    auto releaseDestinations = FuncGuard(
-        [&]()
-        {
-            for (auto& [layerGroup, batch] : batches)
-            {
-                for (auto& slot : batch.dstSlots)
-                {
-                    if (slot.hasValidSlot())
-                    {
-                        releaseSlot(layerGroup, dstLevel, std::move(slot));
-                    }
-                }
-            }
-        });
-    for (auto& [layerGroup, batch] : batches)
-    {
-        auto& pool = poolGroup(dstLevel, getPoolGroupIndex(dstLevel, layerGroup));
-        batch.dstSlots = pool.allocateMultiple(slotCountValueFromSize(batch.srcPages.size()));
-        batch.srcDstPageIndices.reserve(batch.srcPages.size());
-        for (size_t i = 0; i < batch.srcPages.size(); ++i)
-        {
-            batch.srcDstPageIndices.push_back({.dst = slotIdToPageIndexValue(batch.dstSlots[i].slotId()),
-                .src = slotIdToPageIndexValue(batch.srcPages[i]->slotId())});
-        }
-    }
-
-    auto const cudaStream = reinterpret_cast<CudaStream>(stream);
-    std::vector<CachedCudaEvent> ownerEvents;
-    ownerEvents.reserve(ownerStreams.size());
-    for (auto const ownerStream : ownerStreams)
-    {
-        ownerEvents.emplace_back(reinterpret_cast<CudaStream>(ownerStream));
-        ownerEvents.back().waitInStream(cudaStream);
-    }
-    for (auto const& [layerGroup, batch] : batches)
-    {
-        for (size_t i = 0; i < batch.srcPages.size(); ++i)
-        {
-            batch.srcPages[i]->readyEvent.waitInStream(cudaStream);
-            batch.dstSlots[i].readyEvent.waitInStream(cudaStream);
-            for (auto const& event : batch.srcPageLocks[i]->finishEvents)
-            {
-                event.waitInStream(cudaStream);
-            }
-        }
-    }
-
-    // Install the fence even when a codec rejects after enqueueing only part of a batch.
-    CachedCudaEvent completion = CachedCudaEvent::makeNull();
-    auto fenceCopies = FuncGuard(
-        [&]()
-        {
-            completion = CachedCudaEvent(cudaStream);
-            for (auto& [layerGroup, batch] : batches)
-            {
-                for (size_t i = 0; i < batch.srcPages.size(); ++i)
-                {
-                    batch.dstSlots[i].readyEvent = completion;
-                    batch.srcPageLocks[i]->recordMigrationEvent(completion);
-                }
-            }
-        });
-    for (auto const& [layerGroup, batch] : batches)
-    {
-        submitMigrationBatch(
-            dstLevel, srcLevel, layerGroup, batch.srcDstPageIndices.data(), batch.srcDstPageIndices.size(), stream);
-    }
-    fenceCopies.run();
-
-    // Subsequent readers on every owner's stream must observe the completed copy.
-    for (auto const ownerStream : ownerStreams)
-    {
-        completion.waitInStream(reinterpret_cast<CudaStream>(ownerStream));
-    }
-    for (auto const& [layerGroup, batch] : batches)
-    {
-        if (migrationRecorder)
-        {
-            migrationRecorder(batch.srcPages, batch.dstSlots, srcLevel, dstLevel);
-        }
-    }
-    for (auto& [layerGroup, batch] : batches)
-    {
-        for (size_t i = 0; i < batch.srcPages.size(); ++i)
-        {
-            Slot source = batch.srcPageLocks[i]->moveToCacheLevel(dstLevel, std::move(batch.dstSlots[i]));
-            releaseSlot(batch.srcPages[i]->lifeCycle, srcLevel, std::move(source));
-        }
-    }
-    if (mEventSink)
-    {
-        for (auto const& [layerGroup, batch] : batches)
-        {
-            for (auto const& page : batch.srcPages)
-            {
-                if (page->isCommitted())
-                {
-                    auto const& committed = static_cast<CommittedPage const&>(*page);
-                    auto const* block = committed.block;
-                    if (block && !block->isOrphan() && block->holdsPage(committed))
-                    {
-                        mEventSink->addCacheLevelUpdated(block->key, srcLevel, dstLevel, page->lifeCycle);
-                    }
-                }
-            }
-        }
-    }
-}
-
 int64_t StorageManager::prefetch(
     CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages)
 {
@@ -1532,24 +1532,6 @@ int64_t StorageManager::prefetch(
     for (auto& [migrationPath, migrationPages] : migrationGroups)
     {
         CacheLevel const srcLevel = migrationPath.first;
-        if (dstLevel == kHotLevel && srcLevel == kSparseHistoryLevel)
-        {
-            std::vector<SharedPtr<Page>> lockedPages;
-            for (auto const& page : migrationPages)
-            {
-                if (page->status() == PageStatus::LOCKED)
-                {
-                    lockedPages.push_back(page);
-                }
-            }
-            if (!lockedPages.empty())
-            {
-                TemporaryCudaStream stream({});
-                auto scope = stream.enter();
-                promoteSparsePages(stream.get(), lockedPages);
-                std::erase_if(migrationPages, [](auto const& page) { return page->cacheLevel == kHotLevel; });
-            }
-        }
         _batchedMigrate(dstLevel, srcLevel, migrationPages, /*updateSrc=*/true);
         // Per batch, after it landed: the pages are already grouped by source level, so this costs
         // nothing per page and never credits a batch that did not run.
@@ -1640,7 +1622,8 @@ TypedVec<PoolGroupIndex, PoolGroupDesc> StorageManager::poolGroupDescs() const
         pools.reserve(slotSizeList.size());
         for (PoolIndex poolIdx{0}; poolIdx < slotSizeList.size(); ++poolIdx)
         {
-            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx)});
+            pools.push_back(PoolDesc{poolIdx, getMemPoolBaseAddress(pgIdx, poolIdx), slotSizeList.at(poolIdx),
+                poolMedium(kHotLevel, pgIdx, poolIdx)});
         }
         result.push_back(PoolGroupDesc{pgIdx, numSlots(pgIdx, kHotLevel), descList.at(pgIdx), std::move(pools)});
     }
@@ -1719,6 +1702,7 @@ void StorageManager::expandPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, Slo
 void StorageManager::shrinkPoolGroup(
     CacheLevel level, PoolGroupIndex pgIdx, SlotCount newNumSlots, std::vector<SharedPtr<Page>> const& persistentPages)
 {
+    refreshRetention();
     auto& pg = poolGroup(level, pgIdx);
     auto& allocator = pg.slotAllocator();
     auto& ctrl = mLevels.at(level).controller;
@@ -1804,7 +1788,8 @@ void StorageManager::shrinkPoolGroup(
     // Ensure free slots for the overflow pages.
     TypedVec<PoolGroupIndex, SlotCount> reqs(numPoolGroups(level), 0);
     reqs[pgIdx] = slotCountValueFromSize(overflowPages.size());
-    prepareFreeSlots(level, reqs);
+    // The eviction order captured above must remain stable through defragmentation.
+    _prepareFreeSlots(level, reqs, MigrationRecorder{}, DropRecorder{});
 
     // A17: all overflow pages must be at the expected cache level.
     TLLM_CHECK_DEBUG_WITH_INFO(std::all_of(overflowPages.begin(), overflowPages.end(),
@@ -1834,11 +1819,11 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()
-        ? roundUp(newQuota.value(), static_cast<size_t>(lvlStorage.poolSizeGranularity()))
-        : lvlStorage.totalQuota();
-    auto const minSlots
-        = level == kHotLevel ? mMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
-    size_t minQuota = minQuotaForLevel(lvlStorage.slotSizeLists(), lvlStorage.poolSizeGranularity(), minSlots);
+        ? roundUp(newQuota.value(), lvlStorage.poolSizeGranularity(lvlStorage.cacheTier()))
+        : lvlStorage.roundedNumBytes(lvlStorage.cacheTier());
+    // Chargeable, not total: a rebalance that charged host bytes to the device budget would
+    // under-size the level and evict live pages to reach it.
+    size_t minQuota = minQuotaForLevel(level);
     if (quota < minQuota)
     {
         throw std::invalid_argument("Quota " + std::to_string(quota)
@@ -1852,7 +1837,7 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
         throw std::invalid_argument("Quota " + std::to_string(quota) + " exceeds the reserved maximum of "
             + std::to_string(*maxQuota) + " for this cache level (raise the tier's max_quota)");
     }
-    auto newNumSlots = lvlStorage.computeSlotCountList(ratioList, minSlots, quota);
+    auto newNumSlots = slotCountsForLevel(level, quota, ratioList);
 
     TLLM_CHECK_DEBUG(isLastLevel(level) || persistentPages == nullptr);
 
@@ -1919,7 +1904,7 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromLength(
             int const nonStaleShared
                 = std::min(sharedRange.length() - intersect(stale, sharedRange).length(), nonStale);
             int const nonStaleBeam = nonStale - nonStaleShared;
-            numRequiredBlocks = std::max(nonStaleShared + effBeamWidth * nonStaleBeam, 1);
+            numRequiredBlocks = nonStaleShared + effBeamWidth * nonStaleBeam;
         }
         numBytes[lifeCycle] = static_cast<size_t>(numRequiredBlocks) * slotBytes;
     }
@@ -1962,7 +1947,8 @@ TypedVec<PoolGroupIndex, float> StorageManager::projectPoolGroupRatio(
 }
 
 TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const
+    std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
     auto numSlots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);
     // A soft preference, not a feasibility floor: keep one optional endpoint
@@ -1974,7 +1960,7 @@ TypedVec<LifeCycleId, float> StorageManager::ratioFromBatch(BatchDesc const& bat
             numSlots[lc] += slotCountValueFromSize(batch.kvCaches.size());
         }
     }
-    return normalizeToRatio(slotsToBytes(numSlots, granularity));
+    return normalizeToRatio(slotsToBytes(numSlots, deviceGranularity, sparsePools));
 }
 
 // ---------------------------------------------------------------------------
@@ -2154,30 +2140,21 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computePoolGroupSlotsForBatc
 // slotsToBytes
 // ---------------------------------------------------------------------------
 
-TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(
-    TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const
+TypedVec<LifeCycleId, size_t> StorageManager::slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
+    size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const
 {
     TypedVec<LifeCycleId, size_t> numBytes(numLifeCycles(), 0);
     for (LifeCycleId lifeCycle{0}; lifeCycle < numSlots.size(); ++lifeCycle)
     {
         auto const poolGroup = getPoolGroupIndex(kHotLevel, lifeCycle);
-        for (auto const poolSize : slotSize(kHotLevel, poolGroup))
+        auto const& sparse = sparsePools.at(poolGroup);
+        auto const& sizes = slotSize(kHotLevel, poolGroup);
+        for (PoolIndex pool{0}; pool < sizes.size(); ++pool)
         {
-            numBytes[lifeCycle] += roundUp(slotCountToSizeT(numSlots[lifeCycle]) * poolSize, granularity);
-        }
-    }
-    return numBytes;
-}
-
-TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
-    TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const
-{
-    TypedVec<PoolGroupIndex, size_t> numBytes(numPoolGroups(), 0);
-    for (PoolGroupIndex pgIdx{0}; pgIdx < numSlots.size(); ++pgIdx)
-    {
-        for (auto poolSize : slotSize(pgIdx))
-        {
-            numBytes[pgIdx] += roundUp(slotCountToSizeT(numSlots[pgIdx]) * poolSize, granularity);
+            auto const medium
+                = std::ranges::find(sparse, pool) == sparse.end() ? CacheTier::GPU_MEM : CacheTier::HOST_MEM;
+            numBytes[lifeCycle] += roundUp(
+                slotCountToSizeT(numSlots[lifeCycle]) * sizes[pool], hotPoolSizeGranularity(medium, deviceGranularity));
         }
     }
     return numBytes;
@@ -2189,29 +2166,60 @@ TypedVec<PoolGroupIndex, size_t> StorageManager::slotsToBytes(
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeSlotCountForLevel(CacheTierConfig const& tierConfig,
     TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+    TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget)
 {
     size_t quota = cacheTierQuota(tierConfig);
-    size_t const granularity = tierCommitUnit(tierConfig);
-    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots), roundUp(quota, granularity));
-    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots);
+    size_t const granularity = tierCommitUnit(tierConfig, gpuPhysMemSize);
+    quota = std::max(minQuotaForLevel(slotSizeLists, granularity, minSlots, secondBudget), roundUp(quota, granularity));
+    return CacheLevelStorage::ratioToSlotCountList(quota, slotSizeLists, ratio, granularity, minSlots, secondBudget);
 }
 
-size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig) const
+//! Host-backed pools round to HostMem::sizeGranularity(), not to the device granularity, so the
+//! budget is counted in that grain: charging them in device grains would over-count every
+//! pool of every group by up to one device grain.
+std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(CacheLevelStorage const& level) const
+{
+    auto const medium = level.secondaryMedium();
+    if (!medium.has_value())
+    {
+        // Nothing here sits outside what this level's quota pays for.
+        return std::nullopt;
+    }
+    return _secondaryBudget(level.poolsOfMedium(*medium), level.poolSizeGranularity(*medium), mHostSparsePoolQuota);
+}
+
+std::optional<SecondaryPoolBudget> StorageManager::_secondaryBudget(
+    TypedVec<PoolGroupIndex, std::vector<PoolIndex>> secondaryPools, size_t granularity, std::optional<size_t> quota)
+{
+    // Returned whenever the level has such a pool, bounded or not: the allocator needs to
+    // know which pools this level's quota does not pay for before it needs to know whether
+    // anything limits them. Only `quota` carries the latter.
+    if (std::ranges::none_of(secondaryPools, [](auto const& pools) { return !pools.empty(); }))
+    {
+        return std::nullopt;
+    }
+    SecondaryPoolBudget budget;
+    budget.quota = quota;
+    budget.granularity = granularity;
+    budget.pools = std::move(secondaryPools);
+    return budget;
+}
+
+size_t StorageManager::tierCommitUnit(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize)
 {
     // Every GPU level shares one allocator, whose unit was derived from the hot
     // level's quota. A cold GPU level must report that unit rather than one
     // recomputed from its own quota, which is smaller and would not match the
     // chunks the allocator actually hands out.
     return cacheTierOf(tierConfig) == CacheTier::GPU_MEM
-        ? mGpuPhysMemAllocator->physMemSize()
+        ? gpuPhysMemSize
         : tierAllocationGranularity(cacheTierOf(tierConfig), cacheTierQuota(tierConfig));
 }
 
-HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig) const
+HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize)
 {
     HostMemBackingOptions options;
-    options.commitUnit = tierCommitUnit(tierConfig);
     if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
     {
         options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
@@ -2223,15 +2231,39 @@ HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& 
 // minQuotaForLevel
 // ---------------------------------------------------------------------------
 
-size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel level) const
 {
+    return level == kHotLevel ? mHotMinSlots : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
+}
+
+size_t StorageManager::minQuotaForLevel(CacheLevel level) const
+{
+    auto const& storage = *mLevels.at(level).storage;
+    return minQuotaForLevel(storage.slotSizeLists(), storage.poolSizeGranularity(storage.cacheTier()),
+        _minSlotsFor(level), _secondaryBudget(storage));
+}
+
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::slotCountsForLevel(
+    CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const
+{
+    auto const& storage = *mLevels.at(level).storage;
+    return CacheLevelStorage::ratioToSlotCountList(quota, storage.slotSizeLists(), ratio,
+        storage.poolSizeGranularity(storage.cacheTier()), _minSlotsFor(level), _secondaryBudget(storage));
+}
+
+size_t StorageManager::minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
+    size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+    std::optional<SecondaryPoolBudget> const& secondBudget)
+{
+    auto const pools = CacheLevelStorage::poolsPaidByQuota(slotSizeLists, secondBudget);
     size_t total = 0;
     for (PoolGroupIndex pgIdx{0}; pgIdx < slotSizeLists.size(); ++pgIdx)
     {
-        for (auto slotSize : slotSizeLists[pgIdx])
+        // Only the pools this quota pays for: a sparse pool's floor is charged to the host
+        // budget instead, and counting it here would inflate the device quota's own.
+        for (PoolIndex poolIdx : pools[pgIdx])
         {
-            total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSize, granularity);
+            total += roundUp(slotCountToSizeT(minSlots[pgIdx]) * slotSizeLists[pgIdx][poolIdx], granularity);
         }
     }
     return total;
@@ -2245,10 +2277,12 @@ TypedVec<PoolGroupIndex, float> StorageManager::constrainPoolGroupRatio(
     TypedVec<PoolGroupIndex, float> const& ratio) const
 {
     auto& gpuStorage = *mLevels[kHotLevel].storage;
-    size_t granularity = gpuStorage.poolSizeGranularity();
-    auto slotCountList = gpuStorage.computeSlotCountList(ratio, mMinSlots);
-    auto numBytes = slotsToBytes(slotCountList, granularity);
-    return normalizeToRatio(numBytes);
+    auto slotCountList = slotCountsForLevel(kHotLevel, gpuStorage.roundedNumBytes(gpuStorage.cacheTier()), ratio);
+    // All-bytes, each medium in its own grain -- the same measure ratioList() reports, so
+    // the target this derives and the layout a rebalance then achieves are comparable. They
+    // have to be: _needAdjustment treats this as a prediction of the allocator's own output
+    // and re-fires until the two agree.
+    return normalizeToRatio(gpuStorage.allMediaBytes(slotCountList));
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

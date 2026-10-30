@@ -82,6 +82,8 @@ def _factory_model_engine(
 ) -> SimpleNamespace:
     return SimpleNamespace(
         mapping=SimpleNamespace(has_cp_helix=lambda: helix),
+        cuda_graph_batch_sizes=[],
+        cuda_graph_padding_enabled=False,
         spec_config=spec_config,
         model=SimpleNamespace(
             model_config=SimpleNamespace(
@@ -385,7 +387,6 @@ class TestKvCacheCreatorLifecycle:
         creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
         creator._llm_args = SimpleNamespace(kv_cache_compression_config=config)
         creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
-        creator._draft_model_engine = None
         creator._is_encoder_decoder = MagicMock(return_value=False)
         creator._should_create_separate_draft_kv_cache = MagicMock(return_value=False)
         target_manager = object()
@@ -484,7 +485,6 @@ def test_build_routes_compression_manager_by_capabilities(
     pretrained_config = object()
     creator._llm_args = SimpleNamespace(kv_cache_compression_config=compression_config)
     creator._model_engine = _factory_model_engine(pretrained_config=pretrained_config)
-    creator._draft_model_engine = None
     creator._kv_connector_manager = None
     creator._is_kv_cache_manager_v2 = True
     creator._fp8_ctx_mla_kv_len_cap = None

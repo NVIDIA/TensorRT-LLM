@@ -37,6 +37,9 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
         "LICENSE",
         "tensorrt_llm/version.py",
         "tensorrt_llm/llmapi/trtllm-llmapi-launch",
+        "tensorrt_llm/llmapi/_llmapi_process_guard.py",
+        "tensorrt_llm/llmapi/_llmapi_mpi_stop.py",
+        "tensorrt_llm/serve/render/trtllm-render",
     ]
     files += [path.name for path in _REPO_ROOT.glob("requirements*.txt")]
     for name in files:
@@ -83,6 +86,12 @@ def test_wheel_contains_serving_schemas(tmp_path: Path, missing_schema: bool) ->
     wheels = list((staging / "dist").glob("*.whl"))
     assert len(wheels) == 1
     with zipfile.ZipFile(wheels[0]) as wheel:
+        scripts = {Path(name).name for name in wheel.namelist() if ".data/scripts/" in name}
+        assert {
+            "trtllm-llmapi-launch",
+            "_llmapi_process_guard.py",
+            "_llmapi_mpi_stop.py",
+        } <= scripts
         names = {
             name
             for name in wheel.namelist()

@@ -31,8 +31,6 @@ from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
 
 
 class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
-    # NOTE: this is a global counter for the number of instances of this class
-    INSTANCE_COUNTER = 0
 
     def __init__(
         self,
@@ -50,7 +48,6 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         postproc_worker_config: the postproc worker config
         is_llm_executor: whether this is an llm executor
         """
-        GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.init_rpc_executor()
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -112,7 +109,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         """
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
             return [json.loads(s) if isinstance(s, str) else s for s in stats]
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
@@ -184,7 +182,8 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
         except Exception:
             stats = []
 

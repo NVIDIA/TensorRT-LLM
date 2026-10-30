@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
@@ -100,7 +101,7 @@ public:
     CacheLevelManager(TypedVec<LifeCycleId, PoolGroupIndex> const& lifeCycleGrouping, CacheLevel cacheLevel,
         CacheTierConfig const& tierConfig, TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, PooledPhysMemAllocator* gpuPhysMemAllocator = nullptr,
-        HostMemBackingOptions const& options = {});
+        HostMemBackingOptions const& options = {}, std::optional<size_t> sparseReservation = std::nullopt);
 
     CacheLevel cacheLevel;
     CacheTier cacheTier;
@@ -128,7 +129,8 @@ public:
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
         std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
-        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f);
+        std::shared_ptr<EventSink> eventSink = nullptr, float maxUtilForResume = 1.0f,
+        Priority coldTierOffloadMinPriority = kDefaultColdTierOffloadMinPriority);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -145,6 +147,8 @@ public:
         TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder = {},
         DropRecorder const& dropRecorder = {});
 
+    // A sparse life cycle allocates here too: its pages are host memory mapped into a
+    // hot-level pool, not a separate level.
     TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
         MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
@@ -163,6 +167,12 @@ public:
 
     // Remove a page from the eviction queue.
     void excludeFromEviction(Page& page);
+
+    //! Change priority only while detached from its current priority queue.
+    void updatePriority(Page& page, Priority priority);
+    void cancelRetentionExpiry(Page& page);
+    void scheduleRetentionExpiry(Page& page);
+    void refreshRetention();
 
     // Check if a page is evictable (optionally at a target level).
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
@@ -189,18 +199,9 @@ public:
     void batchedMigrate(
         CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages, MigrationRecorder const& migrationRecorder);
 
-    //! Demote complete locked sparse pages on the requesting owner's stream, updating every live owner.
-    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves GPU ownership.
-    void offloadSparsePages(KvCache& requestingCache, std::vector<SharedPtr<Page>> const& pages,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
-
-    //! Promote locked sparse host pages into one shared GPU allocation per page, updating all owners.
-    //! Caller holds the manager's exclusive lock. Allocation/copy failure preserves host ownership.
-    void promoteSparsePages(CUstream stream, std::vector<SharedPtr<Page>> const& pages,
-        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
-
     // Best-effort migration of grouped pages to a destination cache level. Returns how many pages
-    // it moved off the disk tier. If a later batch fails, earlier batches may already have migrated.
+    // it moved off the disk tier, counted per migrated batch rather than per page. A throw reports
+    // nothing, which in practice means slot preparation failed before anything moved.
     int64_t prefetch(
         CacheLevel dstLevel, TypedVec<LifeCycleId, TypedVec<CacheLevel, std::vector<SharedPtr<Page>>>> const& pages);
 
@@ -307,6 +308,19 @@ public:
     // Cache tier for a given level.
     CacheTier cacheTier(CacheLevel level) const;
 
+    //! The medium of one pool's pages. Prefer this to cacheTier(level): the two agree for
+    //! every pool but a host-backed one of a GPU-tier group, where the level's tier names
+    //! device memory for a host address.
+    [[nodiscard]] CacheTier poolMedium(CacheLevel level, PoolGroupIndex pgIdx, PoolIndex poolIdx) const;
+
+    //! Bytes `level` holds in pools whose pages are `medium`, each rounded to that
+    //! medium's grain. Zero when the level has no pool of it.
+    [[nodiscard]] size_t getNumBytes(CacheLevel level, CacheTier medium) const;
+
+    //! The medium backing sparse buffers, or nullopt when no life cycle is sparse.
+    //! The hot level's second medium: host pages the GPU reads through a device mapping.
+    [[nodiscard]] std::optional<CacheTier> sparseBackingMedium() const;
+
     // NOTE: Python's get_statistics(level) returns a list over all pool groups.
     // C++ takes a single pgIdx for flexibility; the nanobind wrapper loops over
     // all pool groups to match Python's signature.
@@ -315,7 +329,7 @@ public:
     float getOverallUtilization(CacheLevel level = kHotLevel) const;
 
     // Pool-group slot count (number of pages).
-    SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
+    [[nodiscard]] SlotCount numSlots(PoolGroupIndex pgIdx, CacheLevel level = kHotLevel) const;
 
     // Layer-to-lifecycle mapping (for KvCacheManager queries).
     std::unordered_map<LayerId, LifeCycleId> const& layerToLifeCycleIds() const noexcept
@@ -347,6 +361,8 @@ private:
         BatchDesc const& batch, int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const;
 
     // Constraint floors apply only to the hot level. Lifecycle demands remain available only as ratio weights.
+    //
+    // Both read the hot pool-group mapping and slot descs, so they run after those are built.
     TypedVec<PoolGroupIndex, SlotCount> computePoolGroupMinSlotsFromConstraints(
         std::vector<BatchDesc> const& constraints, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume = 1.0f) const;
@@ -354,29 +370,67 @@ private:
         int tokensPerBlock, std::optional<SwaScratchReuseConfig> const& swaScratchReuse,
         float maxUtilForResume = 1.0f) const;
     TypedVec<LifeCycleId, float> ratioFromBatch(BatchDesc const& batch, int tokensPerBlock,
-        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t granularity) const;
+        std::optional<SwaScratchReuseConfig> const& swaScratchReuse, size_t deviceGranularity,
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
     // Project source-level lifecycle byte weights onto destination pool groups while preserving the implied
     // lifecycle slot-count proportions.
     TypedVec<PoolGroupIndex, float> projectPoolGroupRatio(
         CacheLevel srcLevel, CacheLevel dstLevel, TypedVec<LifeCycleId, float> const& srcLifeCycleRatio) const;
-    TypedVec<LifeCycleId, size_t> slotsToBytes(
-        TypedVec<LifeCycleId, SlotCount> const& numSlots, size_t granularity) const;
-    TypedVec<PoolGroupIndex, size_t> slotsToBytes(
-        TypedVec<PoolGroupIndex, SlotCount> const& numSlots, size_t granularity) const;
+    //! Bytes a hot-level slot count costs, each pool rounded by hotPoolSizeGranularity() to the
+    //! grain of the medium backing it -- the same measure as CacheLevelStorage::allMediaBytes(),
+    //! which the resulting ratio is compared against. The storage does not exist yet here, so
+    //! `sparsePools` names each group's sparse pools in place of PoolGroupBase::poolMedium().
+    TypedVec<LifeCycleId, size_t> slotsToBytes(TypedVec<LifeCycleId, SlotCount> const& numSlots,
+        size_t deviceGranularity, TypedVec<PoolGroupIndex, std::vector<PoolIndex>> const& sparsePools) const;
+
     //! Allocation granularity for a tier, decided once from its configured
     //! quota. Fixed for the tier's lifetime, so every size derived from it stays
     //! consistent with what the pools were built for.
-    [[nodiscard]] size_t tierCommitUnit(CacheTierConfig const& tierConfig) const;
+    //!
+    //! `gpuPhysMemSize` is the shared GPU allocator's unit, which every GPU level reports.
+    [[nodiscard]] static size_t tierCommitUnit(CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
     //! Backing options for a tier: its fixed allocation unit together with the
-    //! page-placement policy the tier's config asks for.
-    [[nodiscard]] HostMemBackingOptions tierBackingOptions(CacheTierConfig const& tierConfig) const;
+    //! page-placement policy the tier's config asks for. `gpuPhysMemSize` is the shared
+    //! GPU allocator's unit, as tierCommitUnit takes it.
+    [[nodiscard]] static HostMemBackingOptions tierBackingOptions(
+        CacheTierConfig const& tierConfig, size_t gpuPhysMemSize);
 
-    TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
+    //! `slotSizeLists` holds every pool's size. The level's quota pays for all of them bar
+    //! the ones `secondBudget` names, which are host memory charged to it instead.
+    [[nodiscard]] static TypedVec<PoolGroupIndex, SlotCount> computeSlotCountForLevel(CacheTierConfig const& tierConfig,
         TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
-    size_t minQuotaForLevel(TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists,
-        size_t granularity, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+        TypedVec<PoolGroupIndex, float> const& ratio, TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        size_t gpuPhysMemSize, std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+    //! For the config stage, which sizes a level before it exists: every fact it needs is
+    //! named in the call rather than read off the manager.
+    [[nodiscard]] static size_t minQuotaForLevel(
+        TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>> const& slotSizeLists, size_t granularity,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots,
+        std::optional<SecondaryPoolBudget> const& secondBudget = std::nullopt);
+
+    //! The same floor for a level that exists, reading its sizes, grain, second budget and
+    //! slot floors off it.
+    [[nodiscard]] size_t minQuotaForLevel(CacheLevel level) const;
+
+    //! Slot counts `quota` buys at `ratio`, for a level that exists.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> slotCountsForLevel(
+        CacheLevel level, size_t quota, TypedVec<PoolGroupIndex, float> const& ratio) const;
+
+    //! Slot floors for a level: the hot level's feasibility constraints, and elsewhere the
+    //! structural one slot per pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotCount> _minSlotsFor(CacheLevel level) const;
+
+    //! The second medium's budget over `secondaryPools`, as the allocator takes it, or nullopt
+    //! when no pool is named. `granularity` is the grain those pools round to; `quota` is the
+    //! configured bound, if any.
+    [[nodiscard]] static std::optional<SecondaryPoolBudget> _secondaryBudget(
+        TypedVec<PoolGroupIndex, std::vector<PoolIndex>> secondaryPools, size_t granularity,
+        std::optional<size_t> quota);
+
+    //! The second medium's budget for a level that already exists, reading the pools and
+    //! their grain off it.
+    [[nodiscard]] std::optional<SecondaryPoolBudget> _secondaryBudget(CacheLevelStorage const& level) const;
 
     // Internal helpers.
     // Register the slot descriptors for the next cache level and derive its slot-size table.
@@ -387,6 +441,8 @@ private:
 
     [[nodiscard]] auto makeEvictionRollbackGuard(TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const& evicted);
 
+    void _prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+        MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
         PagesByLifeCycle& fallenPages, MigrationRecorder const& migrationRecorder = {},
         DropRecorder const& dropRecorder = {});
@@ -394,8 +450,6 @@ private:
     std::optional<std::vector<Slot>> _batchedMigrate(CacheLevel dstLevel, CacheLevel srcLevel,
         std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
         bool defrag = false);
-    void _migrateLockedSparsePages(CUstream stream, CacheLevel dstLevel, std::vector<SharedPtr<Page>> const& pages,
-        KvCache const* offloadingCache, MigrationRecorder const& migrationRecorder, DropRecorder const& dropRecorder);
     [[nodiscard]] LayerGroupId getMigrationBatchingLayerGroupId(
         CacheLevel dstLevel, CacheLevel srcLevel, LifeCycleId lifeCycle) const;
     void submitMigrationBatch(CacheLevel dstLevel, CacheLevel srcLevel, LayerGroupId batchingLayerGroupId,
@@ -416,6 +470,7 @@ private:
 
     LifeCycleRegistry const& mLifeCycles;
     std::shared_ptr<EventSink> mEventSink;
+    Priority mColdTierOffloadMinPriority;
     LifeCyclePoolGroupMapping mHotPoolGroupMapping;
     LifeCyclePoolGroupMapping mColdPoolGroupMapping;
     // Codec batching representative for each lifecycle.
@@ -459,9 +514,18 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotDesc>> mSlotDescLists;
     // Slot sizes per (level, pool group), built from mSlotDescLists.
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, TypedVec<PoolIndex, size_t>>> mSlotSizes;
-    TypedVec<PoolGroupIndex, SlotCount> mMinSlots;
+    //! Hot-level slot floors, from the batch constraints and scaled by 1/maxUtilForResume.
+    TypedVec<PoolGroupIndex, SlotCount> mHotMinSlots;
+
+    //! Host memory the hot level's host-backed pools may take: the configured quota, or the
+    //! default construction fills in when it is unset. Kept because a rebalance moves the
+    //! slot counts those pools follow, so the bound has to be reapplied rather than assumed
+    //! still satisfied.
+    size_t mHostSparsePoolQuota = 0;
+
     // All GPU cache levels borrow this allocator. It must outlive mLevels.
     std::unique_ptr<PooledPhysMemAllocator> mGpuPhysMemAllocator;
+    RetentionExpiryQueue mRetentionExpiries;
     TypedVec<CacheLevel, CacheLevelManager> mLevels;
 
     static constexpr size_t kDefaultPageStagingBytes = 64u << 20u;
