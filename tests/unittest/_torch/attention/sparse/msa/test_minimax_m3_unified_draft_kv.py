@@ -114,6 +114,12 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
                     unified.layer_offsets[layer], role
                 ) == plain.impl.get_page_stride(plain.layer_offsets[layer], role)
         assert unified.get_index_k_buffer(3).shape[1:] == plain.get_index_k_buffer(3).shape[1:]
+        # Index-K is the manager's own buffer, not a layer-spec role.
+        index_k_bytes = [
+            unified.get_layer_bytes_per_token(unified.layer_offsets[layer], Role.INDEX_KEY)
+            for layer in unified.pp_layers
+        ]
+        assert index_k_bytes == [0, 0, 0, 128] + [0] * NUM_DRAFT
 
         # Draft layers: their own lifecycle, the base view in their dtype.
         groups = unified.layer_to_pool_mapping_dict

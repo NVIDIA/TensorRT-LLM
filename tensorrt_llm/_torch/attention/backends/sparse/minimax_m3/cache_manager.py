@@ -532,7 +532,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.layer_specs is not None or self.dtype != DataType.NVFP4:
+        if self.layer_specs is not None:
+            # Explicit layer specs carry K/V and scales; index-K is this manager's extra buffer.
+            if data_role == Role.INDEX_KEY:
+                if int(self.pp_layers[int(local_layer_idx)]) not in self.sparse_layer_ids:
+                    return 0
+                index_dtype = self._torch_dtype_for_index_cache()
+                return self.sparse_index_dim * torch.tensor([], dtype=index_dtype).element_size()
+            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        if self.dtype != DataType.NVFP4:
             return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
         if global_layer_idx in self.sparse_layer_ids:
