@@ -373,6 +373,14 @@ class ContextKvFork:
             or worker._batch_to_slot is None
         ):
             return None
+        if worker._ctx_unified_cache and worker._ctx_kv_manager is not getattr(
+            attn_metadata, "kv_cache_manager", None
+        ):
+            # KV cache estimation swapped the probe manager for the real one: the
+            # context is still bound to the old pool. The built-in rebinds it this
+            # step (``_lazy_init_ctx_buffers``); a side chain forked now would
+            # write the old pool.
+            return None
         if attn_metadata.num_contexts != 0:
             return None
         num_gens = attn_metadata.num_seqs
