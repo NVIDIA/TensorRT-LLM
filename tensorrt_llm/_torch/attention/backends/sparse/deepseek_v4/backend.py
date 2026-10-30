@@ -487,6 +487,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     req_id,
                     compressed_indices,
                     scratch,
+                    shared_rows=attention_input_type != AttentionInputType.generation_only,
                 )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
