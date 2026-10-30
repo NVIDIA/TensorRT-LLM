@@ -58,6 +58,17 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Muse Spark Open decoder fast paths on one GPU: the fused Triton kernels and the
+  # GB300 cluster boundary kernel, against their reference compositions.
+  - unittest/_torch/modeling/test_musespark_open_router_projection.py
+  - unittest/_torch/modeling/test_musespark_open_full_routing.py
+  - unittest/_torch/modeling/test_musespark_open_norm_gate.py
+  - unittest/_torch/modeling/test_musespark_open_moe_finalize.py
+  - unittest/_torch/modeling/test_musespark_open_pre_expert_quant.py
+  - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
+  - unittest/_torch/modeling/test_musespark_open_boundary_fusion.py
+  - unittest/_torch/modeling/test_musespark_open_cluster_boundary.py
+  - unittest/_torch/modeling/test_musespark_open_finalize_local.py
 - condition:
     ranges:
       system_gpu_count:

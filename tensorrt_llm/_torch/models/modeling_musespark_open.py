@@ -26,12 +26,20 @@ rest are interleaved-RoPE with a 2048-key sliding window.
 
 The residual stream is FP32. Each branch reads a BF16 cast of it, and its
 output rejoins through a norm-preserving gated residual add.
+
+On CUDA the routing, the router projection, the attention output norm and gate,
+the expert finalize and the residual joins run as fused kernels
+(`musespark_open_kernels`), mostly for small batches. On GB300 a residual join
+and the next layer's prenorm can share one CTA-cluster kernel
+(`musespark_open_boundary`), and with TP4 on one node the expert finalize runs
+fused with the all-reduce (`musespark_open_finalize_ar`). Each falls back to
+the reference composition for the inputs it does not support.
 """
 
 import contextlib
 import copy
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 from torch import nn
@@ -39,6 +47,8 @@ from torch import nn
 from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSparkOpenConfig
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 from ...models.modeling_utils import QuantConfig
 from ..attention.backends import AttentionMetadata
@@ -49,6 +59,7 @@ from ..attention.backends.interface import (
 )
 from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce
+from ..kernels.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -56,9 +67,14 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.logits_processor import LogitsProcessor, scale_and_soft_cap_logits
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
-from ..utils import AuxStreamType
+from ..moe.fused_moe.moe_op_backend import TRTLLMOpBackend
+from ..utils import AuxStreamType, Fp4QuantizedTensor
+from . import musespark_open_kernels as fused_kernels
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel
+
+if TYPE_CHECKING:
+    from .musespark_open_finalize_ar import FinalizeIpcWorkspace
 
 # Perception subtrees in the checkpoint. The text decoder never builds these,
 # and their tensors are hundreds of GiB, so the loader skips them unread.
@@ -173,8 +189,21 @@ def post_expert_norm_combine(
     """Weight-first RMSNorm each selected expert output, then combine, in FP32.
 
     The MoE kernel's own finalize cannot do this: RMSNorm is nonlinear, so
-    normalizing after the top-k sum is a different function.
+    normalizing after the top-k sum is a different function. On CUDA this is
+    one fused kernel, which sums the squares and the slots in a different
+    order from the composition below.
     """
+    if fused_kernels.post_expert_norm_combine_supported(gemm2_output, num_tokens):
+        return fused_kernels.post_expert_norm_combine(
+            gemm2_output,
+            expanded_idx_to_permuted_idx,
+            routing_weights,
+            norm_weight,
+            eps,
+            num_tokens=num_tokens,
+            top_k=top_k,
+            hidden_size=hidden_size,
+        )
     normed, _ = post_expert_norm_rows(
         gemm2_output,
         expanded_idx_to_permuted_idx,
@@ -195,6 +224,8 @@ def _routing_weights(
     output_dtype: torch.dtype,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Gather and renormalize the unbiased scores of the selected experts."""
+    if fused_kernels.routing_weights_supported(scores, topk_idx, output_dtype):
+        return fused_kernels.routing_weights(scores, topk_idx, eps)
     weights = scores.gather(1, topk_idx)
     weights = weights / (weights.sum(dim=-1, keepdim=True) + eps)
     return topk_idx.to(torch.int32), weights.to(output_dtype)
@@ -225,7 +256,14 @@ class MuseSparkOpenRoutingMethod(MiniMaxM2MoeRoutingMethod):
         return True
 
     def apply(self, router_logits: torch.Tensor, input_ids: Optional[torch.Tensor] = None):
-        scores, scores_with_bias = self.get_scores(router_logits, self.e_score_correction_bias)
+        bias = self.e_score_correction_bias
+        if fused_kernels.full_routing_supported(router_logits, bias, self.top_k, self.output_dtype):
+            # One kernel for the whole step. Its picks are sorted, with ties
+            # going to the lowest expert id, where `torch.topk(sorted=False)`
+            # leaves the order unspecified; the finalize sums the experts in
+            # pick order.
+            return fused_kernels.full_routing(router_logits, bias, self.renorm_eps)
+        scores, scores_with_bias = self.get_scores(router_logits, bias)
         _, topk_idx = torch.topk(scores_with_bias, k=self.top_k, dim=-1, sorted=False)
         # The weights come from the unbiased scores; the bias only steers which
         # experts are picked.
@@ -356,12 +394,65 @@ class MuseSparkOpenGatedResidual(nn.Module):
         `gain` selects the norm: `1 + w` for the weight-first FFN norm,
         `None` for the weightless attention one. The gain product and the
         normalized branch are each rounded to the activation dtype, as the
-        modules they stand for do.
+        modules they stand for do. On CUDA this is one kernel.
         """
         alpha, beta = self.coefficients()
+        if fused_kernels.gated_residual_supported(residual, branch, gain):
+            return fused_kernels.gated_residual_after_rmsnorm(
+                residual, branch, gain, alpha, beta, eps
+            )
         scaled = (gain * branch if gain is not None else branch).to(torch.float32)
         normed = (scaled * torch.rsqrt(scaled.pow(2).mean(-1, keepdim=True) + eps)).to(branch.dtype)
         return alpha * residual + beta * normed.to(torch.float32)
+
+    def add_after_rmsnorm_and_norm(
+        self,
+        residual: torch.Tensor,
+        branch: torch.Tensor,
+        eps: float,
+        next_norm: RMSNorm,
+        gain: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """`add_after_rmsnorm`, then `next_norm` of the result cast to the activation dtype.
+
+        Returns `(residual, next_input)`: the updated FP32 residual stream and
+        the input of the branch that reads it next. On CUDA both come from one
+        kernel; on GB300, for 1 to 32 tokens of the 8192-wide stream, from a
+        kernel that splits each token across a CTA cluster.
+        """
+        if not (
+            next_norm.use_gemma
+            and fused_kernels.gated_residual_and_norm_supported(
+                residual, branch, gain, next_norm.weight
+            )
+        ):
+            updated = self.add_after_rmsnorm(residual, branch, eps, gain)
+            return updated, next_norm(updated.to(branch.dtype))
+        alpha, beta = self.coefficients()
+        if (
+            not torch.compiler.is_compiling()
+            and residual.shape[1] == 8192
+            and residual.shape[0] <= 32
+        ):
+            # Imported here: the module loads CuTe DSL, which only this path needs.
+            from . import musespark_open_boundary as boundary
+
+            if boundary.cluster_boundary_supported(
+                residual, branch, gain, alpha, beta, next_norm.weight
+            ):
+                return boundary.cluster_boundary(
+                    residual,
+                    branch,
+                    gain,
+                    alpha,
+                    beta,
+                    next_norm.weight,
+                    eps,
+                    next_norm.variance_epsilon,
+                )
+        return fused_kernels.gated_residual_after_rmsnorm_and_norm(
+            residual, branch, gain, alpha, beta, eps, next_norm.weight, next_norm.variance_epsilon
+        )
 
 
 class MuseSparkOpenLogitsProcessor(LogitsProcessor):
@@ -489,8 +580,12 @@ class MuseSparkOpenAttention(QKNormRoPEAttention):
 
         Order matters: the checkpoint normalizes each head of the attention
         output before multiplying by `sigmoid(o_gate)`, and only then
-        projects.
+        projects. On CUDA, up to 128 tokens take one kernel for both.
         """
+        if fused_kernels.attention_norm_gate_supported(attention_output, gate, self.head_dim):
+            return fused_kernels.attention_norm_gate(
+                attention_output, gate, self.head_dim, self.o_head_norm.variance_epsilon
+            )
         normed = self.o_head_norm(attention_output.reshape(-1, self.head_dim)).reshape(
             attention_output.shape
         )
@@ -527,6 +622,15 @@ class MuseSparkOpenMoE(nn.Module):
     RMSNorm is nonlinear, so normalizing the already-combined result would be a
     different model.
     """
+
+    # The auxiliary stream the expert input is prepared on (see
+    # prepare_moe_inputs), and the fused finalize + all-reduce workspace, which
+    # `MuseSparkOpenModel` sets when it can serve this layer. Without them the
+    # MoE takes the unfused paths.
+    _prepare_stream: Optional[torch.cuda.Stream] = None
+    finalize_allreduce_workspace: Optional["FinalizeIpcWorkspace"] = None
+    # Whether this forward's finalize also reduces across the TP group.
+    _reduce_in_finalize = False
 
     def __init__(
         self,
@@ -595,6 +699,10 @@ class MuseSparkOpenMoE(nn.Module):
             dtype=config.torch_dtype,
             use_gemma=True,
         )
+        # `1 + w` of the pre-expert norm, for the norm fused with the experts'
+        # NVFP4 input quantization (see prepare_expert_input). Non-persistent,
+        # filled by cache_derived_state.
+        self.register_buffer("_pre_expert_quant_gain", None, persistent=False)
         self.post_expert_norm_eps = config.rms_post_norm_eps
         # Weight-first post-expert norm, applied per selected expert output.
         self.post_expert_norm_weight = nn.Parameter(
@@ -663,10 +771,139 @@ class MuseSparkOpenMoE(nn.Module):
             layer_idx,
             ("router", "pool", "experts", "finalize", "all_reduce", "unpool"),
         )
+        if aux_stream is not None:
+            self._prepare_stream = aux_stream
+            self._prepare_fork_event = torch.cuda.Event()
+            self._prepare_ready_event = torch.cuda.Event()
+
+    def cache_derived_state(self) -> None:
+        """Cache the pre-expert norm's `1 + w`; the loader calls this after the weights land."""
+        weight = self.pre_expert_norm.weight
+        if weight is None or weight.is_meta:
+            return
+        self._pre_expert_quant_gain = (weight.float() + 1).to(weight.dtype)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
+
+    def _apply(self, *args, **kwargs):
+        # As in MuseSparkOpenRMSNormWeightFirst: a cached `1 + w` would not
+        # follow a dtype move of the weight, so drop it on any move.
+        out = super()._apply(*args, **kwargs)
+        self._pre_expert_quant_gain = None
+        return out
 
     def router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """FP32 router logits, scaled by the metap multiplier before routing."""
+        """FP32 router logits, scaled by the metap multiplier before routing.
+
+        On CUDA, up to 128 tokens take a kernel that keeps the FP32 weights and
+        accumulation and folds in the input cast and the scale.
+        """
+        weight = getattr(self.router, "weight", None)
+        if (
+            weight is not None
+            and not torch.compiler.is_compiling()
+            and fused_kernels.router_projection_supported(hidden_states, weight)
+        ):
+            return fused_kernels.router_projection(
+                hidden_states,
+                weight,
+                self.metap_multiplier,
+                overlapped=self._prepare_stream is not None and self.experts.comm is None,
+            )
         return self.router(hidden_states.to(torch.float32)) * self.metap_multiplier
+
+    def prepare_expert_input(self, pooled: torch.Tensor) -> torch.Tensor | Fp4QuantizedTensor:
+        """The pre-expert norm, fused with the experts' NVFP4 input quantization where they take it.
+
+        The fused kernel quantizes the FP32 norm result without the reference's
+        intermediate BF16 round. It serves the native TRTLLM-Gen NVFP4 experts
+        with a single static input scale and no communication; everything else
+        takes the norm alone and leaves quantization to the experts.
+        """
+        experts = self.experts
+        backend = getattr(experts, "backend", experts)
+        if (
+            not pooled.is_cuda
+            or pooled.dtype != torch.bfloat16
+            or torch.compiler.is_compiling()
+            or getattr(experts, "comm", None) is not None
+            or not isinstance(getattr(backend, "op_backend", None), TRTLLMOpBackend)
+            or not getattr(backend, "has_nvfp4", False)
+            or getattr(backend, "fc31_act_scale", None) is not None
+            or pooled.shape[0] == 0
+            or pooled.shape[0] > getattr(experts, "moe_max_num_tokens", pooled.shape[0])
+            or not rmsnorm_fp4_quant_available()
+        ):
+            return self.pre_expert_norm(pooled)
+        scale = getattr(backend, "fc31_input_scale", None)
+        if scale is None or scale.numel() != 1:
+            return self.pre_expert_norm(pooled)
+        gain = self._pre_expert_quant_gain
+        if gain is None:
+            weight = self.pre_expert_norm.weight
+            gain = (weight.float() + 1).to(weight.dtype)
+        from flashinfer.norm import rmsnorm_fp4quant
+
+        fp4, sf = rmsnorm_fp4quant(
+            pooled,
+            gain,
+            eps=self.pre_expert_norm.variance_epsilon,
+            global_scale=scale.reshape(1),
+            block_size=16,
+            scale_format="e4m3",
+            # The MoE swizzles the scales itself, after any dispatch.
+            is_sf_swizzled_layout=False,
+        )
+        return Fp4QuantizedTensor(fp4.view(torch.uint8), sf.view(torch.uint8), is_sf_swizzled=False)
+
+    def prepare_moe_inputs(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor | Fp4QuantizedTensor, Optional[torch.cuda.Event]]:
+        """Router logits and the expert input.
+
+        Returns `(router_logits, expert_input, input_ready_event)`. Up to 128
+        tokens pool on the auxiliary stream while the router and the routing run
+        on the current one; the returned event marks the expert input as
+        written, and the MoE joins it before its first read.
+        """
+        if not (
+            self._prepare_stream is not None
+            and hidden_states.is_cuda
+            and 0 < hidden_states.shape[0] <= 128
+            and not torch.compiler.is_compiling()
+            and self.experts.comm is None
+        ):
+            with self.nvtx("router"):
+                router_logits = self.router_logits(hidden_states)
+            with self.nvtx("pool"):
+                expert_input = self.prepare_expert_input(self.pooler(hidden_states))
+            return router_logits, expert_input, None
+        self._prepare_fork_event.record()
+        with torch.cuda.stream(self._prepare_stream), self.nvtx("pool"):
+            self._prepare_fork_event.wait()
+            expert_input = self.prepare_expert_input(self.pooler(hidden_states))
+            self._prepare_ready_event.record()
+        # No record_stream, which under graph capture would hold every layer's
+        # blocks until the capture ends: the current stream reads the expert
+        # input only after the join, and the next use of the auxiliary stream
+        # forks from the current one again.
+        with self.nvtx("router"):
+            router_logits = self.router_logits(hidden_states)
+        return router_logits, expert_input, self._prepare_ready_event
+
+    def _finalize_allreduce_applies(self, num_tokens: int) -> bool:
+        """Whether this forward's finalize also reduces across the TP group.
+
+        The workspace takes at most 128 tokens per call, and its calls must
+        follow one stream on each rank, so a batch the MoE would split into
+        chunks stays unfused.
+        """
+        return (
+            self.finalize_allreduce_workspace is not None
+            and 1 <= num_tokens <= min(128, self.experts.moe_max_num_tokens)
+            and not torch.compiler.is_compiling()
+        )
 
     def finalize(
         self,
@@ -684,10 +921,23 @@ class MuseSparkOpenMoE(nn.Module):
         Each output row depends on one `(token, expert)` row at a time and
         non-local slots contribute exact zeros, so combining the per-rank
         results equals finalizing after the combine.
+
+        When forward chose the fused finalize + all-reduce, this returns the
+        BF16 sum over the TP group instead of this rank's FP32 partial.
         """
         # The post-expert norm is the same for every expert.
         del token_selected_slots
         with self.nvtx("finalize"):
+            if self._reduce_in_finalize:
+                return self.finalize_allreduce_workspace.finalize(
+                    gemm2_output,
+                    expanded_idx_to_permuted_idx,
+                    # TRTLLM-Gen dispatches BF16 weights; the kernel reads FP32.
+                    routing_weights.to(torch.float32),
+                    self.post_expert_norm_weight,
+                    self.post_expert_norm_eps,
+                    num_tokens,
+                )
             if self.mapping.moe_tp_size > 1:
                 # Backend row permutations are rank-local, so reduce in canonical
                 # (token, selected-expert) order rather than in GEMM scratch
@@ -717,33 +967,41 @@ class MuseSparkOpenMoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
     ) -> torch.Tensor:
-        with self.nvtx("router"):
-            router_logits = self.router_logits(hidden_states)
-        with self.nvtx("pool"):
-            pooled = self.pre_expert_norm(self.pooler(hidden_states))
-        with self.nvtx("experts"):
-            # With the finalize registered, the MoE returns this rank's tokens
-            # already normalized, weighted and summed over the local experts.
-            combined = self.experts(
-                pooled,
-                router_logits,
-                do_finalize=False,
-                output_dtype=hidden_states.dtype,
-                all_rank_num_tokens=attn_metadata.all_rank_num_tokens
-                if attn_metadata is not None
-                else None,
-                use_dp_padding=False,
-            )
+        router_logits, expert_input, input_ready_event = self.prepare_moe_inputs(hidden_states)
+        # Chosen here rather than in finalize, which cannot tell the reduce
+        # below that it already ran.
+        reduce_in_finalize = self._finalize_allreduce_applies(hidden_states.shape[0])
+        self._reduce_in_finalize = reduce_in_finalize
+        try:
+            with self.nvtx("experts"):
+                # With the finalize registered, the MoE returns this rank's
+                # tokens already normalized, weighted and summed over the local
+                # experts.
+                combined = self.experts(
+                    expert_input,
+                    router_logits,
+                    do_finalize=False,
+                    output_dtype=hidden_states.dtype,
+                    all_rank_num_tokens=attn_metadata.all_rank_num_tokens
+                    if attn_metadata is not None
+                    else None,
+                    use_dp_padding=False,
+                    input_ready_event=input_ready_event,
+                )
+        finally:
+            self._reduce_in_finalize = False
         # Cast before the reduce: with expert parallelism the partial sums cross
         # the wire at the activation width, and they are cast to it for the
         # unpooler either way.
         combined = combined.to(hidden_states.dtype)
         # Expert parallelism leaves a partial sum on each rank; reduce it over
-        # the TP group. Not under attention DP, where the ranks hold different
-        # tokens and the MoE's own combine has already reduced the partials, and
-        # not under pure MoE TP, where finalize has already reduced each expert.
+        # the TP group. Not when the fused finalize already did, not under
+        # attention DP, where the ranks hold different tokens and the MoE's own
+        # combine has already reduced the partials, and not under pure MoE TP,
+        # where finalize has already reduced each expert.
         if (
-            not self.mapping.enable_attention_dp
+            not reduce_in_finalize
+            and not self.mapping.enable_attention_dp
             and self.mapping.has_tp()
             and self.mapping.moe_tp_size == 1
         ):
@@ -806,12 +1064,24 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
         position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        precomputed_attn_input: Optional[torch.Tensor] = None,
+        next_layer_norm: Optional[RMSNorm] = None,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        """Run the layer on the FP32 residual stream `hidden_states`.
+
+        Each residual join computes the next branch's prenorm in the same
+        kernel. Given `next_layer_norm`, the last join also normalizes for the
+        next layer, and the layer returns `(hidden_states, next_attn_input)`;
+        that layer takes the input as `precomputed_attn_input`.
+        """
         # hidden_states is the FP32 residual stream; each branch reads a cast of
         # it to the activation dtype and writes back through the gated add.
         with self.nvtx("pre_qkv_proj_norm"):
-            attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
+            if precomputed_attn_input is not None:
+                attn_input = precomputed_attn_input
+            else:
+                attn_input = self.pre_qkv_proj_norm(hidden_states.to(self.dtype))
         # The attention projection and its TP reduction stay in this range.
         with self.nvtx("attn"):
             attn_out = self.self_attn(
@@ -821,26 +1091,87 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 **kwargs,
             )
         with self.nvtx("norm_add_attn"):
-            hidden_states = self.add_attn.add_after_rmsnorm(
-                hidden_states, attn_out, self.post_attn_norm.variance_epsilon
+            hidden_states, ffn_input = self.add_attn.add_after_rmsnorm_and_norm(
+                hidden_states, attn_out, self.post_attn_norm.variance_epsilon, self.pre_ffn_norm
             )
         with self.nvtx("moe"):
-            ffn_out = self.feed_forward(
-                self.pre_ffn_norm(hidden_states.to(self.dtype)), attn_metadata
-            )
+            ffn_out = self.feed_forward(ffn_input, attn_metadata)
         with self.nvtx("norm_add_ffn"):
-            hidden_states = self.add_ffn.add_after_rmsnorm(
-                hidden_states,
-                ffn_out,
-                self.post_ffn_norm.variance_epsilon,
-                self.post_ffn_norm.gain(),
-            )
+            next_attn_input = None
+            if next_layer_norm is None:
+                hidden_states = self.add_ffn.add_after_rmsnorm(
+                    hidden_states,
+                    ffn_out,
+                    self.post_ffn_norm.variance_epsilon,
+                    self.post_ffn_norm.gain(),
+                )
+            else:
+                hidden_states, next_attn_input = self.add_ffn.add_after_rmsnorm_and_norm(
+                    hidden_states,
+                    ffn_out,
+                    self.post_ffn_norm.variance_epsilon,
+                    next_layer_norm,
+                    self.post_ffn_norm.gain(),
+                )
         # Speculative drafters that read target hidden states capture the FP32
         # residual stream.
         spec_metadata = kwargs.get("spec_metadata")
         if spec_metadata is not None:
             spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states, None)
+        if next_attn_input is not None:
+            return hidden_states, next_attn_input
         return hidden_states
+
+
+def _finalize_allreduce_supported(
+    mapping: Mapping, config: MuseSparkOpenConfig, layers: nn.ModuleList
+) -> bool:
+    """Whether the fused finalize + all-reduce can serve this deployment.
+
+    It needs BF16 TP4 on one GB300 node with expert parallelism over the whole
+    TP group and the checkpoint's expert shape. Every rank reaches the same
+    answer, so either all of them construct the workspace, which is
+    collective, or none does.
+    """
+    return (
+        mapping.tp_size == 4
+        and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 1
+        and mapping.moe_ep_size == mapping.tp_size
+        and not mapping.enable_attention_dp
+        and config.torch_dtype == torch.bfloat16
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (10, 3)
+        and all(
+            layer.feed_forward.expert_hidden_size == 4096
+            and layer.feed_forward.top_k == 8
+            and getattr(layer.feed_forward.experts, "comm", None) is None
+            for layer in layers
+        )
+    )
+
+
+def _build_finalize_allreduce_workspace(mapping: Mapping) -> Optional["FinalizeIpcWorkspace"]:
+    """Construct the workspace, or return None to keep the unfused finalize and all-reduce.
+
+    Construction probes the TP group and raises when the GPUs cannot map each
+    other's memory or the ranks disagree. That is a property of the
+    deployment, so it degrades to the unfused path instead of failing model
+    construction.
+    """
+    from .musespark_open_finalize_ar import HAS_CUTEDSL, FinalizeIpcWorkspace
+
+    if not HAS_CUTEDSL:
+        return None
+    try:
+        workspace = FinalizeIpcWorkspace(mapping)
+    except (ValueError, RuntimeError) as exc:
+        logger.warning(
+            f"MuseSparkOpen finalize+all-reduce fusion unavailable ({exc}); "
+            "using the unfused finalize and AllReduce path."
+        )
+        return None
+    logger.info("MuseSparkOpen: the expert finalize runs fused with the TP4 all-reduce.")
+    return workspace
 
 
 class MuseSparkOpenModel(DecoderModel):
@@ -870,6 +1201,14 @@ class MuseSparkOpenModel(DecoderModel):
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
+        # One fused finalize + all-reduce workspace serves every layer.
+        self.finalize_allreduce_workspace = None
+        if _finalize_allreduce_supported(model_config.mapping, config, self.layers):
+            self.finalize_allreduce_workspace = _build_finalize_allreduce_workspace(
+                model_config.mapping
+            )
+            for layer in self.layers:
+                layer.feed_forward.finalize_allreduce_workspace = self.finalize_allreduce_workspace
         # The final norm uses the stored weight as is (gain centered at 0).
         self.norm = RMSNorm(
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
@@ -893,13 +1232,24 @@ class MuseSparkOpenModel(DecoderModel):
             embeds = embeds * self.m_emb
         # The FP32 residual stream, entered once.
         hidden_states = embeds.to(torch.float32)
-        for decoder_layer in self.layers:
-            hidden_states = decoder_layer(
+        # Each layer but the last also returns the next layer's attention input.
+        attn_input = None
+        for index, decoder_layer in enumerate(self.layers):
+            next_norm = (
+                self.layers[index + 1].pre_qkv_proj_norm if index + 1 < len(self.layers) else None
+            )
+            result = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
+                precomputed_attn_input=attn_input,
+                next_layer_norm=next_norm,
                 **kwargs,
             )
+            if next_norm is None:
+                hidden_states = result
+            else:
+                hidden_states, attn_input = result
         return self.norm(hidden_states.to(self.dtype))
 
 
