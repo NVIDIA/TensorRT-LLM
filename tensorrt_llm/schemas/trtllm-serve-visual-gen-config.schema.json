@@ -740,6 +740,37 @@
       "title": "RuntimeLoRAConfig",
       "type": "object"
     },
+    "SeaCacheConfig": {
+      "additionalProperties": false,
+      "description": "SeaCache step-caching acceleration config (https://arxiv.org/abs/2602.18993).\n\nSkips the generator transformer stack on steps whose spectrally filtered\ninput latents changed little since the last computed step, and predicts the\nstack's residual by linear extrapolation from the last two computed steps.\nThe first and last denoising steps are always computed.",
+      "properties": {
+        "cache_backend": {
+          "const": "seacache",
+          "default": "seacache",
+          "description": "Selects the SeaCache backend in `cache_config`.",
+          "title": "Cache Backend",
+          "type": "string"
+        },
+        "max_consecutive_cached_steps": {
+          "default": 2,
+          "description": "Maximum number of consecutive cached steps; 0 removes the limit.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Max Consecutive Cached Steps",
+          "type": "integer"
+        },
+        "threshold": {
+          "default": 0.25,
+          "description": "Accumulated relative-L1 change of the filtered latents below which a step reuses the cache; larger values skip more steps.",
+          "exclusiveMinimum": 0.0,
+          "status": "prototype",
+          "title": "Threshold",
+          "type": "number"
+        }
+      },
+      "title": "SeaCacheConfig",
+      "type": "object"
+    },
     "SkipSoftmaxAttentionConfig": {
       "additionalProperties": false,
       "description": "SkipSoftmax sparse attention configuration for visual generation.\n\nThis class is only the Python/YAML user surface. Checkpoint calibration\ndata is passed to ``to_sparse_params()`` when SparseParams are created.",
@@ -1010,6 +1041,7 @@
           "discriminator": {
             "mapping": {
               "cache_dit": "#/$defs/CacheDiTConfig",
+              "seacache": "#/$defs/SeaCacheConfig",
               "teacache": "#/$defs/TeaCacheConfig"
             },
             "propertyName": "cache_backend"
@@ -1020,6 +1052,9 @@
             },
             {
               "$ref": "#/$defs/CacheDiTConfig"
+            },
+            {
+              "$ref": "#/$defs/SeaCacheConfig"
             }
           ]
         },

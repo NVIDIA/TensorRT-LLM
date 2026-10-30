@@ -41,7 +41,7 @@ from .sparse_attention import (
 # Type aliases
 # =============================================================================
 
-CacheBackendName = Literal["teacache", "cache_dit"]
+CacheBackendName = Literal["teacache", "cache_dit", "seacache"]
 
 # =============================================================================
 # Sub-configuration classes for VisualGenArgs
@@ -622,8 +622,37 @@ class CacheDiTConfig(BaseCacheConfig):
     )
 
 
+class SeaCacheConfig(BaseCacheConfig):
+    """SeaCache step-caching acceleration config (https://arxiv.org/abs/2602.18993).
+
+    Skips the generator transformer stack on steps whose spectrally filtered
+    input latents changed little since the last computed step, and predicts the
+    stack's residual by linear extrapolation from the last two computed steps.
+    The first and last denoising steps are always computed.
+    """
+
+    cache_backend: Literal["seacache"] = Field(
+        "seacache", description="Selects the SeaCache backend in `cache_config`."
+    )
+    threshold: float = Field(
+        0.25,
+        gt=0.0,
+        status="prototype",
+        description=(
+            "Accumulated relative-L1 change of the filtered latents below which a step "
+            "reuses the cache; larger values skip more steps."
+        ),
+    )
+    max_consecutive_cached_steps: int = Field(
+        2,
+        ge=0,
+        status="prototype",
+        description="Maximum number of consecutive cached steps; 0 removes the limit.",
+    )
+
+
 CacheConfig = Annotated[
-    Union[TeaCacheConfig, CacheDiTConfig],
+    Union[TeaCacheConfig, CacheDiTConfig, SeaCacheConfig],
     Field(discriminator="cache_backend"),
 ]
 
@@ -913,6 +942,10 @@ class VisualGenArgs(StrictBaseModel):
     def cache_dit(self) -> Optional[CacheDiTConfig]:
         return self.cache_config if isinstance(self.cache_config, CacheDiTConfig) else None
 
+    @property
+    def seacache(self) -> Optional[SeaCacheConfig]:
+        return self.cache_config if isinstance(self.cache_config, SeaCacheConfig) else None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()
@@ -961,6 +994,7 @@ __all__ = [
     "BaseCacheConfig",
     "TeaCacheConfig",
     "CacheDiTConfig",
+    "SeaCacheConfig",
     "CacheConfig",
     "TorchCompileConfig",
     "CudaGraphConfig",
