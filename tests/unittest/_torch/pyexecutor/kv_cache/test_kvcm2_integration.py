@@ -2182,9 +2182,10 @@ def _small_spec_manager(
     max_gpu_total_bytes: int = 256 << 20,
     max_seq_len: int = 16384,
     max_num_tokens: int = 8192,
+    tokens_per_block: int = 32,
 ) -> KVCacheManagerV2:
-    """A two-layer, head_dim 64, 32-token-page V2 manager for ``spec``,
-    optionally with a uniform sliding window and no block reuse."""
+    """A two-layer, head_dim 64 V2 manager for ``spec`` (32-token pages by
+    default), optionally with a uniform sliding window and no block reuse."""
     num_layers = 2
     config = KvCacheConfig(
         enable_block_reuse=False,
@@ -2197,7 +2198,7 @@ def _small_spec_manager(
         num_layers=num_layers,
         num_kv_heads=num_kv_heads,
         head_dim=64,
-        tokens_per_block=32,
+        tokens_per_block=tokens_per_block,
         max_seq_len=max_seq_len,
         max_batch_size=2,
         max_num_tokens=max_num_tokens,
@@ -2369,7 +2370,11 @@ class _PoolBoundDFlashDraftModel:
 
 
 def _disagg_draft_fixture(
-    spec: DFlashDecodingConfig, prompt: int, occupant_prompt: int, window: int
+    spec: DFlashDecodingConfig,
+    prompt: int,
+    occupant_prompt: int,
+    window: int,
+    tokens_per_block: int = 32,
 ) -> tuple[KVCacheManagerV2, LlmRequest, LlmRequest]:
     """A sliding-window draft pool with room for 8192 tokens (two layers, one
     KV head of 64, bf16), an occupant that prefilled ``occupant_prompt``
@@ -2386,6 +2391,7 @@ def _disagg_draft_fixture(
         max_gpu_total_bytes=8192 * bytes_per_token,
         max_seq_len=1 << 17,
         max_num_tokens=occupant_prompt,
+        tokens_per_block=tokens_per_block,
     )
     occupant = LlmRequest(
         request_id=1,
@@ -2620,6 +2626,106 @@ def test_disagg_generation_drafter_writes_stay_on_its_own_draft_pages(
         assert worker._ctx_base_host[slot] == base
         assert worker._ctx_len_host[slot] == base * page
         assert num_ctx == tokens_per_req
+        draft.free_resources(request)
+        draft.free_resources(occupant)
+    finally:
+        draft.shutdown()
+
+
+@pytest.mark.parametrize("lag", [2, 7, 31, 127])
+def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
+    monkeypatch: pytest.MonkeyPatch, lag: int
+) -> None:
+    """A disaggregated generation worker seeds the drafter slot on the page
+    holding the request's position, ``lag`` tokens behind it, while the
+    request's sliding-window draft mirror advances its history with the
+    request. Over many generation steps (one accepted token each), every
+    block-table entry the drafter's window reads -- keys from the slot length
+    + 1 - window, never below the slot's base -- must stay on a page the
+    request's own mirror holds; a released entry resolves to another
+    request's page."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.speculative.dflash.validate_dflash_trtllm_gen_runtime",
+        lambda **kwargs: None,
+    )
+    num_layers, num_kv_heads, head_dim, hidden = 2, 1, 64, 8
+    window, page, max_draft_len, steps = 256, 128, 3, 600
+    spec = DFlashDecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model="draft",
+        attention_backend="TRTLLM",
+        mask_token_id=0,
+    )
+    # The first token and two generation steps put the request at prompt + 2.
+    prompt = 65536 + lag - 2
+    draft, occupant, request = _disagg_draft_fixture(spec, prompt, 512, window, page)
+    offsets = torch.zeros(
+        (getattr(draft, "num_attention_op_pools", draft.num_pools), 2, 2, draft.max_blocks_per_seq),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    try:
+        for req in (occupant, request):
+            batch = ScheduledRequests()
+            batch.context_requests_last_chunk.append(req)
+            draft._prepare_draft_resources(batch)
+        request.add_new_token(1, 0)
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        for _ in range(2):
+            _disagg_generation_step(draft, request)
+
+        worker = DFlashWorker(spec, Mapping())
+        draft_model = _PoolBoundDFlashDraftModel(num_layers, num_kv_heads, head_dim, hidden)
+        worker.set_draft_model(draft_model)
+        attn_metadata = SimpleNamespace(
+            max_seq_len=1 << 17,
+            draft_kv_cache_block_offsets=offsets,
+            num_contexts=0,
+            num_seqs=1,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.zeros(1, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.zeros(1, dtype=torch.int32),
+        )
+        worker._lazy_init_ctx_buffers(
+            draft_model,
+            SimpleNamespace(max_num_requests=2),
+            attn_metadata,
+            draft_kv_cache_manager=draft,
+        )
+        assert worker._ctx_page_size == page
+        spec_metadata = DFlashSpecMetadata(
+            max_num_requests=2, max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len
+        )
+        spec_metadata._dflash_worker = worker
+        spec_metadata.request_ids = [request.py_request_id]
+        spec_metadata.num_generations = 1
+        spec_metadata.seq_lens = [max_draft_len + 1]
+        position = request.max_beam_num_tokens - 1
+        spec_metadata.host_position_ids = torch.tensor(
+            [position + offset for offset in range(max_draft_len + 1)], dtype=torch.int32
+        )
+        spec_metadata.prepare()
+        slot = worker._req_to_slot[request.py_request_id]
+        seed_len, base = int(worker._ctx_len_host[slot]), int(worker._ctx_base_host[slot])
+        assert (base, position - seed_len) == (position // page, lag)
+
+        cache = draft.kv_cache_map[request.py_request_id]
+        unbacked_reads = []
+        for step in range(steps):
+            slot_len = seed_len + step + 1
+            lowest = max(base * page, slot_len + 1 - window)
+            read = {key // page for key in range(lowest, slot_len)}
+            missing = read - _backed_ordinals(cache)
+            if missing:
+                unbacked_reads.append((step, cache.history_length, slot_len, sorted(missing)))
+            _disagg_generation_step(draft, request)
+        assert not unbacked_reads, (
+            f"{len(unbacked_reads)}/{steps} steps read a released entry; first "
+            f"(step, history, slot length, entries): {unbacked_reads[:3]}"
+        )
         draft.free_resources(request)
         draft.free_resources(occupant)
     finally:

@@ -1607,10 +1607,13 @@ class DFlashWorker(SpecWorkerBase):
         and the block decode reads from its base, never below it:
 
         * at the first position of the page holding ``position``. The slot's
-          positions then trail the absolute ones by less than a page, so they
-          stay on pages the mirror backs as long as every window of the pool
-          spans a page (``_ctx_seed_page_aligned``), and the slot reads what
-          it stores from its first step;
+          positions then trail the absolute ones by less than a page, and the
+          mirror keeps one page below each window for that trail
+          (``_draft_slot_trail_tokens`` in kv_cache_manager_v2), so every
+          entry the window reads stays on a page the request holds. Taken
+          when every window of the pool spans a page
+          (``_ctx_seed_page_aligned``); the slot reads what it stores from
+          its first step;
         * otherwise at ``position`` itself, with the base rounded up to the
           next page: the slot reads nothing until its context reaches it.
 

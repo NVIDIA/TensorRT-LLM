@@ -762,6 +762,24 @@ def _extend_swa_windows_for_reuse(
     return retention_windows
 
 
+def _draft_slot_trail_tokens(
+    spec_config: Optional["DecodingBaseConfig"], *, is_draft: bool, tokens_per_block: int
+) -> int:
+    """SWA retention a DFlash/DSpark draft pool keeps below its windows.
+
+    The drafter seeds a slot that holds no context yet at the first position of
+    the page holding the request's position (``DFlashWorker._seed_generation_slot``),
+    so the slot's positions trail the request's, which the mirror's history
+    follows, by up to a page less one token. The far edge of the drafter's
+    window reaches that far below the mirror's window; one more page of
+    retention keeps every entry it reads on a page the request holds.
+    """
+    if not is_draft or spec_config is None:
+        return 0
+    mode = spec_config.spec_dec_mode
+    return int(tokens_per_block) if mode.is_dflash() or mode.is_dspark() else 0
+
+
 def _derive_request_windows_from_layer_types(
     model_config: ModelConfigPython,
     local_layer_ids: Sequence[int],
@@ -2095,6 +2113,15 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.reuse_match_backoff,
                 max_seq_len,
             )
+        # The drafter's own windows come from its model config, so this widens
+        # only what the pool retains (see _draft_slot_trail_tokens).
+        self.max_attention_window_vec = _extend_swa_windows_for_reuse(
+            self.max_attention_window_vec,
+            _draft_slot_trail_tokens(
+                spec_config, is_draft=is_draft, tokens_per_block=tokens_per_block
+            ),
+            max_seq_len,
+        )
 
         event_window_size = max(
             self.max_seq_len if window_size is None else int(window_size)
@@ -7638,6 +7665,13 @@ class KVCacheManagerV2(BaseResourceManager):
                 backoff,
                 max_seq_len,
             )
+        attention_windows = _extend_swa_windows_for_reuse(
+            attention_windows,
+            _draft_slot_trail_tokens(
+                spec_config, is_draft=is_draft, tokens_per_block=tokens_per_block
+            ),
+            max_seq_len,
+        )
         _, generation_capacity_headroom = _get_generation_kv_capacity(
             spec_config, is_draft=is_draft
         )
@@ -7778,7 +7812,8 @@ class KVCacheManagerV2(BaseResourceManager):
             return None
         # ``covered_windows`` are the windows ``get_cache_size_per_token``
         # charges as fixed per-request retention in the affine intercept; keep
-        # them in lockstep with its accounting (reuse backoff included).
+        # them in lockstep with its accounting (reuse backoff and the drafter's
+        # trailing page included).
         if (
             kv_cache_config is not None
             and kv_cache_config.enable_block_reuse
@@ -7788,6 +7823,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
             backoff = draft_prompt_lookahead(spec_config) or 0
             covered_windows = _extend_swa_windows_for_reuse(covered_windows, backoff, max_seq_len)
+        covered_windows = _extend_swa_windows_for_reuse(
+            covered_windows,
+            _draft_slot_trail_tokens(
+                spec_config, is_draft=is_draft, tokens_per_block=tokens_per_block
+            ),
+            max_seq_len,
+        )
         if is_draft:
             # Draft mirrors are reserved at the request's full context length
             # (measured: a 41k-token context charges 41k tokens per mirror
