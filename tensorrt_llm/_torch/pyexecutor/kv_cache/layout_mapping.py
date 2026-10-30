@@ -369,15 +369,16 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
 
     Each role of a model layer both ranks transfer goes by the same global layers on both, so ranks
     pair a model layer's buffers with its own however their pipeline stages split the model. A
-    role of such a model layer that one rank alone transfers, whichever sends, is refused unless
-    that rank rebuilds it per request (``PageLayout.request_rebuilt_roles``: CSA2's generation
-    workers rebuild the sliding caches a context-only worker keeps none of past its split), rather
-    than left unwritten. On the layers both hold, every buffer either rank transfers the other
-    transfers too, but for such a rebuilt role, as the same tensors: the same names, axes and
-    extents over all ranks, however each splits them, and elements of the same type where the
-    tensors state one, in pages of as many sub-pages, in layer groups of the same kind. The KV
-    data is of one element type and quantization. Pages pair one to one, so where both transfer
-    attention buffers their pages hold as many tokens.
+    role of a model layer both ranks hold, through any of its buffers whether they move or not,
+    that one rank alone transfers, whichever sends, is refused unless that rank rebuilds it per
+    request (``PageLayout.request_rebuilt_roles``: CSA2's generation workers rebuild the sliding
+    caches a context-only worker keeps none of past its split), rather than left unwritten.
+    On the layers both hold, every buffer either rank transfers the other transfers too, but for
+    such a rebuilt role, as the same tensors: the same names, axes and extents over all ranks,
+    however each splits them, and elements of the same type where the tensors state one, in pages
+    of as many sub-pages, in layer groups of the same kind. The KV data is of one element type and
+    quantization. Pages pair one to one, so where both transfer attention buffers their pages hold
+    as many tokens.
 
     How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
     backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
@@ -442,7 +443,7 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
                 f"model layer {model}'s {role} buffers in layers {sorted(names_a[model, role])} "
                 f"against {sorted(names_b[model, role])}"
             )
-    both = {model for model, _ in names_a} & {model for model, _ in names_b}
+    both = _held_model_layers(a, group_a) & _held_model_layers(b, group_b)
     for model, role in sorted(set(names_a) ^ set(names_b)):
         holder = a if (model, role) in names_a else b
         if model in both and role not in holder.request_rebuilt_roles:
@@ -471,6 +472,17 @@ def _model_layer_names(
         model = group.model_layers[group.layers.index(buffer.layer)]
         names.setdefault((model, buffer.role), set()).add(buffer.layer)
     return names
+
+
+def _held_model_layers(layout: PageLayout, groups: dict[tuple[int, int], int]) -> set[int]:
+    """The model layers of every buffer lying in a layer group, transferred or not."""
+    held = set()
+    for buffer in layout.buffers:
+        index = groups.get((buffer.pool_group, buffer.layer))
+        if index is not None:
+            group = layout.layer_groups[index]
+            held.add(group.model_layers[group.layers.index(buffer.layer)])
+    return held
 
 
 def sent_bytes(src: PageLayout, dst: PageLayout, *, key: int | None = None) -> dict[int, int]:

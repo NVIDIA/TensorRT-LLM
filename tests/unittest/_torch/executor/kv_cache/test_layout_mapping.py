@@ -518,9 +518,14 @@ def test_a_role_rebuilt_per_request_may_share_a_global_layer_with_paired_buffers
     topology = Instance().ranks(0)[0]
     full = layout(topology, (60,), [("swa", kv(4), "attention"), ("global", kv(4), "attention")])
     context_only = layout(topology, (60,), [("global", kv(4), "attention")])
-    for pair in ((context_only, full), (full, context_only)):
-        with pytest.raises(ValueError, match=r"buffer \(60, 'swa'\) is transferred by one rank"):
-            check_compatible(*pair)
+    # Declared by the side lacking it, the role still goes unwritten.
+    declaring = dataclasses.replace(context_only, request_rebuilt_roles=frozenset({"swa"}))
+    for pair in itertools.product((context_only, declaring), (full,)):
+        for ranks in (pair, pair[::-1]):
+            with pytest.raises(
+                ValueError, match=r"buffer \(60, 'swa'\) is transferred by one rank"
+            ):
+                check_compatible(*ranks)
     rebuilding = dataclasses.replace(full, request_rebuilt_roles=frozenset({"swa"}))
     check_compatible(context_only, rebuilding)
     check_compatible(rebuilding, context_only)
@@ -530,6 +535,48 @@ def test_a_role_rebuilt_per_request_may_share_a_global_layer_with_paired_buffers
     assert_layouts_reshard([context_only], [rebuilding])
     with pytest.raises(AssertionError, match="no source sends it"):
         assert_layouts_reshard([context_only], [full])
+
+
+def test_a_model_layer_held_only_through_a_buffer_that_never_moves_is_held():
+    """A peer holding model layer 5 only through a buffer that never moves still holds the layer,
+    so a role of it the other peer transfers is refused, whichever side sends, rather than left
+    unwritten, unless the side transferring it rebuilds it per request."""
+    topology = Instance().ranks(0)[0]
+
+    def stays(page: PageLayout) -> PageLayout:
+        buffers = tuple(
+            dataclasses.replace(b, transferred=False) if b.role == "scratch" else b
+            for b in page.buffers
+        )
+        return dataclasses.replace(page, buffers=buffers)
+
+    both = layout(
+        topology, (10, 11), [("scratch", whole(32), "attention"), ("key", kv(4), "attention")]
+    )
+    full = _with_group(
+        stays(
+            dataclasses.replace(
+                both,
+                buffers=tuple(
+                    b for b in both.buffers if (b.layer, b.role) in {(10, "scratch"), (11, "key")}
+                ),
+            )
+        ),
+        model_layers=(5, 5),
+    )
+    scratch_only = _with_group(
+        stays(layout(topology, (10,), [("scratch", whole(32), "attention")])), model_layers=(5,)
+    )
+    for ranks in ((scratch_only, full), (full, scratch_only)):
+        with pytest.raises(ValueError, match="model layer 5's key buffers are transferred by one"):
+            check_compatible(*ranks)
+    with pytest.raises(AssertionError, match="no source sends it"):
+        assert_layouts_reshard([scratch_only], [full])
+    rebuilding = dataclasses.replace(full, request_rebuilt_roles=frozenset({"key"}))
+    check_compatible(scratch_only, rebuilding)
+    check_compatible(rebuilding, scratch_only)
+    assert not map_buffers(scratch_only, rebuilding)
+    assert_layouts_reshard([scratch_only], [rebuilding])
 
 
 def test_layer_groups_keeping_other_windows_correspond():

@@ -140,7 +140,11 @@ def assert_layouts_reshard(
         for b in page.buffers
         if b.transferred
     }
-    held_models = {model for model, _ in sent_models}
+    held_models = {
+        _model_layer(page, groups, b)
+        for page, groups in zip(sources, source_groups)
+        for b in page.buffers
+    }
     for dst in destinations:
         dst_groups = layer_group_of(dst)
         for buffer in dst.buffers:
