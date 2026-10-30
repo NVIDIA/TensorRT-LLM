@@ -4,6 +4,7 @@
 
 from dataclasses import replace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -75,6 +76,7 @@ def _rank_info(tp_size: int = 2) -> RankInfo:
         transfer_engine_info=b"",
         attention=AttentionInfo(2, 16, 128, 2, False, False),
         page_table=_page_table(),
+        context_first_ownership=True,
     )
 
 
@@ -116,6 +118,26 @@ def test_context_first_profile_accepts_symmetric_tp(
     )
     local = _rank_info(tp_size)
     profile.validate_context_first_peer(local, RankInfo.from_bytes(local.to_bytes()))
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_context_first_ownership_metadata_round_trip(active: bool) -> None:
+    """Inactive endpoints keep the legacy wire shape; active ones advertise protection."""
+    local = replace(_rank_info(), context_first_ownership=active)
+    data = local.to_bytes()
+    assert ("context_first_ownership" in msgpack.unpackb(data, strict_map_key=False)) is active
+    assert RankInfo.from_bytes(data).context_first_ownership is active
+
+
+@pytest.mark.parametrize("local_active,peer_active", [(True, False), (False, True), (False, False)])
+def test_context_first_peer_rejects_inactive_ownership(
+    local_active: bool, peer_active: bool
+) -> None:
+    """Matching layout alone cannot qualify an endpoint with ownership inactive."""
+    local = replace(_rank_info(), context_first_ownership=local_active)
+    peer = replace(_rank_info(), context_first_ownership=peer_active)
+    with pytest.raises(ValueError, match="ownership-enabled peers"):
+        profile.validate_context_first_peer(local, RankInfo.from_bytes(peer.to_bytes()))
 
 
 @pytest.mark.parametrize(

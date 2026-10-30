@@ -20,7 +20,7 @@ import queue
 import threading
 from collections.abc import Callable
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import numpy as np
 import pytest
@@ -1108,7 +1108,7 @@ def test_send_terminal_session_is_retained_when_close_refuses(
     session.close.return_value = True
     completed, failed = transceiver.check_context_transfer_status(None, mark_complete=mark_complete)
 
-    assert failed == []
+    assert failed == ([rid] if status == SessionStatus.CANCELLED else [])
     assert completed == ([rid] if mark_complete else [])
     if mark_complete:
         assert request.state is not initial_state
@@ -1484,6 +1484,10 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
 
     session = transceiver._send_sessions[rid]
     assert session.status == SessionStatus.CANCELLED
+    outcome = session._logical_outcomes.terminal
+    assert outcome.status is SessionStatus.CANCELLED
+    assert outcome.by_peer is True
+    session.close = Mock(wraps=session.close, return_value=False)
     assert session.kv_tasks == []
     assert session.aux_task is None
     assert transceiver._send_reqs == {rid: request}
@@ -1503,15 +1507,31 @@ def test_pre_cancelled_sender_does_not_publish_from_transceiver() -> None:
     # The reap's trailing rank-local error check is not under test here.
     executor.disagg._check_transfer_errors = Mock()
 
+    with pytest.raises(RuntimeError, match="session close refused"):
+        executor.disagg.reap_context_sends(0)
+
+    assert transfers == {rid: request}
+    end_transfer.assert_not_called()
+    assert transceiver._send_sessions == {rid: session}
+    assert transceiver._send_reqs == {rid: request}
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+    assert not request.py_kv_send_session_retired
+    assert session._logical_outcomes.terminal is outcome
+
+    session.close.return_value = DEFAULT
+    executor.disagg.reap_context_sends(0)
     executor.disagg.reap_context_sends(0)
 
     assert transfers == {}
     end_transfer.assert_called_once_with(request)
+    assert session.close.call_count == 2
+    assert session._logical_outcomes.terminal is outcome
+    assert session.status is SessionStatus.CANCELLED
     assert request.state == LlmRequestState.DISAGG_TRANS_ERROR
     assert request.py_kv_send_session_retired
     assert transceiver._send_sessions == {}
     assert transceiver._send_reqs == {}
-    sweep_stale_req_infos.assert_called_once_with()
+    assert sweep_stale_req_infos.call_count == 2
 
 
 @pytest.mark.cpu_only
@@ -1777,7 +1797,7 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
     sender._agent.submit_transfer_requests.assert_not_called()
     assert task.resources_drained
     assert task.status == transfer_mod.TaskStatus.ERROR
-    sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True)
+    sender._get_result_dealer.assert_called_once_with("receiver", legacy_shared=True, owned=True)
     dealer.send.assert_called_once()
     instance_rank, result_rid, result_slice, is_last, status_code, _ = (
         transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])

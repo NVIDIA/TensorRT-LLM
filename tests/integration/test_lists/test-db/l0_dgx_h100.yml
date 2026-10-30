@@ -120,7 +120,8 @@ l0_dgx_h100:
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "ctx_first_sync"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
-  - unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer_tp2
+  - unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer
+  - unittest/disaggregated/test_transfer_lifecycle_gpu.py::test_context_first_bf16_lifecycle_gpu
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2

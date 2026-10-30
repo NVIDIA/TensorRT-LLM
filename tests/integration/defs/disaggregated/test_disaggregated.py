@@ -1583,6 +1583,7 @@ def test_disaggregated_context_first_bf16_ownership(
     setup_model_symlink(llm_venv, model_root, "Qwen3/Qwen3-0.6B")
     env = llm_venv._new_env.copy()
     env.update({
+        "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT": "1",
         "TRTLLM_DISAGG_NO_RETRY": "1",
         "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
         "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",

@@ -35,6 +35,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     get_unique_rid,
 )
 from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
+    _KV_LIFECYCLE_ENFORCEMENT_ENV,
     CtxTransferStatus,
     GenTransferStatus,
     KvCacheTransceiver,
@@ -136,6 +137,22 @@ def _fail_unproven_kv_transfer(
         hang_detector.propagate_hard_kill(diagnostics=False, communicator=communicator)
 
 
+def _warn_retirement_termination_scope(mapping: Mapping) -> None:
+    """Warn the executor's lead rank about the configured containment boundary.
+
+    Args:
+        mapping: The executor's rank mapping.
+    """
+    if mapping.rank == 0:
+        logger.warning(
+            "KV transfer lifecycle enforcement ENABLED. KV retirement fail-stop may "
+            "terminate the entire MPI job, including other "
+            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
+            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
+            "and qualify their termination boundaries."
+        )
+
+
 def _retirement_executor_comm(mapping: Mapping, *, warn: bool = True) -> "MPI.Comm":
     """Capture the MPI executor world that the deadline watchdog may abort.
 
@@ -171,13 +188,8 @@ def _retirement_executor_comm(mapping: Mapping, *, warn: bool = True) -> "MPI.Co
         or communicator.Get_rank() != mapping.rank
     ):
         raise ValueError(message)
-    if warn and mapping.rank == 0:
-        logger.warning(
-            "KV retirement fail-stop may terminate the entire MPI job, including other "
-            "CTX/GEN executors sharing the launch. A split communicator does not isolate "
-            "MPI_Abort. Use separate launcher jobs when independent availability is required, "
-            "and qualify their termination boundaries."
-        )
+    if warn:
+        _warn_retirement_termination_scope(mapping)
     return communicator
 
 
@@ -198,9 +210,13 @@ def _validate_fp4_mla_bridge_profile(
     mapping: Mapping,
     kv_cache_manager: KVCacheManagerV2,
     cache_transceiver_config: CacheTransceiverConfig,
+    *,
+    enabled: bool | None = None,
 ) -> bool:
     """Select the bridge only for its explicit no-retry FP4-MLA deployment cell."""
-    if os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") != "1":
+    if enabled is None:
+        enabled = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+    if not enabled:
         return False
     fp4_mla_layout = (
         isinstance(kv_cache_manager, KVCacheManagerV2)
@@ -230,6 +246,72 @@ def _validate_fp4_mla_bridge_profile(
             "async monolithic non-layerwise transfer, and bounce disabled"
         )
     return True
+
+
+def _select_lifecycle_ownership(
+    mapping: Mapping,
+    manager: KVCacheManagerV2,
+    config: CacheTransceiverConfig,
+    dist: Distributed,
+) -> tuple[bool, bool, Optional["MPI.Comm"]]:
+    """Agree on protection before any rank publishes transfer metadata.
+
+    The global setting requires a supported profile when explicitly enabled.
+    Unset preserves the legacy FP4 opt-in and leaves context-first inactive.
+    Selection failures participate in the collective so peers cannot continue
+    with a different ownership mode. This is executor-local agreement, not
+    negotiation with a remote executor or a general startup-failure handler.
+
+    Args:
+        mapping: Executor rank and topology.
+        manager: Initialized local cache manager.
+        config: Resolved transfer settings.
+        dist: The executor's startup collective interface.
+
+    Returns:
+        FP4 and context-first activation, and the local containment communicator.
+
+    Raises:
+        ValueError: Requested protection cannot be established on every rank.
+    """
+    fp4 = context_first = False
+    communicator = None
+    failure = None
+    try:
+        setting = os.getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
+        legacy_fp4 = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
+        if setting not in (None, "0", "1"):
+            raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
+        if setting == "0" and legacy_fp4:
+            raise ValueError("KV lifecycle enforcement is disabled but the FP4 bridge is enabled")
+        if setting != "0":
+            fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config)
+        if setting == "1" and not fp4:
+            if manager.dtype == DataType.NVFP4:
+                fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config, enabled=True)
+            else:
+                context_first = supports_context_first_bf16(mapping, manager, config)
+                if not context_first:
+                    raise ValueError(
+                        "KV lifecycle enforcement requires a supported no-retry FP4 MLA or "
+                        "direct BF16 context-first profile; the local configuration is unsupported"
+                    )
+        if fp4 or context_first:
+            communicator = _retirement_executor_comm(mapping, warn=False)
+    except ValueError as error:
+        failure = str(error)
+
+    selections = dist.allgather((fp4, context_first, failure))
+    failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
+    if failures:
+        raise ValueError("KV lifecycle initialization rejected: " + "; ".join(failures))
+    if len(selections) != mapping.world_size or any(
+        item[:2] != (fp4, context_first) for item in selections
+    ):
+        raise ValueError("KV lifecycle ownership must agree on every executor rank")
+    if fp4 or context_first:
+        _warn_retirement_termination_scope(mapping)
+    return fp4, context_first, communicator
 
 
 def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
@@ -312,26 +394,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        enforce_physical_ownership = _validate_fp4_mla_bridge_profile(
-            mapping, kv_cache_manager, cache_transceiver_config
-        )
+        (
+            enforce_physical_ownership,
+            self._context_first_ownership,
+            self._retirement_mpi_comm,
+        ) = _select_lifecycle_ownership(mapping, kv_cache_manager, cache_transceiver_config, dist)
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
-        self._retirement_mpi_comm = (
-            _retirement_executor_comm(mapping) if enforce_physical_ownership else None
-        )
-        self._context_first_ownership = False
         self._context_first_ownership_logged = False
-        if not enforce_physical_ownership and supports_context_first_bf16(
-            mapping, kv_cache_manager, cache_transceiver_config
-        ):
-            try:
-                self._retirement_mpi_comm = _retirement_executor_comm(mapping, warn=False)
-            except ValueError:
-                # Non-MPI launchers retain their existing transfer behavior;
-                # only a qualified executor can activate bounded containment.
-                logger.info("Context-first KV ownership inactive: executor MPI is not qualified")
-            else:
-                self._context_first_ownership = True
         ownership_capable = enforce_physical_ownership or self._context_first_ownership
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 

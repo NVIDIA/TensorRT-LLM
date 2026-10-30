@@ -163,9 +163,11 @@ The Python transceiver (`transceiver_runtime: PYTHON`, `KvCacheTransceiverV2`) r
 
 `agent_bounce_buffer_enable` (default `false`) switches to the C++ transfer-agent bounce implementation, which uses one buffer of `kv_cache_bounce_size_mb` MiB shared by send and receive (prefer a power of two; the usable capacity rounds down to one). By default it engages only for KV writes with many small descriptors (at least 1024, averaging at most 16 KiB), i.e. head-mismatch layouts such as context TP != generation TP or DP; head-matched layouts (MLA, symmetric TP) stay on the standard NIXL path unless `agent_bounce_params` relaxes the gate (lower `min_descriptor_count`, where `0` means no minimum; raise `max_average_descriptor_size`, e.g. `4MB`; `max_average_descriptor_size: 0` routes every outbound write to standard NIXL, acting as an outbound gate off switch — it disables outbound routing only: the arena is still allocated, the handshake still advertised and inbound transfers still served; set `agent_bounce_buffer_enable: false` to turn the feature off). Set it consistently on the context and generation workers; in particular `request_timeout_ms` and the effective chunk cap must match on both sides, otherwise the pair falls back to standard NIXL with a WARNING when the peer is loaded (transfers are then routed silently). The compared chunk cap is the effective one, min(`max_chunk_size`, the arena's usable capacity): `kv_cache_bounce_size_mb` matters only when its usable capacity (rounded down to a power of two) is below `max_chunk_size`; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL.
 
-#### Context-first BF16 transfer ownership
+#### KV transfer lifecycle enforcement (PACT)
 
-Physical ownership enforcement is automatic for explicit context-first requests with a non-negative integer `disagg_request_id` when **all** of these conditions hold on both endpoints:
+Set `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT=1` on every CTX and GEN executor rank to request PACT protection. It is off by default; `TRTLLM_DISAGG_NO_RETRY=1` alone does not enable it. Explicit enablement rejects unsupported local configurations during startup rather than silently running without protection.
+
+For context-first, protection applies to requests with an explicit context-first scheduling style and a non-negative integer `disagg_request_id` when **all** of these conditions hold on both endpoints:
 
 - Full-context BF16 MHA/GQA K/V in KV cache manager V2, ordinary HND page views, symmetric TP1 or TP2, attention-DP disabled, PP1 and CP1.
 - `transceiver_runtime: PYTHON`, `backend: NIXL`, the C++ agent binding (`TRTLLM_USE_PY_NIXL_KVCACHE=0`), and `TRTLLM_NIXL_KVCACHE_BACKEND=UCX`.
@@ -173,7 +175,11 @@ Physical ownership enforcement is automatic for explicit context-first requests 
 - `TRTLLM_DISAGG_NO_RETRY=1` on the coordinator and every worker; no rerouting/replay of a published pairing ID.
 - MPI executor workers with a matching rank/world mapping and `MPI_THREAD_MULTIPLE`, so the existing fatal policy can stop the executor.
 
-Use identical images and effective BF16 configuration on all participants; topology/layout checks do not negotiate dtype, version or activation. Each participating rank logs `Context-first BF16 KV ownership ENABLED` on its first protected request. Omitted scheduling style, other configurations and the existing opt-in FP4 generation-first bridge retain their previous behavior.
+Use identical images and effective BF16 configuration on all participants. Before any rank publishes transfer metadata, every executor rank must agree on the selected protection profile. Rank zero then logs an initialization WARNING that enforcement is enabled and fail-stop can affect the entire MPI launcher job. Each rank also logs `Context-first BF16 KV ownership ENABLED` on its first protected request.
+
+Protected context-first transfers require both endpoints to advertise activation and compatible geometry before destination publication or source submission. Incompatible peers fail the request without publishing its destination; the generation worker caches this rejection until restart. This is not dtype or version negotiation. Mixed-version protected transfers remain unsupported, and an explicitly protected transfer never falls back to unprotected operation. Without opt-in, legacy behavior is unchanged; omitted scheduling style and unsupported request paths do not gain protection from this flag.
+
+The same flag can select the existing no-retry FP4 MLA generation-first bridge within its existing supported profile. `TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE=1` remains a compatibility opt-in when the new flag is unset or `1`; combining it with the new flag set to `0` is a startup error. The FP4 bridge still requires matching configuration and enablement on all CTX/GEN participants as a deployment invariant; the new context-first peer check does not add FP4 peer negotiation.
 
 The sender and receiver retain resources until access is proven safe. An unresolved failure, cancellation or timeout starts the existing non-resettable quiescence grace (also `kv_transfer_timeout_ms`); expiry retains those resources and fail-stops the executor, potentially the entire shared MPI launcher job. This does not provide automatic replacement or generalized in-flight cancellation delivery.
 
@@ -405,6 +411,8 @@ configured retry policy, including the transient TCP retry budget.
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
+* `TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT`: Set to `1` to request [PACT protection](#kv-transfer-lifecycle-enforcement-pact) for a supported Python/NIXL profile. Unset or `0` leaves context-first protection off; the existing FP4 bridge opt-in remains supported as described above. This setting is fixed at executor startup and does not release outstanding ownership claims.
+
 * `TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP`: If set to `1`, the generation worker will not overlap KV cache transfer with model inference. The default value is `0`.
 
 * `TRTLLM_NIXL_KVCACHE_BACKEND`: Selects the transport NIXL itself uses. Valid values are `UCX` (default) and `LIBFABRIC`; an unsupported value logs a warning and falls back to `UCX`. `LIBFABRIC` additionally requires a NIXL build carrying the libfabric plugin — see the [disaggregated serving examples](source:examples/disaggregated/README.md).
@@ -457,7 +465,7 @@ A. Each worker logs the outcome at INFO level, which `trtllm-serve` enables by d
 grep -E "Using KvCacheTransceiverV2|cache_transceiver is disabled" log_ctx_0 log_gen_0
 ```
 
-Check the context and the generation worker separately, and configure the two together — nothing negotiates the transfer settings across workers, so a mismatch is not reported as a configuration error.
+Check the context and the generation worker separately, and configure the two together. There is no general negotiation of transfer settings across workers; the opt-in PACT path adds the specific activation and geometry checks described above.
 
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 

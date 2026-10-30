@@ -1661,7 +1661,11 @@ class Sender(SenderBase):
                 return
             owned = True
         try:
-            if owned and getattr(self, "_context_first_ownership", False) and info.context_first:
+            if (
+                owned
+                and getattr(self, "_context_first_ownership", False)
+                and task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            ):
                 peer = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
                 validate_context_first_peer(self._registrar.self_rank_info, peer)
             if task._perf_timer is not None:
@@ -2760,6 +2764,9 @@ class Receiver(ReceiverBase):
         # without re-validating. Executor-thread-only access, no lock (same
         # discipline as _sender_ep_instance_map).
         self._incompatible_peers: dict[str, str] = {}
+        # Context-first protection has a narrower profile than legacy transfers;
+        # its failures must not poison unrelated requests to the same endpoint.
+        self._context_first_incompatible_peers: dict[str, str] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -2974,17 +2981,29 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
+        protected_context_first = (
+            task._enforce_physical_ownership
+            and getattr(self, "_context_first_ownership", False)
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         try:
+            if protected_context_first:
+                info_endpoint = self._extract_info_endpoint(params)
+                cached_error = self._context_first_incompatible_peers.get(info_endpoint)
+                if cached_error is not None:
+                    raise PeerIncompatibleError(cached_error)
             peer_infos: RankInfo = self._get_sender_info(params)
-            if (
-                task._enforce_physical_ownership
-                and getattr(self, "_context_first_ownership", False)
-                and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
-            ):
+            if protected_context_first:
                 try:
                     validate_context_first_peer(self._registrar.self_rank_info, peer_infos)
                 except ValueError as error:
-                    raise PeerIncompatibleError(str(error)) from error
+                    message = (
+                        f"context peer at '{info_endpoint}' cannot provide requested KV "
+                        f"lifecycle enforcement: {error}; restart this generation worker "
+                        "to re-validate after correcting the peer configuration"
+                    )
+                    self._context_first_incompatible_peers[info_endpoint] = message
+                    raise PeerIncompatibleError(message) from error
         except PeerIncompatibleError as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
@@ -4336,6 +4355,7 @@ class TransferWorker:
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
+        self._rank_info.context_first_ownership = config.context_first_ownership
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:

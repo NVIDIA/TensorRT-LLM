@@ -21,6 +21,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from test_context_first_profile import _rank_info
 from test_transfer_ownership_regressions import (
     _BounceProbe,
     _make_owned_receiver,
@@ -52,6 +53,7 @@ def _worker(
     """Use native session factories without creating CUDA agents or network threads."""
     sender = _make_owned_sender()
     receiver = _make_owned_receiver()
+    receiver._context_first_incompatible_peers = {}
     for endpoint in (sender, receiver):
         endpoint._enforce_physical_ownership = legacy_ownership
         endpoint._context_first_ownership = context_first_ownership
@@ -86,7 +88,39 @@ def _request(
     return SimpleNamespace(
         py_request_id=401,
         prompt_len=16,
-        py_disaggregated_params=DisaggregatedParams(disagg_request_id=401, schedule_style=style),
+        py_disaggregated_params=DisaggregatedParams(
+            disagg_request_id=401, schedule_style=style, ctx_info_endpoint="ctx-info"
+        ),
+    )
+
+
+@pytest.mark.parametrize("active", [False, True])
+def test_context_first_ownership_is_set_before_rank_publication(
+    monkeypatch: pytest.MonkeyPatch, active: bool
+) -> None:
+    """Publish the final worker selection, not the metadata factory's default."""
+    rank_info = _rank_info()
+    rank_info.context_first_ownership = not active
+    monkeypatch.setattr(transfer_mod, "_make_aux_buffer", Mock(return_value=None))
+    monkeypatch.setattr(
+        transfer_mod.RankInfo, "from_kv_cache_manager", Mock(return_value=rank_info)
+    )
+
+    def check_publication(worker: transfer_mod.TransferWorker, manager: object) -> None:
+        advertised = transfer_mod.RankInfo.from_bytes(worker._rank_info.to_bytes())
+        assert advertised.context_first_ownership is active
+
+    monkeypatch.setattr(
+        transfer_mod.TransferWorker, "_setup_peer_infrastructure", check_publication
+    )
+    monkeypatch.setattr(transfer_mod.TransferWorker, "_setup_transfer_engine", Mock())
+    transfer_mod.TransferWorker(
+        transfer_mod.TransferWorkerConfig(
+            kv_cache_manager=Mock(),
+            device_id=0,
+            instance_name="worker",
+            context_first_ownership=active,
+        )
     )
 
 
@@ -113,6 +147,12 @@ def test_native_ownership_selection_preserves_legacy_generation_first(
             assert entry is session
         else:
             assert isinstance(entry, weakref.ReferenceType)
+        if session is rx and expected and style == DisaggScheduleStyle.GENERATION_FIRST:
+            # AUX is pending, but this fixture has not published any destination.
+            assert not session.close()
+            assert session.cancel_local()
+            assert session.resources_drained()
+        assert session.close()
         assert session.close()
     assert not worker._retirement_watchdog._owners
 
@@ -357,17 +397,26 @@ def test_context_first_unproven_deadline_keeps_both_owners(
         worker.create_tx_session(_request())
 
 
+@pytest.mark.parametrize("mismatch", ["topology", "ownership"])
 def test_context_first_incompatible_peer_never_publishes_destination(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, mismatch: str
 ) -> None:
     """The profile validator runs before any receive descriptor is sent."""
     worker = _worker()
     rx = worker.create_rx_session(_request())
     task = rx.prepare_receive(_sole_piece(tokens=16))
     assert task is not None
-    worker._receiver._get_sender_info = Mock(return_value=object())
+    local, peer = _rank_info(), _rank_info()
+    if mismatch == "ownership":
+        peer.context_first_ownership = False
+    else:
+        peer.tp_size = 1
+    worker._receiver._registrar.self_rank_info = local
+    worker._receiver._get_sender_info = Mock(
+        return_value=transfer_mod.RankInfo.from_bytes(peer.to_bytes())
+    )
     worker._receiver._get_or_connect_dealer = Mock()
-    validator = Mock(side_effect=ValueError("unqualified context-first peer"))
+    validator = Mock(wraps=transfer_mod.validate_context_first_peer)
     monkeypatch.setattr(transfer_mod, "validate_context_first_peer", validator)
 
     rx.dispatch_prepared_receive(task)
@@ -377,6 +426,92 @@ def test_context_first_incompatible_peer_never_publishes_destination(
     assert rx.has_failed()
     assert rx.resources_drained()
     assert rx.close()
+
+    second_request = _request()
+    second_request.py_request_id = 402
+    second_request.py_disaggregated_params.disagg_request_id = 402
+    second_rx = worker.create_rx_session(second_request)
+    second_task = second_rx.prepare_receive(_sole_piece(tokens=16))
+    assert second_task is not None
+    second_rx.dispatch_prepared_receive(second_task)
+    validator.assert_called_once()
+    worker._receiver._get_sender_info.assert_called_once()
+    worker._receiver._get_or_connect_dealer.assert_not_called()
+    assert second_rx.has_failed() and second_rx.resources_drained()
+    assert second_rx.close()
+
+
+@pytest.mark.parametrize("style", [DisaggScheduleStyle.GENERATION_FIRST, None])
+def test_context_first_rejection_cache_does_not_block_legacy_requests(
+    monkeypatch: pytest.MonkeyPatch, style: DisaggScheduleStyle | None
+) -> None:
+    """A context-first-only rejection must not disable other requests to the same peer."""
+    worker = _worker()
+    receiver = worker._receiver
+    receiver._context_first_incompatible_peers["ctx-info"] = "peer ownership is inactive"
+    local, peer = _rank_info(tp_size=1), _rank_info(tp_size=1)
+    peer.context_first_ownership = False
+    peer.sender_endpoints = ["ctx-sender"]
+    receiver._registrar.self_rank_info = local
+    receiver._registrar.self_extractor = SimpleNamespace(page_table=local.page_table)
+    receiver._registrar.get_peer_overlap = Mock(return_value=SimpleNamespace(ranks=[0]))
+    receiver._get_sender_info = Mock(return_value=peer)
+    receiver._request_sender_data = Mock()
+    validator = Mock(side_effect=AssertionError("legacy request used context-first validation"))
+    monkeypatch.setattr(transfer_mod, "validate_context_first_peer", validator)
+    request = _request()
+    request.py_disaggregated_params.schedule_style = style
+    rx = worker.create_rx_session(request)
+
+    try:
+        rx.receive(_sole_piece(tokens=16))
+
+        assert not rx._enforce_physical_ownership and rx._retirement is None
+        assert not rx.has_failed()
+        assert rx._kv_tasks[0].status is transfer_mod.TaskStatus.TRANSFERRING
+        receiver._get_sender_info.assert_called_once_with(request.py_disaggregated_params)
+        receiver._request_sender_data.assert_called_once()
+        assert receiver._request_sender_data.call_args.args[0] == "ctx-sender"
+        validator.assert_not_called()
+    finally:
+        assert rx.close()
+
+
+@pytest.mark.parametrize("peer_context_first", [False, True])
+def test_context_first_inactive_peer_never_submits_source(peer_context_first: bool) -> None:
+    """Peer scheduling metadata cannot bypass the local protected task's admission check."""
+    worker = _worker()
+    sender = worker._sender
+    tx = worker.create_tx_session(_request())
+    tx.send(_sole_piece(tokens=16))
+    task = tx.kv_tasks[0]
+    local, peer = _rank_info(), _rank_info()
+    peer.context_first_ownership = False
+    sender._registrar.self_rank_info = local
+    sender._registrar.get_peer_rank_info.return_value = transfer_mod.RankInfo.from_bytes(
+        peer.to_bytes()
+    )
+    sender._build_kv_write_meta = Mock(side_effect=AssertionError("unqualified source access"))
+    sender._enqueue = Mock()
+    info = transfer_mod.RecvReqInfo(
+        sender_req_id=401,
+        instance_name="gen",
+        instance_rank=0,
+        block_ids_per_layer_groups=[],
+        unique_rid=401,
+        slice_id=0,
+        context_first=peer_context_first,
+    )
+
+    with pytest.raises(ValueError, match="ownership-enabled peers"):
+        sender._dispatch_task_to_peer(task, info)
+
+    sender._build_kv_write_meta.assert_not_called()
+    sender._enqueue.assert_not_called()
+    assert task.resources_drained
+    assert tx.cancel_local()
+    assert tx.close()
+    assert tx.close()
 
 
 @pytest.mark.parametrize(
