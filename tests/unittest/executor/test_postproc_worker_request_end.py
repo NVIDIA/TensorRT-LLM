@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.executor.postproc_worker import PostprocWorker
+from tensorrt_llm.executor.postprocessor_hook import apply_post_processor_hook
 from tensorrt_llm.executor.result import CompletionOutput, DetokenizedGenerationResultBase
 from tensorrt_llm.executor.utils import ErrorResponse
 
@@ -178,8 +179,23 @@ def test_a_hook_exception_releases_the_request_in_the_hook():
     assert batches[0][0].client_id == 8
     assert "hook bug" in batches[0][0].error_msg, "the hook itself must be what raised"
     assert worker._records == {}
-    assert hook.ended == [(8, "postprocessing_error")]
+    # The hook failure and worker teardown both notify the idempotent callback.
+    assert hook.ended == [(8, "postprocessing_error")] * 2
     assert hook.state == {}, "the state the hook kept for the request must be released"
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_a_hook_exception_releases_the_request_without_a_worker(streaming):
+    hook = _FailingHook()
+    result = SimpleNamespace(
+        id=8, outputs=[CompletionOutput(index=0, text="hello")], _done=False, _aborted=False
+    )
+
+    with pytest.raises(RuntimeError, match="hook bug"):
+        apply_post_processor_hook(hook, result, streaming)
+
+    assert hook.ended == [(8, "postprocessing_error")]
+    assert hook.state == {}, "in-proxy hook failures must release per-request state too"
 
 
 @pytest.mark.parametrize(

@@ -154,17 +154,19 @@ shared across processes or across separate `LLM` instances; when the post-proces
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
 
-With the post-processing worker pool enabled, a request can also end without a final chunk: when the
-executor reports an error for it, or when its post-processing raises (including an exception from the
-hook itself), the worker drops the request and `__call__` is not called for it again. To release the
-state of such a request, a hook can define the optional method `on_request_end(self, request_id,
-reason)`, as `BannedPhraseGuard` above does; the worker calls it when it drops the request:
+A request can also end without a final chunk when the hook raises. With the post-processing worker
+pool enabled, executor errors and other post-processing exceptions can end a request this way too.
+To release its state, a hook can define the optional method `on_request_end(self, request_id,
+reason)`, as `BannedPhraseGuard` above does. It is called when the hook raises on either the in-proxy
+or worker path, and when the worker drops a request after an error:
 
 - `request_id` is the value the hook saw as `chunk.request_id`.
 - `reason` is `"error"` when the executor reported an error for the request, and
   `"postprocessing_error"` when its post-processing raised.
 - It is never called for a request that finished normally. It may be called for a request the hook
   never received a chunk for, so treat an unknown `request_id` as a no-op.
+- Cleanup must be idempotent: a hook exception can notify it once at the failure and again when
+  the worker drops the request.
 - An exception it raises is logged and ignored.
 - Hooks without the method are unaffected.
 

@@ -150,7 +150,9 @@ class PostProcessorHook(Protocol):
     state can also define ``on_request_end(request_id, reason)``, which the
     worker calls through :func:`end_post_processor_hook` when it drops such a
     request. The method is optional, so it is not a member of this protocol, and
-    hooks without it are unaffected.
+    hooks without it are unaffected. Hook exceptions also call this method on
+    the in-proxy path. Cleanup must be idempotent: the worker may notify the
+    hook again when it drops the failed request.
     """
 
     def __call__(self, chunk: PostProcessorHookChunk) -> PostProcessorHookVerdict: ...
@@ -232,6 +234,7 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
         try:
             verdict = hook(chunk)
         except Exception:
+            end_post_processor_hook(hook, result.id, "postprocessing_error")
             logger.exception(
                 "Post-processor hook failed for request %s; failing the request closed.",
                 result.id,
