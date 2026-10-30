@@ -21,6 +21,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import FinishReason
 
 pytestmark = pytest.mark.cpu_only
@@ -68,6 +69,7 @@ def _request(request_id: int = 1) -> SimpleNamespace:
     request = SimpleNamespace(
         request_id=request_id,
         py_request_id=request_id,
+        state=LlmRequestState.CONTEXT_INIT,
         is_child=False,
         is_dummy_request=False,
         is_finished=False,
@@ -529,6 +531,7 @@ def _preemption_executor() -> PyExecutor:
 def _preemption_victim(request_id: int = 1) -> SimpleNamespace:
     """A generation request the scheduler is about to preempt."""
     request = _request(request_id)
+    request.state = LlmRequestState.GENERATION_IN_PROGRESS
     request.py_decoding_iter = 5
     request.py_draft_tokens = []
     request.py_per_pos_drafted = None
@@ -550,6 +553,7 @@ def _preemption_victim(request_id: int = 1) -> SimpleNamespace:
         # The real teardown puts the request back in context state, which is
         # what makes it schedulable again.
         request.is_finished = False
+        request.state = LlmRequestState.CONTEXT_INIT
         request.is_disagg_context_transmission_state = False
 
     request.reset_for_recompute = Mock(side_effect=reset_for_recompute)
