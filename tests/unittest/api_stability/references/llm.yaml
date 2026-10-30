@@ -520,6 +520,10 @@ methods:
     parameters: {}
     return_annotation: bytes
     status: prototype
+  get_memory_report:
+    parameters: {}
+    return_annotation: list[str]
+    status: prototype
   get_memory_status:
     parameters: {}
     return_annotation: tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus

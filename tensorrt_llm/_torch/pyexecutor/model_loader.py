@@ -1603,7 +1603,7 @@ class ModelLoader:
         if LOW_M_GEMM_ACTIVE:
             prepare_low_m_gemm(model)
         # Attribute the parameters the model ended up with, whichever load
-        # path produced them. A no-op unless TLLM_MEM_MONITOR is set.
+        # path produced them. Only a weak reference; read when reporting.
         monitor_claim_memory(model, "WEIGHTS")
         return model, moe_load_balancer
 

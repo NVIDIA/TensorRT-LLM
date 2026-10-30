@@ -1964,6 +1964,26 @@ class _TorchLLM(BaseLLM):
         return normalized
 
     @set_api_status("prototype")
+    def get_memory_report(self) -> list[str]:
+        """Explain where the GPU workers' memory is going, as readable reports.
+
+        Each report splits one worker process's GPU memory by purpose (KV
+        cache, weights, runtime buffers, CUDA graphs, communication buffers,
+        library overhead) so that the parts add up to what the process holds.
+        With ``TLLM_MEM_MONITOR=1`` set for the run, reports also break down
+        startup step by step and compare against the state after warmup.
+
+        With the Ray executor every worker answers. With the default MPI
+        executor only rank 0 does; set ``TLLM_MEM_MONITOR_INTERVAL`` and
+        ``TLLM_MEM_MONITOR_DIR`` to collect every rank's reports.
+
+        Returns:
+            list[str]: One report per answering worker.
+        """
+        replies = self._collective_rpc("get_memory_report")
+        return [reply for reply in replies if reply]
+
+    @set_api_status("prototype")
     def get_memory_status(self) -> RuntimeMemoryStatus:
         """Return the authoritative runtime-memory checkpoint status.
 

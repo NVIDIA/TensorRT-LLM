@@ -890,6 +890,23 @@ class BaseWorker(GenerationExecutor):
         self._check_sleep_wakeup_preconditions("get_memory_status")
         return self.engine.get_memory_status()
 
+    def get_memory_report(self) -> str | None:
+        """Explain where this worker's GPU memory is going, as readable text.
+
+        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
+        from this process; works whether or not ``TLLM_MEM_MONITOR`` is set.
+        ``None`` if it could not be built.
+        """
+        from tensorrt_llm._torch.memory.monitor.triggers import report_now
+
+        # Answered on an RPC thread, whose current device is not necessarily
+        # the one this worker serves on.
+        device = getattr(self.engine, "device_id", None)
+        if device is None:
+            return report_now(tag="on_demand", force=True)
+        with torch.cuda.device(device):
+            return report_now(tag="on_demand", force=True)
+
     def _prepare_sleep_tags(
         self,
         tags: list[ExecutorMemoryType],

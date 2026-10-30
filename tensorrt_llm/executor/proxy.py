@@ -64,8 +64,10 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
+# get_memory_report() needs no coordination: it describes the process that
+# answers, which on this path is rank-0.
 _MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
-    {"get_memory_status", "sleep", "wakeup"})
+    {"get_memory_report", "get_memory_status", "sleep", "wakeup"})
 
 
 def _check_collective_rpc_guard(

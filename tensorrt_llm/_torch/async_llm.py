@@ -47,6 +47,11 @@ class AsyncLLM(LLM):
             self._async_initialized = True
         return self
 
+    async def get_memory_report(self) -> list[str]:
+        """Explain where each GPU worker's memory is going; see ``LLM.get_memory_report``."""
+        replies = await self.collective_rpc("get_memory_report")
+        return [reply for reply in replies if reply]
+
     async def get_memory_status(self) -> RuntimeMemoryStatus:
         """Return the authoritative runtime-memory checkpoint status."""
         self._check_runtime_memory_enabled()

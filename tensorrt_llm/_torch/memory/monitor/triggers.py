@@ -38,6 +38,17 @@ handler also passes its message through :func:`notify_error`, which reports
 when the message describes an out-of-memory condition. Both paths share one
 rate limit, so a torch OOM that the executor then handles is reported once.
 
+Errors that never reach the executor's handler are caught two more ways
+once reporting is armed: TensorRT-LLM's logger passes every ERROR message
+through :func:`notify_error` -- background threads such as the KV transfer
+workers catch their failures and log them -- and a thread that dies of an
+uncaught out-of-memory error is reported through ``threading.excepthook``.
+
+With ``TLLM_MEM_MONITOR_INTERVAL`` set to a number of seconds, a background
+thread also reports at that interval, so memory that grows slowly while
+serving shows up before it runs out. It only wakes on its timer; nothing is
+added to the executor loop.
+
 With ``TLLM_MEM_MONITOR_DIR`` set, every report is also written to its own
 file there, named by rank, process and time. Logs from several ranks
 interleave and are often cut short when a job dies; a file per report is
@@ -51,8 +62,10 @@ per interval, while an unrelated OOM hours later is still reported.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import threading
 import time
 
 import torch
@@ -60,6 +73,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 __all__ = [
+    "INTERVAL_VAR",
     "install_oom_reporter",
     "notify_error",
     "report_now",
@@ -68,6 +82,9 @@ __all__ = [
 
 #: Directory every report is also written to, one file each.
 DIR_VAR = "TLLM_MEM_MONITOR_DIR"
+
+#: Seconds between periodic reports while serving; unset or ``0`` for none.
+INTERVAL_VAR = "TLLM_MEM_MONITOR_INTERVAL"
 
 #: Minimum seconds between two OOM reports. ``0`` reports every one.
 _INTERVAL_VAR = "TLLM_MEM_MONITOR_OOM_INTERVAL"
@@ -83,6 +100,10 @@ _attached = False
 #: observer.
 _enabled_flag = False
 _last_report_at: float | None = None
+_rate_lock = threading.Lock()
+#: Set on a thread while it builds a report, so the report's own logging
+#: cannot trigger another.
+_reporting = threading.local()
 
 #: Messages from CUDA, the driver, NCCL and TensorRT-LLM's C++ code that mean
 #: an allocation failed.
@@ -110,8 +131,11 @@ def report_now(
     record_baseline: bool = False,
     suggestion: str = "",
     startup_steps: bool = False,
+    force: bool = False,
 ) -> str | None:
     """Render the monitor for this process, or ``None`` if it is disabled.
+
+    ``force`` renders it even when disabled; see :func:`capture`.
 
     Returns the text without logging it; the caller decides where it goes
     (the log, an exception message, a crash dump). It is also written to
@@ -129,6 +153,7 @@ def report_now(
             record_baseline=record_baseline,
             suggestion=suggestion,
             startup_steps=startup_steps,
+            force=force,
         )
     except Exception as exc:  # noqa: BLE001 - a report must not add a failure
         logger.warning(f"memory monitor: capture for {tag!r} failed ({type(exc).__name__}: {exc})")
@@ -168,13 +193,16 @@ def _report_oom(headline: str) -> None:
     """Emit one OOM report, subject to the shared rate limit. Never raises."""
     global _last_report_at
 
-    if not _enabled_flag:
+    if not _enabled_flag or getattr(_reporting, "active", False):
         return
-    now = time.monotonic()
-    if _last_report_at is not None and now - _last_report_at < _interval_s():
-        return
-    _last_report_at = now
+    # Background threads report too, so two may race for the same OOM.
+    with _rate_lock:
+        now = time.monotonic()
+        if _last_report_at is not None and now - _last_report_at < _interval_s():
+            return
+        _last_report_at = now
 
+    _reporting.active = True
     try:
         report = report_now(tag="out_of_memory", headline=headline)
         # WARNING rather than ERROR: the caller may yet handle the OOM, and
@@ -184,6 +212,8 @@ def _report_oom(headline: str) -> None:
         )
     except Exception:  # noqa: BLE001 - never add a second failure to an OOM
         pass
+    finally:
+        _reporting.active = False
 
 
 def _on_out_of_memory(device: int, allocation_bytes: int, allocated: int, reserved: int) -> None:
@@ -210,6 +240,101 @@ def notify_error(message: str | None) -> None:
         pass
 
 
+class _ErrorLogFilter(logging.Filter):
+    """Passes ERROR messages to :func:`notify_error`; filters nothing out."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.ERROR:
+            try:
+                notify_error(record.getMessage())
+            except Exception:  # noqa: BLE001 - logging must not fail
+                pass
+        return True
+
+
+_log_filter = _ErrorLogFilter()
+_previous_thread_hook = None
+
+
+def _thread_excepthook(args) -> None:
+    try:
+        notify_error(f"{getattr(args.exc_type, '__name__', 'Error')}: {args.exc_value}")
+    finally:
+        (_previous_thread_hook or threading.__excepthook__)(args)
+
+
+def _install_error_hooks() -> None:
+    global _previous_thread_hook
+    py_logger = getattr(logger, "_logger", None)
+    if py_logger is not None and _log_filter not in py_logger.filters:
+        py_logger.addFilter(_log_filter)
+    if threading.excepthook is not _thread_excepthook:
+        _previous_thread_hook = threading.excepthook
+        threading.excepthook = _thread_excepthook
+
+
+def _remove_error_hooks() -> None:
+    global _previous_thread_hook
+    py_logger = getattr(logger, "_logger", None)
+    if py_logger is not None:
+        py_logger.removeFilter(_log_filter)
+    if threading.excepthook is _thread_excepthook:
+        threading.excepthook = _previous_thread_hook or threading.__excepthook__
+        _previous_thread_hook = None
+
+
+class _PeriodicReporter:
+    """Reports every ``interval`` seconds from a daemon thread until stopped."""
+
+    def __init__(self, interval: float, rank: int | None) -> None:
+        self._stop = threading.Event()
+        self._interval = interval
+        self._rank = rank
+        # A new thread starts on device 0; report on the one being served.
+        self._device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        self._thread = threading.Thread(
+            target=self._run, name="memory-monitor-periodic", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        if self._device is not None:
+            torch.cuda.set_device(self._device)
+        while not self._stop.wait(self._interval):
+            report = report_now(tag="periodic", rank=self._rank)
+            if report is not None:
+                logger.info(f"memory monitor:\n{report}")
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5.0)
+
+
+_periodic: _PeriodicReporter | None = None
+
+
+def _periodic_interval_s() -> float:
+    try:
+        return max(0.0, float(os.environ.get(INTERVAL_VAR, "") or 0))
+    except ValueError:
+        logger.warning(f"memory monitor: ignoring {INTERVAL_VAR}, not a number of seconds")
+        return 0.0
+
+
+def _start_periodic(rank: int | None) -> None:
+    global _periodic
+    interval = _periodic_interval_s()
+    if interval > 0 and _periodic is None:
+        _periodic = _PeriodicReporter(interval, rank)
+
+
+def _stop_periodic() -> None:
+    global _periodic
+    if _periodic is not None:
+        _periodic.stop()
+        _periodic = None
+
+
 def install_oom_reporter(rank: int | None = None) -> bool:
     """Report the monitor the next time an allocation runs out of memory.
 
@@ -229,6 +354,8 @@ def install_oom_reporter(rank: int | None = None) -> bool:
     # Armed even if torch's observer cannot be attached: errors from outside
     # the PyTorch allocator still arrive through notify_error.
     _enabled_flag = True
+    _install_error_hooks()
+    _start_periodic(rank)
     if _attached:
         return True
 
@@ -259,3 +386,5 @@ def uninstall_oom_reporter() -> None:
     global _enabled_flag, _last_report_at
     _enabled_flag = False
     _last_report_at = None
+    _remove_error_hooks()
+    _stop_periodic()
