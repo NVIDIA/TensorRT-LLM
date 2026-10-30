@@ -631,7 +631,7 @@ class _PagedAttnEnv:
             v=None,
             output=output,
             output_sf=None,
-            workspace_=self.workspace,
+            workspace=self.workspace,
             sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
             host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
             host_total_kv_lens=torch.tensor([total_ctx_kv, total_gen_kv], dtype=torch.int32),
@@ -699,7 +699,7 @@ class _PagedAttnEnv:
             use_spec_decoding=False,
             is_spec_dec_tree=False,
             spec_decoding_generation_lengths=None,
-            spec_decoding_position_offsets_for_cpp=None,
+            spec_decoding_position_offsets=None,
             spec_decoding_packed_mask=None,
             spec_decoding_bl_tree_mask_offset=None,
             spec_decoding_bl_tree_mask=None,
@@ -1118,7 +1118,7 @@ class _MultiLayerPagedAttnEnv:
                 v=None,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(kv_lens, dtype=torch.int32),
                 host_total_kv_lens=torch.tensor(
@@ -1189,7 +1189,7 @@ class _MultiLayerPagedAttnEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -2546,8 +2546,10 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
        the decoy changes the output, while the page holding only this call's
        own new tokens is invisible (the append lands wherever the offsets
        point and is read straight back from there).
-    3. use_paged_context_fmha=False on a context call with a cached prefix is
-       silently wrong — no exception, an answer far off the reference.
+    3. The packed path sees only the new tokens, so omitting the cached
+       prefix gives an answer far off the reference. Its KV lengths must
+       match the supplied packed rows; including the prefix would read
+       beyond the QKV buffer.
     4. context_lengths on a context row must be this call's new-token count;
        0 is far off. A larger value is not probed: the context FMHA then
        writes past the output buffer, which holds this call's new tokens
@@ -2621,7 +2623,7 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
     env.check_cache(0)
     env.check_unwritten_pool_zero()
 
-    # (3) the flag itself, and (4) the context length
+    # (3) packed attention without the prefix, and (4) the context length
     penv, pq = prepared()
     assert _bitwise_equal(pq, qkv), "the prepared state is not reproducible"
     _assert_far_outside(
@@ -2632,11 +2634,12 @@ def test_bf16_paged_context_reads_the_pool_and_batch_state() -> None:
             [0],
             MASK_CAUSAL,
             record=False,
+            seq_lens_override=[new],
             ctx_lens_override=[new],
             use_paged_context_fmha=False,
         ),
         base,
-        "cached-prefix context at use_paged_context_fmha=False",
+        "packed context without the cached prefix",
     )
     cenv, cq = prepared()
     _assert_far_outside(
@@ -3247,7 +3250,7 @@ class _MlaPagedEnv:
                 v=v,
                 output=output,
                 output_sf=None,
-                workspace_=self.workspace,
+                workspace=self.workspace,
                 sequence_length=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
                 host_past_key_value_lengths=torch.tensor(
                     kv_lens if host_past_lens is None else host_past_lens,
@@ -3319,7 +3322,7 @@ class _MlaPagedEnv:
                 use_spec_decoding=False,
                 is_spec_dec_tree=False,
                 spec_decoding_generation_lengths=None,
-                spec_decoding_position_offsets_for_cpp=None,
+                spec_decoding_position_offsets=None,
                 spec_decoding_packed_mask=None,
                 spec_decoding_bl_tree_mask_offset=None,
                 spec_decoding_bl_tree_mask=None,
@@ -5628,8 +5631,7 @@ def test_fp8_mla_mtp_decode_sees_a_torn_pool_h128() -> None:
 
 
 def test_mla_rejects_null_q_lora_rank() -> None:
-    """q_lora_rank must be an int on the MLA path: the C++ unwraps the
-    optional unconditionally, so None raises rather than defaulting."""
+    """The catalog requires an explicit int rank for MLA, including zero for no q-LoRA."""
     torch.manual_seed(309)
     h = MLA_NUM_HEADS_H32
     q, k, v, latent = _random_context_inputs(32, h)
@@ -5642,8 +5644,8 @@ def test_mla_rejects_null_q_lora_rank() -> None:
     env.add_request(0, 32)
     try:
         env.call_context([0], [32], q, k, v, latent)
-    except RuntimeError as exc:
-        assert "bad optional access" in str(exc), f"unexpected message: {exc}"
+    except ValueError as exc:
+        assert "q_lora_rank must be an int for MLA" in str(exc), f"unexpected message: {exc}"
     else:
         raise AssertionError("q_lora_rank=None was accepted on the MLA path")
 
@@ -6829,7 +6831,7 @@ _ENCODER_SERVING_SEGMENTS: List[List[int]] = [
     [12544, 9600],
 ]
 
-# What `workspace_` grows to across that sequence, from empty: the op sizes it
+# What `workspace` grows to across that sequence, from empty: the op sizes it
 # in place per call and never shrinks it, and the dump's largest recorded size
 # is this figure.
 _ENCODER_SERVING_WORKSPACE = 33732608
@@ -6856,7 +6858,7 @@ def _encoder_call(
         v=None,
         output=output,
         output_sf=None,
-        workspace_=workspace,
+        workspace=workspace,
         sequence_length=torch.tensor(seg_lens, dtype=torch.int32, device="cuda"),
         host_past_key_value_lengths=torch.tensor(seg_lens, dtype=torch.int32),
         host_total_kv_lens=torch.tensor([total, 0], dtype=torch.int32),
@@ -6923,7 +6925,7 @@ def _encoder_call(
         use_spec_decoding=False,
         is_spec_dec_tree=False,
         spec_decoding_generation_lengths=None,
-        spec_decoding_position_offsets_for_cpp=None,
+        spec_decoding_position_offsets=None,
         spec_decoding_packed_mask=None,
         spec_decoding_bl_tree_mask_offset=None,
         spec_decoding_bl_tree_mask=None,
@@ -7049,7 +7051,7 @@ def test_encoder_no_kv_cache_cache_arguments_are_inert() -> None:
 
 
 def test_encoder_no_kv_cache_workspace_high_water() -> None:
-    """`workspace_` over the mmmu serving sequence, from empty: sized in place
+    """`workspace` over the mmmu serving sequence, from empty: sized in place
     per call, never shrunk, and topping out at the largest size the runtime
     dump records -- which a tower that preallocates it must cover."""
     workspace = torch.empty(0, dtype=torch.int8, device="cuda")
@@ -7059,9 +7061,9 @@ def test_encoder_no_kv_cache_workspace_high_water() -> None:
         qkv = torch.randn(sum(seg_lens), 48 * 72, dtype=torch.bfloat16, device="cuda")
         _encoder_call(qkv, seg_lens, 16, 16, 72, MASK_PADDING, workspace)
         sizes.append(workspace.numel())
-    assert sizes == sorted(sizes), f"workspace_ did not grow monotonically: {sizes}"
+    assert sizes == sorted(sizes), f"workspace did not grow monotonically: {sizes}"
     assert sizes[-1] == _ENCODER_SERVING_WORKSPACE, (
-        f"workspace_ grew to {sizes[-1]} bytes over the serving shapes, expected "
+        f"workspace grew to {sizes[-1]} bytes over the serving shapes, expected "
         f"{_ENCODER_SERVING_WORKSPACE}; the sequence was {sizes}"
     )
 

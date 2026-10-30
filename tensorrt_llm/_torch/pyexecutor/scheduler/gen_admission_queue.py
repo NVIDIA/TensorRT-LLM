@@ -465,6 +465,16 @@ class GenAdmissionWaitingQueue(WaitingQueue):
             raise IndexError("peek from an empty queue")
         return self._next()[0][4]
 
+    def peek_requests(self, k: int) -> list:
+        if k <= 0 or not self:
+            return []
+        self._next()  # builds the admission order
+        return [entry[4] for entry, _ in self._order[: -k - 1 : -1]]
+
+    def admission_groups(self, requests: list) -> list[int]:
+        """One group per request: the admission order is kept."""
+        return list(range(len(requests)))
+
     def prepend_request(self, request) -> None:
         self._insert(self._make_entry(request, next(self._prepend_counter)))
 

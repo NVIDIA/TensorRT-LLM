@@ -88,6 +88,19 @@ struct BufferId
     }
 };
 
+//! Buffers a consumer must address from one table, under one base pointer.
+//!
+//! Some attention ops take a single block table covering K and V rather than one each.
+//! Order defines the table's buffer dimension: a kernel reads buffer `i` at entry `i`.
+//!
+//! All buffers must share a life cycle and a page-index scale; one table cannot serve
+//! buffers whose converted indices differ. A spec spanning either is refused when the
+//! Batch is constructed.
+struct IndexTableSpec
+{
+    std::vector<BufferId> buffers;
+};
+
 struct BufferIdHash
 {
     size_t operator()(BufferId const& id) const noexcept
@@ -108,6 +121,12 @@ struct CoalescedBuffer
     size_t singleBufferSize = 0;
     std::vector<BufferId> bufferIds;
 
+    //! Whether this pool's pages live in the sparse GPU cache: host memory, device-mapped,
+    //! and not charged to the GPU tier's quota.
+    //!
+    //! Per pool, not per life cycle -- one layer may hold both a sparse buffer and a dense one.
+    bool isSparse = false;
+
     [[nodiscard]] size_t size() const noexcept
     {
         return singleBufferSize * bufferIds.size();
@@ -127,6 +146,11 @@ struct SlotDescVariant
 {
     LifeCycleId lifeCycleId{0};
     TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
+
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
+    {
+        return coalescedBuffers.at(poolIdx).isSparse;
+    }
 
     // Slot size for each pool in this group.
     [[nodiscard]] TypedVec<PoolIndex, size_t> slotSizeList() const
@@ -153,6 +177,13 @@ struct SlotDesc
     [[nodiscard]] TypedVec<PoolIndex, size_t> slotSizeList() const
     {
         return getUniformAttribute(variants, [](auto const& v) { return v.slotSizeList(); });
+    }
+
+    //! Life cycles share a pool group only when their pools agree position-wise on
+    //! sparsity as well as size, so this is uniform across variants.
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
+    {
+        return getUniformAttribute(variants, [poolIdx](auto const& v) { return v.isSparse(poolIdx); });
     }
 };
 
@@ -220,6 +251,9 @@ struct StorageConfig
 {
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
+
+    //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.
+    std::optional<size_t> hostSparsePoolQuota;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;

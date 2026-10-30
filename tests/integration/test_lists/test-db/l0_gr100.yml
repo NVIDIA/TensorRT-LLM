@@ -15,6 +15,8 @@ l0_gr100:
   tests:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
+  - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
+  - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
   # The GLM-5.2 target's unit tests, one entry per op directory. Its comm tests
   # run 4 ranks, and CI has no 4-GPU GR100 stage yet.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/attention

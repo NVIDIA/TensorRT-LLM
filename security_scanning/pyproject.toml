@@ -8,6 +8,7 @@ authors = [
 license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "filelock (==3.20.3)",
     "accelerate (>=1.7.0)",
     "build (>=1.6.1,<2.0.0)",
     "colored (>=2.3.2,<3.0.0)",
