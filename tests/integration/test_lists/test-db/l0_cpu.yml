@@ -132,6 +132,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_attention_importable.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_dynamic_batching.py
+  - unittest/_torch/visual_gen/test_cuda_graph_cache.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
   - unittest/_torch/visual_gen/test_flux2_load_weights.py
   - unittest/_torch/visual_gen/test_flux_infer.py
@@ -147,6 +148,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_quant_static_guard.py
   - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_batching.py
+  - unittest/_torch/visual_gen/test_qwen_image_pipeline.py::test_forward_routes_each_cfg_request_layout
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py

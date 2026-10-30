@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.batching import BatchInfo
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
 from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image_edit import (
     QwenImageEditPlusPipeline,
@@ -113,17 +114,17 @@ def test_graph_keys_distinguish_request_layout_at_same_tensor_shape():
     model = QwenImageTransformer2DModel.__new__(QwenImageTransformer2DModel)
     torch.nn.Module.__init__(model)
     model.model_config = SimpleNamespace(attention=SimpleNamespace(sparse_attention_config=None))
-    keys = {}
-    model.register_cuda_graph_extra_key_fns(SimpleNamespace(register_extra_key_fn=keys.__setitem__))
-    key = keys["request_batch"]
-    assert key() is None
+    runner = CUDAGraphRunner(CUDAGraphRunnerConfig(use_cuda_graph=True))
+    model.register_cuda_graph_extra_key_fns(runner)
+    assert runner.get_graph_key() == ()
+    assert runner._extra_key_capture_limits == {"request_batch": 16}
     layouts = [
         QwenImageBatchLayout((1, 2), (2, 3), (True, True)),
         QwenImageBatchLayout((2, 1), (2, 3), (True, True)),
         QwenImageBatchLayout((1, 2), (3, 2), (True, True)),
         QwenImageBatchLayout((1, 2), (2, 3), (False, True)),
     ]
-    assert len({key(request_batch=layout) for layout in layouts}) == len(layouts)
+    assert len({runner.get_graph_key(request_batch=layout) for layout in layouts}) == len(layouts)
 
 
 @pytest.mark.parametrize(

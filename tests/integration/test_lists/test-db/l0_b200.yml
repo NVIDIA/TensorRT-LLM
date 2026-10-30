@@ -344,6 +344,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_media_decode.py
   - unittest/_torch/visual_gen/test_runtime_lora.py
   - unittest/_torch/visual_gen/test_warmup.py
+  - unittest/_torch/visual_gen/test_cuda_graph_cache.py
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_pertoken_adaln.py
@@ -409,6 +410,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_hunyuan_video1_5_pipeline.py
   - examples/visual_gen/test_visual_gen_wan.py::test_wan_t2v_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux1_example
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons[flux1] TIMEOUT (10)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_http TIMEOUT (15)
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_example
   - examples/visual_gen/test_visual_gen_flux.py::test_flux2_reference_image_example
   - examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_example
@@ -585,7 +588,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
-  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons TIMEOUT (30)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons -k "not flux1 or flux1-cuda-graph or flux1-multiple-outputs" TIMEOUT (30)
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]

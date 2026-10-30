@@ -2,10 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Request batching through the public API, worker IPC and native image pipelines."""
 
+import os
+import re
+import signal
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from pathlib import Path
+from threading import Barrier
+
 import pytest
+import requests
 import torch
+import yaml
+from PIL import Image
 from test_common.llm_data import get_checkpoint
 
+from defs.common import get_free_port_in_ci
 from defs.examples.visual_gen.visual_gen_test_utils import (
     _assert_lpips_below_threshold,
     _golden_media_path,
@@ -108,4 +122,139 @@ def test_dynamic_batching_matches_singletons(
             reference,
             tmp_path / "batched_0_0.png",
         )
+        _assert_lpips_below_threshold(score, 0.05)
+
+
+@contextmanager
+def _batching_http_server(tmp_path):
+    """Launch the serving example with inexpensive compilation settings for CI."""
+    root = Path(__file__).resolve().parents[4]
+    example = root / "examples/visual_gen/serve/configs/dynamic_batching.yml"
+    config = yaml.safe_load(example.read_text())
+    config.update(
+        compilation_config={"skip_warmup": True},
+        torch_compile_config={"enable": False},
+        cuda_graph_config={"enable": False},
+    )
+    config_path = tmp_path / "server.yml"
+    config_path.write_text(yaml.safe_dump(config))
+    port = get_free_port_in_ci()
+    url = f"http://127.0.0.1:{port}"
+    log_path = tmp_path / "server.log"
+    env = dict(
+        os.environ,
+        TLLM_LOG_LEVEL="INFO",
+        PYTHONUNBUFFERED="1",
+        TRTLLM_MEDIA_STORAGE_PATH=str(tmp_path / "media"),
+    )
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [
+                "trtllm-serve",
+                get_checkpoint("FLUX.1-dev"),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--visual_gen_args",
+                str(config_path),
+            ],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 600
+            while time.monotonic() < deadline:
+                assert process.poll() is None, log_path.read_text()
+                try:
+                    if requests.get(f"{url}/health", timeout=5).status_code == 200:
+                        break
+                except requests.ConnectionError:
+                    pass
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"VisualGen server did not become ready:\n{log_path.read_text()}")
+            yield url, log_path
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=30)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_dynamic_batching_http(tmp_path):
+    """The example YAML merges HTTP requests and serves each request's own image."""
+    prompts = [
+        "a tiny astronaut hatching from an egg on the moon",
+        "A red fox resting under an oak tree in autumn, sunlight filtering through golden leaves.",
+    ]
+    payloads = [
+        dict(
+            prompt=prompt,
+            seed=seed,
+            size="256x256",
+            num_inference_steps=4,
+            guidance_scale=3.5,
+            n=1,
+            response_format="url",
+            format="png",
+        )
+        for prompt, seed in zip(prompts, (42, 17))
+    ]
+    with _batching_http_server(tmp_path) as (url, log_path):
+
+        def generate(payload, name, barrier=None):
+            if barrier is not None:
+                barrier.wait(timeout=30)
+            response = requests.post(f"{url}/v1/images/generations", json=payload, timeout=300)
+            assert response.status_code == 200, response.text
+            data = response.json()
+            assert data["size"] == "256x256"
+            assert data["output_format"] == "png"
+            assert len(data["data"]) == 1
+            item = data["data"][0]
+            assert item["revised_prompt"] == payload["prompt"]
+            assert item["url"].startswith(f"{url}/v1/images/image_")
+            content = requests.get(item["url"], timeout=30)
+            assert content.status_code == 200, content.text
+            path = tmp_path / f"{name}.png"
+            path.write_bytes(content.content)
+            with Image.open(path) as image:
+                assert image.size == (256, 256)
+                assert image.convert("RGB").getbbox() is not None
+            return path, item["url"]
+
+        baselines = [generate(payload, f"singleton_{i}") for i, payload in enumerate(payloads)]
+        log_offset = len(log_path.read_text())
+        with ThreadPoolExecutor(max_workers=3) as clients:
+            # Keep the worker busy while the two HTTP requests enter its queue.
+            # This exercises the example's 5 ms window without relying on network timing.
+            blocker = clients.submit(
+                generate, dict(payloads[0], seed=123, num_inference_steps=28), "blocker"
+            )
+            deadline = time.monotonic() + 60
+            while "Denoising: 28 steps" not in log_path.read_text()[log_offset:]:
+                assert not blocker.done(), "Queue-filling request finished before it was observed"
+                assert time.monotonic() < deadline, log_path.read_text()
+                time.sleep(0.01)
+            barrier = Barrier(len(payloads))
+            futures = [
+                clients.submit(generate, payload, f"batched_{i}", barrier)
+                for i, payload in enumerate(payloads)
+            ]
+            batched = [future.result(timeout=300) for future in futures]
+            blocker.result(timeout=300)
+
+        batch_log = log_path.read_text()[log_offset:]
+        assert re.search(r"Dynamic batch: requests=\(\d+, \d+\), images=2", batch_log), batch_log
+        assert len({image_url for _, image_url in baselines + batched}) == 4
+
+    for i, ((baseline, _), (image, _)) in enumerate(zip(baselines, batched)):
+        score = _run_lpips_eval(tmp_path, f"http_{i}", "image", prompts[i], baseline, image)
         _assert_lpips_below_threshold(score, 0.05)

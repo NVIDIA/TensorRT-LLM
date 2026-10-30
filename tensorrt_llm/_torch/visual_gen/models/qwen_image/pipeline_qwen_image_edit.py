@@ -89,6 +89,8 @@ class QwenImageEditPlusPipeline(QwenImagePipeline):
     """
 
     supports_image_edit = True
+    # Override the text-to-image parent's opt-in: editing has its own forward
+    # path and reference-image collation, without request-batch layout handling.
     supports_dynamic_batching = False
     DEFAULT_GENERATION_PARAMS = _EDIT_DEFAULT_GENERATION_PARAMS
 

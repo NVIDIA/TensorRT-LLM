@@ -1286,7 +1286,9 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         def request_batch_key(*args: Any, **kwargs: Any) -> QwenImageBatchLayout | None:
             return kwargs.get("request_batch")
 
-        runner.register_extra_key_fn("request_batch", request_batch_key)
+        # Prompt lengths and request boundaries can create many distinct layouts.
+        # Bound their retained graphs without evicting live CFG output tensors.
+        runner.register_extra_key_fn("request_batch", request_batch_key, max_graphs=16)
 
     def post_load_weights(self) -> None:
         for name, module in self.named_modules():
