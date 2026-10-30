@@ -27,6 +27,18 @@ class BatchInfo:
     seeds: tuple[int, ...]
 
 
+def has_dynamic_nvfp4(module: torch.nn.Module) -> bool:
+    """Detect NVFP4 layers that derive an activation scale from the current input."""
+    return any(
+        getattr(getattr(layer, "quant_method", None), "quantizes_nvfp4_activations", False)
+        and (
+            getattr(layer, "input_scale", None) is None
+            or getattr(layer, "force_dynamic_quantization", False)
+        )
+        for layer in module.modules()
+    )
+
+
 def request_sample_count(req: DiffusionRequest) -> int:
     """Count generated samples, including prompt lists and per-prompt multiplicity."""
     return len(req.prompt) * req.params.num_images_per_prompt

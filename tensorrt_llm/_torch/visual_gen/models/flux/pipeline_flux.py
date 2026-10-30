@@ -11,7 +11,11 @@ import torch
 from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 
-from tensorrt_llm._torch.visual_gen.batching import BatchInfo, randn_tensor_for_batch
+from tensorrt_llm._torch.visual_gen.batching import (
+    BatchInfo,
+    has_dynamic_nvfp4,
+    randn_tensor_for_batch,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -51,7 +55,10 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
-    supports_dynamic_batching = True
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        # Dynamic NVFP4 scales span the input tensor, coupling requests when merged.
+        return not has_dynamic_nvfp4(self.transformer)
 
     def __init__(self, pipeline_config):
         if (

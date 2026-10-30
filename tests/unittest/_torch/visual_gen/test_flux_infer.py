@@ -16,6 +16,31 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
+@pytest.mark.parametrize(
+    "nvfp4_activations,force_dynamic,input_scale,expected",
+    [
+        (True, True, torch.tensor(1.0), False),
+        (True, False, None, False),
+        (True, False, torch.tensor(1.0), True),
+        (False, True, None, True),
+    ],
+    ids=["forced-dynamic", "missing-scale", "static-scale", "weight-only"],
+)
+def test_batching_rejects_dynamic_nvfp4_layers(
+    pipeline_cls, nvfp4_activations, force_dynamic, input_scale, expected
+):
+    layer = torch.nn.Module()
+    layer.quant_method = SimpleNamespace(quantizes_nvfp4_activations=nvfp4_activations)
+    layer.force_dynamic_quantization = force_dynamic
+    layer.input_scale = input_scale
+    pipeline = pipeline_cls.__new__(pipeline_cls)
+    torch.nn.Module.__init__(pipeline)
+    # A nested quantized layer among unquantized layers also gates the pipeline.
+    pipeline.transformer = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Sequential(layer))
+    assert pipeline.supports_dynamic_batching is expected
+
+
+@pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
 @pytest.mark.parametrize("batch_info", [None, BatchInfo((1, 2), (2, 2), (42, 17))])
 def test_infer_forwards_num_images_per_prompt(
     pipeline_cls: type[FluxPipeline] | type[Flux2Pipeline],

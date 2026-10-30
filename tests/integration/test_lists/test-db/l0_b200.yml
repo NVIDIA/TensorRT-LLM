@@ -707,7 +707,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cosmos3_t2v_offload.py::TestCosmos3Offload::test_cosmos3_offload_matches_baseline
   - examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden TIMEOUT (10)
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
-  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons -k "not flux1 or flux1-cuda-graph or flux1-multiple-outputs" TIMEOUT (30)
+  - visual_gen/test_dynamic_batching.py::test_dynamic_batching_matches_singletons -k "not flux1 or flux1-cuda-graph or flux1-multiple-outputs or flux1-dynamic-nvfp4" TIMEOUT (30)
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
   # ---- moved to post-merge (MoE CI optimization) ----
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]

@@ -38,7 +38,11 @@ from transformers import (
     Mistral3ForConditionalGeneration,
 )
 
-from tensorrt_llm._torch.visual_gen.batching import BatchInfo, randn_tensor_for_batch
+from tensorrt_llm._torch.visual_gen.batching import (
+    BatchInfo,
+    has_dynamic_nvfp4,
+    randn_tensor_for_batch,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -111,8 +115,12 @@ class Flux2Pipeline(BasePipeline):
     """
 
     supports_image_edit = True
-    supports_dynamic_batching = True
     derive_output_size_from_reference = True
+
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        # Inspect loaded layers so mixed per-layer quantization is covered too.
+        return not has_dynamic_nvfp4(self.transformer)
 
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {
