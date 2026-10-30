@@ -1125,11 +1125,7 @@ class ModelEngine:
         if self._cleanup_done:
             return
 
-        model_loader = self.model_loader
-        if model_loader is not None:
-            model_loader.cleanup()
-            self.model_loader = None
-
+        self._release_model_loader()
         self.moe_load_balancer = None
         # The runner, caller and scheduler retain the model, so clearing the
         # engine's attribute alone would leave the weights reachable.
@@ -1143,19 +1139,29 @@ class ModelEngine:
         release_gc()
         self._cleanup_done = True
 
-    def cleanup(self, *, collective: bool = True) -> None:
-        """Release model resources without rank-asymmetric collectives.
+    def _release_model_loader(self) -> None:
+        # Keep the handle live until its release succeeds, so a failed cleanup
+        # can be retried without releasing the loader twice.
+        model_loader = self.model_loader
+        if model_loader is not None:
+            model_loader.cleanup()
+            self.model_loader = None
 
-        Explicit terminal cleanup first releases local graph captures on every
-        rank, then passes that local result into the load-balancer's collective
-        preflight, and only then drops rank-local model state. Python finalizers
-        perform local cleanup only; worker-owned terminal cleanup is responsible
-        for collective resources.
+    def cleanup(self, *, collective: bool = False) -> None:
+        """Release model resources.
+
+        By default this is the rank-local cleanup that Python finalizers run:
+        the model loader, then graph captures, then the model references. With
+        ``collective``, it first releases local graph captures on every rank,
+        then passes that local result into the load-balancer's collective
+        preflight, and only then drops rank-local model state; worker-owned
+        terminal cleanup is responsible for those collective resources.
         """
         if self._cleanup_done:
             return
 
         if not collective:
+            self._release_model_loader()
             # Destruction timing is not rank-symmetric; only explicit shutdown
             # releases NCCL window owners.
             self.prepare_cleanup(release_nccl_window_owners=False)

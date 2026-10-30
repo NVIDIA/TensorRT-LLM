@@ -638,6 +638,7 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
             "prepare_cleanup",
             "shutdown_moe_load_balancer",
             "finish_cleanup",
+            "_release_model_loader",
             "cleanup",
         },
         {"release_gc": lambda: events.append("release_gc")},
@@ -661,8 +662,8 @@ def test_model_engine_cleanup_shuts_manager_after_graphs_while_model_is_alive():
     engine.model = model
     engine.input_processor = object()
 
-    engine.cleanup()
-    engine.cleanup()
+    engine.cleanup(collective=True)
+    engine.cleanup(collective=True)
 
     assert events == [
         "release_graphs",
@@ -682,6 +683,7 @@ def test_model_engine_prepare_failure_participates_in_unsafe_preflight():
             "prepare_cleanup",
             "shutdown_moe_load_balancer",
             "finish_cleanup",
+            "_release_model_loader",
             "cleanup",
         },
         {"release_gc": lambda: events.append("release_gc")},
@@ -706,7 +708,7 @@ def test_model_engine_prepare_failure_participates_in_unsafe_preflight():
     engine.input_processor = object()
 
     with pytest.raises(RuntimeError, match="graph cleanup failed"):
-        engine.cleanup()
+        engine.cleanup(collective=True)
 
     assert events == [("manager.shutdown", False)]
     assert engine.moe_load_balancer is not None
