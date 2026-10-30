@@ -59,7 +59,7 @@ class TritonPosEmbedInterpolate(OpWrapper):
     embeddings, the 2-D rope, and joining images are the caller's.
     """
 
-    ARCHS: frozenset[Arch] = frozenset()
+    ARCHS = frozenset({Arch.SM_103})
 
     # spec: t, h, w, num_grid_per_side, m_size, dtype, hidden. The tower is
     # replicated on every rank, so these are every member's shapes.
