@@ -59,6 +59,12 @@ class RequestQueueItem:
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        # Normalize bound inputs before any queue, ADP, or broadcast handoff.
+        from tensorrt_llm.bindings.executor import Request
+        if isinstance(self.request, Request):
+            self.request = ExecutorRequest.adapt(self.request)
+
     @property
     def is_shutdown_request(self):
         return self.id == SHUTDOWN_REQUEST_ID
