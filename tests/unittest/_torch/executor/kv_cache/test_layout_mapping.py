@@ -511,6 +511,27 @@ def test_a_role_one_side_alone_transfers_pairs_only_where_that_side_rebuilds_it(
         assert_layouts_reshard([context_only], [full])
 
 
+def test_a_role_rebuilt_per_request_may_share_a_global_layer_with_paired_buffers():
+    """A rebuilt role need not lie in a global layer of its own: kept on layer 60 next to a cache
+    both sides transfer, it pairs where the side holding it rebuilds it per request, whichever
+    side sends, and is refused otherwise."""
+    topology = Instance().ranks(0)[0]
+    full = layout(topology, (60,), [("swa", kv(4), "attention"), ("global", kv(4), "attention")])
+    context_only = layout(topology, (60,), [("global", kv(4), "attention")])
+    for pair in ((context_only, full), (full, context_only)):
+        with pytest.raises(ValueError, match=r"buffer \(60, 'swa'\) is transferred by one rank"):
+            check_compatible(*pair)
+    rebuilding = dataclasses.replace(full, request_rebuilt_roles=frozenset({"swa"}))
+    check_compatible(context_only, rebuilding)
+    check_compatible(rebuilding, context_only)
+    assert {(r.dst.layer, r.dst.role) for r in map_buffers(context_only, rebuilding)} == {
+        (60, "global")
+    }
+    assert_layouts_reshard([context_only], [rebuilding])
+    with pytest.raises(AssertionError, match="no source sends it"):
+        assert_layouts_reshard([context_only], [full])
+
+
 def test_layer_groups_keeping_other_windows_correspond():
     """Retention differs legitimately between the sides: a context worker with block reuse keeps a
     reuse-backoff token more (GPT-OSS with Eagle3 keeps 129 tokens of a 128-token window), a

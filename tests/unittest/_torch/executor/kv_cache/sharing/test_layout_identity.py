@@ -776,6 +776,39 @@ def test_a_share_covers_the_derived_buffers_the_lender_lends():
 
 
 @pytest.mark.cpu_only
+def test_a_role_rebuilt_per_request_needs_the_hook_naming_those_requests():
+    """A manager rebuilding a role per request names the requests through
+    ``disagg_untransferred_buffers``; declaring the role while keeping the base hook, inherited or
+    bound to the manager, is refused, since no request would leave the buffers to it."""
+    groups = [kv_group(lids=(0,), extra=[("swa", 32, None)])]
+    mappers = {"swa": "replicated"}
+    refusal = r"rebuilds its \['swa'\] buffers per request but does not override"
+
+    class Declares(Manager):
+        def _page_request_rebuilt_roles(self):
+            return frozenset({"swa"})
+
+    with pytest.raises(ValueError, match=refusal):
+        Declares(groups, mappers=mappers).get_page_table()
+    bound = Declares(groups, mappers=mappers)
+    bound.disagg_untransferred_buffers = types.MethodType(
+        KVCacheManagerV2.disagg_untransferred_buffers, bound
+    )
+    with pytest.raises(ValueError, match=refusal):
+        bound.get_page_table()
+
+    class Excludes(Declares):
+        def disagg_untransferred_buffers(self, request):
+            return frozenset({(0, "swa")})
+
+    layout = Excludes(groups, mappers=mappers).get_page_table().page_layout
+    assert layout.request_rebuilt_roles == frozenset({"swa"})
+    assert Manager(groups, mappers=mappers).get_page_table().page_layout.request_rebuilt_roles == (
+        frozenset()
+    )
+
+
+@pytest.mark.cpu_only
 def test_groups_of_one_manager_are_judged_one_by_one():
     manager = Manager(
         [

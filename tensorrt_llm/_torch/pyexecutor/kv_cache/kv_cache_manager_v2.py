@@ -3496,9 +3496,10 @@ class KVCacheManagerV2(BaseResourceManager):
         spread over ranks (``_page_buffer_tensors``), how layers are named (``_page_layer_ids``),
         the KV heads (``_page_kv_heads``), which roles never travel because they hold nothing a
         peer needs (``_page_untransferred_roles``) or the receiver rebuilds them
-        (``_page_derived_roles``) and the quantization (``_page_quant_mode``); a subclass
-        overrides the hook whose answer differs. ``ValueError`` if its layer groups, layer configs
-        and declarations do not agree."""
+        (``_page_derived_roles``), which it rebuilds per request instead of receiving them
+        (``_page_request_rebuilt_roles``, with ``disagg_untransferred_buffers``) and the
+        quantization (``_page_quant_mode``); a subclass overrides the hook whose answer differs.
+        ``ValueError`` if its layer groups, layer configs and declarations do not agree."""
         tokens_per_block = int(self.tokens_per_block)
         layer_cfg = self._page_layer_configs()
         grouping = [[int(layer) for layer in group] for group in self.impl.layer_grouping]
@@ -3642,6 +3643,31 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"{rebuild_owner.__name__}, which does not know them; override "
                         "rebuild_disagg_imported_cache with them"
                     )
+        per_request = sorted(self._page_request_rebuilt_roles())
+        if per_request:
+            exclude_owner = next(
+                (
+                    c
+                    for c in (self, *type(self).__mro__)
+                    if "disagg_untransferred_buffers" in vars(c)
+                ),
+                None,
+            )
+            exclude = (
+                vars(exclude_owner)["disagg_untransferred_buffers"]
+                if exclude_owner is not None
+                else None
+            )
+            if (
+                exclude is None
+                or getattr(exclude, "__func__", exclude)
+                is KVCacheManagerV2.disagg_untransferred_buffers
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} rebuilds its {per_request} buffers per request but "
+                    "does not override disagg_untransferred_buffers, which names the requests it "
+                    "rebuilds them for, so a peer lacking them would leave them unwritten"
+                )
 
         layer_groups: list[LayerGroupDesc] = []
         total_kv_heads: dict[int, int] = {}
@@ -3871,8 +3897,10 @@ class KVCacheManagerV2(BaseResourceManager):
     def _page_request_rebuilt_roles(self) -> frozenset[str]:
         """Roles whose buffers this manager, receiving, rebuilds for some requests rather than
         receiving them (``disagg_untransferred_buffers``), so a peer may hold none of them for a
-        model layer it holds: none by default. A peer missing any other role a model layer both
-        hold transfers is refused, rather than leaving the buffer unwritten."""
+        model layer it holds: none by default. A manager naming any overrides
+        ``disagg_untransferred_buffers``, or its page table is refused. A peer missing any other
+        role a model layer both hold transfers is refused, rather than leaving the buffer
+        unwritten."""
         return frozenset()
 
     def _page_dtype(self) -> str | None:

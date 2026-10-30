@@ -369,15 +369,15 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
 
     Each role of a model layer both ranks transfer goes by the same global layers on both, so ranks
     pair a model layer's buffers with its own however their pipeline stages split the model. A
-    role of such a model layer that one rank alone transfers is refused unless that rank rebuilds
-    it per request (``PageLayout.request_rebuilt_roles``: CSA2's generation workers rebuild the
-    sliding caches a context-only worker keeps none of past its split), rather than left
-    unwritten. On
-    the layers both hold, every buffer either rank transfers the other transfers too, as the same
-    tensors: the same names, axes and extents over all ranks, however each splits them, and
-    elements of the same type where the tensors state one, in pages of as many sub-pages, in layer
-    groups of the same kind. The KV data is of one element type and quantization. Pages pair one to
-    one, so where both transfer attention buffers their pages hold as many tokens.
+    role of such a model layer that one rank alone transfers, whichever sends, is refused unless
+    that rank rebuilds it per request (``PageLayout.request_rebuilt_roles``: CSA2's generation
+    workers rebuild the sliding caches a context-only worker keeps none of past its split), rather
+    than left unwritten. On the layers both hold, every buffer either rank transfers the other
+    transfers too, but for such a rebuilt role, as the same tensors: the same names, axes and
+    extents over all ranks, however each splits them, and elements of the same type where the
+    tensors state one, in pages of as many sub-pages, in layer groups of the same kind. The KV
+    data is of one element type and quantization. Pages pair one to one, so where both transfer
+    attention buffers their pages hold as many tokens.
 
     How many tokens each side keeps of a windowed group is not compared: retention margins (reuse
     backoff, draft tokens) legitimately differ between the sides, and a transfer moves the blocks
@@ -398,7 +398,8 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
     for key in sorted(k for k in set(ta) | set(tb) if k[0] in layers):
         x, y = ta.get(key), tb.get(key)
         if x is None or y is None:
-            problems.append(f"buffer {key} is transferred by one rank only")
+            if key[1] not in (a if y is None else b).request_rebuilt_roles:
+                problems.append(f"buffer {key} is transferred by one rank only")
             continue
         if x.expansion != y.expansion:
             problems.append(f"buffer {key}: {x.expansion} sub-pages against {y.expansion}")
@@ -446,8 +447,10 @@ def check_compatible(a: PageLayout, b: PageLayout) -> None:
         holder = a if (model, role) in names_a else b
         if model in both and role not in holder.request_rebuilt_roles:
             problems.append(
-                f"model layer {model}'s {role} buffers are transferred by one rank only, which "
-                "does not rebuild them per request"
+                f"model layer {model}'s {role} buffers are transferred by one rank only, as a "
+                "cache attached by what a pipeline stage holds or a role one peer lacks is; only "
+                "a rank rebuilding them per request, as CSA2's replay does "
+                "(_page_request_rebuilt_roles), may hold them alone"
             )
     if paged and a.tokens_per_page != b.tokens_per_page:
         problems.append(f"pages of {a.tokens_per_page} tokens against {b.tokens_per_page}")
