@@ -1032,11 +1032,12 @@ def test_resource_factory_reuses_only_released_same_capacity_slots(monkeypatch, 
     monkeypatch.setattr(util_module, "SimpleUnifiedScheduler", Mock())
     monkeypatch.setattr(util_module, "create_kv_cache_transceiver", Mock(return_value=None))
     engine = SimpleNamespace(
+        mm_encoder_item_scheduling_enabled=False,
         model=SimpleNamespace(
             model_config=SimpleNamespace(
                 pretrained_config=SimpleNamespace(model_type="llama"), is_encoder_decoder=False
             )
-        )
+        ),
     )
     scheduler_config = SimpleNamespace(
         use_python_scheduler=True,
