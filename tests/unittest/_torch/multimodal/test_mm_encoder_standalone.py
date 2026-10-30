@@ -1358,6 +1358,11 @@ def _encode_images(model_dir: Path, attn_backend: str,
 @pytest.mark.threadleak(enabled=False)
 def test_encoder_flashinfer_attention_matches_trtllm():
     """The encoder-only engine runs with FLASHINFER attention and matches TRTLLM."""
+    # get_attention_backend() falls back to TRTLLM when FlashInfer cannot be
+    # imported, which would turn this test into a TRTLLM self-comparison.
+    pytest.importorskip("flashinfer")
+    if not _QWEN_2_5_VL_3B_DIR.is_dir():
+        pytest.skip(f"Checkpoint not found: {_QWEN_2_5_VL_3B_DIR}")
     media = [[image] for image in example_images]
     reference = _encode_images(_QWEN_2_5_VL_3B_DIR, "TRTLLM", media)
     flashinfer = _encode_images(_QWEN_2_5_VL_3B_DIR, "FLASHINFER", media)
