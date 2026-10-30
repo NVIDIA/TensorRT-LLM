@@ -6141,6 +6141,24 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
             acceptance_length_key="test_nvfp4_adp4_mtp3_trtllm_ple_offload")
 
     @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(70000)
+    @pytest.mark.skip_less_host_memory(131072)
+    def test_nvfp4_adp4_cutlass_ple_offload(self,
+                                            monkeypatch: pytest.MonkeyPatch,
+                                            mocker) -> None:
+        """NVFP4 with attention DP4, expert EP4, and PLE host offload."""
+        self._run_evals(f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4",
+                        tensor_parallel_size=4,
+                        moe_backend="CUTLASS",
+                        max_draft_len=None,
+                        expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+                        monkeypatch=monkeypatch,
+                        mocker=mocker,
+                        moe_expert_parallel_size=4,
+                        enable_attention_dp=True)
+
+    @skip_pre_blackwell
     @pytest.mark.skip_less_device_memory(100000)
     @pytest.mark.skip_less_host_memory(131072)
     def test_nvfp4_1gpu_cutedsl_ple_offload(self,

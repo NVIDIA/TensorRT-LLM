@@ -347,14 +347,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
+        routed_hidden_states = hidden_states
         use_dp_padding = False
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
         if self.enable_attention_dp and self.mapping.tp_size > 1 and is_sm_120f(
         ):
             use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
+            # Padding improves context-phase MoE communication on SM120. Keep
+            # it local to the routed experts: the shared expert operates on
+            # this rank's real tokens and must retain the unpadded row count.
+            routed_hidden_states = torch.nn.functional.pad(
+                routed_hidden_states,
                 (0, 0, 0, max(all_rank_num_tokens) - hidden_states.shape[0]))
 
         if not do_finalize:
@@ -363,11 +367,11 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 "do_finalize == False is not supported yet")
 
         def _compute_routed_output():
-            router_logits = self.gate(hidden_states)
+            router_logits = self.gate(routed_hidden_states)
             final_hidden_states = self.experts(
-                hidden_states,
+                routed_hidden_states,
                 router_logits,
-                output_dtype=hidden_states.dtype,
+                output_dtype=routed_hidden_states.dtype,
                 all_rank_num_tokens=all_rank_num_tokens,
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
