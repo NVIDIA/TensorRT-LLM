@@ -15,12 +15,12 @@
 
 """Per-provider kernel entry points for the TRTLLM-Gen MoE leaves.
 
-The two implementations differ in real ways -- FlashInfer translates activation
-and routing enums and probes which module a given release keeps them in, the
-native one validates SiTu inputs and picks between the NVFP4 and MXFP4 ops --
-so the argument marshalling in ``trtllm_gen/fp4_block_scale.py`` and
-``trtllm_gen/fp8_block_scale.py`` can be written once per weight format and
-shared by that format's native and FlashInfer leaves.
+Every quantized leaf runs on :class:`TRTLLMOpBackend`, the in-tree ``trtllm``
+ops, which validates SiTu inputs and picks between the NVFP4 and MXFP4 runners.
+The unquantized leaf runs on :class:`FlashinferOpBackend`, whose only runner is
+``run_bf16_moe``: TRT-LLM's own cubins have no bf16 x bf16 kernel. A method a
+provider does not implement raises ``NotImplementedError`` from
+:class:`MoEOpBackend`.
 
 Follow-up (TRTLLM-16387): this is a vtable, not a factory. Provider choice now
 happens in ``can_implement`` plus ``IMPL_PRIORITY``, so
@@ -552,20 +552,18 @@ class TRTLLMOpBackend(MoEOpBackend):
         tune_max_num_tokens=8192,
     ):
         raise NotImplementedError(
-            "TRTLLM native op backend does not support unquantized BF16 TRTLLM-Gen fused MoE. "
-            "Enable FlashInfer fused MoE for TRTLLM backend."
+            "TRTLLM native op backend does not support unquantized BF16 TRTLLM-Gen fused MoE; "
+            "the unquantized format runs on the FlashInfer provider."
         )
 
 
 # ==================== Flashinfer Backend ====================
 @register_op_backend("flashinfer")
 class FlashinferOpBackend(MoEOpBackend):
-    """Flashinfer op backend implementation."""
+    """Flashinfer op backend implementation, for the unquantized BF16 runner."""
 
     def __init__(self):
         import flashinfer.fused_moe as _flashinfer_fused_moe
-        from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
-        from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
 
         # Flashinfer reorganised these enums across releases:
         #   - 0.6.9 release (main):    RoutingMethodType in flashinfer.fused_moe,
@@ -587,8 +585,6 @@ class FlashinferOpBackend(MoEOpBackend):
         self._activation_type = _flashinfer_activation_type
         self._routing_method_type = _flashinfer_routing_method_type
         self._fused_moe = _flashinfer_fused_moe
-        self._fp4_quantize = _flashinfer_fp4_quantize
-        self._mxfp8_quantize = _flashinfer_mxfp8_quantize
 
         # need to add this to the flashinfer side
         os.environ["FLASHINFER_EXTRA_LDFLAGS"] = "-Wl,-Bsymbolic-functions"
@@ -623,255 +619,7 @@ class FlashinferOpBackend(MoEOpBackend):
             raise ValueError(f"Unsupported routing method type: {routing_method_type}")
         return int(_mapping[routing_method_type])
 
-    # Quantization
-    def fp4_quantize(
-        self,
-        input: torch.Tensor,
-        global_scale: Optional[torch.Tensor] = None,
-        sf_vec_size: int = 16,
-        sf_use_ue8m0: bool = False,
-        is_sf_swizzled_layout: bool = True,
-        is_sf_8x4_layout: bool = False,
-        enable_pdl: Optional[bool] = None,
-    ):
-        # Keyword binding: the provider inserts new options (e.g.
-        # ``is_global_scale_inversed``) ahead of ``enable_pdl`` in the
-        # positional signature, so positional calls misbind across releases.
-        return self._fp4_quantize(
-            input,
-            global_scale=global_scale,
-            sf_vec_size=sf_vec_size,
-            sf_use_ue8m0=sf_use_ue8m0,
-            is_sf_swizzled_layout=is_sf_swizzled_layout,
-            is_sf_8x4_layout=is_sf_8x4_layout,
-            enable_pdl=enable_pdl,
-        )
-
-    def mxfp8_quantize(
-        self,
-        input: torch.Tensor,
-        is_sf_swizzled_layout: bool = True,
-        alignment: int = 32,
-        enable_pdl: Optional[bool] = None,
-    ):
-        return self._mxfp8_quantize(
-            input, is_sf_swizzled_layout, alignment=alignment, enable_pdl=enable_pdl
-        )
-
     # MoE Runners
-    def run_fp8_block_scale_moe(
-        self,
-        router_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        num_experts,
-        top_k,
-        num_fused_shared_experts,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        routing_method_type,
-        topk_weights=None,
-        topk_ids=None,
-        gated_act_type=0,
-        gemm1_clamp_limit=None,
-        output=None,
-        use_shuffled_weight=False,
-        weight_layout=0,
-        enable_pdl=None,
-        tune_max_num_tokens=8192,
-        use_dp=False,
-    ):
-        assert not num_fused_shared_experts, (
-            "Flashinfer backend does not support fusing shared experts"
-        )
-        if gemm1_clamp_limit is not None:
-            raise NotImplementedError(
-                "FlashinferOpBackend.run_fp8_block_scale_moe does not yet "
-                "forward gemm1_clamp_limit; use the trtllm op backend."
-            )
-        if router_logits is not None:
-            return self._fused_moe.trtllm_fp8_block_scale_moe(
-                router_logits,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale,
-                gemm1_weights,
-                gemm1_weights_scale,
-                gemm2_weights,
-                gemm2_weights_scale,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                enable_pdl=enable_pdl,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-        else:
-            packed_topk_ids = (topk_ids << 16) | topk_weights.view(torch.int16).to(torch.int32)
-            # Run with pre-computed routing (packed format)
-            return self._fused_moe.trtllm_fp8_block_scale_routed_moe(
-                topk_ids=packed_topk_ids,
-                routing_bias=routing_bias,
-                hidden_states=hidden_states,
-                hidden_states_scale=hidden_states_scale,
-                gemm1_weights=gemm1_weights,
-                gemm1_weights_scale=gemm1_weights_scale,
-                gemm2_weights=gemm2_weights,
-                gemm2_weights_scale=gemm2_weights_scale,
-                num_experts=num_experts,
-                top_k=top_k,
-                n_group=n_group,
-                topk_group=topk_group,
-                intermediate_size=intermediate_size,
-                local_expert_offset=local_expert_offset,
-                local_num_experts=num_experts,
-                routed_scaling_factor=routed_scaling_factor,
-                routing_method_type=self.cvt_routing_method_type(routing_method_type),
-                use_shuffled_weight=use_shuffled_weight,
-                weight_layout=weight_layout,
-                enable_pdl=enable_pdl,
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-
-    def run_fp4_block_scale_moe(
-        self,
-        router_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm1_bias,
-        gemm1_alpha,
-        gemm1_beta,
-        gemm1_clamp_limit,
-        gemm2_weights,
-        gemm2_weights_scale,
-        gemm2_bias,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        routing_method_type,
-        do_finalize=True,
-        topk_weights=None,
-        topk_ids=None,
-        valid_hidden_size=None,
-        valid_intermediate_size=None,
-        enable_pdl=None,
-        gated_act_type=0,
-        output=None,
-        tune_max_num_tokens=8192,
-        use_dp=False,
-    ):
-        # The framework hands the scales over token-major 2-D as
-        # ``quantize_input`` produced them, which is exactly what the
-        # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.
-        if router_logits is not None:
-            outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
-                router_logits,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale.view(torch.float8_e4m3fn)
-                if hidden_states_scale is not None
-                else None,
-                gemm1_weights,
-                gemm1_weights_scale.view(torch.float8_e4m3fn),
-                gemm1_bias,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
-                gemm2_weights,
-                gemm2_weights_scale.view(torch.float8_e4m3fn),
-                gemm2_bias,
-                output1_scale_scalar,
-                output1_scale_gate_scalar,
-                output2_scale_scalar,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                activation_type=self.cvt_activation_type(gated_act_type),
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-        else:
-            packed_tensor = (topk_ids.to(torch.int32) << 16) | topk_weights.to(torch.bfloat16).view(
-                torch.int16
-            )
-            outputs = self._fused_moe.trtllm_fp4_block_scale_routed_moe(
-                packed_tensor,
-                routing_bias,
-                hidden_states,
-                hidden_states_scale.view(torch.float8_e4m3fn)
-                if hidden_states_scale is not None
-                else None,
-                gemm1_weights,
-                gemm1_weights_scale.view(torch.float8_e4m3fn),
-                gemm1_bias,
-                gemm1_alpha,
-                gemm1_beta,
-                gemm1_clamp_limit,
-                gemm2_weights,
-                gemm2_weights_scale.view(torch.float8_e4m3fn),
-                gemm2_bias,
-                output1_scale_scalar,
-                output1_scale_gate_scalar,
-                output2_scale_scalar,
-                num_experts,
-                top_k,
-                n_group,
-                topk_group,
-                intermediate_size,
-                local_expert_offset,
-                local_num_experts,
-                routed_scaling_factor,
-                self.cvt_routing_method_type(routing_method_type),
-                do_finalize=do_finalize,
-                enable_pdl=enable_pdl,
-                activation_type=self.cvt_activation_type(gated_act_type),
-                output=output,
-                tune_max_num_tokens=tune_max_num_tokens,
-            )
-        if not do_finalize:
-            if outputs[2].dim() != 2:
-                outputs[2] = outputs[2].view(-1, top_k)
-            return outputs
-        else:
-            final_hidden_states = outputs[0]
-            return final_hidden_states
-
     def run_bf16_moe(
         self,
         router_logits,

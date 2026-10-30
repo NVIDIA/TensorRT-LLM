@@ -388,7 +388,6 @@ class ConfigurableMoE(MoE):
         # enforce ``moe.comm is None`` without ``getattr`` guards.
         self.backend = backend
         self._reject_non_divisible_ep_backend()
-        self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
         # backend code path that reads e.g. ``self.layer_load_balancer`` or
@@ -666,7 +665,6 @@ class ConfigurableMoE(MoE):
             # Currently the TRTLLMGEN reduce sum internally.
             # Keep updated with more supported backends.
             alltoall_result_do_sum=True,
-            use_flashinfer=self.use_flashinfer,
             hidden_size=self.hidden_size,
             communication_method=self.communication_method,
             allow_alltoall=self.backend.supports_alltoall,

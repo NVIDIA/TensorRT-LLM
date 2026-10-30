@@ -221,7 +221,7 @@ Still on old path (standalone, with embedded communication):
 | `routing.py` | Routing methods (`TopKRouting`, etc.) |
 | `moe_comm_timeout_guard.py` | Device-side timeouts of communication kernels, relaxed during warmup — budget resolution and `MoECommTimeoutProxy` registration (see [Communication timeouts](#communication-timeouts)) |
 | `moe_load_balancer.py` | EPLB implementation |
-| `moe_op_backend.py` | Op backend registry for TRTLLMGen (flashinfer/trtllm ops) |
+| `moe_op_backend.py` | Op backend registry for TRTLLMGen: `trtllm` ops for every quantized leaf, the FlashInfer bf16 runner for the unquantized one |
 
 ### Backends (`fused_moe/`)
 
@@ -308,48 +308,39 @@ holds no code: it defines `TRTLLMGenFusedMoE` (the abstract
 |------|------|
 | `identity.py` | TRTLLM-Gen's values of the types `impl_identity.py` defines: the identity constants (`PROVIDER_*`, `TECHNIQUE_TRTLLM_GEN`, `KERNEL_FUSED_MOE`), the two published contracts (`TRTLLM_GEN_CAPABILITIES`, `TRTLLM_GEN_INPUT_REQUIREMENT`), and the `trtllm_gen_descriptor` factory that stamps those segments into what the registry reads |
 | `base.py` | `TrtllmGenFusedMoEBase` — the abstract root every leaf shares: construction, the weight-creation skeleton, the two routing predicates the framework reads off a module, the fake-output shapes. Reads both axes as leaf-declared attributes and overridable hooks, never as a branch on `quant_config` or the provider string |
-| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. Two leaves per format, one per provider |
-| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. Two leaves. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
+| `fp4_block_scale.py` | `run_fp4_block_scale_moe` and the formats that reach it — NVFP4, W4A16_MXFP4, W4A8_MXFP4_MXFP8 — each supplying only its weight/input preparation, its SiTu alignment, and its scale group size. One leaf per format |
+| `fp8_block_scale.py` | DeepSeek-style FP8 with 1x128 block scales: `run_fp8_block_scale_moe`, the narrowed activation ABI (scalar clamp), and shared-expert fusion. One leaf. Shares nothing with the fp4 module, which is why the two sit side by side rather than under a common quant layer |
 | `eligibility.py` | the eligibility checks each leaf's `can_implement` composes, as free functions — every caller is a leaf |
 | `kernel_inputs.py` | the `run_moe` prologue the kernel bodies share, as free functions taking the impl |
 | `trtllm_<quant>.py` | one registered native leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `w4a8_nvfp4_fp8`, `w4a8_mxfp4_fp8` |
-| `flashinfer_<quant>.py` | one registered FlashInfer leaf each: `nvfp4`, `fp8_block_scales`, `w4a16_mxfp4`, `w4a8_mxfp4_mxfp8`, `bf16` |
+| `flashinfer_bf16.py` | the one registered FlashInfer leaf: the unquantized format, which TRT-LLM's own cubins do not cover |
 
 #### The leaves
 
 Module names carry the two identity segments that differ: `provider` — the
 in-tree `trtllm` ops or the FlashInfer package — and `quant`. Technique and
 kernel are `trtllm_gen` / `fused_moe` for every leaf, which the package name
-says once. The grid is not full: FlashInfer has no `w4a8_nvfp4_fp8` or
-`w4a8_mxfp4_fp8` runner and alone serves the unquantized format, so some
-cells of the provider x format grid have no leaf.
+says once. Each format has exactly one leaf: every quantized format runs on the
+native provider, and FlashInfer serves only the unquantized format, for which
+TRT-LLM ships no bf16 x bf16 cubins.
 
-| `quant` segment | `trtllm.` leaf | `flashinfer.` leaf |
-|---|---|---|
-| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` | `FlashinferTrtllmGenNvfp4Impl` |
-| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` | `FlashinferTrtllmGenFp8BlockScalesImpl` |
-| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` | `FlashinferTrtllmGenW4a16Mxfp4Impl` |
-| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` | `FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl` |
-| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` | — |
-| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` | — |
-| `none` (BF16) | — | `FlashinferTrtllmGenBf16Impl` |
+| `quant` segment | Leaf |
+|---|---|
+| `nvfp4` | `TrtllmTrtllmGenNvfp4Impl` |
+| `fp8_block_scales` | `TrtllmTrtllmGenFp8BlockScalesImpl` |
+| `w4a16_mxfp4` | `TrtllmTrtllmGenW4a16Mxfp4Impl` |
+| `w4a8_mxfp4_mxfp8` | `TrtllmTrtllmGenW4a8Mxfp4Mxfp8Impl` |
+| `w4a8_nvfp4_fp8` | `TrtllmTrtllmGenW4a8Nvfp4Fp8Impl` |
+| `w4a8_mxfp4_fp8` | `TrtllmTrtllmGenW4a8Mxfp4Fp8Impl` |
+| `none` (BF16) | `FlashinferTrtllmGenBf16Impl` |
 
 Ids follow the class names (`trtllm.trtllm_gen.fused_moe.nvfp4`,
 `flashinfer.trtllm_gen.fused_moe.none`), keeping the technique and kernel
 segments so a future non-TRTLLM-Gen kernel from the same wheel stays
-distinguishable. The two native-only formats subclass the family base directly:
-a per-quant parent implementing three methods for one subclass buys nothing.
-
-The provider split is a policy call, not a capability one. With the FlashInfer
-wheel installed a `TRTLLM` literal still picks the native leaf, and only
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER=1` moves it — read through
-`MoEEnvironment.env_flag`, so `can_implement` never touches `os.environ`. A
-FlashInfer leaf asked for without the flag declines with `PATH_NOT_ENABLED`,
-which distinguishes "not chosen" from "not installed" (`DEP_MISSING`).
-`IMPL_PRIORITY` lists each FlashInfer leaf ahead of the native leaf of the same
-format, so the flag alone decides the order the two are asked in.
-`FlashinferTrtllmGenBf16Impl` is outside that policy — see the `§` footnote
-under [Quantization Support](#quantization-support).
+distinguishable. The two native formats on runner ops of their own subclass the
+family base directly: a per-quant parent implementing three methods for one
+subclass buys nothing. Because the `quant` segments are disjoint, the order of
+the TRTLLM-Gen leaves within `IMPL_PRIORITY` does not matter.
 
 Only a registered class may be resolved to, and importing the package is what
 registers, which `moe_resolution` guarantees. `trtllm_gen_leaf` sits at the
@@ -660,8 +651,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 § The unquantized TRTLLM-Gen path is `FlashinferTrtllmGenBf16Impl`, and it is
 not a TRTLLM-Gen kernel at all: it calls FlashInfer's `trtllm_bf16_moe` /
 `trtllm_bf16_routed_moe`, which is why it is gated on
-`MoEDep.FLASHINFER_BF16_MOE` rather than on a quant algo or on the
-`TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER` opt-in, and why `TRTLLMOpBackend` raises
+`MoEDep.FLASHINFER_BF16_MOE` and why `TRTLLMOpBackend` raises
 `NotImplementedError` for it. It is the only leaf reachable on a host with no
 quantization configured at all. The row reads `Y` because `can_implement`
 really can select it; without the FlashInfer symbols the layer degrades to

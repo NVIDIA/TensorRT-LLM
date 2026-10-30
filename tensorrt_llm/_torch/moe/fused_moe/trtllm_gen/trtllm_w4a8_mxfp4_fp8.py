@@ -29,8 +29,8 @@ from .kernel_inputs import prepare_kernel_inputs
 class TrtllmTrtllmGenW4a8Mxfp4Fp8Impl(TrtllmGenFusedMoEBase):
     """``trtllm.trtllm_gen.fused_moe.w4a8_mxfp4_fp8``.
 
-    Single-provider like the NVFP4/FP8 leaf, and likewise on its own runner op
-    rather than ``self.op_backend``.
+    On its own runner op like the NVFP4/FP8 leaf, and likewise called directly
+    rather than through ``self.op_backend``.
     """
 
     descriptor = trtllm_gen_descriptor(

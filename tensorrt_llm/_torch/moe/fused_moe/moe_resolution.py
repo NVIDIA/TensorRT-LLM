@@ -61,10 +61,6 @@ from .mega_moe import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, TrtllmCutedslMegaMoeNvfp4I
 from .moe_load_balancer import get_moe_load_balancer
 from .trtllm_gen import (
     FlashinferTrtllmGenBf16Impl,
-    FlashinferTrtllmGenFp8BlockScalesImpl,
-    FlashinferTrtllmGenNvfp4Impl,
-    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
-    FlashinferTrtllmGenW4a16Mxfp4Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenW4a8Mxfp4Fp8Impl,
@@ -107,18 +103,9 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslFusedFc12Nvfp4Impl,
-    # The TRTLLM-Gen leaves. FlashInfer sits ahead of the native leaf
-    # for the same format because the opt-in flag is what selects it: with the
-    # flag unset every FlashInfer leaf rejects in ``check_flashinfer_provider``
-    # and resolution walks on to the native one below.
-    #
-    # Order within a provider does not matter: the ``quant`` segments are
-    # disjoint, so at most one leaf per provider can admit a given problem.
-    FlashinferTrtllmGenNvfp4Impl,
-    FlashinferTrtllmGenFp8BlockScalesImpl,
-    FlashinferTrtllmGenW4a16Mxfp4Impl,
-    FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
-    FlashinferTrtllmGenBf16Impl,  # no native counterpart; flag-independent
+    # The TRTLLM-Gen leaves. Order among them does not matter: the ``quant``
+    # segments are disjoint, so at most one leaf can admit a given problem.
+    FlashinferTrtllmGenBf16Impl,  # the unquantized format; no native counterpart
     TrtllmTrtllmGenNvfp4Impl,
     TrtllmTrtllmGenFp8BlockScalesImpl,
     TrtllmTrtllmGenW4a16Mxfp4Impl,
@@ -159,10 +146,6 @@ BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     # which. A pinned ``impl_id`` names exactly one of them.
     "TRTLLM": frozenset(
         {
-            FlashinferTrtllmGenNvfp4Impl,
-            FlashinferTrtllmGenFp8BlockScalesImpl,
-            FlashinferTrtllmGenW4a16Mxfp4Impl,
-            FlashinferTrtllmGenW4a8Mxfp4Mxfp8Impl,
             FlashinferTrtllmGenBf16Impl,
             TrtllmTrtllmGenNvfp4Impl,
             TrtllmTrtllmGenFp8BlockScalesImpl,

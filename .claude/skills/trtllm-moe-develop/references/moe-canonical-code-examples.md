@@ -90,7 +90,7 @@ only names the code that demonstrates them. Paths are relative to
     `find_cutlass_leaf` / `cutlass_leaf`; gates composed in `eligibility.py`.
   - `trtllm_gen/`: per-kernel-ABI layers (`fp4_block_scale.py`,
     `fp8_block_scale.py`) between `TrtllmGenFusedMoEBase` and the
-    `trtllm_<quant>.py` / `flashinfer_<quant>.py` leaves.
+    `trtllm_<quant>.py` leaves and the unquantized `flashinfer_bf16.py` leaf.
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.
   - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
