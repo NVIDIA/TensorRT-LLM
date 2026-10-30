@@ -75,7 +75,10 @@ class TritonPosEmbedInterpolate(OpWrapper):
 
     note = """
     Source: a Triton JIT kernel, compiled at first call for the device it runs
-    on; the cells ran that JIT path on sm_103 (GB300). Tier 2: a callable already
+    on. On GB300 the compiled kernel's target is `GPUTarget(arch=103)` and its PTX
+    `.target sm_103a`; `H` and `W` are int32, the scales fp32, and `NUM_GRID`,
+    `M_SIZE`, `HIDDEN_DIM` (1152) and `BLOCK_D` (2048) are constexprs, so another
+    table geometry compiles another kernel. Tier 2: a callable already
     in the tree (a private function of the stock Qwen3-VL modeling file), not a
     registered `torch.ops.trtllm` op. Importing this entry imports
     `modeling_qwen3vl`.
