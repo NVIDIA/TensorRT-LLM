@@ -438,24 +438,6 @@ class Gemma4ToolParser(BaseToolParser):
                                 ]
                             )
 
-                # Stream raw argument text incrementally
-                if self._current_func_name is not None:
-                    prefix = BOT_TOKEN + CALL_PREFIX + self._current_func_name + "{"
-                    if current_text.startswith(prefix) and len(current_text) > len(prefix):
-                        args_so_far = current_text[len(prefix) :]
-                        already_sent = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_so_far) > len(already_sent):
-                            diff = args_so_far[len(already_sent) :]
-                            self.streamed_args_for_tool[self.current_tool_id] += diff
-                            return StreamingParseResult(
-                                calls=[
-                                    ToolCallItem(
-                                        tool_index=self.current_tool_id,
-                                        parameters=diff,
-                                    )
-                                ]
-                            )
-
                 return StreamingParseResult()
 
             # Found end token - complete the tool call
@@ -504,6 +486,8 @@ class Gemma4ToolParser(BaseToolParser):
                                 parameters=args_json,
                             )
                         )
+
+                    self.streamed_args_for_tool[self.current_tool_id] = args_json
 
                     # Store for serving layer
                     try:
