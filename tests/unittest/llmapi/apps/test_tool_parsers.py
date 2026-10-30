@@ -3267,8 +3267,9 @@ def test_deepseek_finish_completes_a_call_from_the_last_delta(
     assert [
         (name, json.loads(arguments)) for name, arguments in streamed.values()
     ] == [(call.name, json.loads(call.parameters)) for call in whole.calls]
-    assert [call["arguments"] for call in parser.prev_tool_call_arr
-            ] == [json.loads(call.parameters) for call in whole.calls]
+    for call in results[-1].calls:
+        assert parser.prev_tool_call_arr[call.tool_index]["arguments"] == json.loads(
+            streamed[call.tool_index][1])
 
 
 @pytest.mark.parametrize(
