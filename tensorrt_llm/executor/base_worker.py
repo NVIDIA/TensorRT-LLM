@@ -512,6 +512,7 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logprobs_simple_format)
             executor_request.py_return_routed_experts = (
                 request.sampling_params.return_routed_experts)
+            executor_request.py_watermarking = request.sampling_params.watermarking
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if request.disaggregated_params is not None:

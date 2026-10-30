@@ -684,6 +684,13 @@ class CompletionRequest(OpenAIBaseModel):
     return_context_logits: bool = False
     detokenize: bool = True
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     # doc: end-completion-sampling-params
 
     # doc: begin-completion-extra-params
@@ -768,6 +775,7 @@ class CompletionRequest(OpenAIBaseModel):
                 self.response_format),
             detokenize=self.detokenize,
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(
@@ -1140,6 +1148,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # template understands it (e.g. kimi_k3); other models ignore it.
     thinking: Optional[ChatCompletionThinkingParam] = None
     thinking_token_budget: Optional[int] = None
+    watermarking: Optional[bool] = Field(
+        default=None,
+        description=
+        ("Whether to watermark the generated text. Takes effect only when the "
+         "server is configured with `watermark_config`. None or true requests a "
+         "watermark; false opts out when the server allows it."),
+    )
     prompt_ignore_length: Optional[int] = 0
     # Match Codex CLI's string-map contract; widen only for a client that needs
     # other value types, even though the metadata is otherwise ignored.
@@ -1327,6 +1342,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 reasoning_parser=reasoning_parser,
                 chat_template_kwargs=self.chat_template_kwargs),
             thinking_token_budget=self.thinking_token_budget,
+            watermarking=self.watermarking,
 
             # logits_bias
             embedding_bias=_logit_bias_to_embedding_bias(

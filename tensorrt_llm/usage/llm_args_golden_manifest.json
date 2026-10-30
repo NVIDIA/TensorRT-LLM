@@ -2049,6 +2049,53 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "use_fine_grained_sync"
+    },
+    {
+      "allowed_values": [
+        "gumbel",
+        "gumbel_dual_key"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.algorithm"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_request_opt_out"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "watermark_config.allow_target_only_watermarking"
+    },
+    {
+      "capture_policy": "int",
+      "kind": "value",
+      "path": "watermark_config.context_width"
+    },
+    {
+      "allowed_values": [
+        "none",
+        "single_turn",
+        "all"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.deduplicate_contexts"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "watermark_config.deduplicate_contexts_max_history"
+    },
+    {
+      "allowed_values": [
+        "philox"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "watermark_config.prf"
     }
   ]
 }

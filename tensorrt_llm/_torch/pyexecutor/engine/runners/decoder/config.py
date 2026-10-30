@@ -3,7 +3,8 @@
 
 """Resolved settings for scheduled decoder execution."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -14,6 +15,9 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 
 from ..interface import RunnerConfig
+
+if TYPE_CHECKING:
+    from tensorrt_llm.watermark.config import WatermarkConfig
 
 
 @dataclass(frozen=True)
@@ -48,3 +52,4 @@ class DecoderRunnerConfig(RunnerConfig):
     mm_encoder_cache_enabled: bool
     enable_autotuner: bool
     cuda_graph_specialize_lora: bool
+    watermark_config: "WatermarkConfig | None" = field(default=None, kw_only=True)

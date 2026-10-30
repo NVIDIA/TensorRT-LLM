@@ -36,6 +36,7 @@ from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
 from tensorrt_llm.sampling_params import LogprobMode
+from tensorrt_llm.watermark import WatermarkConfig
 
 
 def repr_annotation(field_type: type) -> str:

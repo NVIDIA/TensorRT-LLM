@@ -528,6 +528,9 @@ class RequestBroadcaster:
                 "py_logprobs_simple_format",
                 "py_return_routed_experts",
                 "py_arrival_time",
+                # A request's opt-out of the text watermark must reach every rank: ranks that
+                # disagree on whether to watermark a request sample different tokens.
+                "py_watermarking",
             )
         ]
         py_objects.extend(
