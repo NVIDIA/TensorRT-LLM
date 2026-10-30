@@ -200,6 +200,29 @@ def test_swa_window_conventions():
     assert dspark_layer_window_size(True, 8, None, 0) == (7, 7)
 
 
+def test_swa_window_all_full_attention_layer_types():
+    """use_swa with no sliding layer declared windows every layer.
+
+    Some windowed DFlash 2 drafters list every layer as `full_attention` and
+    carry the window in `dflash_config`; reading those layer types literally
+    would serve them with full attention and lose acceptance silently.
+    """
+    full = ["full_attention"] * 5
+    for layer_idx in range(len(full)):
+        assert dspark_layer_window_size(True, 2048, full, layer_idx) == (2047, 2047)
+
+    # Without use_swa the same layer types keep flash-attn's default.
+    for layer_idx in range(len(full)):
+        assert dspark_layer_window_size(False, 2048, full, layer_idx) == (-1, -1)
+    assert dspark_layer_window_size(False, 0, None, 0) == (-1, -1)
+
+    # A checkpoint that tells sliding layers from full ones keeps the per-layer windows.
+    mixed = ["sliding_attention", "full_attention", "sliding_attention"]
+    assert dspark_layer_window_size(True, 512, mixed, 0) == (511, 511)
+    assert dspark_layer_window_size(True, 512, mixed, 1) == (-1, -1)
+    assert dspark_layer_window_size(True, 512, mixed, 2) == (511, 511)
+
+
 # ---------------------------------------------------------------------------
 # Tiny end-to-end drafter: config parsing, weight loading, block-decode
 # parity vs an eager bf16 reference (needs CUDA + flash_attn).

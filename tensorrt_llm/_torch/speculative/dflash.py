@@ -1535,7 +1535,12 @@ class DFlashWorker(SpecWorkerBase):
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            # Only TRTLLM attention metadata keeps device-side KV lengths; on
+            # other backends (FlashInfer) there is nothing to save.
+            fields = ["_seq_lens", "_seq_lens_cuda"]
+            if hasattr(attn_metadata, "kv_lens_cuda"):
+                fields.append("kv_lens_cuda")
+            attn_metadata.prepare_for_spec_dec(*fields)
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
@@ -1953,6 +1958,11 @@ class DFlashWorker(SpecWorkerBase):
                     gen_logits = draft_model.logits_processor(
                         gen_hidden_states, draft_model.lm_head, attn_metadata, True
                     )
+                    # The drafter shares the target's LM head but not its logits
+                    # processor, so apply the transform its config declares,
+                    # before any refinement: a DSpark Markov bias is added to
+                    # the transformed logits.
+                    gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
 
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
