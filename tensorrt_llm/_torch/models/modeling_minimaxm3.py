@@ -3102,6 +3102,8 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
     blobs under that namespace.
     """
 
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     lora_owner = DecoderLoraOwner(module_path="model")
 
     def __init__(self, model_config: "ModelConfig[PretrainedConfig]"):

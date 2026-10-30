@@ -815,6 +815,21 @@ class MultimodalEncoderSchedulingPolicy(StrEnum):
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
+    encoder_attention_backend: dict[str, Literal[
+        "VANILLA", "TRTLLM", "FLASHINFER"]] | None = Field(
+            default=None,
+            description=
+            ("TensorRT-LLM attention backend for each logical multimodal encoder, "
+             "for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, "
+             "and FLASHINFER. Image and video share the vision encoder. Only encoders "
+             "using TensorRT-LLM Attention support this option; encoders using fixed "
+             "attention reject overrides at initialization. Omitted entries retain "
+             "their model-specific defaults and the language model's attn_backend "
+             "is unchanged. Unsupported encoders or backends raise an error."),
+            status="prototype",
+            telemetry=False,
+        )
+
     encoder_cuda_graph: dict[str, MultimodalEncoderCudaGraphConfig] | None = Field(
         default=None,
         description=
@@ -882,6 +897,16 @@ class MultimodalConfig(StrictBaseModel):
     @classmethod
     def parse_encoder_cache_max_bytes(cls, value):
         return _parse_binary_byte_string(value)
+
+    @field_validator('encoder_attention_backend', mode='before')
+    @classmethod
+    def normalize_encoder_attention_backend(cls, value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                name: backend.upper() if isinstance(backend, str) else backend
+                for name, backend in value.items()
+            }
+        return value
 
     @model_validator(mode='after')
     def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':

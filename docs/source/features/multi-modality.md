@@ -27,6 +27,42 @@ TensorRT LLM incorporates some key optimizations to enhance the performance of m
 
 Further optimizations are under development and will be updated as they become available.
 
+## Encoder attention backends
+
+`multimodal_config.encoder_attention_backend` selects a TensorRT-LLM attention backend for each logical encoder. The public values are `VANILLA` (PyTorch scaled dot product attention), `TRTLLM`, and `FLASHINFER`; values are case-insensitive. Image and video inputs share the `vision` encoder.
+
+```yaml
+multimodal_config:
+  encoder_attention_backend:
+    vision: FLASHINFER
+```
+
+The same setting is available in the Python API:
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(
+    model="Qwen/Qwen3-VL-8B-Instruct",
+    multimodal_config={"encoder_attention_backend": {"vision": "VANILLA"}},
+)
+```
+
+Omitted entries preserve the model's existing encoder defaults, including inheritance from `attn_backend` where applicable. An encoder override leaves the language model's backend unchanged. Backend availability and supported tensor shapes still depend on the installed kernels and hardware; floating-point differences between backends are expected.
+
+| Encoder | Supported values | Default when omitted |
+| --- | --- | --- |
+| Qwen2.5-VL, Qwen3-VL / Qwen3.5-VL vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | Existing `attn_backend` |
+| Gemma 4 vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `TRTLLM` |
+| Kimi K2.5 / K3, MiniCPM-V 4.6, Step 3.7 vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | Existing `attn_backend` |
+| Mistral3 / Pixtral vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `TRTLLM` |
+| Nemotron multimodal vision | `VANILLA`, `TRTLLM`, `FLASHINFER` | `FLASHINFER` |
+| GLM5-Next vision | `TRTLLM` | Existing `attn_backend` |
+
+For MiniCPM-V 4.6, the selection applies to its TensorRT-LLM attention layers; its fixed window-merger attention is unchanged.
+
+Only the declared encoders using TensorRT-LLM's `Attention` support this setting. Qwen2-VL's Hugging Face vision encoder, VILA's Hugging Face CLIP/SigLIP towers, Phi-4-multimodal's Hugging Face encoder, Parakeet audio, Gemma 4 audio, and MiniMax M3 / DeepSeek V4.1 vision keep their fixed attention implementations. Overrides for these encoders fail during initialization, even if the requested value is `VANILLA`. Gemma 4 Unified has no configurable attention encoder. Unknown encoder names and unsupported backends also fail during initialization; Hugging Face `attn_implementation` names are not accepted.
+
 ## Model Support Matrix
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).

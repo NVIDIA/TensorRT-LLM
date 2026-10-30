@@ -647,6 +647,7 @@ class Glm5NextVisionModelBase(nn.Module):
         vlm_base_model: Optional[type[nn.Module]] = None,
     ) -> None:
         super().__init__()
+        model_config = model_config.with_encoder_attention_backend("vision")
         self.model_config = model_config
         self.model_dtype = _text_dtype(model_config)
         # The tower is excluded from checkpoint quantization (BF16 in
@@ -1027,6 +1028,8 @@ class Glm5NextVLM(MultimodalModelMixin, PreTrainedModel):
     The inner decoder owns recurrent/KV state and speculative decoding. Text-only
     requests bypass the vision tower, which runs full attention without KV cache.
     """
+
+    supported_encoder_attention_backends = {"vision": frozenset({"TRTLLM"})}
 
     _supports_flash_attn = True
     _supports_sdpa = True

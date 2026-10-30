@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import contextlib
+import copy
 import errno
 import json
 import os
@@ -358,6 +359,32 @@ class ModelConfig(Generic[TConfig]):
     # The modeling_v2 target class to build, or None for the built-in
     # implementation. Set by the model loader, read by `_resolve_class`.
     modeling_v2_target: Optional[type] = None
+
+    def get_encoder_attention_backend(self, encoder: str, default: str) -> str:
+        """Select a logical encoder's backend, preserving its existing default."""
+        overrides = (self.multimodal_config.encoder_attention_backend
+                     if self.multimodal_config is not None else None)
+        if not overrides or encoder not in overrides:
+            return default
+        backend = overrides[encoder]
+        if backend not in ("VANILLA", "TRTLLM", "FLASHINFER"):
+            raise ValueError(
+                f"Invalid attention backend {backend!r} for the {encoder} encoder; "
+                "expected VANILLA, TRTLLM, or FLASHINFER")
+        return backend
+
+    def with_encoder_attention_backend(self,
+                                       encoder: str,
+                                       default: str | None = None
+                                       ) -> "ModelConfig":
+        """Apply an encoder selection to a shallow copy without changing the decoder."""
+        backend = self.get_encoder_attention_backend(
+            encoder, self.attn_backend if default is None else default)
+        if backend == self.attn_backend:
+            return self
+        config = copy.copy(self)
+        object.__setattr__(config, "attn_backend", backend)
+        return config
 
     @property
     def kv_cache_layer_specs(self) -> Optional[Tuple[KVCacheLayerSpec, ...]]:

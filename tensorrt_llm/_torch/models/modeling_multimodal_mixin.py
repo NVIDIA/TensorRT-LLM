@@ -427,6 +427,12 @@ class MultimodalModelMixin:
     `BaseMultimodalInputProcessor.get_mm_item_metadata`. This is the executor-layer gate for
     item scheduling."""
 
+    # TODO: Move capability declarations into the planned single
+    # SupportsMultimodal Protocol; keep shared execution in this mixin
+    # and encoder attention-metadata setup in MultimodalEncoderMixin.
+    supported_encoder_attention_backends: ClassVar[dict[str, frozenset[str]]] = {}
+    """Public backends by logical encoder; an empty set marks fixed attention."""
+
     model_config: ModelConfig
     _multimodal_encoder_cache: Optional[TensorLRUCache] = None
 

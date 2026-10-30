@@ -1815,6 +1815,7 @@ class TestMultimodalEncoderCudaGraphConfig:
 class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
+        assert MultimodalConfig().encoder_attention_backend is None
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
@@ -1824,6 +1825,7 @@ class TestMultimodalConfig:
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
+        assert args.multimodal_config.encoder_attention_backend is None
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2

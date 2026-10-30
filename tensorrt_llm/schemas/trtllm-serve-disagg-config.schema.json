@@ -5822,6 +5822,27 @@
       "additionalProperties": false,
       "description": "Multimodal model configuration.",
       "properties": {
+        "encoder_attention_backend": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "pattern": "^(?:[Vv][Aa][Nn][Ii][Ll][Ll][Aa]|[Tt][Rr][Tt][Ll][Ll][Mm]|[Ff][Ll][Aa][Ss][Hh][Ii][Nn][Ff][Ee][Rr])$(?![\\s\\S])",
+                "type": "string"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "TensorRT-LLM attention backend for each logical multimodal encoder, for example {'vision': 'FLASHINFER'}. Public values are VANILLA, TRTLLM, and FLASHINFER. Image and video share the vision encoder. Only encoders using TensorRT-LLM Attention support this option; encoders using fixed attention reject overrides at initialization. Omitted entries retain their model-specific defaults and the language model's attn_backend is unchanged. Unsupported encoders or backends raise an error.",
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Encoder Attention Backend"
+        },
         "encoder_cache_max_bytes": {
           "default": 134217728,
           "description": "Target capacity in bytes for reusable multimodal encoder embeddings; 0 disables cross-request reuse. The capacity applies per rank; ranks do not share a cache. With item scheduling, encoder outputs still use the model-owned cache and its capacity is at least one legal encoder iteration; this value can make that cache larger. String values such as '512MB' and '1GiB' use binary units. Both inline encoding and item scheduling cache individual items; inline caching supports only single-modality parameters. Compatible with side-stream prefetch.",

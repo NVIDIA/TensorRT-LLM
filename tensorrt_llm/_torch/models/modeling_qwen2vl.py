@@ -1351,6 +1351,8 @@ class Qwen2VisionModelBase(nn.Module):
                 model_class(model_config.pretrained_config.vision_config),
                 self.model_dtype).eval()
         elif model_class == Qwen2_5_VisionModel:
+            self.model_config = self.model_config.with_encoder_attention_backend(
+                "vision")
             self.visual = MultimodalModelMixin._cast_multimodal_encoder_dtype(
                 model_class(self.model_config), self.model_dtype)
         else:
@@ -2207,6 +2209,10 @@ def _qwen_vision_input_partitions(
 
 
 class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     supports_mm_encoder_item_scheduling = True
 
     def get_multimodal_item_partitions(
@@ -2489,6 +2495,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         content_format=ContentFormat.STRING,
     ))
 class Qwen2VLModel(Qwen2VLModelBase):
+
+    supported_encoder_attention_backends = {"vision": frozenset()}
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
