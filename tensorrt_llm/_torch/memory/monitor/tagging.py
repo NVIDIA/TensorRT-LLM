@@ -314,10 +314,15 @@ def _live_blocks(segments: list | None = None) -> list[tuple[int, int, bool, lis
         except Exception:  # noqa: BLE001
             logger.debug("memory monitor: snapshot failed while reading tags")
             return None
+    from .pools import is_released
+
     kinds = classify_all(segment.get("segment_pool_id", (0, 0)) for segment in segments)
     blocks = []
     for segment in segments:
-        in_graph = kinds[tuple(segment.get("segment_pool_id", (0, 0)))][0] == "graph"
+        pool_id = tuple(segment.get("segment_pool_id", (0, 0)))
+        if is_released(pool_id):
+            continue  # asleep: not resident, so not attributed
+        in_graph = kinds[pool_id][0] == "graph"
         for block in segment["blocks"]:
             if block["state"] == "active_allocated":
                 blocks.append(

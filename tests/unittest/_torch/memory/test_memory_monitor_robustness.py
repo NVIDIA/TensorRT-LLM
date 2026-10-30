@@ -114,7 +114,7 @@ class TestSleepReleasedKvCache:
         def get_kv_cache_stats(self):
             return types.SimpleNamespace(allocated_bytes=512 * MB)
 
-    def test_released_pool_is_taken_back_out(self):
+    def test_released_pool_is_listed_not_counted(self):
         from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
 
         manager = self._V1Manager()
@@ -125,7 +125,8 @@ class TestSleepReleasedKvCache:
             entries = provider.collect()
             counted = sum(e.size_bytes for e in entries if e.counts_toward_total)
             assert counted == 0
-            assert any(e.category is Category.SLEEP_RELEASED for e in entries)
+            assert all(e.released for e in entries if e.category is Category.KV_CACHE_POOL)
+            assert all(e.size_bytes >= 0 for e in entries if e.size_bytes is not None)
             pools.mark_materialized(["kv_cache"])
             assert sum(e.size_bytes for e in provider.collect()) == 512 * MB
         finally:
@@ -143,7 +144,7 @@ class TestSleepReleasedKvCache:
         try:
             release_with_tag("unit_detail")
             text = mon.render_capture(mon.capture(tag="unit"))
-            assert "nontorch_residual" in text and "sleep_released" in text
+            assert "nontorch_residual" in text and "Released by sleep mode" in text
             assert "unattributed_live" in text
         finally:
             from tensorrt_llm._torch.virtual_memory import materialize_with_tag
@@ -267,3 +268,51 @@ def test_an_unwritable_directory_does_not_lose_the_report(monkeypatch, tmp_path)
     blocker.write_text("")
     monkeypatch.setenv(triggers.DIR_VAR, str(blocker / "sub"))
     assert triggers.report_now(tag="unit") is not None
+
+
+def test_another_process_holding_the_gpu_is_named():
+    from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    gib = 1 << 30
+    device = DeviceReading(total=178 * gib, free=gib // 2, process_used=2 * gib)
+    frame = build_frame(device, TorchReading(reserved=gib, live=gib), [])
+    text = "\n".join(render_summary(frame, group_totals(frame), headline="STARTUP FAILED."))
+    assert "other processes on this GPU hold 175.50 GiB" in text
+
+
+def test_share_column_never_runs_into_the_size():
+    from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    gib = 1 << 30
+    # A residual far larger than the process, as when readings disagree.
+    device = DeviceReading(total=178 * gib, free=100 * gib, process_used=gib)
+    frame = build_frame(device, TorchReading(reserved=40 * gib, live=40 * gib), [])
+    for line in render_summary(frame, group_totals(frame)):
+        assert "GiB-" not in line and not __import__("re").search(r"GiB\d", line)
+
+
+def test_released_note_uses_readable_merged_names():
+    from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
+    from tensorrt_llm._torch.memory.monitor.pools import PoolUsage
+    from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+    gib = 1 << 30
+    pools_ = (
+        PoolUsage((0, 1), "mempool", "sleep: model_weights", gib, gib, released=True),
+        PoolUsage((0, 2), "mempool", "sleep: model", 20 * MB, 10 * MB, released=True),
+        PoolUsage((0, 3), "mempool", "sleep: model", 1 * MB, 0, released=True),
+    )
+    frame = build_frame(
+        DeviceReading(total=178 * gib, free=170 * gib, process_used=2 * gib),
+        TorchReading(reserved=0, live=0, pools=pools_),
+        [],
+    )
+    startup.record_memory_plan(non_kv_peak=3 * gib, activation=gib)
+    text = "\n".join(render_summary(frame, group_totals(frame)))
+    note = [line for line in text.splitlines() if "Released by sleep mode" in line][0]
+    assert "Model weights 1.00 GiB" in note
+    assert note.count("Model ") == 1 + note.count("Model weights")  # one merged "Model" part
+    # The startup plan describes the awake process; not compared while asleep.
+    assert "Startup plan" not in text
