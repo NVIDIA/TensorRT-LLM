@@ -3,11 +3,13 @@
 """GPU test for the gdn_decode_rows_gated_norm entry.
 
 Cells against the composition's fp64 reference (the gated delta rule's recurrence,
-then the gated norm entry's) in torch's default band for the bf16 output and the fp32
-pool, the pool compared whole so slots the call did not name are
-gated too. Beyond the cells: a stale-read check under graph replay (a producer
-rewrites the projection inside the graph right before the op), and the pool-dtype
-guard. The `gdn_decode_rows` entry (the recurrence alone) has its own cells below.
+then the gated norm entry's) in torch's default band for the bf16 output and the pool's
+dtype (fp32 or bf16), the pool compared whole so slots the call did not name are
+gated too. Beyond the cells: a fixed row bitwise across batch sizes over a bf16 pool, a
+stale-read check under graph replay (a producer rewrites the projection inside the graph
+right before the op), the two launch variants (state rows by bulk copy into shared memory,
+or loaded into registers) bitwise each other, and the guards. The `gdn_decode_rows` entry
+(the recurrence alone) has its own cells below.
 """
 
 import zlib
@@ -15,6 +17,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm import (  # noqa: E501
+    gdn_decode_rows_gated_norm as rows_mod,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows as rows_op,
 )
@@ -43,19 +48,20 @@ def _scattered(n: int, slots: int) -> tuple[int, ...]:
 def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     rows = spec["rows"]
+    state = torch.bfloat16 if spec.get("state") == "bf16" else torch.float32
     proj = torch.randn(rows, WIDTH, generator=g, device=DEV).to(torch.bfloat16)
     if spec.get("pool") == "coalesced":
         # The KV-cache-v2 manager's view: every GDN layer's state of a slot in one page,
         # this layer's state one sub-page of it, so the slot stride is 36 layers' states
         # and slot 100 sits ~2.8G elements past the base (past int32).
         layers, slots = 36, 102
-        page = torch.empty(slots * layers * HV * V * K, device=DEV)
+        page = torch.empty(slots * layers * HV * V * K, device=DEV, dtype=state)
         page[: HV * V * K * 4].normal_(0.0, 0.05, generator=g)
         pool = page.as_strided((slots, HV, V, K), (layers * HV * V * K, V * K, K, 1))
         for s in (100, 101):
             pool[s].copy_(torch.randn(HV, V, K, generator=g, device=DEV) * 0.05)
     else:
-        pool = torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05
+        pool = (torch.randn(SLOTS, HV, V, K, generator=g, device=DEV) * 0.05).to(state)
     if spec.get("pool") == "coalesced":
         slots = torch.tensor([100, 101][:rows], dtype=torch.int32, device=DEV)
     else:
@@ -84,6 +90,39 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare(out, args[1], ref_out, ref_pool)
     if cell.spec.get("pad"):
         assert (out[1] == 0).all(), "a pad row's output is zero"
+
+
+#: Decode batch sizes up to the engine's largest CUDA-graph batch.
+_BATCHES = (1, 2, 4, 5, 16, 33, 128, 256)
+_FIXED_SLOT = 301
+
+
+def test_bf16_pool_is_batch_invariant() -> None:
+    """The property the bf16 decode step relies on: a row's output and state are bitwise
+    independent of the batch it rides in. One fixed row (its projection and slot 301 of a
+    bf16 pool) sits first and last in random batches of every size."""
+    gen = torch.Generator(device=DEV).manual_seed(3)
+    cpu = torch.Generator().manual_seed(3)
+    pool0 = (torch.randn(SLOTS, HV, V, K, generator=gen, device=DEV) * 0.05).to(torch.bfloat16)
+    row = torch.randn(WIDTH, generator=gen, device=DEV).to(torch.bfloat16)
+    rest = _build(dict(rows=1), seed=3)[3:]
+    first = None
+    for n in _BATCHES:
+        for pos in sorted({0, n - 1}):
+            g = torch.Generator(device=DEV).manual_seed(1000 * n + pos)
+            proj = torch.randn(n, WIDTH, generator=g, device=DEV).to(torch.bfloat16)
+            proj[pos] = row
+            others = [s for s in torch.randperm(SLOTS, generator=cpu).tolist() if s != _FIXED_SLOT]
+            others = others[:n]
+            others[pos] = _FIXED_SLOT
+            slots = torch.tensor(others, dtype=torch.int32, device=DEV)
+            pool = pool0.clone()
+            out = op(proj, pool, slots, *rest)
+            got = (out[pos].clone(), pool[_FIXED_SLOT].clone())
+            first = first or got
+            assert torch.equal(got[0], first[0]) and torch.equal(got[1], first[1]), (
+                f"the fixed row differs at batch {n}, position {pos}"
+            )
 
 
 def test_reads_after_the_wait_under_graph_replay() -> None:
@@ -117,11 +156,72 @@ def test_reads_after_the_wait_under_graph_replay() -> None:
         assert torch.equal(after, args[1]), f"replay {trial} pool"
 
 
+_VARIANT_SPECS = (
+    dict(rows=1, state="bf16"),
+    dict(rows=8, state="bf16", pad=True),
+    dict(rows=33, state="bf16"),
+    dict(rows=3),
+    dict(rows=33, pad=True),
+    dict(rows=2, pool="coalesced", state="bf16", pad=True),
+    dict(rows=2, pool="coalesced"),
+)
+
+
+@pytest.mark.parametrize("norm", [True, False], ids=["norm", "rows"])
+@pytest.mark.parametrize("spec", _VARIANT_SPECS, ids=lambda s: "-".join(map(str, s.values())))
+def test_bulk_and_register_variants_agree(spec, norm) -> None:
+    """The bulk-copy and the register variants: outputs and state bitwise equal.
+
+    The bulk-copy variant stages the state rows in shared memory; the register variant holds
+    them in registers; both compute the same instructions. Over contiguous bf16 and fp32 pools
+    and the cache manager's coalesced pool (slot 100, ~2.8G elements past the base, by the
+    bulk copy), with pad rows.
+    """
+    args = _build(spec, seed=zlib.crc32(repr(spec).encode()) % (2**31))
+    proj, pool, slots = args[0], args[1], args[2]
+    assert rows_mod._bulk_eligible(pool, K)
+    live = slots[slots >= 0].long()
+    before = pool[live].clone()
+    got = []
+    for bulk in (False, True):
+        pool[live] = before
+        w = args[5] if norm else None
+        out = rows_mod.launch(proj, pool, slots, args[3], args[4], w, EPS, H, K, bulk=bulk)
+        got.append((out.clone(), pool[live].clone()))
+    assert torch.equal(got[0][0], got[1][0]), "outputs differ between the variants"
+    assert torch.equal(got[0][1], got[1][1]), "states differ between the variants"
+
+
+def test_variant_choice_and_unaligned_pool() -> None:
+    """The variant choice, and the fallback for a pool the bulk copy cannot take.
+
+    The bulk variant from the batch the register variant needs a second wave for; a pool 8-
+    but not 16-byte aligned stays on the register variant whatever is asked, and matches the
+    aligned pool's result.
+    """
+    sms = torch.cuda.get_device_properties(DEV).multi_processor_count
+    edge = (2 * sms) // HV
+    assert not rows_mod._use_bulk(edge, HV, DEV) and rows_mod._use_bulk(edge + 1, HV, DEV)
+    args = _build(dict(rows=33, state="bf16"), seed=19)
+    pool = args[1]
+    flat = torch.empty(pool.numel() + 4, dtype=pool.dtype, device=DEV)
+    shifted = flat[4:].view(pool.shape)
+    shifted.copy_(pool)
+    assert not rows_mod._bulk_eligible(shifted, K)
+    want = rows_mod.launch(args[0], pool, *args[2:], bulk=True)
+    got = rows_mod.launch(args[0], shifted, *args[2:], bulk=True)
+    assert torch.equal(got, want) and torch.equal(shifted, pool)
+
+
 def test_guards() -> None:
-    """A bf16 pool (the target sends this entry an fp32 one only) is refused."""
+    """An fp16 pool, int64 slot indices and a projection of the wrong width are refused."""
     args = _build(dict(rows=4), seed=5)
     with validating(op), pytest.raises(AssertionError):
-        op(args[0], args[1].to(torch.bfloat16), *args[2:])
+        op(args[0], args[1].to(torch.float16), *args[2:])
+    with validating(op), pytest.raises(AssertionError):
+        op(args[0], args[1], args[2].long(), *args[3:])
+    with validating(op), pytest.raises(AssertionError):
+        op(args[0][:, :-2], *args[1:])
 
 
 # ---- gdn_decode_rows: the recurrence alone, into a row range of a step's output ----------

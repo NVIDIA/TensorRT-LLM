@@ -186,6 +186,115 @@ def triton_qsa_decode_token_mapping(
     )
 
 
+# Largest batch the generation token mapping holds in one tile of request lengths.
+QSA_GENERATION_MAPPING_MAX_SEQS = 256
+
+
+@triton.jit
+def _qsa_generation_token_mapping_kernel(
+    kv_lens,
+    seq_lens,
+    request_indices,
+    logical_positions,
+    sequence_lengths,
+    visible_blocks,
+    num_seqs,
+    num_rows,
+    COMPRESS_RATIO: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_SEQS: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    valid = rows < num_rows
+    seqs = tl.arange(0, BLOCK_SEQS)
+    lengths = tl.load(seq_lens + seqs, mask=seqs < num_seqs, other=0).to(tl.int64)
+    # A row belongs to the first request whose inclusive end exceeds it; the
+    # lengths of the requests ending at or before it sum to its request's start.
+    ends = tl.cumsum(lengths, axis=0)
+    ended = (ends[None, :] <= rows[:, None].to(tl.int64)) & (seqs < num_seqs)[None, :]
+    request = tl.sum(ended.to(tl.int32), axis=1)
+    request_start = tl.sum(tl.where(ended, lengths[None, :], 0), axis=1)
+    kv_len = tl.load(kv_lens + request, mask=valid, other=0)
+    seq_len = tl.load(seq_lens + request, mask=valid, other=0)
+    logical = kv_len.to(tl.int64) - seq_len.to(tl.int64) + rows.to(tl.int64) - request_start
+    # Floor division, matching the integer floor division of the general mapping.
+    visible_num = logical + 1
+    visible = visible_num // COMPRESS_RATIO
+    visible = tl.where(
+        (visible_num % COMPRESS_RATIO != 0) & (visible_num < 0), visible - 1, visible
+    )
+    tl.store(request_indices + rows, request, mask=valid)
+    tl.store(logical_positions + rows, logical, mask=valid)
+    tl.store(sequence_lengths + rows, kv_len, mask=valid)
+    tl.store(visible_blocks + rows, visible.to(tl.int32), mask=valid)
+
+
+def triton_qsa_generation_token_mapping(
+    *,
+    kv_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    request_indices: torch.Tensor,
+    logical_positions: torch.Tensor,
+    sequence_lengths: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    num_rows: int,
+    compress_ratio: int,
+) -> None:
+    """Build request and position metadata for a batch without context requests.
+
+    Each request owns ``seq_lens`` consecutive packed rows, read on the device,
+    so verify groups of any width are covered: the same mapping as a cumulative
+    sum of the lengths followed by a right-sided search of every row, in one
+    launch for up to ``QSA_GENERATION_MAPPING_MAX_SEQS`` requests.
+    """
+    if kv_lens.ndim != 1 or seq_lens.ndim != 1:
+        raise ValueError("QSA generation lengths must be one-dimensional")
+    num_seqs = kv_lens.numel()
+    if seq_lens.numel() != num_seqs:
+        raise ValueError("QSA generation KV and sequence lengths must have matching shapes")
+    if num_seqs > QSA_GENERATION_MAPPING_MAX_SEQS:
+        raise ValueError(
+            f"QSA generation token mapping supports at most {QSA_GENERATION_MAPPING_MAX_SEQS} "
+            f"requests, got {num_seqs}"
+        )
+    outputs = (
+        request_indices,
+        logical_positions,
+        sequence_lengths,
+        visible_blocks,
+    )
+    if any(output.numel() < num_rows for output in outputs):
+        raise ValueError("QSA generation token-mapping outputs are too small")
+    if kv_lens.dtype != torch.int32 or seq_lens.dtype != torch.int32:
+        raise ValueError("QSA generation lengths must use int32 storage")
+    expected_dtypes = (torch.int32, torch.int64, torch.int32, torch.int32)
+    if any(tensor.dtype != dtype for tensor, dtype in zip(outputs, expected_dtypes)):
+        raise ValueError("QSA generation token-mapping outputs have incompatible dtypes")
+    _require_same_cuda_device("QSA generation token mapping", kv_lens, seq_lens, *outputs)
+    if compress_ratio <= 0:
+        raise ValueError(f"QSA compression ratio must be positive, got {compress_ratio}")
+    if num_rows == 0 or num_seqs == 0:
+        return
+
+    # One specialization covers every batch and verify width, so no graph shape
+    # compiles a variant of its own.
+    block_rows = 32
+    _qsa_generation_token_mapping_kernel[(triton.cdiv(num_rows, block_rows),)](
+        kv_lens,
+        seq_lens,
+        request_indices,
+        logical_positions,
+        sequence_lengths,
+        visible_blocks,
+        num_seqs,
+        num_rows,
+        COMPRESS_RATIO=compress_ratio,
+        BLOCK_ROWS=block_rows,
+        BLOCK_SEQS=QSA_GENERATION_MAPPING_MAX_SEQS,
+        num_warps=4,
+    )
+
+
 @triton.jit
 def _qsa_paged_kv_store_kernel(
     k,

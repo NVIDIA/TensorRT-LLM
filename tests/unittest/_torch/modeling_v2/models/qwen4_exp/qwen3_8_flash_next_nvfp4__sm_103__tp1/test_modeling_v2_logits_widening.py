@@ -48,3 +48,53 @@ def test_context_logits_and_no_metadata(head) -> None:
             want = LogitsProcessor().forward(hidden, head, md, ctx)
             got = T._WideningLogitsProcessor().forward(hidden, head, md, ctx)
             assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+
+@pytest.mark.parametrize("rows", [1, 4, 256])
+def test_unwidened_logits_give_the_same_greedy_tokens(head, rows) -> None:
+    """`widen=False` returns the head's own bf16 logits, whose greedy samplers (the verify
+    sampler's `greedy_argmax`, the draft sampler's int32 one) pick the widened logits' tokens."""
+    from tensorrt_llm._torch.speculative.greedy_argmax import greedy_argmax
+
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    hidden = torch.randn(rows, HIDDEN, generator=g, device="cuda").to(torch.bfloat16)
+    proc = T._WideningLogitsProcessor()
+    with torch.no_grad():
+        wide = proc.forward(hidden, head, None, True)
+        narrow = proc.forward(hidden, head, None, True, widen=False)
+        # Without return_context_logits the shell's gather and fp32 contract stay.
+        gathered = proc.forward(hidden, head, None, False, widen=False)
+    assert narrow.dtype == torch.bfloat16 and wide.dtype == torch.float32
+    assert gathered.dtype == torch.float32
+    assert torch.equal(narrow.float().view(torch.int32), wide.view(torch.int32))
+    narrow[0, 17] = narrow[0].max()  # an exact tie, broken to the lower index either way
+    wide = narrow.float()
+    assert torch.equal(greedy_argmax(narrow), greedy_argmax(wide))
+    assert torch.equal(greedy_argmax(narrow, torch.int32), greedy_argmax(wide, torch.int32))
+    assert torch.equal(greedy_argmax(narrow), torch.argmax(wide, dim=-1))
+
+
+def _gate(guided=None, greedy=True, rejection=False, penalty=False, relaxed=False):
+    worker = SimpleNamespace(
+        guided_decoder=guided,
+        spec_config=SimpleNamespace(use_relaxed_acceptance_for_thinking=relaxed),
+    )
+    md = SimpleNamespace(
+        is_all_greedy_sample=greedy,
+        wants_advanced_draft_sampling=rejection and not greedy,
+        enable_penalty=penalty,
+    )
+    return T._spec_argmax_only(worker, md)
+
+
+def test_argmax_only_gate() -> None:
+    assert _gate() == (True, True)
+    # A non-greedy batch: the verify sampler samples; the draft stays argmax unless
+    # rejection sampling needs its distribution.
+    assert _gate(greedy=False) == (False, True)
+    assert _gate(greedy=False, rejection=True) == (False, False)
+    # The occurrence penalties and relaxed acceptance read the verify logits only.
+    assert _gate(penalty=True) == (False, True)
+    assert _gate(relaxed=True) == (False, True)
+    # A guided decoder edits both.
+    assert _gate(guided=object()) == (False, False)

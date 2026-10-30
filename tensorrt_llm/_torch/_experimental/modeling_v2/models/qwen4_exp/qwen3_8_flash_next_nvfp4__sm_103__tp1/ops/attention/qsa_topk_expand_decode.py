@@ -50,6 +50,9 @@ _I32_MAX = 0x7FFFFFFF
 CAP = 128
 #: Threads that own the 2048 bins of a scan, four each.
 _SCAN_THREADS = _HIST // 4
+#: Consecutive threads that rank one candidate of the threshold's bin, each over every
+#: `_RANK_LANES`-th candidate (`_SCAN_THREADS` threads cover `CAP` candidates).
+_RANK_LANES = _SCAN_THREADS // CAP
 
 
 def _threads(width: int) -> int:
@@ -151,15 +154,16 @@ class _TopkExpandKernel:
                 flags[tidx + b * nt] = cutlass.Int32(0)
         if tidx == 0:
             state[5] = cutlass.Int32(0)  # candidates compacted
+        # The row's metadata, host-filled: read before the wait too.
+        n = mEnd[row]
+        seqlen = mLen[row]
+        visible = cutlass.Int32(mPos[row]) + 1
         if const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
             cute.arch.griddepcontrol_launch_dependents()
 
-        # 1. The row's metadata and four consecutive keys a thread (a column past the
-        # window is no candidate: -1); the largest and smallest key in the window.
-        n = mEnd[row]
-        seqlen = mLen[row]
-        visible = cutlass.Int32(mPos[row]) + 1
+        # 1. Four consecutive keys a thread (a column past the window is no candidate:
+        # -1); the largest and smallest key in the window.
         e0 = tidx * KPT
         keys = cute.make_rmem_tensor(cute.make_layout((KPT,), stride=(1,)), cutlass.Int32)
         keys.fill(-1)
@@ -282,19 +286,31 @@ class _TopkExpandKernel:
                             cand_key[slot] = keys[c]
                             cand_idx[slot] = e0 + c
                 cute.arch.sync_threads()
-                if tidx < at_thr:
-                    kt = cand_key[tidx]
-                    it = cand_idx[tidx]
-                    rank = cutlass.Int32(0)
-                    for j in cutlass.range(0, at_thr, 1, unroll=8):
+                # Candidate `ci` is ranked by `_RANK_LANES` consecutive lanes, lane `sub`
+                # counting the better ones among candidates sub, sub + _RANK_LANES, ...;
+                # butterfly shuffles add the counts up.
+                ci = tidx // _RANK_LANES
+                sub = tidx % _RANK_LANES
+                rank = cutlass.Int32(0)
+                it = cutlass.Int32(0)
+                if ci < at_thr:
+                    kt = cand_key[ci]
+                    it = cand_idx[ci]
+                    for j in cutlass.range(sub, at_thr, _RANK_LANES, unroll=4):
                         kj = cand_key[j]
                         ij = cand_idx[j]
                         better = (kj > kt) | ((kj == kt) & (ij > it))
                         rank = rank + cutlass.Int32(cutlass.select_(better, 1, 0))
-                    if rank < need:
-                        cute.arch.atomic_or(
-                            flags.iterator + (it >> 5), cutlass.Int32(1) << (it & 31), scope="cta"
-                        )
+                for off in cutlass.range_constexpr(_RANK_LANES.bit_length() - 1):
+                    rank = rank + cute.arch.shuffle_sync_bfly(rank, offset=1 << off)
+                if ci < at_thr:
+                    if sub == 0:
+                        if rank < need:
+                            cute.arch.atomic_or(
+                                flags.iterator + (it >> 5),
+                                cutlass.Int32(1) << (it & 31),
+                                scope="cta",
+                            )
                 cute.arch.sync_threads()
 
         # 4. Block order: one scan of (selected, tied at the threshold) counts. A tied key
@@ -512,6 +528,13 @@ class QsaTopkExpandDecode(OpWrapper):
         Cell(
             why="decode, 1 row of scores within 5% of each other",
             spec=dict(rows=1, pos=(8700,), narrow=True),
+        ),
+        # Serving's decode rows at 8K: positive, log-normally spread over ~2 octaves, a
+        # zero or two; the first pass leaves tens to ~CAP candidates at the threshold.
+        Cell(
+            why="decode, 16 rows of log-normal scores with a few zeros: threshold bins of "
+            "up to CAP candidates ranked pairwise, ties included",
+            spec=dict(rows=16, pos=tuple(8192 + 37 * r for r in range(16)), lognormal=True),
         ),
     )
 

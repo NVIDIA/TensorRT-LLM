@@ -95,6 +95,7 @@ def _build(spec, seed):
         PAD,
         L2_NORM_EPS,
         SOFTPLUS_THRESHOLD,
+        spec.get("linear_gate", False),
     ]
 
 
@@ -136,3 +137,20 @@ def test_guard_refuses_channel_strided_x() -> None:
     with pytest.raises(AssertionError, match="unit channel stride"):
         with validating(op):
             op(*bad)
+
+
+def test_linear_gate_is_torch_exp_of_the_log_gate() -> None:
+    """`linear_gate=True` stores `torch.exp` of the log-space decay bitwise, and leaves
+    every other output and the conv pool as without it."""
+    spec = next(c for c in op.CELLS if c.spec.get("linear_gate")).spec
+    args = _build(spec, seed=77)
+    log_args = list(args)
+    log_args[-1] = False
+    log_args[2] = args[2].clone()
+    pool_lin = args[2]
+    log_out = op(*log_args)
+    lin_out = op(*args)
+    assert torch.equal(lin_out[3], torch.exp(log_out[3]))
+    for got, want in zip(lin_out[:3] + lin_out[4:], log_out[:3] + log_out[4:]):
+        assert torch.equal(got, want)
+    assert torch.equal(pool_lin, log_args[2])

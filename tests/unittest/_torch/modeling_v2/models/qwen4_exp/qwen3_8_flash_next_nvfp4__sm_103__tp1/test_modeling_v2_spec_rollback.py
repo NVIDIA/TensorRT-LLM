@@ -12,7 +12,8 @@ pre-step state over each generation request's accepted prefix only, which is by
 definition the state a verify step must leave behind. Every pool and plane is compared
 bitwise in full, so a write to a slot the step does not own fails too. The step is also
 run sync-free and under CUDA-graph capture and replay with the accepted counts changed
-in place.
+in place. Each check runs over the three handler forms: per-layer plane staging, the
+batched plane gather / restore, and the fused one-launch staging and commit.
 """
 
 import pytest
@@ -175,9 +176,11 @@ def _write_planes(b, layer_index, position, req_idx, logical, keys, anchor_keys,
     layer_index[pages, within] = torch.where(anchor, anchor_keys, layer_index[pages, within])
 
 
-def _verify_step(b, rollback):
+def _verify_step(b, rollback, fused=False):
     """The forward's write sequence over all `p` rows of every generation
-    request, staged at the forward's call sites, then the worker's commit."""
+    request, staged at the forward's call sites, then the worker's commit. The
+    PLE pools stage as the fused PLE launches do: `stage_ple_verify` before the
+    id history publishes, `stage_ple_conv_input` from the conv input."""
     rollback.discard()
     qsl = b.qsl
     rollback.begin(
@@ -190,10 +193,11 @@ def _verify_step(b, rollback):
         logical_positions=b.logical[b.prefix :],
         block_table=b.block_table,
         tokens_per_block=TPB,
+        fused=fused,
     )
-    rollback.stage_ple_pools(b.ngram, b.conv)
-    window = ngram_token_history(b.ids, b.ngram, b.slots, b.carry, qsl, EOS, NGRAM)
-    rollback.stage_ple_rows(window, b.x)
+    rollback.stage_ple_verify(b.ngram, b.conv, b.ids)
+    ngram_token_history(b.ids, b.ngram, b.slots, b.carry, qsl, EOS, NGRAM)
+    rollback.stage_ple_conv_input(b.x)
     dilated_short_conv_paged(
         b.x.t(), b.weight, None, b.conv, qsl, b.slots, b.carry, DILATION, True, -1
     )
@@ -258,8 +262,8 @@ def _assert_state(b, expected, what):
 
 
 # (ctx_lens, gen_starts, p, gen_accepted). Positions straddle pages and land on
-# compression anchors; one request accepts everything. `decode` and `mixed` are the accepted-
-# prefix check; `decode_p8` drives the shared-page and capture tests.
+# compression anchors; one request accepts everything. All three are the accepted-prefix check;
+# `decode_p8` also drives the shared-page and capture tests.
 CASES = {
     "decode": ((), (5, 30, 61, 100), 4, (1, 2, 4, 3)),
     "mixed": ((7, 3), (12, 29, 95), 4, (2, 1, 3)),
@@ -273,16 +277,31 @@ def _slots(num):
     return list(range(3, 3 + 2 * num, 2))
 
 
-@pytest.mark.parametrize("case", ["decode", "mixed"])
-def test_commit_matches_the_accepted_prefix(case):
+#: Handler forms: per-layer plane staging; the planes bound (`begin` gathers them all in one
+#: launch and the commit restores them in one, `qsa_rollback_gather` / `qsa_rollback_restore`);
+#: the planes bound and the step opened `fused` (`spec_rollback_stage` / `spec_rollback_commit`).
+MODES = ["per_layer", "batched", "fused"]
+
+
+def _rollback(b, mode):
+    rollback = SpeculativeRollback()
+    if mode != "per_layer":
+        rollback.set_index_planes(b.index)
+    return rollback
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", ["decode", "mixed", "decode_p8"])
+def test_commit_matches_the_accepted_prefix(case, mode):
     ctx_lens, gen_starts, p, gen_accepted = CASES[case]
     b = _Batch(11, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
     b.set_accepted(gen_accepted)
-    _verify_step(b, SpeculativeRollback())
+    _verify_step(b, _rollback(b, mode), mode == "fused")
     _assert_state(b, _reference(b), case)
 
 
-def test_commit_over_the_strided_planes_of_a_shared_page():
+@pytest.mark.parametrize("mode", MODES)
+def test_commit_over_the_strided_planes_of_a_shared_page(mode):
     """The handler stages and restores the index and position planes by advanced indexing, so
     planes that are strided views of one buffer (an NVFP4 KV cache's side planes) roll back
     like contiguous ones, and the bytes of the other layers' pages in the same buffer stay as
@@ -293,7 +312,7 @@ def test_commit_over_the_strided_planes_of_a_shared_page():
         13, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)), shared_page=True
     )
     b.set_accepted(gen_accepted)
-    _verify_step(b, SpeculativeRollback())
+    _verify_step(b, _rollback(b, mode), mode == "fused")
     _assert_state(b, _reference(b), case)
 
 
@@ -328,21 +347,27 @@ def test_discard_drops_a_stale_staging():
     _assert_state(b, (b.ngram0, b.conv0, b.index0, b.position0), "discarded")
 
 
-def test_commit_is_sync_free():
+@pytest.mark.parametrize("mode", MODES)
+def test_commit_is_sync_free(mode):
     ctx_lens, gen_starts, p, gen_accepted = CASES["mixed"]
     b = _Batch(16, ctx_lens, gen_starts, p, _slots(len(ctx_lens) + len(gen_starts)))
     b.set_accepted(gen_accepted)
-    rollback = SpeculativeRollback()
+    rollback = _rollback(b, mode)
+    if mode == "fused":
+        # Triton compiles the launches on their first call, outside the checked region.
+        _verify_step(b, rollback, True)
+        b.reset()
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        _verify_step(b, rollback)
+        _verify_step(b, rollback, mode == "fused")
     finally:
         torch.cuda.set_sync_debug_mode(0)
     _assert_state(b, _reference(b), "sync-free")
 
 
-def test_padding_duplicates_leave_the_unique_request_exact():
+@pytest.mark.parametrize("mode", MODES)
+def test_padding_duplicates_leave_the_unique_request_exact(mode):
     # Requests 2 and 3 are the same padding dummy as request 1: one slot, one
     # block-table row, written concurrently with no defined winner, so only the
     # unique request is compared.
@@ -350,7 +375,7 @@ def test_padding_duplicates_leave_the_unique_request_exact():
     slots = [3, 7, 7, 7]
     b = _Batch(17, (), gen_starts, p, slots, dup_of={2: 1, 3: 1})
     b.set_accepted((2, 3, 3, 3))
-    _verify_step(b, SpeculativeRollback())
+    _verify_step(b, _rollback(b, mode), mode == "fused")
     # The unique request's slot is exactly its accepted prefix.
     pages = b.block_table[0].long()
     expected = _reference(_single(b, 0))
@@ -396,24 +421,26 @@ _REPLAYS = {
 }
 
 
+@pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("case", sorted(_REPLAYS))
-def test_capture_and_replay_follow_the_accepted_counts(case):
+def test_capture_and_replay_follow_the_accepted_counts(case, mode):
     """The whole staged step and commit captured once, replayed with the
     accepted counts and the pre-step state rewritten in place."""
     ctx_lens, gen_starts, p, _ = CASES[case]
     b = _Batch(18, ctx_lens, gen_starts, p, _slots(len(gen_starts)))
-    rollback = SpeculativeRollback()
+    rollback = _rollback(b, mode)
+    fused = mode == "fused"
     b.set_accepted((p,) * len(gen_starts))
 
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
-        _verify_step(b, rollback)
+        _verify_step(b, rollback, fused)
     torch.cuda.current_stream().wait_stream(side)
     b.reset()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        _verify_step(b, rollback)
+        _verify_step(b, rollback, fused)
 
     for accepted in _REPLAYS[case]:
         b.reset()

@@ -16,10 +16,12 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.indexer import (
     average_pool_qsa_keys,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
+    QSA_GENERATION_MAPPING_MAX_SEQS,
     _expand_launch,
     _qsa_index_scores_query_tile,
     triton_qsa_decode_pre_indexer,
     triton_qsa_decode_token_mapping,
+    triton_qsa_generation_token_mapping,
     triton_qsa_mtp_reuse_topk,
     triton_qsa_paged_index_scores,
     triton_qsa_paged_kv_store,
@@ -532,6 +534,119 @@ def test_qsa_decode_token_mapping_matches_reference(rows: int) -> None:
     torch.testing.assert_close(logical_positions, (kv_lens - seq_lens).to(torch.int64))
     torch.testing.assert_close(sequence_lengths, kv_lens)
     torch.testing.assert_close(visible_blocks, ((kv_lens - seq_lens + 1) // 4))
+
+
+def _general_token_mapping(kv_lens, seq_lens, num_tokens, compress_ratio):
+    """The cumulative-sum and search mapping used for batches with context rows."""
+    num_seqs = seq_lens.numel()
+    cu_seq_lens = torch.zeros(num_seqs + 1, dtype=torch.int64, device=seq_lens.device)
+    torch.cumsum(seq_lens, dim=0, dtype=torch.int64, out=cu_seq_lens[1:])
+    token_ids = torch.arange(num_tokens, dtype=torch.int64, device=seq_lens.device)
+    req_idx = torch.searchsorted(cu_seq_lens[1:], token_ids, right=True)
+    cached_lens = kv_lens.to(torch.int64) - seq_lens.to(torch.int64)
+    logical = cached_lens[req_idx] + token_ids - cu_seq_lens[:num_seqs][req_idx]
+    return (
+        req_idx.to(torch.int32),
+        logical,
+        kv_lens[req_idx],
+        ((logical + 1) // compress_ratio).to(torch.int32),
+    )
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [4],
+        [4] * 3,
+        [4] * 32,
+        [4] * QSA_GENERATION_MAPPING_MAX_SEQS,
+        [2] * 7,
+        [1, 4, 2, 0, 3, 4, 1],
+        [0, 5],
+    ],
+    ids=["one", "three", "batch32", "batch-max", "width2", "ragged", "leading-empty"],
+)
+@pytest.mark.parametrize("cached", [0, 3, 1029])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_generation_token_mapping_matches_general_mapping(
+    seq_lens: list[int], cached: int
+) -> None:
+    seq_lens_cuda = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    kv_lens = seq_lens_cuda + cached + torch.arange(len(seq_lens), dtype=torch.int32, device="cuda")
+    num_tokens = sum(seq_lens)
+    outputs = (
+        torch.full((num_tokens + 3,), -7, dtype=torch.int32, device="cuda"),
+        torch.full((num_tokens + 3,), -7, dtype=torch.int64, device="cuda"),
+        torch.full((num_tokens + 3,), -7, dtype=torch.int32, device="cuda"),
+        torch.full((num_tokens + 3,), -7, dtype=torch.int32, device="cuda"),
+    )
+
+    triton_qsa_generation_token_mapping(
+        kv_lens=kv_lens,
+        seq_lens=seq_lens_cuda,
+        request_indices=outputs[0],
+        logical_positions=outputs[1],
+        sequence_lengths=outputs[2],
+        visible_blocks=outputs[3],
+        num_rows=num_tokens,
+        compress_ratio=4,
+    )
+
+    expected = _general_token_mapping(kv_lens, seq_lens_cuda, num_tokens, 4)
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual[:num_tokens], reference, rtol=0, atol=0)
+        # Rows past the batch are left untouched.
+        assert (actual[num_tokens:] == -7).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_generation_token_mapping_floors_negative_positions() -> None:
+    """Visible blocks floor like the general mapping even below position zero."""
+    seq_lens = torch.tensor([4, 4], dtype=torch.int32, device="cuda")
+    kv_lens = torch.tensor([1, 6], dtype=torch.int32, device="cuda")
+    outputs = (
+        torch.empty(8, dtype=torch.int32, device="cuda"),
+        torch.empty(8, dtype=torch.int64, device="cuda"),
+        torch.empty(8, dtype=torch.int32, device="cuda"),
+        torch.empty(8, dtype=torch.int32, device="cuda"),
+    )
+
+    triton_qsa_generation_token_mapping(
+        kv_lens=kv_lens,
+        seq_lens=seq_lens,
+        request_indices=outputs[0],
+        logical_positions=outputs[1],
+        sequence_lengths=outputs[2],
+        visible_blocks=outputs[3],
+        num_rows=8,
+        compress_ratio=4,
+    )
+
+    expected = _general_token_mapping(kv_lens, seq_lens, 8, 4)
+    assert expected[1].min() < -1
+    for actual, reference in zip(outputs, expected):
+        torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_generation_token_mapping_rejects_batches_past_one_tile() -> None:
+    num_seqs = QSA_GENERATION_MAPPING_MAX_SEQS + 1
+    lengths = torch.ones(num_seqs, dtype=torch.int32, device="cuda")
+    outputs = [
+        torch.empty(num_seqs, dtype=dtype, device="cuda")
+        for dtype in (torch.int32, torch.int64, torch.int32, torch.int32)
+    ]
+    with pytest.raises(ValueError, match="at most"):
+        triton_qsa_generation_token_mapping(
+            kv_lens=lengths,
+            seq_lens=lengths,
+            request_indices=outputs[0],
+            logical_positions=outputs[1],
+            sequence_lengths=outputs[2],
+            visible_blocks=outputs[3],
+            num_rows=num_seqs,
+            compress_ratio=4,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
