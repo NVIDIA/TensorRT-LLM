@@ -28,9 +28,10 @@ ROW = 128
 #: `Qwen4ExpHybridCacheManager` (KV cache manager V2) allocates them: the 12 attention layers'
 #: `[32, 1, 128]` INDEX_KEY buffers coalesce into one pool, layer k's buffer at element 4096 k of
 #: a 49152-element page, so every plane is a `[pages, 32, 1, 128]` view at page stride 49152.
-#: 258983 pages is a tep4 rank's pool at core's configuration (the stock engine's `maxNumBlocks`,
-#: the largest measured per member; `qsa_paged_index_scores__r20` records both measurements).
-_TEP4_POOL = dict(planes=12, layout="coalesced", pool_pages=258983)
+#: 257109 pages is a tep4 rank's attention pool at core's configuration, which the index pool
+#: shares: the stock engine's `maxNumBlocks` 258983 less the 1874 recurrent-state slots that
+#: total also counts. The largest measured per member.
+_TEP4_POOL = dict(planes=12, layout="coalesced", pool_pages=257109)
 
 
 def _verify(requests: int, p: int) -> dict:
@@ -44,7 +45,7 @@ _CELLS: tuple[Cell, ...] = (
     Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
     Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
     Cell(
-        why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 258983-page coalesced pool",
+        why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 257109-page coalesced pool",
         spec=_verify(128, 2),
     ),
     Cell(
@@ -117,12 +118,12 @@ class QsaRollbackGather(OpWrapper):
     Triton, JIT-compiled at first call for the running device (sm_103 here).
 
     Addressing is 64-bit: `pages` and the page strides are int64, so a slot past 2^31 elements
-    from a plane's base is reached. The tep4 cells read the pool's last page (layer 11's plane
-    there starts ~1.27e10 elements past the pool base) and its first.
+    from a plane's base is reached. The tep4 cells gather from (and restore into) the pool's
+    last page, 257108 x 49152 = 1.26e10 elements past every plane's base, and its first.
 
     Layouts certified: separate contiguous planes and the packed side-plane page of an FP8 /
     NVFP4 pool (page stride 12 x 4096 + 192) at the tp1 cells' 4 and 512 rows over 600 pages;
-    core's coalesced bf16 pool (page stride 49152) at 256 and 1024 rows over 258983 pages.
+    core's coalesced bf16 pool (page stride 49152) at 256 and 1024 rows over 257109 pages.
     `test_cuda_graph_replay` captures the 1024-row call and replays it at new slots.
 
     Hard limits (not probed): rows is the launch grid's y extent, at most 65535; out-of-pool or
