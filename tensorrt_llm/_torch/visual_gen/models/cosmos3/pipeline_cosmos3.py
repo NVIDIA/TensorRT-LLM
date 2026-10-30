@@ -55,6 +55,7 @@ from tensorrt_llm.media.decoding import decode_video_reference_window, video_str
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     action_reference_frame_step,
     action_reference_size,
     action_start_frame_offset,
@@ -68,12 +69,18 @@ from .action import (
     resolve_action_size,
     resolve_domain_id,
 )
+from .config_resolver import Cosmos3ConfigResolver
 from .defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DURATION_TEMPLATE,
     COSMOS3_ENVELOPES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
-    COSMOS3_V2V_DEFAULT_FLOW_SHIFT,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
+    COSMOS3_T2I_SYSTEM_PROMPT,
+    COSMOS3_V2V_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
     resolve_checkpoint_policy_defaults,
@@ -81,6 +88,7 @@ from .defaults import (
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
+from .request_resolver import RequestContext, resolve_generation
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
@@ -130,14 +138,15 @@ def _resolve_use_system_prompt(
     is_v2v: bool,
     is_transfer: bool,
 ) -> bool:
-    """Resolve the request override against workflow and checkpoint defaults."""
-    if requested is not None:
-        return bool(requested)
-    # Transfer opts out for reference parity; vllm-omni's transfer path also
-    # defaults use_system_prompt to False.
-    if is_transfer:
-        return False
-    return is_v2v or checkpoint_default
+    """The request rule: the caller's value, else transfer never (reference parity),
+    else video-to-video always, else the checkpoint's declaration."""
+    ctx = RequestContext(
+        family="",
+        checkpoint_use_system_prompt=checkpoint_default,
+        is_v2v=is_v2v,
+        is_transfer=is_transfer,
+    )
+    return bool(resolve_generation(ctx, use_system_prompt=requested)["use_system_prompt"])
 
 
 def _validate_request_compatibility(
@@ -223,22 +232,11 @@ def _validate_request_compatibility(
         )
 
 
-# NOTE: Intentional typo in "give" instead of "given" to match training setup.
-COSMOS3_DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant who will generate videos from a give prompt."
-)
-COSMOS3_T2I_SYSTEM_PROMPT = (
-    "You are a helpful assistant who will generate images from a give prompt."
-)
-COSMOS3_V2V_FLOW_SHIFT = 10.0
 # Fraction of a transfer hint that may be mirror-padding before it is worth a
 # warning. A few frames of tail ping-pong is normal when clips differ slightly;
 # beyond this the control is mostly invented and the client likely sent clips of
 # different videos.
 CONTROL_LENGTH_MISMATCH_RATIO = 0.10
-COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of {fps:.0f} FPS."
-COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
-COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
@@ -257,13 +255,6 @@ _COSMOS3_DEFAULT_OFFLOAD_STAGES = (
     (COSMOS3_REASONER_OFFLOAD_COMPONENT,),
     (COSMOS3_GENERATOR_OFFLOAD_COMPONENT,),
 )
-
-# ``W,H`` bucket names the reference builds requests from. A request there starts
-# as a (resolution, bucket) pair and the bucket string is carried into the prompt
-# verbatim; we only ever see the resolved height/width, so map back to the nearest
-# bucket. Emitting the exact reduced ratio instead would put a string the model
-# never saw in training into the caption (832x480 reduces to "15,26", not "16,9").
-COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
 
 
 def _aspect_ratio_bucket(height: int, width: int) -> str:
@@ -491,6 +482,32 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             }
         return params
 
+    def _request_context(
+        self,
+        output_type: str = "video",
+        *,
+        action_mode: Optional[str] = None,
+        checkpoint_policy_domain_matches: bool = True,
+        **workflow,
+    ) -> RequestContext:
+        normalized_action_mode = normalize_action_mode(action_mode)
+        policy_defaults = getattr(self, "checkpoint_policy_defaults", {}) or {}
+        fixed_sigmas = getattr(self.sampling, "fixed_sigmas", None)
+        return RequestContext(
+            family=self.family,
+            mode=str(output_type).lower(),
+            action_mode=normalized_action_mode,
+            distilled_steps=None if not fixed_sigmas else len(fixed_sigmas),
+            policy_defaults=policy_defaults,
+            policy_active=(
+                normalized_action_mode == ACTION_MODE_POLICY
+                and checkpoint_policy_domain_matches
+                and bool(policy_defaults)
+            ),
+            checkpoint_use_system_prompt=getattr(self, "default_use_system_prompt", False),
+            **workflow,
+        )
+
     def _resolve_generation_params(
         self,
         output_type: str,
@@ -499,24 +516,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         checkpoint_policy_domain_matches: bool = True,
         **values,
     ) -> dict:
-        """Fill None values: sampling-policy overrides win, then the mode
-        table, then the video table (for fields the image table omits)."""
-        mode_params = self._mode_params(
+        """Fill ``None`` values by the request rules: the distilled schedule, then the
+        policy block, then the mode table, then the video table."""
+        ctx = self._request_context(
             output_type,
             action_mode=action_mode,
             checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
         )
-        video_params = self._mode_params("video")
-        sampling_overrides = self.sampling.generation_default_overrides()
-        resolved = {}
-        for key, value in values.items():
-            if value is None:
-                if key in sampling_overrides:
-                    value = sampling_overrides[key]
-                else:
-                    value = mode_params.get(key, video_params.get(key))
-            resolved[key] = value
-        return resolved
+        resolved = resolve_generation(ctx, **values)
+        return {name: resolved[name] for name in values}
 
     def _log_envelope_advisory(
         self,
@@ -643,32 +651,16 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> None:
         skip_components = skip_components or []
 
-        # Prompting defaults are checkpoint-declared: distilled conversions
-        # carry ``default_use_system_prompt`` in model_index.json (diffusers'
-        # distilled blocks default it to True); older checkpoints omit it and
-        # keep the historical False.
-        model_index_path = os.path.join(checkpoint_dir, "model_index.json")
-        if os.path.exists(model_index_path):
-            with open(model_index_path) as f:
-                model_index = json.load(f)
-            self.default_use_system_prompt = bool(
-                model_index.get("default_use_system_prompt", self.default_use_system_prompt)
-            )
-            self.use_native_flow_schedule = bool(
-                model_index.get("use_native_flow_schedule", self.use_native_flow_schedule)
-            )
-
-        checkpoint_metadata_path = os.path.join(checkpoint_dir, "checkpoint.json")
-        if os.path.exists(checkpoint_metadata_path):
-            with open(checkpoint_metadata_path) as f:
-                checkpoint_metadata = json.load(f)
-            self.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(
-                checkpoint_metadata.get("policy")
-            )
-            if self.checkpoint_policy_defaults:
-                logger.info(
-                    f"Loaded Cosmos3 checkpoint policy defaults: {self.checkpoint_policy_defaults}"
-                )
+        # The transformer config is read from the checkpoint directory, not from the
+        # loaded pretrained config, whose omitted keys the transformer has already filled.
+        self.cosmos3_config = Cosmos3ConfigResolver(
+            checkpoint_dir, serving=getattr(self, "pipeline_config", None)
+        ).resolve()
+        logger.info(self.cosmos3_config.describe())
+        cfg = self.cosmos3_config
+        self.default_use_system_prompt = cfg.prompt.use_system_prompt
+        self.use_native_flow_schedule = cfg.sampling.native_flow_schedule
+        self.checkpoint_policy_defaults = resolve_checkpoint_policy_defaults(cfg.action.policy)
 
         if self.audio_gen and PipelineComponent.SOUND_TOKENIZER not in skip_components:
             logger.info("Loading audio tokenizer...")
@@ -689,9 +681,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 subfolder="text_tokenizer",
             )
 
-        # Cosmos3 canonical defaults — overwritten if VAE is loaded
-        self.vae_scale_factor_temporal = 4
-        self.vae_scale_factor_spatial = 16
+        self.vae_scale_factor_temporal = cfg.vae.temporal_compression
+        self.vae_scale_factor_spatial = cfg.vae.spatial_compression
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
@@ -706,12 +697,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 dtype=torch.bfloat16,
             )
 
-            self.vae_scale_factor_temporal = getattr(
-                self.vae.config, "scale_factor_temporal", self.vae_scale_factor_temporal
-            )
-            self.vae_scale_factor_spatial = getattr(
-                self.vae.config, "scale_factor_spatial", self.vae_scale_factor_spatial
-            )
             _validate_temporal_compression(self.transformer, self.vae_scale_factor_temporal)
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
@@ -918,7 +903,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         cached = getattr(self, "_cacheable_flow_shifts_cache", None)
         if cached is not None:
             return cached
-        shifts = {COSMOS3_V2V_FLOW_SHIFT, COSMOS3_V2V_DEFAULT_FLOW_SHIFT}
+        shifts = {COSMOS3_V2V_FLOW_SHIFT}
         checkpoint_shift = getattr(self.sampling, "checkpoint_flow_shift", None)
         if checkpoint_shift is not None:
             shifts.add(float(checkpoint_shift))
@@ -1380,26 +1365,25 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     # VAE decode
     # =========================================================================
 
-    def _decode_latents_raw(self, latents):
+    def _scale_latents_for_decode(self, latents):
+        """Latents as the VAE decoder expects them: the checkpoint's per-channel
+        statistics undone, or its scaling factor."""
         latents = latents.to(self.vae.dtype)
-
         if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            if not hasattr(self, "_latents_mean"):
-                self._latents_mean = (
-                    torch.tensor(self.vae.config.latents_mean)
-                    .view(1, -1, 1, 1, 1)
-                    .to(self.device, self.vae.dtype)
+            stats = getattr(self, "_latents_stats", None)
+            if stats is None or stats[0].device != latents.device:
+                stats = tuple(
+                    torch.tensor(values).view(1, -1, 1, 1, 1).to(latents.device, self.vae.dtype)
+                    for values in (self.vae.config.latents_std, self.vae.config.latents_mean)
                 )
-                self._latents_std = (
-                    torch.tensor(self.vae.config.latents_std)
-                    .view(1, -1, 1, 1, 1)
-                    .to(self.device, self.vae.dtype)
-                )
-            latents = (latents * self._latents_std) + self._latents_mean
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latents = latents / scaling_factor
+                self._latents_stats = stats
+            std, mean = stats
+            return (latents * std) + mean
+        scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
+        return latents / scaling_factor
 
+    def _decode_latents_raw(self, latents):
+        latents = self._scale_latents_for_decode(latents)
         with self.offloader.context_if_requested(PipelineComponent.VAE.value):
             return self.vae.decode(latents, return_dict=False)[0]
 
@@ -1744,6 +1728,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 checkpoint_policy_defaults=checkpoint_policy_defaults,
             )
             checkpoint_policy_domain_matches = action_cfg["checkpoint_policy_domain_matches"]
+            if self.rank == 0:
+                logger.debug(
+                    "Cosmos3 action fields: "
+                    + ", ".join(f"{k} [{v}]" for k, v in action_cfg["sources"].items())
+                )
 
         mode_params = self._mode_params(
             output_type,
@@ -3012,7 +3001,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         flow_shift_target = float(
             transfer_config.flow_shift
             if transfer_config.flow_shift is not None
-            else COSMOS3_V2V_DEFAULT_FLOW_SHIFT
+            else COSMOS3_V2V_FLOW_SHIFT
         )
         max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         self._guidance_scale = guidance_scale

@@ -1,0 +1,631 @@
+{
+ "action": {
+  "None": {
+   "action_chunk_size": 16,
+   "action_fps": 24.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": null,
+   "frame_rate": 24.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": null,
+   "raw_action_dim": null,
+   "use_state": false
+  },
+  "None/droid-policy": {
+   "action_chunk_size": 32,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": true,
+   "domain_name": "droid_lerobot",
+   "frame_rate": 15.0,
+   "num_frames": 33,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 8,
+   "use_state": true
+  },
+  "agibot_gear_gripper": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibot_gear_gripper",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "agibot_gear_gripper/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibot_gear_gripper",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "agibot_gear_gripper_ext": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibot_gear_gripper_ext",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "agibot_gear_gripper_ext/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibot_gear_gripper_ext",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "agibotworld": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibotworld",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "agibotworld/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "agibotworld",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 29,
+   "use_state": false
+  },
+  "av": {
+   "action_chunk_size": 60,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "av",
+   "frame_rate": 10.0,
+   "num_frames": 61,
+   "num_warnings": 0,
+   "preset_key": "av",
+   "raw_action_dim": 9,
+   "use_state": false
+  },
+  "av/droid-policy": {
+   "action_chunk_size": 60,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "av",
+   "frame_rate": 10.0,
+   "num_frames": 61,
+   "num_warnings": 1,
+   "preset_key": "av",
+   "raw_action_dim": 9,
+   "use_state": false
+  },
+  "bridge_orig_lerobot": {
+   "action_chunk_size": 16,
+   "action_fps": 5.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "bridge_orig_lerobot",
+   "frame_rate": 5.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "bridge_orig_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "bridge_orig_lerobot/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 5.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "bridge_orig_lerobot",
+   "frame_rate": 5.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "bridge_orig_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "camera_pose": {
+   "action_chunk_size": 60,
+   "action_fps": 30.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "camera_pose",
+   "frame_rate": 30.0,
+   "num_frames": 61,
+   "num_warnings": 0,
+   "preset_key": "camera_pose",
+   "raw_action_dim": 9,
+   "use_state": false
+  },
+  "camera_pose/droid-policy": {
+   "action_chunk_size": 60,
+   "action_fps": 30.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "camera_pose",
+   "frame_rate": 30.0,
+   "num_frames": 61,
+   "num_warnings": 1,
+   "preset_key": "camera_pose",
+   "raw_action_dim": 9,
+   "use_state": false
+  },
+  "droid_lerobot": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "droid_lerobot",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "droid_lerobot/droid-policy": {
+   "action_chunk_size": 32,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": true,
+   "domain_name": "droid_lerobot",
+   "frame_rate": 15.0,
+   "num_frames": 33,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 8,
+   "use_state": true
+  },
+  "fractal": {
+   "action_chunk_size": 16,
+   "action_fps": 5.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "fractal",
+   "frame_rate": 5.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "fractal",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "fractal/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 5.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "fractal",
+   "frame_rate": 5.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "fractal",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "galbot": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "galbot",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 30,
+   "use_state": false
+  },
+  "galbot/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "galbot",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "agibotworld",
+   "raw_action_dim": 30,
+   "use_state": false
+  },
+  "hand_pose": {
+   "action_chunk_size": 16,
+   "action_fps": 24.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "hand_pose",
+   "frame_rate": 24.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "hand_pose",
+   "raw_action_dim": 57,
+   "use_state": false
+  },
+  "hand_pose/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 24.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "hand_pose",
+   "frame_rate": 24.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "hand_pose",
+   "raw_action_dim": 57,
+   "use_state": false
+  },
+  "libero": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 256,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "libero",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "libero",
+   "raw_action_dim": null,
+   "use_state": false
+  },
+  "libero/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 256,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "libero",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 2,
+   "preset_key": "libero",
+   "raw_action_dim": null,
+   "use_state": false
+  },
+  "no_action": {
+   "action_chunk_size": 16,
+   "action_fps": 24.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "no_action",
+   "frame_rate": 24.0,
+   "num_frames": 17,
+   "num_warnings": 2,
+   "preset_key": null,
+   "raw_action_dim": null,
+   "use_state": false
+  },
+  "no_action/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 24.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "no_action",
+   "frame_rate": 24.0,
+   "num_frames": 17,
+   "num_warnings": 3,
+   "preset_key": null,
+   "raw_action_dim": null,
+   "use_state": false
+  },
+  "pusht": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 256,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "pusht",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "pusht",
+   "raw_action_dim": 2,
+   "use_state": false
+  },
+  "pusht/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 256,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "pusht",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "pusht",
+   "raw_action_dim": 2,
+   "use_state": false
+  },
+  "robomind-franka": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-franka",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "robomind-franka-dual": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-franka-dual",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 20,
+   "use_state": false
+  },
+  "robomind-franka-dual/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-franka-dual",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 20,
+   "use_state": false
+  },
+  "robomind-franka/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-franka",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "robomind-ur": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-ur",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "robomind-ur/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 15.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "robomind-ur",
+   "frame_rate": 15.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "droid_lerobot",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "umi": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "umi",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 0,
+   "preset_key": "umi",
+   "raw_action_dim": 10,
+   "use_state": false
+  },
+  "umi/droid-policy": {
+   "action_chunk_size": 16,
+   "action_fps": 10.0,
+   "action_resolution": 480,
+   "checkpoint_policy_domain_matches": false,
+   "domain_name": "umi",
+   "frame_rate": 10.0,
+   "num_frames": 17,
+   "num_warnings": 1,
+   "preset_key": "umi",
+   "raw_action_dim": 10,
+   "use_state": false
+  }
+ },
+ "generation": {
+  "nemotron_dense/action:forward_dynamics/base": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "nemotron_dense/action:forward_dynamics/base/droid-policy": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "nemotron_dense/action:policy/base": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "nemotron_dense/action:policy/base/droid-policy": {
+   "guidance_interval": [
+    960.0,
+    1001.0
+   ],
+   "guidance_scale": 3.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "nemotron_dense/image/base": {
+   "frame_rate": 24.0,
+   "guidance_interval": null,
+   "guidance_scale": 4.0,
+   "height": 640,
+   "max_sequence_length": 4096,
+   "num_frames": 121,
+   "num_inference_steps": 50,
+   "width": 640
+  },
+  "nemotron_dense/video/base": {
+   "frame_rate": 24.0,
+   "guidance_interval": null,
+   "guidance_scale": 5.0,
+   "height": 480,
+   "max_sequence_length": 4096,
+   "num_frames": 121,
+   "num_inference_steps": 50,
+   "width": 832
+  },
+  "qwen3/action:forward_dynamics/base": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "qwen3/action:forward_dynamics/base/droid-policy": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "qwen3/action:forward_dynamics/distilled": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "qwen3/action:forward_dynamics/distilled/droid-policy": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "qwen3/action:policy/base": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 30
+  },
+  "qwen3/action:policy/base/droid-policy": {
+   "guidance_interval": [
+    960.0,
+    1001.0
+   ],
+   "guidance_scale": 3.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "qwen3/action:policy/distilled": {
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "qwen3/action:policy/distilled/droid-policy": {
+   "guidance_interval": [
+    960.0,
+    1001.0
+   ],
+   "guidance_scale": 1.0,
+   "max_sequence_length": 4096,
+   "num_inference_steps": 4
+  },
+  "qwen3/image/base": {
+   "frame_rate": 24.0,
+   "guidance_interval": [
+    400.0,
+    1000.0
+   ],
+   "guidance_scale": 7.0,
+   "height": 1024,
+   "max_sequence_length": 4096,
+   "num_frames": 189,
+   "num_inference_steps": 50,
+   "width": 1024
+  },
+  "qwen3/image/distilled": {
+   "frame_rate": 24.0,
+   "guidance_interval": [
+    400.0,
+    1000.0
+   ],
+   "guidance_scale": 1.0,
+   "height": 1024,
+   "max_sequence_length": 4096,
+   "num_frames": 189,
+   "num_inference_steps": 4,
+   "width": 1024
+  },
+  "qwen3/video/base": {
+   "frame_rate": 24.0,
+   "guidance_interval": null,
+   "guidance_scale": 6.0,
+   "height": 720,
+   "max_sequence_length": 4096,
+   "num_frames": 189,
+   "num_inference_steps": 35,
+   "width": 1280
+  },
+  "qwen3/video/distilled": {
+   "frame_rate": 24.0,
+   "guidance_interval": null,
+   "guidance_scale": 1.0,
+   "height": 720,
+   "max_sequence_length": 4096,
+   "num_frames": 189,
+   "num_inference_steps": 4,
+   "width": 1280
+  }
+ },
+ "system_prompt": {
+  "checkpoint=False/v2v=False/transfer=False": false,
+  "checkpoint=False/v2v=False/transfer=True": false,
+  "checkpoint=False/v2v=True/transfer=False": true,
+  "checkpoint=False/v2v=True/transfer=True": false,
+  "checkpoint=True/v2v=False/transfer=False": true,
+  "checkpoint=True/v2v=False/transfer=True": false,
+  "checkpoint=True/v2v=True/transfer=False": true,
+  "checkpoint=True/v2v=True/transfer=True": false
+ }
+}

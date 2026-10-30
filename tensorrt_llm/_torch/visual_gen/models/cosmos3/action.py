@@ -95,8 +95,11 @@ def resolve_raw_action_dim(
     return widths.pop() if len(widths) == 1 else None
 
 
-# Canonical ``W,H`` labels; every action canvas is one of these bucket shapes.
-ACTION_ASPECT_RATIO_LABELS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+# The reference's ``W,H`` aspect buckets: every canvas is one of these shapes, and a
+# request's bucket string is carried into the caption verbatim, so a resolved frame
+# size maps back to the nearest bucket rather than to its exact reduced ratio
+# (832x480 reduces to "15,26", which the model never saw).
+COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
 
 
 VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {

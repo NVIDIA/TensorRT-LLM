@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    ACTION_ASPECT_RATIO_LABELS,
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
@@ -75,7 +75,7 @@ class TestFindClosestTargetSize:
     def test_all_buckets_have_aspect_entries(self, action_resolution):
         # find_closest_target_size picks from whatever entries exist, so a bucket
         # that lost "9,16" would silently land portrait sources on another canvas.
-        assert set(VIDEO_RES_SIZE_INFO[action_resolution]) == set(ACTION_ASPECT_RATIO_LABELS)
+        assert set(VIDEO_RES_SIZE_INFO[action_resolution]) == set(COSMOS3_ASPECT_RATIO_BUCKETS)
 
 
 class TestResolveActionSize:

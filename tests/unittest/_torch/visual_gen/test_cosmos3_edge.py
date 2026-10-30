@@ -1129,6 +1129,13 @@ class TestSamplingRecipeMatrix:
         (tmp_path / "model_index.json").write_text(
             json.dumps({"_class_name": "Cosmos3OmniPipeline"})
         )
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model": {"config": {"vlm_config": {"use_system_prompt": False}}}})
+        )
+        (tmp_path / "vae").mkdir()
+        (tmp_path / "vae" / "config.json").write_text(
+            json.dumps({"scale_factor_temporal": 4, "scale_factor_spatial": 16})
+        )
 
         def fresh_pipeline():
             pipeline = _bare_pipeline(NEMOTRON_DENSE_RECIPE.name)
@@ -1802,7 +1809,7 @@ class TestEdgeCheckpoint:
     def test_tokenization_matches_diffusers_golden(self):
         from transformers import AutoTokenizer
 
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
             COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
             COSMOS3_DURATION_TEMPLATE,
         )
