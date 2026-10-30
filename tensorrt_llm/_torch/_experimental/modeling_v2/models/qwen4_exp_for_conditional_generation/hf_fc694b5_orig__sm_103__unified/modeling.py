@@ -1927,9 +1927,9 @@ class DecodeTarget:
         The four input projections are one GEMM against the fused operand; the norm + rope of
         both planes runs on it; one compact copy of its leading `[q | k | v]` feeds the dense
         op and the sparse GQA's query heads, the sparse K/V append reads k and v as views of
-        it, and the index branch reads the raw key from it. The index plane is maintained on every step, at both ends of the
-        threshold; above it the dense core is replaced and the main K/V append becomes this
-        layer's own call."""
+        it, and the index branch reads the raw key from it. The index plane is maintained on
+        every step, at both ends of the threshold; above it the dense core is replaced and the
+        main K/V append becomes this layer's own call."""
         core = self.core
         (
             req_idx,
@@ -1987,7 +1987,14 @@ class DecodeTarget:
                 selected,
             )
             attn = _sparse_gqa(
-                core, kv, _packed_q(core, qkv), block_table, selected, req_idx, tokens_per_block, None
+                core,
+                kv,
+                _packed_q(core, qkv),
+                block_table,
+                selected,
+                req_idx,
+                tokens_per_block,
+                None,
             )
             out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
