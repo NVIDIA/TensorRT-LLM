@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Vision patch embedding: one 3-D convolution per pixel patch.
+"""Vision patch embedding: one 3-D convolution per pixel patch, made as the GEMM it is.
 
-Tier-3 composed: one `torch.nn.functional.conv3d` call between two views that
-launch nothing. No registered op is a 3-D convolution, and the CuTe DSL
-implicit-GEMM conv3d kernels in `visual_gen/kernels/blackwell/conv/` refuse this
-checkpoint's three input channels (bf16 needs `in_channels % 8 == 0`;
-`can_implement` swallows the refusal and returns False).
+With one whole patch per row and the stride equal to the kernel, the convolution
+has one output position per row: `out = rows @ filters.T + bias`, where `rows` and
+`filters` are views of `pixel_values` and `weight`. `__call__` is one
+`torch.ops.trtllm.cublas_mm` call (the C++ thop in `thop/cublasScaledMM.cpp`,
+cuBLASLt, bias fused into the epilogue) between views that launch nothing.
 """
 
 from __future__ import annotations
@@ -14,8 +14,8 @@ from __future__ import annotations
 from typing import Optional
 
 import torch
-import torch.nn.functional as F
 
+import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
@@ -48,7 +48,8 @@ class PatchEmbedConv3d(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: num_patches, dtype. The checkpoint's geometry, flat contiguous
-    # rows and a bias: what the vision tower passes.
+    # rows and a bias: what the vision tower passes. The tower is replicated,
+    # so these are every member's shapes (rank-invariant).
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"checkpoint geometry, {n} patches bf16",
@@ -63,28 +64,48 @@ class PatchEmbedConv3d(OpWrapper):
     )
 
     note = """
-    Metadata consumed: none. `pixel_values` is not mutated. All three operands
-    share one dtype and device -- torch raises "... should be the same"
-    otherwise. Several images, and a video's frame groups, are just more rows;
-    there is no batch axis.
+    Source: `torch.ops.trtllm.cublas_mm`, compiled into the engine's torch-op
+    library (no JIT path). One kernel launch per call; cuBLASLt picks the
+    kernel by row count (`nvjet_sm103` 64x8 tiles at 64 rows, 128x256 at 4096
+    and 32768, each with the bias in its epilogue).
 
-    fp32 runs in TF32 unless the caller sets `torch.backends.cudnn.allow_tf32 =
-    False` (global state the caller owns): measured 5.84e-4 from an exact fp32
-    matmul with it on (99.99% of outputs differ), 3.58e-6 with it off. bf16 and
-    fp16 are unaffected.
+    Metadata consumed: none. `pixel_values` is not mutated. Several images,
+    and a video's frame groups, are just more rows; there is no batch axis.
 
-    At this shape the op is a GEMM: one output position per row, and the
-    `[1152, 1536]` reshape of the filter is a view of the same bytes. Not timed.
-    CUDA-graph capturable; the output is a fresh allocation.
+    Measured on GB300 against `reference` at the three cells: 99.91-99.92% of
+    outputs bitwise equal, the rest one-ulp rounding flips of the element
+    (at most 4.4 bf16 ulps at the output RMS); relative L2 <= 9.4e-5; the worst
+    element at 0.49 of torch's default bf16 band. Each cell also holds
+    `reference`, in fp32, to an fp32 `F.conv3d` of the 5-D patches (TF32 off):
+    max |d| 2.0e-6 at 64 patches, 0 at 4096 and 32768 -- the flatten order
+    `__call__` and `reference` share is `nn.Conv3d`'s.
 
-    Not batch-invariant: cuDNN picks its kernel by row count, so a row's last bits
-    depend on how many rows share the call. Check rows against `reference`, never
-    against a call of a different size.
+    The same patches through `torch.nn.functional.conv3d` (cuDNN) are seven
+    GPU operations: three memsets, NCHW-to-NHWC transposes of both operands, an
+    implicit-GEMM fprop and a separate bf16 bias add that rounds a second time
+    (relative L2 2.85e-3 against `reference`). Eager time per call, this op vs
+    that one: 64 vs 117 us at 64 patches, 65 vs 489 us at 4096, 121 vs 2963 us
+    at 32768.
 
-    Not certified: dtypes other than bf16 (the fp32 TF32 behavior above is
-    measured, not certified); other geometries, `bias=None` and non-contiguous
-    pixel rows; patch counts below 64, between the cells, and past 32768
-    (cuDNN picks its kernel by row count).
+    Row-count invariance is not claimed: the first 64 rows of a 4096-row call
+    measured bitwise equal to a 64-row call, but the kernel changes with the
+    row count. Check rows against `reference`, never against a call of a
+    different size. CUDA-graph capturable (replayed at 64 and 32768 patches);
+    the output is a fresh allocation.
+
+    Silent, refused by `is_valid` (each measured unguarded): a row that is not
+    exactly one patch; row-strided pixel rows (2-D, or 5-D with a batch
+    stride) and a weight sliced along its output channels, read as if dense
+    (10^5 times outside the band); a bias in another dtype (fp32 or fp16 with
+    bf16 input) or strided (5000 times outside); a bias shorter than
+    `out_channels`, read past its end without an error; fp32 input with a
+    bias, which drops the bias. Loud, not guarded: a channels-last or
+    transposed operand fails the view, and a weight dtype unlike the input's
+    fails in cuBLASLt (CUBLAS_STATUS_NOT_SUPPORTED).
+
+    Not certified: dtypes other than bf16 (fp16 with an fp16 bias measured
+    inside the band, not a cell); other geometries; `bias=None`; patch counts
+    below 64, between the cells, and past 32768.
     """
 
     def __call__(
@@ -94,8 +115,9 @@ class PatchEmbedConv3d(OpWrapper):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         out_channels, in_channels, kt, kh, kw = weight.shape
-        patches = pixel_values.view(-1, in_channels, kt, kh, kw)
-        return F.conv3d(patches, weight, bias).view(-1, out_channels)
+        rows = pixel_values.view(-1, in_channels * kt * kh * kw)
+        filters = weight.view(out_channels, -1)
+        return torch.ops.trtllm.cublas_mm(rows, filters.t(), bias, None, 0, None)
 
     def reference(
         self,
@@ -120,8 +142,8 @@ class PatchEmbedConv3d(OpWrapper):
     ) -> None:
         # The view reinterprets anything whose element count divides: a whole
         # [1, 3, 2, 64, 64] volume becomes 16 "patches" -- a [16, 1152] result
-        # of the right shape from the wrong pixels, 2.52 from the strided conv
-        # the caller meant -- and [N, 3072] rows become 2N, without an error.
+        # of the right shape from the wrong pixels -- and [N, 3072] rows become
+        # 2N, without an error.
         _, in_channels, kt, kh, kw = weight.shape
         patch_numel = in_channels * kt * kh * kw
         if pixel_values.dim() == 2:
@@ -136,6 +158,26 @@ class PatchEmbedConv3d(OpWrapper):
             f"[num_patches, {in_channels}, {kt}, {kh}, {kw}] for this weight; got "
             f"{tuple(pixel_values.shape)}"
         )
+        # cuBLASLt reads the rows as dense row-major and the filter as dense
+        # column-major: a row-strided view, or a weight sliced along its output
+        # channels, still views to 2-D and is read as if dense.
+        assert pixel_values.is_contiguous(), (
+            "pixel_values must be contiguous; a strided view is read as dense rows"
+        )
+        assert weight.is_contiguous(), "weight must be contiguous; a strided view is read as dense"
+        if bias is not None:
+            # The epilogue reads the bias as `out_channels` dense elements of
+            # the output dtype, and drops it altogether for fp32 input.
+            assert bias.dtype == pixel_values.dtype, (
+                f"bias dtype {bias.dtype} must equal the input dtype {pixel_values.dtype}"
+            )
+            assert bias.shape == (weight.shape[0],) and bias.is_contiguous(), (
+                f"bias must be a contiguous [{weight.shape[0]}] tensor; got "
+                f"{tuple(bias.shape)} with stride {bias.stride()}"
+            )
+            assert pixel_values.dtype != torch.float32, (
+                "the bias is silently dropped for fp32 input"
+            )
 
 
 patch_embed_conv3d = PatchEmbedConv3d()
