@@ -18,6 +18,7 @@ offloaded layer with ``_build_sparse_offload_descriptor``.
 
 from __future__ import annotations
 
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Collection, Iterable
@@ -54,6 +55,12 @@ if TYPE_CHECKING:
 # Attention metadata holding a SparseOffloadState: the eager one, and the CUDA
 # graph metadata, which share theirs through the graph buffer pool.
 SPARSE_OFFLOAD_STATE_COPIES = 2
+
+# With TLLM_SPARSE_OFFLOAD_DEBUG_ASSERT=1, every merge of fetched arena rows asserts on
+# the device that each live selection of a history or in-flight unit got a row. Read
+# at import, before any graph capture. A failed assertion makes the CUDA context
+# unusable, so it is opt-in.
+SPARSE_OFFLOAD_DEBUG_ASSERT = os.environ.get("TLLM_SPARSE_OFFLOAD_DEBUG_ASSERT", "0") == "1"
 
 # The sparse MLA FMHA reads the NVFP4 scratch as its aux KV pool and can read up to
 # one KV tile (128 rows) past the last row its indices name (https://nvbugs/6796296),
@@ -131,15 +138,19 @@ class SparseOffloadState:
     Batch row; per-request inputs and attention outputs by input position.
 
     ``prepared`` means preparation was enqueued successfully; stream ordering
-    establishes device readiness. ``is_prefill`` is set by host batch validation
-    before execution, never inferred from a device count inside a layer.
-    ``write_layer`` tracks which layer enqueued the shared write mapping during
-    eager execution or capture. Graph replay uses the captured GPU operations;
-    this host marker does not determine device readiness.
+    establishes device readiness. Host batch validation clears it first, and
+    rejects any batch that is not pure decode. ``write_layer`` tracks which
+    layer enqueued the shared write mapping during eager execution or capture.
+    Graph replay uses the captured GPU operations; this host marker does not
+    determine device readiness.
 
     An in-flight selection is masked out of the history fetch. Its physical
     index must come from the separately prepared write mapping when assembling
     attention inputs.
+
+    ``coverage`` is an int32 [1] diagnostic flag the merges of fetched rows
+    assert on (``offload_kernels.merge_sparse_arena_indices``), allocated only
+    with ``SPARSE_OFFLOAD_DEBUG_ASSERT``.
     """
 
     layers: dict[int, SparseOffloadLayerDescriptor]
@@ -155,10 +166,10 @@ class SparseOffloadState:
     #: own position. Filled on first use, the earliest the native Batch exists to ask.
     out_slots: dict[int, tuple[int, ...]] = field(default_factory=dict)
     nvfp4_scratch: torch.Tensor | None = None
+    coverage: torch.Tensor | None = None
     batch: Batch | None = None
     history_lengths: torch.Tensor | None = None
     prepared: bool = False
-    is_prefill: bool = False
     write_layer: int | None = None
 
     @staticmethod
@@ -179,10 +190,11 @@ class SparseOffloadState:
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
         """
-        # The active count, the selections, the scatter start positions and the
-        # Batch row map, then the fetch outputs and write destinations of each
-        # buffer count.
+        # The active count, the selections, the scatter start positions, the
+        # Batch row map and any coverage flag, then the fetch outputs and write
+        # destinations of each buffer count.
         index_entries = 1 + max_batch_size * topk + 2 * max_batch_size
+        index_entries += int(SPARSE_OFFLOAD_DEBUG_ASSERT)
         index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
@@ -243,6 +255,7 @@ def allocate_sparse_offload_state(
         },
         scatter_start_positions=index_tensor("scatter_start_positions", (max_batch_size,), 0),
         nvfp4_scratch=nvfp4_scratch(nvfp4_head_dim) if nvfp4_head_dim is not None else None,
+        coverage=index_tensor("coverage", (1,), 1) if SPARSE_OFFLOAD_DEBUG_ASSERT else None,
     )
 
 
@@ -994,12 +1007,7 @@ class SparseOffloadCacheMixin:
         Data and scale buffers use the same column when their arena indices coincide;
         the output-slot mapping follows the arena geometry and requires no device read.
         """
-        if (
-            not self._enable_kv_cache_offload
-            or not state.prepared
-            or state.is_prefill
-            or state.batch is None
-        ):
+        if not self._enable_kv_cache_offload or not state.prepared or state.batch is None:
             raise RuntimeError("Sparse writes require prepared decode metadata")
         descriptor = state.layers[layer_idx]
         out = state.write_indices[len(descriptor.buffer_ids)]
@@ -1047,7 +1055,6 @@ class SparseOffloadCacheMixin:
         if (
             not self._enable_kv_cache_offload
             or not state.prepared
-            or state.is_prefill
             or state.batch is None
             or state.history_lengths is None
         ):

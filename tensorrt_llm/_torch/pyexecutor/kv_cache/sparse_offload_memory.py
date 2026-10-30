@@ -21,10 +21,11 @@ sparse cell arena.
 
 The native manager puts a sparse buffer's pages in a host-backed pool of the
 same pool group as its life cycle's dense buffers. A slot spans every pool of
-its group, so the host-backed pools get the slot count the device quota buys
-for the dense ones, and nothing else bounds them. The host memory offload takes
-is therefore set by the device quota and by how that quota is split across life
-cycles. The arena is a separate device allocation outside every tier's quota.
+its group, so the host-backed pools take the slot count of their group. The
+manager is handed a host budget (``host_sparse_pool_quota``) beside the device
+quota, divides both by one pool ratio, and lowers a group's slot count where
+its host-backed pools would exceed that budget. The arena is a separate device
+allocation outside every tier's quota.
 
 Everything here is derived from the layer configs a cache manager declares, so
 it is the same for every model. A model marks each offloaded buffer
@@ -49,6 +50,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, Spars
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        BatchDesc,
         BufferConfig,
         KVCacheManagerConfig,
         LayerConfig,
@@ -72,6 +74,9 @@ _INDEX_BYTES = 4
 _BATCH_WATERMARKS_PER_ROW = 2
 # Pinned host memory is mapped in whole pages of this many bytes.
 _HOST_PAGE_BYTES = 4096
+# A host-backed pool rounds its bytes up to this grain (hostMemSizeGranularity in
+# utils/hostMemBacking.cpp: 2 MiB, or the commit alignment where that is larger).
+_HOST_POOL_GRANULARITY = 2 << 20
 # A decode step writes one query token per request, which completes at most one
 # unit, so one unit per layer is in flight (_sparseCacheMaxInFlightUnits).
 _SPARSE_MAX_FLUSH_UNITS = 1
@@ -293,26 +298,6 @@ class LifeCyclePage:
     host_bytes: int
     device_pool_bytes: tuple[int, ...]
 
-    def pages_per_request(
-        self, *, capacity: int, capacity_headroom: int, tokens_per_block: int
-    ) -> int:
-        """Return the most pages one decoding request holds.
-
-        Args:
-            capacity: Tokens the request's cache holds, its history included.
-            capacity_headroom: Tokens a decode step reserves above the history.
-            tokens_per_block: Tokens per page.
-        """
-        if self.is_state:
-            return 1
-        pages = ceil_div(capacity, tokens_per_block)
-        if self.window_size is None:
-            return pages
-        # The live interval spans window + headroom - 1 tokens, at any page offset.
-        window_pages = ceil_div(self.window_size + capacity_headroom - 2, tokens_per_block) + 1
-        sink_pages = ceil_div(self.num_sink_tokens, tokens_per_block)
-        return min(pages, window_pages + sink_pages)
-
 
 def life_cycle_pages(layers: Sequence[LayerConfig], tokens_per_block: int) -> list[LifeCyclePage]:
     """Return the life cycles ``layers`` form, in the order the native manager numbers them.
@@ -379,9 +364,10 @@ class SparseBatchShape:
     """The native Batch the sparse fetch reads, sized once for every step.
 
     It holds a page table per life cycle, and two watermarks and one arena slot per row,
-    in a device mirror, a pinned host staging copy and a device staging copy, and the
-    fetch's work arrays on the device. Every step uploads the host staging copy to the
-    device one, then copies the mirror's part of it across.
+    in a device mirror, a pinned host staging copy and a device staging copy, the
+    converted index tables the fetch and the write-back read, and the fetch's work arrays
+    on the device. Every step uploads the host staging copy to the device one, then
+    copies the mirror's part of it across.
 
     Attributes:
         num_life_cycles: Life cycles of the manager; each has a page table.
@@ -394,6 +380,9 @@ class SparseBatchShape:
             the allocation, which is why it is required rather than defaulted.
         flush_capacities: Units one step can write back per layer, for each of those life
             cycles, from the step's token budget.
+        index_table_entries: Entries of the converted index tables, summed over the
+            tables; each entry is a page table's worth of indices. Required for the same
+            reason as ``layer_counts``.
     """
 
     num_life_cycles: int
@@ -402,6 +391,7 @@ class SparseBatchShape:
     selection_widths: tuple[int, ...]
     layer_counts: tuple[int, ...]
     flush_capacities: tuple[int, ...]
+    index_table_entries: int
 
     @property
     def block_bytes(self) -> int:
@@ -426,10 +416,22 @@ class SparseBatchShape:
         return pad_up(self.block_bytes, _HOST_PAGE_BYTES)
 
     @property
+    def index_table_bytes(self) -> int:
+        """Device bytes of the converted index tables, each sized for every row.
+
+        Their descriptors, a few bytes per table and buffer, are not counted.
+        """
+        return (
+            _INDEX_BYTES * self.index_table_entries * self.max_batch_size * self.max_blocks_per_seq
+        )
+
+    @property
     def device_bytes(self) -> int:
-        """Device bytes of the Batch: the staged block, the mirror of its tail and the
-        fetch's work arrays."""
-        return self.block_bytes + self.mirror_bytes + self.fetch_scratch_bytes
+        """Device bytes of the Batch: the staged block, the mirror of its tail, the
+        converted index tables and the fetch's work arrays."""
+        return (
+            self.block_bytes + self.mirror_bytes + self.index_table_bytes + self.fetch_scratch_bytes
+        )
 
     @property
     def fetch_scratch_bytes(self) -> int:
@@ -481,6 +483,17 @@ def sparse_batch_shape(
         unit_tokens = grouped_layers[0].sparse_cache.unit_tokens or tokens_per_block
         return max_total_input_tokens // unit_tokens + max_batch_size
 
+    def index_table_entries(grouped_layers: Sequence[LayerConfig]) -> int:
+        # The Batch converts every sparse buffer's indices (sparseIndexTableSpecs, one spec
+        # per layer and pool), and merges the specs of a life cycle's layers into shared
+        # tables where nothing can substitute a scratch slot (_buildIndexTables). Only a
+        # windowed life cycle can hold scratch (supportsIndexMode); counting its layers'
+        # tables separately is exact with SWA scratch reuse on and an upper bound without.
+        entries = len(_fetched_sparse_buffers(grouped_layers[0]))
+        if grouped_layers[0].sliding_window_size is not None:
+            entries *= len(grouped_layers)
+        return entries
+
     return SparseBatchShape(
         num_life_cycles=len(life_cycle_pages(layers, tokens_per_block)),
         max_batch_size=max_batch_size,
@@ -490,12 +503,15 @@ def sparse_batch_shape(
         ),
         layer_counts=tuple(len(grouped_layers) for grouped_layers in fetch_groups),
         flush_capacities=tuple(flush_capacity(grouped_layers) for grouped_layers in fetch_groups),
+        index_table_entries=sum(
+            index_table_entries(grouped_layers) for grouped_layers in fetch_groups
+        ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Sizing policy: the GPU cache per request, the quota split, the host budget and
-# the device quota it bounds.
+# Sizing policy: the GPU cache per request and the host budget, which the native
+# manager divides beside the device quota.
 # ---------------------------------------------------------------------------
 
 
@@ -569,47 +585,47 @@ def sparse_cache_config(
     )
 
 
-def sparse_offload_pool_ratio(
-    life_cycles: Sequence[LifeCyclePage],
+def sparse_history_floor_bytes(
+    layers: Sequence[LayerConfig],
+    constraints: Sequence[BatchDesc],
     *,
-    capacity: int,
-    capacity_headroom: int,
     tokens_per_block: int,
-) -> list[float]:
-    """Return the device quota's split across life cycles for decoding requests.
+    max_util_for_resume: float,
+) -> int:
+    """Return the host bytes the host-backed pools need for the batches in ``constraints``.
 
-    Each life cycle's share is the device bytes its pages take in a request of
-    ``capacity`` tokens, so the quota buys the same number of such requests in
-    every life cycle. Host-backed pools cost the quota nothing and get no share.
+    The native manager reserves the slots every constraint batch needs before it
+    divides the host budget, and refuses a budget below them
+    (``computePoolGroupMinSlotsFromConstraints``, ``ratioToSlotCountList``). A batch
+    needs a slot per page its requests' capacities cover in a life cycle that keeps
+    all of its history, every beam counted, and no more in a windowed one; the
+    manager scales that by ``1 / max_util_for_resume``. Every host-backed pool then
+    rounds its bytes up to the host grain, which this counts in full.
 
     Args:
-        life_cycles: The manager's life cycles, in native order.
-        capacity: Tokens one request's cache holds.
-        capacity_headroom: Tokens a decode step reserves above the history.
+        layers: Every layer config the manager allocates.
+        constraints: The manager config's constraint batches.
         tokens_per_block: Tokens per page.
-
-    Returns:
-        One positive share per life cycle, summing to 1; the order and meaning of
-        ``KVCacheManagerConfig.initial_pool_ratio``.
+        max_util_for_resume: The utilization the manager keeps every pool group under.
     """
-    # Device and host bytes together. The manager's pool ratio counts every pool, host-backed
-    # ones included -- it is projected onto cold levels, where one pool holds dense and sparse
-    # buffers together, and a rebalance compares it against a layout measured the same way.
-    # Weighing device bytes alone here would hand the manager a ratio in one currency and
-    # measure the result in another.
-    weights = [
-        (life_cycle.device_bytes + life_cycle.host_bytes)
-        * life_cycle.pages_per_request(
-            capacity=capacity,
-            capacity_headroom=capacity_headroom,
-            tokens_per_block=tokens_per_block,
+    # The native manager gives each size of sparse buffer in a life cycle a pool.
+    host_pools = {
+        (layer.sliding_window_size, ceil_div(layer.num_sink_tokens or 0, tokens_per_block), size)
+        for layer in layers
+        if isinstance(layer, AttentionLayerConfig)
+        for size in (buffer.size for buffer in layer.buffers if buffer.is_sparse)
+    }
+    if not host_pools or not constraints:
+        return 0
+    pages = max(
+        sum(
+            ceil_div(request.capacity, tokens_per_block) * max(1, request.beam_width)
+            for request in batch.kv_caches
         )
-        for life_cycle in life_cycles
-    ]
-    if any(weight <= 0 for weight in weights):
-        raise ValueError(f"Every life cycle needs bytes to share the quota, got {weights}")
-    total = sum(weights)
-    return [weight / total for weight in weights]
+        for batch in constraints
+    )
+    slots = math.ceil(pages / max_util_for_resume)
+    return slots * sparse_history_bytes_per_block(layers) + len(host_pools) * _HOST_POOL_GRANULARITY
 
 
 def plan_host_history_bytes(
@@ -619,13 +635,15 @@ def plan_host_history_bytes(
     host_bytes_per_request: int,
     pinnable_host_bytes: float,
     staging_bytes: int,
+    floor_bytes: int = 0,
 ) -> int:
     """Return the host bytes the host-backed history pools may take.
 
     Offload also pins the sparse Batch's staging buffers, so they come out of
     the same host memory. An explicit ``host_history_size`` covers both.
     Otherwise the pools hold ``max_batch_size`` requests, capped so that pools
-    and staging fit in the host memory the rank may pin.
+    and staging fit in the host memory the rank may pin. Either way they must
+    reach ``floor_bytes``: the native manager refuses a smaller budget.
 
     Args:
         host_history_size: The configured size, or None to size automatically.
@@ -634,10 +652,17 @@ def plan_host_history_bytes(
         pinnable_host_bytes: Host bytes automatic sizing may pin for offload;
             ``inf`` when unknown.
         staging_bytes: Pinned host bytes of the sparse Batch's staging buffers.
+        floor_bytes: Host bytes the manager's constraint batches need in the
+            host-backed pools (:func:`sparse_history_floor_bytes`).
 
     Raises:
-        ValueError: No host memory is left for the pools.
+        ValueError: No host memory is left for the pools, or less than
+            ``floor_bytes``.
     """
+    floor = (
+        f"the {floor_bytes / _MIB:.1f}MiB the KV cache manager reserves for the batches it must "
+        "always hold, such as one max_seq_len request"
+    )
     if host_history_size is not None:
         budget = host_history_size - staging_bytes
         if budget <= 0:
@@ -647,20 +672,38 @@ def plan_host_history_bytes(
                 f"history: the sparse Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB "
                 "of it."
             )
+        if budget < floor_bytes:
+            raise ValueError(
+                "sparse_attention_config.kv_cache_offload_config.host_history_size "
+                f"({host_history_size / _MIB:.1f}MiB) leaves {budget / _MIB:.1f}MiB for offloaded "
+                f"history beside the sparse Batch's staging buffers, less than {floor}. Raise "
+                "host_history_size, or lower max_seq_len."
+            )
         return budget
     if not host_bytes_per_request:
         # This rank's layers offload no history.
         return 0
-    budget = min(max_batch_size * host_bytes_per_request, pinnable_host_bytes - staging_bytes)
-    if budget <= 0:
+    available = pinnable_host_bytes - staging_bytes
+    pinnable = (
+        f"this rank may pin {max(0.0, pinnable_host_bytes) / _MIB:.1f}MiB, and the sparse "
+        f"Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB"
+    )
+    if available <= 0:
         raise ValueError(
             "Sizing sparse KV cache offload automatically leaves no host memory for offloaded "
-            f"history: this rank may pin {max(0.0, pinnable_host_bytes) / _MIB:.1f}MiB, and the "
-            f"sparse Batch's staging buffers take {staging_bytes / _MIB:.1f}MiB. Set "
+            f"history: {pinnable}. Set "
             "sparse_attention_config.kv_cache_offload_config.host_history_size, or lower "
             "kv_cache_config.host_cache_size."
         )
-    return int(budget)
+    if available < floor_bytes:
+        raise ValueError(
+            "Sizing sparse KV cache offload automatically leaves "
+            f"{available / _MIB:.1f}MiB of host memory for offloaded history, less than "
+            f"{floor}: {pinnable}. Set "
+            "sparse_attention_config.kv_cache_offload_config.host_history_size, lower "
+            "max_seq_len, or lower kv_cache_config.host_cache_size."
+        )
+    return int(max(min(max_batch_size * host_bytes_per_request, available), floor_bytes))
 
 
 # ---------------------------------------------------------------------------

@@ -175,6 +175,7 @@ class KvCacheConfigV2:
     # tensorrt_llm/llmapi/llm_args.py; KVCacheManagerV2._build_base_config()
     # reads it unconditionally.
     kv_pool_rebalance_config: KvPoolRebalanceConfig = field(default_factory=KvPoolRebalanceConfig)
+    enable_kv_pool_rebalance: bool = False
 
 
 # ---------------------------------------------------------------------------

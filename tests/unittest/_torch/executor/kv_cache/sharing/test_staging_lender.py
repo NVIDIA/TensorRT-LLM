@@ -176,11 +176,11 @@ def test_recurrent_state_is_refused(kit, hybrid_manager):
 
 
 def sparse_layers(monkeypatch, indices):
-    """Managers built from now on give their layers ``indices`` sparse attention, which no model
+    """Managers built from now on give their layers ``indices`` sparse buffers, which no model
     here does: their K/V buffers become sparse, and each also carries the dense indexer buffer
-    that selects from them and the sparse cache it selects into. ``indices`` must cover whole
-    life cycles, as a model with sparse attention does; the runtime may then lock those layer
-    groups' read-only pages in host memory."""
+    that would select from them. ``indices`` must cover whole life cycles, as a model with
+    sparse attention does; the runtime may then lock those layer groups' read-only pages in
+    host memory."""
     from dataclasses import replace
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2

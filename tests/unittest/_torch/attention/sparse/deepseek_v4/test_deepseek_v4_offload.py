@@ -530,6 +530,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         # The mocked fetch cannot fill this, so stand in for it: one slice per buffer.
         out_slots={2: tuple(range(physical.shape[1]))},
         nvfp4_scratch=torch.empty(1, 8, 512, dtype=torch.float8_e4m3fn) if nvfp4 else None,
+        coverage=None,
     )
     descriptor = state.layers[2]
     if nvfp4:
@@ -659,18 +660,14 @@ def test_fetch_uses_batch_rows_and_preserves_topk_slots(multiple_roles, rows):
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("invalid", ["disabled", "unprepared", "prefill", "batch", "watermarks"])
-def test_fetch_rejects_unprepared_or_prefill_metadata(invalid):
+@pytest.mark.parametrize("invalid", ["disabled", "unprepared", "batch", "watermarks"])
+def test_fetch_rejects_unprepared_metadata(invalid):
     manager = _manager()
-    state = SimpleNamespace(
-        prepared=True, is_prefill=False, batch=object(), history_lengths=object()
-    )
+    state = SimpleNamespace(prepared=True, batch=object(), history_lengths=object())
     if invalid == "disabled":
         manager._enable_kv_cache_offload = False
     elif invalid == "unprepared":
         state.prepared = False
-    elif invalid == "prefill":
-        state.is_prefill = True
     elif invalid == "batch":
         state.batch = None
     else:
@@ -757,7 +754,7 @@ def _host_batch(*, prefill=False):
         cache.history_length = 0
     metadata = SimpleNamespace(
         sparse_metadata_params=SimpleNamespace(enable_kv_cache_offload=True),
-        sparse_offload_state=SimpleNamespace(prepared=True, is_prefill=False),
+        sparse_offload_state=SimpleNamespace(prepared=True),
         kv_cache_manager=manager,
         request_ids=[20, 10],
         beam_width=1,
@@ -775,16 +772,24 @@ def _host_batch(*, prefill=False):
     metadata._validate_ragged_verification = MethodType(
         DeepseekV4TrtllmAttentionMetadata._validate_ragged_verification, metadata
     )
+    metadata._validate_dsa_sparse_offload_batch = MethodType(
+        DeepseekV4TrtllmAttentionMetadata._validate_dsa_sparse_offload_batch, metadata
+    )
     return metadata
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("prefill", [False, True])
-def test_offload_admits_decode_or_fresh_prefill(prefill):
+def test_offload_admits_only_decode(prefill):
+    # An offloading worker is a disaggregated decode worker: context requests reach it
+    # through the KV transfer, never as a batch of its own.
     metadata = _host_batch(prefill=prefill)
-    DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    if prefill:
+        with pytest.raises(NotImplementedError, match="decode batches only"):
+            DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
+    else:
+        DeepseekV4TrtllmAttentionMetadata.validate_sparse_offload_batch(metadata)
     assert not metadata.sparse_offload_state.prepared
-    assert metadata.sparse_offload_state.is_prefill == prefill
 
 
 @pytest.mark.cpu_only

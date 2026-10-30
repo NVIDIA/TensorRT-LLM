@@ -19,6 +19,11 @@ import torch
 import triton
 import triton.language as tl
 
+# Message of the opt-in device assertion on a merge's coverage flag.
+SPARSE_ARENA_COVERAGE_MESSAGE = (
+    "Sparse offload: a live selection of a fetched or in-flight unit has no arena row"
+)
+
 
 def check_sparse_offload_tensor(
     tensor: torch.Tensor, name: str, ndim: int, device: torch.device
@@ -28,6 +33,95 @@ def check_sparse_offload_tensor(
         raise ValueError(f"{name} must be a {ndim}D int32 tensor")
     if not tensor.is_cuda or tensor.device != device:
         raise ValueError(f"{name} must be on CUDA device {device}")
+
+
+def check_sparse_arena_merge_inputs(
+    topk_indices: torch.Tensor,
+    unit_lengths: torch.Tensor,
+    history_lengths: torch.Tensor,
+    batch_rows: torch.Tensor,
+    fetched_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    active_request_count: torch.Tensor,
+    coverage: torch.Tensor | None,
+) -> None:
+    """Check the inputs every merge of fetched arena rows into a selection reads.
+
+    Selections are [Q, K] in query order; the fetch output [B, K], write rows,
+    history lengths and the Batch row map [B] are by Batch row; unit lengths
+    cover the queries and fit the Batch; the active count and the coverage
+    flag are [1].
+    """
+    device = fetched_indices.device
+    for tensor, name, ndim in (
+        (topk_indices, "topk_indices", 2),
+        (unit_lengths, "unit_lengths", 1),
+        (history_lengths, "history_lengths", 1),
+        (batch_rows, "batch_rows", 1),
+        (fetched_indices, "fetched_indices", 2),
+        (write_indices, "write_indices", 1),
+        (active_request_count, "active_request_count", 1),
+    ):
+        check_sparse_offload_tensor(tensor, name, ndim, device)
+    num_rows, width = fetched_indices.shape
+    num_queries, topk = topk_indices.shape
+    if topk != width:
+        raise ValueError("Selections and the fetch output must share the top-k width")
+    if active_request_count.shape != (1,):
+        raise ValueError("active_request_count must be [1]")
+    if (
+        history_lengths.shape != (num_rows,)
+        or write_indices.shape != (num_rows,)
+        or batch_rows.shape != (num_rows,)
+    ):
+        raise ValueError(
+            "history_lengths, write_indices and batch_rows must cover the native Batch"
+        )
+    if not num_queries <= unit_lengths.numel() <= num_rows:
+        raise ValueError("Query and unit-length rows must fit the native Batch capacity")
+    if coverage is not None:
+        check_sparse_offload_tensor(coverage, "coverage", 1, device)
+        if coverage.shape != (1,):
+            raise ValueError("coverage must be [1]")
+
+
+@triton.jit
+def sparse_arena_rows(
+    unit,
+    in_width,
+    live,
+    length,
+    history_units,
+    fetched_row_ptr,
+    fetched_stride,
+    lane,
+    write,
+    coverage_ptr,
+    CHECK_COVERAGE: tl.constexpr,
+):
+    """Return the arena row each lane's selected unit is read from.
+
+    ``unit`` holds a query's selected units in its lanes, -1 for none, and
+    ``in_width`` the lanes that hold a selection. A unit below the request's
+    ``history_units`` takes its fetched row, from ``fetched_row_ptr`` at
+    ``lane``; the in-flight unit takes ``write``; padding queries (``live``
+    false), invalid selections and units past ``length`` take -1.
+
+    With ``CHECK_COVERAGE``, clears the int32 flag at ``coverage_ptr`` when a
+    live, valid selection of a history or in-flight unit gets no row.
+    """
+    valid = live & (unit >= 0) & (unit < length)
+    fetched = tl.load(
+        fetched_row_ptr + lane * fetched_stride,
+        mask=valid & in_width & (unit < history_units),
+        other=-1,
+    )
+    rows = tl.where(valid & (unit == history_units), write, fetched)
+    if CHECK_COVERAGE:
+        required = valid & in_width & (unit <= history_units)
+        covered = tl.min((~required | (rows >= 0)).to(tl.int32), axis=0)
+        tl.atomic_and(coverage_ptr, covered, sem="relaxed")
+    return rows
 
 
 @triton.jit(do_not_specialize=["num_lengths"])
@@ -179,11 +273,13 @@ def _merge_sparse_arena_indices_kernel(
     write_stride,
     out_stride0,
     out_stride1,
+    coverage_ptr,
     NUM_ROWS: tl.constexpr,
     num_lengths,
     TOPK: tl.constexpr,
     UNIT_TOKENS: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    CHECK_COVERAGE: tl.constexpr,
 ):
     query = tl.program_id(0)
     active_count = tl.load(active_request_count_ptr)
@@ -199,18 +295,21 @@ def _merge_sparse_arena_indices_kernel(
     k = tl.arange(0, BLOCK_K)
     in_width = k < TOPK
     unit = tl.load(topk_ptr + query * topk_stride0 + k * topk_stride1, in_width, other=-1)
-    valid = live & (unit >= 0) & (unit < length)
-    fetched = tl.load(
-        fetched_ptr + row * fetched_stride0 + k * fetched_stride1,
-        valid & in_width & (unit < history_units),
-        other=-1,
-    )
     write = tl.load(write_ptr + row * write_stride, live, other=-1)
-    tl.store(
-        out_ptr + query * out_stride0 + k * out_stride1,
-        tl.where(valid & (unit == history_units), write, fetched),
-        mask=in_width,
+    rows = sparse_arena_rows(
+        unit,
+        in_width,
+        live,
+        length,
+        history_units,
+        fetched_ptr + row * fetched_stride0,
+        fetched_stride1,
+        k,
+        write,
+        coverage_ptr,
+        CHECK_COVERAGE,
     )
+    tl.store(out_ptr + query * out_stride0 + k * out_stride1, rows, mask=in_width)
 
 
 def merge_sparse_arena_indices(
@@ -225,6 +324,7 @@ def merge_sparse_arena_indices(
     out: torch.Tensor,
     *,
     unit_tokens: int,
+    coverage: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return each query's selection as rows of one sparse buffer's arena.
 
@@ -233,45 +333,37 @@ def merge_sparse_arena_indices(
     order; ``write_indices`` [B] is that buffer's in-flight row by Batch row,
     written this step. Both may be strided views of the per-buffer outputs.
 
-    ``out`` is [Q, K] in query order. A selected history unit takes its fetched
-    row, the in-flight unit takes the write row, and padding queries, invalid
-    selections and units past the unit length take -1. No tensor allocation,
-    host read, or synchronization is performed.
+    ``out`` is [Q, K] in query order, assembled by :func:`sparse_arena_rows`.
+    No tensor allocation, host read, or synchronization is performed. With
+    ``coverage``, an int32 [1] diagnostic flag, the merge also resets the flag,
+    clears it when a live selection gets no row, and asserts on it on the
+    device. A failed assertion makes the CUDA context unusable, so pass it only
+    for debugging.
     """
     device = out.device
-    for tensor, name, ndim in (
-        (topk_indices, "topk_indices", 2),
-        (request_indices, "request_indices", 1),
-        (batch_rows, "batch_rows", 1),
-        (active_request_count, "active_request_count", 1),
-        (unit_lengths, "unit_lengths", 1),
-        (history_lengths, "history_lengths", 1),
-        (fetched_indices, "fetched_indices", 2),
-        (write_indices, "write_indices", 1),
-        (out, "out", 2),
-    ):
+    check_sparse_arena_merge_inputs(
+        topk_indices,
+        unit_lengths,
+        history_lengths,
+        batch_rows,
+        fetched_indices,
+        write_indices,
+        active_request_count,
+        coverage,
+    )
+    for tensor, name, ndim in ((request_indices, "request_indices", 1), (out, "out", 2)):
         check_sparse_offload_tensor(tensor, name, ndim, device)
-    num_rows, width = fetched_indices.shape
+    num_rows = fetched_indices.shape[0]
     num_queries, topk = topk_indices.shape
     if unit_tokens <= 0:
         raise ValueError("unit_tokens must be positive")
-    if topk != width or out.shape != (num_queries, topk):
-        raise ValueError("Selections, fetch output and out must share the top-k width")
-    if request_indices.shape != (num_queries,) or active_request_count.shape != (1,):
-        raise ValueError("request_indices must be [Q] and active_request_count must be [1]")
-    if (
-        history_lengths.shape != (num_rows,)
-        or write_indices.shape != (num_rows,)
-        or batch_rows.shape != (num_rows,)
-    ):
-        raise ValueError(
-            "history_lengths, write_indices and batch_rows must cover the native Batch"
-        )
-    if not num_queries <= unit_lengths.numel() <= num_rows:
-        raise ValueError("Query and unit-length rows must fit the native Batch capacity")
+    if out.shape != (num_queries, topk) or request_indices.shape != (num_queries,):
+        raise ValueError("out must be [Q, K] and request_indices [Q]")
     if num_queries == 0 or topk == 0:
         return out
     with torch.cuda.device(device):
+        if coverage is not None:
+            coverage.fill_(1)
         _merge_sparse_arena_indices_kernel[(num_queries,)](
             topk_indices,
             request_indices,
@@ -290,12 +382,16 @@ def merge_sparse_arena_indices(
             *fetched_indices.stride(),
             write_indices.stride(0),
             *out.stride(),
+            coverage if coverage is not None else out,
             NUM_ROWS=num_rows,
             num_lengths=unit_lengths.numel(),
             TOPK=topk,
             UNIT_TOKENS=unit_tokens,
             BLOCK_K=triton.next_power_of_2(topk),
+            CHECK_COVERAGE=coverage is not None,
         )
+        if coverage is not None:
+            torch._assert_async(coverage, SPARSE_ARENA_COVERAGE_MESSAGE)
     return out
 
 
