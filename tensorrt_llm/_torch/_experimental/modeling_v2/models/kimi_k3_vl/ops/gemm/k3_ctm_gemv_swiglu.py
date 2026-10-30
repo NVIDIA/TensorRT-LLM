@@ -17,7 +17,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
 class K3CtmGemvSwiglu(OpWrapper):
     """Return `bf16(silu_and_mul(gu) @ weight.T)`, gate columns first, in one k3_ctm_gemv_swiglu call."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="drafter down, seven k-tiles split unevenly as four and three",

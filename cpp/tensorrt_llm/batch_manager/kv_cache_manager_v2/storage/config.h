@@ -28,6 +28,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -88,6 +89,19 @@ struct BufferId
     }
 };
 
+//! Buffers a consumer must address from one table, under one base pointer.
+//!
+//! Some attention ops take a single block table covering K and V rather than one each.
+//! Order defines the table's buffer dimension: a kernel reads buffer `i` at entry `i`.
+//!
+//! All buffers must share a life cycle and a page-index scale; one table cannot serve
+//! buffers whose converted indices differ. A spec spanning either is refused when the
+//! Batch is constructed.
+struct IndexTableSpec
+{
+    std::vector<BufferId> buffers;
+};
+
 struct BufferIdHash
 {
     size_t operator()(BufferId const& id) const noexcept
@@ -108,6 +122,12 @@ struct CoalescedBuffer
     size_t singleBufferSize = 0;
     std::vector<BufferId> bufferIds;
 
+    //! Whether this pool's pages live in the sparse GPU cache: host memory, device-mapped,
+    //! and not charged to the GPU tier's quota.
+    //!
+    //! Per pool, not per life cycle -- one layer may hold both a sparse buffer and a dense one.
+    bool isSparse = false;
+
     [[nodiscard]] size_t size() const noexcept
     {
         return singleBufferSize * bufferIds.size();
@@ -127,6 +147,11 @@ struct SlotDescVariant
 {
     LifeCycleId lifeCycleId{0};
     TypedVec<PoolIndex, CoalescedBuffer> coalescedBuffers; // sorted size desc
+
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
+    {
+        return coalescedBuffers.at(poolIdx).isSparse;
+    }
 
     // Slot size for each pool in this group.
     [[nodiscard]] TypedVec<PoolIndex, size_t> slotSizeList() const
@@ -154,6 +179,13 @@ struct SlotDesc
     {
         return getUniformAttribute(variants, [](auto const& v) { return v.slotSizeList(); });
     }
+
+    //! Life cycles share a pool group only when their pools agree position-wise on
+    //! sparsity as well as size, so this is uniform across variants.
+    [[nodiscard]] bool isSparse(PoolIndex poolIdx) const
+    {
+        return getUniformAttribute(variants, [poolIdx](auto const& v) { return v.isSparse(poolIdx); });
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -164,14 +196,14 @@ struct BufferAttr
 {
     LifeCycleId lifeCycleId{0};
     PoolIndex poolIndex{0};
-    size_t offset = 0; // byte offset within the slot
-    size_t size = 0;   // expanded size of the buffer (after expansion)
-    int expansion = 1; // expansion factor (tokens_per_block / tokens_per_block_override)
+    size_t offset = 0;            // byte offset within the slot
+    size_t size = 0;              // expanded size of the buffer (after expansion)
+    int expansion = 1;            // expansion factor (tokens_per_block / tokens_per_block_override)
+    int scratchPagesPerBlock = 1; // buffers of this layer in the same coalesced slot
 };
 
 // ---------------------------------------------------------------------------
 // Rational — exact fraction for slot utilization computations.
-// Mirrors Python's fractions.Fraction used in _storage/_config.py::LayerAttr.
 // ---------------------------------------------------------------------------
 struct Rational
 {
@@ -197,22 +229,6 @@ struct Rational
 };
 
 // ---------------------------------------------------------------------------
-// LayerAttr — per-layer storage attributes for scratch slot management.
-// Mirrors _storage/_config.py::LayerAttr.
-// ---------------------------------------------------------------------------
-struct LayerAttr
-{
-    LifeCycleId lifeCycleId{0};
-
-    // Number of sub-pages within a single coalesced slot that belong to this layer,
-    // per pool within the pool group.
-    TypedVec<PoolIndex, int> slotUtil;
-
-    // Fraction of slot_util to total number of buffers in the slot, max over all pools.
-    Rational slotUtilFracMax;
-};
-
-// ---------------------------------------------------------------------------
 // StorageConfig — complete storage layout for the KV cache.
 // Mirrors _storage/_config.py::StorageConfig.
 // ---------------------------------------------------------------------------
@@ -220,6 +236,9 @@ struct StorageConfig
 {
     TypedVec<CacheLevel, CacheTierConfig> cacheTiers;
     TypedVec<PoolGroupIndex, SlotDesc> slotDescList;
+
+    //! Host bytes the GPU tier's host-backed pools may take, or unset for unbounded.
+    std::optional<size_t> hostSparsePoolQuota;
 
     // Expansion factor per buffer (for heterogeneous tokens_per_block).
     std::unordered_map<BufferId, int, BufferIdHash> expansion;
@@ -230,12 +249,9 @@ struct StorageConfig
     // Attribute map for each buffer.
     std::map<BufferId, BufferAttr> bufferAttributes() const;
 
-    // Map LayerId → LifeCycleId.
-    std::unordered_map<LayerId, LifeCycleId> layerToLifeCycleIds() const;
-
-    // Per-layer storage attributes (slot utilization within coalesced slots).
-    // Mirrors _storage/_config.py::StorageConfig.layer_attributes().
-    std::map<LayerId, LayerAttr> layerAttributes() const;
+    // Map LayerId → the lifecycles of its buffers, in ascending order. A layer spans several
+    // lifecycles when its buffers use different reuse policies.
+    std::unordered_map<LayerId, std::vector<LifeCycleId>> layerToLifeCycleIds() const;
 
     LifeCycleId numLifeCycles() const;
 };

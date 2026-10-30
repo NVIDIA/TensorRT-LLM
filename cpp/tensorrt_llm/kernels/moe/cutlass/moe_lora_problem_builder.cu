@@ -43,7 +43,7 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     void** __restrict__ a_ptrs_in, void** __restrict__ b_ptrs_in, void** __restrict__ d_ptrs_in,
     void** __restrict__ b_ptrs_out, void** __restrict__ d_ptrs_out, int64_t* __restrict__ lda_in,
     int64_t* __restrict__ ldb_in, int64_t* __restrict__ ldd_in, int64_t* __restrict__ ldb_out,
-    int64_t* __restrict__ ldd_out, int64_t* __restrict__ splitk_offsets)
+    int64_t* __restrict__ ldd_out, int64_t* __restrict__ splitk_offsets, int64_t output_dtype_bytes)
 {
     int64_t const i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= num_permuted_tokens)
@@ -80,10 +80,10 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, out_n, rank);
 
     // Pointer rows. dtype_bytes scales the per-row stride so the same
-    // builder serves bf16/fp16/fp32 adapters without templating.
+    // builder serves fp8/bf16/fp16/fp32 adapters with a separate output dtype.
     int64_t const in_row_stride = in_hidden_size * dtype_bytes;
     int64_t const work_row_stride = max_lora_rank * dtype_bytes;
-    int64_t const out_row_stride = out_hidden_size * dtype_bytes;
+    int64_t const out_row_stride = out_hidden_size * output_dtype_bytes;
 
     a_ptrs_in[i] = reinterpret_cast<void*>(input_base + i * in_row_stride);
     b_ptrs_in[i] = reinterpret_cast<void*>(a_ptr_bits);
@@ -121,7 +121,7 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
 void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_dev, void const* input_base,
     void* lowrank_workspace, void* output_base, int64_t num_permuted_tokens, int64_t in_hidden_size,
     int64_t out_hidden_size, int64_t max_lora_rank, int64_t dtype_bytes, int64_t splitk_slices,
-    MoeLoraGemmGroupArrays const& out, cudaStream_t stream)
+    MoeLoraGemmGroupArrays const& out, cudaStream_t stream, int64_t output_dtype_bytes)
 {
     if (num_permuted_tokens <= 0)
     {
@@ -136,6 +136,7 @@ void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_d
     TLLM_CHECK_WITH_INFO(
         out.lda_in && out.ldb_in && out.ldd_in && out.ldb_out && out.ldd_out, "All ld* arrays must be non-null");
     TLLM_CHECK_WITH_INFO(dtype_bytes > 0, "dtype_bytes must be positive");
+    TLLM_CHECK_WITH_INFO(output_dtype_bytes > 0, "output_dtype_bytes must be positive");
     TLLM_CHECK_WITH_INFO(max_lora_rank > 0, "max_lora_rank must be positive");
     TLLM_CHECK_WITH_INFO(in_hidden_size > 0 && out_hidden_size > 0, "hidden sizes must be positive");
     TLLM_CHECK_WITH_INFO(splitk_slices > 0, "splitk_slices must be positive");
@@ -151,7 +152,7 @@ void launchMoeLoraProblemBuilder(int32_t const* ranks_dev, int64_t const* ptrs_d
         reinterpret_cast<int64_t>(output_base), num_permuted_tokens, in_hidden_size, out_hidden_size, max_lora_rank,
         dtype_bytes, splitk_slices, out.problem_sizes_in, out.problem_sizes_out, out.a_ptrs_in, out.b_ptrs_in,
         out.d_ptrs_in, out.b_ptrs_out, out.d_ptrs_out, out.lda_in, out.ldb_in, out.ldd_in, out.ldb_out, out.ldd_out,
-        out.splitk_offsets);
+        out.splitk_offsets, output_dtype_bytes);
     sync_check_cuda_error(stream);
 }
 

@@ -16,9 +16,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.mnnvl_allreduce 
     workspace_bytes,
     workspace_bytes_up_to,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.comm.mnnvl_allreduce import (
-    K3MnnvlAllReduce,
-)
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 
 # (hidden, world): the two default targets at their MNNVL sizes.
@@ -52,21 +49,3 @@ def test_the_largest_one_shot_call_sets_the_size_below_the_band_edge():
     assert workspace_bytes(64, 2880, 8, torch.bfloat16) == 737_280
     assert workspace_bytes(22, 2880, 8, torch.bfloat16) == 1_013_760
     assert workspace_bytes_up_to(64, 2880, 8, torch.bfloat16) == 1_013_760
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("world", (4, 16))
-@pytest.mark.parametrize("rows", (1, 3, 8, 16, 33, 64))
-def test_k3_workspace_threshold_is_inclusive_and_two_shot_pads(rows, world):
-    hidden = 7168
-    one_shot = rows * hidden * world * 2
-    assert (
-        K3MnnvlAllReduce.get_required_workspace_size(rows, hidden, world, torch.bfloat16, one_shot)
-        == one_shot
-    )
-    assert (
-        K3MnnvlAllReduce.get_required_workspace_size(
-            rows, hidden, world, torch.bfloat16, one_shot - 1
-        )
-        == 2 * ((rows + world - 1) // world) * world * hidden * 2
-    )

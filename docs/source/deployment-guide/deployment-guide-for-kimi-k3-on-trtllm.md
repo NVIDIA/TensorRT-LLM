@@ -39,6 +39,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` is `64`** — retained as the validated configuration. Earlier releases needed this page size to avoid a legacy MLA fallback that did not support Kimi K3's 96 query heads.
+* **NVFP4 KV cache is supported** (`kv_cache_config.dtype: nvfp4`). The last two MLA layers stay in an FP8 KV cache by default (see `TLLM_KIMI_K3_FP8_KV_LAYERS` below), and KV cache block reuse with an NVFP4 KV cache requires `enable_chunked_prefill: true`.
 * **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
 
 ## Deployment Steps
@@ -216,6 +217,7 @@ When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API seman
 * **Streaming usage:** `usage` is reported in the final streaming chunk even when the client does not send `stream_options` (Kimi API parity).
 * **Prompt-token accounting:** reported `usage.prompt_tokens` excludes the trailing 3-token generation channel opener, matching Kimi's reference accounting; the model still consumes the full rendered prompt.
 * **`TRTLLM_KIMI_PARAM_POLICY`** (default `0`, off): when set to `1`, enforces Kimi's immutable sampling parameters — `top_p` pinned to 0.95 (unset or the OpenAI default `1.0` are coerced to 0.95; other values are rejected with HTTP 400), `presence_penalty`/`frequency_penalty` 0, `n` 1, and `temperature` bounded to [0, 1]. Off by default so existing deployments keep accepting the requests they accept today; a Kimi-Vendor-Verifier certification run must set it to `1` (the KVV params suite requires the rejections).
+* **`TLLM_KIMI_K3_FP8_KV_LAYERS`** (NVFP4 KV cache only): comma-separated zero-based global MLA layer IDs to keep in an FP8 KV cache instead of the default last two MLA layers; an empty value keeps every MLA layer in NVFP4. The previous `TLLM_KIMI_K3_BF16_KV_LAYERS` is deprecated: it is still honored as this list, with a warning, when `TLLM_KIMI_K3_FP8_KV_LAYERS` is unset.
 * **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
 
 ## Testing API Endpoint
