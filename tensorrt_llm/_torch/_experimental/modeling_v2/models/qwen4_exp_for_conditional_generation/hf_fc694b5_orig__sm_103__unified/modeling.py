@@ -20,9 +20,12 @@ cut per rank. What the layout settles is settled once, at construction:
   rank's heads. One plain sum (`comm/allreduce`, op `NONE`) completes it before the
   hyper-connection inject, which every rank runs on the same reduced rows. Under attention DP
   a rank holds every head and serves its own requests, so there is nothing to sum.
-* **Routed experts** are an EP window of `num_experts / moe_ep_size` experts per rank on the
-  trtllm-gen NVFP4 runner, pre-routed by `renorm_moe_routing_op` over the whole routing space.
-  Under attention TP every rank holds every row and the window's partial output is summed the
+* **Routed experts** run on the trtllm-gen NVFP4 runner, pre-routed by
+  `renorm_moe_routing_op` over the whole routing space. A rank holds an EP window of
+  `num_experts / moe_ep_size` whole experts (tep4, dep4), or every expert at its quarter of the
+  intermediate (tp4: 160 of 640 rows, stored zero-padded to 256, `weights.EXPERT_INTER_ALIGN`,
+  with zero codes and scales, so the padding adds nothing). Under attention TP every rank holds
+  every row and the partial output -- the window's, or the intermediate slice's -- is summed the
   same way. Under attention DP each rank holds its own rows: they are padded to the group's
   largest row count, gathered (`comm/allgather`), routed and run through the window, and
   reduce-scattered back (`comm/reducescatter`), each row's window partials summed once
@@ -68,8 +71,7 @@ makes it device-resident. Output is identical.
 
 Not assembled here: the one-model MTP draft layer and its verify-step recurrence (the
 target refuses a `speculative_config` at construction), the vision tower (a request carrying
-media is refused at admission) and the intermediate-split experts (tp4). Each refusal names
-what is missing.
+media is refused at admission). Each refusal names what is missing.
 
 Integration facts this file depends on:
 
@@ -328,11 +330,6 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.dp_size = mapping.tp_size if mapping.enable_attention_dp else 1
         self.dp_rank = mapping.tp_rank
         self.dp_group = list(mapping.tp_group)
-        if mapping.moe_tp_size != 1:
-            raise NotImplementedError(
-                f"routed experts split by intermediate (moe_tp_size {mapping.moe_tp_size}, "
-                "tp4): the zero-padded expert layout is not assembled in this target yet"
-            )
         spec_config = getattr(model_config, "spec_config", None)
         if spec_config is not None:
             raise NotImplementedError(
@@ -494,6 +491,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         self.in_proj_split = d.in_proj_split
         self.local_experts = d.local_experts
         self.expert_offset = d.expert_offset
+        # The runner's `intermediate_size`: each held expert's intermediate as stored, this
+        # rank's slice zero-padded at tp4 (`weights.EXPERT_INTER_ALIGN`), whole otherwise.
+        self.expert_inter = d.expert_inter
 
         # Every weight but the n-gram table; meta-init intercepts torch.empty.
         self.w = _weights.MODEL_WEIGHTS.declare(d)
@@ -1020,7 +1020,9 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
     over the whole routing space (`renorm_moe_routing_op`), the NVFP4 activation with linear
     block scales at the layer's FC1 input global scale, and the trtllm-gen runner over this
     rank's expert window, pre-routed, finalized. A slot routed outside the window adds
-    nothing, so the window outputs sum to the layer's.
+    nothing, so the window outputs sum to the layer's. Under the intermediate split (tp4)
+    the window is every expert at this rank's `expert_inter`-wide slice, and the slices'
+    outputs sum to the layer's the same way.
 
     Every step is row-wise, so `x` runs in chunks of at most the runner's certified rows (a
     host decision on `T`): one chunk at a TP rank's rows, several over the rows an
@@ -1059,7 +1061,7 @@ def _routed_experts(core, x, L: _LayerWeights) -> torch.Tensor:
                 top_k=core.topk,
                 n_group=None,
                 topk_group=None,
-                intermediate_size=core.moe_inter,
+                intermediate_size=core.expert_inter,
                 local_expert_offset=core.expert_offset,
                 local_num_experts=core.local_experts,
                 routed_scaling_factor=None,

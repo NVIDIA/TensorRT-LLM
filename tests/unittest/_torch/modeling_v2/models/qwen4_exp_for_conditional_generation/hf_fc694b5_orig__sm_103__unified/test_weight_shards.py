@@ -8,7 +8,8 @@ read -- at each member (tp4, tep4, dep4):
 * **coverage**: at every rank, with MTP off and on, every checkpoint tensor is either read by
   the rank's table or predicted unread by `expected_unconsumed`, never both; across a member's
   ranks every tensor is read by some rank, and each routed or draft expert's tensors by
-  exactly one;
+  exactly one -- except tp4's routed experts, which every rank reads at its intermediate
+  slice;
 * **shapes**: at ranks 0 and 3, every source read through its cut lies inside the stored
   tensor, and the cut run through the table's own transform (on meta tensors) has exactly
   the shape and dtype of the parameter it fills. A rank reads a split tensor at its share
@@ -17,10 +18,8 @@ read -- at each member (tp4, tep4, dep4):
   ranges the same rank's K/V and recurrent pools hold (`pool.pool_geometry`).
 
 And, on small synthetic tensors whose values name their rows, that each cut selects the
-rank's own heads in the order the fused operands lay them out.
-
-tp4 splits each routed expert's intermediate four ways, a layout this table does not
-declare: at tp4 the test holds what no rank reads to exactly those experts' tensors.
+rank's own heads in the order the fused operands lay them out, and that tp4's routed
+experts hold the rank's intermediate slice with zero padding at the end of each half.
 """
 
 from __future__ import annotations
@@ -201,9 +200,11 @@ class _HeaderEntry:
 def _share(member: str, key: str) -> float:
     """The fraction of `key` a rank of `member` holds, worked out here from the member alone:
     attention q/o by q head and k/v by KV head (two heads over the attention TP ranks), the
-    Gated-DeltaNet tensors by head over the same ranks, the shell's lm_head by vocabulary.
-    Everything else is read whole."""
+    Gated-DeltaNet tensors by head over the same ranks, the shell's lm_head by vocabulary,
+    and at tp4 each routed expert's tensors by intermediate. Everything else is read whole."""
     tp = _attention_tp(member)
+    if member == "tp4" and _TRUNK_EXPERT_TENSOR.match(key):
+        return 1 / MEMBERS[member]["moe_tp_size"]
     if re.search(r"\.self_attn\.(q_proj|o_proj)\.weight$", key) or key == "lm_head.weight":
         return 1 / tp
     if re.search(r"\.self_attn\.(k_proj|v_proj)\.weight$", key):
@@ -224,8 +225,6 @@ def _share(member: str, key: str) -> float:
 @pytest.mark.parametrize("member", list(MEMBERS))
 def test_every_checkpoint_tensor_is_claimed(stored, configs, member, mtp):
     everything = set(stored)
-    # tp4's routed experts are split by intermediate, which this table does not declare.
-    gap = {k for k in everything if _TRUNK_EXPERT_TENSOR.match(k)} if member == "tp4" else set()
     read_by = collections.Counter()
     for rank in RANKS:
         d = _dims(configs, member, rank, mtp)
@@ -237,18 +236,22 @@ def test_every_checkpoint_tensor_is_claimed(stored, configs, member, mtp):
         assert not claimed & unread, f"rank {rank}: read and predicted unread: " + str(
             sorted(claimed & unread)[:8]
         )
-        assert claimed | unread == everything - gap, (
-            f"rank {rank}: neither read nor predicted {sorted(everything - gap - claimed - unread)[:8]}"
-            f"; outside the checkpoint or in the tp4 gap {sorted((claimed | unread) - (everything - gap))[:8]}"
+        assert claimed | unread == everything, (
+            f"rank {rank}: neither read nor predicted {sorted(everything - claimed - unread)[:8]}"
         )
         read_by.update(claimed)
 
     mtp_keys = set() if mtp else {k for k in everything if k.startswith("mtp.")}
-    assert set(read_by) == everything - gap - mtp_keys, "tensors no rank reads: " + str(
-        sorted(everything - gap - mtp_keys - set(read_by))[:8]
+    assert set(read_by) == everything - mtp_keys, "tensors no rank reads: " + str(
+        sorted(everything - mtp_keys - set(read_by))[:8]
     )
-    twice = sorted(k for k in read_by if _EXPERT_TENSOR.search(k) and read_by[k] != 1)
-    assert not twice, f"expert tensors not read by exactly one rank: {twice[:8]}"
+
+    def readers(key):
+        # tp4: every rank reads every routed expert, at its slice (checked by the shape test).
+        return len(RANKS) if member == "tp4" and _TRUNK_EXPERT_TENSOR.match(key) else 1
+
+    wrong = sorted(k for k in read_by if _EXPERT_TENSOR.search(k) and read_by[k] != readers(k))
+    assert not wrong, f"expert tensors not read by their expected rank count: {wrong[:8]}"
 
 
 # -------------------------------------------------------------------- shapes --
@@ -347,13 +350,23 @@ _COMMON_SHAPES = {
     "l48_mtp_fc2_s": (128, 20, 5),
 }
 
-#: The routed experts' 128-expert NVFP4 window (tep4, dep4).
-_EXPERT_WINDOW_SHAPES = {
-    "l0_fc1_w": (128, 1280, 1280),
-    "l0_fc1_s": (128, 1280, 160),
-    "l0_fc2_w": (128, 2560, 320),
-    "l0_fc2_s": (128, 2560, 40),
+#: The routed experts a rank holds: a 128-expert window of whole experts (tep4, dep4), or
+#: all 512 at a 160-row intermediate slice stored 256 wide (tp4).
+_EXPERT_SHAPES = {
+    "tep4": {
+        "l0_fc1_w": (128, 1280, 1280),
+        "l0_fc1_s": (128, 1280, 160),
+        "l0_fc2_w": (128, 2560, 320),
+        "l0_fc2_s": (128, 2560, 40),
+    },
+    "tp4": {
+        "l0_fc1_w": (512, 512, 1280),
+        "l0_fc1_s": (512, 512, 160),
+        "l0_fc2_w": (512, 2560, 128),
+        "l0_fc2_s": (512, 2560, 16),
+    },
 }
+_EXPERT_SHAPES["dep4"] = _EXPERT_SHAPES["tep4"]
 
 
 @pytest.mark.parametrize("rank", SHAPE_RANKS)
@@ -367,16 +380,13 @@ def test_rank_shapes_are_what_the_modules_expect(stored, configs, member, rank):
         assert tuple(params[key].shape) == shapes[dp], (key, tuple(params[key].shape))
     for key, shape in _COMMON_SHAPES.items():
         assert tuple(params[key].shape) == shape, (key, tuple(params[key].shape))
-    if member == "tp4":
-        assert not any(re.match(r"l\d+_fc[12]_[ws]", k) for k in params), "tp4 experts declared"
-    else:
-        for key, shape in _EXPERT_WINDOW_SHAPES.items():
-            assert tuple(params[key].shape) == shape, (key, tuple(params[key].shape))
-        experts = [s[0] for s in WT.MODEL_WEIGHTS.manifest(d)["l0_fc2_w"]]
-        assert experts == [
-            f"model.language_model.layers.0.mlp.experts.{e}.down_proj.weight"
-            for e in range(128 * rank, 128 * (rank + 1))
-        ]
+    for key, shape in _EXPERT_SHAPES[member].items():
+        assert tuple(params[key].shape) == shape, (key, tuple(params[key].shape))
+    window = range(512) if member == "tp4" else range(128 * rank, 128 * (rank + 1))
+    experts = [s[0] for s in WT.MODEL_WEIGHTS.manifest(d)["l0_fc2_w"]]
+    assert experts == [
+        f"model.language_model.layers.0.mlp.experts.{e}.down_proj.weight" for e in window
+    ]
     drafts = [s[0] for s in WT.MODEL_WEIGHTS.manifest(d)["l48_mtp_fc2_w"]]
     assert drafts == [
         f"mtp.layers.0.mlp.experts.{e}.down_proj.weight"
@@ -456,7 +466,8 @@ def _meta_checkpoint(stored) -> dict:
 
 
 @pytest.mark.parametrize(
-    "member, rank, mtp", [("tep4", 3, True), ("dep4", 0, True), ("tep4", 1, False)]
+    "member, rank, mtp",
+    [("tep4", 3, True), ("dep4", 0, True), ("tep4", 1, False), ("tp4", 2, True)],
 )
 def test_load_fills_every_parameter_and_covers_the_checkpoint(
     stored, configs, member, rank, mtp, monkeypatch
@@ -469,12 +480,6 @@ def test_load_fills_every_parameter_and_covers_the_checkpoint(
     model = _stub_model(configs, member, rank, mtp)
     WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
     assert tuple(model.model.w["ple_table"].shape) == (320_001_536, 160)
-
-
-def test_load_refuses_the_intermediate_split(stored, configs):
-    model = _stub_model(configs, "tp4", 0, mtp=False)
-    with pytest.raises(AssertionError, match="intermediate split"):
-        WT.MODEL_WEIGHTS.load(model, _meta_checkpoint(stored))
 
 
 # --------------------------------------------------- the cuts pick the heads --
@@ -608,3 +613,110 @@ def test_cuts_select_the_rank_heads(stored, configs, member, rank):
     assert torch.equal(_assemble(d, fake, manifest["l0_dt_bias"]), _expected_rows("dtb", v_heads))
     assert torch.equal(_assemble(d, fake, manifest["l0_out_w"])[0],
                        _expected_rows("out", rows(v_heads, 128)))  # fmt: skip
+
+
+# ------------------------------------------ tp4: the padded intermediate slice --
+
+
+def _blk32_gather(rows: int) -> torch.Tensor:
+    """The 32-row block shuffle's gather index, written out here: inside each block of 32
+    rows, source row `4u + v` lands at destination row `8v + u`."""
+    j = torch.arange(32)
+    idx = torch.empty(32, dtype=torch.long)
+    idx[(j % 4) * 8 + j // 4] = j
+    return idx.repeat(rows // 32) + torch.arange(rows // 32).repeat_interleave(32) * 32
+
+
+def _interleave_gather(rows: int) -> torch.Tensor:
+    """`[up | gate]` -> up0, gate0, up1, gate1, ..."""
+    p = torch.empty(rows, dtype=torch.long)
+    p[0::2] = torch.arange(rows // 2)
+    p[1::2] = torch.arange(rows // 2, rows)
+    return p
+
+
+def _swizzle_flat(s: torch.Tensor) -> torch.Tensor:
+    """The 128x4 block-scale swizzle of one `[M, C]` matrix, flat: scale `(m, c)` lands at
+    `(m // 128) * 512 * (C // 4) + (c // 4) * 512 + (m % 32) * 16 + ((m % 128) // 32) * 4
+    + c % 4`."""
+    m, c = s.shape
+    v = s.reshape(m // 128, 4, 32, c // 4, 4).permute(0, 3, 2, 1, 4)
+    return v.reshape(-1).contiguous()
+
+
+def _zero_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+    return torch.cat((x, x.new_zeros(rows - x.shape[0], *x.shape[1:])), 0)
+
+
+def _zero_cols(x: torch.Tensor, cols: int) -> torch.Tensor:
+    return torch.cat((x, x.new_zeros(x.shape[0], cols - x.shape[1])), 1)
+
+
+@pytest.mark.parametrize("expert", [0, 511])
+@pytest.mark.parametrize("rank", RANKS)
+def test_tp4_experts_hold_the_rank_slice_zero_padded_per_half(configs, rank, expert, monkeypatch):
+    """At tp4 rank `r` reads rows `[160r, 160r + 160)` of an expert's `up_proj` and
+    `gate_proj` (codes and block scales) and the same columns of its `down_proj`; each half is
+    zero-extended to 256 rows (FC2 to 256 columns) *before* the `[up ; gate]` concatenation,
+    then interleaved, block-shuffled and swizzled as at the whole width. The bytes are
+    nonzero, so every zero in the operand is padding. The scale swizzle is the formula
+    `fp4_block_scale_moe_runner__r4`'s test writes out, standing in for the native op on
+    the CPU; the shrunk axes (FC1's input bytes, FC2's output rows) take no cut."""
+    monkeypatch.setattr(WT, "_swizzle", _swizzle_flat)
+    d = _dims(configs, "tp4", rank, mtp=False)
+    assert (d.expert_inter_share, d.expert_inter_start, d.expert_inter) == (160, 160 * rank, 256)
+    gen = torch.Generator().manual_seed(rank * 1000 + expert)
+
+    def nonzero(*shape):
+        return torch.randint(1, 256, shape, generator=gen, dtype=torch.uint8)
+
+    p = f"model.language_model.layers.0.mlp.experts.{expert}"
+    fake = {
+        f"{p}.up_proj.weight": nonzero(640, 4),
+        f"{p}.gate_proj.weight": nonzero(640, 4),
+        f"{p}.up_proj.weight_scale": nonzero(640, 4).view(torch.float8_e4m3fn),
+        f"{p}.gate_proj.weight_scale": nonzero(640, 4).view(torch.float8_e4m3fn),
+        f"{p}.down_proj.weight": nonzero(128, 320),
+        f"{p}.down_proj.weight_scale": nonzero(128, 40).view(torch.float8_e4m3fn),
+    }
+    manifest = WT.MODEL_WEIGHTS.manifest(d)
+
+    def operand(param_key):
+        (row,) = [s for s in manifest[param_key] if s[1] == (expert,)]
+        ckpt_key, _, cut, transform = row
+        return WT.MODEL_WEIGHTS.read(fake, ckpt_key, cut, transform, d).view(torch.uint8)
+
+    rows = slice(160 * rank, 160 * rank + 160)
+
+    def fc1(kind):
+        up = fake[f"{p}.up_proj.{kind}"].view(torch.uint8)[rows]
+        gate = fake[f"{p}.gate_proj.{kind}"].view(torch.uint8)[rows]
+        both = torch.cat((_zero_rows(up, 256), _zero_rows(gate, 256)), 0)
+        return both[_interleave_gather(512)[_blk32_gather(512)]]
+
+    assert torch.equal(operand("l0_fc1_w"), fc1("weight"))
+    assert torch.equal(operand("l0_fc1_s"), _swizzle_flat(fc1("weight_scale")).view(512, 4))
+
+    down = fake[f"{p}.down_proj.weight"][:, 80 * rank : 80 * rank + 80]
+    assert torch.equal(operand("l0_fc2_w"), _zero_cols(down, 128)[_blk32_gather(128)])
+    down_s = fake[f"{p}.down_proj.weight_scale"].view(torch.uint8)[:, 10 * rank : 10 * rank + 10]
+    expected = _swizzle_flat(_zero_cols(down_s, 16)[_blk32_gather(128)]).view(128, 16)
+    assert torch.equal(operand("l0_fc2_s"), expected)
+
+    # The padding is where the runner's `intermediate_size` = 256 puts it: the last 96 rows
+    # of each half and the last 96 of FC2's 256 input columns, nothing else.
+    w1 = operand("l0_fc1_w")[torch.argsort(_interleave_gather(512)[_blk32_gather(512)])]
+    for half in (w1[:256], w1[256:]):
+        assert bool((half[:160] != 0).all()) and not bool(half[160:].any())
+
+
+@pytest.mark.parametrize("member", list(MEMBERS))
+def test_the_stored_intermediate_follows_the_engines_storage_rule(configs, member):
+    """The width a rank stores each expert's intermediate at is the one the engine's own
+    NVFP4 trtllm-gen MoE stores that shard at, and the width the runner is certified at."""
+    from tensorrt_llm._torch.moe.fused_moe.quantization import NVFP4TRTLLMGenFusedMoEMethod
+
+    d = _dims(configs, member, 1)
+    align, _ = NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments(d.hidden, d.expert_inter_share)
+    assert d.expert_inter == -(-d.expert_inter_share // align) * align
+    assert (d.expert_inter_share, d.expert_inter) == ((160, 256) if member == "tp4" else (640, 640))

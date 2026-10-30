@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The unified target's core at tep4 and dep4: each rank's forward widths and the expert window.
+"""The unified target's core at tp4, tep4 and dep4: each rank's forward widths and its experts.
 
 The core is built on the meta device from the checkpoint's text and vision config values at
-every rank of a tep4 or dep4 mapping, so nothing here touches a device. What is pinned is what
-the forward addresses: the fused attention row and the split the norm + rope reads it through,
-the Gated-DeltaNet projection's column split, the routed experts' window and the
-per-expert scalars cut to it, the attention-DP round trip's padding and slicing, and the
+every rank of a tp4, tep4 or dep4 mapping, so nothing here touches a device. What is pinned is
+what the forward addresses: the fused attention row and the split the norm + rope reads it
+through, the Gated-DeltaNet projection's column split, the routed experts a rank holds (an
+expert window, or tp4's padded intermediate slice of every expert) and the per-expert scalars
+cut to them, the attention-DP round trip's padding and slicing, and the
 layouts this core does not assemble.
 """
 
@@ -187,6 +188,31 @@ def test_a_tep4_rank_holds_one_128_expert_window(rank) -> None:
     assert tuple(core.w["embed"].shape) == (248320, 2560)
 
 
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tp4_rank_holds_every_expert_at_its_padded_intermediate_slice(rank) -> None:
+    """tp4 cuts attention and Gated-DeltaNet as tep4 does, and holds all 512 experts at a
+    160-row intermediate slice stored 256 wide: the runner is handed the whole routing space
+    (`local_expert_offset` 0, `local_num_experts` 512) at `intermediate_size` 256, the
+    stack `fp4_block_scale_moe_runner__r4` certifies, and the scalars span every expert."""
+    core = _core(rank, _TP4)
+    assert (core.heads_q, core.heads_kv, core.kv_head_start) == (6, 1, rank * 2 // WORLD)
+    assert (core.num_k_heads, core.num_v_heads, core.attn_in_width) == (4, 12, 4352)
+    assert (core.dp_size, core.attn_tp_size) == (1, WORLD)
+    assert (core.local_experts, core.expert_offset, core.expert_inter) == (512, 0, 256)
+    assert core.moe_inter == 640
+    assert tuple(core.w["l0_fc1_w"].shape) == (512, 2 * 256, 2560 // 2)
+    assert tuple(core.w["l0_fc1_s"].shape) == (512, 2 * 256, 2560 // 16)
+    assert tuple(core.w["l0_fc2_w"].shape) == (512, 2560, 256 // 2)
+    assert tuple(core.w["l0_fc2_s"].shape) == (512, 2560, 256 // 16)
+    assert tuple(core.w["l0_e_isc2"].shape) == (512,)
+
+
+@pytest.mark.parametrize("layout", [_TEP4, _DEP4], ids=["tep4", "dep4"])
+def test_an_expert_window_runs_at_the_whole_intermediate(layout) -> None:
+    core = _core(1, layout)
+    assert (core.local_experts, core.expert_offset, core.expert_inter) == (128, 128, 640)
+
+
 def test_the_expert_scalars_are_cut_to_the_window() -> None:
     """The runner takes one scalar per expert of its window: each is the whole routing
     space's product, sliced, and the FC1 activation scale is the layer's one number."""
@@ -234,11 +260,8 @@ def test_a_spread_fc1_input_scale_is_refused() -> None:
 
 @pytest.mark.parametrize(
     "layout, spec_config, missing",
-    [
-        (_TP4, None, "split by intermediate"),
-        (_TEP4, MTPDecodingConfig(max_draft_len=3), "MTP draft layer"),
-    ],
-    ids=["tp4", "mtp"],
+    [(_TEP4, MTPDecodingConfig(max_draft_len=3), "MTP draft layer")],
+    ids=["mtp"],
 )
 def test_what_this_core_does_not_assemble_is_refused_at_construction(
     layout, spec_config, missing

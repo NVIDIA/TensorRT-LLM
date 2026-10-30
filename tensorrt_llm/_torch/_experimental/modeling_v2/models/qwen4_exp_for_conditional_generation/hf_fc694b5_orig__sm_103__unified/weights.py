@@ -26,8 +26,12 @@ scalars are derived in `modeling.py` after load.
   `dt_bias` are cut by value head, `out_proj` by its value-head input columns.
 * **Routed experts** are split over the MoE EP group (tep4, dep4): rank `r` holds the
   contiguous window `[128r, 128r + 128)`, NVFP4 codes and block scales. tp4 splits each
-  expert's intermediate instead (160 of 640 rows a rank, short of the runner's 128-row
-  alignment); that layout is not in this table, and `load` refuses it.
+  expert's intermediate instead: rank `r` holds rows `[160r, 160r + 160)` of every expert's
+  `up_proj` and `gate_proj` and the same columns of its `down_proj`, all 512 experts. 160
+  is short of the layout the runner's operands need (the FC1 row shuffle and scale swizzle
+  work in 128-row blocks), so each half is zero-extended to `expert_inter` = 256 rows (FC2
+  to 256 columns) with zero codes and zero block scales before the relayout: SwiGLU of a
+  zero row pair is zero and a zero FC2 column adds nothing, so the padding is exact.
 * **The MTP layer's FP8 block-scale experts** are split by expert over the whole TP
   group at every member, `[128r, 128r + 128)`: the FP8 runner takes `H` and `I` in
   multiples of 128, which 640 / 4 is not.
@@ -317,9 +321,17 @@ FP8_BLOCK = 128
 PLE_TABLE_DTYPE = torch.float8_e4m3fn
 
 #: How the trunk's routed experts are split (`rank_dims`'s `expert_split`) that this table
-#: declares and `load` fills: by expert. Splitting each expert's intermediate (tp4) needs
-#: its own padded layout, which is not here.
-LOADED_EXPERT_SPLITS = ("ep",)
+#: declares and `load` fills: by expert (`ep`, a window of whole experts) or by each
+#: expert's intermediate (`tp`, every expert at a zero-padded slice).
+LOADED_EXPERT_SPLITS = ("ep", "tp")
+
+#: The multiple a rank's stored routed-expert intermediate is padded up to. It is the
+#: engine's own storage rule for an NVFP4 trtllm-gen shard
+#: (`NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments`: a padded intermediate that is not a
+#: multiple of 128 drops to a 128 weight alignment), which turns tp4's 160 into 256, the
+#: width `fp4_block_scale_moe_runner__r4` certifies the padded 512-expert stack at. 640
+#: (tep4, dep4) is already a multiple.
+EXPERT_INTER_ALIGN = 128
 
 # Parameter-key suffixes after which to release transform scratch. The expert
 # relayouts allocate per-expert scratch once per local expert and the table
@@ -520,6 +532,66 @@ def _expert_fc2_s(t: torch.Tensor, d) -> torch.Tensor:
     return _swizzle(s).reshape(rows, cols)
 
 
+def _zero_extend(x: torch.Tensor, dim: int, size: int) -> torch.Tensor:
+    """`x` extended along `dim` to `size` with zero bytes: a zero packed byte is two +0.0
+    e2m1 codes, a zero scale byte is an e4m3 +0.0 block scale."""
+    if x.shape[dim] == size:
+        return x
+    assert x.shape[dim] < size, (tuple(x.shape), dim, size)
+    raw = x.view(torch.uint8)
+    pad = list(raw.shape)
+    pad[dim] = size - raw.shape[dim]
+    return torch.cat((raw, raw.new_zeros(pad)), dim).view(x.dtype)
+
+
+def _zero_padded(transform: Callable | None, dim: int, unit: int) -> Callable:
+    """`transform` run on its source(s) zero-extended along `dim` to the rank's stored
+    routed-expert intermediate, `d.expert_inter // unit` there: unit 1 for the rows of an
+    `up_proj` / `gate_proj` and of their scales, 2 for `down_proj`'s packed code columns,
+    `SF_VEC` for its scale columns. Each half of FC1 is extended before the `[up ; gate]`
+    concatenation, so the pad rows sit at the end of each half, where the runner's
+    `intermediate_size` puts them. A no-op where the rank holds whole experts."""
+
+    def padded(t, d):
+        size = d.expert_inter // unit
+        if isinstance(t, tuple):
+            t = tuple(_zero_extend(x, dim, size) for x in t)
+        else:
+            t = _zero_extend(t, dim, size)
+        return t if transform is None else transform(t, d)
+
+    return padded
+
+
+def _expert_inter_rows(d) -> Cut | None:
+    """This rank's rows of one expert's `up_proj` or `gate_proj` (or their block scales):
+    its slice of the intermediate, or None (whole) when the experts are split by expert."""
+    if d.expert_inter_share == d.moe_inter:
+        return None
+    return (_span(d.expert_inter_start, d.expert_inter_share),)
+
+
+def _fc1_cut(d):
+    """The `(up, gate)` pair's cuts: the same intermediate rows of both halves."""
+    rows = _expert_inter_rows(d)
+    return None if rows is None else (rows, rows)
+
+
+def _fc2_cut(unit: int) -> Callable:
+    """`down_proj`'s input columns of this rank's intermediate slice, `unit` intermediate
+    elements to a stored column (2 for the packed codes, `SF_VEC` for the block scales)."""
+
+    def cut(d):
+        if _expert_inter_rows(d) is None:
+            return None
+        return (
+            slice(None),
+            _span(d.expert_inter_start // unit, d.expert_inter_share // unit),
+        )
+
+    return cut
+
+
 #: The layout argument of the second, CuteDSL-layout expert copy (`fc*_cd`).
 _CUTEDSL_LAYOUT = SimpleNamespace(trunk_moe_backend="CUTEDSL")
 
@@ -632,8 +704,8 @@ def _gdn_layers(d):
 
 
 def _trunk_expert_layers(d):
-    """Every layer when the routed experts are split by expert, the split this table
-    declares (`LOADED_EXPERT_SPLITS`); none otherwise."""
+    """Every layer when the routed experts are split in a way this table declares
+    (`LOADED_EXPERT_SPLITS`); none otherwise."""
     return range(d.num_layers) if d.expert_split in LOADED_EXPERT_SPLITS else ()
 
 
@@ -1018,73 +1090,84 @@ class Qwen4ExpUnifiedWeights:
         # --- MoE on every layer: this rank's window of NVFP4 routed experts, a replicated
         # bf16 router and shared expert ---
         W("router", shape=lambda d: (d.num_experts, d.hidden), src="{p}.mlp.gate.weight"),
+        # Each expert at this rank's intermediate share (`_fc1_cut`, `_fc2_cut`), stored
+        # zero-padded to `expert_inter` (`_zero_padded`); whole experts under an EP window.
         W(
             "fc1_w",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // 2),
+            shape=lambda d: (d.local_experts, 2 * d.expert_inter, d.hidden // 2),
             dtype=u8,
             src=_experts(_trunk_mlp, "up_proj.weight", "gate_proj.weight", window=_trunk_window),
-            transform=_expert_fc1_w,
+            cut=_fc1_cut,
+            transform=_zero_padded(_expert_fc1_w, 0, 1),
             layers=_trunk_expert_layers,
         ),
         W(
             "fc1_s",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // SF_VEC),
+            shape=lambda d: (d.local_experts, 2 * d.expert_inter, d.hidden // SF_VEC),
             dtype=u8,
             src=_experts(
                 _trunk_mlp, "up_proj.weight_scale", "gate_proj.weight_scale", window=_trunk_window
             ),
-            transform=_expert_fc1_s,
+            cut=_fc1_cut,
+            transform=_zero_padded(_expert_fc1_s, 0, 1),
             layers=_trunk_expert_layers,
         ),
         W(
             "fc2_w",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // 2),
+            shape=lambda d: (d.local_experts, d.hidden, d.expert_inter // 2),
             dtype=u8,
             src=_experts(_trunk_mlp, "down_proj.weight", window=_trunk_window),
-            transform=_expert_fc2_w,
+            cut=_fc2_cut(2),
+            transform=_zero_padded(_expert_fc2_w, 1, 2),
             layers=_trunk_expert_layers,
         ),
         W(
             "fc2_s",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // SF_VEC),
+            shape=lambda d: (d.local_experts, d.hidden, d.expert_inter // SF_VEC),
             dtype=u8,
             src=_experts(_trunk_mlp, "down_proj.weight_scale", window=_trunk_window),
-            transform=_expert_fc2_s,
+            cut=_fc2_cut(SF_VEC),
+            transform=_zero_padded(_expert_fc2_s, 1, SF_VEC),
             layers=_trunk_expert_layers,
         ),
         # Under trtllm-gen, the same window again in the CuteDSL layout, when the core keeps
         # it for prefill-sized launches.
         W(
             "fc1_w_cd",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // 2),
+            shape=lambda d: (d.local_experts, 2 * d.expert_inter, d.hidden // 2),
             dtype=u8,
             src=_experts(_trunk_mlp, "up_proj.weight", "gate_proj.weight", window=_trunk_window),
-            transform=_expert_fc1_w_cd,
+            cut=_fc1_cut,
+            transform=_zero_padded(_expert_fc1_w_cd, 0, 1),
             layers=_cute_dsl_copy_layers,
         ),
         W(
             "fc1_s_cd",
-            shape=lambda d: (d.local_experts, 2 * d.moe_inter, d.hidden // SF_VEC),
+            shape=lambda d: (d.local_experts, 2 * d.expert_inter, d.hidden // SF_VEC),
             dtype=u8,
             src=_experts(
                 _trunk_mlp, "up_proj.weight_scale", "gate_proj.weight_scale", window=_trunk_window
             ),
-            transform=_expert_fc1_s_cd,
+            cut=_fc1_cut,
+            transform=_zero_padded(_expert_fc1_s_cd, 0, 1),
             layers=_cute_dsl_copy_layers,
         ),
         W(
             "fc2_w_cd",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // 2),
+            shape=lambda d: (d.local_experts, d.hidden, d.expert_inter // 2),
             dtype=u8,
             src=_experts(_trunk_mlp, "down_proj.weight", window=_trunk_window),
+            cut=_fc2_cut(2),
+            transform=_zero_padded(None, 1, 2),
             layers=_cute_dsl_copy_layers,
         ),
         W(
             "fc2_s_cd",
-            shape=lambda d: (d.local_experts, d.hidden, d.moe_inter // SF_VEC),
+            shape=lambda d: (d.local_experts, d.hidden, d.expert_inter // SF_VEC),
             dtype=u8,
             src=_experts(_trunk_mlp, "down_proj.weight_scale", window=_trunk_window),
-            transform=_expert_fc2_s_cd,
+            cut=_fc2_cut(SF_VEC),
+            transform=_zero_padded(_expert_fc2_s_cd, 1, SF_VEC),
             layers=_cute_dsl_copy_layers,
         ),
         # Replicated over the whole routing space, at every split.
@@ -1406,8 +1489,9 @@ class Qwen4ExpUnifiedWeights:
 
     def expected_unconsumed(self, d: SimpleNamespace, keys) -> set:
         """The checkpoint keys this rank predicts it leaves unread: the tensors of every
-        routed expert outside its window (its per-tensor scalars are read on every rank),
-        and, with MTP live, the draft experts outside its draft window; with MTP off, the
+        routed expert outside its window (its per-tensor scalars are read on every rank;
+        under the intermediate split the window is every expert, each read at this rank's
+        slice), and, with MTP live, the draft experts outside its draft window; with MTP off, the
         whole `mtp.` subtree. The windows are enumerated from `d`, not read off the
         checkpoint, so a key that belongs to a real weight can never land here."""
         out = set()
@@ -1493,8 +1577,8 @@ class Qwen4ExpUnifiedWeights:
         core = model.model
         d = self.dims(core)
         assert d.expert_split in LOADED_EXPERT_SPLITS, (
-            f"routed experts split by {d.expert_split!r}: this table declares the expert-"
-            f"parallel windows ({LOADED_EXPERT_SPLITS}) and not the intermediate split"
+            f"routed experts split by {d.expert_split!r}: this table declares the splits "
+            f"{LOADED_EXPERT_SPLITS}"
         )
         # The one load-time declaration, before the manifest is built: the table's
         # height comes from the shards, and the manifest addresses it by row range.
@@ -1612,6 +1696,14 @@ def rank_dims(
     )
     local_experts = num_experts // mapping.moe_ep_size
     mtp_local_experts = num_experts // mapping.tp_size
+    # Each expert's intermediate over the MoE TP ranks (tp4; one rank, the whole of it,
+    # otherwise). A share holds whole group-16 scale vectors, so `down_proj`'s scale
+    # columns cut on a vector boundary; it is stored zero-padded to EXPERT_INTER_ALIGN.
+    moe_inter = cfg.moe_intermediate_size
+    assert moe_inter % mapping.moe_tp_size == 0, (moe_inter, mapping.moe_tp_size)
+    expert_inter_share = moe_inter // mapping.moe_tp_size
+    assert expert_inter_share % SF_VEC == 0, (expert_inter_share, SF_VEC)
+    expert_inter = -(-expert_inter_share // EXPERT_INTER_ALIGN) * EXPERT_INTER_ALIGN
 
     ngram_heads = cfg.heads_per_ngram * (cfg.ngram_size - 1)
     v_hidden = vcfg.hidden_size
@@ -1655,9 +1747,15 @@ def rank_dims(
         expert_split="ep" if mapping.moe_tp_size == 1 else "tp",
         local_experts=local_experts,
         expert_offset=local_experts * mapping.moe_ep_rank,
+        # This rank's intermediate rows `[expert_inter_start, + expert_inter_share)` of
+        # every expert it holds, stored `expert_inter` wide (the runner's
+        # `intermediate_size`).
+        expert_inter_share=expert_inter_share,
+        expert_inter_start=expert_inter_share * mapping.moe_tp_rank,
+        expert_inter=expert_inter,
         mtp_local_experts=mtp_local_experts,
         mtp_expert_offset=mtp_local_experts * mapping.tp_rank,
-        moe_inter=cfg.moe_intermediate_size,
+        moe_inter=moe_inter,
         shared_inter=cfg.shared_expert_intermediate_size,
         vocab=cfg.vocab_size,
         # --- PLE ---
