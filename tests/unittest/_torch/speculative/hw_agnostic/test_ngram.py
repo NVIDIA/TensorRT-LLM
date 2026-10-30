@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
 
 import pytest
@@ -5,6 +20,7 @@ import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.speculative.ngram import NGramPoolManager
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, NGramDecodingConfig
 
 
@@ -62,6 +78,90 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool, attn
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
         assert text_spec == text_ref
+
+
+@pytest.mark.cpu_only
+def test_ngram_pool_manager_prunes_all_shorter_matches():
+    spec_config = NGramDecodingConfig(
+        max_draft_len=5,
+        max_matching_ngram_size=2,
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=True,
+    )
+    manager = NGramPoolManager(spec_config=spec_config, max_num_requests=8)
+    # Populate pattern (100, 101) with three short matches: (1,), (2,), (3,)
+    manager.get_draft_tokens(prefix=[100, 101, 1], request_id=0, max_sequence_length=100)
+    manager.get_draft_tokens(prefix=[100, 101, 2], request_id=1, max_sequence_length=100)
+    manager.get_draft_tokens(prefix=[100, 101, 3], request_id=2, max_sequence_length=100)
+
+    assert (100, 101) in manager.pool
+    assert list(manager.pool[(100, 101)]) == [(1,), (2,), (3,)]
+
+    # Add a longer match (4, 5, 6, 7) for pattern (100, 101)
+    manager.get_draft_tokens(prefix=[100, 101, 4, 5, 6, 7], request_id=3, max_sequence_length=100)
+
+    # All three shorter matches must be pruned; none should be skipped due to in-place iterator mutation
+    assert list(manager.pool[(100, 101)]) == [(4, 5, 6, 7)]
+
+    # Subsequent draft retrieval should return the longer match [4, 5, 6, 7], not a leaked short match [2]
+    draft = manager.get_draft_tokens(prefix=[50, 100, 101], request_id=0, max_sequence_length=100)
+    assert draft == [4, 5, 6, 7]
+
+
+@pytest.mark.cpu_only
+def test_ngram_pool_manager_is_keep_all_false_invariant():
+    spec_config = NGramDecodingConfig(
+        max_draft_len=5,
+        max_matching_ngram_size=2,
+        is_keep_all=False,
+        is_use_oldest=True,
+        is_public_pool=True,
+    )
+    manager = NGramPoolManager(spec_config=spec_config, max_num_requests=4)
+    # Initial sequence provides match (1, 2, 3) for pattern (100, 101)
+    manager.get_draft_tokens(prefix=[100, 101, 1, 2, 3], request_id=0, max_sequence_length=100)
+    assert list(manager.pool[(100, 101)]) == [(1, 2, 3)]
+
+    # Shorter match (1, 2) must NOT be added to pool when is_keep_all=False
+    manager.get_draft_tokens(prefix=[100, 101, 1, 2], request_id=1, max_sequence_length=100)
+    assert list(manager.pool[(100, 101)]) == [(1, 2, 3)]
+
+    # Longer match (1, 2, 3, 4) replaces the existing match
+    manager.get_draft_tokens(prefix=[100, 101, 1, 2, 3, 4], request_id=2, max_sequence_length=100)
+    assert list(manager.pool[(100, 101)]) == [(1, 2, 3, 4)]
+
+
+@pytest.mark.cpu_only
+def test_ngram_pool_manager_draft_order():
+    # Test is_use_oldest=True vs False
+    config_oldest = NGramDecodingConfig(
+        max_draft_len=5,
+        max_matching_ngram_size=2,
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=True,
+    )
+    manager_oldest = NGramPoolManager(spec_config=config_oldest, max_num_requests=4)
+    manager_oldest.get_draft_tokens(prefix=[100, 101, 1, 2], request_id=0, max_sequence_length=100)
+    manager_oldest.get_draft_tokens(prefix=[100, 101, 3, 4], request_id=1, max_sequence_length=100)
+
+    draft_oldest = manager_oldest.get_draft_tokens(prefix=[50, 100, 101], request_id=2, max_sequence_length=100)
+    assert draft_oldest == [1, 2]
+
+    config_newest = NGramDecodingConfig(
+        max_draft_len=5,
+        max_matching_ngram_size=2,
+        is_keep_all=True,
+        is_use_oldest=False,
+        is_public_pool=True,
+    )
+    manager_newest = NGramPoolManager(spec_config=config_newest, max_num_requests=4)
+    manager_newest.get_draft_tokens(prefix=[100, 101, 1, 2], request_id=0, max_sequence_length=100)
+    manager_newest.get_draft_tokens(prefix=[100, 101, 3, 4], request_id=1, max_sequence_length=100)
+
+    draft_newest = manager_newest.get_draft_tokens(prefix=[50, 100, 101], request_id=2, max_sequence_length=100)
+    assert draft_newest == [3, 4]
 
 
 if __name__ == "__main__":
