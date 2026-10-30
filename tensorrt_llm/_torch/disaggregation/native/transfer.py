@@ -589,7 +589,7 @@ class _SessionQuiescence:
 
 
 class Sender(SenderBase):
-    # Minimum time-to-live for orphaned RecvReqInfo entries (seconds).
+    # Time-to-live for orphaned RecvReqInfo entries (seconds).
     # In gen-first ADP broadcast, non-assigned DP ranks accumulate
     # RecvReqInfo that never gets consumed.  Entries older than this
     # are evicted during periodic sweeps.
@@ -602,7 +602,6 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
-        request_info_timeout_s: Optional[float] = None,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
@@ -610,9 +609,6 @@ class Sender(SenderBase):
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
-        # Generation-first metadata can arrive while prefill is still queued, so it
-        # is kept for at least the configured transfer timeout (_request_info_ttl).
-        self._request_info_timeout_s = request_info_timeout_s or 0.0
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
         self._peer_requests_lock = threading.Lock()
@@ -708,40 +704,27 @@ class Sender(SenderBase):
         """
         now = time.monotonic()
         with self._peer_requests_lock:
-            stale_rids = {}
-            for rid, ts in self._peer_requests_timestamps.items():
-                ttl = self._request_info_ttl(rid)
-                if now - ts > ttl:
-                    stale_rids[rid] = ttl
+            stale_rids = [
+                rid
+                for rid, ts in self._peer_requests_timestamps.items()
+                if now - ts > self._STALE_REQ_INFO_TTL_S
+            ]
         if not stale_rids:
             return
-        orphaned_infos: list[tuple[RecvReqInfo, float]] = []
-        for rid, ttl in stale_rids.items():
+        orphaned_infos: list[RecvReqInfo] = []
+        for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
                     req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
                     orphaned_infos.extend(
-                        (info, ttl) for info in req_info_map.values() if info.context_first
+                        info for info in req_info_map.values() if info.context_first
                     )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
-        for info, ttl in orphaned_infos:
-            self._fail_orphaned_receiver(info, ttl)
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
 
-    def _request_info_ttl(self, unique_rid: int) -> float:
-        """How long REQUEST_DATA for ``unique_rid`` waits for its TxSession.
-
-        A generation-first request can arrive while its prefill is still queued,
-        so it waits as long as the transfer may take. A context-first one names a
-        session that should already exist, so it is failed after the base TTL.
-        Called with ``_peer_requests_lock`` held.
-        """
-        infos = self._peer_requests.get(unique_rid) or {}
-        if any(not info.context_first for info in infos.values()):
-            return max(self._STALE_REQ_INFO_TTL_S, self._request_info_timeout_s)
-        return self._STALE_REQ_INFO_TTL_S
-
-    def _fail_orphaned_receiver(self, info: RecvReqInfo, waited_s: float) -> None:
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
         """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
 
         This resolves the receiver's task, so its RxSession fails through the
@@ -751,7 +734,7 @@ class Sender(SenderBase):
         logger.warning(
             f"KV transfer request rid={info.unique_rid} from receiver "
             f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
-            f"rank after {waited_s:.0f}s; failing it"
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
         )
         self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
@@ -4433,7 +4416,6 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
-                request_info_timeout_s=self._config.tx_overall_timeout_s,
             )
             self._receiver = Receiver(
                 self._peer_registrar,

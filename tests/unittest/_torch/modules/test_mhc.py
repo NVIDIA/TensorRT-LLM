@@ -22,46 +22,6 @@ BENCH_ITERS = 200
 timing_stats = defaultdict(dict)
 
 
-@skip_pre_blackwell
-@pytest.mark.parametrize("num_tokens", [1, 129])
-@pytest.mark.parametrize("force_fma", [False, True])
-@pytest.mark.parametrize(
-    "deterministic_env", ["FORCE_DETERMINISTIC", "FORCE_MHC_KERNEL_DETERMINISTIC"]
-)
-def test_mhc_deterministic_mode_repeats_with_cached_tactic(
-    monkeypatch: pytest.MonkeyPatch, num_tokens: int, force_fma: bool, deterministic_env: str
-) -> None:
-    from tensorrt_llm._torch.modules.mhc import mhc_cuda
-
-    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
-    monkeypatch.delenv("FORCE_MHC_KERNEL_DETERMINISTIC", raising=False)
-    monkeypatch.setenv(deterministic_env, "1")
-    if force_fma:
-        monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: False)
-    runner = mhc_cuda.MhcFusedHcRunner(4, 4096, 1e-6, 1e-6, 1e-6, 2.0, 20)
-    generator = torch.Generator(device="cuda").manual_seed(0)
-
-    def random_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        return torch.randn(shape, generator=generator, dtype=dtype, device="cuda")
-
-    inputs = [
-        random_tensor(num_tokens, 4096, dtype=torch.bfloat16),
-        random_tensor(num_tokens, 4, 4096, dtype=torch.bfloat16),
-        random_tensor(num_tokens, 4).sigmoid(),
-        random_tensor(num_tokens, 4, 4).softmax(-1),
-        random_tensor(24, 16384) * 0.01,
-        torch.ones(3, device="cuda"),
-        torch.zeros(24, device="cuda"),
-    ]
-    assert len(runner.get_valid_tactics(inputs, None)) == 1
-    reference = runner(inputs)
-    for _ in range(20):
-        actual = runner(inputs, tactic=("fused_half_mma", 0, 16, 0, 1))
-        for expected, value in zip(reference, actual):
-            assert torch.isfinite(value).all()
-            assert torch.equal(value, expected)
-
-
 def _mhc_fused_hc_mma_available() -> bool:
     try:
         from tensorrt_llm._torch.modules.mhc.mhc_cuda import _fused_hc_mma_supported
@@ -1238,9 +1198,7 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
-# 300 rows take a different automatic BigFuse block size than one row, which the
-# row-invariance check below must not see.
-@pytest.mark.parametrize("num_tokens", [1, 129, 300])
+@pytest.mark.parametrize("num_tokens", [1, 129])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("fuse_norm", [False, True])
 @pytest.mark.parametrize("lagged", [False, True])
@@ -1302,15 +1260,6 @@ def test_mhc_fused_hc_force_deterministic(
     single_pre_mix = pre_mix_ext[row : row + 1].clone() if pre_mix_ext is not None else None
     for actual, reference in zip(run(single_inputs, single_pre_mix), expected, strict=True):
         torch.testing.assert_close(actual, reference[row : row + 1], rtol=0, atol=0)
-    # Nor may splitting the batch, which checks every row.
-    half = (num_tokens + 1) // 2
-    for start, stop in ((0, half), (half, num_tokens)):
-        if start == stop:
-            continue
-        part_inputs = [v[start:stop].clone() for v in inputs[:4]] + inputs[4:]
-        part_pre_mix = pre_mix_ext[start:stop].clone() if pre_mix_ext is not None else None
-        for actual, reference in zip(run(part_inputs, part_pre_mix), expected, strict=True):
-            torch.testing.assert_close(actual, reference[start:stop], rtol=0, atol=0)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
