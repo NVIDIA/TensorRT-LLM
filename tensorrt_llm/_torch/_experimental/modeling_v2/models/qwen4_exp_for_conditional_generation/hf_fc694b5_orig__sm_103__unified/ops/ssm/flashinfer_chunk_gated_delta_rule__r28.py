@@ -353,9 +353,9 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     one. Both paths take the bf16 packed state. The cells hold the path
     they reach (`fi_path`), and a CP fallback warning fails them.
 
-    Measured per cell against the fp64 reference (bf16 pool): o rel-L2
-    3.74e-3 to 3.79e-3, cosine 0.999993, max abs 4.9e-4; named slots'
-    states rel-L2 3.23e-3 to 3.45e-3, max abs 3.9e-3 -- the CP pipeline and
+    Measured per rank cell against the fp64 reference (bf16 pool): o rel-L2
+    3.72e-3 to 3.77e-3, cosine 0.999993, max abs 7.3e-4; named slots'
+    states rel-L2 3.25e-3 to 3.47e-3, max abs 3.9e-3 -- the CP pipeline and
     the chunked kernel alike. A value head reading the wrong key head at
     4/12 (key heads rolled by one) is o rel-L2 1.41, max abs 7.6e-2, which
     the band refuses.

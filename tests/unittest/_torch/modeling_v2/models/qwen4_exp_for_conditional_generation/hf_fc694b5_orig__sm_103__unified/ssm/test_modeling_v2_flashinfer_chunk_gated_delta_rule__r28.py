@@ -44,7 +44,7 @@ DEV = "cuda"
 #: operands. This op is the same class of sum: measured against fp64 at
 #: 1 x 8192 tokens, o max abs 1.26e-3 and state max abs 8.6e-3 (Triton op:
 #: 1.13e-3 / 7.7e-3), inside it. At a rank's pool every cell measured o max
-#: abs 4.9e-4 and state max abs 3.9e-3, CP pipeline and chunked kernel alike;
+#: abs at most 7.3e-4 and state max abs 3.9e-3, CP pipeline and chunked kernel alike;
 #: a value head reading the wrong key head at 4/12 is o max abs 7.6e-2 (o
 #: rel-L2 1.41 against 3.8e-3), which `test_band_refuses_a_misgrouped_key_head`
 #: holds the band refuses.
