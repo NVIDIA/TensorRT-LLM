@@ -843,10 +843,12 @@ def apply_chat_template(
     # STRING path: placeholders already inserted in content by caller
 
     template_renderer = tokenizer.apply_chat_template
-    if isinstance(
-            tokenizer,
-            PreTrainedTokenizerBase) and _has_python_chat_template(tokenizer):
-        # A selected Jinja template must not be ignored by a native renderer.
+    if (model_type in ("kimi_k3", "kimi_linear")
+            and isinstance(tokenizer, PreTrainedTokenizerBase)
+            and callable(getattr(tokenizer, "_encode_chat_segments", None))):
+        # Kimi-K3's segment renderer (also used by its kimi_linear text model)
+        # ignores Jinja templates. Other overrides, e.g. Kimi-K2.5's, delegate
+        # to Jinja after preprocessing tools and must remain in the call path.
         template_renderer = partial(PreTrainedTokenizerBase.apply_chat_template,
                                     tokenizer)
 

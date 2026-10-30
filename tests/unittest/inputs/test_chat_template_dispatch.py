@@ -365,6 +365,34 @@ class TestAsyncApplyChatTemplate:
 
 
 class TestPythonChatTemplate:
+    @pytest.mark.parametrize("model_type", ["kimi_k25", "kimi_linear"])
+    @pytest.mark.parametrize("template_source", ["tokenizer", "request"])
+    def test_jinja_override_preserves_tool_preprocessing(
+        self, template_source: str, model_type: str
+    ) -> None:
+        class ToolPreprocessingTokenizer(PreTrainedTokenizerBase):
+            def apply_chat_template(self, conversation, tools=None, **kwargs):
+                # Kimi-K2.5/K2.6 preprocess tools before delegating to the Jinja renderer.
+                kwargs["tools_ts_str"] = f"declare function {tools[0]['function']['name']}();"
+                return super().apply_chat_template(conversation, tools=tools, **kwargs)
+
+        template = "SELECTED:{{ tools_ts_str }}|{{ messages[0].content }}"
+        tokenizer = ToolPreprocessingTokenizer(
+            chat_template=template if template_source == "tokenizer" else "DEFAULT"
+        )
+        result = apply_chat_template(
+            model_type=model_type,
+            tokenizer=TransformersTokenizer(tokenizer),
+            processor=None,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            chat_template=template if template_source == "request" else None,
+        )
+
+        assert result == "SELECTED:declare function echo();|hello"
+
     @pytest.mark.parametrize(
         ("enable_tokenize", "expected"),
         [(False, "native-rendered"), (True, [1, 2, 3])],
