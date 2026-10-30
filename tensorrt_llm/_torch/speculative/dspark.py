@@ -98,6 +98,10 @@ class DSparkSpecMetadata(SpecMetadata):
     captured_hidden_states: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        # Keep the full slot capacity across CUDA graph copies, whose
+        # max_num_requests is narrowed to the captured graph bucket.
+        self.num_seq_slots = self.num_seq_slots or self.max_num_requests
+
         self.batch_indices_cuda = torch.empty(
             [self.max_num_requests],
             dtype=torch.int,
@@ -310,7 +314,10 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self._publish_position_ceiling(draft_model, attn_metadata, block_size)
 
         if self._ctx_len is None:
-            max_batch = spec_metadata.max_num_requests
+            # Allocated once, so span the full seq-slot pool rather than
+            # max_num_requests, which create_cuda_graph_metadata narrows to the
+            # captured graph bucket (see the DFlash counterpart).
+            max_batch = spec_metadata.num_seq_slots
             draft_model.configure_generation_autotuner(max_batch)
             self._num_stages = draft_model.num_stages
             self._win = int(draft_model._attn_params["window_size"])
