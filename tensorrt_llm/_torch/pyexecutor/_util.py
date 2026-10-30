@@ -931,6 +931,32 @@ def _derive_draft_max_attention_window(
     return None
 
 
+def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
+    """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
+    if draft_kv_config.pool_ratio is None:
+        return
+    if draft_kv_config.mixed_precision_kv is not None:
+        # The mixed MTP draft manager has its own pool plus a retained-token
+        # pool; the target's ratios describe the target's pools.
+        logger.warning(
+            f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
+            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
+            "its pools automatically.")
+        draft_kv_config.pool_ratio = None
+    elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
+          and len(draft_kv_config.pool_ratio) != 1):
+        # pool_ratio describes one manager's layer-group layout. The
+        # target hybrid manager may have separate recurrent-state and
+        # attention layer groups, while a non-VSWA draft manager has one
+        # attention layer group. Reusing the target's ratios fails its arity
+        # check.
+        logger.info(
+            "Normalizing the separate one-model draft KV cache pool_ratio "
+            f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
+            "layer group.")
+        draft_kv_config.pool_ratio = [1.0]
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -2394,19 +2420,7 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
-                and draft_kv_config.pool_ratio is not None
-                and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's layer-group layout. The
-            # target hybrid manager may have separate recurrent-state and
-            # attention layer groups, while a non-VSWA draft manager has one
-            # attention layer group. Reusing the target's ratios fails its arity
-            # check.
-            logger.info(
-                "Normalizing the separate one-model draft KV cache pool_ratio "
-                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "layer group.")
-            draft_kv_config.pool_ratio = [1.0]
+        _fit_draft_pool_ratio(draft_kv_config)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "

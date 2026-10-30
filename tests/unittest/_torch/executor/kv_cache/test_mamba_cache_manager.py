@@ -3968,6 +3968,30 @@ def test_v2_hybrid_mixed_precision_mixes_appended_mtp_layer():
         mgr.shutdown()
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_names_twins():
+    """Disaggregated transfer gives a hybrid manager's twins collision-free layer ids."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        assert mgr.high_layers == {1: 2}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        # Model layers L -> 2L, the twin of layer L -> 2L + 1.
+        assert ids == {0: 0, 1: 2, 2: 3}
+    finally:
+        mgr.shutdown()
+
+
 @skip_no_cuda
 def test_v2_hybrid_supports_pure_mamba_pp_rank():
     mgr = _build_v2_hybrid_with_mamba_layer(

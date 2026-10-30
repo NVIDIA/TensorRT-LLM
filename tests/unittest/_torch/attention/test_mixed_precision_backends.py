@@ -773,6 +773,27 @@ def test_one_model_draft_kv_cache_dtype(is_mtp):
     assert target.mixed_precision_kv is not None
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "dtype, ratio, expected",
+    [
+        # Mixed MTP draft: its own pool plus a retained-token pool, sized automatically.
+        ("mixed_nvfp4_fp8", [0.75, 0.25], None),
+        # Plain drafter with one layer group: the target's ratios collapse to [1.0].
+        ("auto", [0.75, 0.25], [1.0]),
+        ("auto", [1.0], [1.0]),
+        ("mixed_nvfp4_fp8", None, None),
+    ],
+)
+def test_draft_pool_ratio(dtype, ratio, expected):
+    """The target's pool_ratio never reaches a mixed MTP draft manager."""
+    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
+
+    draft = KvCacheConfig(dtype=dtype, pool_ratio=ratio)
+    _fit_draft_pool_ratio(draft)
+    assert draft.pool_ratio == expected
+
+
 @pytest.mark.parametrize("backend", ["dsa", "deepseek_v4"])
 @pytest.mark.cpu_only
 def test_draft_forward_hides_retained_rows(backend):
@@ -802,6 +823,41 @@ def test_draft_forward_hides_retained_rows(backend):
     meta.restore_draft_swaps()
     assert meta.retained_block_table is table
     assert cls.has_mixed_precision_retained_rows.fget(meta) is True
+
+
+@pytest.mark.cpu_only
+def test_dsa_twin_tables_refresh_full_width():
+    """An MTP draft loop reads past this step's kv lengths: no column may keep a stale page."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    num_blocks = {10: 3, 11: 1}
+
+    def fill(request_ids, layer, out):
+        # Like _fill_page_table: a request's allocated blocks only; the rest stay as given.
+        for row, request_id in enumerate(request_ids):
+            out[row, : num_blocks[request_id]] = 100 + row
+
+    def manager():
+        return SimpleNamespace(
+            high_layers={0: 1}, pp_layers=[0], fill_high_precision_page_table=fill
+        )
+
+    meta = SimpleNamespace(
+        num_seqs=2,
+        request_ids=[10, 11],
+        kv_cache_manager=manager(),
+        draft_kv_cache_manager=manager(),
+        # Stale page ids from an earlier step, page 0 included.
+        retained_block_table=torch.zeros(4, 6, dtype=torch.int32),
+        draft_retained_block_table=torch.full((4, 6), 7, dtype=torch.int32),
+    )
+    DSAtrtllmAttentionMetadata._fill_retained_block_tables(meta)
+
+    expected = torch.tensor([[100] * 3 + [-1] * 3, [101] + [-1] * 5], dtype=torch.int32)
+    for table in (meta.retained_block_table, meta.draft_retained_block_table):
+        assert torch.equal(table[:2], expected)
 
 
 @pytest.mark.cpu_only

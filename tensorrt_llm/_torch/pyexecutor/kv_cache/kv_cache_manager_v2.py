@@ -4067,8 +4067,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 AttentionLayerConfig(
                     layer_id=LayerId(len(layers)),
                     buffers=[BufferConfig(role=role, size=page_bytes) for role in roles],
-                    # Native SWA includes the next query's write position, plus the draft tokens.
-                    sliding_window_size=self.last_n + 1 + self.max_draft_len,
+                    # Native SWA includes the next query's write position.
+                    sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
                     reuse_policy=AttentionReusePolicy.REQUIRED,
                 )

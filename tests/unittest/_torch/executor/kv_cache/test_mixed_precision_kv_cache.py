@@ -350,6 +350,136 @@ def test_separate_mtp_draft_manager_goes_mixed(make_manager):
     assert manager.high_layers == {0: 1}
 
 
+def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
+    """A target pool_ratio sizes the target; the mixed MTP draft manager still builds."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
+    from tensorrt_llm.llmapi import MTPDecodingConfig
+
+    config = mixed_config(pool_ratio=[0.75, 0.25], max_tokens=None, max_gpu_total_bytes=128 << 20)
+    target = make_manager(config=config, num_layers=2)
+    assert target.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx([0.75, 0.25])
+    draft_config = config.model_copy()
+    _fit_draft_pool_ratio(draft_config)
+    draft = make_manager(
+        config=draft_config,
+        num_layers=1,
+        layer_mask=[False, False, True],
+        spec_config=MTPDecodingConfig(num_nextn_predict_layers=1),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        is_draft=True,
+    )
+    assert draft.high_layers == {0: 1}
+
+
+def test_twin_window_covers_every_draft_step(make_manager):
+    """A window of last_n + 1 holds every position an MTP step reads or writes.
+
+    Each step grows the capacity by 1 + draft tokens: its queries at positions history ..
+    history + draft read the last_n tokens before them, and the draft loop writes up to
+    history + draft. Then 0..draft drafts are accepted and the history advances.
+    """
+    import random
+
+    draft, tokens_per_block, first_n, last_n = 3, 16, 4, 20
+    manager = make_manager(
+        config=mixed_config(
+            pool_ratio=None,
+            enable_block_reuse=False,
+            mixed_precision_first_n=first_n,
+            mixed_precision_last_n=last_n,
+        ),
+        tokens_per_block=tokens_per_block,
+        max_seq_len=512,
+    )
+    assert manager.kv_cache_manager_py_config.layers[1].sliding_window_size == last_n + 1
+    native = manager.impl
+    stream = torch.cuda.current_stream().cuda_stream
+    high_group = native.get_layer_group_id(manager.high_layers[0])
+    rng = random.Random(0)
+    history = 100
+    with closing(native.create_kv_cache(None, [])) as kv_cache:
+        assert kv_cache.resume(stream) and kv_cache.resize(history)
+        while history + 1 + draft < 400:
+            assert kv_cache.resize(history + 1 + draft, history)
+            pages = list(kv_cache.get_base_page_indices(high_group))
+            first_read = (history - last_n) // tokens_per_block
+            last_write = (history + draft) // tokens_per_block
+            held = [
+                pages[block] != kv.BAD_PAGE_INDEX for block in range(first_read, last_write + 1)
+            ]
+            assert all(held), (history, first_read, last_write, pages)
+            assert pages[0] != kv.BAD_PAGE_INDEX  # the first_n sink
+            history += 1 + rng.randint(0, draft)
+        # The window is tight: pages well before the last_n tokens were released.
+        assert pages[2] == kv.BAD_PAGE_INDEX
+
+
+def test_deepseek_v4_mixed_disagg_names_every_layer():
+    """Disaggregated transfer gives the DeepSeek-V4 twins their own layer ids."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    ratios = [1, 4, 128, 4]
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=4,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.NVFP4,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+            index_head_dim=128, window_size=128, compress_ratios=ratios
+        ),
+        pretrained_config=SimpleNamespace(num_hidden_layers=4),
+    )
+    try:
+        # The three compressed layers each have a twin, registered under RETAINED.
+        assert sorted(manager.high_layers) == [1, 2, 3]
+        retained = DeepseekV4AttentionType.RETAINED
+        for local, twin in manager.high_layers.items():
+            assert manager._layer_attn_to_layer_id[manager.pp_layers[local], retained] == twin
+        rank = RankInfo.from_kv_cache_manager("dsv4_mixed", manager, device_id=0)
+        ids = [
+            layer.global_layer_id
+            for group in rank.page_table.layer_groups
+            for layer in group.local_layers
+        ]
+        assert len(ids) == len(set(ids))
+        num_types = max(member.value for member in DeepseekV4AttentionType) + 1
+        assert {layer * num_types + retained.value for layer in (1, 2, 3)} <= set(ids)
+        # A peer with the same layout pairs every pool, the twins' included.
+        registrar = PeerRegistrar(rank, KVRegionExtractorV1(rank.page_table))
+        peer = RankInfo.from_bytes(rank.to_bytes())
+        peer.instance_name = "decode"
+        mapping = registrar.get_pool_mapping(peer)
+        assert all(source == destination for source, destination in mapping.items())
+        twin_groups = {
+            int(manager.impl.get_layer_group_id(t)) for t in manager.high_layers.values()
+        }
+        assert twin_groups <= {group for group, _ in mapping}
+    finally:
+        manager.shutdown()
+
+
 def test_mixed_precision_page_tables_match_base_page_indices(make_manager):
     """The batched page-table gather equals reading each request's base page indices."""
     import numpy as np

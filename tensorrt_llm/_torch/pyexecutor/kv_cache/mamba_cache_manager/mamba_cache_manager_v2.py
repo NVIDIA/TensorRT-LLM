@@ -492,13 +492,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         layer. With it, the MLA latent and HP-ring layers use the policy's
         ``2 * L`` / ``2 * L + 1`` encoding, and recurrent layers use ``2 * L``
         so that the IDs stay collision-free across all of the manager's
-        layers and identical under any pipeline split.
+        layers and identical under any pipeline split. Mixed-precision twins
+        use the same encoding: ``2 * L`` for the model's layers, ``2 * L + 1``
+        for the twin of layer ``L``.
         """
         layout_policy = self._attention_cache_layout_policy
+        twin_owner = {twin: local for local, twin in self.high_layers.items()}
         result = []
         for layer_id in self.impl.layer_grouping[layer_group_id]:
             internal_layer = int(layer_id)
-            if layout_policy is None:
+            if layout_policy is None and twin_owner:
+                if internal_layer in twin_owner:
+                    global_layer_id = 2 * int(self.pp_layers[twin_owner[internal_layer]]) + 1
+                else:
+                    global_layer_id = 2 * int(self.pp_layers[internal_layer])
+            elif layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
