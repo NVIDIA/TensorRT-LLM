@@ -1012,6 +1012,9 @@ def _edge_positional_embedding_params(config) -> PositionalEmbeddingParams:
     placeholder_metadata=PLACEHOLDER_METADATA,
 )
 class Cosmos3EdgeModel(Qwen3VLModelBase):
+    # The custom SigLIP path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     supports_encoder_cache = True
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):

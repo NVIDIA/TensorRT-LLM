@@ -866,6 +866,9 @@ class WhisperModel(nn.Module):
 class WhisperForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
     """Whisper encoder-decoder model with LM head."""
 
+    # The native audio path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"audio": frozenset()}
+
     def __init__(self, model_config: ModelConfig[WhisperConfig]):
         super().__init__()
         self.model_config = model_config

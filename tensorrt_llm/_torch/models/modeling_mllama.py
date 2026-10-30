@@ -1,6 +1,6 @@
 # Adapted from https://github.com/huggingface/transformers/blob/a7f5479b45a8040392af80bf1107a2bdd796931c/src/transformers/models/mllama/modeling_mllama.py
 #
-# Copyright 2024 the NVIDIA Inc. team. All rights reserved.
+# Copyright 2024-2026 the NVIDIA Inc. team. All rights reserved.
 # Copyright 2024 the HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -260,6 +260,9 @@ class MllamaForCausalLM(nn.Module):
 
 @register_auto_model("MllamaForConditionalGeneration")
 class MllamaForConditionalGeneration(nn.Module):
+
+    # Vision input is not implemented.
+    supported_encoder_attention_backends = {"vision": frozenset()}
 
     def __init__(
         self,
