@@ -50,11 +50,14 @@ Tuning (optional):
 - Budget: <time/resource limit>. Preserve correctness and report baseline versus final results.
 ```
 
-Role models are resolved once per launch: per-role settings override global settings, then explicit
-backend model environment overrides, then the launching session. Claude uses its last recorded
-assistant model, which can lag a switch; Codex queries its live thread. If lookup is unavailable,
-set the model explicitly. Custom models and effort remain available through `agents.defaults` and
-`agents.roles` in [task.example.yaml](task.example.yaml). Model inheritance does not grant permissions.
+Roles run on the launching agent's own harness, model and reasoning effort, which it writes into
+`agents.defaults` ([spec/INTAKE.md](spec/INTAKE.md), section 7): written values hold on any host.
+Unwritten, they are resolved once per launch: per-role settings override global settings, then
+explicit backend model environment overrides, then the launching session, which never gives the
+effort and must be within the orchestrator's reach: its session variables, and Claude's transcript
+(its last recorded assistant model, which can lag a switch) or Codex's live app-server, on its own
+host only. The keys are in
+[task.example.yaml](task.example.yaml). Model inheritance does not grant permissions.
 Roles load the run's own skills only: preflight's agent probe reads the skills a session would load
 and turns off the user's, and Codex roles run without the user's plugins and apps. Codex roles keep
 their state in the run's own home, `<workspace>/codex-home` (the login and configuration copied from

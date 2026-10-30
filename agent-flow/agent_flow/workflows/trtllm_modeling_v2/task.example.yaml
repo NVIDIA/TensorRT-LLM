@@ -311,7 +311,9 @@ accuracy:
   # benchmark_args: [--apply_chat_template]
 
 # ------------------------------------------------------- agent backends
-# Every role shares the launching session's model unless explicitly overridden here.
+# The launching agent writes its own backend, model and reasoning_effort into defaults (spec/INTAKE.md
+# section 7); written values hold on any host. Unwritten, every role shares the launching session's
+# backend and model, never its effort, and only where the orchestrator reaches it (Codex: same host).
 # Claude reads the exact session's last recorded assistant model (transcripts may lag a switch);
 # Codex queries its live thread through the existing app-server. Unknown models stop startup:
 # from a plain terminal set defaults.model or CLAUDE_CODE_DEFAULT_MODEL / CODEX_DEFAULT_MODEL.
@@ -320,7 +322,7 @@ accuracy:
 # reasoning_effort, extra_mcp_servers. Models are inherited only within the same backend.
 # Models are pinned once for probes, primers and all stages. Effort defaults are unchanged.
 # agents:
-#   defaults: {backend: claude-code, model: <your-model-id>}
+#   defaults: {backend: claude-code, model: <your-model-id>, reasoning_effort: <your-effort>}
 #   roles:
 #     tuner: {backend: codex, model: <your-codex-model-id>, reasoning_effort: high}
 #   # defaults: {extra_mcp_servers: {knowledge-base: {type: http, url: https://example.test/mcp}}}

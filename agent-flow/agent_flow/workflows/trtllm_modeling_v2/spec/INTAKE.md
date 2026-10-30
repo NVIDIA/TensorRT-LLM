@@ -148,7 +148,31 @@ you start by hand.
 - A `session_spool` environment's spools exist once their sessions run. Until then lint with
   `--sessions-planned`; start the sessions before launch.
 
-## 7. Notes: the run's brief
+## 7. Agents: yours
+
+The roles run on your harness, model and reasoning effort. Write all three into the spec:
+
+```yaml
+agents:
+  defaults: {backend: <claude-code | codex>, model: <your model id>, reasoning_effort: <your effort>}
+```
+
+- Written values hold wherever the orchestrator runs. Inheriting from your session does not: the
+  backend comes from session variables that a command sent over ssh or from a scheduler may not
+  carry, a Codex model is read from your live app-server on your own host only, and effort is
+  never inherited.
+- Take them from your own session: the exact model id you run as and your effort. When you cannot
+  tell one, ask the user; never write another.
+- `intake derive --site` copies the site's `agents` block into the spec: replace it with yours
+  unless the user asked for it.
+- The roles sign in on the orchestrator's host, so your model must be served there (one behind a
+  proxy only your workstation reaches is not). When it is not, stop and ask the user what to use;
+  never change the harness or the model yourself.
+- `agents.roles.<role>` only for a role the user asks to run differently.
+- The agent probe (preflight, so `--dry-run` too) runs every pinned agent on the orchestrator's
+  host and prints each one's backend, model and effort: check them against yours before launch.
+
+## 8. Notes: the run's brief
 
 `notes` reach every role verbatim, in every turn. Keep them a brief (under ~6000 characters) of
 what the roles need while they work:
@@ -172,7 +196,7 @@ Nothing about the intake itself: what intake may or may not do, launch blockers,
 provenance and questions for the user belong in your own summary beside the spec. Notes are read
 as standing orders, so "no build is allowed" written for the intake stops the run's own builds.
 
-## 8. Lint, then launch
+## 9. Lint, then launch
 
 ```bash
 trtllm-modeling-v2 intake lint --task task.yaml --report intake.report.md [--sessions-planned]
