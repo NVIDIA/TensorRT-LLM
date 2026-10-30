@@ -2115,12 +2115,11 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         # The drafter's own windows come from its model config, so this widens
         # only what the pool retains (see _draft_slot_trail_tokens).
+        self.draft_slot_trail_tokens = _draft_slot_trail_tokens(
+            spec_config, is_draft=is_draft, tokens_per_block=tokens_per_block
+        )
         self.max_attention_window_vec = _extend_swa_windows_for_reuse(
-            self.max_attention_window_vec,
-            _draft_slot_trail_tokens(
-                spec_config, is_draft=is_draft, tokens_per_block=tokens_per_block
-            ),
-            max_seq_len,
+            self.max_attention_window_vec, self.draft_slot_trail_tokens, max_seq_len
         )
 
         event_window_size = max(

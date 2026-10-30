@@ -1497,8 +1497,14 @@ class DFlashWorker(SpecWorkerBase):
                 self._ctx_reuse_addressable = bool(
                     getattr(draft_kv_cache_manager, "enable_joint_kv_cache_reuse", False)
                 )
-                self._ctx_seed_page_aligned = dflash_windows_span_a_page(
-                    getattr(draft_kv_cache_manager, "max_attention_window_vec", None), page_size
+                # A slot seeded on a page boundary trails its request by less
+                # than a page; a windowed pool backs that trail only when it
+                # keeps a page below its windows (kv_cache_manager_v2's
+                # draft_slot_trail_tokens; a V1 pool does not).
+                windows = getattr(draft_kv_cache_manager, "max_attention_window_vec", None)
+                self._ctx_seed_page_aligned = dflash_windows_span_a_page(windows, page_size) and (
+                    all(window is None for window in windows or ())
+                    or getattr(draft_kv_cache_manager, "draft_slot_trail_tokens", 0) >= page_size
                 )
             self._ctx_kv_last_page_len = torch.full(
                 (num_slots,), page_size, dtype=torch.int32, device="cuda"

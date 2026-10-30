@@ -2696,6 +2696,7 @@ def test_trailing_drafter_slot_reads_only_pages_its_request_holds(
             draft_kv_cache_manager=draft,
         )
         assert worker._ctx_page_size == page
+        assert worker._ctx_seed_page_aligned
         spec_metadata = DFlashSpecMetadata(
             max_num_requests=2, max_draft_len=max_draft_len, max_total_draft_tokens=max_draft_len
         )
