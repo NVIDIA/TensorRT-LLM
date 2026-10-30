@@ -1028,6 +1028,12 @@ def _attn_in_heads(core, proj):
     return q, k, v
 
 
+def _packed_q(core, qkv):
+    """The query heads `[T, heads_q, head_dim]` of the compact `[T, qkv_width]` packed QKV."""
+    heads = core.heads_q + 2 * core.heads_kv
+    return torch.reshape(qkv, [qkv.shape[0], heads, core.head_dim])[:, : core.heads_q]
+
+
 def _attention_rope(core, proj, index_scratch, L: _LayerWeights, pos3, pos) -> None:
     """Both planes' Gemma norm + rope. The main q/k heads in place on the fused projection
     row (interleaved mRoPE over the three position rows; everything after k is passed as v
@@ -1403,8 +1409,11 @@ class PrefillTarget:
         ) = step.qsa
         num_tokens = step.num_tokens
         proj = proj[:num_tokens]
-        qkv_view = proj[:, : core.qkv_width]
-        q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
+        _, k_dst, v_dst = _attn_in_heads(core, proj)
+        # The packed `[q | k | v]` as one compact copy: the dense op reads it flat, and the
+        # sparse GQA reads its query heads from it.
+        qkv = proj_qkv[:num_tokens]
+        qkv.copy_(proj[:, : core.qkv_width])
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
 
         if sparse:
@@ -1453,7 +1462,7 @@ class PrefillTarget:
                 out = _sparse_gqa(
                     core,
                     kv,
-                    q_dst[lo:hi],
+                    _packed_q(core, qkv)[lo:hi],
                     block_table,
                     selected[lo:hi],
                     req_idx[lo:hi],
@@ -1462,9 +1471,6 @@ class PrefillTarget:
                 )
                 attn_out[lo:hi].copy_(torch.reshape(out, [hi - lo, core.q_width]))
         else:
-            # The dense op reads its packed QKV flat: one compact copy.
-            qkv = proj_qkv[:num_tokens]
-            qkv.copy_(qkv_view)
             thop_attention(
                 q=qkv,
                 output=attn_out[:num_tokens],
@@ -1919,9 +1925,9 @@ class DecodeTarget:
         rank's heads.
 
         The four input projections are one GEMM against the fused operand; the norm + rope of
-        both planes runs on it; the sparse path reads q/k/v as views of it, the dense path
-        takes one compact copy of its leading `[q | k | v]`, and the index branch reads the
-        raw key from it. The index plane is maintained on every step, at both ends of the
+        both planes runs on it; one compact copy of its leading `[q | k | v]` feeds the dense
+        op and the sparse GQA's query heads, the sparse K/V append reads k and v as views of
+        it, and the index branch reads the raw key from it. The index plane is maintained on every step, at both ends of the
         threshold; above it the dense core is replaced and the main K/V append becomes this
         layer's own call."""
         core = self.core
@@ -1944,9 +1950,12 @@ class DecodeTarget:
         qkv_view, gate, _ = torch.split(
             proj, [core.qkv_width, core.q_width, core.index_scratch_width], 1
         )
-        q_dst, k_dst, v_dst = _attn_in_heads(core, proj)
+        _, k_dst, v_dst = _attn_in_heads(core, proj)
         _attention_rope(core, proj, index_scratch, L, pos3, pos)
         _index_plane(core, proj, i, L, (req_idx, logical, block_table, tokens_per_block, coords))
+        # The packed `[q | k | v]` as one compact copy: the dense op reads it flat, and the
+        # sparse GQA reads its query heads from it.
+        qkv.copy_(qkv_view)
 
         if sparse:
             kv = core._bound.pools.kv[i]
@@ -1978,12 +1987,10 @@ class DecodeTarget:
                 selected,
             )
             attn = _sparse_gqa(
-                core, kv, q_dst, block_table, selected, req_idx, tokens_per_block, None
+                core, kv, _packed_q(core, qkv), block_table, selected, req_idx, tokens_per_block, None
             )
             out = torch.reshape(attn, [num_tokens, core.q_width])
         else:
-            # The dense op reads its packed QKV flat: one compact copy.
-            qkv.copy_(qkv_view)
             out = thop_attention(
                 q=qkv,
                 output=attn_out,
