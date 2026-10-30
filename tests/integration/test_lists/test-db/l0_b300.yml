@@ -57,7 +57,7 @@ l0_b300:
   - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
-  - unittest/_torch/executor # 250s
+  - unittest/_torch/pyexecutor # 250s
   - unittest/_torch/disaggregation
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py

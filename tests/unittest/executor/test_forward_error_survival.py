@@ -125,6 +125,7 @@ def _loop_executor(monkeypatch: pytest.MonkeyPatch) -> PyExecutor:
     executor.dist = Mock(tp_size=1, world_size=1)
 
     executor._disagg_coordinator = MagicMock()
+    executor._disagg_coordinator.handle_errors_synced.return_value = False
     executor.resource_manager = MagicMock()
 
     batches = iter([(_scheduled_batch(), None), (None, None)])
