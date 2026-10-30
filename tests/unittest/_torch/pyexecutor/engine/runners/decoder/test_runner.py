@@ -70,10 +70,9 @@ def _make_decoder_runner(
         model.extra_attrs = {}
         model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
     else:
-        model = SimpleNamespace(
-            extra_attrs={},
-            model_config=SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None)),
-        )
+        model = torch.nn.Module()
+        model.extra_attrs = {}
+        model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(rope_scaling=None))
     outputs = {"logits": object()}
     backend = Mock()
     backend.enabled = runner_enabled
