@@ -156,14 +156,14 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
+        lc_id = manager.get_layer_group_id(layer_id)
         index_mode = (
             PageIndexMode.SHARED
-            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED, lc_id)
             else PageIndexMode.PER_LAYER
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: only one page (the SSM slot), only check the last history token
             if not history:
@@ -174,8 +174,12 @@ class FakeEngine:
         else:
             base_pages = kv_cache.get_base_page_indices(lc_id, beam)
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         history_len = len(history)
         if is_ssm:
@@ -232,14 +236,14 @@ class FakeEngine:
         is_ssm = isinstance(layer_cfg, SsmLayerConfig)
         tokens_per_block = 1 if is_ssm else self.tokens_per_block_map[layer_id][buf_id]
         token_bytes = buf.size if is_ssm else exact_div(buf.size, tokens_per_block)
+        lc_id = manager.get_layer_group_id(layer_id)
         index_mode = (
             PageIndexMode.SHARED
-            if kv_cache.supports_index_mode(PageIndexMode.SHARED)
+            if kv_cache.supports_index_mode(PageIndexMode.SHARED, lc_id)
             else PageIndexMode.PER_LAYER
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: write only the last input token at position 0 of the SSM page
             ssm_idx = kv_cache.get_ssm_block_base_index(lc_id, beam)
@@ -252,8 +256,12 @@ class FakeEngine:
                 : div_up(history_len + len(input), tokens_per_block)
             ]
         page_converter = manager.get_page_index_converter(layer_id, role)
-        scratch_desc = kv_cache.get_scratch_desc(lc_id)
-        pages = page_converter(base_pages, index_mode, scratch_desc)
+        pages = page_converter(
+            base_pages,
+            index_mode,
+            kv_cache.get_swa_scratch_range(lc_id) or None,
+            kv_cache.get_scratch_slots(lc_id),
+        )
         capacity = kv_cache.capacity
         input_range = HalfOpenRange(history_len, history_len + len(input))
         if not is_ssm:

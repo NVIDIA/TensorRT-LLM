@@ -52,7 +52,7 @@ make -C docker devel_run LOCAL_USER=1 EXTRA_VOLUMES="-v /pathA:/pathA -v /pathB:
 Specific CUDA architectures supported by the `wheel` can be specified with `CUDA_ARCHS`:
 
 ```bash
-make -C docker release_build CUDA_ARCHS="80-real;90-real"
+make -C docker release_build CUDA_ARCHS="80;90"
 ```
 
 The `run` action maps the locally checked out source code into the `/code/tensorrt_llm` directory within the container.
@@ -113,7 +113,7 @@ image](#ngc-integration) or [build an image locally](#building-docker-images-wit
 One may also build a release image based on the Jenkins development image:
 
 ```bash
-make -C docker trtllm_build CUDA_ARCHS="80-real;90-real"
+make -C docker trtllm_build CUDA_ARCHS="80;90"
 ```
 
 Note that the above requires access to the Jenkins development image from the

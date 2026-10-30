@@ -33,6 +33,7 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
+  - unittest/_torch/modeling/test_modeling_glm.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_token_ban.py
@@ -60,6 +61,7 @@ l0_a10:
   - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
+  - unittest/others/test_cuda_architecture_check.py
   - unittest/others/test_import_cuda_context.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
