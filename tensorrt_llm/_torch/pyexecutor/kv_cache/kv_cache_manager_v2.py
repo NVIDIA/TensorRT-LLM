@@ -6134,14 +6134,21 @@ class KVCacheManagerV2(BaseResourceManager):
                             kv_cache.history_length,
                             req.context_current_position + req.context_chunk_size,
                         )
-                    elif kv_cache.capacity >= req.context_current_position:
+                    elif (
+                        kv_cache.capacity >= req.context_current_position
+                        or self.draft_slot_trail_tokens > 0
+                    ):
                         # The chunk start is history for a mirror that already
                         # holds [0, chunk start): sliding-window layers keep
                         # pages only from history + 1 - window (AttnLifeCycle::
                         # getStaleRange), so the mirror holds its window plus
                         # the chunk in flight rather than the whole prompt so
-                        # far. A mirror first seen past position 0 is not one
-                        # and keeps its history, i.e. pages from 0.
+                        # far. So it is for a DFlash/DSpark mirror first seen
+                        # past position 0 (a prefix this worker did not
+                        # compute): that drafter stores the chunk at its target
+                        # position over a base hiding the prefix
+                        # (DFlashWorker._ctx_store_start). Any other mirror
+                        # first seen there keeps its history, i.e. pages from 0.
                         history = max(kv_cache.history_length, req.context_current_position)
                 if not kv_cache.resize(capacity, history):
                     raise self._mirror_resize_error(req, "context", capacity)

@@ -1888,31 +1888,35 @@ def test_draft_manager_keeps_shared_progress_across_context_and_generation() -> 
         "mirror_capacity",
         "mirror_history",
         "expected_resize",
+        "trail_tokens",
     ),
     [
         # External drafter (target view), aggregated chunked prefill. The
         # prompt is 8192 + 2 * 1024 tokens, so the 1024-token chunk at 8192 is
         # not the last one and carries no draft tokens.
-        pytest.param(False, False, 0, 0, 0, (1024, 0), id="first_chunk"),
+        pytest.param(False, False, 0, 0, 0, (1024, 0), 0, id="first_chunk"),
         # A later chunk of a mirror that holds [0, 8192): the chunk start is
         # history, so a sliding window drops the pages below it.
-        pytest.param(False, False, 8192, 8192, 4096, (9216, 8192), id="later_chunk"),
+        pytest.param(False, False, 8192, 8192, 4096, (9216, 8192), 0, id="later_chunk"),
         # The history is already ahead of the chunk start; a resize never
         # lowers it.
-        pytest.param(False, False, 8192, 8192, 8704, (9216, 8704), id="history_ahead"),
+        pytest.param(False, False, 8192, 8192, 8704, (9216, 8704), 0, id="history_ahead"),
         # A mirror first seen past position 0 (a target prefix this worker did
-        # not compute) keeps its history and covers [0, chunk end); the DFlash
-        # drafter stores the chunk at its target position above the prefix.
-        pytest.param(False, False, 8192, 0, 0, (9216, None), id="fresh_past_zero"),
+        # not compute). A DFlash/DSpark pool (one with a trailing page) takes
+        # the chunk start as history: that drafter stores the chunk at its
+        # target position above the prefix. Any other keeps its history and
+        # covers [0, chunk end).
+        pytest.param(False, False, 8192, 0, 0, (9216, 8192), 32, id="fresh_past_zero-dflash"),
+        pytest.param(False, False, 8192, 0, 0, (9216, None), 0, id="fresh_past_zero-pard"),
         # MTP, Eagle and two-engine drafters keep the draft request view: it
         # reads position 0 with the whole prompt as its (last) chunk, and the
         # resize keeps the cache's history.
-        pytest.param(True, False, 8192, 8192, 0, (10243, None), id="draft_view"),
+        pytest.param(True, False, 8192, 8192, 0, (10243, None), 0, id="draft_view"),
         # Disaggregated generation init: the mirror holds no drafter K/V for
         # the transferred prompt (10240 tokens), so the whole prompt is
         # history; the capacity stays absolute, as the drafter's positions.
-        pytest.param(False, True, 0, 0, 0, (10243, 10240), id="disagg_gen_init-target_view"),
-        pytest.param(True, True, 0, 0, 0, (10243, None), id="disagg_gen_init-draft_view"),
+        pytest.param(False, True, 0, 0, 0, (10243, 10240), 0, id="disagg_gen_init-target_view"),
+        pytest.param(True, True, 0, 0, 0, (10243, None), 0, id="disagg_gen_init-draft_view"),
     ],
 )
 def test_unpaired_draft_mirror_context_resize(
@@ -1922,6 +1926,7 @@ def test_unpaired_draft_mirror_context_resize(
     mirror_capacity: int,
     mirror_history: int,
     expected_resize: tuple,
+    trail_tokens: int,
 ) -> None:
     """Which request view an unpaired draft mirror reads, and the capacity and
     history its context resize asks for."""
@@ -1950,6 +1955,7 @@ def test_unpaired_draft_mirror_context_resize(
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager._mirror_uses_draft_view = uses_draft_view
+    manager.draft_slot_trail_tokens = trail_tokens
     manager.num_extra_kv_tokens = 0
     manager.kv_cache_map = {request.py_request_id: kv_cache}
     manager._resume_and_restore = Mock(return_value=True)
