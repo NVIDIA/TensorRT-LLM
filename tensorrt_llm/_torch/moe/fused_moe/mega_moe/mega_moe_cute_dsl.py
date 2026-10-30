@@ -17,7 +17,8 @@
 Runtime probing and EP bootstrap live in ``cute_dsl_runtime``. The workspace
 owns local staging and borrows build-time symmetric providers; profiling scratch
 is scoped independently to each custom-op call. Kernel tuning stays in the
-custom op's TunableRunner. Multi-rank empty chunks still launch collectively.
+custom op's TunableRunner. With ep_size > 1, a rank whose chunk is empty
+still launches the kernel so that every rank joins the same collective.
 """
 
 from __future__ import annotations
@@ -178,7 +179,7 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
     Capability gate (``can_implement``): SM100/103/107 + NVFP4 +
     bfloat16 activation + CUDA 13 Cutlass DSL runtime present.
 
-    Topology source-of-truth: :meth:`_acquire_buffers`.
+    Topology source-of-truth: :meth:`MegaMoeWorkspace.acquire`.
 
       * ``ep_size == 1``: local CUDA tensors and ``peer_offsets = [0]``,
         which collapses the kernel's ``peer_rank_ptr_mapper.map(local,
