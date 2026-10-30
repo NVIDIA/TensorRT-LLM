@@ -971,7 +971,7 @@ def fp4_mla(kit, monkeypatch, backend):
         FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
     )
     from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
-    from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_BF16_KV_LAYERS_ENV
+    from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.bindings.internal.batch_manager import CacheType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -979,7 +979,7 @@ def fp4_mla(kit, monkeypatch, backend):
 
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
     monkeypatch.setenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, "0")
-    monkeypatch.delenv(KIMI_K3_BF16_KV_LAYERS_ENV, raising=False)
+    monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     return kit.managed(
         lambda: Fp4MlaKVCacheManagerV2(
             KvCacheConfig(

@@ -468,12 +468,13 @@ Map `device_type` (from the env-check output) to the `build_wheel.py` `-a` flag:
 
 | `device_type` | `-a` value |
 |------------|------------|
-| B200, GB200, GB300, B300 | `100-real` |
-| H100, H200 | `90-real` |
-| L40S | `89-real` |
-| A100 | `80-real` |
+| B200, GB200 | `100` |
+| B300, GB300 | `103` |
+| H100, H200 | `90` |
+| L40S | `89` |
+| A100 | `80` |
 
-Default to `100-real` if `device_type` is unknown.
+Default to `100` if `device_type` is unknown.
 
 ### 5c. Submit the build job
 
