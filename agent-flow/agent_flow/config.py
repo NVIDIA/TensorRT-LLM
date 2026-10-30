@@ -47,6 +47,13 @@ class BackendConfig:
     # confines to a workspace-write sandbox may write them without approval;
     # Claude Code, which runs unsandboxed, ignores them.
     writable_roots: tuple[str, ...] = ()
+    # Where Codex keeps its login, configuration and session rollouts
+    # (``CODEX_HOME``) and its SQLite databases (``CODEX_SQLITE_HOME``).
+    # ``None`` keeps the launching environment's. SQLite is not safe on a file
+    # system several hosts write at once, such as a network home that
+    # concurrent runs share. Claude Code ignores both.
+    codex_home: Path | None = None
+    codex_sqlite_home: Path | None = None
 
 
 @dataclass(frozen=True)

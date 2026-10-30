@@ -79,12 +79,18 @@ def _git_stays_under_the_base_temp(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_parent_codex_session(monkeypatch):
-    """Pin fake models; offline tests never inspect the developer's live session."""
+def _no_parent_codex_session(monkeypatch, tmp_path):
+    """Pin fake models; offline tests never inspect the developer's live session.
+
+    A Codex role seeds the run's Codex home from ``$CODEX_HOME`` and keeps its
+    databases under ``$TMPDIR``: neither is the developer's.
+    """
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_DEFAULT_MODEL", "claude-test-model")
     monkeypatch.setenv("CODEX_DEFAULT_MODEL", "codex-test-model")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "user-codex-home"))
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)

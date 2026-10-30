@@ -43,6 +43,7 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     assert backend.hooks and backend.hooks["Stop"]
     assert backend.cwd == workflow.workspace
     assert layer.config.required_tools == ()
+    assert backend.codex_home is None and backend.codex_sqlite_home is None
 
     layer = workflow._make_agent("planner", "system")
     backend = layer.config.backend
@@ -50,6 +51,9 @@ def test_a_claude_role_keeps_its_stop_hook_and_a_codex_role_gets_none(tmp_path):
     assert backend.hooks is None
     assert backend.extra_mcp_servers == kb
     assert layer.config.required_tools == ()
+    # The run's own Codex home, and its databases off the shared file systems.
+    assert backend.codex_home == (workflow.workspace / "codex-home").absolute()
+    assert backend.codex_sqlite_home.is_dir() and backend.codex_sqlite_home != backend.codex_home
     # Without the user's plugins, and, once the agent probe has read them, their skills.
     assert backend.plugins is False and backend.disabled_skills == ()
     workflow._foreign_skills = {"codex": ("imagegen", "cluster-jobs")}

@@ -152,6 +152,25 @@ async def test_backend_can_run_without_the_users_plugins(monkeypatch):
         )
 
 
+async def test_backend_runs_on_the_codex_state_it_is_given(monkeypatch, tmp_path):
+    """The app server's home and databases; a configuration file's own ``sqlite_home`` loses."""
+    monkeypatch.setattr(codex_module, "CodexTransport", FakeTransport)
+    monkeypatch.setattr(codex_module, "_resolve_codex_bin", lambda: "/configured/codex")
+    from agent_flow.backends import create_backend
+    from agent_flow.config import BackendConfig
+
+    home, databases = tmp_path / "home", tmp_path / "local"
+    instance = create_backend(
+        BackendConfig(kind="codex", model="m", codex_home=home, codex_sqlite_home=databases)
+    )
+    async with instance:
+        config = instance._transport.config
+        assert config.env == {"CODEX_HOME": str(home), "CODEX_SQLITE_HOME": str(databases)}
+        assert config.config_overrides == (f'sqlite_home="{databases}"',)
+    async with CodexBackend() as instance:
+        assert instance._transport.config.env is None
+
+
 async def test_session_options_use_developer_instructions_and_preserve_native_defaults(
     backend, tmp_path
 ):

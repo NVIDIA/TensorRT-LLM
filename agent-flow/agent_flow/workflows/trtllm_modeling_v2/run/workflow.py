@@ -51,6 +51,7 @@ from agent_flow.agent_runtime import AgentConfig
 from agent_flow.console import print_message
 from agent_flow.logger import get_logger
 
+from ..agents import codex_state
 from ..agents.prompts import PromptBundle, build_trtllm_modeling_v2_prompts
 from ..agents.roles import PACKAGED_SKILLS_DIR, resolve_role_agents
 from ..agents.slots import AgentGate, Priority, turn_priority
@@ -260,6 +261,8 @@ class TrtllmModelingV2Workflow:
         # Backend kind -> the skills its sessions load besides the run's own (the user's),
         # which the agent probe reads and every role then runs without.
         self._foreign_skills: dict[str, tuple[str, ...]] = {}
+        # This run's Codex home and databases (`_codex`), made on first use.
+        self._codex_state: codex_state.CodexState | None = None
 
     # ------------------------------------------------------------- lifecycle
 
@@ -283,6 +286,13 @@ class TrtllmModelingV2Workflow:
                 self._agent_configs = resolve_role_agents(self.task_data)
             return self._agent_configs
 
+    def _codex(self) -> codex_state.CodexState:
+        """This run's Codex home in its workspace and its databases on this host's disk."""
+        with self._agent_config_lock:
+            if self._codex_state is None:
+                self._codex_state = codex_state.prepare(self.workspace)
+            return self._codex_state
+
     def _make_agent(
         self,
         name: str,
@@ -302,6 +312,7 @@ class TrtllmModelingV2Workflow:
         hooks = require_tool_call_stop_hook(["Write"]) if requires_decision else None
         if agent.backend == "codex":
             hooks = None
+        codex = self._codex() if agent.backend == "codex" else None
         return AgentLayer(
             AgentLayerConfig(
                 name=name,
@@ -322,6 +333,8 @@ class TrtllmModelingV2Workflow:
                     writable_roots=self._writable_roots(),
                     disabled_skills=self._foreign_skills.get(agent.backend, ()),
                     plugins=False,
+                    codex_home=codex.home if codex else None,
+                    codex_sqlite_home=codex.sqlite_home if codex else None,
                 ),
                 session=SessionConfig(mode=session_mode, fork_from=fork_from),
             )

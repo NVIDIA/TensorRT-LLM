@@ -29,6 +29,8 @@ def create_backend(config: BackendConfig | str) -> Backend:
             disabled_skills=disabled_skills,
             writable_roots=config.writable_roots if isinstance(config, BackendConfig) else (),
             plugins=config.plugins if isinstance(config, BackendConfig) else True,
+            home=config.codex_home if isinstance(config, BackendConfig) else None,
+            sqlite_home=config.codex_sqlite_home if isinstance(config, BackendConfig) else None,
         )
 
     raise ValueError(f"Unknown backend: {kind!r}")

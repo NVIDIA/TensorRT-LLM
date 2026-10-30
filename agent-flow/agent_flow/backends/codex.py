@@ -250,12 +250,25 @@ class CodexBackend(Backend):
         disabled_skills: tuple[str, ...] = (),
         writable_roots: tuple[str, ...] = (),
         plugins: bool = True,
+        home: Path | None = None,
+        sqlite_home: Path | None = None,
     ) -> None:
         self._transport: CodexTransport | None = None
         self._reasoning_effort = reasoning_effort
         self._disabled_skills = disabled_skills
         self._writable_roots = writable_roots
         self._plugins = plugins
+        # The app server's state directories; unset ones are the environment's.
+        # A configuration file's own ``sqlite_home`` would win over the
+        # environment, so the databases' directory is also an override.
+        self._env = {
+            name: str(path)
+            for name, path in (("CODEX_HOME", home), ("CODEX_SQLITE_HOME", sqlite_home))
+            if path is not None
+        }
+        self._state_overrides = (
+            (f"sqlite_home={json.dumps(str(sqlite_home))}",) if sqlite_home is not None else ()
+        )
         self._sandbox, self._approval = _SANDBOXES[0], _APPROVALS[0]
 
     def version(self) -> str:
@@ -270,7 +283,9 @@ class CodexBackend(Backend):
                 CodexConfig(
                     codex_bin=_resolve_codex_bin(),
                     experimental_api=True,
-                    config_overrides=_config_overrides(self._disabled_skills, self._plugins),
+                    config_overrides=_config_overrides(self._disabled_skills, self._plugins)
+                    + self._state_overrides,
+                    env=self._env or None,
                 )
             )
             try:

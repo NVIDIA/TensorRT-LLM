@@ -364,8 +364,20 @@ def _prove_agents(workflow, log) -> bool:
         print_message(f"[bold yellow]⚠ agent probe not run: {why}[/bold yellow]", log)
         return True
     agents = agent_probe.distinct_agents(workflow.task_data, resolved=workflow._role_agents())
+    codex = None
+    if any(probed.agent.backend == "codex" for probed in agents):
+        codex = workflow._codex()
+        workflow.journal.event("codex state", codex.describe())
+        if not codex.local:
+            print_message(
+                f"[bold yellow]⚠ codex state: no local disk for the databases[/bold yellow]; "
+                f"{escape_markup(codex.describe())}",
+                log,
+            )
     record_path = workflow.workspace / agent_probe.AGENT_PROBE_RECORD
-    inputs = agent_probe.probe_inputs(workflow.task_data, agents)
+    inputs = agent_probe.probe_inputs(
+        workflow.task_data, agents, codex_home=codex.home if codex else None
+    )
     if workflow.resume:
         reusable, why = substrate_reuse(
             read_json(record_path),

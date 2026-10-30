@@ -56,7 +56,9 @@ assistant model, which can lag a switch; Codex queries its live thread. If looku
 set the model explicitly. Custom models and effort remain available through `agents.defaults` and
 `agents.roles` in [task.example.yaml](task.example.yaml). Model inheritance does not grant permissions.
 Roles load the run's own skills only: preflight's agent probe reads the skills a session would load
-and turns off the user's, and Codex roles run without the user's plugins and apps.
+and turns off the user's, and Codex roles run without the user's plugins and apps. Codex roles keep
+their state in the run's own home, `<workspace>/codex-home` (the login and configuration copied from
+`$CODEX_HOME`), and its SQLite databases on the host's local disk: runs never share them.
 
 **While it runs**, the operator keeps the sessions alive and leaves the work to the run. Never cancel
 a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled

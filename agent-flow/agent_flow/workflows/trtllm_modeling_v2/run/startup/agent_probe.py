@@ -37,6 +37,7 @@ from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig
 from agent_flow.agent_runtime import AgentConfig
 from agent_flow.backends.claude_code import CLI_PATH_ENV, cli_stderr_to, launched_cli
 
+from ...agents import codex_state
 from ...agents.roles import CODEX_SESSION_ENV, ROLES, resolve_role_agents
 from ...agents.turns import InProcessTurnExecutor, TurnRequest
 
@@ -129,6 +130,7 @@ def probe_inputs(
     agents: Sequence[ProbedAgent],
     *,
     environ: Mapping[str, str] | None = None,
+    codex_home: Path | None = None,
 ) -> dict[str, str]:
     """What a probe pass stands for, one digest per part.
 
@@ -136,8 +138,8 @@ def probe_inputs(
     - ``cli``: the ``claude`` binary a layer launches and its version, when an
       agent is on Claude Code (``$AGENT_FLOW_CLAUDE_CLI`` moves it);
     - ``process``: this host, whether this process runs inside another
-      agent's session, and the home and configuration directory the CLI
-      authenticates from;
+      agent's session, and the home and configuration directories the CLIs
+      authenticate from (the run's own Codex home, ``codex_home``);
     - ``checkout``: the checkout whose ``HEAD`` the probe reads, by path.
     """
     env = os.environ if environ is None else environ
@@ -150,6 +152,7 @@ def probe_inputs(
             "nested": {name: env.get(name) for name in NESTED_SESSION_ENV},
             "home": env.get("HOME"),
             "config_dir": env.get("CLAUDE_CONFIG_DIR"),
+            "codex_home": str(codex_home) if codex_home else None,
         },
         "checkout": task_data.get("trtllm_repo_path"),
     }
@@ -236,6 +239,7 @@ _AUTH = re.compile(
     r"authentication|\b401\b",
     re.I,
 )
+_CODEX_STATE = re.compile(r"sqlite state runtime|state db|file is not a database", re.I)
 _MODEL_UNAVAILABLE = re.compile(
     r"model is not supported|model[_ ]not[_ ]found|does not exist or you do not have access",
     re.I,
@@ -287,6 +291,14 @@ def hint_for(evidence: str, *, environ: Mapping[str, str] | None = None) -> str:
             "or `codex login` (Codex) in the shell that launches the run (the CLIs read HOME, "
             "CLAUDE_CONFIG_DIR and CODEX_HOME from it), or launch from one that is logged in."
         )
+    if _CODEX_STATE.search(evidence):
+        hints.append(
+            "Codex could not open its state databases. A run keeps them in its own directory on "
+            "this host's local disk (the journal's `codex state` line names it); remove that "
+            "directory and the next start rebuilds it from the session rollouts in the run's "
+            f"`{codex_state.CODEX_HOME_DIR}`. A Codex home on a network file system that "
+            "several runs share is what damages them."
+        )
     if _MODEL_UNAVAILABLE.search(evidence):
         hints.append(
             "This login does not offer the model the turn asked for. Set "
@@ -298,7 +310,8 @@ def hint_for(evidence: str, *, environ: Mapping[str, str] | None = None) -> str:
 
 
 def make_probe_layer(agent: AgentConfig, workspace: Path) -> AgentLayer:
-    """The layer a role on ``agent`` runs on, without the role."""
+    """The layer a role on ``agent`` runs on, without the role, with the run's Codex state."""
+    codex = codex_state.prepare(workspace) if agent.backend == "codex" else None
     return AgentLayer(
         AgentLayerConfig(
             name=PROBE_ROLE,
@@ -312,6 +325,8 @@ def make_probe_layer(agent: AgentConfig, workspace: Path) -> AgentLayer:
                 # As the roles run: without the user's plugins. Its skills stay on, so the
                 # probe reports what a session would load (ProbeOutcome.skills).
                 plugins=False,
+                codex_home=codex.home if codex else None,
+                codex_sqlite_home=codex.sqlite_home if codex else None,
             ),
             print_activity=False,
         )
