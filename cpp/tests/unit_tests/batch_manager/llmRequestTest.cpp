@@ -430,6 +430,70 @@ TEST_F(LlmRequestTest, testCreateRequests)
     }
 }
 
+TEST_F(LlmRequestTest, childrenOwnMutableInputsAndFreshRuntimeState)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(3);
+    texec::Request input(VecTokens{1, 2, 3}, 10, false, samplingConfig);
+    input.setEncoderInputTokenIds(VecTokens{4, 5});
+    input.setEncoderOutputLength(1);
+    tb::LlmRequest parent(77, input);
+    parent.setDraftTokens(std::make_shared<VecTokens>(VecTokens{6, 7}));
+    parent.mSeqSlot = 9;
+
+    auto const child = parent.createChildRequest(78);
+    auto const sibling = parent.createChildRequest(79);
+    EXPECT_EQ(parent.getChildRequests().at(0).get(), child.get());
+    EXPECT_EQ(parent.getChildRequests().at(1).get(), sibling.get());
+    EXPECT_TRUE(child->getChildRequests().empty());
+    EXPECT_TRUE(sibling->getChildRequests().empty());
+    EXPECT_FALSE(child->mSeqSlot.has_value());
+    EXPECT_EQ(child->getDecodingIter(), 0);
+    EXPECT_EQ(child->getContextCurrentPosition(), 0);
+    EXPECT_FALSE(child->getContextProgress());
+    EXPECT_EQ(child->tryGetEncoderOutputLen(), 1);
+    EXPECT_EQ(parent.mSamplingConfig.getSeed(), texec::RandomSeedType{0});
+    EXPECT_EQ(child->mSamplingConfig.getSeed(), texec::RandomSeedType{1});
+    EXPECT_EQ(sibling->mSamplingConfig.getSeed(), texec::RandomSeedType{2});
+
+    child->getDraftTokens()->pop_back();
+    child->getEncoderTokens().value()->push_back(8);
+    EXPECT_EQ(*parent.getDraftTokens(), (VecTokens{6, 7}));
+    EXPECT_EQ(*sibling->getDraftTokens(), (VecTokens{6, 7}));
+    EXPECT_EQ(*parent.getEncoderTokens().value(), (VecTokens{4, 5}));
+    EXPECT_EQ(*sibling->getEncoderTokens().value(), (VecTokens{4, 5}));
+}
+
+TEST_F(LlmRequestTest, rejectChildConstructionAfterExecution)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(2);
+    tb::LlmRequest parent(77, texec::Request(VecTokens{1, 2, 3}, 10, false, samplingConfig));
+    parent.addNewTokens(VecTokens{4});
+    parent.setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
+    EXPECT_THROW(parent.createChildRequest(78), tc::TllmException);
+    EXPECT_TRUE(parent.getChildRequests().empty());
+    EXPECT_FALSE(parent.mSamplingConfig.getSeed().has_value());
+}
+
+TEST_F(LlmRequestTest, childRegistrationRejectsDuplicateIdentity)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(3);
+    tb::LlmRequest parent(77, texec::Request(VecTokens{1, 2, 3}, 10, false, samplingConfig));
+    parent.setDraftTokens(nullptr);
+    EXPECT_THROW(parent.createChildRequest(77), tc::TllmException);
+    EXPECT_TRUE(parent.getChildRequests().empty());
+    auto const child = parent.createChildRequest(78);
+    EXPECT_EQ(child->getNumDraftTokens(), 0);
+    EXPECT_THROW(parent.createChildRequest(78), tc::TllmException);
+    EXPECT_THROW(parent.registerChildRequest(child), tc::TllmException);
+    EXPECT_THROW(child->createChildRequest(79), tc::TllmException);
+    EXPECT_EQ(parent.getChildRequests().size(), 1);
+    auto const sibling = parent.createChildRequest(79);
+    EXPECT_EQ(sibling->mSamplingConfig.getSeed(), texec::RandomSeedType{2});
+}
+
 using ParamType = std::tuple<bool, bool, bool, SizeType32, SizeType32, SizeType32>;
 
 std::string generateTestName(testing::TestParamInfo<ParamType> const& info)

@@ -53,8 +53,10 @@ def _generation_request(post_processors, tokens=(1, 2, 3)):
 
 def _engine(vocab_size=None, attention_dp=False):
     engine = object.__new__(DecoderRunner)
-    engine.mapping = SimpleNamespace(is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp)
-    engine.model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
+    engine._mapping = SimpleNamespace(
+        is_last_pp_rank=lambda: True, enable_attention_dp=attention_dp
+    )
+    engine._model = SimpleNamespace(lm_head=SimpleNamespace(num_embeddings=vocab_size))
     return engine
 
 
@@ -89,7 +91,7 @@ def test_sharded_logits_are_gathered_for_post_processors(monkeypatch):
     )
 
     assert len(calls) == 1
-    assert calls[0][0] is shard and calls[0][1] is engine.mapping and calls[0][2] == -1
+    assert calls[0][0] is shard and calls[0][1] is engine._mapping and calls[0][2] == -1
     assert seen == [(1, 1, 32)]  # the post-processor sees the whole vocabulary
 
 

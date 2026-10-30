@@ -85,6 +85,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `dwdp_config.num_experts_per_worker` | `int` | `value` |  |
 | `dwdp_config.num_groups` | `int` | `value` |  |
 | `dwdp_config.num_prefetch_experts` | `int` | `value` |  |
+| `dwdp_config.num_prefetch_slots` | `int` | `value` |  |
 | `enable_attention_dp` | `bool` | `value` |  |
 | `enable_autotuner` | `bool` | `value` |  |
 | `enable_chunked_prefill` | `bool` | `value` |  |

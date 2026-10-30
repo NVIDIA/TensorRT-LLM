@@ -293,6 +293,10 @@ class TransformersTokenizer(TokenizerBase):
     def encode(self, text: str, *args, **kwargs) -> List[int]:
         return self.tokenizer.encode(text, *args, **kwargs)
 
+    def num_special_tokens_to_add(self, pair: bool = False) -> int:
+        # PreTrainedTokenizerBase.num_special_tokens_to_add raises NotImplementedError.
+        return self.tokenizer.num_special_tokens_to_add(pair)
+
     def decode(self, token_ids: List[int], *args, **kwargs) -> str:
         return self.tokenizer.decode(token_ids, *args, **kwargs)
 

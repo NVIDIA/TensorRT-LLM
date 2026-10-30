@@ -24,9 +24,9 @@ from .api_router import attach_render_routes, mount_render_endpoints, render_end
 from .chat import (
     PreparedChat,
     arender_chat,
-    legacy_render_enabled,
     prepare_chat_request,
     render_chat,
+    render_chat_for_length,
     render_conversation,
     tokenize_rendered,
 )
@@ -39,9 +39,11 @@ from .fingerprint import (
 )
 from .prompt_types import (
     RENDERED_REQUEST_SCHEMA_VERSION,
+    HarmonyConversionError,
     PreparedContext,
     RenderedPrompt,
     RenderedRequest,
+    UnrenderableMessagesError,
     UnsupportedRenderError,
 )
 from .resources import RenderResources, harmony_enabled_for
@@ -56,6 +58,8 @@ __all__ = [
     "RenderResources",
     "RenderedPrompt",
     "ServingRender",
+    "HarmonyConversionError",
+    "UnrenderableMessagesError",
     "UnsupportedRenderError",
     "arender_chat",
     "attach_render_routes",
@@ -64,10 +68,10 @@ __all__ = [
     "fingerprint_summary",
     "fingerprints_match",
     "harmony_enabled_for",
-    "legacy_render_enabled",
     "mount_render_endpoints",
     "prepare_chat_request",
     "render_chat",
+    "render_chat_for_length",
     "render_conversation",
     "render_endpoints_enabled",
     "tokenize_rendered",

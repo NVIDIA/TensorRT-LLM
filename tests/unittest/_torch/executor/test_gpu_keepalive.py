@@ -315,6 +315,7 @@ def test_fill_gate_wiring():
     # notified first, then the keepalive is closed, then the PP handles are awaited.
     class CleanupStub:
         _executor_loop_cleanup = pe.PyExecutor._executor_loop_cleanup
+        _executor_events = None
 
         def __init__(self, keepalive):
             self.events = []

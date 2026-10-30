@@ -336,7 +336,7 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             // Declining the claim allocates writable pages without replacing
             // the candidates available to a later reader.
             auto declined = manager->createKvCache({}, prefix, 3);
-            ASSERT_TRUE(declined->resume(mStream, std::nullopt, std::vector<LifeCycleId>{}));
+            ASSERT_TRUE(declined->resume(mStream, std::vector<LifeCycleId>{}));
             for (size_t i = 0; i < original.size(); ++i)
             {
                 EXPECT_NE(declined->getBasePageIndices(encoder)[c.ordinals[i]], original[i]);
@@ -349,13 +349,13 @@ TEST_F(ReplayCacheTest, OptionalWindowClaimsSurviveIndependentPageRemoval)
             EXPECT_FALSE(missing->reuseStatus()[encoder.value()].complete);
             EXPECT_TRUE(missing->reuseStatus()[encoder.value()].coverage.empty());
             EXPECT_TRUE(missing->reuseStatus()[peer.value()].complete);
-            EXPECT_THROW(missing->resume(mStream, std::nullopt, selected), std::invalid_argument);
+            EXPECT_THROW(missing->resume(mStream, selected), std::invalid_argument);
             EXPECT_FALSE(missing->isActive());
-            ASSERT_TRUE(missing->resume(mStream, std::nullopt, std::vector<LifeCycleId>{peer}));
+            ASSERT_TRUE(missing->resume(mStream, std::vector<LifeCycleId>{peer}));
             missing->close();
             // The earlier claim owns every candidate even after tree unlink.
             manager->getAndResetIterationReusedBlocksByLevel();
-            ASSERT_TRUE(reader->resume(mStream, std::nullopt, selected));
+            ASSERT_TRUE(reader->resume(mStream, selected));
             reader->commitPendingStats();
             auto const reusedByLevel = manager->getAndResetIterationReusedBlocksByLevel();
             ASSERT_NE(reusedByLevel.find(encoder), reusedByLevel.end());
@@ -438,7 +438,7 @@ TEST_F(ReplayCacheTest, DecliningOptionalClaimReleasesCapacityBeforeAllocation)
     auto reservations = storage.newSlotsForPoolGroup(kHotLevel, group, storage.getStatistics(kHotLevel, group).free);
     // No host tier, no free slots: the rejected candidate is the only capacity
     // available to the request's fresh writable Encoder page.
-    EXPECT_TRUE(reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{}));
+    EXPECT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{}));
     EXPECT_EQ(reader->numCommittedTokens(), 8);
     reader->close();
     for (auto& slot : reservations)

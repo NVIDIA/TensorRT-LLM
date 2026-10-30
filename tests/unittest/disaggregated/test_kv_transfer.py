@@ -15,10 +15,13 @@
 """Test KV Transfer with KVCacheManagerV2."""
 
 import ast
+import gc
 import os
 import random
+import threading
 import time
 import uuid
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -65,6 +68,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
 from tensorrt_llm.bindings import DataType
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import BlockReuseConfig, KvPoolRebalanceConfig
 from tensorrt_llm.logger import logger
 
@@ -726,6 +730,7 @@ def create_transfer_worker_setup(
         )
 
     return {
+        "device_id": device_id,
         "ctx_transfer_workers": ctx_transfer_workers,
         "ctx_kv_cache_managers": ctx_kv_cache_managers,
         "gen_transfer_workers": gen_transfer_workers,
@@ -748,6 +753,17 @@ def create_transfer_worker_setup(
         "request_len": request_len,
         "max_attention_window_vec": max_attention_window_vec,
     }
+
+
+def _shutdown_transfer_worker_setup(setup: dict) -> None:
+    """Close cache managers on their CUDA device after stopping transfer workers."""
+    for side in ("ctx", "gen"):
+        for worker in setup[f"{side}_transfer_workers"]:
+            worker.shutdown()
+    torch.cuda.set_device(setup["device_id"])
+    for side in ("ctx", "gen"):
+        for manager in setup[f"{side}_kv_cache_managers"]:
+            manager.shutdown()
 
 
 def get_block_data(
@@ -1252,10 +1268,7 @@ def test_transfer_worker_v2(ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_e
         add_and_verify_request(setup, 2, 3, request_len, send_first=True)
         add_and_verify_request(setup, 4, 5, request_len * 2, send_first=False)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -1288,10 +1301,7 @@ def test_transfer_worker_v2_with_window(
         add_and_verify_request(setup, 2, 3, request_len=32, send_first=True)
         add_and_verify_request(setup, 4, 5, request_len=64, send_first=False)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -1442,8 +1452,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         torch.cuda.current_stream().synchronize()
         for kv in ctx_kv_caches + gen_kv_caches:
             kv.close()
-        ctx_tw.shutdown()
-        gen_tw.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1507,8 +1516,7 @@ def test_session_cancel_before_send():
         assert not rx_session.is_completed()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1563,7 +1571,7 @@ def test_session_cancel_after_send():
         assert tx_session.wait_complete() == WaitResult.FAILED
         tx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
@@ -1737,8 +1745,7 @@ def test_session_cancel_twice():
         assert not rx_session.has_transferring_tasks()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(60)
@@ -1809,8 +1816,103 @@ def test_session_has_transferring_tasks_false():
         assert not rx_session.has_transferring_tasks()
         rx_session.close()
     finally:
-        ctx_transfer_worker.shutdown()
-        gen_transfer_worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
+
+
+def _wait_until(predicate, timeout_s: float = 20.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize(
+    "schedule_style",
+    [DisaggScheduleStyle.CONTEXT_FIRST, DisaggScheduleStyle.GENERATION_FIRST],
+    ids=["ctx_first", "gen_first"],
+)
+def test_receive_without_context_session_fails_after_sweep(schedule_style):
+    """A receive that no context TxSession will ever serve must end, not hang.
+
+    A context-first generation request whose context KV cache is gone (its
+    TxSession failed and was closed, or the request names a disagg_request_id the
+    context rank never had) leaves its REQUEST_DATA unclaimed on the sender. Once
+    that entry outlives the sweep TTL the sender reports FAILED, so the RxSession
+    fails instead of holding its KV cache and transfer budget forever.
+    Generation-first entries may legitimately stay unclaimed (ADP broadcast) and
+    are only evicted.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    ctx_transfer_worker = setup["ctx_transfer_workers"][0]
+    gen_transfer_worker = setup["gen_transfer_workers"][0]
+    sender = ctx_transfer_worker._sender
+    sampling_config = tensorrt_llm.bindings.SamplingConfig(
+        SamplingParams(temperature=0)._get_sampling_config()
+    )
+
+    unique_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    gen_request = LlmRequest(
+        request_id=600,
+        max_new_tokens=1,
+        input_tokens=list(range(16)),
+        sampling_config=sampling_config,
+        is_streaming=False,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+    )
+    gen_request.py_disaggregated_params = DisaggregatedParams(
+        ctx_request_id=599,
+        ctx_dp_rank=0,
+        ctx_info_endpoint=setup["ctx_info_endpoint"],
+        disagg_request_id=unique_rid,
+        schedule_style=schedule_style,
+    )
+    page_table = gen_transfer_worker._rank_info.page_table
+    block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
+    empty_chunk = Chunk(
+        block_ids_per_layer_groups=block_ids_per_groups,
+        kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+        token_range=TokenRange(start=0, end=gen_request.prompt_len),
+        is_last=True,
+    )
+
+    try:
+        rx_session = gen_transfer_worker.create_rx_session(gen_request)
+        rx_session.receive(empty_chunk)
+        assert _wait_until(lambda: sender._get_req_info(unique_rid) is not None)
+        assert rx_session.wait_complete(blocking=False) is None
+
+        # Inside the TTL the sender keeps waiting for a TxSession.
+        ctx_transfer_worker.sweep_stale_req_infos()
+        time.sleep(0.2)
+        assert sender._get_req_info(unique_rid) is not None
+        assert rx_session.wait_complete(blocking=False) is None
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(type(sender), "_STALE_REQ_INFO_TTL_S", 0.0)
+            ctx_transfer_worker.sweep_stale_req_infos()
+        assert sender._get_req_info(unique_rid) is None
+        if schedule_style == DisaggScheduleStyle.CONTEXT_FIRST:
+            assert _wait_until(
+                lambda: rx_session.wait_complete(blocking=False) == WaitResult.FAILED
+            )
+            assert rx_session.has_failed()
+        else:
+            time.sleep(0.2)
+            assert rx_session.wait_complete(blocking=False) is None
+        rx_session.close()
+
+        # The same workers keep serving ordinary transfers.
+        add_and_verify_request(setup, 0, 1, setup["request_len"], send_first=True)
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
 
 
 @pytest.mark.timeout(120)
@@ -1930,11 +2032,8 @@ def test_incompatible_peer_fails_only_affected_requests(
         add_and_verify_request(setup_good, 0, 1, setup_good["request_len"], send_first=True)
         assert setup_good["ctx_info_endpoint"] in receiver._sender_ep_instance_map
     finally:
-        for s in (setup_good, setup_bad):
-            for worker in s["ctx_transfer_workers"]:
-                worker.shutdown()
-            for worker in s["gen_transfer_workers"]:
-                worker.shutdown()
+        for setup in (setup_good, setup_bad):
+            _shutdown_transfer_worker_setup(setup)
 
 
 def add_and_verify_pipelined_request(
@@ -2028,10 +2127,7 @@ def test_transfer_worker_pipelined(
         add_and_verify_pipelined_request(setup, 0, 1, request_len, chunk_size_blocks=chunk_size)
         add_and_verify_pipelined_request(setup, 2, 3, request_len * 2, chunk_size_blocks=chunk_size)
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -2075,10 +2171,7 @@ def test_transfer_worker_pipelined_ctx_prefix_reuse(
             prepopulated_blocks=prepopulated_blocks,
         )
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
 
 
 @pytest.mark.timeout(120)
@@ -2122,10 +2215,36 @@ def test_transfer_worker_pipelined_unaligned_chunk_boundaries(
             boundary_offset_tokens=1,
         )
     finally:
-        for worker in setup["ctx_transfer_workers"]:
-            worker.shutdown()
-        for worker in setup["gen_transfer_workers"]:
-            worker.shutdown()
+        _shutdown_transfer_worker_setup(setup)
+
+
+@pytest.mark.timeout(120)
+def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
+    """Collecting a closed setup on a worker must not poison other managers."""
+    healthy = create_transfer_worker_setup(
+        ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+    )
+    try:
+        setup = create_transfer_worker_setup(
+            ctx_tp=1, ctx_pp=1, ctx_enable_dp=False, gen_tp=1, gen_pp=1, gen_enable_dp=False
+        )
+        pending = setup["ctx_kv_cache_managers"] + setup["gen_kv_cache_managers"]
+        released_managers = [weakref.ref(manager) for manager in pending]
+        _shutdown_transfer_worker_setup(setup)
+        del setup
+
+        def collect_on_worker() -> None:
+            pending.clear()
+            gc.collect()
+
+        worker = threading.Thread(target=collect_on_worker)
+        worker.start()
+        worker.join(timeout=30)
+        assert not worker.is_alive()
+        assert all(reference() is None for reference in released_managers)
+        add_and_verify_request(healthy, 0, 1, healthy["request_len"], send_first=True)
+    finally:
+        _shutdown_transfer_worker_setup(healthy)
 
 
 if __name__ == "__main__":

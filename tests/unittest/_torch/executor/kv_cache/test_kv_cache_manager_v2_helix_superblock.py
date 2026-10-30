@@ -254,13 +254,14 @@ def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPa
 
     from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
 
-    def creator(max_gpu_total_bytes, max_tokens):
+    def creator(max_gpu_total_bytes, max_tokens, *, is_disagg=False, fraction=0.5):
         return SimpleNamespace(
+            _is_disagg=is_disagg,
             _mapping=SimpleNamespace(cp_size=4),
             _kv_cache_config=SimpleNamespace(
                 max_gpu_total_bytes=max_gpu_total_bytes,
                 max_tokens=max_tokens,
-                free_gpu_memory_fraction=0.5,
+                free_gpu_memory_fraction=fraction,
             ),
         )
 
@@ -280,6 +281,14 @@ def test_helix_quota_fallback_sets_rank_local_bytes(monkeypatch: pytest.MonkeyPa
     assert KvCacheCreator._configure_helix_kv_cache_capacity(c) is None
     assert c._kv_cache_config.max_gpu_total_bytes == 500_000
     assert c._kv_cache_config.max_tokens is None
+    # Default fraction: aggregated helix lowers it to leave room for prefill
+    # activations; disaggregated helix keeps it.
+    c = creator(0, None, fraction=0.9)
+    KvCacheCreator._configure_helix_kv_cache_capacity(c)
+    assert c._kv_cache_config.max_gpu_total_bytes == 600_000
+    c = creator(0, None, is_disagg=True, fraction=0.9)
+    KvCacheCreator._configure_helix_kv_cache_capacity(c)
+    assert c._kv_cache_config.max_gpu_total_bytes == 900_000
     # Degenerate free memory: actionable error instead of a deep assert.
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda: (0, 2_000_000))
     with pytest.raises(ValueError, match="free memory"):
@@ -368,6 +377,55 @@ def test_scheduler_allocation_failure_raises_under_helix() -> None:
             recompute_paused=[],
             inflight_request_ids=set(),
             scheduled_beam_width=0,
+        )
+
+
+def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
+    kv = SimpleNamespace(capacity=0, resize=lambda cap: resizes.append(cap) or True)
+    return SimpleNamespace(
+        _has_cp_helix=True,
+        is_disagg=is_disagg,
+        kv_cache_map={7: kv},
+        num_extra_kv_tokens=0,
+        _connector_reservations_enabled=lambda: False,
+        _fill_fresh_kv_pages=lambda req_id: None,
+        _log_window_crossing=lambda *args: None,
+    )
+
+
+def _context_req(prompt_len: int, total_input_len_cp: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=7,
+        is_disagg_generation_init_state=False,
+        is_dummy_request=False,
+        prompt_len=prompt_len,
+        total_input_len_cp=total_input_len_cp,
+        context_current_position=64,
+        is_first_context_chunk=False,
+    )
+
+
+def test_resize_context_allows_agg_helix_request() -> None:
+    """An agg helix request holds the full prompt on every rank, so its
+    context target is already in global ledger tokens."""
+    resizes = []
+    req = _context_req(prompt_len=200, total_input_len_cp=200)
+    assert KVCacheManagerV2.resize_context(
+        _context_resize_mgr(is_disagg=False, resizes=resizes), req, num_tokens=32
+    )
+    assert resizes == [64 + 32]
+
+
+@pytest.mark.parametrize("prompt_len", [50, 200])
+def test_resize_context_rejects_disagg_helix_request(prompt_len: int) -> None:
+    """A disagg helix request holds only this rank's slice of the prompt; a
+    rank-local target would under-size the global ledger. The guard keys on
+    disagg mode, so a slice that happens to equal the full prompt (a
+    single-block prompt on rank 0) is rejected too."""
+    req = _context_req(prompt_len=prompt_len, total_input_len_cp=200)
+    with pytest.raises(ValueError, match="disaggregated helix"):
+        KVCacheManagerV2.resize_context(
+            _context_resize_mgr(is_disagg=True, resizes=[]), req, num_tokens=32
         )
 
 

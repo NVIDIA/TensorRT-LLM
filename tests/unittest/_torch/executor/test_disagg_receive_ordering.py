@@ -42,6 +42,7 @@ def _coordinator(manager: Mock, receive: Mock) -> DisaggTransferCoordinator:
         request_and_receive_sync=receive,
         kv_transfer_timeout_ms=None,
     )
+    coordinator._dist = SimpleNamespace(cp_size=1)
     coordinator.reap_gen_receives = Mock()
     coordinator._check_transfer_errors = Mock()
     return coordinator

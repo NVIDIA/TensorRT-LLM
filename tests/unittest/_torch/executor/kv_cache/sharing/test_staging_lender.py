@@ -175,36 +175,49 @@ def test_recurrent_state_is_refused(kit, hybrid_manager):
     assert len(kit.retained()) == before, "a refused attach allocated staging"
 
 
-def sparse_layer(monkeypatch, index):
-    """Managers built from now on mark the buffers of their layer ``index`` sparse, which no model
-    here does: the runtime may then lock that layer group's read-only pages in host memory."""
+def sparse_layers(monkeypatch, indices):
+    """Managers built from now on give their layers ``indices`` sparse attention, which no model
+    here does: their K/V buffers become sparse, and each also carries the dense indexer buffer
+    that selects from them and the sparse cache it selects into. ``indices`` must cover whole
+    life cycles, as a model with sparse attention does; the runtime may then lock those layer
+    groups' read-only pages in host memory."""
     from dataclasses import replace
 
     from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, BufferConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+        AttentionLayerConfig,
+        BufferConfig,
+        SparseCacheConfig,
+    )
 
     build = KVCacheManagerV2._build_cache_config
 
-    def with_a_sparse_layer(self, config):
+    def with_sparse_layers(self, config):
         layers = list(config.layers)
-        layer = layers[index]
-        layers[index] = AttentionLayerConfig(
-            layer_id=layer.layer_id,
-            buffers=[
+        for index in indices:
+            layer = layers[index]
+            buffers = [
                 BufferConfig(b.role, b.size, b.tokens_per_block_override, is_sparse=True)
                 for b in layer.buffers
-            ],
-            sliding_window_size=layer.sliding_window_size,
-            num_sink_tokens=layer.num_sink_tokens,
-        )
+            ]
+            buffers.append(BufferConfig("indexer", layer.buffers[0].size))
+            layers[index] = AttentionLayerConfig(
+                layer_id=layer.layer_id,
+                buffers=buffers,
+                sliding_window_size=layer.sliding_window_size,
+                num_sink_tokens=layer.num_sink_tokens,
+                sparse_cache=SparseCacheConfig(
+                    num_selected_blocks=1, max_cached_units=2, unit_tokens=self.tokens_per_block
+                ),
+            )
         return build(self, replace(config, layers=layers))
 
-    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", with_a_sparse_layer)
+    monkeypatch.setattr(KVCacheManagerV2, "_build_cache_config", with_sparse_layers)
 
 
-# case: (manager keywords, the layer whose buffers are sparse); "later" puts them in a layer group
-# after a dense one
-SPARSE_CASES = {"first": ({}, 0), "later": ({"windows": [WINDOW, 256]}, 1)}
+# case: (manager keywords, the layers given sparse attention); "first" makes the only life cycle
+# sparse, "later" the one after a dense life cycle
+SPARSE_CASES = {"first": ({}, (0, 1)), "later": ({"windows": [WINDOW, 256]}, (1,))}
 
 
 @pytest.mark.parametrize("case", list(SPARSE_CASES))
@@ -213,8 +226,8 @@ def test_a_layer_group_of_sparse_buffers_is_refused(kit, host_tier_manager, monk
     names a host slot that staging would address as a device slot: the attach refuses such a
     manager, naming the group and keeping nothing, also where it follows a dense one. The runtime
     builds sparse buffers only with host memory as the cache level below the GPU, as here."""
-    keywords, index = SPARSE_CASES[case]
-    sparse_layer(monkeypatch, index)
+    keywords, indices = SPARSE_CASES[case]
+    sparse_layers(monkeypatch, indices)
     before = len(kit.retained())
     with host_tier_manager(**keywords) as mgr:
         layers = {int(layer.layer_id): layer for layer in mgr.impl.init_config.layers}

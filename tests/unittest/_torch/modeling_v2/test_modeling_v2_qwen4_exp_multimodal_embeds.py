@@ -5,7 +5,7 @@ carries and puts the rows back in prompt order; the tower itself runs a request'
 in calls of whole frames under a row ceiling.
 
 The tower is a stub whose rows name the item they came from, so the bookkeeping --
-modality dispatch, `mm_item_order`, the chunk slice, the frame grouping and the order of
+modality dispatch, item metadata, the chunk slice, the frame grouping and the order of
 the concatenated calls -- runs on the CPU without the vision ops or an engine.
 """
 
@@ -21,6 +21,11 @@ __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as M,
+)
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -77,7 +82,9 @@ def _params(image=None, video=None, order=None, runtime=None, mrope=True):
         data["image"] = _media(IMAGE, image)
     if video is not None:
         data["video"] = _media(VIDEO, video)
-    return SimpleNamespace(multimodal_data=data, mm_item_order=order, multimodal_runtime=runtime)
+    if order is not None:
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs=order)
+    return MultimodalParams(multimodal_data=data, multimodal_runtime=runtime)
 
 
 def _splice(tower, params, num_rows, padding=0):
@@ -101,7 +108,7 @@ def _splice(tower, params, num_rows, padding=0):
 
 
 def _item(modality, index):
-    return {"modality": modality, "index": index}
+    return modality, index
 
 
 # Two videos of 4 and 8 rows, two images of 4 and 1.
@@ -137,7 +144,7 @@ def test_a_mixed_request_is_reassembled_in_prompt_order():
 
 
 def test_a_mixed_request_needs_its_manifest():
-    with pytest.raises(AssertionError, match="needs mm_item_order"):
+    with pytest.raises(AssertionError, match="needs item metadata"):
         _splice(_Tower(), _params(image=IMAGES, video=VIDEOS), len(MIXED_ROWS))
 
 

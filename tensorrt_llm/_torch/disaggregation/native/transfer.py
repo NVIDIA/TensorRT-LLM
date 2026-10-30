@@ -130,6 +130,9 @@ class RecvReqInfo:
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
     bounce_dst_base: Optional[int] = None
+    # Context-first receivers send REQUEST_DATA only after the context phase
+    # produced the KV cache, so a TxSession must already exist (or have ended).
+    context_first: bool = False
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -145,6 +148,7 @@ class RecvReqInfo:
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
                 "bounce_dst_base": self.bounce_dst_base,
+                "context_first": self.context_first,
             }
         )
 
@@ -643,6 +647,11 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first entry that no TxSession claimed within the TTL never will
+        be (the session already ended, or the receiver names a request this rank
+        never had), so its receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
         with self._peer_requests_lock:
@@ -653,12 +662,32 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
+        orphaned_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
+                    orphaned_infos.extend(
+                        info for info in req_info_map.values() if info.context_first
+                    )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's task, so its RxSession fails through the
+        normal transfer-failure path. The sweep runs on the executor and listener
+        threads, so the message goes through a worker queue.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
@@ -2754,6 +2783,7 @@ class Receiver(ReceiverBase):
             dst_start_token=None,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
+            context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
         )
 
     @staticmethod

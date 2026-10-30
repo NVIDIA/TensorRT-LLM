@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -61,7 +61,7 @@ from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerCo
 
 
 @dataclass(frozen=True, kw_only=True)
-class EncoderConfigMixin:
+class EncoderConfig(RunnerConfig):
     """Encoder-specific fields shared by runner configuration types."""
 
     enable_autotuner: bool
@@ -94,7 +94,6 @@ class EncoderConfigMixin:
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
         is_encoder_decoder: bool,
     ) -> Self:
@@ -195,7 +194,6 @@ class EncoderConfigMixin:
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             cuda_graph_enabled=cuda_graph_enabled,
             cuda_graph_padding_enabled=enable_padding,
@@ -222,7 +220,7 @@ class EncoderConfigMixin:
 
 
 @dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderRunnerConfig(EncoderConfig):
     """Configuration for the EncoderOnly model runner."""
 
     @classmethod
@@ -238,7 +236,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
         max_beam_width: int,
         without_logits: bool,
         attention_backend: type[AttentionBackend],
-        attention_runtime_features: AttentionRuntimeFeatures,
         enable_autotuner: bool,
     ) -> Self:
         return super().create(
@@ -251,7 +248,6 @@ class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
             max_beam_width=max_beam_width,
             without_logits=without_logits,
             attention_backend=attention_backend,
-            attention_runtime_features=attention_runtime_features,
             enable_autotuner=enable_autotuner,
             is_encoder_decoder=False,
         )
@@ -276,17 +272,19 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        config: EncoderConfigMixin,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model = model
         self._mapping = mapping
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
-        self._config = cast(RunnerConfig, config)
+        self._attention_runtime_features = attention_runtime_features
+        self._config = config
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
 
@@ -304,7 +302,6 @@ class EncoderMixin:
                 max_cuda_graph_num_tokens=config.max_cuda_graph_num_tokens,
                 max_num_tokens=self._config.max_num_tokens,
                 max_seq_len=self._config.max_seq_len,
-                cuda_graph_mem_pool=None,
                 is_encoder_decoder=config.is_encoder_decoder,
                 use_fixed_sequence_slots=config.use_fixed_sequence_slots,
                 feature_shape=config.feature_shape,
@@ -349,7 +346,7 @@ class EncoderMixin:
             max_num_tokens=self._config.max_num_tokens,
             max_beam_width=self._config.max_beam_width,
             attention_backend=self._config.attention_backend,
-            attention_runtime_features=self._config.attention_runtime_features,
+            attention_runtime_features=self._attention_runtime_features,
             mapping=self._mapping,
             cache_indirection=cache_indirection,
             kv_cache_manager=None,
@@ -580,6 +577,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         model_caller: ModelCaller,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         self._model_caller = model_caller
         if config.is_encoder_decoder:
@@ -592,7 +590,12 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             use_cache_indirection=config.attention_backend.Metadata is TrtllmAttentionMetadata,
         )
         self._initialize_encoder(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
 
@@ -812,7 +815,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             return False
         return True
 
-    def prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
+    def _prepare_inputs(self, batch: PackedInputs) -> EncoderPreparedInputs:
         """Prepare a batch the caller already packed."""
         model_inputs = batch.model_inputs
         self._reject_unsupported_model_inputs(model_inputs)
@@ -1044,7 +1047,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
     ) -> dict[str, Any]:
         forward = partial(
             self._forward_step,
-            gather_ids=prepared.gather_ids,
             gather_context_logits=gather_context_logits,
         )
         graph_runner = self._encoder_cuda_graph_runner
@@ -1072,7 +1074,7 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         inputs: PackedInputs,
     ) -> dict[str, Any]:
         """Execute packed inputs with their requested output options."""
-        prepared = self.prepare_inputs(inputs)
+        prepared = self._prepare_inputs(inputs)
         return self._execute_prepared(
             prepared,
             gather_context_logits=inputs.gather_context_logits,
@@ -1082,7 +1084,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         self,
         inputs: dict[str, Any],
         *,
-        gather_ids: torch.Tensor | None,
         gather_context_logits: bool,
     ) -> dict[str, Any]:
         metadata = inputs.get("attn_metadata")
@@ -1091,17 +1092,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
         outputs = self._model_caller(
             **inputs,
-            return_context_logits=(gather_ids is not None or gather_context_logits),
+            return_context_logits=gather_context_logits,
         )
         if self._config.without_logits:
             return outputs
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits")
-            if logits is None:
-                return outputs
-        else:
-            logits = outputs
-            outputs = {"logits": logits}
-        if gather_ids is not None:
-            outputs["logits"] = logits[gather_ids]
+        if not isinstance(outputs, dict):
+            outputs = {"logits": outputs}
         return outputs

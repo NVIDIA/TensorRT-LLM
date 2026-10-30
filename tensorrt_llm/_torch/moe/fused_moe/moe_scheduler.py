@@ -47,6 +47,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from tensorrt_llm._torch.modules.multi_stream_utils import do_multi_stream
 from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.route_capture import get_active_route_capture  # R3
 from tensorrt_llm._torch.utils import EventType, Fp4QuantizedTensor
@@ -257,6 +258,36 @@ class ExternalCommMoEScheduler(MoEScheduler):
         return isinstance(self.moe.comm, NVLinkOneSided)
 
     # ------------------------------------------------------------------
+    # Async input quantization
+    # ------------------------------------------------------------------
+    def _should_quantize_input_async(self, x: torch.Tensor) -> bool:
+        """Whether to fork the input quantization onto the backend's aux stream.
+
+        Backends providing ``quantize_input_async`` (CuteDSL NVFP4) can quantize
+        ``x`` on an aux stream so it overlaps routing (top-k) and the backend's
+        ``moe_sort`` on the main stream; at small decode batches those
+        latency-bound kernels otherwise serialize (~25 us per layer at batch 8
+        on GB300). The fork and join add stream switches, event record/wait and
+        ``record_stream`` calls on the host, so, like
+        ``maybe_execute_in_parallel``, it only runs under multi-stream (set by
+        the CUDA graph runner) or while a CUDA graph is being captured, where
+        the host work is not replayed. Eager forwards are host-bound and
+        quantize on the main stream.
+
+        Requires that nothing modifies ``x`` before quantization (no
+        ``apply_router_weight_on_input``) and that no comm strategy decides the
+        quantize/dispatch order.
+        """
+        moe = self.moe
+        return (
+            moe.comm is None
+            and not moe.apply_router_weight_on_input
+            and not isinstance(x, Fp4QuantizedTensor)
+            and hasattr(moe.backend, "quantize_input_async")
+            and (do_multi_stream() or torch.cuda.is_current_stream_capturing())
+        )
+
+    # ------------------------------------------------------------------
     # DeepGemm workspace allocation
     # ------------------------------------------------------------------
     def _prepare_workspace_deepgemm(
@@ -407,21 +438,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         # ========== Step 1: EPLB - Start wait GPU stage ==========
         moe._load_balancer_start_wait_gpu_stage(is_first_call)
 
-        # Async input quantization (backends providing quantize_input_async,
-        # currently CuteDSL NVFP4): quantize x on the MoE aux stream now so it
-        # overlaps routing (top-k) and the backend's moe_sort on the main
-        # stream -- at decode batch 8 these three latency-bound kernels
-        # otherwise serialize to ~25 us per layer. Only when nothing modifies
-        # x before quantization (no apply_router_weight_on_input) and no comm
-        # strategy decides the quantize/dispatch order.
+        # Async input quantization: see _should_quantize_input_async.
         async_quant = None
         x_ready_event = None
-        if (
-            moe.comm is None
-            and not moe.apply_router_weight_on_input
-            and not isinstance(x, Fp4QuantizedTensor)
-            and hasattr(moe.backend, "quantize_input_async")
-        ):
+        if self._should_quantize_input_async(x):
             # The quantization stream joins input_ready_event itself.
             async_quant = moe.backend.quantize_input_async(x, input_ready_event)
             input_ready_event = None
@@ -832,7 +852,12 @@ class ExternalCommMoEScheduler(MoEScheduler):
             else [None] * num_chunks
         )
 
-        use_multi_stream = not moe.enable_alltoall and moe.aux_stream is not None
+        # A backend that reuses its buffers across calls can have only one chunk
+        # in flight, and each chunk's output is gone once the next one runs.
+        reuses_buffers = moe.backend.input_requirement.run_moe_reuses_buffers
+        use_multi_stream = (
+            not moe.enable_alltoall and moe.aux_stream is not None and not reuses_buffers
+        )
 
         # ========== Setup auxiliary stream ==========
         if use_multi_stream:
@@ -955,7 +980,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             row_offset += chunk_size_list[idx_chunk]
             if chunked_used[idx_chunk]:
-                outputs_list.append(outputs)
+                # The last chunk needs no copy: no further ``run_moe`` runs
+                # before the ``torch.cat`` below, which copies it anyway.
+                needs_copy = reuses_buffers and idx_chunk != num_chunks - 1
+                outputs_list.append(outputs.clone() if needs_copy else outputs)
 
         # ========== Wait for auxiliary stream to complete ==========
         if use_multi_stream:
@@ -1122,6 +1150,8 @@ class FusedCommMoEScheduler(MoEScheduler):
        so peers can cross the in-kernel NVLink barrier.
     8. No external Communication.dispatch / Communication.combine.
     9. No multi-stream chunk overlap.
+    10. Reject a backend declaring ``input_requirement.run_moe_reuses_buffers``:
+        chunk outputs are kept, never copied, so such a backend would alias.
 
     ``repeat_idx`` advancement is done by ``ConfigurableMoE.forward_impl``
     after this scheduler returns. The scheduler must not rotate
@@ -1166,6 +1196,19 @@ class FusedCommMoEScheduler(MoEScheduler):
             raise NotImplementedError(
                 "Fused-comm MoE expects BF16 activation; "
                 "quantization happens in backend.quantize_input."
+            )
+
+        # ``run_moe_reuses_buffers`` is an external-comm promise today: this
+        # scheduler already runs its chunks on one stream, but ``_run_chunks``
+        # keeps the tensor each chunk returned, so a backend whose next call
+        # overwrites it would hand ``torch.cat`` the same storage num_chunks
+        # times -- the last chunk's rows, silently, for every chunk. Refuse the
+        # combination rather than honour half of it.
+        if self.moe.backend.input_requirement.run_moe_reuses_buffers:
+            raise NotImplementedError(
+                f"{type(self.moe.backend).__name__} declares "
+                "run_moe_reuses_buffers; the fused-comm (MegaMoE) scheduler "
+                "does not copy chunk outputs and cannot drive it."
             )
 
         x_real, rl_real, input_ids_real, real_all_rank_num_tokens, ep_rank, had_meta = (

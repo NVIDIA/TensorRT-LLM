@@ -9,14 +9,21 @@ host memory and that store, gathering a row's spans into one object and scatteri
 and keeps a trailer beside each object that it verifies on every get, the way a real store checks
 sizes and checksums natively.
 
-In automatic mode an operation completes inside ``put``/``get``, like a blocking SDK. In controlled
-mode the test releases three things separately per operation: the transfer, the logical results
-and the end of access, so it can stage partial arrival, a result before or after access end, a late
-write after a fault, an operation whose end can never be proven, and registration failures.
+In automatic mode ``put``/``get`` run the operation before returning; in background mode they
+start a thread of the driver's own to run it. Neither keeps the protocol's rule that ``put`` and
+``get`` only record and queue the work, which a test can afford, and automatic mode waits on the
+store, so over a store a test holds, use background mode. In controlled mode the test releases
+three things separately per operation: the transfer, the logical results and the end of access,
+so it can stage partial arrival, a result before or after access end, a late write after a fault,
+an operation whose end can never be proven, and registration failures.
 
 Transfers copy and call the store outside the driver's lock, so queries never wait on the store
 and one blocked operation never delays another. Each submission check is its own method, so a
 test can subclass the driver and disable exactly one rule.
+
+``TogetherMemoryDriver`` is the same driver registering regions in batches, for the optional
+``RegistersRegionsTogether`` protocol; its single-region ``register`` and ``unregister`` are
+rejected, as for a store that opens its client with the memory it will use.
 """
 
 from __future__ import annotations
@@ -26,18 +33,21 @@ import enum
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal, NoReturn
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 from tensorrt_llm._torch.disaggregation.blob.store import (
     DriverCapabilities,
     DriverRejected,
     Hint,
+    OnChange,
     OpHandle,
     ProbeStatus,
     RegionHandle,
     RegionLayout,
+    RegionSpec,
     RegistrationError,
+    RowBatch,
     RowIO,
     RowResult,
     RowStatus,
@@ -205,6 +215,7 @@ class MemoryOp:
     kind: Kind
     rows: list[_Row]
     hint: Hint = None
+    on_change: OnChange | None = None
     access_ended: bool = False
     unprovable: bool = False
 
@@ -233,7 +244,7 @@ def _scatter(spans: Sequence[Span], payload: bytes) -> None:
 
 
 class MemoryDriver:
-    """A ``StoreDriver`` over a ``MemoryStore``; see the module docstring for the two modes."""
+    """A ``StoreDriver`` over a ``MemoryStore``; see the module docstring for its three modes."""
 
     def __init__(
         self,
@@ -270,19 +281,8 @@ class MemoryDriver:
         return self._capabilities
 
     def register(self, address: int, nbytes: int, layout: RegionLayout) -> _Registration:
-        try:
-            span = Span(address, nbytes)
-        except ValueError as error:
-            raise DriverRejected(str(error)) from None
-        if layout.nbytes > nbytes:
-            raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
-        self._check_region_kind(layout)
         with self._lock:
-            self._require_accepting()
-            for other in self._registrations:
-                if other.live and other.span.overlaps(span):
-                    raise DriverRejected(f"region {span} overlaps a live registration {other.span}")
-            registration = _Registration(span, layout)
+            registration = _Registration(self._validate_region(address, nbytes, layout, ()), layout)
             if self._register_failure is not None:
                 reason, escaped = self._register_failure
                 self._register_failure = None
@@ -305,11 +305,13 @@ class MemoryDriver:
                 raise StoreError(reason)
             registration.live = False
 
-    def put(self, rows: Sequence[RowIO]) -> MemoryOp:
-        return self._submit("put", rows)
+    def put(self, rows: RowBatch, *, on_change: OnChange | None = None) -> MemoryOp:
+        return self._submit("put", rows, on_change=on_change)
 
-    def get(self, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
-        return self._submit("get", rows, hint)
+    def get(
+        self, rows: RowBatch, hint: Hint = None, *, on_change: OnChange | None = None
+    ) -> MemoryOp:
+        return self._submit("get", rows, hint, on_change)
 
     def poll(self, op: OpHandle) -> tuple[RowResult, ...]:
         with self._lock:
@@ -324,9 +326,15 @@ class MemoryDriver:
             return self._op(op).unprovable
 
     def cancel(self, op: OpHandle) -> None:
+        """Cancels the rows not started yet, and tells ``on_change`` only when that changed one."""
         with self._lock:
+            op = self._op(op)
+            before = ([row.published for row in op.rows], op.access_ended)
             if self._cancel_effective:
-                self._cancel_unstarted(self._op(op))
+                self._cancel_unstarted(op)
+            changed = ([row.published for row in op.rows], op.access_ended) != before
+        if changed:
+            self._call_on_change(op)
 
     def probe(
         self, keys: Sequence[str], budget_s: float, hint: Hint = None
@@ -371,8 +379,12 @@ class MemoryDriver:
         with self._lock:
             self._require_not_closed()
             self._start_draining()
-            for op in self._ops:
+            ops_to_cancel = [op for op in self._ops if any(_cancellable(row) for row in op.rows)]
+            for op in ops_to_cancel:
                 self._cancel_unstarted(op)
+        for op in ops_to_cancel:  # the operations this drain changed; outside the lock
+            self._call_on_change(op)
+        with self._lock:
             self._lock.wait_for(self._drain_can_return, timeout=budget_s)
             return self._quiet()
 
@@ -420,6 +432,7 @@ class MemoryDriver:
                 if row.staged is None:
                     raise RuntimeError(f"row {index} has no staged result to publish")
                 row.published, row.staged = row.staged, None
+        self._call_on_change(op)
 
     def complete(self, op: MemoryOp, rows: Iterable[int] | None = None) -> None:
         """Transfer ``rows`` and publish their results, leaving access open."""
@@ -437,6 +450,7 @@ class MemoryDriver:
                 if row.started or row.published.concluded:
                     raise RuntimeError(f"row {index} was already taken or decided")
                 row.published = faulted(reason)
+        self._call_on_change(op)
 
     def write_late(self, op: MemoryOp, index: int, data: bytes) -> None:
         """Write into a faulted get row's spans after its result, as a transfer that kept going
@@ -460,6 +474,7 @@ class MemoryDriver:
                 raise RuntimeError("a transfer is still in progress")
             op.access_ended = True
             self._lock.notify_all()
+        self._call_on_change(op)
 
     def mark_unprovable(self, op: MemoryOp) -> None:
         """Declare that the driver will never learn when this operation's access ends, as after a
@@ -468,6 +483,7 @@ class MemoryDriver:
             self._require_open(op)
             op.unprovable = True
             self._lock.notify_all()
+        self._call_on_change(op)
 
     def set_cancel_effective(self, effective: bool) -> None:
         self._cancel_effective = effective
@@ -518,16 +534,9 @@ class MemoryDriver:
             raise DriverRejected("this driver reads no hints")
 
     def _check_row_limit(self, rows: Sequence[RowIO]) -> None:
-        if not rows:
-            raise DriverRejected("an operation needs at least one row")
         limit = self._capabilities.max_rows_per_op
         if limit is not None and len(rows) > limit:
             raise DriverRejected(f"{len(rows)} rows exceed the limit of {limit} per operation")
-
-    def _check_unique_keys(self, rows: Sequence[RowIO]) -> None:
-        keys = [io.key for io in rows]
-        if len(set(keys)) != len(keys):
-            raise DriverRejected("a key appears more than once in the operation")
 
     def _check_span_count(self, rows: Sequence[RowIO]) -> None:
         if not self._capabilities.multi_span and any(len(io.spans) > 1 for io in rows):
@@ -548,11 +557,39 @@ class MemoryDriver:
         if layout.memory_kind is MemoryKind.DEVICE and not self._capabilities.device_memory:
             raise DriverRejected("this driver registers host memory only")
 
+    def _validate_region(
+        self, address: int, nbytes: int, layout: RegionLayout, taken: Sequence[Span]
+    ) -> Span:
+        """The span this driver would register for the region, or DriverRejected. ``taken`` are
+        the spans of the same batch, which count as live registrations."""
+        try:
+            span = Span(address, nbytes)
+        except ValueError as error:
+            raise DriverRejected(str(error)) from None
+        if layout.nbytes > nbytes:
+            raise DriverRejected(f"layout needs {layout.nbytes} bytes, region has {nbytes}")
+        self._check_region_kind(layout)
+        self._require_accepting()
+        for other in self._registrations:
+            if other.live and other.span.overlaps(span):
+                raise DriverRejected(f"region {span} overlaps a live registration {other.span}")
+        for other_span in taken:
+            if other_span.overlaps(span):
+                raise DriverRejected(f"region {span} overlaps another of the batch {other_span}")
+        return span
+
     def _check_registered(self, rows: Sequence[RowIO]) -> None:
         for io in rows:
             for span in io.spans:
                 if not self._registered(span):
                     raise DriverRejected(f"{span} is outside every live registration")
+
+    def _check_extents(self, rows: Sequence[RowIO]) -> None:
+        """A ``RowBatch`` promises each extent inside one registered region, which a driver may
+        check in place of every row; rows given as a plain sequence carry no extent."""
+        for extent in getattr(rows, "extents", ()):
+            if not self._registered(extent):
+                raise DriverRejected(f"extent {extent} is outside every live registration")
 
     def _check_region_idle(self, registration: _Registration) -> None:
         busy = sum(
@@ -595,18 +632,24 @@ class MemoryDriver:
 
     # Internals.
 
-    def _submit(self, kind: Kind, rows: Sequence[RowIO], hint: Hint = None) -> MemoryOp:
+    def _submit(
+        self,
+        kind: Kind,
+        rows: Sequence[RowIO],
+        hint: Hint = None,
+        on_change: OnChange | None = None,
+    ) -> MemoryOp:
         with self._lock:
             self._require_accepting()
             self._check_direction(kind)
             self._check_not_draining()
             self._check_hint(hint)
             self._check_row_limit(rows)
-            self._check_unique_keys(rows)
             self._check_span_count(rows)
             self._check_disjoint(kind, rows)
             self._check_registered(rows)
-            op = MemoryOp(kind, [_Row(io) for io in rows], hint)
+            self._check_extents(rows)
+            op = MemoryOp(kind, [_Row(io) for io in rows], hint, on_change)
             self._ops.append(op)
             if hint is not None:
                 self.hints_seen.append(hint)
@@ -627,12 +670,17 @@ class MemoryDriver:
                     self._workers.append(_Worker(thread, finished))
         if not self.background and not self.controlled:
             self._run(op, None)
+        elif op.access_ended:  # no worker thread: it concluded at once
+            self._call_on_change(op)
         return op
 
     def _run(self, op: MemoryOp, finished: threading.Event | None) -> None:
         try:
             self._before_execute(op)
             self._execute(op)
+            # Told before the worker counts as finished: a drain that returned True earlier would
+            # let the owner close the driver while the callback still queries it.
+            self._call_on_change(op)
         finally:
             if finished is not None:
                 finished.set()
@@ -703,6 +751,11 @@ class MemoryDriver:
         """Why the stored object may not be delivered as ``io``, or ``None``."""
         return check_trailer(stored.trailer, io.key.encode(), io.nbytes, stored.payload)
 
+    def _call_on_change(self, op: MemoryOp) -> None:
+        """Outside the lock, as ``OnChange`` asks."""
+        if op.on_change is not None:
+            op.on_change(op)
+
     def _fail_unstarted(self, op: MemoryOp, reason: str) -> None:
         """Every row FAULT and access over, for an operation none of whose rows started."""
         for row in op.rows:
@@ -712,7 +765,7 @@ class MemoryDriver:
 
     def _cancel_unstarted(self, op: MemoryOp) -> None:
         for row in op.rows:
-            if not row.started and not row.published.concluded:
+            if _cancellable(row):
                 row.published = _CANCELLED
         self._settle_untouched(op)
 
@@ -755,3 +808,95 @@ class MemoryDriver:
     @staticmethod
     def _indexes(op: MemoryOp, rows: Iterable[int] | None) -> list[int]:
         return list(range(len(op.rows))) if rows is None else list(rows)
+
+
+def _cancellable(row: _Row) -> bool:
+    """Neither taken by a transfer nor decided: a cancel or a drain may still cancel it."""
+    return not row.started and not row.published.concluded
+
+
+@dataclass(eq=False)
+class _Batch:
+    """The handle of one ``register_regions`` call: its registrations, revoked together."""
+
+    registrations: list[_Registration]
+    live: bool = True
+
+
+class TogetherMemoryDriver(MemoryDriver):
+    """The in-memory driver as a ``RegistersRegionsTogether``: regions come and go in batches,
+    one handle per ``register_regions`` call, and the single-region ``register`` and
+    ``unregister`` are rejected. Everything else is the in-memory driver's, controls included."""
+
+    def __init__(self, store: MemoryStore, **options: Any) -> None:
+        super().__init__(store, **options)
+        self._batches: list[_Batch] = []
+        self._batch_failure: tuple[str, bool] | None = None
+        self._revocation_failure: str | None = None
+
+    def register(self, address: int, nbytes: int, layout: RegionLayout) -> NoReturn:
+        raise DriverRejected("this driver registers regions together; use register_regions")
+
+    def unregister(self, handle: RegionHandle) -> NoReturn:
+        raise DriverRejected("this driver revokes regions together; use unregister_regions")
+
+    def register_regions(self, specs: Sequence[RegionSpec]) -> _Batch:
+        if not specs:
+            raise DriverRejected("a batch registers at least one region")
+        with self._lock:
+            spans: list[Span] = []
+            for spec in specs:  # all checked before any is kept: a rejection escapes nothing
+                spans.append(self._validate_region(spec.address, spec.nbytes, spec.layout, spans))
+            batch = _Batch(
+                [_Registration(span, spec.layout) for span, spec in zip(spans, specs, strict=True)]
+            )
+            if self._batch_failure is not None:
+                reason, escaped = self._batch_failure
+                self._batch_failure = None
+                if not escaped:
+                    raise RegistrationError(reason)
+                self._keep(batch)  # the store kept the batch before it answered
+                raise RegistrationError(reason, batch)
+            self._keep(batch)
+            return batch
+
+    def unregister_regions(self, handle: RegionHandle) -> None:
+        with self._lock:
+            batch = self._batch(handle)
+            if not batch.live:
+                return
+            for registration in batch.registrations:
+                self._check_region_idle(registration)
+            if self._revocation_failure is not None:
+                reason, self._revocation_failure = self._revocation_failure, None
+                raise StoreError(reason)
+            for registration in batch.registrations:
+                registration.live = False
+            batch.live = False
+
+    # Controls.
+
+    def fail_next_register_regions(self, reason: str, *, escaped: bool) -> None:
+        """Make the next ``register_regions`` raise; with ``escaped`` the store keeps the batch
+        anyway and the error carries its handle."""
+        self._batch_failure = (reason, escaped)
+
+    def fail_next_unregister_regions(self, reason: str) -> None:
+        """Make the next ``unregister_regions`` of a live batch raise, the batch staying live."""
+        self._revocation_failure = reason
+
+    def live_batches(self) -> list[_Batch]:
+        with self._lock:
+            return [batch for batch in self._batches if batch.live]
+
+    # Internals.
+
+    def _keep(self, batch: _Batch) -> None:
+        self._registrations.extend(batch.registrations)
+        self._batches.append(batch)
+
+    def _batch(self, handle: RegionHandle) -> _Batch:
+        self._require_not_closed()
+        if not isinstance(handle, _Batch) or handle not in self._batches:
+            raise ValueError("handle does not belong to this driver")
+        return handle

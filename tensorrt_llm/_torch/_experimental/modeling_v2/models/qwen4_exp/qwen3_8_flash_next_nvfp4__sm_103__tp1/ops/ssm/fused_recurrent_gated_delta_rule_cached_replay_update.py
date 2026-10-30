@@ -194,7 +194,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
       history);
     * after every step, before the next: with work items,
       `commit_gdn_cached_replay_history_layers` over every local GDN layer; then the
-      advance (`_advance_replay_state` in `pyexecutor/kv_cache/mamba_cache_manager.py`)
+      advance (`_advance_replay_state` in `modules/fla/cache_manager.py`)
       with the accepted counts including the bonus token. Advancing as if every
       draft were accepted is silent at the op and wrong from the next step on;
     * the conv state is not this op's: under replay the conv still writes its

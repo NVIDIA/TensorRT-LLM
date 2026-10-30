@@ -47,6 +47,7 @@ def _make_worker(backend="pytorch", world_size=1, sleep_config=_SLEEP_CONFIG_DEF
     from tensorrt_llm.executor.base_worker import BaseWorker
 
     w = object.__new__(BaseWorker)
+    w.doing_shutdown = True
     w._backend = backend
     w.llm_args = SimpleNamespace(
         backend=backend,
@@ -145,6 +146,8 @@ def _make_proxy(cls_name, model_world_size=1, rpc_client=None):
     else:
         from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy as Cls
     p = object.__new__(Cls)
+    if cls_name == "ipc":
+        p.workers_started = False
     p.model_world_size = model_world_size
     p.rpc_client = rpc_client
     return p
@@ -335,6 +338,7 @@ class TestMultiRankSleepWakeupLock:
         from tensorrt_llm.executor.base_worker import BaseWorker
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w._backend = "pytorch"
         w.rank = 0
         w.llm_args = SimpleNamespace(
@@ -510,6 +514,7 @@ def _make_proto_worker(recv_responses, world_size=3):
     responses = list(recv_responses)
 
     w = object.__new__(BaseWorker)
+    w.doing_shutdown = True
     w._backend = "pytorch"
     w.rank = 0
     w.llm_args = SimpleNamespace(
@@ -765,6 +770,7 @@ class TestMultiRankSendFailureRecovery:
             yield None
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w._backend = "pytorch"
         w.rank = 0
         w.llm_args = SimpleNamespace(
@@ -808,6 +814,7 @@ class TestMultiRankSendFailureRecovery:
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w.rank = 1
 
         with pytest.raises(RuntimeError, match="rank 0"):
@@ -819,6 +826,7 @@ class TestMultiRankSendFailureRecovery:
         from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w.rank = 0
         w.engine = SimpleNamespace(_sleep_wakeup_comm=None)
 
@@ -850,6 +858,7 @@ class TestMultiRankSendFailureRecovery:
             yield None
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w._backend = "pytorch"
         w.rank = 0
         w.llm_args = SimpleNamespace(
@@ -985,6 +994,7 @@ class TestMultiRankSendFailureRecovery:
             yield None
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w._backend = "pytorch"
         w.rank = 0
         w.llm_args = SimpleNamespace(
@@ -1064,6 +1074,7 @@ class TestMultiRankSendFailureRecovery:
             yield None
 
         worker = object.__new__(BaseWorker)
+        worker.doing_shutdown = True
         worker._backend = "pytorch"
         worker.rank = 0
         worker.llm_args = SimpleNamespace(
@@ -1136,6 +1147,7 @@ class TestMultiRankSendFailureRecovery:
             yield None
 
         worker = object.__new__(BaseWorker)
+        worker.doing_shutdown = True
         worker._backend = "pytorch"
         worker.rank = 0
         worker.llm_args = SimpleNamespace(
@@ -1207,6 +1219,7 @@ class TestMultiRankSendFailureRecovery:
         from tensorrt_llm.executor.base_worker import BaseWorker
 
         worker = object.__new__(BaseWorker)
+        worker.doing_shutdown = True
         worker._fatal_error = None
         worker.engine = SimpleNamespace(
             _fatal_error=None,
@@ -1474,7 +1487,9 @@ class TestListenerAbortAndShutdown:
         executor = object.__new__(PyExecutor)
         executor._sleep_wakeup_comm = FakeComm()
         executor.device_id = 0
-        executor.dist = SimpleNamespace(rank=1)
+        executor.dist = SimpleNamespace(rank=1, pp_size=1)
+        executor.disable_overlap_scheduler = True
+        executor.enable_attention_dp = False
         executor.control_request_barrier = threading.Event()
         executor.control_action_done = threading.Event()
         executor.control_requests = [RequestQueueItem(id=CONTROL_REQUEST_ID, control_id=op_id)]
@@ -1674,6 +1689,7 @@ class TestSingleRankLockAcquired:
         from tensorrt_llm.executor.base_worker import BaseWorker
 
         w = object.__new__(BaseWorker)
+        w.doing_shutdown = True
         w._backend = "pytorch"
         w.llm_args = SimpleNamespace(
             backend="pytorch",

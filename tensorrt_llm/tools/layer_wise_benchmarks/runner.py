@@ -419,6 +419,16 @@ class Runner:
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
             load_format=load_format,
+            # Must agree with `mapping`, which the loader takes separately:
+            # to_mapping() derives world_size from tp*pp*cp, so the 1-GPU defaults
+            # reject every rank above 0.
+            tensor_parallel_size=mapping.tp_size,
+            pipeline_parallel_size=mapping.pp_size,
+            context_parallel_size=mapping.cp_size,
+            moe_expert_parallel_size=mapping.moe_ep_size,
+            moe_cluster_parallel_size=mapping.moe_cluster_size,
+            enable_attention_dp=mapping.enable_attention_dp,
+            gpus_per_node=mapping.gpus_per_node,
             # `ModelLoader(spec_config=...)` below is what reaches
             # `model_config.spec_config`; this keeps `llm_args` consistent with it.
             **({"speculative_config": spec_config} if spec_config is not None else {}),
@@ -434,20 +444,26 @@ class Runner:
                 dtype=kv_cache_dtype, mamba_ssm_cache_dtype=mamba_ssm_cache_dtype
             ),
         )
-        model_loader = ModelLoader(
-            llm_args=llm_args,
-            mapping=mapping,
-            spec_config=spec_config,
-            sparse_attention_config=None,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-        )
-
         with (
             self.scaled_from_ctx(scaled_from, mapping),
             self.vision_config_ctx(vision_config),
             self.skip_unused_layers_ctx(layer_indices),
         ):
+            # Serving applies these in py_executor_creator; the harness builds
+            # llm_args by hand, so without this every model default is off here
+            # only. Resolved inside the config contexts so the defaults come from
+            # the same config (text-only, scaled) that the model loads with.
+            llm_args = ModelLoader.load_config_and_apply_defaults(
+                pretrained_model_name_or_path, llm_args, checkpoint_loader
+            )
+            model_loader = ModelLoader(
+                llm_args=llm_args,
+                mapping=mapping,
+                spec_config=spec_config,
+                sparse_attention_config=None,
+                max_num_tokens=max_num_tokens,
+                max_seq_len=max_seq_len,
+            )
             model, _ = model_loader.load(
                 checkpoint_dir=pretrained_model_name_or_path, checkpoint_loader=checkpoint_loader
             )
