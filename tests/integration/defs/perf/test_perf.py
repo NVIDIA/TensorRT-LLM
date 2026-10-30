@@ -136,6 +136,7 @@ SPEC_DEC_REAL_DATASET_MODELS = {
 # benchmark client commands and fixed sequence-length inference: forcing
 # generation past EOS produces unstable acceptance rates for spec-dec.
 SPEC_DEC_MODELS = {
+    "glm_5.3_flash_fp8_mtp",
     "deepseek_v4_pro_base_fp8",
     *QWEN38_MTP_MODELS,
     "qwen3_4b_eagle3",
@@ -1582,6 +1583,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 server_timeout = 1800
             elif self._config.model_name == "minimax_m3_fp4":
                 # Cold MSA JIT compilation can exceed the default 10 minutes.
+                server_timeout = 1800
+            elif self._config.model_name == "glm_5.3_fp8":
+                # Allow time for checkpoint loading and cold executor warmup.
                 server_timeout = 1800
             else:
                 server_timeout = 600

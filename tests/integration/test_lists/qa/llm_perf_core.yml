@@ -154,6 +154,9 @@ llm_perf_core:
   tests:
   # Upper bound is 10.7 so Rubin shares this set: a VR200 NVL72 node exposes 4 GPUs,
   # the same shape these cases are sized for, so it runs them rather than a copy.
+  # GLM-5.3-Flash FP8, TP4/EP4, BF16 KV cache, TRTLLM MoE, MTP3; honor EOS.
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8_mtp-serve-pytorch-streaming-float8-maxbs:64-maxnt:16384-kv_frac:0.5-input_output_len:1024,1024-reqs:320-con:64-ep:4-tp:4-gpus:4] TIMEOUT(120)
   #qwen3.5_27b (dense BF16 52G, 1-GPU): maxbs 512 mamba states need >95G
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:128,128]
   - perf/test_perf.py::test_perf[qwen3.5_27b-bench-pytorch-bfloat16-input_output_len:500,2000]
@@ -265,6 +268,9 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120) #min_latency
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  # GLM-5.3 FP8, TP8/EP8, FP8 KV cache, DEEPGEMM; no MTP.
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:5-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-serve-pytorch-streaming-float8-maxbs:128-maxnt:8192-kv_frac:0.75-input_output_len:1024,1024-reqs:320-con:64-ep:8-tp:8-gpus:8] TIMEOUT(120)
   #glm_5_fp8 (MoE FP8 708G, 8-GPU ep=8)
   - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
