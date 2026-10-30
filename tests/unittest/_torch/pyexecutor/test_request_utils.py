@@ -451,6 +451,25 @@ def test_child_factory_copies_processor_list_and_preserves_callables(processor_c
     assert len(sibling_processors) == processor_count
 
 
+@pytest.mark.parametrize("apply_batched", [False, True])
+def test_child_factory_copies_the_batched_logits_processor_flag(apply_batched) -> None:
+    parent = LlmRequest(
+        request_id=42,
+        input_tokens=[1, 2, 3],
+        max_new_tokens=10,
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=3),
+        is_streaming=False,
+        py_apply_batched_logits_processor=apply_batched,
+    )
+    parent.create_child_request(43)
+    parent.create_child_request(44)
+
+    assert [child.py_apply_batched_logits_processor for child in parent.child_requests] == [
+        apply_batched,
+        apply_batched,
+    ]
+
+
 @pytest.mark.parametrize("runtime_field", ["py_mm_encoder_state", "py_mm_encoder_event"])
 def test_child_factory_rejects_multimodal_encoder_ownership(runtime_field) -> None:
     parent = LlmRequest(
@@ -993,6 +1012,24 @@ def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
     kind, payload = dist.calls[0]
     assert kind == "broadcast_or_none"
     assert payload == (items, py_request_objects)
+
+
+def test_py_objects_carry_the_batched_logits_processor_flag():
+    # The flag is only set on requests that opted in, so only those cross the
+    # pipeline stages with it.
+    broadcaster = RequestBroadcaster(_SingleRoundDist(rank=0), MagicMock())
+    items = [_make_broadcast_item(1), _make_broadcast_item(2)]
+    items[1].request.py_apply_batched_logits_processor = True
+
+    py_request_objects = broadcaster._collect_py_objects(items)
+
+    assert ("py_apply_batched_logits_processor", {2: True}) in py_request_objects
+    # Receiving ranks rebuild the requests without the flag; attaching the
+    # broadcast objects must restore it on request 2 only.
+    received = [_make_broadcast_item(1), _make_broadcast_item(2)]
+    attach_py_objects_to_requests(received, py_request_objects)
+    assert not hasattr(received[0].request, "py_apply_batched_logits_processor")
+    assert received[1].request.py_apply_batched_logits_processor is True
 
 
 def test_single_round_non_root_receives_payload_or_nothing():

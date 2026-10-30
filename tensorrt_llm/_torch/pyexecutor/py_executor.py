@@ -758,6 +758,20 @@ class PyExecutor:
                                   if model_engine.is_spec_decode else 0)
         self.llm_args = self.model_engine.llm_args
         self._kv_connector_config = self.llm_args.kv_connector_config
+        # LLM(batched_logits_processor=...) is called once per step by the
+        # engine's logits post-processor walk, for the requests that opted in
+        # with SamplingParams.apply_batched_logits_processor.
+        batched_logits_processor = self.llm_args.batched_logits_processor
+        if batched_logits_processor is not None:
+            # Fail at construction rather than serve requests that asked for
+            # processing nothing would run.
+            if not hasattr(model_engine, "register_batched_logits_processor"):
+                raise ValueError(
+                    "LLM(batched_logits_processor=...) is not supported by "
+                    f"{type(model_engine).__name__}: it has no logits "
+                    "post-processor walk to call it from.")
+            model_engine.register_batched_logits_processor(
+                batched_logits_processor)
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log

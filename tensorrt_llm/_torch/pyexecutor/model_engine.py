@@ -895,6 +895,16 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             self._runner.start_beam_histories_callable = callable
 
+    def register_batched_logits_processor(self, processor: Callable | None) -> None:
+        """Register LLM(batched_logits_processor=...) with the post-processor walk."""
+        if not isinstance(self._runner, DecoderRunner):
+            raise ValueError(
+                "LLM(batched_logits_processor=...) is not supported by "
+                f"{type(self._runner).__name__}: it has no logits "
+                "post-processor walk to call it from."
+            )
+        self._runner.batched_logits_processor = processor
+
     def register_sample_type_resolver(
         self, resolver: Callable | None, stage: Callable | None = None
     ) -> None:

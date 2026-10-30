@@ -410,3 +410,34 @@ llm.generate(["Hello, my name is"], sampling_params)
 ```
 
 You can find a more detailed example on logits processors [here](source:examples/llm-api/llm_logits_processor.py).
+
+### Batched logits processor
+
+A per-request logits processor is called once per request on every decoding step. When many requests share the same processing, pass one [`BatchedLogitsProcessor`](source:tensorrt_llm/sampling_params.py) to the `LLM` instead and opt requests in with `apply_batched_logits_processor=True`. It is then called once per step with the logits, token ids, request ids and client ids of every scheduled request that opted in, after each of those requests' own `logits_processor`(s) have run. Each entry of `logits` is that request's rows, shaped `[beam_width, 1, vocab_size]`, and must be modified in place.
+
+```python
+from typing import List, Optional
+
+import torch
+
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.sampling_params import BatchedLogitsProcessor
+
+class MyBatchedLogitsProcessor(BatchedLogitsProcessor):
+    def __call__(self,
+        req_ids: List[int],
+        logits: List[torch.Tensor],
+        token_ids: List[List[List[int]]],
+        stream_ptr: Optional[int],
+        client_ids: List[Optional[int]]
+    ) -> None:
+        for rows in logits:
+            rows *= rows
+
+llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
+          batched_logits_processor=MyBatchedLogitsProcessor())
+sampling_params = SamplingParams(apply_batched_logits_processor=True)
+llm.generate(["Hello, my name is"], sampling_params)
+```
+
+Like a per-request processor, the batched one runs where the model runs, which may be a different process from the caller: it must be picklable, and state it keeps is not shared with the calling process. Also like a per-request processor, under a one-model speculative decoding worker that keeps its logits vocabulary-sharded it is handed a gathered copy after acceptance has already run, so its edits do not reach the sampled tokens there.

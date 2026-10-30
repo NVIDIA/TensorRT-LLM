@@ -54,6 +54,7 @@ from tensorrt_llm._torch.utils import (
 )
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ...lora import LoraParamBuilder, make_cuda_graph_lora_manager
@@ -193,6 +194,11 @@ class DecoderRunner(ScheduledModelRunner):
         # post-processors read the result instead of the per-slot token lists
         # (see _start_beam_histories). Left None when the sampler has none.
         self.start_beam_histories_callable = None
+        # LLM(batched_logits_processor=...), registered by PyExecutor. Called
+        # once per step with the logits of every scheduled request that set
+        # SamplingParams.apply_batched_logits_processor, after the request's
+        # own processors (see _execute_logit_post_processors).
+        self.batched_logits_processor = None
         # Stages (or clears) in-graph sampling state once the batch is settled.
         self._stage_in_graph_sampling = None
         # Set by warmup: whether a forward is the TRTLLM-Gen FMHA JIT warmup,
@@ -811,13 +817,9 @@ class DecoderRunner(ScheduledModelRunner):
         return outputs
 
     @staticmethod
-    def _apply_logits_processors(
-        request, logits_processors, logits_tensor, beam_width, token_ids, logits_row_offset
-    ) -> None:
-        logits_rows = logits_tensor[logits_row_offset : logits_row_offset + beam_width]
-        # Reshape to align w/ the shape used in the TRT backend,
-        # so the same logit processors can be used across both backends.
-        logits_rows = logits_rows.view(beam_width, 1, -1)
+    def _apply_logits_processors(request, logits_processors, logits_rows, token_ids) -> None:
+        # logits_rows: the request's rows as [beam_width, 1, vocab], a view
+        # into the step's logits tensor (see _execute_logit_post_processors).
         for lp in logits_processors:
             lp_params = inspect.signature(lp).parameters
 
@@ -831,6 +833,49 @@ class DecoderRunner(ScheduledModelRunner):
         # copy), so the processors already mutated it in place. Writing it
         # back would be a self-assignment, which torch rejects for the
         # non-contiguous slices a TP-padded vocab produces.
+
+    def _applies_batched_logits_processor(self, request) -> bool:
+        if not getattr(request, "py_apply_batched_logits_processor", False):
+            return False
+        if self.batched_logits_processor is None:
+            # LLM refuses the flag without a processor, so only a direct
+            # caller gets here. Raising would fail the whole step for every
+            # request in it; say so once and leave the request unprocessed.
+            logger.warning_once(
+                "a request sets apply_batched_logits_processor, but no batched "
+                "logits processor is registered with the engine; it generates "
+                "without one",
+                key="batched_logits_processor_unregistered",
+            )
+            return False
+        return True
+
+    def _has_logits_post_processors(self, request) -> bool:
+        """Whether the walk hands this request's logits to any processor."""
+        return bool(
+            getattr(request, "py_logits_post_processors", None)
+        ) or self._applies_batched_logits_processor(request)
+
+    def _apply_batched_logits_processor(
+        self,
+        req_ids: list[int],
+        logits: list[torch.Tensor],
+        token_ids: list[list[list[int]]],
+        client_ids: list[int | None],
+    ) -> None:
+        """One call for every request the walk collected, in scheduling order.
+
+        Each logits entry is the request's rows viewed as [beam_width, 1,
+        vocab], the shape its own processors see, and a view into the step's
+        logits tensor, so the callback's in-place edits land there. The stream
+        is the one the logits live on (None off CUDA, which only tests do),
+        for processors written against the TensorRT backend's contract.
+        """
+        device = logits[0].device
+        stream_ptr = (
+            torch.cuda.current_stream(device).cuda_stream if device.type == "cuda" else None
+        )
+        self.batched_logits_processor(req_ids, logits, token_ids, stream_ptr, client_ids)
 
     def _start_beam_histories(
         self, scheduled_requests: ScheduledRequests
@@ -850,7 +895,7 @@ class DecoderRunner(ScheduledModelRunner):
         beam_requests = [
             request
             for request in scheduled_requests.generation_requests
-            if getattr(request, "py_logits_post_processors", None)
+            if self._has_logits_post_processors(request)
             and request.get_beam_width_by_iter(for_next_iteration=False) > 1
         ]
         if not beam_requests:
@@ -864,6 +909,11 @@ class DecoderRunner(ScheduledModelRunner):
         pending_beam_histories: tuple[list[LlmRequest], PendingBeamHistories] | None = None,
     ) -> None:
         """Apply logit post processors (in-place modify outputs Tensors) if any.
+
+        A request's own processors run as the walk reaches it. The requests
+        that asked for the LLM's batched processor are collected on the way
+        and handed to it in one call once the walk is done, so it sees the
+        per-request edits and every request of the step at once.
 
         pending_beam_histories is what _start_beam_histories returned for this
         step.
@@ -890,7 +940,7 @@ class DecoderRunner(ScheduledModelRunner):
                     "not"
                 )
             if not any(
-                getattr(request, "py_logits_post_processors", None)
+                self._has_logits_post_processors(request)
                 for request in scheduled_requests.all_requests()
             ):
                 return
@@ -898,7 +948,10 @@ class DecoderRunner(ScheduledModelRunner):
 
             logits_tensor = allgather(logits_tensor, self._mapping, dim=-1).float()
             # Drop the vocabulary's TP padding, as the LM head's own gather
-            # does.
+            # does. The processors (per-request and batched alike) edit this
+            # gathered copy only: the worker's acceptance already ran inside
+            # the forward (see SpecWorkerBase.target_logits), so the shard
+            # the sampler reads is left as it is.
             vocab_size = getattr(getattr(self._model, "lm_head", None), "num_embeddings", None)
             if vocab_size is not None:
                 logits_tensor = logits_tensor[..., :vocab_size]
@@ -911,6 +964,10 @@ class DecoderRunner(ScheduledModelRunner):
             }
 
         logits_row_offset = 0
+        batched_req_ids: list[int] = []
+        batched_logits: list[torch.Tensor] = []
+        batched_token_ids: list[list[list[int]]] = []
+        batched_client_ids: list[int | None] = []
         request_groups = (
             (scheduled_requests.context_requests, True),
             (scheduled_requests.generation_requests, False),
@@ -932,16 +989,17 @@ class DecoderRunner(ScheduledModelRunner):
                     row_stride = request.py_beam_width
 
                 logits_processors = getattr(request, "py_logits_post_processors", None)
-                if logits_processors:
+                apply_batched = self._applies_batched_logits_processor(request)
+                if logits_processors or apply_batched:
                     if (
                         not is_context_request
                         and getattr(request, "py_verify_len", None) is not None
                     ):
                         raise RuntimeError(
-                            "per-request logits post-processors are not supported with DSpark "
-                            "ragged verification: the processor interface assumes one uniform "
-                            "row stride and would modify another request's packed logits after "
-                            "a short verify window"
+                            "logits post-processors (per-request or batched) are not supported "
+                            "with DSpark ragged verification: the processor interface assumes one "
+                            "uniform row stride and would modify another request's packed logits "
+                            "after a short verify window"
                         )
                     if is_context_request:
                         token_ids = [request.get_tokens(0)]
@@ -955,15 +1013,27 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_row_offset += row_stride
                         continue
 
-                    self._apply_logits_processors(
-                        request,
-                        logits_processors,
-                        logits_tensor,
-                        beam_width,
-                        token_ids,
-                        logits_row_offset,
-                    )
+                    # The request's rows, reshaped to the TRT backend's
+                    # [beam_width, 1, vocab] so the same processors serve both
+                    # backends; a view, so edits land in the step's logits.
+                    logits_rows = logits_tensor[
+                        logits_row_offset : logits_row_offset + beam_width
+                    ].view(beam_width, 1, -1)
+                    if logits_processors:
+                        self._apply_logits_processors(
+                            request, logits_processors, logits_rows, token_ids
+                        )
+                    if apply_batched:
+                        batched_req_ids.append(request.py_request_id)
+                        batched_logits.append(logits_rows)
+                        batched_token_ids.append(token_ids)
+                        batched_client_ids.append(request.py_client_id)
                 logits_row_offset += row_stride
+
+        if batched_req_ids:
+            self._apply_batched_logits_processor(
+                batched_req_ids, batched_logits, batched_token_ids, batched_client_ids
+            )
 
     def _cuda_graph_metadata_prepare_scope(
         self,
