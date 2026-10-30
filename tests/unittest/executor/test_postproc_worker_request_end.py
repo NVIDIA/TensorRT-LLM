@@ -22,12 +22,17 @@ lives. These tests drive the worker's own loop over both paths.
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
 from tensorrt_llm.executor.postproc_worker import PostprocWorker
 from tensorrt_llm.executor.postprocessor_hook import apply_post_processor_hook
-from tensorrt_llm.executor.result import CompletionOutput, DetokenizedGenerationResultBase
+from tensorrt_llm.executor.result import (
+    CompletionOutput,
+    DetokenizedGenerationResultBase,
+    GenerationResult,
+)
 from tensorrt_llm.executor.utils import ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
@@ -227,3 +232,43 @@ def test_an_error_for_a_request_the_worker_never_saw_is_harmless():
 
     assert hook.ended == []
     assert isinstance(batches[0][0], ErrorResponse)
+
+
+@pytest.mark.parametrize("read_method", ["result", "__next__", "aresult", "__anext__"])
+@pytest.mark.parametrize("abort_raises", [False, True])
+def test_hook_failure_is_terminal_for_repeated_reads(read_method, abort_raises):
+    hook = _FailingHook()
+    result = SimpleNamespace(
+        id=8,
+        outputs=[CompletionOutput(index=0, text="hello")],
+        _done=False,
+        _aborted=False,
+        _terminal_error=None,
+        abort=Mock(side_effect=RuntimeError("abort failed") if abort_raises else None),
+    )
+
+    def step(*args):
+        apply_post_processor_hook(hook, result, streaming=True)
+
+    async def astep():
+        step()
+
+    result._result_step = step
+    result._aresult_step = astep
+
+    def read():
+        value = getattr(GenerationResult, read_method)(result)
+        if read_method in ("aresult", "__anext__"):
+            asyncio.run(value)
+
+    with pytest.raises(RuntimeError, match="hook bug") as first:
+        read()
+    with pytest.raises(RuntimeError, match="hook bug") as second:
+        read()
+
+    assert second.value is first.value
+    assert result._done
+    assert result._aborted
+    result.abort.assert_called_once_with()
+    assert hook.ended == [(8, "postprocessing_error")]
+    assert hook.state == {}

@@ -233,7 +233,17 @@ def apply_post_processor_hook(hook: PostProcessorHook, result, streaming: bool) 
         )
         try:
             verdict = hook(chunk)
-        except Exception:
+        except Exception as exc:
+            # Keep the failure sticky for callers that retry a result read.
+            result._terminal_error = exc
+            result._done = True
+            result._aborted = True
+            abort = getattr(result, "abort", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    logger.exception("Failed to abort request %s after hook failure.", result.id)
             end_post_processor_hook(hook, result.id, "postprocessing_error")
             logger.exception(
                 "Post-processor hook failed for request %s; failing the request closed.",
