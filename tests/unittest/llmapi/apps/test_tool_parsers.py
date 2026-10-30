@@ -16,6 +16,7 @@
 import abc
 import functools
 import json
+import random
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
@@ -27,6 +28,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     apply_tool_parser,
                                                      forced_tool_arguments_end)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import BaseToolParser
 from tensorrt_llm.serve.tool_parser.core_types import (StreamingParseResult,
@@ -3301,6 +3303,356 @@ def test_deepseek_streaming_prefix_is_delta_independent(
 
         assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
         assert names == ["get_weather"], f"{deltas!r} called {names!r}"
+
+
+# ============================================================================
+# DeepSeek DSML literal closing tags
+# ============================================================================
+
+
+class _DsmlFormat(NamedTuple):
+    parser_cls: type[DeepSeekV32Parser]
+    tool_parser: str
+    calls: str
+    invoke: str
+    parameter: str
+
+    def param(self, name: str, value: str, string: str = "true") -> str:
+        return (f'<｜DSML｜{self.parameter} name="{name}" string="{string}">'
+                f"{value}</｜DSML｜{self.parameter}>\n")
+
+    def call(self, name: str, *params: str) -> str:
+        return (f'<｜DSML｜{self.invoke} name="{name}">\n' + "".join(params) +
+                f"</｜DSML｜{self.invoke}>\n")
+
+    def wrap(self, *calls: str, prefix: str = "Sure.\n\n", end=None) -> str:
+        if end is None:
+            end = f"</｜DSML｜{self.calls}>"
+        return prefix + f"<｜DSML｜{self.calls}>\n" + "".join(calls) + end
+
+
+_DSML_DIALECTS = {
+    "v32":
+    _DsmlFormat(DeepSeekV32Parser, "deepseek_v32", "function_calls", "invoke",
+                "parameter"),
+    "v4":
+    _DsmlFormat(DeepSeekV4Parser, "deepseek_v4", "tool_calls", "invoke",
+                "parameter"),
+    "v41":
+    _DsmlFormat(DeepSeekV41Parser, "deepseek_v41", " calls", " invoke",
+                " parameter"),
+}
+
+_DSML_EOS = "<｜end▁of▁sentence｜>"
+
+
+def _dsml_tool(name: str, required: list[str],
+               **types: str) -> ChatCompletionToolsParam:
+    properties = {key: {"type": value} for key, value in types.items()}
+    parameters = {
+        "type": "object",
+        "properties": properties,
+        "required": required
+    }
+    return ChatCompletionToolsParam(type="function",
+                                    function=FunctionDefinition(
+                                        name=name,
+                                        description=name,
+                                        parameters=parameters))
+
+
+_DSML_TOOLS = [
+    _dsml_tool("Write", ["path", "content"], path="string", content="string"),
+    _dsml_tool("Bash", ["command"], command="string", timeout="integer"),
+    _dsml_tool("Edit", ["path", "old_string", "new_string"],
+               path="string",
+               old_string="string",
+               new_string="string",
+               replace_all="boolean"),
+]
+
+
+def _dsml_cases(fmt: _DsmlFormat) -> dict:
+    """Map case name -> (model output, normal text, [(name, arguments)])."""
+    p, call, wrap = fmt.param, fmt.call, fmt.wrap
+    param_end = f"</｜DSML｜{fmt.parameter}>"
+    invoke_end = f"</｜DSML｜{fmt.invoke}>"
+    calls_end = f"</｜DSML｜{fmt.calls}>"
+    literal_param = f"The parameter end tag is {param_end} and that is all."
+    literal_invoke = (f"tags: {invoke_end} then {calls_end} then {param_end}\n"
+                      f"{invoke_end}")
+    literal_open = (f'<｜DSML｜{fmt.parameter} name="q" string="true">z and '
+                    f'<｜DSML｜{fmt.invoke} name="Bash">')
+    code = (f'END = "{param_end}"\n'
+            f'self.invoke_end_token = "{invoke_end}"\n'
+            f'self.parameter_regex = r"(.*?){param_end}"\n')
+    literal_eos = f"stop at {_DSML_EOS} here"
+    grep = f"grep -n '{param_end}' /tmp/x.py"
+    bash_ls = call("Bash", p("command", "ls"))
+    timeout = p("timeout", "5", "false")
+
+    cases = {}
+    cases["normal_two_calls"] = (
+        wrap(call("Write", p("path", "/tmp/a"), p("content", "x\ny")),
+             call("Bash", p("command", "ls"), timeout)),
+        "Sure.",
+        [("Write", dict(path="/tmp/a", content="x\ny")),
+         ("Bash", dict(command="ls", timeout=5))],
+    )
+    cases["literal_param_end"] = (
+        wrap(call("Write", p("path", "/tmp/n.md"), p("content",
+                                                     literal_param))),
+        "Sure.",
+        [("Write", dict(path="/tmp/n.md", content=literal_param))],
+    )
+    cases["literal_param_end_first_param"] = (
+        wrap(call("Bash", p("command", grep), timeout)),
+        "Sure.",
+        [("Bash", dict(command=grep, timeout=5))],
+    )
+    cases["literal_invoke_and_calls_end"] = (
+        wrap(
+            call("Write", p("path", "/tmp/n.md"), p("content", literal_invoke)),
+            bash_ls),
+        "Sure.",
+        [("Write", dict(path="/tmp/n.md", content=literal_invoke)),
+         ("Bash", dict(command="ls"))],
+    )
+    cases["parser_source_code"] = (
+        wrap(
+            call("Edit", p("path", "/tmp/p.py"), p("old_string", code),
+                 p("new_string", code + "x = 1\n"),
+                 p("replace_all", "false", "false"))),
+        "Sure.",
+        [("Edit",
+          dict(path="/tmp/p.py",
+               old_string=code,
+               new_string=code + "x = 1\n",
+               replace_all=False))],
+    )
+    cases["literal_open_tags"] = (
+        wrap(call("Write", p("path", "/tmp/n.md"), p("content", literal_open))),
+        "Sure.",
+        [("Write", dict(path="/tmp/n.md", content=literal_open))],
+    )
+    cases["literal_eos"] = (
+        wrap(call("Write", p("path", "/tmp/n.md"), p("content", literal_eos))) +
+        _DSML_EOS,
+        "Sure.",
+        [("Write", dict(path="/tmp/n.md", content=literal_eos))],
+    )
+    cases["json_body"] = (
+        wrap(f'<｜DSML｜{fmt.invoke} name="Bash">\n{{"command": "ls -l"}}\n'
+             f"{invoke_end}\n"),
+        "Sure.",
+        [("Bash", dict(command="ls -l"))],
+    )
+    cases["no_params"] = (
+        wrap(f'<｜DSML｜{fmt.invoke} name="Bash">\n{invoke_end}\n'),
+        "Sure.",
+        [("Bash", {})],
+    )
+    cases["no_calls_end"] = (
+        wrap(bash_ls, end=""),
+        "Sure.",
+        [("Bash", dict(command="ls"))],
+    )
+    cases["no_calls_end_literal"] = (
+        wrap(call("Write", p("path", "/tmp/n.md"), p("content", literal_param)),
+             end=""),
+        "Sure.",
+        [("Write", dict(path="/tmp/n.md", content=literal_param))],
+    )
+    cases["eos_after_calls"] = (
+        wrap(bash_ls) + _DSML_EOS,
+        "Sure.",
+        [("Bash", dict(command="ls"))],
+    )
+    cases["no_prefix_compact"] = (
+        f'<｜DSML｜{fmt.calls}><｜DSML｜{fmt.invoke} name="Bash">'
+        f'<｜DSML｜{fmt.parameter} name="command" string="true">'
+        f"echo {param_end}{param_end}{invoke_end}{calls_end}",
+        "",
+        [("Bash", dict(command=f"echo {param_end}"))],
+    )
+    return cases
+
+
+_DSML_CASE_NAMES = sorted(_dsml_cases(_DSML_DIALECTS["v32"]))
+
+
+def _dsml_calls(calls) -> list:
+    """Merge streamed tool-call items into [(name, arguments)]."""
+    merged = {}
+    for call in calls:
+        entry = merged.setdefault(call.tool_index, {"name": "", "args": ""})
+        entry["name"] += call.name or ""
+        entry["args"] += call.parameters or ""
+    return [(merged[index]["name"], json.loads(merged[index]["args"]))
+            for index in sorted(merged)]
+
+
+def _dsml_deltas(text: str, sizes: Iterator[int]) -> list[str]:
+    deltas, pos = [], 0
+    while pos < len(text):
+        size = next(sizes)
+        deltas.append(text[pos:pos + size])
+        pos += size
+    return deltas
+
+
+def _dsml_stream(parser: DeepSeekV32Parser,
+                 deltas: list[str],
+                 finish: bool = True) -> tuple[str, list]:
+    normal_text, calls = "", []
+    results = [
+        parser.parse_streaming_increment(delta, _DSML_TOOLS) for delta in deltas
+    ]
+    if finish:
+        results.append(parser.finish(_DSML_TOOLS))
+    for result in results:
+        normal_text += result.normal_text or ""
+        calls += result.calls
+    return normal_text, calls
+
+
+def _dsml_chunkings(text: str) -> Iterator[tuple[str, list[str]]]:
+    yield "char", list(text)
+    yield "whole", [text]
+    for hi in (3, 7, 40):
+        for seed in range(10):
+            rng = random.Random(seed)
+            sizes = iter(lambda: rng.randint(1, hi), 0)
+            yield f"rand{hi}-{seed}", _dsml_deltas(text, sizes)
+
+
+@pytest.mark.parametrize("case", _DSML_CASE_NAMES)
+@pytest.mark.parametrize("fmt", sorted(_DSML_DIALECTS))
+class TestDeepSeekDsmlLiteralTags:
+    """Parameter values may contain literal DSML tags and the EOS token."""
+
+    def test_detect_and_parse(self, fmt: str, case: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        text, normal_text, calls = _dsml_cases(dsml)[case]
+
+        result = dsml.parser_cls().detect_and_parse(text, _DSML_TOOLS)
+
+        assert result.normal_text == normal_text
+        assert [(call.name, json.loads(call.parameters))
+                for call in result.calls] == calls
+
+    def test_streaming_matches_detect_and_parse(self, fmt: str,
+                                                case: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        text, normal_text, calls = _dsml_cases(dsml)[case]
+
+        for label, deltas in _dsml_chunkings(text):
+            streamed, items = _dsml_stream(dsml.parser_cls(), deltas)
+
+            assert _dsml_calls(items) == calls, label
+            assert streamed == normal_text, label
+            assert "｜DSML｜" not in streamed, label
+            assert _DSML_EOS not in streamed, label
+
+    def test_apply_tool_parser(self, fmt: str, case: str) -> None:
+        """The serving layer passes finished=True with the last delta."""
+        dsml = _DSML_DIALECTS[fmt]
+        text, normal_text, calls = _dsml_cases(dsml)[case]
+        rng = random.Random(3)
+        deltas = _dsml_deltas(text, iter(lambda: rng.randint(1, 9), 0))
+
+        def make_args():
+            return ChatPostprocArgs(role="assistant",
+                                    model="deepseek",
+                                    tools=_DSML_TOOLS,
+                                    tool_parser=dsml.tool_parser)
+
+        args = make_args()
+        content, items = "", []
+        for index, delta in enumerate(deltas):
+            delta_content, delta_calls = apply_tool_parser(
+                args,
+                0,
+                delta,
+                streaming=True,
+                finished=index == len(deltas) - 1)
+            content += delta_content or ""
+            items += delta_calls
+
+        assert _dsml_calls(items) == calls
+        assert content == normal_text
+
+        content, items = apply_tool_parser(make_args(),
+                                           0,
+                                           text,
+                                           streaming=False)
+        assert content == normal_text
+        assert [(call.name, json.loads(call.parameters))
+                for call in items] == calls
+
+
+@pytest.mark.parametrize("fmt", sorted(_DSML_DIALECTS))
+class TestDeepSeekDsmlStreamingFinish:
+    """Streaming emission points and the end-of-stream flush."""
+
+    @pytest.mark.parametrize("case", [
+        "literal_param_end", "literal_invoke_and_calls_end",
+        "parser_source_code", "normal_two_calls"
+    ])
+    def test_call_emitted_once_confirmed(self, fmt: str, case: str) -> None:
+        """With the closing calls tag present, calls are emitted before finish."""
+        dsml = _DSML_DIALECTS[fmt]
+        text, _, calls = _dsml_cases(dsml)[case]
+        parser = dsml.parser_cls()
+
+        _, items = _dsml_stream(parser, list(text), finish=False)
+
+        assert _dsml_calls(items) == calls
+        assert parser.finish(_DSML_TOOLS).calls == []
+
+    def test_finish_flushes_invoke_without_calls_end(self, fmt: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        text, _, calls = _dsml_cases(dsml)["no_calls_end"]
+        parser = dsml.parser_cls()
+
+        _, items = _dsml_stream(parser, list(text), finish=False)
+        assert items == []
+
+        result = parser.finish(_DSML_TOOLS)
+        assert _dsml_calls(result.calls) == calls
+
+        again = parser.finish(_DSML_TOOLS)
+        assert again.calls == [] and not again.normal_text
+
+    def test_finish_keeps_call_followed_by_stray_text(self, fmt: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        text = dsml.wrap(dsml.call("Bash", dsml.param("command", "ls")),
+                         end="trailing")
+        expected = [("Bash", {"command": "ls"})]
+
+        _, items = _dsml_stream(dsml.parser_cls(), list(text))
+
+        assert _dsml_calls(items) == expected
+        result = dsml.parser_cls().detect_and_parse(text, _DSML_TOOLS)
+        assert [(call.name, json.loads(call.parameters))
+                for call in result.calls] == expected
+
+    def test_finish_on_empty_or_plain_stream(self, fmt: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        assert dsml.parser_cls().finish(_DSML_TOOLS).calls == []
+
+        text = f"just text, no tools </ hmm <｜DSML｜{dsml.calls[:3]}"
+        streamed, items = _dsml_stream(dsml.parser_cls(), list(text))
+
+        assert items == [] and streamed == text
+
+    def test_parse_partial_waits_for_confirmed_close(self, fmt: str) -> None:
+        dsml = _DSML_DIALECTS[fmt]
+        text = dsml.wrap(dsml.call("Bash", dsml.param("command", "ls")), end="")
+        parser = dsml.parser_cls()
+
+        assert parser.parse_partial(text, _DSML_TOOLS).calls == []
+        assert len(parser.detect_and_parse(text, _DSML_TOOLS).calls) == 1
 
 
 # ============================================================================
