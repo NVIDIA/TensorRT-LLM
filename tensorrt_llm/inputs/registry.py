@@ -30,6 +30,8 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
@@ -1073,7 +1075,7 @@ def register_input_processor(
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
-    checkpoint_format: Optional[str] = "HF",
+    checkpoint_format: CheckpointFormat | str | None = CheckpointFormat.HF,
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
     **kwargs,
@@ -1105,7 +1107,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format in ("HF", "MX"):
+    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1114,7 +1116,8 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
+    elif checkpoint_format in (CheckpointFormat.MISTRAL,
+                               CheckpointFormat.MISTRAL_LARGE_3):
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader

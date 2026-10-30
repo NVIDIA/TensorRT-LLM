@@ -563,6 +563,27 @@
       "title": "CapacitySchedulerPolicy",
       "type": "string"
     },
+    "CheckpointFormat": {
+      "description": "Built-in checkpoint loader formats. Custom registrations can use strings.",
+      "enum": [
+        "HF",
+        "MX",
+        "mistral",
+        "mistral_large_3"
+      ],
+      "title": "CheckpointFormat",
+      "type": "string"
+    },
+    "CheckpointIOPolicy": {
+      "description": "Strategy for reading checkpoint weights and transferring them to GPU.",
+      "enum": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "title": "CheckpointIOPolicy",
+      "type": "string"
+    },
     "ColdPageQuantizationCompressionConfig": {
       "additionalProperties": false,
       "description": "Quantize Host and Disk KV pages without changing the active GPU cache.",
@@ -1761,6 +1782,9 @@
         "checkpoint_format": {
           "anyOf": [
             {
+              "$ref": "#/$defs/CheckpointFormat"
+            },
+            {
               "type": "string"
             },
             {
@@ -1768,21 +1792,18 @@
             }
           ],
           "default": null,
-          "description": "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+          "description": "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
           "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Checkpoint Format"
         },
         "checkpoint_io_policy": {
+          "$ref": "#/$defs/CheckpointIOPolicy",
           "default": "auto",
           "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-          "enum": [
-            "auto",
-            "native",
-            "rank_striped_read_ahead"
-          ],
-          "status": "prototype",
-          "title": "Checkpoint Io Policy",
-          "type": "string"
+          "status": "prototype"
         },
         "checkpoint_loader": {
           "description": "Live objects require the Python LLM API.",
@@ -8075,6 +8096,9 @@
     "checkpoint_format": {
       "anyOf": [
         {
+          "$ref": "#/$defs/CheckpointFormat"
+        },
+        {
           "type": "string"
         },
         {
@@ -8082,21 +8106,18 @@
         }
       ],
       "default": null,
-      "description": "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
+      "description": "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. `MX` selects ModelExpress as an opportunistic P2P loading path and falls back to loading the provided Hugging Face checkpoint; it does not require converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing `BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\nIf neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF and the default HfCheckpointLoader will be used.\nIf checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
       "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      },
       "title": "Checkpoint Format"
     },
     "checkpoint_io_policy": {
+      "$ref": "#/$defs/CheckpointIOPolicy",
       "default": "auto",
       "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-      "enum": [
-        "auto",
-        "native",
-        "rank_striped_read_ahead"
-      ],
-      "status": "prototype",
-      "title": "Checkpoint Io Policy",
-      "type": "string"
+      "status": "prototype"
     },
     "checkpoint_loader": {
       "description": "Live objects require the Python LLM API.",

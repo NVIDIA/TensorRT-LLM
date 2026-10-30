@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
@@ -15,16 +18,17 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.quantization import QuantAlgo
 
 _FP8_2D_BLOCK_SIZE = 128
 
 
-@register_mapper("HF", "Qwen3_5ForConditionalGeneration")
-@register_mapper("HF", "Qwen3_5MoeForCausalLM")
-@register_mapper("HF", "Qwen3_5MoeForConditionalGeneration")
-@register_mapper("HF", "Qwen3_5ForCausalLM")
-@register_mapper("HF", "Qwen3_5ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen3_5ForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen3_5MoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3_5MoeForConditionalGeneration")
+@register_mapper(CheckpointFormat.HF, "Qwen3_5ForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3_5ForConditionalGeneration")
 class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     """Weight mapper for Qwen3.5 MoE text checkpoints.
 

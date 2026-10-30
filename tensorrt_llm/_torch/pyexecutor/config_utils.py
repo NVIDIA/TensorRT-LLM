@@ -9,6 +9,7 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           is_speculators_dspark_config,
                                           translate_speculators_dspark_config)
@@ -1031,9 +1032,11 @@ def build_minimax_dspark_draft_config(
 
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
-                           checkpoint_format: Optional[str] = None,
+                           checkpoint_format: CheckpointFormat | str
+                           | None = None,
                            **kwargs) -> transformers.PretrainedConfig:
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         return MistralConfigLoader().load(model_name_or_path).pretrained_config
@@ -1043,7 +1046,8 @@ def load_pretrained_config(model_name_or_path: str,
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         model_config = MistralConfigLoader().load(

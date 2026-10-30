@@ -37,6 +37,8 @@ from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 try:
     from ray.util.placement_group import PlacementGroup
 except ImportError:
@@ -6297,6 +6299,14 @@ class BaseLlmArgs(StrictBaseModel):
         )
 
 
+class CheckpointIOPolicy(StrEnum):
+    """Strategy for reading checkpoint weights and transferring them to GPU."""
+
+    AUTO = "auto"
+    NATIVE = "native"
+    RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+
+
 class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
@@ -6938,10 +6948,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_format: Optional[str] = Field(
+    checkpoint_format: Union[CheckpointFormat, str, None] = Field(
         default=None,
+        telemetry=False,
         description=
-        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. "
+        "`MX` selects ModelExpress as an opportunistic P2P "
         "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
         "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
@@ -6951,24 +6963,20 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_io_policy: Literal[
-        "auto", "native", "rank_striped_read_ahead"] = Field(
-            default="auto",
-            description=
-            "Controls checkpoint storage I/O independently of checkpoint format. "
-            "'auto' selects rank-striped read-ahead for compatible built-in "
-            "PyTorch/HF loads and selects native I/O otherwise. "
-            "'native' preserves the existing loader. "
-            "'rank_striped_read_ahead' lets node-local ranks read disjoint "
-            "SafeTensors extents while native mapping, materialization, and H2D "
-            "continue. Incompatible configurations select native I/O before "
-            "optimized reader or collective setup. Runtime-ineligible loads fall "
-            "back to native before model mutation.",
-            status="prototype",
-            json_schema_extra={
-                "type": "Literal['auto', 'native', 'rank_striped_read_ahead']"
-            },
-        )
+    checkpoint_io_policy: CheckpointIOPolicy = Field(
+        default=CheckpointIOPolicy.AUTO,
+        description=
+        "Controls checkpoint storage I/O independently of checkpoint format. "
+        "'auto' selects rank-striped read-ahead for compatible built-in "
+        "PyTorch/HF loads and selects native I/O otherwise. "
+        "'native' preserves the existing loader. "
+        "'rank_striped_read_ahead' lets node-local ranks read disjoint "
+        "SafeTensors extents while native mapping, materialization, and H2D "
+        "continue. Incompatible configurations select native I/O before "
+        "optimized reader or collective setup. Runtime-ineligible loads fall "
+        "back to native before model mutation.",
+        status="prototype",
+    )
 
     @property
     def is_partial_model_loading(self) -> bool:
@@ -7805,6 +7813,19 @@ class TorchLlmArgs(BaseLlmArgs):
             self.enable_early_first_token_response = False
         return self
 
+    @field_validator("checkpoint_format", mode="before")
+    @classmethod
+    def convert_checkpoint_format(
+            cls, value: CheckpointFormat | str | None
+    ) -> CheckpointFormat | str | None:
+        if isinstance(value, str):
+            try:
+                return CheckpointFormat(value)
+            except ValueError:
+                # Custom loader registrations can define additional formats.
+                return value
+        return value
+
     @model_validator(mode="after")
     def validate_checkpoint_format(self):
         if self.checkpoint_format is not None and self.checkpoint_loader is not None:
@@ -7817,7 +7838,7 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.info(
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
-            self.checkpoint_format = "HF"
+            self.checkpoint_format = CheckpointFormat.HF
 
         return self
 
@@ -7828,7 +7849,7 @@ class TorchLlmArgs(BaseLlmArgs):
         # env var that the upstream ``modelexpress`` library reads. This
         # lets orchestrators configure MX via the environment while keeping
         # the resolved value visible on ``llm_args.mx_config.server_url``.
-        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+        if self.checkpoint_format == CheckpointFormat.MX and self.mx_config.server_url is None:
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
@@ -7836,7 +7857,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     "from environment.", env_url)
                 self.mx_config.server_url = env_url
 
-        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+        if self.mx_config.server_url is not None and self.checkpoint_format != CheckpointFormat.MX:
             logger.warning(
                 "mx_config.server_url is set but checkpoint_format is '%s', not "
                 "'MX'. The MX config will be ignored. Set "
