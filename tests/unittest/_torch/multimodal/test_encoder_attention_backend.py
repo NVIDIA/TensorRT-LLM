@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +15,75 @@ from tensorrt_llm.llmapi.llm_args import MultimodalConfig
 pytestmark = pytest.mark.cpu_only
 
 _PUBLIC_BACKENDS = frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+
+
+def test_all_multimodal_encoder_backends_are_declared_and_documented() -> None:
+    from tensorrt_llm._torch.models._arch_index import (
+        MODEL_ARCH_TO_MODULE,
+        MULTIMODAL_MODEL_TYPE_TO_MODULE,
+        is_builtin_zoo_module,
+    )
+    from tensorrt_llm._torch.models.modeling_gemma4_unified import (
+        Gemma4UnifiedForConditionalGeneration,
+    )
+    from tensorrt_llm._torch.models.modeling_mllama import MllamaForConditionalGeneration
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
+    from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
+    from tensorrt_llm.inputs.registry import (
+        INPUT_PROCESSOR_REGISTRY,
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+    )
+
+    # Import the lazy zoo before enumerating registries, including mixin models
+    # that may not register an input processor yet.
+    for module in sorted(set(MODEL_ARCH_TO_MODULE.values())):
+        import_module(f"tensorrt_llm._torch.models.{module}")
+    encoders_by_module = {}
+    for model_type in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types():
+        module = MULTIMODAL_MODEL_TYPE_TO_MODULE[model_type]
+        modalities = MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(model_type)
+        # Aliases and variants in a provider share logical encoders. Union their
+        # modalities so adding an encoder to any alias cannot escape this check.
+        encoders_by_module.setdefault(module, set()).update(
+            "vision" if modality in ("image", "video") else modality for modality in modalities
+        )
+    models = set(INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type)
+    models.update(
+        model for model in MODEL_CLASS_MAPPING.values() if issubclass(model, MultimodalModelMixin)
+    )
+    models.add(MllamaForConditionalGeneration)
+    rows = ["| Model | Logical encoder | Supported backends |", "| --- | --- | --- |"]
+    for model in sorted(models, key=lambda model: model.__name__):
+        if not is_builtin_zoo_module(model.__module__):
+            continue
+        assert "supported_encoder_attention_backends" in vars(model), model.__name__
+        declared = model.supported_encoder_attention_backends
+        if model is Gemma4UnifiedForConditionalGeneration:
+            expected = set()  # Encoder-free projections have no attention backend.
+        elif model is MllamaForConditionalGeneration:
+            expected = {"vision"}  # Registered stub; vision input is not implemented.
+        else:
+            expected = encoders_by_module[model.__module__.rsplit(".", 1)[1]]
+        assert set(declared) == expected, model.__name__
+        for encoder in sorted(declared) or [None]:
+            backends = declared[encoder] if encoder else frozenset()
+            assert isinstance(backends, frozenset), (model.__name__, encoder)
+            assert backends <= _PUBLIC_BACKENDS, (model.__name__, encoder)
+            status = (
+                ", ".join(
+                    f"`{backend}`"
+                    for backend in ("VANILLA", "TRTLLM", "FLASHINFER")
+                    if backend in backends
+                )
+                or "Not supported"
+            )
+            label = f"`{encoder}`" if encoder else "None (encoder-free)"
+            rows.append(f"| `{model.__name__}` | {label} | {status} |")
+
+    doc = Path(__file__).resolve().parents[4] / "docs/source/features/multi-modality.md"
+    table = doc.read_text().split("<!-- encoder-attention-backends:start -->\n", 1)[1]
+    table = table.split("\n<!-- encoder-attention-backends:end -->", 1)[0]
+    assert table == "\n".join(rows), "Update the encoder backend support table from declarations"
 
 
 @pytest.mark.parametrize("backend", sorted(_PUBLIC_BACKENDS))
