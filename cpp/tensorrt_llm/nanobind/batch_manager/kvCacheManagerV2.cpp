@@ -1722,9 +1722,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(), nb::arg("role"), nb::arg("size"),
-            nb::arg("tokens_per_block_override") = std::nullopt, nb::arg("is_sparse") = false,
-            nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1, nb::arg("reuse_policy") = std::nullopt)
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+            nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
+            nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
+            nb::arg("reuse_policy") = std::nullopt)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)

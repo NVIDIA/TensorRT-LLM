@@ -16,6 +16,43 @@ pytestmark = [
 ]
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_sparse_fetch_buffer_policy_overrides(split):
+    buffers = [
+        kv.BufferConfig(
+            role=role, size=4096, is_sparse=is_sparse, reuse_policy=kv.ReusePolicy.PRIVATE
+        )
+        for role, is_sparse in (("key", False), ("value", True))
+    ]
+    if split:
+        buffers.append(kv.BufferConfig(role="index", size=2048))
+    config = kv.KVCacheManagerConfig(
+        tokens_per_block=4,
+        cache_tiers=[kv.GpuCacheTierConfig(quota=4 << 20)],
+        layers=[
+            kv.AttentionLayerConfig(
+                layer_id=0,
+                buffers=buffers,
+                sparse_cache=kv.SparseCacheConfig(
+                    num_selected_blocks=2, max_cached_units=4, unit_tokens=4
+                ),
+            )
+        ],
+    )
+    if split:
+        with pytest.raises(RuntimeError, match="layer groups"):
+            kv.KVCacheManager(config)
+        return
+    manager = kv.KVCacheManager(config)
+    try:
+        assert manager.get_buffer_group_id(0, "key") == manager.get_buffer_group_id(0, "value")
+        assert manager.get_sparse_cache_max_units(0) == 4
+        assert manager.get_sparse_cache_units_per_page(0) == 1
+        assert manager.get_sparse_cache_buffer_count(0) == 1
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.parametrize("priority", [None, 80])
 def test_reuse_status_and_optional_selection_bindings(priority):
     layers = [

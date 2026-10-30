@@ -119,6 +119,8 @@ validate that they use the same policy; independent policies require independent
 index tables. In particular, the default attention view couples K/V and scales,
 and Mamba kernels couple recurrent, convolution, PLE, and replay state. Native
 KVCM supports independent policies for callers that provide those indices.
+The sparse fetch path configured by `sparseCache` still uses one group per layer;
+its setup uses the checked layer lookup and rejects split layers.
 
 SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
 groups; iterate `ssmLifeCycleIds()` for working state and use

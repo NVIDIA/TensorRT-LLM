@@ -30,6 +30,7 @@ from typing import (
     Type,
     TypeAlias,
     Union,
+    overload,
 )
 
 from tensorrt_llm.bindings.executor import KvCacheRetentionConfig
@@ -325,8 +326,6 @@ class BufferConfig:
     is_sparse: bool = False
     coalescing_group: int = 0
 
-    reuse_policy: ReusePolicy | None = None
-
     sparse_unit_chunks: int = 1
     """Pieces a selection unit is gathered from within *this buffer's* page.
 
@@ -343,6 +342,7 @@ class BufferConfig:
     ``sparse_cache.unit_tokens`` and the page being densely packed, so a padded page is not
     expressible.
     """
+    reuse_policy: ReusePolicy | None = None
 
 @dataclass(slots=True)
 class SparseCacheConfig:

@@ -244,8 +244,6 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
             cudaSuccess);
     }
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    auto reservations
-        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
     EXPECT_FALSE(reader->resume(stream, std::vector<LifeCycleId>{encoder, peer}));
     EXPECT_FALSE(reader->isActive());
     EXPECT_EQ(reader->numCommittedTokens(), 8);

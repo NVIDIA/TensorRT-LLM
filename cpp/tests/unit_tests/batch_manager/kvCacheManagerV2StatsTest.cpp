@@ -291,9 +291,8 @@ TEST_F(ReplayCacheTest, MixedSsmPoliciesRestoreStateAndCopyEveryBeam)
         EXPECT_FALSE(reader->reuseStatus()[privateGroup.value()].complete);
         EXPECT_EQ(
             reader->reuseStatus()[optional.value()].coverage, (std::vector<std::pair<int, int>>{{length, length}}));
-        EXPECT_THROW(
-            reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{privateGroup}), std::invalid_argument);
-        ASSERT_TRUE(reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{optional}));
+        EXPECT_THROW(reader->resume(mStream, std::vector<LifeCycleId>{privateGroup}), std::invalid_argument);
+        ASSERT_TRUE(reader->resume(mStream, std::vector<LifeCycleId>{optional}));
         reader->commitPendingStats();
         auto const snapshotStats = manager->getAndResetSsmSnapshotIterationStats();
         ASSERT_EQ(snapshotStats.size(), 2);
@@ -360,8 +359,7 @@ TEST_F(ReplayCacheTest, OptionalSsmRequiresExactEndpointAndDoesNotLimitAttention
             EXPECT_EQ(reader->reuseStatus()[group.value()].complete, available);
             if (!available)
             {
-                EXPECT_THROW(
-                    reader->resume(mStream, std::nullopt, std::vector<LifeCycleId>{group}), std::invalid_argument);
+                EXPECT_THROW(reader->resume(mStream, std::vector<LifeCycleId>{group}), std::invalid_argument);
             }
             // Unselected OPTIONAL and PRIVATE state both get writable request-local storage.
             ASSERT_TRUE(reader->resume(mStream));

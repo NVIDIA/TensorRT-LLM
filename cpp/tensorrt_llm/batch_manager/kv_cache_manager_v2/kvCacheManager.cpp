@@ -184,7 +184,7 @@ void KvCacheManager::_computeSparseCacheShape()
         {
             continue;
         }
-        LifeCycleId const lcId = mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock));
+        LifeCycleId const lcId = getLayerGroupId(attn->layerId);
         auto const& cache = *attn->sparseCache;
         int const unitsPerPage = cache.unitsPerPage(mConfig.tokensPerBlock);
 
@@ -296,7 +296,7 @@ std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId life
     for (auto const& layer : mConfig.layers)
     {
         auto const* attn = std::get_if<AttentionLayerConfig>(&layer);
-        if (attn == nullptr || mLifeCycles.getId(makeLifeCycle(layer, mConfig.tokensPerBlock)) != lifeCycle)
+        if (attn == nullptr || !attn->sparseCache.has_value() || getLayerGroupId(attn->layerId) != lifeCycle)
         {
             continue;
         }
