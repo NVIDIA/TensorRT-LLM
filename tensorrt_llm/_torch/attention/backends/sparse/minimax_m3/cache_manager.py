@@ -384,15 +384,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
         layer_specs = kwargs.get("layer_specs")
-        if layer_specs is not None:
-            # Explicit specs declare which layers are the target's.
-            num_target_layers = sum(
-                1 for spec in layer_specs if spec.owner is KVCacheLayerOwner.TARGET
-            )
+        # Explicit specs declare the draft layers, which are never sparse or native target layers.
+        draft_ids = {
+            spec.global_layer_id
+            for spec in (layer_specs or ())
+            if spec.owner is KVCacheLayerOwner.DRAFT
+        }
         if sparse_layer_ids is None:
             sparse_layer_ids = default_sparse_layer_ids(
                 kwargs.get("pretrained_config"), num_target_layers
             )
+        sparse_layer_ids = [i for i in sparse_layer_ids if int(i) not in draft_ids]
         if disable_index_value_layer_ids is None:
             disable_index_value_layer_ids = list(sparse_layer_ids)
 
@@ -402,7 +404,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.sparse_layer_ids = sorted(int(i) for i in sparse_layer_ids)
         if implementation == "triton" and native_dense_cache and num_target_layers is not None:
             self._dense_native_layer_ids = tuple(
-                i for i in range(num_target_layers) if i not in self.sparse_layer_ids
+                i
+                for i in range(num_target_layers)
+                if i not in self.sparse_layer_ids and i not in draft_ids
             )
         self.disable_index_value_layer_ids = set(int(i) for i in disable_index_value_layer_ids)
         self.sparse_index_dim = sparse_index_dim

@@ -291,6 +291,55 @@ def test_disagg_draft_layers_need_the_hnd_layout() -> None:
         _manager(specs, dtype=DataType.FP8, implementation="triton", is_disagg=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
+    """Allocation rounds the window-sized draft share, but one full chunk still fits."""
+    torch.cuda.init()
+    max_num_tokens = 8320
+    specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=owner,
+            dtype=DataType.BF16,
+            num_kv_heads=HEADS,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE),
+            sliding_window_size=window,
+        )
+        for layer, owner, window in (
+            (0, KVCacheLayerOwner.TARGET, None),
+            (1, KVCacheLayerOwner.DRAFT, DRAFT_WINDOW),
+        )
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=1 << 30,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=HEADS,
+        head_dim=HEAD_DIM,
+        tokens_per_block=128,
+        max_seq_len=16384,
+        max_batch_size=1,
+        max_num_tokens=max_num_tokens,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.BF16,
+        vocab_size=16,
+        layer_specs=specs,
+    )
+    try:
+        assert manager.kv_cache_manager_py_config.initial_pool_ratio is not None
+        requests = manager.add_dummy_requests([7], token_nums=[max_num_tokens])
+        assert requests is not None
+        manager.free_resources(requests[0])
+    finally:
+        manager.shutdown()
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pp_size", [1, 2])
 @pytest.mark.parametrize("is_disagg", [False, True])
