@@ -406,6 +406,51 @@ There are some other useful environment variables that may help when encounterin
 
 * `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
+### Opt-in transfer lifecycle diagnostics
+
+For a targeted native Python-transceiver/Scheduler V2 debugging run, set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS=1` before starting the workers. Diagnostics
+are disabled by default; leave them disabled for throughput comparisons.
+Existing `RequestPerfMetrics` and native `perf_logger` remain the sources for
+aggregate request latency, transfer bytes, and bandwidth.
+
+Generate one fresh UUID for the launch and set
+`TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS_RUN_ID` to that same value on all CTX and
+GEN workers. Preserve each worker's stdout, which contains JSON records prefixed
+with `[DISAGG_TRANSFER_DIAG]`. From a source checkout, produce a timing report:
+
+```bash
+python scripts/disagg_transfer_diagnostics.py ctx-worker.log gen-worker.log -o timing.json
+```
+
+The events record actual admission, receiver readiness, queue/submission,
+completion, cancellation, and resource-release boundaries, including unfinished
+requests. Explicit disaggregated request IDs support cross-worker correlation;
+fallback IDs stay process-local. Durations never subtract clocks from different
+processes. Submission-to-completion measures backend residence, not necessarily
+on-wire service. CTX handoff-to-release starts at the final chunk's handoff and
+excludes earlier prefill KV retention. Executor timeouts and native blocking-wait
+deadlines are separate observations; neither proves that memory is reusable.
+Transceiver settlement records confirm session retirement, not physical resource
+drain; diagnostics do not add lifecycle polling to establish that stronger claim.
+KV-capacity deferral is recorded only on the first failed preparation per local
+request. `kv_deferral_count` counts failed KV preparation attempts, not every
+scheduler pass. Successful KV preparation is tentative: `outcome=admitted` is
+recorded only after transfer-window selection, PP reconciliation, and executor
+resource preparation succeed. This admission boundary precedes receive
+publication, which can still wait for destination readiness.
+Rollback records are emitted once per request and reason. Final admission carries
+the cumulative `transfer_window_rollback_count` and `pp_reconciliation_rollback_count`,
+along with `kv_deferral_count`; tentative successes do not reset these counts.
+Requests cancelled before admission have no completed admission-wait interval.
+
+Buffering is bounded; output is asynchronous and best-effort. Overflow, broken stdout, or
+process exit can lose records. The report exposes malformed, unmatched, and
+ambiguous evidence; it is not an end-to-end health or completeness verdict.
+Unsupported profiles are unassessed. Enabled collection can perturb timings;
+disabled mode avoids diagnostic recording and I/O, but is not a claim of
+measured zero overhead. Diagnostics do not change admission or timeout policy.
+
 ## Troubleshooting and FAQ
 
 ### General FAQs
