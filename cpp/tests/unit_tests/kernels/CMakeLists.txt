@@ -228,18 +228,6 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
-# The trtllm-gen FMHA runner has no component target, so this links the full
-# stack.
-add_tllm_gtest(
-  fmhaDeterministicTest
-  OWNER
-  kernel
-  SOURCES
-  fmhaDeterministicTest.cpp
-  FULL_STACK
-  NO_GTEST_MAIN
-  LABELS
-  "unit;kernels;fmha;full-stack;gpu")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

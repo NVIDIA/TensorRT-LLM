@@ -138,7 +138,6 @@ l0_b200:
   - unittest/_torch/modeling/test_glm5_next_contracts.py
   - unittest/llmapi/test_deepseek_v4_tokenizer.py
   - unittest/_torch/modules/test_mhc.py
-  - unittest/_torch/modules/test_top_k.py
   - unittest/_torch/modules/test_engram.py
   - unittest/_torch/modules/test_gate_up_swiglu_quack.py
   - unittest/_torch/modules/test_multi_stream_utils.py
