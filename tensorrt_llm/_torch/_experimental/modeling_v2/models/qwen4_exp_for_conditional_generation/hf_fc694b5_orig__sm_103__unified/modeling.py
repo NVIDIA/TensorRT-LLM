@@ -93,10 +93,10 @@ runs every generation request's `max_draft_len + 1` verify rows:
   the draft-extend step captures each request's selection and the later draft steps rebuild
   theirs from it (`qsa_mtp_reuse_topk`).
 
-Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`), the
-vision tower (a request carrying media is refused at admission), and MTP under attention DP
-(dep4) or with the routed experts split by intermediate (tp4): the draft layer is cut for
-attention TP with whole experts only. Each refusal names what is missing.
+Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`), and
+MTP under attention DP (dep4) or with the routed experts split by intermediate (tp4): the
+draft layer is cut for attention TP with whole experts only. Each refusal names what is
+missing.
 
 Integration facts this file depends on:
 
@@ -131,9 +131,9 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import pool as _pool
