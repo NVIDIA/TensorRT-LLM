@@ -213,8 +213,10 @@ some code changes:
     iteration, check out a new worktree from the commit the base worktree was built at, hard-link the base
     worktree's build outputs (the files Git ignores under `tensorrt_llm/`) into it instead of rebuilding,
     and use `PYTHONPATH` pointing at the new worktree during run time.
-  - Once you know the built artifacts (build directories and container images) at one worktree will
-    never be used again, delete them. If the code needs to be kept, keep note of the branch name, then run
+  - Once you know the built artifacts of one worktree (its build directories and the container images built
+    only for it) will never be used again by any worktree or job, clean up that worktree if user has granted
+    you the permission to delete. If not, add its items to the cleanup list. To clean up, delete the built
+    artifacts. If the code needs to be kept, commit it and keep note of the branch name, then run
     `git worktree remove`. Otherwise, delete the branch and worktree too.
 
 ### GitHub CLI authentication (`GH_CONFIG_DIR`)
