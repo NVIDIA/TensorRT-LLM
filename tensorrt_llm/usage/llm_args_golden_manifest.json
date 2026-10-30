@@ -2077,7 +2077,8 @@
     {
       "allowed_values": [
         "none",
-        "single_turn"
+        "single_turn",
+        "all"
       ],
       "capture_policy": "literal",
       "kind": "categorical",

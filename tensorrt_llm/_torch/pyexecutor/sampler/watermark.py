@@ -25,7 +25,9 @@ host state.
   the slot gets a new occupant and advanced on the device from the tokens that were
   actually committed;
 * a ring of the seeds of recent contexts, used to send a repeated context back to ordinary
-  sampling (``deduplicate_contexts="single_turn"``).
+  sampling (``deduplicate_contexts="single_turn"``); with ``"all"`` the ring starts out holding
+  the contexts of the prompt, and the first ``context_width`` generated tokens of every request
+  stay unwatermarked (a per-slot countdown, ``skip``).
 
 A sampling step covers a *window* of positions per request: one position for plain
 sampling, ``1 + k`` positions when ``k`` draft tokens are verified together. Position ``j``
@@ -97,6 +99,7 @@ class WatermarkRows:
     # Seeds of the second key, for the tokens that follow a rejection (dual-key watermarking
     # with rejection sampling); equal to ``seeds`` when there is a single key.
     seeds_secondary: Optional[torch.Tensor] = None
+    skip: Optional[torch.Tensor] = None  # [B] int64, reference path only (``"all"`` scope)
 
 
 class WatermarkHandler:
@@ -125,7 +128,8 @@ class WatermarkHandler:
         self._step_scratch = StepScratch(num_rows, self._device)
         self._begin_cache: Optional[tuple] = None
         self._tail = torch.full((num_rows, width), PAD_TOKEN, dtype=torch.int64, device=device)
-        self._dedupe = config.deduplicate_contexts == "single_turn"
+        self._dedupe = config.deduplicate_contexts != "none"
+        self._all = config.deduplicate_contexts == "all"
         history = config.deduplicate_contexts_max_history
         self._ring_size = max_seq_len if history is None else min(history, max_seq_len)
         if self._dedupe:
@@ -135,6 +139,8 @@ class WatermarkHandler:
             )
             self._ring_arange = torch.arange(self._ring_size, device=device)
         self._count = torch.zeros(num_rows, dtype=torch.int64, device=device)
+        # Generated tokens each slot still leaves unwatermarked (``"all"`` scope only).
+        self._skip = torch.zeros(num_rows, dtype=torch.int64, device=device) if self._all else None
         self._width_arange = torch.arange(width, device=device)
         # The request object that last took each slot. Compared by identity, not by request id:
         # warmup dummy requests reuse the ids that real requests are given later.
@@ -164,6 +170,7 @@ class WatermarkHandler:
         width = self.config.context_width
         new_slots: list[int] = []
         new_tails: list[list[int]] = []
+        prefills: list[tuple[int, torch.Tensor, int]] = []
         for request in requests:
             slot = request.py_seq_slot
             if slot is None:
@@ -177,9 +184,25 @@ class WatermarkHandler:
             self._slot_neutral[slot] = enabled and is_neutral is not None and is_neutral(request)
             if not enabled:
                 continue
-            tokens = request.get_tokens(0)[-width:]
+            all_tokens = request.get_tokens(0)
+            tokens = all_tokens[-width:]
             new_slots.append(slot)
             new_tails.append([PAD_TOKEN] * (width - len(tokens)) + list(tokens))
+            if self._dedupe:
+                # Seed the repeat ring with the contexts that already exist when the request
+                # reaches the sampler: the generated positions (a request can arrive with tokens
+                # generated elsewhere, or be resumed after a preemption) and, with "all", the
+                # positions of the prompt too. Only the most recent `ring_size` count; the context
+                # of the next position is recorded when it commits.
+                prompt_len = getattr(request, "py_orig_prompt_len", None)
+                if prompt_len is None:
+                    prompt_len = len(all_tokens)
+                start = 0 if self._all else max(prompt_len - width, 0)
+                recent = all_tokens[start:][-(self._ring_size + width) :]
+                generated = len(all_tokens) - prompt_len
+                prefills.append(
+                    (slot, torch.tensor(recent, dtype=torch.int64), max(width - generated, 0))
+                )
         if not new_slots:
             return
         pin = prefer_pinned()
@@ -191,6 +214,15 @@ class WatermarkHandler:
         )
         self._tail.index_copy_(0, slots, tails)
         self._count.index_fill_(0, slots, 0)
+        for slot, recent, skip in prefills:
+            recent = recent.to(self._device, non_blocking=True)
+            num_contexts = max(recent.shape[0] - width, 0)
+            if num_contexts:
+                windows = recent.unfold(0, width, 1)[:num_contexts]
+                self._ring[slot, :num_contexts] = context_seeds_torch(self.config.key, windows)
+            self._count[slot] = num_contexts
+            if self._all:
+                self._skip[slot] = skip
 
     def is_enabled(self, slot: int) -> bool:
         return self._slot_enabled[slot]
@@ -220,6 +252,7 @@ class WatermarkHandler:
             self._keys,
             self._dual,
             drafts,
+            self._skip,
         )
         return WatermarkRows(
             slots=slots,
@@ -263,6 +296,12 @@ class WatermarkHandler:
             same = seeds.unsqueeze(2) == seeds.unsqueeze(1)
             earlier = torch.tril(same, diagonal=-1).any(dim=2)
             active = active & ~(seen.any(dim=2) | earlier)
+        skip = None
+        if self._all:
+            skip = self._skip.index_select(0, slots)
+            active = active & (
+                torch.arange(num_positions, device=skip.device).unsqueeze(0) >= skip.unsqueeze(1)
+            )
         if self._secondary_key == self.config.key:
             seeds_secondary = seeds
         else:
@@ -277,6 +316,7 @@ class WatermarkHandler:
             seeds=seeds,
             active=active,
             seeds_secondary=seeds_secondary,
+            skip=skip,
         )
 
     def plan_draft_step(
@@ -310,6 +350,8 @@ class WatermarkHandler:
             seen &= self._ring_arange.unsqueeze(0) < filled.unsqueeze(1)
             earlier = (prior_seeds == seeds.unsqueeze(1)).any(dim=1)
             active = active & ~(seen.any(dim=1) | earlier)
+        if self._all:
+            active = active & (self._skip.index_select(0, slots) <= prior_drafts.shape[1])
         return seeds, active
 
     def commit(
@@ -340,6 +382,7 @@ class WatermarkHandler:
             self._count,
             self._ring if self._dedupe else None,
             self._ring_size,
+            self._skip,
         )
 
     def commit_reference(
@@ -372,6 +415,8 @@ class WatermarkHandler:
                 (rows.slots.unsqueeze(1).expand(batch, num_positions), target), rows.seeds
             )
         self._count.index_put_((rows.slots,), rows.count + committed)
+        if self._all:
+            self._skip.index_put_((rows.slots,), torch.clamp(rows.skip - committed, min=0))
         # New tail = the last `width` tokens of (old tail ++ the committed tokens).
         history = torch.cat([rows.tail, accepted_tokens.to(torch.int64)], dim=1)
         advanced = history.gather(1, committed.unsqueeze(1) + self._width_arange)
@@ -457,4 +502,5 @@ class WatermarkHandler:
             self._keys,
             self._step_scratch,
             from_probs=from_probs,
+            skip=self._skip,
         )

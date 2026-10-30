@@ -202,6 +202,18 @@ class TestDetector:
             flagged += detector.detect(text, prompt_token_ids=[1, 2, 3]).is_watermarked
         assert flagged / trials < 0.12
 
+    def test_all_scope_scores_what_the_sampler_watermarked(self):
+        prompt, output = [1, 2, 3, 9, 1, 2, 3, 4], [1, 2, 3, 7, 5]  # as in the handler test
+        scored = {
+            scope: GumbelWatermarkDetector(
+                WatermarkConfig(key=7, context_width=3, deduplicate_contexts=scope)
+            )
+            .detect(output, prompt_token_ids=prompt)
+            .num_scored
+            for scope in ("single_turn", "all")
+        }
+        assert scored == {"single_turn": 5, "all": 1}
+
     def test_without_prompt_skips_first_context_width_positions(self):
         config = WatermarkConfig(key=1, context_width=4)
         text = _generate(config, self._zipf(), num_tokens=50, prompt=[1, 2, 3])
@@ -473,7 +485,7 @@ class TestHandler:
             handler.commit(rows, _device([token], torch.int32))
             history.append(token)
 
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn"])
+    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
     @pytest.mark.parametrize("from_probs", [False, True])
     def test_step_matches_plan_draw_commit(self, dedupe, from_probs):
         config = WatermarkConfig(key=99, context_width=3, deduplicate_contexts=dedupe)
@@ -507,9 +519,11 @@ class TestHandler:
             assert torch.equal(actual, expected)
         assert torch.equal(fused._tail, reference._tail)
         assert torch.equal(fused._count, reference._count)
-        if dedupe == "single_turn":
+        if dedupe != "none":
             size = fused._ring_size  # the last column is a trash column
             assert torch.equal(fused._ring[:, :size], reference._ring[:, :size])
+        if dedupe == "all":
+            assert torch.equal(fused._skip, reference._skip)
 
     def test_short_prompt_is_padded(self):
         config, handler = self._handler()
@@ -577,7 +591,37 @@ class TestHandler:
         rows = handler.plan(_device([0]), _device([True], torch.bool), _device([[5, 5]]))
         assert rows.active.tolist() == [[True, False, False]]
 
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn"])
+    def test_all_scope_skips_first_tokens_and_searches_the_prompt(self):
+        prompt = [1, 2, 3, 9, 1, 2, 3, 4]  # holds the contexts [1, 2, 3] and [2, 3, 9]
+        output = [1, 2, 3, 7, 5]  # position 3 has the context [1, 2, 3] of the prompt
+        flags = {}
+        for scope in ("single_turn", "all"):
+            _, handler = self._handler(deduplicate_contexts=scope)
+            handler.observe([_request(1, 0, prompt)], _can_sample)
+            flags[scope] = []
+            for token in output:
+                rows = handler.begin([0])
+                flags[scope].append(bool(rows.active[0, 0]))
+                handler.commit(rows, _device([token], torch.int32))
+        assert flags["single_turn"] == [True] * 5
+        # The first `context_width` tokens are unwatermarked, and so is the prompt repeat.
+        assert flags["all"] == [False, False, False, False, True]
+
+    def test_request_arriving_with_generated_tokens_remembers_their_contexts(self):
+        _, handler = self._handler()
+        tokens = [1, 2, 3, 4, 5, 6, 1]  # prompt [1, 2, 3], four tokens generated elsewhere
+        request = _request(1, 0, tokens)
+        request.py_orig_prompt_len = 3
+        handler.observe([request], _can_sample)
+        flags = []
+        for token in (2, 3, 9):
+            rows = handler.begin([0])
+            flags.append(bool(rows.active[0, 0]))
+            handler.commit(rows, _device([token], torch.int32))
+        # The third position repeats the context [1, 2, 3] of the first generated position.
+        assert flags == [True, True, False]
+
+    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
     def test_speculative_windows_match_plain_decoding(self, dedupe):
         # Whatever the draft quality, the seeds of the committed positions and the final state
         # must equal those of one-token-at-a-time decoding of the same output.
@@ -640,7 +684,7 @@ def _twin_handlers(**config_kwargs):
 class TestFusedKernels:
     """The fused plan and commit kernels must match the plain-torch reference exactly."""
 
-    @pytest.mark.parametrize("dedupe", ["none", "single_turn"])
+    @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
     @pytest.mark.parametrize("algorithm", ["gumbel", "gumbel_dual_key"])
     @pytest.mark.parametrize("num_drafts", [0, 1, 3])
     def test_matches_reference_over_random_steps(self, dedupe, algorithm, num_drafts):
@@ -666,10 +710,12 @@ class TestFusedKernels:
             reference.commit_reference(expected, accepted, num_accepted)
             assert torch.equal(fused._tail, reference._tail)
             assert torch.equal(fused._count, reference._count)
-            if dedupe == "single_turn":
+            if dedupe != "none":
                 assert torch.equal(
                     fused._ring[:, : fused._ring_size], reference._ring[:, : reference._ring_size]
                 )
+            if dedupe == "all":
+                assert torch.equal(fused._skip, reference._skip)
 
     def test_inactive_and_padding_rows_keep_their_state(self):
         _, (fused, reference) = _twin_handlers()

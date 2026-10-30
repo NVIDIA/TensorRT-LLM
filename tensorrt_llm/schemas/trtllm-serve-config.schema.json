@@ -6454,10 +6454,11 @@
         },
         "deduplicate_contexts": {
           "default": "single_turn",
-          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within one generation.",
+          "description": "How repeated contexts are treated. A repeated context would repeat its token and be counted as independent evidence, so it falls back to ordinary sampling. 'none' disables this; 'single_turn' deduplicates within the tokens this request generates; 'all' also searches the prompt (for instance earlier turns of a conversation) and leaves the first context_width generated tokens unwatermarked, so short answers do not share a random context across requests.",
           "enum": [
             "none",
-            "single_turn"
+            "single_turn",
+            "all"
           ],
           "title": "Deduplicate Contexts",
           "type": "string"

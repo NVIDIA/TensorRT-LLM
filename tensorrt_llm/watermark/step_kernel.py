@@ -72,6 +72,7 @@ def _step_kernel(
     partial_value_ptr,
     partial_index_ptr,
     counter_ptr,
+    skip_ptr,
     stride_values,
     stride_tail,
     stride_ring,
@@ -82,6 +83,7 @@ def _step_kernel(
     BLOCK_WIDTH: tl.constexpr,
     FROM_PROBS: tl.constexpr,
     DEDUPE: tl.constexpr,
+    SKIP: tl.constexpr,
     HAS_FALLBACK: tl.constexpr,
     BLOCK: tl.constexpr,
     CHUNK: tl.constexpr,
@@ -154,6 +156,9 @@ def _step_kernel(
 
         count = tl.load(count_ptr + slot)
         active = enabled
+        if SKIP:
+            # The first generated tokens of a request stay unwatermarked.
+            active = active & (tl.load(skip_ptr + slot) <= 0)
         if DEDUPE:
             filled = tl.minimum(count, ring_size)
             ring_row = ring_ptr + slot * stride_ring
@@ -179,6 +184,8 @@ def _step_kernel(
             if DEDUPE:
                 tl.store(ring_ptr + slot * stride_ring + count % ring_size, seed_signed)
             tl.store(count_ptr + slot, count + 1)
+            if SKIP:
+                tl.store(skip_ptr + slot, tl.maximum(tl.load(skip_ptr + slot) - 1, 0))
 
 
 def watermark_step(
@@ -195,6 +202,7 @@ def watermark_step(
     scratch: StepScratch,
     *,
     from_probs: bool,
+    skip: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """One decode step for ``R`` rows. Device-only; safe to capture in a CUDA graph.
 
@@ -211,6 +219,7 @@ def watermark_step(
         tail, count, ring, ring_size, keys: the slot state of
             :class:`~tensorrt_llm._torch.pyexecutor.sampler.watermark.WatermarkHandler`.
         scratch: partial-result buffers with at least ``R`` rows.
+        skip: optional ``[rows]`` int64, generated tokens each slot still leaves unwatermarked.
 
     Returns:
         ``[R]`` int32 tokens.
@@ -237,6 +246,7 @@ def watermark_step(
         scratch.value,
         scratch.index,
         scratch.counter,
+        skip if skip is not None else count,
         values.stride(0),
         tail.stride(0),
         ring.stride(0) if ring is not None else 0,
@@ -249,6 +259,7 @@ def watermark_step(
         BLOCK_WIDTH=triton.next_power_of_2(width),
         FROM_PROBS=from_probs,
         DEDUPE=ring is not None,
+        SKIP=skip is not None,
         HAS_FALLBACK=fallback is not None,
         BLOCK=_BLOCK,
         CHUNK=_CHUNK,
@@ -263,7 +274,7 @@ def watermark_step(
     key = (
         values.dtype,
         values.data_ptr() % 16 == 0,
-        tuple(runtime_args[13:]),
+        tuple(runtime_args[14:]),
         tuple(constexprs.values()),
     )
     compiled = _COMPILED.get(key)
