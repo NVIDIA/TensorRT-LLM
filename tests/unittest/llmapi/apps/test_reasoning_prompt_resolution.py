@@ -156,13 +156,15 @@ class _FakeResult:
     ("template_kwargs", "expected"),
     [(None, True), ({"enable_thinking": False}, False)],
 )
-@pytest.mark.parametrize("parser_name", ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone"])
+@pytest.mark.parametrize(
+    "parser_name",
+    ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone", "glm", "glm45", "glm47", "glm_moe_dsa"],
+)
 def test_context_worker_stamps_the_resolved_mode(
     template_kwargs: dict[str, bool] | None, expected: bool, parser_name: str
 ) -> None:
     """Calls the real handler, so dropping the stamp fails this test."""
-    args = build_args(render(template_kwargs), template_kwargs)
-    args.reasoning_parser = parser_name
+    args = build_args(render(template_kwargs), template_kwargs, reasoning_parser=parser_name)
 
     response = chat_response_post_processor(_FakeResult("hidden</think>visible"), args)
 
@@ -180,7 +182,10 @@ def test_context_worker_does_not_stamp_for_other_parsers() -> None:
 
 
 @pytest.mark.parametrize("relayed", [True, False])
-@pytest.mark.parametrize("parser_name", ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone"])
+@pytest.mark.parametrize(
+    "parser_name",
+    ["poolside_v1", "nemotron-v3", "nano-v3", "k-exaone", "glm", "glm47", "glm_moe_dsa"],
+)
 def test_relayed_mode_drives_the_parser(relayed: bool, parser_name: str) -> None:
     """Contract the generation worker relies on, given a relayed value.
 
@@ -254,3 +259,75 @@ def test_minimax_m3_context_worker_stamps_adaptive_prompt_as_off() -> None:
     response = chat_response_post_processor(_FakeResult(M3_OUTPUT), args)
 
     assert response.choices[0].disaggregated_params.resolved_thinking is False
+
+
+# The generation prompt of each GLM chat template family, as the template writes it.
+GLM_GENERATION_PROMPTS = {
+    # GLM-4.5 and GLM-4.6 prefill nothing unless thinking is off.
+    "glm-4.6": "'\\n<think></think>' if (enable_thinking is defined and not enable_thinking) else ''",
+    "glm-4.7": "'</think>' if (enable_thinking is defined and not enable_thinking) else '<think>'",
+    "glm-5.2": "'<think></think>' if (enable_thinking is defined and not enable_thinking) else '<think>'",
+    # GLM-5.3 opens the block whatever enable_thinking says.
+    "glm-5.3": "'<think>'",
+}
+
+
+def render_glm(template: str, chat_template_kwargs: dict | None) -> str:
+    source = (
+        "{%- for m in messages -%}<|{{ m.role }}|>{{ m.content }}{%- endfor -%}"
+        "{%- if add_generation_prompt -%}<|assistant|>{{- "
+        + GLM_GENERATION_PROMPTS[template]
+        + " -}}{%- endif -%}"
+    )
+    return (
+        jinja2.Environment()
+        .from_string(source)
+        .render(messages=MESSAGES, add_generation_prompt=True, **(chat_template_kwargs or {}))
+    )
+
+
+OFF = {"enable_thinking": False}
+
+
+@pytest.mark.parametrize(
+    ("template", "parser_name", "request_kwargs", "output", "content", "reasoning"),
+    [
+        ("glm-5.3", "glm_moe_dsa", None, "hidden</think>visible", "visible", "hidden"),
+        ("glm-5.3", "glm_moe_dsa", OFF, "hidden</think>visible", "visible", "hidden"),
+        ("glm-5.3", "glm", OFF, "hidden</think>visible", "visible", "hidden"),
+        ("glm-5.2", "glm_moe_dsa", None, "hidden</think>visible", "visible", "hidden"),
+        ("glm-5.2", "glm_moe_dsa", OFF, "visible", "visible", ""),
+        (
+            "glm-4.7",
+            "glm47",
+            {"enable_thinking": True},
+            "hidden</think>visible",
+            "visible",
+            "hidden",
+        ),
+        ("glm-4.7", "glm47", OFF, "visible", "visible", ""),
+        ("glm-4.6", "glm45", None, "\n<think>hidden</think>visible", "visible", "hidden"),
+        ("glm-4.6", "glm45", OFF, "visible", "visible", ""),
+    ],
+)
+def test_each_glm_template_sets_the_mode(
+    template: str,
+    parser_name: str,
+    request_kwargs: dict | None,
+    output: str,
+    content: str,
+    reasoning: str,
+) -> None:
+    """The mode the template rendered wins over the request's `enable_thinking`."""
+    args = build_args(
+        render_glm(template, request_kwargs), request_kwargs, reasoning_parser=parser_name
+    )
+
+    whole = apply_reasoning_parser(args, 0, output, streaming=False)
+    deltas = [
+        apply_reasoning_parser(args, 1, char, streaming=True, finished=i == len(output) - 1)
+        for i, char in enumerate(output)
+    ]
+
+    assert whole == (content, reasoning)
+    assert ("".join(c for c, _ in deltas), "".join(r for _, r in deltas)) == whole

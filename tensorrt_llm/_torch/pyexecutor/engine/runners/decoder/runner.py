@@ -36,6 +36,11 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import PendingBeamHistories
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -127,6 +132,9 @@ class PrefillCompiledModel(torch.nn.Module):
 class DecoderRunner(ScheduledModelRunner):
     """Run scheduled decoder generation with its own buffers, graphs and metadata."""
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
+
     # Optional execution paths that a subclass can turn off.
     _context_warmups_supported = True
     _context_graph_promotion_supported = True
@@ -204,6 +212,8 @@ class DecoderRunner(ScheduledModelRunner):
         self._dummy_requests = self._make_dummy_requests()
         self._init_decoder_state()
         self._inputs = self._make_input_preparer(mm_item_scheduler)
+        self.runtime_hooks = runtime_hooks_of(self._model)
+        self._inputs.decode_prologue = self.runtime_hooks.decode_prologue
         self._graphs = self._make_cuda_graphs()
         self._inputs.cuda_graph_runner = self.cuda_graph_runner
         self._initialize_moe_workspace_reclaimer()

@@ -64,6 +64,13 @@
           "title": "Enable Balance",
           "type": "boolean"
         },
+        "enable_kv_balanced_admission": {
+          "default": false,
+          "description": "Admit generation-only requests by per-rank KV load. When True and the first 32 queued requests are all generation-only requests without an attention_dp_rank, the attention DP router chooses which of them to admit and which rank takes each, keeping the largest per-rank request count and KV token count low, instead of admitting them in queue order. Request priorities are respected, and a request passed over in 64 admitting rounds is admitted next. Useful on disaggregated generation workers. Has no effect with kv_cache_routing_conversation_affinity, or with enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+          "status": "prototype",
+          "title": "Enable Kv Balanced Admission",
+          "type": "boolean"
+        },
         "enable_kv_cache_aware_routing": {
           "default": false,
           "description": "Enable internal KV cache-aware routing for attention DP. When enabled, distributes requests among ranks within a single instance's attention DP group, routing them to the rank with the matching prefix KV cache to reduce redundant prefill computation.",
@@ -3676,19 +3683,6 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
-        },
         "sa_config": {
           "anyOf": [
             {
@@ -3973,19 +3967,6 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
-        },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
         },
         "spec_dec_variant": {
           "default": 3,

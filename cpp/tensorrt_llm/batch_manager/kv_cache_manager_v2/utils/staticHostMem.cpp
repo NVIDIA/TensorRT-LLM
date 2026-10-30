@@ -42,7 +42,10 @@ void StaticHostMem::Deleter::operator()(void* ptr) const noexcept
 
 StaticHostMem::StaticHostMem(size_t size)
 {
-    TLLM_CHECK_WITH_INFO(size > 0, "StaticHostMem size must be non-zero");
+    if (size == 0)
+    {
+        return;
+    }
     void* ptr = nullptr;
     cuCheck(cuMemHostAlloc(&ptr, size, CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP));
     mPtr.reset(ptr);

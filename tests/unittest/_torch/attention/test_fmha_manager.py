@@ -976,3 +976,60 @@ def test_update_quant_config_replaces_manager_with_fresh_cache() -> None:
     assert isinstance(attn._fmha_manager.fmha_libs[0], _NewFmha)
     assert quant_states_during_construction == [True]
     assert events == [("support", "old", None)]
+
+
+def _listed_fmha(name: str, available: bool, checked: list) -> type:
+    """An FMHA library class that records its availability check."""
+
+    def is_available(cls, attn) -> bool:
+        checked.append((name, attn))
+        return available
+
+    return type(
+        name,
+        (),
+        {"is_available": classmethod(is_available), "__init__": lambda self, attn: None},
+    )
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "empty"])
+def test_manager_without_prepended_libraries_builds_the_registry_list(declared: bool) -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked), _listed_fmha("Second", True, checked)]
+    attn = FakeAttention()
+    if declared:
+        attn.prepended_fmha_lib_classes = ()
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == registry
+    assert TrtllmAttention.prepended_fmha_lib_classes == ()
+
+
+def test_manager_tries_a_prepended_library_first() -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked), _listed_fmha("Second", True, checked)]
+    prepended = _listed_fmha("Prepended", True, checked)
+    attn = FakeAttention()
+    attn.prepended_fmha_lib_classes = (prepended,)
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == [prepended, *registry]
+    assert [name for name, _ in checked] == ["Prepended", "First", "Second"]
+    assert all(checked_attn is attn for _, checked_attn in checked)
+
+
+def test_manager_skips_an_unavailable_prepended_library() -> None:
+    checked: list = []
+    registry = [_listed_fmha("First", True, checked)]
+    attn = FakeAttention()
+    attn.prepended_fmha_lib_classes = (_listed_fmha("Prepended", False, checked),)
+
+    with patch.object(fmha_manager, "get_enabled_fmha_lib_classes", return_value=registry):
+        manager = FmhaManager(attn)
+
+    assert [type(lib) for lib in manager.fmha_libs] == registry
+    assert [name for name, _ in checked] == ["Prepended", "First"]

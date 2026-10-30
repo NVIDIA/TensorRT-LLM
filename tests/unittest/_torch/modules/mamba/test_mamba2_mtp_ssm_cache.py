@@ -182,8 +182,16 @@ class TestMamba2MTPSSMCache:
         std = 0.5
 
         # SSM state
-        state = torch.randn(batch_size, nheads, head_dim, ssm_dim, device=device, dtype=dtype) * std
+        pool_size = batch_size if batch_size == 1 else 2 * batch_size + 3
+        state_size = nheads * head_dim * ssm_dim
+        # Exercise a hybrid pool with an aligned storage offset and conv-state gaps.
+        padding = 0 if batch_size == 1 else 32
+        backing = torch.randn(pool_size, state_size + padding, device=device, dtype=dtype) * std
+        offset = padding // 2
+        state = backing[:, offset : offset + state_size].view(pool_size, nheads, head_dim, ssm_dim)
+        backing_before = backing.clone()
         state_ref = state.clone()
+        disable_state_update = cache_steps == 4
 
         # Input tensors
         x = torch.randn(batch_size, cache_steps, nheads, head_dim, device=device, dtype=dtype) * std
@@ -214,6 +222,9 @@ class TestMamba2MTPSSMCache:
 
         # state_batch_indices
         state_batch_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
+        if batch_size > 1:
+            state_batch_indices = state_batch_indices * 2 + 2
+            state_batch_indices[-1] = -1
 
         # intermediate_state_indices
         intermediate_state_indices = torch.arange(batch_size, device=device, dtype=torch.int32)
@@ -236,6 +247,10 @@ class TestMamba2MTPSSMCache:
         )
         intermediate_ref = intermediate_kernel.clone()
 
+        # The wrapper must not stage a contiguous copy of the hybrid pool.
+        torch.cuda.reset_peak_memory_stats()
+        allocated_before = torch.cuda.memory_allocated()
+
         # Run CUDA kernel
         selective_state_update_mtp_ssm_cache_trtllm(
             state,
@@ -253,10 +268,12 @@ class TestMamba2MTPSSMCache:
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
             pad_slot_id=-1,
-            disable_state_update=True,
+            disable_state_update=disable_state_update,
             retrieve_parent_token=retrieve_parent_token,
             intermediate_state_indices=intermediate_state_indices,
         )
+
+        assert torch.cuda.max_memory_allocated() == allocated_before
 
         # Run PyTorch reference
         out_ref, intermediate_ref = mamba2_mtp_ssm_cache_ref(
@@ -275,7 +292,7 @@ class TestMamba2MTPSSMCache:
             dt_softplus=True,
             state_batch_indices=state_batch_indices,
             pad_slot_id=-1,
-            disable_state_update=True,
+            disable_state_update=disable_state_update,
             retrieve_parent_token=retrieve_parent_token,
             intermediate_state_indices=intermediate_state_indices,
         )
@@ -299,3 +316,14 @@ class TestMamba2MTPSSMCache:
             f"Too many intermediate_states mismatches: {mismatch_frac:.6f} "
             f"(> 0.01%), max diff = {inter_diff.max().item():.4f}"
         )
+
+        # Only selected SSM slots may change; conv gaps and parked slots retain their contents.
+        if disable_state_update:
+            torch.testing.assert_close(backing, backing_before, rtol=0, atol=0)
+        else:
+            expected_backing = backing_before.clone()
+            expected_state = expected_backing[:, offset : offset + state_size].view_as(state)
+            for row, slot in enumerate(state_batch_indices.tolist()):
+                if slot != -1:
+                    expected_state[slot].copy_(intermediate_kernel[row, -1])
+            torch.testing.assert_close(backing, expected_backing, rtol=0, atol=0)

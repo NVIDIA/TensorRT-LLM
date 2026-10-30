@@ -31,6 +31,8 @@ def _executor() -> PyExecutor:
     executor.enable_attention_dp = False
     executor._kv_connector_failed = False
     executor._kv_connector_has_pending = False
+    executor._closed = False
+    executor._resources_released = False
     executor.kv_connector_manager = Mock(spec=KvCacheConnectorManager)
     # Set explicitly: `capacity_only` is not on the spec, so a double that
     # leaves it unset fails loudly rather than silently lifting the executor

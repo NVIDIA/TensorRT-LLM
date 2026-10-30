@@ -214,7 +214,6 @@ def test_docs_stage_matches_jenkins_stage_key() -> None:
 @pytest.mark.parametrize(
     "path",
     (
-        "tests/integration/defs/verl/.gitignore",
         "tests/integration/test_lists/qa/.gitignore",
         "tests/unittest/new/nested/.gitignore",
     ),
@@ -582,7 +581,6 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         "cpp/kernels/fmha_v2/.gitignore",
         "cpp/tests/resources/.gitignore",
         "scripts/attribution/sbom/.gitignore",
-        "tests/integration/defs/verl/.gitignore",
         "new/nested/.gitignore",
         ".github/ISSUE_TEMPLATE/01-installation.yml",
         ".github/ISSUE_TEMPLATE/02-new-model.yml",
