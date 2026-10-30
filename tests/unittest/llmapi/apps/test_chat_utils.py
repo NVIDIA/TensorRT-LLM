@@ -1070,6 +1070,38 @@ class TestRequestLocalMediaPaths:
             await self._load(f"file://{fifo}")
 
     @pytest.mark.asyncio
+    async def test_decoder_reads_the_opened_file_not_the_path(self, monkeypatch, media_dirs):
+        """Once opened and checked, the file is decoded even if its path names another file."""
+        from PIL import Image
+
+        from tensorrt_llm.inputs import media_io
+
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        path = allowed / "img.png"  # 8x8 from the fixture
+        real_open = media_io.open_allowed_local_media
+
+        def open_then_replace(url):
+            fd = real_open(url)
+            replacement = allowed / "replacement.png"
+            Image.new("RGB", (4, 4), (255, 0, 0)).save(replacement)
+            os.replace(replacement, path)
+            return fd
+
+        monkeypatch.setattr(media_io, "open_allowed_local_media", open_then_replace)
+        image = await self._load(f"file://{path}")
+        assert tuple(image.shape) == (3, 8, 8)
+
+    @pytest.mark.asyncio
+    async def test_loaded_without_descriptor_directory(self, monkeypatch, media_dirs):
+        """Without /proc/self/fd the open file is read into memory and decoded from bytes."""
+        allowed, _ = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        monkeypatch.setattr("tensorrt_llm.inputs.media_io._DESCRIPTOR_DIR", None)
+        image = await self._load(f"file://{allowed}/img.png")
+        assert tuple(image.shape) == (3, 8, 8)
+
+    @pytest.mark.asyncio
     async def test_misconfigured_directory_refused_generically(
         self, monkeypatch, tmp_path, media_dirs
     ):
