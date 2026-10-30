@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # aiperf-based benchmark script for disaggregated serving
 # Args: model_name dataset_file multi_round num_gen_servers concurrency_list streaming log_path hostname port ucx_warmup_requests
@@ -30,10 +32,13 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-# Always install/upgrade aiperf to ensure we have the version with trust_remote_code fix
-# (container may have an older version with parallel_decode.py that lacks trust_remote_code)
-echo "Installing aiperf..."
-pip install --force-reinstall --no-deps 'aiperf @ git+https://github.com/ai-dynamo/aiperf.git@ac3d91652e5e024bfb4ac38d48603423aad666bc'
+benchmark_root=${TRTLLM_BENCHMARK_ENV_ROOT:-/opt/trtllm-benchmark-tools}
+benchmark_python=${TRTLLM_AIPERF_PYTHON:-"$benchmark_root/stock/bin/python"}
+benchmark_repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)
+if ! command -v "$benchmark_python" >/dev/null 2>&1; then
+    echo "Install the benchmark client with scripts/install_benchmark_tools.py before launching." >&2
+    exit 1
+fi
 
 # warmup requests for ucx connections
 if [ "${ucx_warmup_requests}" -gt 0 ]; then
@@ -68,7 +73,11 @@ for concurrency in ${concurrency_list}; do
     echo "Benchmarking with concurrency ${concurrency} ... ${request_count} requests, duration ${benchmark_duration}s"
     mkdir -p ${log_path}/concurrency_${concurrency}
 
-    aiperf profile \
+    python3 "$benchmark_repo/scripts/install_benchmark_tools.py" \
+        --profile stock --client-python "$benchmark_python" \
+        --export-environment "$log_path/concurrency_${concurrency}/client_environment.json"
+
+    "$benchmark_python" -I -m aiperf profile \
         -m ${model_name} \
         --tokenizer ${model_name} \
         --tokenizer-trust-remote-code \

@@ -21,10 +21,12 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from collections import deque, namedtuple
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -2430,8 +2432,7 @@ def enforce_aiperf_error_rate(artifact_dir,
     (HTTP 499 / RequestCancellationError) are excluded from both the numerator
     and the denominator — stress tests cancel a fraction of requests on purpose.
 
-    Record schema validated against aiperf==0.8.0 (the pin in
-    requirements-dev.txt): each JSONL line is a MetricRecordInfo object
+    Each JSONL line is a MetricRecordInfo object
     ({"metadata", "metrics", "error"}), and both cancellation construction
     sites in aiperf's aiohttp client emit exactly error.code == 499 with
     error.type == "RequestCancellationError". Reference gate output from the
@@ -2471,8 +2472,8 @@ def enforce_aiperf_error_rate(artifact_dir,
             if not isinstance(record, dict) or ("metrics" not in record
                                                 and "error" not in record):
                 # Non-request records would inflate the denominator and
-                # under-report the rate. The aiperf==0.8.0 record export is
-                # request-only, but stay robust to future metadata additions.
+                # under-report the rate. Stay robust to metadata additions
+                # outside the request records.
                 non_request += 1
                 continue
             total += 1
@@ -2610,10 +2611,14 @@ def run_disaggregated_aiperf(config_file,
                 f"Disaggregated server did not become ready within {server_start_timeout} seconds"
             )
 
-        # Build base command (using aiperf instead of genai-perf)
+        benchmark_root = Path(
+            env.get("TRTLLM_BENCHMARK_ENV_ROOT", "/opt/trtllm-benchmark-tools"))
+        client_python = env.get("TRTLLM_AIPERF_PYTHON",
+                                str(benchmark_root / "stock/bin/python"))
         aiperf_cmd = [
-            'aiperf', 'profile', '--model', model_path, '--tokenizer',
-            model_path, '--endpoint-type', endpoint_type
+            client_python, '-I', '-m', 'aiperf', 'profile', '--model',
+            model_path, '--tokenizer', model_path, '--endpoint-type',
+            endpoint_type
         ]
 
         # Add endpoint path based on type
@@ -2678,6 +2683,16 @@ def run_disaggregated_aiperf(config_file,
 
         # Run aiperf
         all_worker_procs = [w.process for w in ctx_workers + gen_workers]
+        setup_script = Path(__file__).resolve(
+        ).parents[4] / "scripts/install_benchmark_tools.py"
+        check_call([
+            sys.executable,
+            str(setup_script), '--profile', 'stock', '--client-python',
+            client_python, '--export-environment',
+            str(Path(artifact_dir) / 'client_environment.json')
+        ],
+                   env=env,
+                   poll_procs=all_worker_procs + [disagg_server.process])
         check_call(aiperf_cmd,
                    env=env,
                    poll_procs=all_worker_procs + [disagg_server.process])

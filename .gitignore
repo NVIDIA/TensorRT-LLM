@@ -131,3 +131,6 @@ examples/kimi_k3/.eval_dflash_runtime.*.yaml
 
 # Media a VisualGen server generates, when it is started from the checkout
 trtllm_generated/
+
+# Isolated benchmark clients created by the setup guide.
+.benchmark-tools/

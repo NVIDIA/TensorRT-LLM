@@ -81,8 +81,7 @@ def _probe(client: ModuleType, monkeypatch, site: Path) -> tuple[bool, str]:
 
 
 def test_upstream_aiperf_is_not_usable(client: ModuleType, monkeypatch, tmp_path: Path):
-    # requirements-dev.txt installs the PyPI aiperf, which has no AgentX scenario
-    # and rejects --scenario; it must trigger the fork install, not skip it.
+    # Stock AIPerf has no AgentX scenario and must fail the fork preflight.
     _write_stub_site(tmp_path, fork=False)
     usable, log = _probe(client, monkeypatch, tmp_path)
     assert not usable
@@ -134,7 +133,21 @@ def test_command_keeps_special_tokens_in_the_text(client: ModuleType, monkeypatc
 
 
 def test_command_runs_aiperf_from_the_checked_interpreter(client: ModuleType, monkeypatch):
-    # The probe and the install use sys.executable; a bare "aiperf" on PATH could be
-    # another installation, e.g. the upstream build without the AgentX scenario.
+    # The probe and workload must use the same isolated fork environment.
     cmd = _default_cmd(client, monkeypatch)
-    assert cmd[:4] == [sys.executable, "-m", "aiperf", "profile"]
+    assert cmd[:5] == [client._agentx_python(), "-I", "-m", "aiperf", "profile"]
+
+
+def test_missing_isolated_environment_does_not_use_ambient_python(
+    client: ModuleType, monkeypatch, tmp_path: Path
+):
+    monkeypatch.delenv("AGENTX_FORCE_REINSTALL", raising=False)
+    monkeypatch.setenv("AGENTX_PYTHON", str(tmp_path / "missing-python"))
+    with pytest.raises(RuntimeError, match="during setup"):
+        client.ensure_aiperf()
+
+
+def test_benchmark_rejects_install_request(client: ModuleType, monkeypatch):
+    monkeypatch.setenv("AGENTX_FORCE_REINSTALL", "1")
+    with pytest.raises(RuntimeError, match="during setup"):
+        client.ensure_aiperf()

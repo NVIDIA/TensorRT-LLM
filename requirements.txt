@@ -5,6 +5,7 @@
 filelock==3.20.3; python_version < "3.11"
 filelock>=4.2.1; python_version >= "3.11"
 accelerate>=1.7.0
+aiohttp>=3.14.4
 build
 colored
 cuda-python>=13

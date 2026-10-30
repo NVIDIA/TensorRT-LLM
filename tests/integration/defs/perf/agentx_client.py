@@ -24,7 +24,7 @@ to give it, and the run length is time-bounded.
 
 This module is the adapter between the perf-sanity harness and that client. It
 
-1. installs the pinned ``agentx-harness`` build (see ``AGENTX_AIPERF_REF``),
+1. checks the separately installed ``agentx-harness`` environment,
 2. verifies the endpoint really serves one token before spending GPU-hours,
 3. runs ``aiperf profile``, and
 4. translates ``profile_export_aiperf.json`` into the exact stdout lines that
@@ -58,54 +58,15 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
-
-# Pinned agentx-harness build. It installs *as* ``aiperf`` (shadowing any
-# PyPI aiperf), so the version is pinned by commit rather than by release.
-DEFAULT_AIPERF_REF = (
-    "git+https://github.com/SemiAnalysisAI/agentx-harness.git"
-    "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
-)
+from pathlib import Path
 
 # aiperf's idle-connection keep-alive, in seconds. Must stay below the server's
 # own keep-alive timeout: trtllm-serve's is 5 s (TIMEOUT_KEEP_ALIVE in
 # tensorrt_llm/serve/openai_server.py).
 AIPERF_HTTP_KEEPALIVE_TIMEOUT_S = 4
-
-# aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
-# carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
-# only this set has been verified to add packages without reinstalling the
-# pinned scientific stack.
-AIPERF_EXTRA_DEPS = [
-    "cyclopts",
-    "ruamel.yaml",
-    "msgspec",
-    "orjson",
-    "kaleido",
-    "dash",
-    "dash-bootstrap-components",
-    "textual",
-    "starlette-compress",
-    "setproctitle",
-    "jmespath",
-    "aiofiles",
-    "ffmpeg-python",
-    "pydantic-settings",
-    "prometheus_client",
-    "fastapi",
-    "soundfile",
-    "plotly",
-    "seaborn",
-    "tiktoken",
-    "tqdm",
-    "uvicorn[standard]",
-    "uvloop",
-    "crick",
-    "zstandard",
-]
 
 # The container ships datasets 3.x, which cannot parse the trace corpus schema
 # ("Feature type 'Json' not found"). 4.x+ is required.
@@ -115,12 +76,6 @@ MIN_DATASETS_MAJOR = 4
 # fork registers it, so its presence is also how the fork is told apart from the
 # upstream PyPI aiperf of the same import name.
 AGENTX_SCENARIO = "inferencex-agentx-mvp"
-
-# PyExecutor's HangDetector is hard-coded at 300 s with no env override, so a
-# multi-minute pip install with zero requests in flight idles the GEN worker
-# into MPI_Abort -- which then presents as a *client* connection failure. A
-# best-effort 1-token request on this period keeps the executor awake.
-HEARTBEAT_PERIOD_S = 60
 
 # Mapping from perf-sanity's report labels to aiperf metric fields.
 #
@@ -182,21 +137,20 @@ def _env_float(name: str, default: float) -> float:
     return float(os.environ.get(name, default))
 
 
+def _agentx_python() -> str:
+    root = Path(os.environ.get("TRTLLM_BENCHMARK_ENV_ROOT", "/opt/trtllm-benchmark-tools"))
+    return os.environ.get("AGENTX_PYTHON", str(root / "agentx" / "bin" / "python"))
+
+
+def _agentx_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "CONDA_PREFIX"):
+        env.pop(key, None)
+    return env
+
+
 def aiperf_is_usable() -> bool:
-    """Return whether the ambient interpreter already has a working agentx stack.
-
-    Checks importability, that the ``aiperf`` found is the agentx-harness fork
-    (it alone ships the ``inferencex-agentx-mvp`` scenario), *and* the datasets
-    major version, since a container with aiperf but datasets 3.x fails only
-    later, when loading the corpus. The fork check matters because
-    requirements-dev.txt pins the upstream PyPI ``aiperf``, which imports fine
-    but rejects ``--scenario`` at the start of the run.
-
-    The scenario is looked up through ``aiperf.common.scenario.registry``, the
-    module path in the pinned ``DEFAULT_AIPERF_REF`` build. The reason for a
-    failed probe is logged, so a fork that moves that module shows up as such
-    instead of as a reinstall on every run.
-    """
+    """Check the isolated client's fork-only scenario and dataset support."""
     probe = (
         "import sys\n"
         "try:\n"
@@ -216,7 +170,11 @@ def aiperf_is_usable() -> bool:
         f"    sys.exit(f'datasets {{datasets.__version__}} < {MIN_DATASETS_MAJOR}')\n"
     )
     result = subprocess.run(
-        [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        [_agentx_python(), "-I", "-c", probe],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=_agentx_environment(),
     )
     if result.returncode != 0:
         lines = result.stderr.strip().splitlines()
@@ -275,59 +233,22 @@ def post_one_token(
         return None
 
 
-class _Heartbeat:
-    """Keeps the GEN worker's hang detector at bay during a long pip install."""
-
-    def __init__(self, url: str, model: str):
-        self._url = url
-        self._model = model
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        while not self._stop.wait(HEARTBEAT_PERIOD_S):
-            # Best-effort by construction: post_one_token swallows every
-            # network error, so the heartbeat can never fail the run.
-            post_one_token(self._url, self._model, timeout=60)
-
-    def __enter__(self) -> "_Heartbeat":
-        self._thread.start()
-        _log(f"heartbeat armed ({HEARTBEAT_PERIOD_S}s) to hold off the 300s hang detector")
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self._stop.set()
-        self._thread.join(timeout=HEARTBEAT_PERIOD_S + 30)
-
-
-def _pip(*args: str) -> None:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *args])
-
-
-def ensure_aiperf(url: str, model: str) -> None:
-    """Install the pinned agentx build unless a usable one is already present."""
+def ensure_aiperf() -> None:
+    """Require an explicitly prepared AgentX environment before benchmarking."""
     if os.environ.get("AGENTX_FORCE_REINSTALL", "0") == "1":
-        _log("AGENTX_FORCE_REINSTALL=1 -> reinstalling unconditionally")
-    elif aiperf_is_usable():
-        _log("aiperf + deps already usable; skipping install")
-        return
-
-    ref = os.environ.get("AGENTX_AIPERF_REF", DEFAULT_AIPERF_REF)
-    with _Heartbeat(url, model):
-        _log(f"installing aiperf (agentx) from {ref}")
-        _pip("--force-reinstall", "--no-deps", f"aiperf @ {ref}")
-        _pip(*AIPERF_EXTRA_DEPS)
-        _pip("-U", "datasets")
-        _pip("transformers==5.8.1")
-        # aiperf needs a newer pydantic than the container pins, but its own
-        # dependency resolution would drag in a fresh ML stack; pin the pair
-        # directly with --no-deps instead.
-        _pip("--force-reinstall", "--no-deps", "pydantic==2.12.5", "pydantic-core==2.41.5")
-
-    if not aiperf_is_usable():
         raise RuntimeError(
-            "aiperf is still not importable after install; refusing to start the "
-            "benchmark (see the pip output above)"
+            "Run scripts/install_benchmark_tools.py --profile agentx during setup, "
+            "then unset AGENTX_FORCE_REINSTALL before benchmarking."
+        )
+    try:
+        usable = aiperf_is_usable()
+    except FileNotFoundError:
+        usable = False
+    if not usable:
+        raise RuntimeError(
+            "AgentX benchmark environment is unavailable. Run "
+            "python3 scripts/install_benchmark_tools.py --profile agentx during setup. "
+            "Use TRTLLM_BENCHMARK_ENV_ROOT or AGENTX_PYTHON for a custom location."
         )
 
 
@@ -373,13 +294,12 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     ``--endpoint``. That is why this client takes ``--host``/``--port`` and
     composes them itself instead of having them appended to the argv.
 
-    aiperf runs as ``python -m aiperf`` under ``sys.executable``, the interpreter
-    that ``aiperf_is_usable`` checked and ``ensure_aiperf`` installed into. A bare
-    ``aiperf`` on PATH could be a different installation, such as the upstream
-    PyPI build that has no AgentX scenario.
+    The probe and workload use the same isolated interpreter. The stock
+    ``aiperf`` executable does not provide the fork-only AgentX scenario.
     """
     cmd = [
-        sys.executable,
+        _agentx_python(),
+        "-I",
         "-m",
         "aiperf",
         "profile",
@@ -649,7 +569,7 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     # connections on the client side first avoids that.
     os.environ.setdefault("AIPERF_HTTP_KEEPALIVE_TIMEOUT", str(AIPERF_HTTP_KEEPALIVE_TIMEOUT_S))
 
-    ensure_aiperf(url, args.model)
+    ensure_aiperf()
     verify_endpoint(url, args.model)
 
     cmd = build_aiperf_cmd(args, url, artifact_dir)
@@ -663,9 +583,25 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     if os.path.exists(export_path):
         _log(f"removing export from a previous run: {export_path}")
         os.remove(export_path)
+    setup_script = Path(__file__).resolve().parents[4] / "scripts/install_benchmark_tools.py"
+    subprocess.check_call(
+        [
+            sys.executable,
+            str(setup_script),
+            "--profile",
+            "agentx",
+            "--client-python",
+            _agentx_python(),
+            "--export-environment",
+            str(Path(artifact_dir) / "client_environment.json"),
+        ],
+        env=_agentx_environment(),
+    )
     _log("running: " + " ".join(cmd))
     grace = _env_int("AGENTX_TIMEOUT_GRACE", 900)
-    completed = subprocess.run(cmd, timeout=_env_int("AGENTX_DURATION", 3600) + grace)
+    completed = subprocess.run(
+        cmd, timeout=_env_int("AGENTX_DURATION", 3600) + grace, env=_agentx_environment()
+    )
 
     if not os.path.exists(export_path):
         # No export at all means aiperf died before writing results; its exit

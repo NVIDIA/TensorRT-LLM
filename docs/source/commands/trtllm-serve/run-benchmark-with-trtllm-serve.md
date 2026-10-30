@@ -449,7 +449,38 @@ AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
 
 ### Installation
 
-AIPerf is installed with TensorRT-LLM by default.  
+Install the benchmark client separately with Python 3.11, 3.12, or 3.13:
+
+```bash
+export TRTLLM_BENCHMARK_ENV_ROOT="$PWD/.benchmark-tools"
+python3.12 scripts/install_benchmark_tools.py
+export PATH="$TRTLLM_BENCHMARK_ENV_ROOT/bin:$PATH"
+```
+
+This installs the pinned stock AIPerf client without changing TensorRT-LLM's Python packages.
+TensorRT-LLM itself continues to support Python 3.10. Installation is an explicit
+setup step; benchmark commands do not install packages. Setup upgrades the selected
+client environment, including compatible transitive dependencies, and records
+the resolved package versions in `trtllm-benchmark.json` inside that environment. For AgentX tests, run
+`python3.12 scripts/install_benchmark_tools.py --profile agentx` in the same setup.
+The pinned AgentX fork uses its own dependencies and is not a replacement for the
+stock `aiperf` command.
+
+The CI and disaggregated benchmark adapters save the selected client's current
+software in `client_environment.json` alongside its benchmark outputs, before
+the timed workload. Custom interpreters can be selected with
+`TRTLLM_AIPERF_PYTHON` (stock) or `AGENTX_PYTHON`; the record describes that
+interpreter. Compare results using matching client source and dependency
+versions, since client changes can affect measured latency.
+
+For a manual run, record the environment separately:
+
+```bash
+python3 scripts/install_benchmark_tools.py --profile stock \
+    --export-environment client_environment.json
+```
+
+This mode does not install packages or create a client environment.
 
 
 ### Running AIPerf with trtllm-serve
