@@ -57,7 +57,7 @@ The following is a table of supported models for the PyTorch backend:
 | `WhisperForConditionalGeneration`    | Whisper                            | `openai/whisper-large-v3`                    |
 
 
-## Models Supported on Day-0 Side Branches
+## Models Supported outside main branch
 
 Some newly released models are first supported on a dedicated feature branch, with release
 containers published from that branch, before the support is merged into `main`. The entries
