@@ -55,7 +55,6 @@ class Group(Enum):
     COMMUNICATION = "Communication buffers"
     OVERHEAD = "CUDA and library overhead"
     OTHER = "Other tagged memory"
-    SLEEP_RELEASED = "Released by sleep mode"
 
 
 _NOTES = {
@@ -68,7 +67,6 @@ _NOTES = {
     Group.COMMUNICATION: "multi-GPU communication buffers",
     Group.OVERHEAD: "CUDA context, cuBLAS, NCCL internals and other driver memory",
     Group.OTHER: "tagged with a name the report does not group",
-    Group.SLEEP_RELEASED: "included in the rows above but returned to the driver",
 }
 
 #: Every category that can count toward a total, by the group it belongs to.
@@ -98,7 +96,6 @@ GROUP_OF: dict[Category, Group | None] = {
     Category.TAGGED_OTHER: Group.OTHER,
     Category.CUDA_GRAPHS: Group.CUDA_GRAPHS,
     Category.CPP_BUFFERS: None,
-    Category.SLEEP_RELEASED: Group.SLEEP_RELEASED,
 }
 
 
@@ -151,7 +148,7 @@ def group_totals(frame: Frame) -> GroupTotals:
         sizes[Group.TORCH_CACHE] = sum(p.free for p in pools if p.kind == "default")
         for pool in pools:
             kind, label, free = pool.kind, pool.label, pool.free
-            if kind == "default" or not free:
+            if kind == "default" or not free or pool.released:
                 continue
             group = Group.CUDA_GRAPHS if kind == "graph" else Group.OTHER
             name = "free in graph pools" if kind == "graph" else f"{label} pool, free"
@@ -179,6 +176,37 @@ def group_totals(frame: Frame) -> GroupTotals:
             g: sorted(owners.items(), key=lambda kv: -abs(kv[1])) for g, owners in members.items()
         },
     )
+
+
+def _released_parts(frame: Frame) -> dict[str, int]:
+    """What sleep mode has released, by the name a reader knows it under."""
+    from . import startup
+
+    parts: dict[str, int] = {}
+    for pool in frame.torch.pools or ():
+        if pool.released and pool.reserved:
+            tag = pool.label.removeprefix("sleep: ")
+            name = startup.step_name(tag)
+            if name == tag:
+                name = tag.replace("_", " ").capitalize()
+            parts[name] = parts.get(name, 0) + pool.reserved
+    for entry in frame.entries:
+        if entry.released and entry.size_bytes:
+            group = GROUP_OF.get(entry.category)
+            name = group.value if group else str(entry.category)
+            parts[name] = parts.get(name, 0) + entry.size_bytes
+    return parts
+
+
+def _released_line(frame: Frame) -> str:
+    """One line for what sleep mode has released; the rows leave it out."""
+    parts = sorted(
+        ((n, b) for n, b in _released_parts(frame).items() if b >= _SHOWN), key=lambda kv: -kv[1]
+    )
+    if not parts:
+        return ""
+    listed = ", ".join(f"{name} {size / _GIB:.2f} GiB" for name, size in parts)
+    return f"  Released by sleep mode, returns on wakeup (not in the rows above): {listed}."
 
 
 def _size(value: int | None) -> str:
@@ -264,7 +292,7 @@ def render_summary(
         if size is not None and abs(size) < _SHOWN and not changed:
             continue
         share = (
-            f"{100.0 * size / totals.process_total:7.1f}%"
+            f" {100.0 * size / totals.process_total:6.1f}%"
             if size is not None and totals.process_total > 0
             else "        "
         )
@@ -285,9 +313,20 @@ def render_summary(
             more = f", +{len(parts) - 5} more" if len(parts) > 5 else ""
             out.append(f"  {'':<28s}  of which (GiB): {listed}{more}")
 
+    asleep = _released_line(frame)
+    if asleep:
+        out.append(asleep)
     out.append("")
-    plan = startup.render_plan_lines(
-        device.device_used, totals.sizes.get(Group.KV_CACHE), totals.sizes.get(Group.TORCH_CACHE)
+    # The startup plan describes the awake process; compared with a sleeping
+    # one it would only report the released memory as savings.
+    plan = (
+        None
+        if asleep
+        else startup.render_plan_lines(
+            device.device_used,
+            totals.sizes.get(Group.KV_CACHE),
+            totals.sizes.get(Group.TORCH_CACHE),
+        )
     )
     if plan:
         out.extend(plan)
@@ -300,7 +339,9 @@ def render_summary(
     # Advice only when something went wrong: a healthy startup whose largest
     # part is the KV cache is working as designed, and telling its reader to
     # shrink it would be noise at best.
-    out.extend(_conclusion(totals, baseline, (advice or {}) if headline else {}, suggestion))
+    out.extend(
+        _conclusion(totals, baseline, (advice or {}) if headline else {}, suggestion, device)
+    )
     return out
 
 
@@ -309,6 +350,7 @@ def _conclusion(
     baseline: dict[Group, int | None] | None,
     advice: dict[Group, str],
     suggestion: str = "",
+    device=None,
 ) -> list[str]:
     known = {g: s for g, s in totals.sizes.items() if s is not None}
     if not known:
@@ -341,6 +383,16 @@ def _conclusion(
         focus = max(known, key=known.get)
         share = 100.0 * known[focus] / totals.process_total if totals.process_total else 0.0
         lines.append(f"  Largest: {focus.value} ({share:.1f}% of this process).")
+
+    # When other processes hold most of the GPU, this process's own rows do
+    # not explain why memory ran out, and tuning them is the wrong fix.
+    other = device.other_process if device is not None else None
+    if other is not None and other > totals.process_total and device.free < 0.05 * device.total:
+        lines.append(
+            f"  Note: other processes on this GPU hold {other / _GIB:.2f} GiB, more than this "
+            f"process ({totals.process_total / _GIB:.2f} GiB), leaving {device.free / _GIB:.2f} GiB "
+            "free; check what else is running on it."
+        )
 
     cache = known.get(Group.TORCH_CACHE, 0)
     if totals.process_total and cache > 0.1 * totals.process_total:

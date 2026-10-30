@@ -130,6 +130,10 @@ class TestSleepRelease:
 
         pool_mod.clear_registered_pools()
         proxy, held = self._scoped("unit_sleep", 256 * MB)
+        # Claimed like model weights: asleep, they must not be counted.
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(held, requires_grad=False)
+        tagging.claim_module_memory(module, "WEIGHTS")
         try:
             torch.cuda.synchronize()
             awake = _capture().frame
@@ -137,19 +141,31 @@ class TestSleepRelease:
             torch.cuda.synchronize()
             asleep = _capture().frame
             # torch's own counter does not move ...
-            assert asleep.torch.reserved == awake.torch.reserved
-            # ... but the footprint does, so the residual stays put instead
-            # of dropping by the released size.
+            assert torch.cuda.memory_reserved() >= awake.torch.reserved
+            # ... but the reading leaves the released pool out, so the
+            # residual stays put instead of dropping by the released size.
             assert asleep.torch.released >= 256 * MB
+            assert asleep.torch.reserved <= awake.torch.reserved - 256 * MB
             assert abs(asleep.nontorch_residual - awake.nontorch_residual) < 64 * MB
+            assert group_totals(awake).sizes.get(Group.WEIGHTS, 0) >= 256 * MB
             totals = group_totals(asleep)
-            assert totals.sizes[Group.SLEEP_RELEASED] == -asleep.torch.released
+            assert totals.sizes.get(Group.WEIGHTS, 0) < 256 * MB
+            # Rows show what is resident: none of them is negative, and they
+            # still add up to the process.
+            assert all(
+                s >= 0 for g, s in totals.sizes.items() if s is not None and g is not Group.OVERHEAD
+            )
             assert sum(s for s in totals.sizes.values() if s is not None) == totals.process_total
+            from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+            note = "\n".join(render_summary(asleep, totals))
+            assert "Released by sleep mode" in note and "Unit sleep 0.25 GiB" in note
             materialize_with_tag("unit_sleep")
             torch.cuda.synchronize()
             assert _capture().frame.torch.released == 0
         finally:
-            del held, proxy
+            tagging.clear_claims()
+            del module, held, proxy
 
 
 class TestGraphMemory:

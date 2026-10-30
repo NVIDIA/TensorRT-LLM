@@ -38,6 +38,7 @@ CUDA directly is outside its reach.
 from __future__ import annotations
 
 import os
+import re
 
 import torch
 
@@ -50,6 +51,8 @@ ENV_VAR = "TLLM_MEM_MONITOR_STACKS"
 #: Frames from these paths say how memory was allocated, not who wanted it.
 _SKIP = ("/torch/", "/memory/monitor/", "<frozen", "/contextlib.py", "/functools.py")
 _PACKAGE = "/tensorrt_llm/"
+#: Paths that hold installed libraries and the standard library.
+_LIBRARY_PATHS = ("/site-packages/", "/dist-packages/", "/lib/python3")
 
 
 def stacks_enabled() -> bool:
@@ -80,24 +83,35 @@ def start_stack_recording() -> bool:
     return True
 
 
+def _is_library(path: str) -> bool:
+    """Installed third-party code or the standard library, not ours or the user's."""
+    if _PACKAGE in path:
+        return False
+    return any(part in path for part in _LIBRARY_PATHS)
+
+
 def site_of(frames) -> str | None:
     """A short name for the code that made an allocation.
 
-    The innermost TensorRT-LLM frame when there is one, otherwise the
-    innermost frame outside PyTorch itself (a third-party library), as
-    ``path:function`` with the path trimmed to something readable.
+    The innermost frame that is either TensorRT-LLM or the user's own code
+    -- a logits processor, say -- wins: that is the code a reader can change.
+    Only when there is neither does a third-party library frame name the
+    allocation. Given as ``path:function``, the path trimmed to something
+    readable.
     """
     if not frames:
         return None
     outside = [f for f in frames if not any(s in f.get("filename", "") for s in _SKIP)]
-    ours = [f for f in outside if _PACKAGE in f.get("filename", "")]
-    frame = (ours or outside or [None])[0]
+    own = [f for f in outside if not _is_library(f.get("filename", ""))]
+    frame = (own or outside or [None])[0]
     if frame is None:
         return None
     path = frame.get("filename", "?")
     if _PACKAGE in path:
         path = path.rsplit(_PACKAGE, 1)[1]
         path = path[len("_torch/") :] if path.startswith("_torch/") else path
-    elif "/site-packages/" in path:
-        path = path.rsplit("/site-packages/", 1)[1]
+    elif any(part in path for part in ("/site-packages/", "/dist-packages/")):
+        path = re.split(r"/(?:site|dist)-packages/", path)[-1]
+    else:
+        path = "/".join(path.split("/")[-2:])
     return f"{path}:{frame.get('name', '?')}"

@@ -27,6 +27,7 @@ from the same three (``free + evictable`` and ``total - available()``,
 conservation check into a tautology.
 """
 
+import dataclasses
 import weakref
 
 from tensorrt_llm.logger import logger
@@ -173,30 +174,26 @@ class KvCacheProvider:
 
     @staticmethod
     def _with_sleep_release(entries: list[Entry]) -> list[Entry]:
-        """Take a pool that sleep mode has released back out of the totals.
+        """Mark a pool that sleep mode has released.
 
         The pool is allocated inside the ``kv_cache`` sleep scope. Once that
         tag is released the GPU no longer backs it, while the manager still
-        reports it; the row is kept, so the reader sees what is asleep, and
-        a matching negative entry takes it out, as for released PyTorch pools.
+        reports it; it is then listed as released and left out of the totals.
         """
         from ..pools import is_tag_released
 
         if not is_tag_released(KV_CACHE_SLEEP_TAG):
             return entries
-        held = sum(e.size_bytes or 0 for e in entries if e.counts_toward_total)
-        if not held:
-            return entries
-        return entries + [
-            Entry(
-                category=Category.SLEEP_RELEASED,
-                size_bytes=-held,
-                source=Source.COMPONENT,
-                placement=Placement.NON_TORCH,
-                basis=Basis.PHYSICAL_BACKING,
-                owner=f"{entries[0].owner}, released",
-                note="KV cache released by sleep mode",
+        return [
+            dataclasses.replace(
+                e,
+                counts_toward_total=False,
+                released=True,
+                note=f"{e.note}; released by sleep mode" if e.note else "released by sleep mode",
             )
+            if e.counts_toward_total
+            else e
+            for e in entries
         ]
 
     def _collect(self, manager) -> list[Entry]:
