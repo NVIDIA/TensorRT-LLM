@@ -34,6 +34,10 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 _SENTINEL = "GPU-FREE-OK"
 
 
@@ -80,7 +84,24 @@ def test_import_tensorrt_llm_is_gpu_free():
     ``benchmark_serving`` load generator): the import must neither require a GPU
     nor initialize a CUDA context.
     """
-    result = _run_gpu_free("import tensorrt_llm\n")
+    result = _run_gpu_free("""\
+        import os
+        import tensorrt_llm
+        from tensorrt_llm import deep_gemm
+
+        # Observe only the native boundary: importing the engine must leave
+        # configuration for startup, after its final environment is selected.
+        configured = []
+        deep_gemm.set_pdl = configured.append
+        os.environ["TRTLLM_ENABLE_PDL"] = "1"
+        from tensorrt_llm._torch.pyexecutor import model_engine
+        assert configured == [], "Engine-module import called the native PDL setter"
+        os.environ["TRTLLM_ENABLE_PDL"] = "0"
+        model_engine._configure_deep_gemm_pdl()
+        assert configured == [False], (
+            "Engine-module import configured DeepGEMM before startup settings were applied"
+        )
+        """)
     assert result.returncode == 0, (
         "`import tensorrt_llm` failed with CUDA_VISIBLE_DEVICES=''\n"
         f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
