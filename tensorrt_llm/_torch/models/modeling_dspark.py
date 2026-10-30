@@ -2111,13 +2111,23 @@ class DSv4DSparkForCausalLM(nn.Module):
         )
 
     def _prepare_confidence_head_for_load(self, weights: Dict) -> None:
-        """Match the projection's optional bias to the checkpoint before loading."""
+        """Prepare and validate the embedded confidence namespace before loading."""
         head = self.dspark_model.mtp_layers[-1].confidence_head
-        bias_key = f"mtp_layers.{self.num_stages - 1}.confidence_head.proj.bias"
-        if head is not None and bias_key in weights and head.proj.bias is None:
+        prefix = f"mtp_layers.{self.num_stages - 1}.confidence_head."
+        module_weights = {
+            name[len(prefix) :]: value for name, value in weights.items() if name.startswith(prefix)
+        }
+        if head is None:
+            if module_weights:
+                raise ValueError("DSpark confidence head checkpoint has no constructed head")
+            return
+        if "proj.bias" in module_weights and head.proj.bias is None:
             # This runs before weight loading and graph capture. Empty storage
             # avoids consuming RNG or reinitializing the existing projection.
             head.proj.bias = nn.Parameter(head.proj.weight.new_empty(head.proj.out_features))
+        # The generic V4 loader skips this parameter-free head container and
+        # visits its Linear child, so strict validation must run at this seam.
+        head._validate_checkpoint_weights(module_weights)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Load the ``mtp.*`` draft weights from the (full) checkpoint dict.

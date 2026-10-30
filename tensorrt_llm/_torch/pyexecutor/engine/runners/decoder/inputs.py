@@ -394,20 +394,32 @@ class DecoderInputPreparer:
             and getattr(spec_config, "enable_fused_confidence_scheduler", False)
         )
         self._dspark_sps_cost_table = None
+        self._dspark_sps_artifact_metadata = None
+        self._dspark_sps_observed_runtime = None
         self._dspark_exact_candidate_cells = ()
         self._dspark_exact_identity_words = (0,) * 8
         table_path = getattr(spec_config, "confidence_sps_table_path", None)
         if self._dspark_confidence_enabled and table_path:
             from tensorrt_llm._torch.speculative.dspark_planner import load_runtime_sps_cost_table
 
-            self._dspark_sps_cost_table, _ = load_runtime_sps_cost_table(
-                table_path,
-                graph_batch_sizes=self._config.cuda_graph_batch_sizes,
-                max_draft_len=int(spec_config.max_draft_len),
-                live_engine_fingerprint_path=getattr(
-                    spec_config, "confidence_sps_live_fingerprint_path", None
-                ),
+            self._dspark_sps_cost_table, self._dspark_sps_artifact_metadata = (
+                load_runtime_sps_cost_table(
+                    table_path,
+                    graph_batch_sizes=self._config.cuda_graph_batch_sizes,
+                    max_draft_len=int(spec_config.max_draft_len),
+                    live_engine_fingerprint_path=getattr(
+                        spec_config, "confidence_sps_live_fingerprint_path", None
+                    ),
+                    validate_freshness=spec_config.validate_confidence_artifact_freshness,
+                )
             )
+            self._dspark_sps_observed_runtime = {
+                "max_draft_len": int(spec_config.max_draft_len),
+                "rank_local_graph_batch_sizes": list(self._config.cuda_graph_batch_sizes),
+                "gpu": torch.cuda.get_device_name(self._buffers.input_ids_cuda.device),
+                "torch_version": torch.__version__,
+                "validate_artifact_freshness": spec_config.validate_confidence_artifact_freshness,
+            }
             self._dspark_exact_candidate_cells = self._dspark_sps_cost_table.candidate_cells()
             self._dspark_exact_identity_words = (
                 self._dspark_sps_cost_table.collective_identity_words

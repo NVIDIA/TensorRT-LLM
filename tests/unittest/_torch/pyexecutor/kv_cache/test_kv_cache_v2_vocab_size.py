@@ -21,7 +21,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import resolve_vocab_size
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
@@ -85,7 +85,14 @@ def _dense_config():
 
 
 def _capture_manager_kwargs(
-    pretrained_config, base_cls, *, is_multimodal=None, disable_mm_encoder=False
+    pretrained_config,
+    base_cls,
+    *,
+    is_multimodal=None,
+    disable_mm_encoder=False,
+    spec_config=None,
+    estimating_kv_cache=False,
+    initialize=False,
 ):
     """Route a config through _create_kv_cache_manager, capture the ctor kwargs."""
     captured: dict[str, object] = {}
@@ -93,6 +100,8 @@ def _capture_manager_kwargs(
     class RecordingManager(base_cls):
         def __init__(self, *args: object, **kwargs: object) -> None:
             captured["kwargs"] = kwargs
+            if initialize:
+                super().__init__(*args, **kwargs)
 
     model_config = SimpleNamespace(
         pretrained_config=pretrained_config,
@@ -117,7 +126,7 @@ def _capture_manager_kwargs(
         tokens_per_block=64,
         max_seq_len=2048,
         max_batch_size=4,
-        spec_config=None,
+        spec_config=spec_config,
         sparse_attention_config=None,
         max_num_tokens=256,
         max_beam_width=1,
@@ -125,8 +134,74 @@ def _capture_manager_kwargs(
         model_config=model_config,
         dtype=torch.bfloat16,
         is_draft=False,
+        estimating_kv_cache=estimating_kv_cache,
     )
     return captured["kwargs"]
+
+
+@pytest.mark.parametrize("estimating_kv_cache", [False, True])
+@pytest.mark.parametrize(
+    "config_factory, base_cls",
+    [
+        pytest.param(_nemotron_hybrid_config, MambaHybridCacheManagerV2, id="nemotron_hybrid"),
+        pytest.param(_qwen3_5_hybrid_config, MambaHybridCacheManagerV2, id="qwen3_5_hybrid"),
+        pytest.param(_dense_config, KVCacheManagerV2, id="dense"),
+    ],
+)
+def test_factory_preserves_native_index_slot_reservation(
+    config_factory, base_cls, estimating_kv_cache
+):
+    kwargs = _capture_manager_kwargs(
+        config_factory(), base_cls, estimating_kv_cache=estimating_kv_cache
+    )
+
+    assert "num_reserved_index_slots" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "enabled, estimating_kv_cache, expected",
+    [(False, False, None), (False, True, None), (True, False, 2), (True, True, 0)],
+)
+def test_factory_only_overrides_index_slots_for_enabled_confidence(
+    enabled, estimating_kv_cache, expected
+):
+    spec_config = DSparkDecodingConfig(max_draft_len=3, enable_confidence_scheduling=enabled)
+    kwargs = _capture_manager_kwargs(
+        _dense_config(),
+        KVCacheManagerV2,
+        spec_config=spec_config,
+        estimating_kv_cache=estimating_kv_cache,
+    )
+
+    if expected is None:
+        assert "num_reserved_index_slots" not in kwargs
+    else:
+        assert kwargs["num_reserved_index_slots"] == expected
+
+
+@pytest.mark.parametrize("config_factory", [_nemotron_hybrid_config, _qwen3_5_hybrid_config])
+@pytest.mark.parametrize("estimating_kv_cache", [False, True])
+def test_hybrid_constructor_receives_its_own_index_slot_reservation(
+    monkeypatch: pytest.MonkeyPatch, config_factory, estimating_kv_cache
+):
+    reservations = []
+
+    def capture_base_init(manager, *args, num_reserved_index_slots, **kwargs):
+        reservations.append((num_reserved_index_slots, manager._num_reserved_dummy_slots))
+
+    monkeypatch.setattr(KVCacheManagerV2, "__init__", capture_base_init)
+    monkeypatch.setattr(MambaHybridCacheManagerV2, "_setup_state_pool", lambda self: None)
+    _capture_manager_kwargs(
+        config_factory(),
+        MambaHybridCacheManagerV2,
+        estimating_kv_cache=estimating_kv_cache,
+        initialize=True,
+    )
+
+    assert len(reservations) == 1
+    received, owned = reservations[0]
+    assert received == owned
+    assert received > 0
 
 
 @pytest.mark.parametrize(

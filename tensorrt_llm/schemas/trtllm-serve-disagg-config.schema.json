@@ -965,7 +965,7 @@
     },
     "DSparkDecodingConfig": {
       "additionalProperties": false,
-      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. This configuration selects\nnative full-block drafting and does not expose confidence-scheduling or\ncalibration controls.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
+      "description": "Configuration for DSpark speculative decoding.\n\nDSpark (DeepSeek) is a target-dependent, \"semi-parallel\" speculative\ndecoding method. Like DFlash it captures hidden states from several target\nlayers as cross-attention context and drafts a whole block in a single\nbackbone forward, but it additionally refines the per-position draft logits\nwith a lightweight sequential head (a low-rank Markov head, optionally an RNN\nhead). A confidence head can score each draft position for verification\nscheduling without truncating the proposed block. Confidence scheduling is\nopt-in; the default configuration retains native full-block verification.\n\nKey features:\n- Target-dependent: captures hidden states from ``target_layer_ids``.\n- Semi-parallel: one block backbone forward + cheap sequential head refine.\n- Full-block proposals: confidence scoring does not change the draft tokens\n  or the standard target-verification acceptance rule.\n\nReference: DeepSeek DeepSpec (https://github.com/deepseek-ai/DeepSpec).",
       "properties": {
         "acceptance_rate_threshold": {
           "anyOf": [
@@ -1034,6 +1034,76 @@
           "description": "Number of draft positions produced per block. If None, read from the draft model config (dspark_block_size). Should equal max_draft_len.",
           "title": "Block Size"
         },
+        "confidence_admission_receipt_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an authenticated workload-level confidence admission receipt. Required only when validate_confidence_artifact_freshness=True; it must prove positive aggregate compact value after the fixed confidence-path overhead and safety margin are charged.",
+          "status": "prototype",
+          "title": "Confidence Admission Receipt Path"
+        },
+        "confidence_admission_receipt_sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Externally authenticated lowercase SHA256 of confidence_admission_receipt_path. This pin must come from the sealed deployment package rather than from the receipt itself.",
+          "status": "prototype",
+          "title": "Confidence Admission Receipt Sha256"
+        },
+        "confidence_sps_live_fingerprint_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an independently generated JSON fingerprint of the active runtime. Required when validate_confidence_artifact_freshness=True. Otherwise it is optional observed provenance, kept separate from the cost artifact's original metadata.",
+          "status": "prototype",
+          "title": "Confidence Sps Live Fingerprint Path"
+        },
+        "confidence_sps_table_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to an authenticated schema-v2 JSON table of measured decode step costs keyed by exact rank-local CUDA-graph shape (G, V).",
+          "status": "prototype",
+          "title": "Confidence Sps Table Path"
+        },
+        "confidence_sts_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Path to a JSON file with per-position sequential-temperature-scaling (STS) values used to calibrate the confidence head. The scheduler consumes a cumulative product of per-position probabilities, so a per-position calibration error compounds geometrically along the block. If None, the raw sigmoid is used (identity calibration).",
+          "status": "prototype",
+          "title": "Confidence Sts Path"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1055,6 +1125,13 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "enable_confidence_scheduling": {
+          "default": false,
+          "description": "Enable confidence-guided selection of a measured verifier-token budget for decode-only batches. The full physical draft block is still proposed; target verification and acceptance rules are unchanged. Requires trained confidence-head weights and compatible measured cost artifacts. Selection follows the artifact's cost and optional drain policy, retaining native verification when no compact candidate qualifies. Artifact freshness validation is optional.",
+          "status": "prototype",
+          "title": "Enable Confidence Scheduling",
+          "type": "boolean"
         },
         "enable_penalty": {
           "default": false,
@@ -1250,6 +1327,13 @@
           "description": "If true, enables rejection sampling for one-model speculative decoding paths when the batch contains any non-greedy request. All-greedy batches always take the argmax fast path regardless of this flag. Set to false (default) to use exact-match verification on non-greedy batches. The non-dynamic-tree one-model path requires FlashInfer.",
           "status": "prototype",
           "title": "Use Rejection Sampling",
+          "type": "boolean"
+        },
+        "validate_confidence_artifact_freshness": {
+          "default": false,
+          "description": "Require exact live cost-artifact identity and a positive workload admission receipt before enabling confidence scheduling. By default, explicitly enabled scheduling reuses structurally valid cost and calibration artifacts, with a warning that performance predictions may be stale. This never changes target verification or acceptance.",
+          "status": "prototype",
+          "title": "Validate Confidence Artifact Freshness",
           "type": "boolean"
         }
       },

@@ -59,7 +59,7 @@ from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
 from .inputs import DecoderInputPreparer
-from .metadata import DecoderMetadata
+from .metadata import DecoderMetadata, supports_advanced_draft_sampling
 from .warmup import WarmupAgreement
 
 
@@ -898,7 +898,8 @@ class DecoderCudaGraphs:
             # Dummy warmup requests carry no sampling params, so the greedy pass
             # needs no override while the advanced one has to force the flag.
             _capture_variant("greedy")
-            _capture_variant("advanced sampling", force_non_greedy=True)
+            if supports_advanced_draft_sampling(self._config.spec_config):
+                _capture_variant("advanced sampling", force_non_greedy=True)
         else:
             # TorchSampler branch: FULL carries no sampling in the graph and is
             # what every batch replays unless in-graph sampling is enabled, so it

@@ -3775,9 +3775,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     backbone forward, but it additionally refines the per-position draft logits
     with a lightweight sequential head (a low-rank Markov head, optionally an RNN
     head). A confidence head can score each draft position for verification
-    scheduling without truncating the proposed block. This configuration selects
-    native full-block drafting and does not expose confidence-scheduling or
-    calibration controls.
+    scheduling without truncating the proposed block. Confidence scheduling is
+    opt-in; the default configuration retains native full-block verification.
 
     Key features:
     - Target-dependent: captures hidden states from ``target_layer_ids``.
@@ -3819,6 +3818,70 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "read from the draft model config (dspark_markov_head_type), "
         "defaulting to \"vanilla\".")
 
+    enable_confidence_scheduling: bool = Field(
+        default=False,
+        description=
+        "Enable confidence-guided selection of a measured verifier-token budget "
+        "for decode-only batches. The full physical draft block is still "
+        "proposed; target verification and acceptance rules are unchanged. "
+        "Requires trained confidence-head weights and compatible measured cost "
+        "artifacts. Selection follows the artifact's cost and optional drain "
+        "policy, retaining native verification when no compact candidate "
+        "qualifies. Artifact freshness validation is optional.",
+        status="prototype")
+
+    validate_confidence_artifact_freshness: bool = Field(
+        default=False,
+        description=
+        "Require exact live cost-artifact identity and a positive workload "
+        "admission receipt before enabling confidence scheduling. By default, "
+        "explicitly enabled scheduling reuses structurally valid cost and "
+        "calibration artifacts, with a warning that performance predictions "
+        "may be stale. This never changes target verification or acceptance.",
+        status="prototype")
+
+    confidence_sts_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to a JSON file with per-position sequential-temperature-scaling "
+        "(STS) values used to calibrate the confidence head. The scheduler "
+        "consumes a cumulative product of per-position probabilities, so a "
+        "per-position calibration error compounds geometrically along the "
+        "block. If None, the raw sigmoid is used (identity calibration).",
+        status="prototype")
+
+    confidence_sps_table_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an authenticated schema-v2 JSON table of measured decode step "
+        "costs keyed by exact rank-local CUDA-graph shape (G, V).",
+        status="prototype")
+
+    confidence_sps_live_fingerprint_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an independently generated JSON fingerprint of the active "
+        "runtime. Required when validate_confidence_artifact_freshness=True. "
+        "Otherwise it is optional observed provenance, kept separate from "
+        "the cost artifact's original metadata.",
+        status="prototype")
+
+    confidence_admission_receipt_path: Optional[str] = Field(
+        default=None,
+        description=
+        "Path to an authenticated workload-level confidence admission receipt. "
+        "Required only when validate_confidence_artifact_freshness=True; it "
+        "must prove positive aggregate compact value after the fixed "
+        "confidence-path overhead and safety margin are charged.",
+        status="prototype")
+
+    confidence_admission_receipt_sha256: Optional[str] = Field(
+        default=None,
+        description="Externally authenticated lowercase SHA256 of "
+        "confidence_admission_receipt_path. This pin must come from the sealed "
+        "deployment package rather than from the receipt itself.",
+        status="prototype")
+
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
     attention_backend: Literal["AUTO", "VANILLA", "TRTLLM", "CUTEDSL"] = Field(
@@ -3834,6 +3897,46 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA "
         "decode pass over context and block, on SM100/SM103/SM107. Which "
         "kernel each name selects: MLADSparkForCausalLM.")
+
+    @model_validator(mode="after")
+    def validate_confidence_scheduling(self):
+        if not self.enable_confidence_scheduling:
+            if (self.validate_confidence_artifact_freshness
+                    or self.confidence_sts_path
+                    or self.confidence_sps_table_path
+                    or self.confidence_sps_live_fingerprint_path
+                    or self.confidence_admission_receipt_path
+                    or self.confidence_admission_receipt_sha256):
+                raise ValueError("validate_confidence_artifact_freshness / "
+                                 "confidence_sts_path / "
+                                 "confidence_sps_table_path / "
+                                 "confidence_sps_live_fingerprint_path / "
+                                 "confidence_admission_receipt_path / "
+                                 "confidence_admission_receipt_sha256 require "
+                                 "enable_confidence_scheduling=True")
+            return self
+
+        if self.max_draft_len == 1:
+            # Physical K1 has no smaller verifier window, so confidence
+            # scheduling can only add control-path work. Resolve it to the
+            # ordinary feature-off configuration before any runtime component
+            # observes the config. This preserves the original static K path
+            # rather than running a confidence-enabled native fallback.
+            logger.warning(
+                "DSpark confidence scheduling has no compact tier below the "
+                "native K1 layout; using the feature-off static K1 path and "
+                "ignoring confidence-scheduling inputs.")
+            self.enable_confidence_scheduling = False
+            self.validate_confidence_artifact_freshness = False
+            self.confidence_sts_path = None
+            self.confidence_sps_table_path = None
+            self.confidence_sps_live_fingerprint_path = None
+            self.confidence_admission_receipt_path = None
+            self.confidence_admission_receipt_sha256 = None
+            return self
+        # Resolve optional freshness admission before runtime components
+        # snapshot the flag. Exact graph/K coverage is checked by the engine.
+        return self
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -7310,6 +7413,177 @@ class TorchLlmArgs(BaseLlmArgs):
                 "graphs or disable enable_piecewise_cuda_graph.")
         return self
 
+    def _validate_dspark_confidence_environment(self) -> None:
+        """Reject configurations confidence scheduling cannot honour.
+
+        Every check here guards a path that would otherwise degrade *silently*:
+        the run comes up, produces plausible text, and either never takes the
+        ragged path at all or takes it with a kernel that mis-attributes rows.
+        A hard error at construction is the only signal that survives.
+        """
+        if not self.speculative_config.draft_is_embedded_in_target:
+            raise ValueError(
+                "DSpark confidence scheduling supports only the embedded "
+                "DeepSeek-V4 draft. Standalone DSpark retains native "
+                "verification; disable confidence scheduling for that path.")
+        cuda_graph_config = self.cuda_graph_config
+        if self.context_parallel_size > 1:
+            raise ValueError(
+                "DSpark confidence scheduling requires context_parallel_size=1; "
+                "the exact-shape policy does not coordinate CP groups.")
+        if self.pipeline_parallel_size > 1:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support pipeline parallelism. The PP executor's pipelined "
+                "microbatches do not provide the single-iteration host-input "
+                "lifetime boundary required by ragged verification staging. "
+                "Set pipeline_parallel_size=1 or disable confidence scheduling."
+            )
+        if self.guided_decoding_backend is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support guided decoding. Guided-decoder bitmasks are laid "
+                "out with one uniform speculative stride; applying them to "
+                "packed per-request verify windows would shift every request "
+                "after the first short window. Disable guided decoding or "
+                "disable confidence scheduling.")
+        if self.enable_lora or self.lora_config is not None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True does not yet "
+                "support LoRA. LoRA metadata expands generation requests "
+                "with one uniform speculative stride, which cannot represent "
+                "packed per-request verify windows. Disable LoRA or disable "
+                "confidence scheduling.")
+        # `fit_ragged_verify_lens` plans against the padded row count and
+        # reserves tokens for the CUDA-graph padding rows, so it presumes those
+        # rows exist. With padding off, `_get_padded_batch` adds none: the batch
+        # then carries a token total that keys into a graph nobody captured and
+        # drops to eager on every ragged step -- which costs far more than the
+        # trimmed tokens save -- while real requests were still shrunk to leave
+        # room for padding that never arrived.
+        if cuda_graph_config is None:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config to be set with enable_padding=True. Ragged "
+                "verification fits each step's token total onto a captured "
+                "CUDA-graph bucket; with no graphs there is no bucket to fit "
+                "and every step would silently run eager.")
+        if not cuda_graph_config.enable_padding:
+            raise ValueError(
+                "speculative_config.enable_confidence_scheduling=True requires "
+                "cuda_graph_config.enable_padding=True (it defaults to False). "
+                "The ragged token budget is planned against the padded batch "
+                "size and reserves tokens for the padding rows; without padding "
+                "those rows never appear, so the step's token total misses its "
+                "captured bucket and falls out of graph replay.")
+        if getattr(self.moe_config.load_balancer, "mode",
+                   None) == "per_layer_dynamic":
+            raise ValueError(
+                "DSpark confidence scheduling does not support per-layer dynamic "
+                "EPLB because it disables the required CUDA graphs.")
+
+        sparse_attention_config = self.sparse_attention_config
+        if sparse_attention_config is not None:
+            # Both recover "which request is this row" from a fixed next_n --
+            # GVR indexes its previous-step top-k hint by request and strides it
+            # by next_n, and the CuTe-DSL kernel takes next_n as a compile-time
+            # constant and JIT cache key. Neither can express per-request
+            # windows. The C++ launcher already refuses the combination
+            # (indexerTopK.cu, "ragged rowKvLens is incompatible with the GVR
+            # preIdx hint"), but that fires deep in a decode step; say so here.
+            incompatible = [
+                name for name in ("enable_heuristic_topk", "use_cute_dsl_topk")
+                if getattr(sparse_attention_config, name, False)
+            ]
+            if incompatible:
+                raise ValueError(
+                    "speculative_config.enable_confidence_scheduling=True is "
+                    "incompatible with sparse_attention_config."
+                    f"{' / '.join(incompatible)}=True: those top-k paths "
+                    "reconstruct each row's request and window position from a "
+                    "single batch-wide next_n, which a ragged batch does not "
+                    "have. Disable them, or disable confidence scheduling.")
+            # Not an error: the DSL paged-MQA-logits path is structurally
+            # uniform too, but the expanded (one row per query token) path it
+            # falls back to is numerically equivalent, and it is the default on
+            # DeepSeek-V4 anyway. Still worth saying out loud, since the knob
+            # will read as honoured otherwise.
+            if getattr(sparse_attention_config, "use_cute_dsl_paged_mqa_logits",
+                       False):
+                logger.warning(
+                    "sparse_attention_config.use_cute_dsl_paged_mqa_logits=True "
+                    "is ignored on ragged-verification steps: the DSL kernel "
+                    "broadcasts one KV length per request across a fixed next_n. "
+                    "Those steps use the expanded DeepGEMM path instead, which "
+                    "is numerically equivalent.")
+
+    @staticmethod
+    def _resolve_dspark_confidence_workload_admission(
+            spec_cfg: DSparkDecodingConfig) -> None:
+        """Resolve confidence activation before engines or workers observe it."""
+        from tensorrt_llm._torch.speculative.dspark_planner import \
+            load_confidence_workload_admission
+
+        receipt_path = spec_cfg.confidence_admission_receipt_path
+        receipt_sha256 = spec_cfg.confidence_admission_receipt_sha256
+        sps_table_path = spec_cfg.confidence_sps_table_path
+        live_fingerprint_path = spec_cfg.confidence_sps_live_fingerprint_path
+        if not spec_cfg.validate_confidence_artifact_freshness:
+            if not sps_table_path:
+                raise ValueError(
+                    "DSpark confidence scheduling requires confidence_sps_table_path; "
+                    "a missing measured cost table cannot be timed as enabled.")
+            logger.warning(
+                "DSpark confidence scheduling is enabled with reusable artifacts. "
+                "Cost/calibration predictions and performance economics are not "
+                "freshness-validated and may be stale; target acceptance is unchanged. "
+                "Set validate_confidence_artifact_freshness=True to require exact "
+                "live provenance and positive workload admission.")
+            return
+        missing = [
+            name for name, value in (
+                ("confidence_admission_receipt_path", receipt_path),
+                ("confidence_admission_receipt_sha256", receipt_sha256),
+                ("confidence_sps_table_path", sps_table_path),
+                ("confidence_sps_live_fingerprint_path", live_fingerprint_path),
+            ) if not value
+        ]
+        fallback_reason = ("missing " + ", ".join(missing)) if missing else None
+        if fallback_reason is None:
+            assert receipt_path is not None
+            assert receipt_sha256 is not None
+            assert sps_table_path is not None
+            assert live_fingerprint_path is not None
+            try:
+                admission = load_confidence_workload_admission(
+                    receipt_path,
+                    expected_receipt_sha256=receipt_sha256,
+                    sps_cost_table_path=sps_table_path,
+                    live_engine_fingerprint_path=live_fingerprint_path,
+                    physical_k=spec_cfg.max_draft_len,
+                )
+                if not admission.admitted:
+                    fallback_reason = (
+                        "the authenticated workload replay does not have positive "
+                        "net compact value after fixed overhead and safety margin"
+                    )
+            except (OSError, TypeError, ValueError) as error:
+                fallback_reason = str(error)
+
+        if fallback_reason is None:
+            return
+
+        logger.warning(
+            f"DSpark confidence scheduling is not deployment-admitted ({fallback_reason}); "
+            f"using the feature-off static K{spec_cfg.max_draft_len} path.")
+        spec_cfg.enable_confidence_scheduling = False
+        spec_cfg.validate_confidence_artifact_freshness = False
+        spec_cfg.confidence_sts_path = None
+        spec_cfg.confidence_sps_table_path = None
+        spec_cfg.confidence_sps_live_fingerprint_path = None
+        spec_cfg.confidence_admission_receipt_path = None
+        spec_cfg.confidence_admission_receipt_sha256 = None
+
     @model_validator(mode="after")
     def normalize_prefill_cuda_graph_config(self) -> 'TorchLlmArgs':
         """Normalize legacy piecewise CUDA graph options into prefill fields."""
@@ -7797,6 +8071,10 @@ class TorchLlmArgs(BaseLlmArgs):
                         "DSpark block_size must equal max_draft_len; got "
                         f"block_size={spec_cfg.block_size} and "
                         f"max_draft_len={spec_cfg.max_draft_len}")
+                if spec_cfg.enable_confidence_scheduling:
+                    self._resolve_dspark_confidence_workload_admission(spec_cfg)
+                if spec_cfg.enable_confidence_scheduling:
+                    self._validate_dspark_confidence_environment()
 
             if isinstance(self.speculative_config, SADecodingConfig):
                 pool_size = self.speculative_config.global_pool_size

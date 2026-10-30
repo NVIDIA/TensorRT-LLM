@@ -70,6 +70,7 @@ from .metadata import (
     get_spec_managers,
     sync_group_all_greedy_sample,
     update_spec_metadata,
+    validate_dspark_draft_sampling,
 )
 from .warmup import DecoderWarmup, WarmupAgreement
 
@@ -563,7 +564,16 @@ class DecoderRunner(ScheduledModelRunner):
             # unpopulated (greedy) buffers, hanging the run (e.g. MTP nextn>=2).
             if spec_metadata is not None:
                 spec_metadata.update_is_all_greedy_sample(padded_graph_requests.all_requests())
-                sync_group_all_greedy_sample(spec_metadata, self._mapping, self._dist)
+                sync_group_all_greedy_sample(
+                    spec_metadata,
+                    self._mapping,
+                    self._dist,
+                    confidence_enabled=self._dspark_confidence_enabled,
+                )
+                validate_dspark_draft_sampling(
+                    spec_metadata,
+                    confidence_enabled=self._dspark_confidence_enabled,
+                )
 
             selection = self._graphs.select(
                 padded_graph_requests,

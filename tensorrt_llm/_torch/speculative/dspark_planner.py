@@ -175,9 +175,12 @@ class ExactSpsCostTable:
     max_draft_len: int
     minimum_predicted_gain: float = 0.01
     iteration_drain_guard: ExactSpsDrainGuard | None = None
+    validate_artifact_freshness: bool = True
     identity_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
+        if type(self.validate_artifact_freshness) is not bool:
+            raise TypeError("validate_artifact_freshness must be a bool")
         max_draft_len = _require_exact_int(self.max_draft_len, field="max_draft_len", minimum=1)
         normalized: dict[int, ExactSpsCostRow] = {}
         for graph_batch_size, table in self.tables.items():
@@ -278,6 +281,9 @@ class ExactSpsCostTable:
                 for graph_batch_size, table in sorted(normalized.items())
             ],
         }
+        if not self.validate_artifact_freshness:
+            # Reuse and strict policies must not share a collective identity.
+            identity_payload["validate_artifact_freshness"] = False
         object.__setattr__(self, "identity_sha256", _canonical_json_sha256(identity_payload))
 
     @property
@@ -371,42 +377,63 @@ def load_runtime_sps_cost_table(
     graph_batch_sizes: Sequence[int],
     max_draft_len: int,
     live_engine_fingerprint_path: str | Path | None = None,
+    validate_freshness: bool = True,
 ) -> tuple[ExactSpsCostTable, dict[str, object]]:
-    """Load an authenticated schema-v2 exact ``T(G,V)`` table.
+    """Load structurally checked exact costs, optionally checking freshness.
 
-    The source-head pin is intentional: a TRT-LLM version can cover source
-    changes that alter measured step costs. A changed source identity requires
-    requalification of the cost table and its workload-admission receipt.
+    Original artifact metadata is returned unchanged. Reuse does not assert
+    that recorded timings still describe the active source or GPU node. Only
+    configured graph tiers are installed as runtime execution choices; unused
+    measured tiers remain in the original returned payload.
     """
     payload = _read_sps_cost_payload(path)
     schema_version = payload.get("schema_version")
     if type(schema_version) is not int or schema_version != 2:
         raise ValueError("Exact SPS cost artifacts require schema_version=2")
-    if live_engine_fingerprint_path is None:
+    if validate_freshness and live_engine_fingerprint_path is None:
         raise ValueError(
             "Schema-v2 exact SPS artifacts require an independently generated "
             "live engine fingerprint path"
         )
-    live_engine_fingerprint = _read_sps_cost_payload(live_engine_fingerprint_path)
+    live_engine_fingerprint = (
+        _read_sps_cost_payload(live_engine_fingerprint_path)
+        if live_engine_fingerprint_path is not None
+        else None
+    )
     validate_sps_cost_table_payload(
         payload,
         graph_batch_sizes=graph_batch_sizes,
         max_draft_len=max_draft_len,
         live_engine_fingerprint=live_engine_fingerprint,
+        validate_freshness=validate_freshness,
     )
-    return _build_exact_sps_cost_table(payload, max_draft_len=max_draft_len), payload
+    return _build_exact_sps_cost_table(
+        payload,
+        max_draft_len=max_draft_len,
+        validate_artifact_freshness=validate_freshness,
+        runtime_graph_batch_sizes=graph_batch_sizes,
+    ), payload
 
 
 def _build_exact_sps_cost_table(
     payload: dict[str, object],
     *,
     max_draft_len: int,
+    validate_artifact_freshness: bool = True,
+    runtime_graph_batch_sizes: Sequence[int] | None = None,
 ) -> ExactSpsCostTable:
     exact_tables = payload["cost_tables"]
     assert isinstance(exact_tables, dict)
     parsed_tables: dict[int, ExactSpsCostRow] = {}
+    # Scope execution choices, not serialized measurements. The loader already
+    # validates the entire original artifact, including unused finite cells.
+    runtime_graphs = (
+        set(runtime_graph_batch_sizes) if runtime_graph_batch_sizes is not None else None
+    )
     for graph_batch_size, exact_payload in exact_tables.items():
         canonical_graph_batch_size = _parse_graph_batch_size_key(graph_batch_size)
+        if runtime_graphs is not None and canonical_graph_batch_size not in runtime_graphs:
+            continue
         assert isinstance(exact_payload, dict)
         parsed_tables[canonical_graph_batch_size] = ExactSpsCostRow(
             token_counts=tuple(
@@ -452,6 +479,7 @@ def _build_exact_sps_cost_table(
             payload["minimum_predicted_gain"], field="minimum_predicted_gain"
         ),
         iteration_drain_guard=iteration_drain_guard,
+        validate_artifact_freshness=validate_artifact_freshness,
     )
 
 
@@ -698,6 +726,7 @@ def validate_sps_cost_table_payload(
     graph_batch_sizes: Sequence[int],
     max_draft_len: int,
     live_engine_fingerprint: dict[str, object] | None = None,
+    validate_freshness: bool = True,
 ) -> dict[str, object]:
     """Validate exact schema-v2 coverage and engine provenance.
 
@@ -711,8 +740,9 @@ def validate_sps_cost_table_payload(
         graph_batch_sizes: Rank-local CUDA-graph row counts captured by the
             active engine.
         max_draft_len: Physical full draft-block length K.
-        live_engine_fingerprint: Independently supplied runtime fingerprint.
-            Validation refuses to use an artifact without this comparison.
+        live_engine_fingerprint: Optional independently supplied runtime identity.
+        validate_freshness: Require an exact live-identity comparison in addition
+            to mandatory schema, K, graph coverage and measurement provenance.
 
     Returns:
         The artifact's authenticated engine fingerprint.
@@ -720,7 +750,8 @@ def validate_sps_cost_table_payload(
     Raises:
         TypeError: If the artifact has malformed container types.
         ValueError: If its schema, fingerprint, coverage, or provenance does
-            not exactly describe the configured graph ladder.
+            not cover the configured graph ladder. Strict freshness additionally
+            requires the original full graph ladder and exact live identity.
     """
     if not isinstance(payload, dict):
         raise TypeError("SPS cost artifact must contain a JSON object")
@@ -733,30 +764,37 @@ def validate_sps_cost_table_payload(
     assert isinstance(exact_tables, dict)
     assert isinstance(fingerprint, dict)
 
-    if live_engine_fingerprint is None:
+    if type(validate_freshness) is not bool:
+        raise TypeError("validate_freshness must be a bool")
+    if validate_freshness and live_engine_fingerprint is None:
         raise ValueError(
             "Schema-v2 SPS validation requires an independently supplied live engine fingerprint"
         )
-    if live_engine_fingerprint is fingerprint:
+    if validate_freshness and live_engine_fingerprint is fingerprint:
         raise ValueError(
             "Live engine fingerprint must be supplied independently of the SPS artifact"
         )
-    live_engine_fingerprint = _validate_exact_fields(
-        live_engine_fingerprint,
-        name="live engine fingerprint",
-        fields=_V2_FINGERPRINT_FIELDS,
-    )
-    _validate_live_fingerprint_values(live_engine_fingerprint)
+    if live_engine_fingerprint is not None:
+        live_engine_fingerprint = _validate_exact_fields(
+            live_engine_fingerprint,
+            name="live engine fingerprint",
+            fields=_V2_FINGERPRINT_FIELDS,
+        )
+        _validate_live_fingerprint_values(live_engine_fingerprint)
 
     if payload["engine_fingerprint_sha256"] != _canonical_json_sha256(fingerprint):
         raise ValueError("SPS engine_fingerprint SHA256 does not match payload")
-    mismatches = sorted(
-        key for key in _V2_FINGERPRINT_FIELDS if fingerprint[key] != live_engine_fingerprint[key]
-    )
-    if mismatches:
-        raise ValueError(
-            "SPS engine_fingerprint does not match active runtime: " + ", ".join(mismatches)
+    if validate_freshness:
+        assert live_engine_fingerprint is not None
+        mismatches = sorted(
+            key
+            for key in _V2_FINGERPRINT_FIELDS
+            if fingerprint[key] != live_engine_fingerprint[key]
         )
+        if mismatches:
+            raise ValueError(
+                "SPS engine_fingerprint does not match active runtime: " + ", ".join(mismatches)
+            )
 
     configured_graph_batch_sizes = {
         _require_json_int(value, field="runtime graph batch size", minimum=1)
@@ -778,19 +816,24 @@ def validate_sps_cost_table_payload(
             field="iteration drain tail_graph_batch_size",
             minimum=1,
         )
-        if tail_graph_batch_size not in measured_tables:
+        if (
+            tail_graph_batch_size not in measured_tables
+            or tail_graph_batch_size not in configured_graph_batch_sizes
+        ):
             raise ValueError(
-                "Iteration drain guard requires a measured native tail table for "
+                "Iteration drain guard requires a captured, measured native tail table for "
                 f"G={tail_graph_batch_size}"
             )
     fingerprint_graph_batch_sizes = set(fingerprint["rank_local_graph_batch_sizes"])
     if (
-        configured_graph_batch_sizes != set(measured_tables)
-        or configured_graph_batch_sizes != fingerprint_graph_batch_sizes
+        set(measured_tables) != fingerprint_graph_batch_sizes
+        or not configured_graph_batch_sizes.issubset(measured_tables)
+        or (validate_freshness and configured_graph_batch_sizes != set(measured_tables))
     ):
         raise ValueError(
-            "Multi-G SPS graph batch sizes must match exactly across runtime "
-            "graphs, cost_tables, and engine_fingerprint"
+            "Runtime graphs require measured coverage; cost_tables and their "
+            "original engine_fingerprint must match exactly. Strict freshness "
+            "also requires the original runtime graph ladder."
         )
     runtime_max_draft_len = _require_json_int(
         max_draft_len, field="runtime max_draft_len", minimum=1
@@ -876,7 +919,7 @@ def validate_sps_cost_table_payload(
     gpu_count = fingerprint["gpu_count"]
     global_graph_batch_sizes = set(fingerprint["global_graph_batch_sizes"])
     if global_graph_batch_sizes != {
-        graph_batch_size * gpu_count for graph_batch_size in configured_graph_batch_sizes
+        graph_batch_size * gpu_count for graph_batch_size in measured_tables
     }:
         raise ValueError(
             "SPS engine_fingerprint global_graph_batch_sizes are inconsistent "
@@ -1130,8 +1173,8 @@ def select_exact_sps_candidate(
 
     The caller supplies globally agreed expected yields after the phase-2
     allgather. This pure layer only compares exact measured cells; it cannot
-    create a ragged budget or synchronize ranks. Compact serving fails closed
-    until the exact table carries matched iteration/drain metadata. Every
+    create a ragged budget or synchronize ranks. Strict validation retains
+    native verification without matched iteration/drain metadata. Every
     measured tier that clears the aggregate immediate-goodput guard is reranked
     by its guarded group-E2E value. Drain loss is the maximum expected loss per
     real request on any active attention-DP rank, derived from the same
@@ -1199,10 +1242,10 @@ def select_exact_sps_candidate(
         return 0
     drain_guard = cost_table.iteration_drain_guard
     if drain_guard is None:
-        # The matched mean-output statistic is workload-specific and cannot be
-        # inferred from T(G,V). An older exact artifact therefore remains a
-        # valid native-static control but is not allowed to enable compact V.
-        return 0
+        if cost_table.validate_artifact_freshness:
+            return 0
+        # Without optional drain evidence, reuse prices only immediate goodput.
+        return int(max(goodput_budgets, key=lambda budget: (compact_scores[budget], budget)))
     native_step_ms = cost_table.step_time(0, graph_batch_size)
     tail_step_ms = cost_table.step_time(0, drain_guard.tail_graph_batch_size)
     group_values_ms = {}

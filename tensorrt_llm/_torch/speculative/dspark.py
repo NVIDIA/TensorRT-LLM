@@ -20,6 +20,7 @@
 # ``DSv4DSparkDraftModel.forward`` rather than via mask-token cross-attention.
 
 import json
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
@@ -40,6 +41,7 @@ from .vocab_parallel import tp_pair_exchange
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import DSparkDecodingConfig
+    from ..pyexecutor.llm_request import LlmRequest
 
 # Unscored-slot fill: sigmoid saturates to 1.0, so an unwritten row schedules
 # as "verify the whole block" (fail-safe).
@@ -63,7 +65,10 @@ def load_sts_temperatures_from_path(path: str) -> list[float]:
         )
     if not isinstance(temps, list) or not temps:
         raise ValueError(f"{path} must contain a non-empty temperature list")
-    return [float(t) for t in temps]
+    temperatures = [float(t) for t in temps]
+    if any(not math.isfinite(value) or value <= 0.0 for value in temperatures):
+        raise ValueError("STS temperatures must be a finite positive numeric vector")
+    return temperatures
 
 
 def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.Module]:
@@ -73,6 +78,35 @@ def resolve_confidence_head(draft_model: torch.nn.Module) -> Optional[torch.nn.M
     if not stages:
         return None
     return getattr(stages[-1], "confidence_head", None)
+
+
+def validate_confidence_request(spec_config: "DSparkDecodingConfig", request: "LlmRequest") -> None:
+    """Reject unsupported request controls before confidence-policy admission."""
+    if not spec_config.enable_confidence_scheduling:
+        return
+    if getattr(request, "py_logits_post_processors", None):
+        raise ValueError(
+            "DSpark confidence scheduling does not support per-request logits post-processors"
+        )
+    sampling = request.sampling_config
+    if not spec_config.use_rejection_sampling or sampling is None:
+        return
+    from tensorrt_llm.sampling_params import SamplingParams
+
+    # Match SpecMetadata's actual draft-sampler classification; temperature
+    # alone is insufficient (for example, top_k=1 remains greedy).
+    greedy = SamplingParams.params_imply_greedy_decoding(
+        temperature=sampling.temperature,
+        top_k=sampling.top_k,
+        top_p=sampling.top_p,
+        min_p=sampling.min_p,
+        use_beam_search=False,
+    )
+    if not greedy:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection draft sampling: "
+            "confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def _dspark_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
@@ -454,7 +488,15 @@ class DSv4DSparkWorker(SpecWorkerBase):
         sequence of the last completed draft.
         """
         prev = self._draft_seq_host
-        self._draft_seq_host += 1
+        self._draft_seq_host = (prev + 1) & ((1 << 31) - 1)
+        if self._draft_seq_host == 0:
+            # Recycled stamps must not authenticate an ancient score. The
+            # wrap step sees expected=-1 and uses neutral confidence; later
+            # steps can consume only newly produced scores or neutral rows.
+            if self._confidence_stamp is not None:
+                self._confidence_stamp.zero_()
+            if self._confidence_logits is not None:
+                self._confidence_logits.fill_(_NEUTRAL_CONFIDENCE_LOGIT)
         if self._draft_seq_cuda is not None:
             self._draft_seq_cuda.fill_(self._draft_seq_host)
         return prev
@@ -692,7 +734,6 @@ class DSv4DSparkWorker(SpecWorkerBase):
         self.verify_planner = DSparkVerifyPlanner(
             cfg=cfg,
             apply_calibration=apply_calibration,
-            device_windows=bool(self.spec_config.enable_fused_confidence_scheduler),
         )
         logger.info(
             f"DSpark verify planner: max_verify_len={self.verify_planner.max_verify_len}, "
