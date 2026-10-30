@@ -505,6 +505,8 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Shutdown publication is leader-only, while join/finalize runs on every rank.
+    shutdown_all_ranks = True
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -2238,18 +2240,27 @@ class PyExecutor:
         """Finally close the executor; closed executors cannot be rebound."""
         if self._closed:
             return
+        # Capture model owners before any rank-local shutdown step can fail;
+        # outer workers still need them for an all-rank unsafe preflight.
+        terminal_engines = list(getattr(self, "_terminal_model_engines", ()))
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and all(engine is not item
+                                          for item in terminal_engines):
+                terminal_engines.append(engine)
+        self._terminal_model_engines = tuple(terminal_engines)
         if not self._resources_released:
             if not self._release_execution_resources(
                     release_model_owned_graphs=True):
                 return
         else:
-            for engine in (self.model_engine, self.draft_model_engine):
-                if engine is not None:
-                    engine.release_executor_resources(
-                        release_model_owned_graphs=True)
+            for engine in self._terminal_model_engines:
+                engine.release_executor_resources(
+                    release_model_owned_graphs=True)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
         self._closed = True
+        # The snapshot above keeps the model owners reachable for the outer
+        # worker's collective terminal cleanup.
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
@@ -2259,6 +2270,8 @@ class PyExecutor:
                                      release_model_owned_graphs: bool = False
                                      ) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
+        if getattr(self, "_shutdown_runtime_complete", False):
+            return self._release_execution_pools()
         node_server = getattr(self, "_openengine_node_server", None)
         if node_server is not None:
             node_server.close()
@@ -2288,9 +2301,11 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             # Stop the relay thread and the native progress thread from
             # probing while the hang detector aborts MPI. A relay-thread probe
-            # already in flight is not interrupted.
+            # already in flight is not interrupted. Do not let the outer worker
+            # enter model collectives on a broken rank set.
             self._pp_mpi_progress_stop.set()
             self._stop_mpi_progress_thread()
+            self._terminal_model_engines = ()
             return False
         if self.worker_started:
             self.worker_thread.join()
@@ -2316,10 +2331,13 @@ class PyExecutor:
             encoder_launch_executor.shutdown(wait=True)
             self.encoder_launch_executor = None
 
-        # Stop the sampler's async worker, if it was used
-        if (isinstance(self.sampler, AsyncWorkerMixin)
-                and self.sampler.async_worker_enabled()):
-            self.sampler.async_worker_stop()
+        # Stop the sampler's async worker, if it was used. A retried
+        # release stops it only once.
+        if not getattr(self, "_shutdown_sampler_complete", False):
+            if (isinstance(self.sampler, AsyncWorkerMixin)
+                    and self.sampler.async_worker_enabled()):
+                self.sampler.async_worker_stop()
+            self._shutdown_sampler_complete = True
 
         self.worker_started = False
         if self._kv_connector_failed:
@@ -2348,6 +2366,12 @@ class PyExecutor:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     manager.shutdown()
+        # Retry a later failure without repeating request publication, graph
+        # release, or resource-manager shutdown.
+        self._shutdown_runtime_complete = True
+        return self._release_execution_pools()
+
+    def _release_execution_pools(self) -> bool:
         if self.virtual_memory_pools is not None:
             keys = list(self.virtual_memory_pools.keys())
             for key in keys:
@@ -2355,7 +2379,94 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        # Released in full: the next release, after a rebind or of resources a
+        # failed rebind bound, starts over.
+        self._shutdown_runtime_complete = False
+        self._shutdown_sampler_complete = False
         return True
+
+    def terminal_cleanup(self, *, local_safe: bool = True) -> None:
+        """Collectively release model resources after all worker threads stop.
+
+        Every rank first completes local graph preparation for every engine,
+        then participates in every manager preflight/collective in the same
+        order. Rank-local model and FC12 cache release happens only afterwards.
+        """
+        engines = getattr(self, "_terminal_model_engines", ())
+        if not engines:
+            return
+
+        prepare_errors = []
+        if local_safe:
+            for engine in engines:
+                try:
+                    engine.prepare_cleanup()
+                except BaseException as error:
+                    prepare_errors.append(error)
+
+        collective_errors = []
+        collective_safe = bool(local_safe and not prepare_errors)
+        for engine in engines:
+            try:
+                manager_safe = engine.shutdown_moe_load_balancer(
+                    local_safe=collective_safe)
+            except BaseException as error:
+                collective_errors.append(error)
+                collective_safe = False
+            else:
+                collective_safe = collective_safe and manager_safe
+
+        if prepare_errors:
+            raise prepare_errors[0]
+        if collective_errors:
+            raise collective_errors[0]
+        if not collective_safe:
+            raise RuntimeError(
+                "MoE load-balancer collective shutdown was not safe on every rank"
+            )
+
+        local_errors = []
+        for engine in engines:
+            try:
+                engine.finish_cleanup()
+            except BaseException as error:
+                local_errors.append(error)
+
+        # FC12 runners are rank-local and may be released only after every
+        # model-owned collective resource has been closed.
+        try:
+            self.release_rank_local_caches()
+        except BaseException as error:
+            local_errors.append(error)
+
+        if local_errors:
+            raise local_errors[0]
+        self._terminal_model_engines = ()
+
+    def local_cleanup(self) -> None:
+        """Rank-local teardown for executors without collective EP resources.
+
+        Drops the terminal model snapshot so the engines release their model
+        state through their own finalizers, as before collective cleanup.
+        """
+        try:
+            self.release_rank_local_caches()
+        finally:
+            self._terminal_model_engines = ()
+
+    def release_rank_local_caches(self) -> None:
+        """Release this executor stream's shared-FC12 runners, if any were built."""
+        shared_fc12 = sys.modules.get(
+            "tensorrt_llm._torch.moe.kernels.megamoe_shared_fc12")
+        if shared_fc12 is None:
+            return
+
+        device = self.execution_stream.device
+        device_index = device.index if hasattr(device, "index") else int(device)
+        shared_fc12.release_shared_fc12_cache(
+            device_index,
+            stream_handle=int(self.execution_stream.cuda_stream),
+        )
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -9981,8 +10092,10 @@ class PyExecutor:
                                 f"_enqueue_responses.")
                         gather_responses.extend(resp)
                     responses = gather_responses
-        logger.debug(
-            f'after gather, rank = {self.dist.rank}, responses = {responses}')
+        if logger.is_debug_enabled():
+            logger.debug(
+                f'after gather, rank = {self.dist.rank}, responses = {responses}'
+            )
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -10090,9 +10203,10 @@ class PyExecutor:
         requests_finished_by_transfer = []
         new_active_requests = []
         timed_out_requests = []
-        logger.debug(
-            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
-        )
+        if logger.is_debug_enabled():
+            logger.debug(
+                f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
+            )
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
