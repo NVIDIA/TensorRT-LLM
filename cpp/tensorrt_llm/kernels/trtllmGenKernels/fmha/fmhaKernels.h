@@ -1231,6 +1231,10 @@ private:
         // Softmax optimization
         options.mSkipSoftmaxThresholdScaleFactor = params.mSkipSoftmaxThresholdScaleFactor;
         options.mSkipsSoftmaxWhenPossible = params.mSkipSoftmaxThresholdScaleFactor != 0.0f;
+#ifdef TLLM_RUBIN_FEATURES
+        // hashFromFmhaOptions reads this field to pick the fp16-softmax Sm107a cubins.
+        options.mEnablesFp16Softmax = params.mFp16Softmax;
+#endif // TLLM_RUBIN_FEATURES
 
         // Paged KV cache
         options.mMaxNumPagesPerSeqKv = params.mMaxNumPagesPerSeqKv;

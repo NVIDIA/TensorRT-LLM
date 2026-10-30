@@ -277,6 +277,60 @@ def apply_fused_layernorm_adaln_quant(
     return out
 
 
+def fp8_static_input(linear) -> bool:
+    """Whether a Linear quantizes its input to FP8 with a static scale on the cuBLAS path."""
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
+
+    method = getattr(linear, "quant_method", None)
+    return isinstance(method, FP8QDQLinearMethod) and method.supports_cublas_epilogues(linear)
+
+
+def residual_norm_quant(
+    x: torch.Tensor,
+    mode: int,
+    rows_per_batch: int,
+    *,
+    y: Optional[torch.Tensor] = None,
+    y_bias: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
+    weight: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+    inv_out_scale: Optional[torch.Tensor] = None,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Gated residual and LayerNorm / AdaLN + static FP8 quant of [..., hidden] rows in one pass.
+
+    mode 0: returns (x + gate * (y + y_bias), None).
+    mode 1: LayerNorm with affine weight / bias; mode 2: AdaLN with weight (scale) / bias (shift)
+    of shape [batch, hidden]. Returns (updated x or None without y, e4m3 normalized rows).
+    """
+    shape = x.shape
+    hidden = shape[-1]
+
+    def rows(t):
+        return None if t is None else t.reshape(-1, hidden).contiguous()
+
+    def fp32(t):
+        return None if t is None else t.to(torch.float32).reshape(-1, hidden).contiguous()
+
+    x_out, normed = torch.ops.trtllm.fused_residual_norm_quant(
+        rows(x),
+        rows(y),
+        y_bias,
+        fp32(gate),
+        mode,
+        fp32(weight),
+        fp32(bias),
+        rows_per_batch,
+        eps,
+        None if inv_out_scale is None else inv_out_scale.reshape(1).to(torch.float32),
+    )
+    return (
+        x_out.view(shape) if y is not None else None,
+        normed.view(shape) if mode != 0 else None,
+    )
+
+
 def apply_fused_layernorm_affine_quant(
     x: torch.Tensor,
     ln_weight: torch.Tensor,

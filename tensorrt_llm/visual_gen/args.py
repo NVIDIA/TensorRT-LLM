@@ -180,6 +180,12 @@ class AttentionConfig(StrictBaseModel):
                 ("fp8", "fp8", (0, 0, 0)),
             },
         }
+        # trtllm-gen dense FP8 context attention serves the per-tensor FP8 recipe on Rubin.
+        DENSE_FP8_RECIPES = {
+            107: {
+                ("fp8", "fp8", (0, 0, 0)),
+            },
+        }
         # Other recipes verify the hardware at corresponding backend implementations.
         CUDNN_RECIPES = {
             ("fp8", "fp8", (0, 0, 0)),
@@ -210,12 +216,16 @@ class AttentionConfig(StrictBaseModel):
         )
         if self.backend == "TRTLLM":
             sm_version = get_sm_version()
-            recipes = SAGE_RECIPES.get(sm_version, set()) | PRIMSTS_RECIPES.get(sm_version, set())
+            recipes = (
+                SAGE_RECIPES.get(sm_version, set())
+                | PRIMSTS_RECIPES.get(sm_version, set())
+                | DENSE_FP8_RECIPES.get(sm_version, set())
+            )
             if recipe not in recipes:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='TRTLLM'. Supported SAGE and PrimTS recipes on this device: "
-                    f"{sorted(recipes)}."
+                    f"for backend='TRTLLM'. Supported SAGE, PrimTS and dense FP8 recipes on this "
+                    f"device: {sorted(recipes)}."
                 )
             if (q_config.smooth_k or q_config.smooth_v) and q_config.q_block_size == 0:
                 raise ValueError(

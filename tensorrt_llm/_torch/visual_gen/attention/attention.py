@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from enum import Enum
 from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig, SolAttentionConfig
 
@@ -29,6 +31,32 @@ from ..modules.rms_norm import RMSNormTPAware
 from .backends.interface import AttentionTensorLayout
 from .backends.parallel import wrap_parallel_attention
 from .backends.utils import create_attention
+
+LOG2E = math.log2(math.e)
+
+
+def fused_qk_norm_rope_fp8_supported(num_heads: int, head_dim: int) -> bool:
+    """Shapes and devices served by ``trtllm::fused_dit_qk_norm_rope_fp8``."""
+    return get_sm_version() >= 90 and head_dim == 128 and 0 < num_heads <= 64
+
+
+def _dense_fp8_serves_recipe(attention_config) -> bool:
+    """Whether TRTLLM self-attention runs the per-tensor FP8 recipe on trtllm-gen dense FP8.
+
+    PrimTS serves the same recipe when it is enabled and keeps precedence.
+    """
+    cfg = attention_config.quant_attention_config if attention_config is not None else None
+    if cfg is None or attention_config.sparse_attention_config is not None:
+        return False
+    if (cfg.qk_dtype, cfg.v_dtype) != ("fp8", "fp8") or (
+        cfg.q_block_size,
+        cfg.k_block_size,
+        cfg.v_block_size,
+    ) != (0, 0, 0):
+        return False
+    from ...attention.backends.fmha.registry import FMHA_LIBS, get_enabled_fmha_lib_classes
+
+    return FMHA_LIBS["prims_ts"] not in get_enabled_fmha_lib_classes()
 
 
 class QKVMode(str, Enum):
@@ -120,11 +148,20 @@ class Attention(nn.Module):
         is_separate_qkv_cross_attention = (
             self.qkv_mode == QKVMode.SEPARATE_QKV and not separate_qkv_is_self_attention
         )
+        dense_fp8_trtllm = base_backend == "TRTLLM" and _dense_fp8_serves_recipe(config.attention)
 
         # Cross-attention fallback: every TRTLLM backend and every VSA backend are
         # self-attention only. The CuTeDSL SOL backend delegates cross-attention per
-        # call instead; see SOLCuTeDSLAttention._can_serve.
-        if is_separate_qkv_cross_attention and (base_backend == "TRTLLM" or is_vsa):
+        # call instead; see SOLCuTeDSLAttention._can_serve. The trtllm-gen dense FP8
+        # recipe keeps cross-attention in FP8 on cuDNN.
+        if is_separate_qkv_cross_attention and dense_fp8_trtllm and not is_vsa:
+            backend_name = "CUDNN"
+            logger.info_once(
+                f"{type(self).__name__}: TRTLLM per-tensor FP8 attention runs cross-attention "
+                "on CUDNN FP8.",
+                key=(type(self).__name__, "dense_fp8_cross_attention"),
+            )
+        elif is_separate_qkv_cross_attention and (base_backend == "TRTLLM" or is_vsa):
             backend_name = "VANILLA"
             requested = (
                 f"{base_backend} (VSA)"
@@ -139,6 +176,15 @@ class Attention(nn.Module):
                 f"{type(self).__name__}: requested attention backend {requested} does not "
                 f"support qkv_mode=SEPARATE_QKV; falling back to {backend_name}.",
                 key=(type(self).__name__, requested, backend_name),
+            )
+        elif dense_fp8_trtllm and cp_size > 1 and enable_sequence_parallel:
+            # Attention2D and Ring merge partial results by LSE, which the trtllm-gen dense
+            # FP8 path does not return; cuDNN FP8 runs the same recipe with LSE.
+            backend_name = "CUDNN"
+            logger.info_once(
+                f"{type(self).__name__}: TRTLLM per-tensor FP8 attention runs on CUDNN FP8 "
+                f"under context parallelism (cp_size={cp_size}).",
+                key=(type(self).__name__, "dense_fp8_context_parallel"),
             )
         else:
             backend_name = base_backend
@@ -303,6 +349,25 @@ class Attention(nn.Module):
             use_ulysses=use_ulysses,
             async_ulysses=use_ulysses and async_ulysses,
         )
+
+        # FUSE_QKV self-attention with full-dim QK norm hands e4m3 Q/K/V straight to a backend
+        # that accepts them: one kernel normalizes, rotates and quantizes the packed QKV.
+        self._fp8_qkv_producer = (
+            self.qkv_mode == QKVMode.FUSE_QKV
+            and self.fuse_qk_norm_rope
+            and self.qk_norm
+            and qk_norm_mode == "full"
+            and self.tp_size == 1
+            and sparse_config is None
+            and not (use_ulysses and async_ulysses)
+            and self.num_attention_heads == self.num_key_value_heads
+            and fused_qk_norm_rope_fp8_supported(self.num_attention_heads, self.head_dim)
+            and self.attn.accepts_fp8_qkv()
+        )
+        # sqrt(softmax_scale * log2(e)) on Q and K: the FP16-softmax kernels take no softmax scale.
+        self._fp8_qk_mul = math.sqrt(LOG2E / math.sqrt(self.head_dim))
+        # Dequant scale of to_out's FP8 input; the attention output stays BF16 while None.
+        self._fp8_out_scale: Optional[torch.Tensor] = None
 
     @staticmethod
     def _qualified_module_name(
@@ -580,6 +645,59 @@ class Attention(nn.Module):
             tokens_per_batch,
         )
 
+    def apply_packed_qk_norm_rope_fp8(
+        self,
+        qkv: torch.Tensor,
+        freqs_cos: torch.Tensor,
+        freqs_sin: torch.Tensor,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Full-dim QK Norm + RoPE + FP8 quantization of a packed QKV tensor [B, S, 3*H*D].
+
+        Q and K are quantized as x * qk_mul (callers fold their descale into qk_mul). V uses a
+        per-tensor scale from ``v_amax`` (e.g. reduced across sequence-parallel ranks), or from the
+        local |V| maximum when it is None. Returns e4m3 Q, K, V [B*S, H, D] and the fp32 [1] V
+        descale.
+        """
+        B, S, D = qkv.shape
+        assert self.tp_size == 1, "fused_dit_qk_norm_rope_fp8 does not support TP"
+        return torch.ops.trtllm.fused_dit_qk_norm_rope_fp8(
+            qkv.view(B * S, D),
+            self.num_attention_heads,
+            self.head_dim,
+            self.eps,
+            self.norm_q.weight,
+            self.norm_k.weight,
+            freqs_cos,
+            freqs_sin,
+            self.interleave,
+            qk_mul,
+            v_amax,
+        )
+
+    def _fp8_self_attention(
+        self, qkv: torch.Tensor, freqs_cos: torch.Tensor, freqs_sin: torch.Tensor
+    ) -> torch.Tensor:
+        """Packed BF16 QKV [B, S, 3*H*D] to the attention output [B, S, H*D] through FP8 Q/K/V."""
+        batch_size, seq_len, _ = qkv.shape
+        num_heads, head_dim = self.num_attention_heads, self.head_dim
+        v_amax = self.attn.fp8_v_amax(qkv.view(batch_size * seq_len, -1), num_heads, head_dim)
+        q8, k8, v8, v_descale = self.apply_packed_qk_norm_rope_fp8(
+            qkv, freqs_cos, freqs_sin, self._fp8_qk_mul, v_amax
+        )
+        shape = (batch_size, seq_len, num_heads, head_dim)
+        out = self.attn.forward_fp8(
+            q8.view(shape),
+            k8.view(shape),
+            v8.view(shape),
+            v_descale,
+            batch_size,
+            seq_len,
+            out_scale=self._fp8_out_scale,
+        )
+        return out.reshape(batch_size, seq_len, num_heads * head_dim)
+
     def apply_split_norm_rope(
         self,
         tensor: torch.Tensor,
@@ -728,12 +846,16 @@ class Attention(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         freqs: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         timestep: Optional[torch.Tensor] = None,
+        defer_out_bias: bool = False,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """With defer_out_bias, returns the output projection without its bias (the caller adds
+        it, for example in a fused residual kernel)."""
         # hidden_states may be [B, S, H] or an Fp4QuantizedTensor from an upstream
         # fused norm+quant kernel; downstream Linear accepts either.
         if not isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.ndim == 3, "hidden_states must be a 3D tensor"
+        to_out = self.to_out[0].forward_without_bias if defer_out_bias else self.to_out[0]
 
         # Fused path: QKV projection → fused QK norm + RoPE → attention
         if (
@@ -744,10 +866,18 @@ class Attention(nn.Module):
         ):
             qkv = self.qkv_proj(hidden_states)
             freqs_cos, freqs_sin = freqs
+            if (
+                self._fp8_qkv_producer
+                and encoder_hidden_states is None
+                and not kwargs
+                and qkv.dtype == torch.bfloat16
+            ):
+                out = self._fp8_self_attention(qkv, freqs_cos, freqs_sin)
+                return to_out(out)
             self.apply_packed_qk_norm_rope(qkv, freqs_cos, freqs_sin)
             q, k, v = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)
             out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
-            return self.to_out[0](out)
+            return to_out(out)
 
         # Unfused path: separate QK norm → separate RoPE → attention
         q, k, v = self.get_qkv(hidden_states, encoder_hidden_states)
@@ -769,7 +899,7 @@ class Attention(nn.Module):
             k = k.flatten(2)
 
         out = self._attn_impl(q, k, v, timestep=timestep, **kwargs)
-        out = self.to_out[0](out)
+        out = to_out(out)
         return out
 
     def forward_async(

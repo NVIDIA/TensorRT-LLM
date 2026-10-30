@@ -335,6 +335,8 @@ def _register_fake():
         out_dtype,
         output_buffer_kind: int = 0,
         group: Optional[List[int]] = None,
+        epilogue: int = 0,
+        d_scale: Optional[torch.Tensor] = None,
     ):
         shape = [i for i in mat_a.shape]
         shape[-1] = mat_b.shape[-1]
@@ -1835,6 +1837,61 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fused_residual_norm_quant")
+    def _(
+        x: torch.Tensor,
+        y: Optional[torch.Tensor],
+        y_bias: Optional[torch.Tensor],
+        gate: Optional[torch.Tensor],
+        mode: int,
+        weight: Optional[torch.Tensor],
+        bias: Optional[torch.Tensor],
+        rows_per_batch: int,
+        eps: float,
+        inv_out_scale: Optional[torch.Tensor],
+    ):
+        x_out = torch.empty_like(x) if y is not None else x.new_empty(0)
+        normed = (x.new_empty(x.shape, dtype=torch.float8_e4m3fn)
+                  if mode != 0 else x.new_empty(0, dtype=torch.float8_e4m3fn))
+        return x_out, normed
+
+    @torch.library.register_fake("trtllm::fmha_dense_fp8")
+    def _(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        scale_bmm1: Optional[torch.Tensor],
+        scale_out: torch.Tensor,
+        fp16_softmax: bool,
+        out_dtype: torch.dtype,
+    ):
+        return q.new_empty(q.shape, dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::dit_v_amax")
+    def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
+        return qkv.new_empty((1, ), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::fused_dit_qk_norm_rope_fp8")
+    def _(
+        qkv: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_emb: torch.Tensor,
+        sin_emb: torch.Tensor,
+        interleave: bool,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor],
+    ):
+        shape = (qkv.shape[0], num_heads, head_dim)
+        q8, k8, v8 = (qkv.new_empty(shape, dtype=torch.float8_e4m3fn)
+                      for _ in range(3))
+        return q8, k8, v8, qkv.new_empty((1, ), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
     def _(

@@ -30,6 +30,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
+from ....attention.backends.fmha.trtllm_gen_dense_fp8 import (
+    TrtllmGenDenseFp8Fmha,
+    dense_fp8_supported,
+)
 from ....attention.backends.interface import (
     AttentionForwardArgs,
     AttentionRuntimeFeatures,
@@ -322,6 +326,8 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 "by visual-gen config for model-scoped metadata and plan sharing."
             )
 
+        # FMHA libraries read the recipe when the base class builds its FMHA manager.
+        self.quant_attention_config = quant_attention_config
         super().__init__(
             layer_idx=layer_idx,
             num_heads=num_heads,
@@ -340,7 +346,6 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
             attention_metadata_state=attention_metadata_state,
         )
 
-        self.quant_attention_config = quant_attention_config
         if (
             quant_attention_config is not None
             and quant_attention_config.q_block_size == 0
@@ -348,12 +353,26 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         ):
             raise RuntimeError(
                 "The per-tensor FP8 attention recipe needs the PrimTS FMHA library "
-                "(TLLM_FMHA_LIBS=+prims_ts), which is not enabled or not available on this "
-                "platform."
+                "(TLLM_FMHA_LIBS=+prims_ts) or the trtllm-gen dense FP8 FMHA library "
+                "(trtllm_gen_dense_fp8), and neither is enabled or available for this layer "
+                "on this platform."
             )
         # Compiled callers guard on this flag; testing layer_idx per call would specialize, and
         # recompile, the attention frames for every layer.
         self.is_dense_layer = self.layer_idx in self.dense_layers
+        # The dense FP8 library also serves pre-quantized Q/K/V (FP16 softmax with the softmax
+        # scale folded into Q/K) for the per-tensor FP8 recipe when no library ahead of it
+        # claims the recipe.
+        self._dense_fp8_lib: Optional[TrtllmGenDenseFp8Fmha] = None
+        if quant_attention_config is not None and quant_attention_config.q_block_size == 0:
+            per_tensor_fp8 = next(
+                (fmha for fmha in self._fmha_manager.fmha_libs if fmha.supports_per_tensor_fp8),
+                None,
+            )
+            if isinstance(per_tensor_fp8, TrtllmGenDenseFp8Fmha) and dense_fp8_supported(
+                head_dim, num_heads, torch.bfloat16, True
+            ):
+                self._dense_fp8_lib = per_tensor_fp8
 
     @property
     def timestep_cutoff(self) -> Optional[float]:
@@ -657,6 +676,32 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         full[:num_tokens].copy_(output.view(num_tokens, -1))
         full[num_tokens:].zero_()
         return full
+
+    def accepts_fp8_qkv(self) -> bool:
+        return self._dense_fp8_lib is not None
+
+    def forward_fp8(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        v_descale: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        out_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        tokens = batch_size * seq_len
+        flat = (tokens, self.num_heads, self.head_dim)
+        out = self._dense_fp8_lib.run_prequantized(
+            q.reshape(flat),
+            k.reshape(flat),
+            v.reshape(flat),
+            v_descale,
+            batch_size,
+            seq_len,
+            out_scale,
+        )
+        return out.view(batch_size, seq_len, self.num_heads, self.head_dim)
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
