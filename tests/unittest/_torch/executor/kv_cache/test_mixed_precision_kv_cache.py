@@ -519,6 +519,49 @@ def test_dsa_mtp_layer_goes_mixed():
         manager.shutdown()
 
 
+def test_dsa_cold_page_window_twins_share_the_pool():
+    """On a plain DSA pool a twin mirrors its layer's buffers and lands in the layer's pool."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode
+
+    manager = DSACacheManagerV2(
+        kv_cache_config=cold_page_config(pool_ratio=None),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        cold_page_codec_provider=_ColdPageProvider(),
+    )
+    try:
+        assert manager.high_layers == {0: 2, 1: 3}
+        layers = manager.kv_cache_manager_py_config.layers
+        for local, twin in manager.high_layers.items():
+            assert [(b.role, b.size) for b in layers[twin].buffers] == [
+                (b.role, b.size) for b in layers[local].buffers
+            ]
+        pool = manager.get_unique_primary_pool()
+        assert pool.shape[1] == 2
+        base = manager.impl.get_mem_pool_base_address(0, Role.KEY, PageIndexMode.SHARED)
+        stride = manager.impl.get_page_stride(0, Role.KEY)
+        assert sorted(manager.retained_row_layer_offsets) == [0, 1]
+        for local, twin in manager.high_layers.items():
+            offset = manager.retained_row_layer_offsets[local]
+            assert (
+                manager.impl.get_mem_pool_base_address(twin, Role.KEY, PageIndexMode.SHARED)
+                == base + offset * stride
+            )
+    finally:
+        manager.shutdown()
+
+
 def test_deepseek_v4_mtp_layer_stays_native():
     """DeepSeek-V4's MTP layer has only a sliding window, so it gets no twin."""
     from types import SimpleNamespace

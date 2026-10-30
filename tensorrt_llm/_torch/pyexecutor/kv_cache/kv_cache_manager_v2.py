@@ -4087,6 +4087,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ):
             raise ValueError("Mixed precision requires FP16/BF16/FP8 KV")
         layers = list(config.layers)
+        layer_by_id = {int(layer.layer_id): layer for layer in layers}
         roles = (Role.KEY,) if self.kv_factor == 1 else (Role.KEY, Role.VALUE)
         for local in range(self.num_local_layers):
             if not self._is_mixed_precision_layer(local):
@@ -4097,11 +4098,31 @@ class KVCacheManagerV2(BaseResourceManager):
                 * self.head_dim_per_layer[local],
                 self.high_precision_dtype,
             )
+            buffers = [BufferConfig(role=role, size=page_bytes) for role in roles]
+            main_buffers = {buffer.role: buffer for buffer in layer_by_id[local].buffers}
+            if all(
+                role in main_buffers and main_buffers[role].size == page_bytes for role in roles
+            ):
+                # Same page as the layer itself: mirror its other buffers (such as a sparse
+                # indexer cache) so both slots match and the core keeps the layer and its
+                # twin in one pool, where sparse attention addresses twin rows directly.
+                buffers.extend(
+                    BufferConfig(
+                        role=buffer.role,
+                        size=buffer.size,
+                        tokens_per_block_override=buffer.tokens_per_block_override,
+                        is_sparse=buffer.is_sparse,
+                        coalescing_group=buffer.coalescing_group,
+                        sparse_unit_chunks=buffer.sparse_unit_chunks,
+                    )
+                    for buffer in layer_by_id[local].buffers
+                    if buffer.role not in roles
+                )
             self.high_layers[local] = len(layers)
             layers.append(
                 AttentionLayerConfig(
                     layer_id=LayerId(len(layers)),
-                    buffers=[BufferConfig(role=role, size=page_bytes) for role in roles],
+                    buffers=buffers,
                     # Native SWA includes the next query's write position, plus the draft tokens.
                     sliding_window_size=self.last_n + 1 + self.max_draft_len,
                     num_sink_tokens=self.first_n,
