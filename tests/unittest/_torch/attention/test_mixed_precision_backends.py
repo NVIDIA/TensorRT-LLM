@@ -893,22 +893,26 @@ def test_draft_forward_swaps_in_draft_staging():
     assert meta.mixed_precision_staging is target
 
 
-@pytest.mark.cpu_only
-def test_gather_pool_rows_for_generation_copies_pairs():
-    """A plain pool's selected rows land at their pair index; unselected pairs stay -1."""
+def test_retained_row_indices_point_at_the_twin():
+    """A plain pool reads a retained position from the twin's row; released pages keep the pool row."""
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_retained_rows import (
-        gather_pool_rows_for_generation,
+        retained_row_indices,
     )
 
-    pool_rows = torch.arange(10, dtype=torch.float32).view(10, 1, 1).expand(10, 1, 4).contiguous()
-    topk_global = torch.tensor([[3, -1], [0, 9]], dtype=torch.int32)
-    scratch = torch.full((2, 2, 4), -7.0)
-    compact = torch.zeros((2, 2), dtype=torch.int32)
-    gather_pool_rows_for_generation(pool_rows, topk_global, scratch, compact)
-    assert compact.tolist() == [[0, -1], [2, 3]]
-    assert scratch[0, 0].tolist() == [3.0] * 4
-    assert scratch[1, 0].tolist() == [0.0] * 4
-    assert scratch[1, 1].tolist() == [9.0] * 4
+    manager = SimpleNamespace(
+        layer_offsets={3: 0}, tokens_per_block=4, retained_row_layer_offsets={0: 1}
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        retained_block_table=torch.tensor([[8, -1, 12]], dtype=torch.int32, device="cuda"),
+    )
+    attention = SimpleNamespace(layer_idx=3)
+    topk = torch.tensor([[0, 5, 9, -1]], dtype=torch.int32, device="cuda")
+    pool_rows = torch.tensor([[100, 101, 102, -1]], dtype=torch.int32, device="cuda")
+    requests = torch.zeros(1, dtype=torch.int32, device="cuda")
+    rows = retained_row_indices(metadata, attention, topk, pool_rows, requests)
+    # Twin page 8 holds position 0 at row 8 * 4 + 1 * 4 + 0; the twin released block 1.
+    assert rows.tolist() == [[36, 101, 53, -1]]
 
 
 @pytest.mark.cpu_only
