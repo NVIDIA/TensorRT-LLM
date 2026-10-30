@@ -78,6 +78,11 @@ class BreakableCUDAGraphRunner:
         """Token buckets with a captured graph, in ascending order."""
         return self._captured_num_tokens
 
+    def has_graphable_breaks(self, num_tokens: int) -> bool:
+        """Whether the bucket's graph has breaks that can replay as CUDA graphs."""
+        graph = self._graphs.get(num_tokens)
+        return graph is not None and graph.has_graphable_breaks
+
     @property
     def num_break_graphs(self) -> int:
         """CUDA graphs captured for graphable breaks, over all buckets."""

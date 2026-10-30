@@ -1080,6 +1080,7 @@ class DecoderCudaGraphs:
                 if (
                     self.breakable_cuda_graph_runner is not None
                     and num_tokens <= self._config.max_num_tokens // 4
+                    and self.breakable_cuda_graph_runner.has_graphable_breaks(num_tokens)
                 ):
                     free_bytes = torch.cuda.mem_get_info()[0]
                     with timing_metric("ctx_cuda_graph_capture_seconds", self._metrics):

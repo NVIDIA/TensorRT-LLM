@@ -265,6 +265,11 @@ class BreakableCUDAGraph:
         return len(self._break_functions)
 
     @property
+    def has_graphable_breaks(self) -> bool:
+        """Whether a break can replay as CUDA graphs (see ``eager_on_graph``)."""
+        return any(isinstance(fn, _GraphedBreak) for fn in self._break_functions)
+
+    @property
     def num_break_graphs(self) -> int:
         """CUDA graphs captured for the breaks (see ``eager_on_graph``)."""
         return sum(len(fn.graphs) for fn in self._break_functions if isinstance(fn, _GraphedBreak))

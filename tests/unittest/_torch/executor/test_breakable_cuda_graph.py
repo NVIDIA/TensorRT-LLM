@@ -428,6 +428,7 @@ def test_runner_first_bucket_segments_share_one_memory_pool():
 
     graph = runner._graphs[8]
     assert graph.num_segments == 3
+    assert not runner.has_graphable_breaks(8)
     assert runner._memory_pool is not None
     assert all(segment.pool() == runner._memory_pool for segment in graph._segments)
 
@@ -457,6 +458,7 @@ def test_runner_captures_break_graphs_only_in_capture_break_graphs():
         return body(inputs["value"])
 
     runner.capture(8, engine_forward)
+    assert runner.has_graphable_breaks(8) and not runner.has_graphable_breaks(4)
     eager_calls = calls["eager"]
     runner.execute(8, lambda: body(inputs["value"]))
     assert calls["eager"] == eager_calls + 1 and runner.num_break_graphs == 0
