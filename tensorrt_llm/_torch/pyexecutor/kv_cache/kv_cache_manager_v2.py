@@ -3989,10 +3989,17 @@ class KVCacheManagerV2(BaseResourceManager):
         for config, owner in zip(layer_configs, owners):
             bytes_per_block[owner] += sum(buffer.size for buffer in config.buffers)
         # The context-chunk floor declared with this ratio: every lifecycle holds one fresh chunk
-        # below the resume watermark. Without room for it the backend keeps its own split.
+        # below the resume watermark, each pool rounded to the allocation granularity (bounded
+        # here per buffer). Without room for it the backend keeps its own split.
         chunk_blocks = -(-(self.max_num_tokens + self.num_extra_kv_tokens) // tokens_per_block)
-        floor_slots = math.ceil(chunk_blocks / max_util_for_resume)
-        if floor_slots * sum(bytes_per_block.values()) > gpu_quota:
+        floor_slots = math.ceil(chunk_blocks / float(np.float32(max_util_for_resume)))
+        granularity = _gpu_alloc_granularity(gpu_quota)
+        floor_bytes = sum(
+            -(-floor_slots * buffer.size // granularity) * granularity
+            for config in layer_configs
+            for buffer in config.buffers
+        )
+        if floor_bytes > gpu_quota:
             return None
         token_share = bytes_per_block[KVCacheLayerOwner.DRAFT] / sum(bytes_per_block.values())
         draft_ratio = min(draft_bytes / gpu_quota, token_share)

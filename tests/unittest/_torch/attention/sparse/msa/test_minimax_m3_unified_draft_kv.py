@@ -398,16 +398,19 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128, 0.5)[1] == pytest.approx(
         2 * draft_bytes / (1 << 30)
     )
-    # A quota too small for the windows keeps the bytes-per-token split.
+    # A quota too small for every window keeps the bytes-per-token split.
     token_share = draft_bytes_per_token / sum(
         spec.bytes_per_token() for spec in manager.layer_specs
     )
-    assert manager._windowed_draft_pool_ratio(configs, 1 << 20, 128)[1] == pytest.approx(
+    manager.max_batch_size = 64
+    assert manager._windowed_draft_pool_ratio(configs, 8 << 20, 128)[1] == pytest.approx(
         token_share
     )
-    # The quota must hold the context-chunk floor: two blocks per lifecycle, over the resume
-    # watermark; otherwise the backend keeps its own split.
-    floor_bytes = 3 * sum(spec.bytes_per_token() * 128 for spec in manager.layer_specs)
+    manager.max_batch_size = 2
+    # The quota must hold the context-chunk floor: two blocks per lifecycle over the resume
+    # watermark, each buffer rounded to the 2 MiB allocation granularity; otherwise the backend
+    # keeps its own split.
+    floor_bytes = len(configs) * (2 << 20)
     assert manager._windowed_draft_pool_ratio(configs, floor_bytes - 1, 128, 0.95) is None
     assert manager._windowed_draft_pool_ratio(configs, floor_bytes, 128, 0.95) is not None
     # Without a context-chunk bound the backend keeps its own split.
