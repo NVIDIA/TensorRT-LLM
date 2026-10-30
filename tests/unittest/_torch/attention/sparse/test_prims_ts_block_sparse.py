@@ -40,6 +40,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.attention.kernels.sage_quant import SageQuantized
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.quantization.mode import QuantMode
 
 pytestmark = pytest.mark.cpu_only
 
@@ -268,6 +269,19 @@ def test_block_sparse_support_is_phase_specific_and_paged_proxy_is_rejected(
     )
     assert not _supported
     assert reason == "paged block-sparse attention only supports BSR exact routes"
+
+
+def test_paged_block_sparse_rejects_fp8_kv_cache() -> None:
+    attention, fmha, q, metadata, args = _paged_case()
+    attention.quant_mode = QuantMode.FP8_KV_CACHE
+    metadata.kv_cache_manager.dtype = torch.float8_e4m3fn
+
+    supported, reason = fmha._is_supported_with_reason(
+        q, None, None, metadata, args, phase=FmhaPhase.GENERATION
+    )
+
+    assert not supported
+    assert "quantized KV cache" in reason
 
 
 def test_contiguous_proxy_routes_reject_causal_mask_before_planning(monkeypatch) -> None:

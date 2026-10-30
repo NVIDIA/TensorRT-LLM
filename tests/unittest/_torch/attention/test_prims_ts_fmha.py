@@ -196,6 +196,9 @@ def _support_result(
         relative_attention_bias=torch.empty(1) if has_relative_attention_bias else None,
         is_fused_qkv=is_fused_qkv,
     )
+    if quant_mode.has_fp8_kv_cache():
+        forward_args.kv_scale_orig_quant = _TensorSpec((1,), torch.float32)
+        forward_args.kv_scale_quant_orig = _TensorSpec((1,), torch.float32)
     if is_mla and quant_mode.has_fp8_kv_cache():
         forward_args.quant_q_buffer = _TensorSpec(q.shape, torch.uint8)
         forward_args.mla_bmm1_scale = _TensorSpec((2,), torch.float32)
@@ -321,6 +324,20 @@ def test_supported_matrix(case: dict) -> None:
     assert supported, reason
 
 
+@pytest.mark.parametrize("phase", list(AttentionInputType))
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_fp8_standard_supported(phase, dtype, use_v2) -> None:
+    supported, reason = _support_result(
+        attention_input_type=phase,
+        dtype=dtype,
+        kv_dtype=DataType.FP8,
+        quant_mode=QuantMode.FP8_KV_CACHE,
+        use_kv_cache_v2=use_v2,
+    )
+    assert supported, reason
+
+
 @pytest.mark.parametrize("num_heads", [6, 12, 64, 96, 128])
 @pytest.mark.parametrize("use_kv_cache_v2", [False, True])
 @pytest.mark.parametrize("tokens_per_block", [16, 32, 64, 128])
@@ -345,10 +362,12 @@ def test_fp8_mla_supported(
 @pytest.mark.parametrize(
     ("overrides", "expected_reason"),
     [
-        ({"is_mla": False, "head_dim": 128}, "only for FP8 MLA"),
-        ({"quant_mode": QuantMode.INT8_KV_CACHE}, "only for FP8 MLA"),
-        ({"quant_mode": QuantMode.NVFP4_KV_CACHE}, "only for FP8 MLA"),
-        ({"quant_mode": QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE}, "only for FP8 MLA"),
+        ({"quant_mode": QuantMode.INT8_KV_CACHE}, "only FP8 E4M3 KV-cache quantization"),
+        ({"quant_mode": QuantMode.NVFP4_KV_CACHE}, "only FP8 E4M3 KV-cache quantization"),
+        (
+            {"quant_mode": QuantMode.FP8_KV_CACHE | QuantMode.INT8_KV_CACHE},
+            "only FP8 E4M3 KV-cache quantization",
+        ),
         ({"kv_dtype": DataType.BF16}, "FP8 E4M3 KV cache"),
         ({"quant_mode": QuantMode(0)}, "query and KV-cache dtypes"),
         ({"dtype": torch.float16}, "BF16 query input and output"),
@@ -703,22 +722,24 @@ def test_unsupported_matrix_falls_through(case: dict, expected_reason: str) -> N
 
 
 @pytest.mark.parametrize(
-    ("sm", "cutlass_version", "compiler_version", "expected"),
+    ("sm", "compiler_version", "is_mla", "expected"),
     [
-        (100, "4.7.0", "13.3", True),
-        (103, "4.7.0", "13.3", True),
-        (100, "4.7.0", "13.4", True),
-        (100, "4.7.0", "13.2", False),
-        (107, "4.7.0", "13.3", False),
-        (120, "4.7.0", "13.3", False),
-        (100, "4.6.2", "13.3", False),
+        (100, "13.3", False, True),
+        (103, "13.3", False, True),
+        (100, "13.4", False, True),
+        (100, "13.2", False, False),
+        (107, "13.3", False, True),
+        (107, "13.2", False, False),
+        (107, "13.3", True, False),
+        (100, "13.3", True, True),
+        (120, "13.3", False, False),
     ],
 )
 def test_static_availability_gate(
     monkeypatch: pytest.MonkeyPatch,
     sm: int,
-    cutlass_version: str,
     compiler_version: str,
+    is_mla: bool,
     expected: bool,
 ) -> None:
     target_version = Mock(
@@ -733,12 +754,11 @@ def test_static_availability_gate(
         return object()
 
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: sm)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: cutlass_version)
     monkeypatch.setattr(prims_ts_module, "import_module", import_cutlass_module)
     monkeypatch.setattr(PrimsTSFmha, "_missing_fused_nanobind_ops", staticmethod(lambda: []))
 
-    assert PrimsTSFmha.is_available(_Attention()) is expected
-    if sm in (100, 103) and Version(cutlass_version) >= Version("4.7.0"):
+    assert PrimsTSFmha.is_available(_Attention(is_mla=is_mla)) is expected
+    if sm in (100, 103) or (sm == 107 and not is_mla):
         target_version.assert_called_once_with(min_version="13.3")
     else:
         target_version.assert_not_called()
@@ -749,7 +769,6 @@ def test_static_availability_gate_fails_closed_when_compiler_query_fails(
 ) -> None:
     cutlass = SimpleNamespace(target_version=Mock(side_effect=RuntimeError("query failed")))
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: 100)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: "4.7.0")
     monkeypatch.setattr(
         prims_ts_module,
         "import_module",
@@ -770,7 +789,6 @@ def test_unsupported_cutlass_compiler_excludes_prims_ts_from_fmha_selection(
     cutlass = SimpleNamespace(target_version=target_version)
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts,fallback")
     monkeypatch.setattr(prims_ts_module, "get_sm_version", lambda: 100)
-    monkeypatch.setattr(prims_ts_module, "version", lambda _: "4.7.0")
     monkeypatch.setattr(
         prims_ts_module,
         "import_module",
@@ -915,15 +933,21 @@ def test_sequence_lengths_are_live_source_view() -> None:
     torch.testing.assert_close(actual, torch.tensor([33, 65], dtype=torch.int32))
 
 
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    fp8: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
+    attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
+    kernel_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    bmm1 = torch.tensor([0.125, 0.125 * math.log2(math.e)])
+    bmm2 = torch.tensor([0.75])
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 120
     q_processed = torch.empty((3, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=torch.bfloat16)
+    kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=kernel_dtype)
     block_tables = torch.tensor(
         [
             [[0, 1, 2, 3], [6, 7, 8, 9]],
@@ -940,8 +964,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
             kv_pool,
             block_tables,
             None,
-            1.0,
-            1.0,
+            bmm1,
+            bmm2,
             fmha_workspace,
             cu_q_seqlens,
             cu_kv_seqlens,
@@ -1037,9 +1061,9 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "num_qo_heads": attn.num_heads,
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
-        "q_dtype": torch.bfloat16,
-        "k_dtype": torch.bfloat16,
-        "v_dtype": torch.bfloat16,
+        "q_dtype": kernel_dtype,
+        "k_dtype": kernel_dtype,
+        "v_dtype": kernel_dtype,
         "out_dtype": torch.bfloat16,
         "page_size": 32,
         "mask_type": "causal",
@@ -1051,7 +1075,13 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
     wrapper.run.assert_called_once()
     run_args = wrapper.run.call_args.args
     run_kwargs = wrapper.run.call_args.kwargs
-    assert run_args[0] is q_processed
+    assert run_args[0].data_ptr() == q_processed.data_ptr()
+    assert run_args[0].dtype == kernel_dtype
+    assert context_preprocess.call_args.args[35] is fp8
+    assert context_postprocess.call_args.args[32] is fp8
+    if fp8:
+        assert run_kwargs["scale_softmax_log2"].data_ptr() == bmm1[1:].data_ptr()
+        assert run_kwargs["output_scale"].data_ptr() == bmm2.data_ptr()
     k_cache, v_cache = run_args[1], run_args[2]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
     assert v_cache.storage_offset() - k_cache.storage_offset() == 6 * math.prod(kv_pool.shape[1:])
@@ -1119,8 +1149,10 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         pytest.param(True, False, True, False, id="cluster-smem-reduction"),
     ),
 )
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
 def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     monkeypatch: pytest.MonkeyPatch,
+    fp8: bool,
     use_split_kv: bool,
     use_separate_reduction_kernel: bool,
     use_cluster_smem_reduction: bool,
@@ -1128,13 +1160,17 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention()
+    attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
+    kernel_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    bmm1 = torch.tensor([0.125, 0.125 * math.log2(math.e)])
+    bmm2 = torch.tensor([0.75])
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 120
     fmha._decode_workspace_offset_bytes = 0
     fmha._decode_workspace_required_bytes = 64
     fmha_workspace = torch.empty(0, dtype=torch.uint8)
     q_processed = torch.empty((2, attn.num_heads, attn.head_dim), dtype=torch.bfloat16)
-    kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=torch.bfloat16)
+    kv_pool = torch.empty((12, attn.num_kv_heads, 32, attn.head_dim), dtype=kernel_dtype)
     block_tables = torch.tensor(
         [
             [[0, 1, 2, 3], [6, 7, 8, 9]],
@@ -1150,8 +1186,8 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
             kv_pool,
             block_tables,
             None,
-            1.0,
-            1.0,
+            bmm1,
+            bmm2,
             fmha_workspace,
             None,
             1,
@@ -1252,8 +1288,9 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
         "max_seq_len_q": 1,
         "packed_query": False,
-        "q_data_type": torch.bfloat16,
-        "kv_data_type": torch.bfloat16,
+        "use_device_scales": fp8,
+        "q_data_type": kernel_dtype,
+        "kv_data_type": kernel_dtype,
         "o_data_type": torch.bfloat16,
         "mask_type": "causal",
         "window_left": 15,
@@ -1264,6 +1301,14 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     run_kwargs = wrapper.run.call_args.kwargs
     assert run_args[0].shape == (2, attn.num_heads, attn.head_dim)
     assert run_args[0].data_ptr() == q_processed.data_ptr()
+    assert run_args[0].dtype == kernel_dtype
+    assert generation_preprocess.call_args.args[35] is fp8
+    if fp8:
+        assert run_kwargs["bmm1_scale"].data_ptr() == bmm1.data_ptr()
+        assert run_kwargs["bmm2_scale"].data_ptr() == bmm2.data_ptr()
+    else:
+        assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
+        assert run_kwargs["bmm2_scale"] == 1.0
     k_cache, v_cache = run_args[1]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
     assert v_cache.storage_offset() - k_cache.storage_offset() == 6 * math.prod(kv_pool.shape[1:])
@@ -1276,8 +1321,6 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
         fixed_block_tables,
         torch.tensor([[0, 1, 2, 3], [2, 3, 4, 5]], dtype=torch.int32),
     )
-    assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
-    assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == (2, attn.num_heads, attn.head_dim)
     assert run_kwargs["out"].data_ptr() == output.data_ptr()
     assert run_kwargs["validate"] is False
@@ -2066,8 +2109,10 @@ def test_mla_caller_workspace_grows_across_plan_profiles(
     assert workspace.numel() == 64
 
 
+@pytest.mark.parametrize("fp8", [False, True])
 def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
     monkeypatch: pytest.MonkeyPatch,
+    fp8: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(
@@ -2075,12 +2120,14 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
         "get_trtllm_gen_generation_workspace_layout",
         lambda *args, **kwargs: {"total_size": 64},
     )
+    workspace_size = Mock(return_value=48)
     monkeypatch.setattr(
         prims_ts_package,
         "get_prims_ts_batch_decode_workspace_size",
-        lambda *args, **kwargs: 48,
+        workspace_size,
     )
     attn = _Attention()
+    attn.quant_mode = QuantMode.FP8_KV_CACHE if fp8 else QuantMode(0)
     fmha = PrimsTSFmha(attn)
     fmha._multi_processor_count = 1
     metadata = SimpleNamespace(
@@ -2113,6 +2160,11 @@ def test_decode_prepare_workspace_reserves_tail_after_compact_preprocessing(
     decode_workspace = fmha._get_decode_workspace(workspace)
     assert decode_workspace.data_ptr() == workspace.data_ptr() + 64
     assert decode_workspace.numel() == 48
+
+    expected_dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    assert workspace_size.call_args.kwargs["q_dtype"] == expected_dtype
+    assert workspace_size.call_args.kwargs["kv_dtype"] == expected_dtype
+    assert workspace_size.call_args.kwargs["out_dtype"] == torch.bfloat16
 
 
 def test_decode_workspace_tail_is_stable_across_mixed_context_layouts(

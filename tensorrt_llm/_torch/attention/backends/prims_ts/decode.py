@@ -132,6 +132,7 @@ class _DecodeCompileSpec:
     max_active_clusters: int
     kv_prefix_mode: Literal["dynamic", "planned_full"]
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"]
+    use_device_scales: bool = False
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None
 
 
@@ -152,8 +153,8 @@ class _DecodeRuntime:
     v_page_stride: int
     v_head_stride: int
     v_token_stride: int
-    bmm1_scale: float
-    bmm2_scale: float
+    bmm1_scale: float | torch.Tensor
+    bmm2_scale: float | torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ class _DecodePlanState:
     planned_seq_lens_device: Optional[torch.Tensor]
     policy: tuple[tuple[str, object], ...]
     storage_page_size: Optional[int] = None
+    use_device_scales: bool = False
 
 
 def _decode_policy_from_config(
@@ -1479,6 +1481,7 @@ def _make_decode_compile_spec(
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
     flat_native_kv_tma: bool = False,
+    use_device_scales: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
@@ -1503,15 +1506,15 @@ def _make_decode_compile_spec(
         kv_prefix_mode=kv_prefix_mode,
         kv_lengths_mode=kv_lengths_mode,
         direct_q1_spec=direct_q1_spec,
+        use_device_scales=use_device_scales,
     )
 
 
 @functools.cache
-def _get_compiled_decode(
-    compile_spec: _DecodeCompileSpec,
-):
+def _get_compiled_decode(compile_spec: _DecodeCompileSpec):
     """Compile and cache one batch-dynamic TS decode topology."""
 
+    use_device_scales = compile_spec.use_device_scales
     device_index = compile_spec.device_index
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
@@ -1588,8 +1591,8 @@ def _get_compiled_decode(
         v_page_stride: cutlass.Int64,
         v_head_stride: cutlass.Int64,
         v_token_stride: cutlass.Int64,
-        bmm1_scale: cutlass.Float32,
-        bmm2_scale: cutlass.Float32,
+        bmm1_scale: cutlass.Float32 | cute.Tensor,
+        bmm2_scale: cutlass.Float32 | cute.Tensor,
         direct_q1_inputs: tuple,
         stream: cuda_drv.CUstream,
         static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
@@ -1667,8 +1670,8 @@ def _get_compiled_decode(
             partial_stats.iterator,
             split_kv_counter.iterator,
             attention_sinks.iterator,
-            bmm1_scale,
-            bmm2_scale,
+            bmm1_scale.iterator if use_device_scales else bmm1_scale,
+            bmm2_scale.iterator if use_device_scales else bmm2_scale,
             Int32(0),
             Int32(static_max_active_clusters),
             stream,
@@ -1704,8 +1707,6 @@ def _get_compiled_decode(
             partial_o: cute.Tensor,
             partial_stats: cute.Tensor,
             attention_sinks: cute.Tensor,
-            bmm1_scale: cutlass.Float32,
-            bmm2_scale: cutlass.Float32,
             direct_q1_inputs: tuple,
             stream: cuda_drv.CUstream,
             static_cfg: cutlass.Constexpr[FmhaDecodeConfig],
@@ -1752,8 +1753,6 @@ def _get_compiled_decode(
                 partial_o.iterator,
                 partial_stats.iterator,
                 attention_sinks.iterator,
-                bmm1_scale,
-                bmm2_scale,
                 stream,
                 static_cfg,
                 static_full_split_prefix,
@@ -1899,6 +1898,7 @@ def _get_compiled_decode(
                 4,
             ),
         )
+    scale_fake = fake_compact(Float32, (1,), 4) if use_device_scales else Float32(1.0)
 
     def compile_main():
         return cute.compile(
@@ -1924,8 +1924,8 @@ def _get_compiled_decode(
             Int64(1),
             Int64(1),
             Int64(1),
-            Float32(1.0),
-            Float32(1.0),
+            scale_fake,
+            scale_fake,
             direct_q1_fake,
             stream_fake,
             cfg,
@@ -1950,8 +1950,6 @@ def _get_compiled_decode(
             partial_o_fake,
             partial_stats_fake,
             attention_sinks_fake,
-            Float32(1.0),
-            Float32(1.0),
             direct_q1_fake,
             stream_fake,
             cfg,
@@ -1965,7 +1963,11 @@ def _get_compiled_decode(
 
     with torch.cuda.device(device_index):
         compiled_main = build_and_load_attention_kernel(
-            "decode", "main", compile_spec, _COMPILE_OPTIONS, compile_main
+            "decode",
+            "main",
+            compile_spec,
+            _COMPILE_OPTIONS,
+            compile_main,
         )
         compiled_reducer = None
         if cfg.use_separate_reduction_kernel:
@@ -2112,9 +2114,10 @@ def _prepare_decode_runtime(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    bmm1_scale: Optional[float],
-    bmm2_scale: float,
+    bmm1_scale: Optional[float | torch.Tensor],
+    bmm2_scale: float | torch.Tensor,
     out: Optional[torch.Tensor],
+    use_device_scales: bool = False,
 ) -> _DecodeRuntime:
     """Validate runtime tensors and normalize zero-copy K/V views."""
 
@@ -2158,11 +2161,15 @@ def _prepare_decode_runtime(
         k_cache=k_cache,
         logical_head_dim=head_dim,
     )
-    effective_bmm1_scale = _validate_scale(
-        1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
-        "bmm1_scale",
-    )
-    effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+    if use_device_scales:
+        effective_bmm1_scale = bmm1_scale
+        effective_bmm2_scale = bmm2_scale
+    else:
+        effective_bmm1_scale = _validate_scale(
+            1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
+            "bmm1_scale",
+        )
+        effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
     output_shape = _decode_output_shape(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -2247,8 +2254,6 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             workspace.attention_sinks,
-            runtime.bmm1_scale,
-            runtime.bmm2_scale,
             (),
         )
     return runtime.out
@@ -2309,9 +2314,10 @@ def _prepare_decode_runtime_unchecked(
     kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     output_dtype: torch.dtype,
-    bmm1_scale: Optional[float],
-    bmm2_scale: float,
+    bmm1_scale: Optional[float | torch.Tensor],
+    bmm2_scale: float | torch.Tensor,
     out: Optional[torch.Tensor],
+    use_device_scales: bool = False,
 ) -> _DecodeRuntime:
     """Canonicalize one trusted run without invoking explicit validators."""
 
@@ -2346,11 +2352,15 @@ def _prepare_decode_runtime_unchecked(
         v_head_stride=int(v_cache.stride(1)),
         v_token_stride=int(v_cache.stride(2)),
         bmm1_scale=(
-            1.0 / math.sqrt(int(q.shape[-1]))
-            if bmm1_scale is None
-            else float(bmm1_scale)
+            bmm1_scale
+            if use_device_scales
+            else (
+                1.0 / math.sqrt(int(q.shape[-1]))
+                if bmm1_scale is None
+                else float(bmm1_scale)
+            )
         ),
-        bmm2_scale=float(bmm2_scale),
+        bmm2_scale=bmm2_scale if use_device_scales else float(bmm2_scale),
     )
 
 
@@ -2581,8 +2591,6 @@ class PrimsTSBatchDecodePlan:
                 self._workspace.partial_o,
                 self._workspace.partial_stats,
                 self._workspace.attention_sinks,
-                scale_qk,
-                scale_v,
                 direct_inputs,
             )
         return out
@@ -3773,6 +3781,7 @@ class BatchDecodePagedTSWrapper:
         split_kv: bool = True,
         validate: bool = True,
         initialize_workspace: bool = True,
+        use_device_scales: bool = False,
     ) -> None:
         """Compile one static-capacity plan and optionally own sequence lengths.
 
@@ -3787,6 +3796,11 @@ class BatchDecodePagedTSWrapper:
         :meth:`run` requires its ``seq_lens`` argument to be ``None``. When
         omitted, both K/V prefix and length handling compile dynamically and
         every run must supply a CUDA length tensor.
+
+        ``use_device_scales=True`` compiles a plan that reads float32 BMM
+        scales from CUDA tensors supplied to every run. Values must be finite
+        and positive; they are not read back to the host for validation. This
+        supports preprocessing-produced scales and CUDA graph replay.
 
         ``workspace_buffer`` is caller-owned scratch for this plan. It is
         allocated when omitted, retained by the frozen plan state, and never
@@ -3863,7 +3877,13 @@ class BatchDecodePagedTSWrapper:
             Initialize control sections during planning, default ``True``.
             Set to ``False`` only for caller-initialized scratch with unchanged
             layout. Newly allocated scratch is always initialized.
+        use_device_scales : bool
+            Read BMM scales from per-run CUDA tensors instead of host scalars.
+            Defaults to ``False``.
         """
+
+        if not isinstance(use_device_scales, bool):
+            raise TypeError("use_device_scales must be a bool")
 
         k_data_type, v_data_type = _resolve_kv_dtypes(
             q_data_type, k_data_type, v_data_type, kv_data_type
@@ -3995,6 +4015,7 @@ class BatchDecodePagedTSWrapper:
             use_packed_q=packed_query,
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
+            use_device_scales=use_device_scales,
         )
         compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
         policy = spec.policy + (
@@ -4067,6 +4088,7 @@ class BatchDecodePagedTSWrapper:
             planned_seq_lens_device=planned_seq_lens_device,
             policy=policy,
             storage_page_size=storage_page_size,
+            use_device_scales=use_device_scales,
         )
         # This is the only wrapper mutation. Any failure above leaves the
         # previous complete plan revision usable.
@@ -4082,8 +4104,8 @@ class BatchDecodePagedTSWrapper:
         *,
         kv_scale_factors: Optional[PagedKVScaleFactors] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        bmm1_scale: Optional[float] = None,
-        bmm2_scale: float = 1.0,
+        bmm1_scale: Optional[float | torch.Tensor] = None,
+        bmm2_scale: float | torch.Tensor = 1.0,
         out: Optional[torch.Tensor] = None,
         validate: bool = True,
     ) -> torch.Tensor:
@@ -4096,7 +4118,7 @@ class BatchDecodePagedTSWrapper:
         ``validate=True`` performs structural and value validation. It
         reads per-run metadata values back to the host.
         ``validate=False`` treats every run argument as a trusted binding,
-        performs no explicit wrapper validation, and remains free of metadata
+        skips metadata validation and remains free of metadata
         device-to-host synchronization. K/V view selection, scale forwarding,
         and optional output allocation are unavoidable in both modes.
 
@@ -4129,17 +4151,22 @@ class BatchDecodePagedTSWrapper:
         qo_indptr : torch.Tensor, optional
             Per-run cumulative query offsets with shape ``[B + 1]``. Required for
             a packed-query plan and rejected for a fixed-query plan.
-        bmm1_scale : float, optional
-            QK scaling factor. Defaults to the inverse square root of
-            ``head_dim``.
-        bmm2_scale : float
-            Value/output scaling factor. Defaults to ``1.0``.
+        bmm1_scale : float or torch.Tensor, optional
+            QK scaling factor in regular, not log2, units. For host-scale plans,
+            defaults to the inverse square root of ``head_dim``.
+        bmm2_scale : float or torch.Tensor
+            Value/output scaling factor. Defaults to ``1.0`` for host-scale plans.
+            A plan with ``use_device_scales=True`` requires both scales to be
+            contiguous float32 CUDA tensors of shape ``(1,)`` on the plan device.
+            Their values must be finite and positive; values are not read back
+            to the host for validation and may change in place on graph replay.
         out : torch.Tensor, optional
             Caller-owned output tensor. A new tensor is allocated when omitted.
         validate : bool
             Run explicit structural and value validation. Disable only
             when the caller guarantees the complete runtime contract. Sequence
-            length ownership is enforced in either mode. Defaults to ``True``.
+            length ownership and scale argument types are enforced in either mode.
+            Defaults to ``True``.
 
         Returns
         -------
@@ -4150,6 +4177,26 @@ class BatchDecodePagedTSWrapper:
         state = self._require_plan_state()
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
+        if state.use_device_scales:
+            for name, scale in (
+                ("bmm1_scale", bmm1_scale),
+                ("bmm2_scale", bmm2_scale),
+            ):
+                if (
+                    not isinstance(scale, torch.Tensor)
+                    or scale.dtype != torch.float32
+                    or scale.device != state.device
+                    or scale.shape != (1,)
+                    or not scale.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be a float32 tensor of shape (1,) on {state.device}"
+                    )
+        elif isinstance(bmm1_scale, torch.Tensor) or isinstance(
+            bmm2_scale, torch.Tensor
+        ):
+            raise ValueError("device scales require plan(use_device_scales=True)")
+
         planned_seq_lens = state.planned_seq_lens_device
         plan_owns_seq_lens = planned_seq_lens is not None
         if plan_owns_seq_lens:
@@ -4218,6 +4265,7 @@ class BatchDecodePagedTSWrapper:
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 out=out,
+                use_device_scales=state.use_device_scales,
             )
             _validate_decode_run_metadata_values(
                 runtime,
@@ -4241,6 +4289,7 @@ class BatchDecodePagedTSWrapper:
                 bmm1_scale=bmm1_scale,
                 bmm2_scale=bmm2_scale,
                 out=out,
+                use_device_scales=state.use_device_scales,
             )
 
         return _launch_decode(
