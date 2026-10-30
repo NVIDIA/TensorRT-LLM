@@ -160,6 +160,8 @@ def dflash_trtllm_windowed_block_attention(
         out: [B * blk, Hq, D] output.
     """
     B, block_size, num_heads, head_dim = query.shape
+    # The decode and future-block merge must see the precision stored in the cache.
+    query = query.to(layer_cache.dtype)
     window_left, window_right = window_size
     merge_future = not causal and window_left >= 0
     decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
@@ -190,7 +192,13 @@ def dflash_trtllm_windowed_block_attention(
         lse = decoded[1] * TRTLLM_GEN_LSE_LN2
         out.copy_(
             dflash_merge_future_block_attention(
-                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
+                out,
+                lse,
+                query,
+                block_key.to(layer_cache.dtype),
+                block_value.to(layer_cache.dtype),
+                head_dim**-0.5,
+                window_right,
             )
         )
 
@@ -1952,7 +1960,7 @@ class DFlashForCausalLM(nn.Module):
                 if causal or window_left >= 0:
                     dflash_trtllm_windowed_block_attention(
                         trtllm_gen_ops,
-                        Q_bshd,
+                        q_flat.view_as(Q_bshd),
                         k_noise_bshd,
                         v_noise_bshd,
                         layer_cache,
