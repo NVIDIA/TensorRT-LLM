@@ -1,5 +1,5 @@
 diff --git a/kda_chunked_bt16_small_bh.py b/kda_chunked_bt16_small_bh.py
-index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b074971f38c 100644
+index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..8d8118e6803d7119048c4d7fd46f1e400e0e3f1b 100644
 --- a/kda_chunked_bt16_small_bh.py
 +++ b/kda_chunked_bt16_small_bh.py
 @@ -1,3 +1,4 @@
@@ -118,11 +118,10 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      cu_dtype = _cute_dtype(dtype)
      b, t, tp, nt = (cute.sym_int() for _ in range(4))
      feature: tuple[object, ...]
-@@ -2904,7 +2922,11 @@ def _compile_k2(
+@@ -2904,7 +2922,10 @@ def _compile_k2(
      has_state_output: bool,
      transpose_state: bool,
      is_varlen: bool,
-+    state_row_stride: int | None,
 +    has_state_indices: bool,
  ):
 +    if torch.cuda.is_current_stream_capturing():
@@ -130,22 +129,25 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      cu_dtype = _cute_dtype(dtype)
      b, bs, t, tp, h, nt = (cute.sym_int() for _ in range(6))
      feature: tuple[object, ...]
-@@ -2925,6 +2947,14 @@ def _compile_k2(
+@@ -2925,6 +2946,17 @@ def _compile_k2(
          cu_seqlens = None
      state = (b, h, d, d)
  
 +    def fake_state():
-+        if state_row_stride is None:
++        if not has_state_indices:
 +            return _fake(_cute_dtype(state_dtype), state)
++        # An indexed row may start beyond 2**31 elements into the pool (a strided
++        # view of the KV-cache memory), so the row stride is a 64-bit runtime value.
 +        return cute.runtime.make_fake_tensor(
 +            _cute_dtype(state_dtype), state,
-+            stride=(state_row_stride, d * d, d, 1), assumed_align=16,
++            stride=(cute.sym_int64(divisibility=16 // state_dtype.itemsize), d * d, d, 1),
++            assumed_align=16,
 +        )
 +
      q, k, kr = [_fake(cu_dtype, feature) for _ in range(3)]
      kernel = ChunkKdaFwdK2(D=d, BT=_BT, BV=bv, transpose_S=transpose_state)
      stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-@@ -2938,9 +2968,10 @@ def _compile_k2(
+@@ -2938,9 +2970,10 @@ def _compile_k2(
          _fake(cu_dtype, matrix),
          _fake(cutlass.Float32, gate),
          _fake(cu_dtype, output),
@@ -158,7 +160,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
          stream,
          options="--enable-tvm-ffi",
      )
-@@ -3040,6 +3071,7 @@ def chunk_kda_fwd_k2(
+@@ -3040,6 +3073,7 @@ def chunk_kda_fwd_k2(
      output: torch.Tensor | None = None,
      state_input: torch.Tensor | None = None,
      state_output: torch.Tensor | None = None,
@@ -166,16 +168,15 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      max_active_clusters: int = 152,
  ) -> tuple[torch.Tensor, torch.Tensor | None]:
      is_varlen = cu_seqlens is not None
-@@ -3072,6 +3104,8 @@ def chunk_kda_fwd_k2(
+@@ -3072,6 +3106,7 @@ def chunk_kda_fwd_k2(
          has_output,
          transpose_state,
          is_varlen,
-+        state_input.stride(0) if state_indices is not None else None,
 +        state_indices is not None,
      )
      compiled(
          q,
-@@ -3085,6 +3119,7 @@ def chunk_kda_fwd_k2(
+@@ -3085,6 +3120,7 @@ def chunk_kda_fwd_k2(
          state_input,
          state_output,
          cu_seqlens,
@@ -183,7 +184,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      )
      return output, state_output
  
-@@ -3108,11 +3143,12 @@ def chunk_kda_fwd(
+@@ -3108,11 +3144,12 @@ def chunk_kda_fwd(
      output: torch.Tensor | None = None,
      state_input: torch.Tensor | None = None,
      state_output: torch.Tensor | None = None,
@@ -197,7 +198,7 @@ index e8bc9feb5ece3dbfe3156c90bb27e68fa5a4521a..7478dc054a5a9afb9de5d416588a4b07
      qd, kd, kr, mqk, mkk, gk = chunk_kda_fwd_k1(
          q,
          k,
-@@ -3142,6 +3178,7 @@ def chunk_kda_fwd(
+@@ -3142,6 +3179,7 @@ def chunk_kda_fwd(
          output=output,
          state_input=state_input,
          state_output=state_output,
