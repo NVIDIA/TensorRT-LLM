@@ -29,11 +29,15 @@
 #include <nvml.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -882,6 +886,78 @@ void BatchedPageCopier::launchGenericKernel(PoolCopyArgs const& args, CopyDirect
 //! Copy-engine path: expand the index pairs into per-page descriptors and submit them as one
 //! batch. Descriptor construction is O(numPairs) on the CPU and on the critical path, which is
 //! why the kernel path exists at all -- but on PCIe the copy engine still wins overall.
+namespace
+{
+struct HostCopySplitRange
+{
+    MemAddress end;
+    size_t unitBytes;
+};
+
+struct HostCopySplitRegistry
+{
+    std::shared_mutex mutex;
+    std::map<MemAddress, HostCopySplitRange> ranges; //!< by base
+    std::atomic<bool> empty{true};
+};
+
+HostCopySplitRegistry& hostCopySplitRegistry()
+{
+    static HostCopySplitRegistry registry;
+    return registry;
+}
+} // namespace
+
+void addHostCopySplitRange(MemAddress base, size_t size, size_t unitBytes)
+{
+    TLLM_CHECK_WITH_INFO(size > 0 && unitBytes > 0, "addHostCopySplitRange: size and unit must be positive");
+    auto& registry = hostCopySplitRegistry();
+    std::unique_lock lock(registry.mutex);
+    TLLM_CHECK_WITH_INFO(registry.ranges.emplace(base, HostCopySplitRange{base + size, unitBytes}).second,
+        "addHostCopySplitRange: range already added");
+    registry.empty.store(false, std::memory_order_release);
+}
+
+void removeHostCopySplitRange(MemAddress base)
+{
+    auto& registry = hostCopySplitRegistry();
+    std::unique_lock lock(registry.mutex);
+    registry.ranges.erase(base);
+    registry.empty.store(registry.ranges.empty(), std::memory_order_release);
+}
+
+namespace detail
+{
+void appendHostCopySplitOffsets(CUdeviceptr address, size_t numBytes, std::vector<size_t>& offsets)
+{
+    auto& registry = hostCopySplitRegistry();
+    if (registry.empty.load(std::memory_order_acquire))
+    {
+        return;
+    }
+    std::shared_lock lock(registry.mutex);
+    auto const addr = static_cast<MemAddress>(address);
+    auto it = registry.ranges.upper_bound(addr);
+    if (it == registry.ranges.begin())
+    {
+        return;
+    }
+    --it;
+    MemAddress const base = it->first;
+    auto const [end, unit] = it->second;
+    if (addr >= end)
+    {
+        return;
+    }
+    // First boundary strictly after addr, then one per unit while inside the copy.
+    size_t offset = unit - (addr - base) % unit;
+    for (; offset < numBytes; offset += unit)
+    {
+        offsets.push_back(offset);
+    }
+}
+} // namespace detail
+
 void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stream) const
 {
     // Descriptor scratch. Page identities change on every eviction so the contents cannot be
@@ -892,15 +968,38 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
     thread_local std::vector<CUdeviceptr> copyEngineSrcs;
     thread_local std::vector<size_t> copyEngineSizes;
 
-    copyEngineDsts.resize(args.numPairs);
-    copyEngineSrcs.resize(args.numPairs);
-    copyEngineSizes.assign(args.numPairs, args.bytesPerPage);
+    thread_local std::vector<size_t> splitOffsets;
+
+    copyEngineDsts.clear();
+    copyEngineSrcs.clear();
+    copyEngineSizes.clear();
+    copyEngineDsts.reserve(args.numPairs);
+    copyEngineSrcs.reserve(args.numPairs);
+    copyEngineSizes.reserve(args.numPairs);
     for (uint32_t slot = 0; slot < args.numPairs; ++slot)
     {
         PageIndexPair const pair = args.pairs[slot]; // host memory; see pageIndexLocation()
         TLLM_CHECK_DEBUG(pair.dst >= 0 && pair.src >= 0);
-        copyEngineDsts[slot] = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
-        copyEngineSrcs[slot] = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+        CUdeviceptr const dst = args.dstBase + static_cast<uint64_t>(pair.dst) * args.dstStride;
+        CUdeviceptr const src = args.srcBase + static_cast<uint64_t>(pair.src) * args.srcStride;
+        // A page that crosses a registration boundary of a host arena goes as one copy per side of it.
+        splitOffsets.clear();
+        detail::appendHostCopySplitOffsets(dst, args.bytesPerPage, splitOffsets);
+        detail::appendHostCopySplitOffsets(src, args.bytesPerPage, splitOffsets);
+        if (splitOffsets.size() > 1)
+        {
+            std::sort(splitOffsets.begin(), splitOffsets.end());
+            splitOffsets.erase(std::unique(splitOffsets.begin(), splitOffsets.end()), splitOffsets.end());
+        }
+        size_t begin = 0;
+        splitOffsets.push_back(args.bytesPerPage);
+        for (size_t const end : splitOffsets)
+        {
+            copyEngineDsts.push_back(dst + begin);
+            copyEngineSrcs.push_back(src + begin);
+            copyEngineSizes.push_back(end - begin);
+            begin = end;
+        }
     }
     // Stream-ordered source access is what keeps this asynchronous when the host side is
     // unregistered memory, which is what the mmap host backing provides. A plain cuMemcpyAsync
@@ -911,7 +1010,7 @@ void BatchedPageCopier::launchCopyEngine(PoolCopyArgs const& args, CUstream stre
     attributes.flags = CU_MEMCPY_FLAG_PREFER_OVERLAP_WITH_COMPUTE;
     size_t firstCopy = 0;
     TLLM_CU_CHECK(cuMemcpyBatchAsync(copyEngineDsts.data(), copyEngineSrcs.data(), copyEngineSizes.data(),
-        args.numPairs, &attributes, &firstCopy, 1, stream));
+        copyEngineSizes.size(), &attributes, &firstCopy, 1, stream));
 }
 
 void BatchedPageCopier::launchKernel(PoolCopyArgs const& args, CopyDirection direction, CUstream stream) const

@@ -15,13 +15,18 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/batchedPageCopy.h"
 #include "tensorrt_llm/batch_manager/kv_cache_manager_v2/storage/core.h"
+#include "tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.h"
+
+#include <cuda_runtime_api.h>
 
 #include <gtest/gtest.h>
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -515,6 +520,80 @@ TEST(KvCacheManagerV2BoundPoolTest, CompleteBindingsAfterMove)
     }
     std::sort(seen.begin(), seen.end());
     EXPECT_TRUE(std::adjacent_find(seen.begin(), seen.end()) == seen.end());
+}
+
+// Host arena (copy-based rebalancing): a page that straddles two host registrations is copied by the copy engine
+// in one piece per registration once its range is listed with addHostCopySplitRange. Without the listing the driver
+// rejects the copy, which is what the second half checks where the copy engine is used.
+TEST(HostArenaCopySplit, StraddlingPagesAreSplitAtRegistrationBoundaries)
+{
+    ASSERT_EQ(cudaFree(nullptr), cudaSuccess); // a current context for the copier and the registrations
+    constexpr size_t kUnit = 2ULL << 20;
+    constexpr uint32_t kPageBytes = 80 << 10; // 2 MiB is not a multiple: page 25 spans [2000 KiB, 2080 KiB)
+    HostMem host(2 * kUnit, 2 * kUnit, HostMemBackingOptions{kUnit, true}, /*waitForFill=*/true);
+    auto* bytes = reinterpret_cast<uint8_t*>(host.address());
+    for (size_t i = 0; i < 2 * kUnit; ++i)
+        bytes[i] = static_cast<uint8_t>(i * 7 + 3);
+    std::vector<PageIndexPair> const onboard{{0, 24}, {1, 25}, {2, 26}}; // host pages 24..26 -> device 0..2
+    ASSERT_LT(24 * size_t{kPageBytes}, kUnit);
+    ASSERT_GT(26 * size_t{kPageBytes}, kUnit);
+
+    void* device = nullptr;
+    ASSERT_EQ(cudaMalloc(&device, 3 * kPageBytes), cudaSuccess);
+    void* devicePairs = nullptr;
+    ASSERT_EQ(cudaMalloc(&devicePairs, sizeof(PageIndexPair) * 3), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreate(&stream), cudaSuccess);
+    BatchedPageCopier copier;
+    auto pairsFor = [&](std::vector<PageIndexPair> const& pairs) -> PageIndexPair const*
+    {
+        if (copier.pageIndexLocation() == PageIndexLocation::kHost)
+            return pairs.data();
+        EXPECT_EQ(cudaMemcpy(devicePairs, pairs.data(), sizeof(PageIndexPair) * pairs.size(), cudaMemcpyHostToDevice),
+            cudaSuccess);
+        return static_cast<PageIndexPair const*>(devicePairs);
+    };
+    auto args = [&](CUdeviceptr dstBase, CUdeviceptr srcBase, std::vector<PageIndexPair> const& pairs)
+    {
+        PoolCopyArgs a;
+        a.dstBase = dstBase;
+        a.srcBase = srcBase;
+        a.dstStride = kPageBytes;
+        a.srcStride = kPageBytes;
+        a.bytesPerPage = kPageBytes;
+        a.pairs = pairsFor(pairs);
+        a.numPairs = static_cast<uint32_t>(pairs.size());
+        return a;
+    };
+    auto const hostBase = static_cast<CUdeviceptr>(host.address());
+    auto const deviceBase = reinterpret_cast<CUdeviceptr>(device);
+
+    addHostCopySplitRange(host.address(), 2 * kUnit, kUnit);
+    copier.launch(args(deviceBase, hostBase, onboard), CopyDirection::kH2D, reinterpret_cast<CUstream>(stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    std::vector<uint8_t> back(3 * kPageBytes);
+    ASSERT_EQ(cudaMemcpy(back.data(), device, back.size(), cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_EQ(0, std::memcmp(back.data(), bytes + 24 * size_t{kPageBytes}, back.size()));
+
+    // Offload back into the zeroed straddling page.
+    std::memset(bytes + 25 * size_t{kPageBytes}, 0, kPageBytes);
+    std::vector<PageIndexPair> const offload{{25, 1}};
+    copier.launch(args(hostBase, deviceBase, offload), CopyDirection::kD2H, reinterpret_cast<CUstream>(stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    EXPECT_EQ(0, std::memcmp(bytes + 25 * size_t{kPageBytes}, back.data() + kPageBytes, kPageBytes));
+
+    removeHostCopySplitRange(host.address());
+    if (copier.pageIndexLocation() == PageIndexLocation::kHost)
+    {
+        // The copy engine: unsplit, the straddling page is rejected.
+        EXPECT_ANY_THROW(copier.launch(
+            args(deviceBase, hostBase, onboard), CopyDirection::kH2D, reinterpret_cast<CUstream>(stream)));
+    }
+    cudaStreamSynchronize(stream);
+    cudaStreamDestroy(stream);
+    cudaFree(devicePairs);
+    cudaFree(device);
+    host.destroy();
 }
 
 } // namespace

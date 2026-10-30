@@ -1421,12 +1421,16 @@ void KvCacheManager::_adjustLevel(CacheLevel level, size_t quota)
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> lockedPages;
     TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratch = nullptr;
     TypedVec<PoolGroupIndex, ScratchSlotLockList> scratchSlots;
-    if (level == kHotLevel && mStorage->isInPlaceRelocation())
+    if (mStorage->isInPlaceRelocation() && mStorage->isArenaLevel(level))
     {
-        lockedPages = _gatherLockedHotPages();
+        // A host arena holds locked pages too: DSA sparse history keeps an active request's pages locked there.
+        lockedPages = _gatherLockedPages(level);
         locked = &lockedPages;
-        scratchSlots = _gatherActiveScratchSlots();
-        scratch = &scratchSlots;
+        if (level == kHotLevel)
+        {
+            scratchSlots = _gatherActiveScratchSlots();
+            scratch = &scratchSlots;
+        }
     }
     // Relocated scratch slots change only their locks; each cache's index mirror (which may be a
     // caller-bound buffer) is rewritten from them afterwards, even if the adjust stops part way.
@@ -1463,9 +1467,9 @@ TypedVec<PoolGroupIndex, ScratchSlotLockList> KvCacheManager::_gatherActiveScrat
     return result;
 }
 
-TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLockedHotPages() const
+TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLockedPages(CacheLevel level) const
 {
-    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(mStorage->numPoolGroups(kHotLevel));
+    TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> result(mStorage->numPoolGroups(level));
     std::set<Page const*> seen; // a page shared by several owners has one lock
     for (KvCache* kvc : mLivingKvCaches)
     {
@@ -1480,9 +1484,9 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLo
                     if (!std::holds_alternative<SharedPageLock>(beamPages[lc]))
                         continue;
                     auto const& pg = blockPageGetPage(beamPages[lc]);
-                    if (!pg || pg->cacheLevel != kHotLevel || !seen.insert(pg.get()).second)
+                    if (!pg || pg->cacheLevel != level || !seen.insert(pg.get()).second)
                         continue;
-                    result[mStorage->getPoolGroupIndex(kHotLevel, lc)].push_back(pg);
+                    result[mStorage->getPoolGroupIndex(level, lc)].push_back(pg);
                 }
             }
         }
@@ -1501,7 +1505,7 @@ TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> KvCacheManager::_gatherLa
     for (KvCache* kvc : mLivingKvCaches)
     {
         // With in-place relocation ACTIVE caches stay active; their locked pages are gathered by
-        // _gatherLockedHotPages() and only the pages they merely hold are persistent here.
+        // _gatherLockedPages() and only the pages they merely hold are persistent here.
         bool const active = kvc->isActive();
         TLLM_CHECK_DEBUG(active ? mStorage->isInPlaceRelocation() : kvc->status() == KvCache::Status::SUSPENDED);
         for (auto const& sb : kvc->blocks())

@@ -633,6 +633,22 @@ void KvCacheIntrospection::setTargetRatioListGpu(KvCacheManager& manager, TypedV
     ++manager.mTargetRatioGeneration;
 }
 
+void KvCacheIntrospection::setTargetRatioListCold(KvCacheManager& manager, TypedVec<PoolGroupIndex, float> value)
+{
+    manager.mTargetRatioListCold = std::move(value);
+    ++manager.mTargetRatioGeneration;
+}
+
+std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::slotWindows(KvCacheManager& manager, CacheLevel level)
+{
+    std::vector<std::pair<SlotCount, SlotCount>> result;
+    for (auto const& window : manager.mStorage->levelWindows(level))
+    {
+        result.emplace_back(window.begin.value(), window.end.value());
+    }
+    return result;
+}
+
 std::vector<std::pair<SlotCount, SlotCount>> KvCacheIntrospection::gpuSlotWindows(KvCacheManager& manager)
 {
     std::vector<std::pair<SlotCount, SlotCount>> result;

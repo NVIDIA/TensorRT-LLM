@@ -548,6 +548,18 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         // into it, dense and sparse buffers alike, so its quota pays for all of it.
         auto slotCounts = computeSlotCountForLevel(
             config.cacheTiers[level], coldSlotSizeLists, coldRatio, coldMinSlots, gpuGranularity);
+        if (mGpuArena && cacheTierOf(config.cacheTiers[level]) == CacheTier::HOST_MEM)
+        {
+            // Copy-based rebalancing: the host quota becomes one arena too, committed once and never resized.
+            auto const& tierConfig = config.cacheTiers[level];
+            size_t const unit = ArenaHostCacheLevelStorage::arenaUnitBytes(tierCommitUnit(tierConfig, gpuGranularity));
+            size_t const arenaBytes = std::max(roundDown(cacheTierQuota(tierConfig), unit),
+                roundUp(ArenaGpuCacheLevelStorage::minArenaBytes(coldSlotSizeLists, coldMinSlots), unit));
+            auto arena = std::make_unique<ArenaHostCacheLevelStorage>(
+                slotDescList(level), arenaBytes, unit, coldRatio, coldMinSlots, tierBackingOptions(tierConfig, gpuGranularity));
+            mLevels.emplace_back(lifeCycleGrouping(level), level, std::move(arena));
+            continue;
+        }
         auto* gpuPhysMemAllocator
             = cacheTierOf(config.cacheTiers[level]) == CacheTier::GPU_MEM ? mGpuPhysMemAllocator.get() : nullptr;
         mLevels.emplace_back(lifeCycleGrouping(level), level, config.cacheTiers[level], slotDescList(level), slotCounts,
@@ -1793,7 +1805,7 @@ void StorageManager::shrinkPoolGroupToWindow(CacheLevel level, PoolGroupIndex pg
 
     // Copy-based rebalancing, step 7: pages that would have to move and that nothing references
     // can be dropped instead, when the server is configured to.
-    if (mGpuArena && mDropUnreferencedOnRebalance && level == kHotLevel)
+    if (mDropUnreferencedOnRebalance && isArenaLevel(level))
     {
         dropUnreferencedPagesOutside(level, pgIdx, target);
     }
@@ -2047,11 +2059,18 @@ void StorageManager::_relocateLockedPages(CacheLevel level, PoolGroupIndex pgIdx
     releaseDestinations.cancel();
 }
 
-void StorageManager::moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
+bool StorageManager::isArenaLevel(CacheLevel level) const
+{
+    if (level == kHotLevel)
+        return mGpuArena;
+    return dynamic_cast<ArenaHostCacheLevelStorage const*>(mLevels.at(level).storage.get()) != nullptr;
+}
+
+void StorageManager::moveArenaWindow(CacheLevel level, PoolGroupIndex pgIdx, SlotWindow from, SlotWindow to,
     std::vector<SharedPtr<Page>> const& persistentPages, std::vector<SharedPtr<Page>> const& lockedPages,
     ScratchSlotLockList const& scratchSlots)
 {
-    auto& pg = poolGroup(kHotLevel, pgIdx);
+    auto& pg = poolGroup(level, pgIdx);
     TLLM_CHECK_DEBUG(pg.slotAllocator().window() == from);
     // Growing first lets the blocks this group gives up be copied into the space it gains.
     SlotWindow const hull = from.hull(to);
@@ -2062,51 +2081,62 @@ void StorageManager::moveArenaWindow(PoolGroupIndex pgIdx, SlotWindow from, Slot
     }
     if (hull != to)
     {
-        shrinkPoolGroupToWindow(kHotLevel, pgIdx, to, persistentPages, lockedPages, scratchSlots);
+        shrinkPoolGroupToWindow(level, pgIdx, to, persistentPages, lockedPages, scratchSlots);
     }
 }
 
-void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<PoolGroupIndex, float> const& ratioList,
+void StorageManager::adjustArenaLevel(CacheLevel level, std::optional<size_t> newQuota,
+    TypedVec<PoolGroupIndex, float> const& ratioList,
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* persistentPages,
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
     TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots)
 {
-    auto& arena = static_cast<ArenaGpuCacheLevelStorage&>(*mLevels.at(kHotLevel).storage);
-    size_t const arenaQuota = arena.roundedNumBytes(CacheTier::GPU_MEM);
-    if (newQuota.has_value() && roundUp(*newQuota, arena.poolSizeGranularity(CacheTier::GPU_MEM)) != arenaQuota)
+    auto& storage = *mLevels.at(level).storage;
+    auto* const gpuArena = level == kHotLevel ? &static_cast<ArenaGpuCacheLevelStorage&>(storage) : nullptr;
+    auto* const hostArena = gpuArena ? nullptr : &static_cast<ArenaHostCacheLevelStorage&>(storage);
+    size_t const arenaQuota = storage.roundedNumBytes(storage.cacheTier());
+    if (newQuota.has_value() && roundUp(*newQuota, storage.poolSizeGranularity(storage.cacheTier())) != arenaQuota)
     {
-        throw std::invalid_argument("Copy-based rebalancing uses a fixed GPU arena of "
-            + std::to_string(arenaQuota) + " bytes; the GPU quota cannot be changed to "
-            + std::to_string(*newQuota));
+        throw std::invalid_argument("Copy-based rebalancing uses a fixed arena of "
+            + std::to_string(arenaQuota) + " bytes at cache level " + std::to_string(level.value())
+            + "; its quota cannot be changed to " + std::to_string(*newQuota));
     }
-    auto const oldWindows = arena.windows();
+    auto const oldWindows = gpuArena ? gpuArena->windows() : hostArena->windows();
     // Target clamping: a group cannot shrink below the pages it is unable to give up (occupied but
     // not evictable, i.e. held by requests when this is the last level), scaled by 1/maxUtilForResume
     // so that KvCache::resume does not then refuse every suspended request. Computing every window
     // before touching any keeps an impossible target from leaving the arena half-adjusted.
-    auto minSlots = mHotMinSlots;
-    auto const& ctrl = mLevels.at(kHotLevel).controller;
+    auto minSlots = level == kHotLevel ? mHotMinSlots
+                                       : TypedVec<PoolGroupIndex, SlotCount>(numPoolGroups(level), SlotCount{1});
+    auto const& ctrl = mLevels.at(level).controller;
     for (PoolGroupIndex pgIdx{0}; pgIdx < minSlots.size(); ++pgIdx)
     {
         SlotCount const unevictable
-            = arena.poolGroup(pgIdx).slotAllocator().numOccupiedSlots() - ctrl.numEvictablePages(pgIdx);
+            = storage.poolGroup(pgIdx).slotAllocator().numOccupiedSlots() - ctrl.numEvictablePages(pgIdx);
         auto const resumable = static_cast<SlotCount>(
             std::ceil(static_cast<double>(unevictable) / static_cast<double>(mMaxUtilForResume)));
         minSlots[pgIdx] = std::max(minSlots[pgIdx], resumable);
     }
-    auto const newPoolWindows = arena.computePoolWindows(ratioList, minSlots);
-    if (arena.hasBoundPools())
-    {
-        adjustArenaPools(newPoolWindows, persistentPages, lockedPages, scratchSlots);
-        return;
-    }
     TypedVec<PoolGroupIndex, SlotWindow> newWindows;
-    for (auto const& windows : newPoolWindows)
-        newWindows.push_back(windows[PoolIndex{0}]);
-    PoolGroupIndex const numPg = oldWindows.size();
-    auto byteRange = [this](PoolGroupIndex pgIdx, SlotWindow w)
+    if (gpuArena)
     {
-        size_t const s = slotSize(kHotLevel, pgIdx)[PoolIndex{0}];
+        auto const newPoolWindows = gpuArena->computePoolWindows(ratioList, minSlots);
+        if (gpuArena->hasBoundPools())
+        {
+            adjustArenaPools(newPoolWindows, persistentPages, lockedPages, scratchSlots);
+            return;
+        }
+        for (auto const& windows : newPoolWindows)
+            newWindows.push_back(windows[PoolIndex{0}]);
+    }
+    else
+    {
+        newWindows = hostArena->computeWindows(ratioList, minSlots);
+    }
+    PoolGroupIndex const numPg = oldWindows.size();
+    auto byteRange = [this, level](PoolGroupIndex pgIdx, SlotWindow w)
+    {
+        size_t const s = slotSize(level, pgIdx)[PoolIndex{0}];
         return std::make_pair(toSizeT(w.begin) * s, toSizeT(w.end) * s);
     };
     // Group a gains from group b if a's new range overlaps b's old range. Such space must be vacated
@@ -2141,7 +2171,7 @@ void StorageManager::adjustArenaLevel(std::optional<size_t> newQuota, TypedVec<P
         {
             static std::vector<SharedPtr<Page>> const kNoPages;
             static ScratchSlotLockList const kNoScratch;
-            moveArenaWindow(pgIdx, oldWindows[pgIdx], newWindows[pgIdx],
+            moveArenaWindow(level, pgIdx, oldWindows[pgIdx], newWindows[pgIdx],
                 persistentPages ? (*persistentPages)[pgIdx] : kNoPages,
                 lockedPages ? (*lockedPages)[pgIdx] : kNoPages, scratchSlots ? (*scratchSlots)[pgIdx] : kNoScratch);
         }
@@ -2234,7 +2264,7 @@ void StorageManager::adjustArenaPools(TypedVec<PoolGroupIndex, TypedVec<PoolInde
             {
                 // Bound pools need nothing for scratch slots: remapArenaPool moves every group id
                 // in use, scratch slots included.
-                moveArenaWindow(pgIdx, from, to, persistentPages ? (*persistentPages)[pgIdx] : kNoPages,
+                moveArenaWindow(kHotLevel, pgIdx, from, to, persistentPages ? (*persistentPages)[pgIdx] : kNoPages,
                     lockedPages ? (*lockedPages)[pgIdx] : kNoPages, scratchSlots ? (*scratchSlots)[pgIdx] : kNoScratch);
             }
             else
@@ -2361,7 +2391,12 @@ uint64_t StorageManager::hotPoolBindingVersion() const noexcept
 
 TypedVec<PoolGroupIndex, SlotWindow> StorageManager::hotWindows() const
 {
-    auto const& storage = *mLevels.at(kHotLevel).storage;
+    return levelWindows(kHotLevel);
+}
+
+TypedVec<PoolGroupIndex, SlotWindow> StorageManager::levelWindows(CacheLevel level) const
+{
+    auto const& storage = *mLevels.at(level).storage;
     TypedVec<PoolGroupIndex, SlotWindow> result;
     result.reserve(storage.numPoolGroups());
     for (PoolGroupIndex pgIdx{0}; pgIdx < storage.numPoolGroups(); ++pgIdx)
@@ -2381,13 +2416,13 @@ void StorageManager::adjustCacheLevel(CacheLevel level, std::optional<size_t> ne
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> const* lockedPages,
     TypedVec<PoolGroupIndex, ScratchSlotLockList> const* scratchSlots)
 {
-    if (level == kHotLevel && mGpuArena)
+    if (isArenaLevel(level))
     {
-        adjustArenaLevel(newQuota, ratioList, persistentPages, lockedPages, scratchSlots);
+        adjustArenaLevel(level, newQuota, ratioList, persistentPages, lockedPages, scratchSlots);
         return;
     }
     TLLM_CHECK_WITH_INFO(lockedPages == nullptr && scratchSlots == nullptr,
-        "Locked pages and scratch slots can only be relocated in a GPU arena");
+        "Locked pages and scratch slots can only be relocated in an arena");
     auto& lvlStorage = *mLevels.at(level).storage;
     auto oldNumSlots = lvlStorage.slotCountList();
     size_t quota = newQuota.has_value()

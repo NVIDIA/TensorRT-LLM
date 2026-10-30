@@ -18,6 +18,7 @@
 #pragma once
 
 #include "coldPageCodec.h"
+#include "kv_cache_manager_v2/common.h"
 
 #include <cuda.h>
 
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -175,6 +177,26 @@ private:
     KernelConfig mOffload{};
     KernelConfig mOnboard{};
 };
+
+//! Host ranges registered with the driver in several pieces whose copies may cross from one piece to the next.
+//!
+//! The copy engine rejects a copy that spans two cuMemHostRegister registrations. A host pool keeps its slots
+//! inside one registration by sizing its units to whole slots, but a host arena (copy-based rebalancing) holds
+//! pools of different slot sizes in one range registered in fixed units, so some of their pages straddle a unit
+//! boundary. Such a range is listed here, and BatchedPageCopier's copy-engine path splits every copy at the unit
+//! boundaries it crosses. Kernels read registered host memory through its mapping, where the units are contiguous,
+//! so they need no split.
+void addHostCopySplitRange(MemAddress base, size_t size, size_t unitBytes);
+void removeHostCopySplitRange(MemAddress base);
+
+namespace detail
+{
+
+//! Appends, in ascending order, the offsets in (0, numBytes) at which a copy of numBytes at `address` crosses a
+//! unit boundary of a range added with addHostCopySplitRange. Appends nothing for any other address.
+void appendHostCopySplitOffsets(CUdeviceptr address, size_t numBytes, std::vector<size_t>& offsets);
+
+} // namespace detail
 
 //! Stages a host array into device memory, reading the source during the call.
 //!

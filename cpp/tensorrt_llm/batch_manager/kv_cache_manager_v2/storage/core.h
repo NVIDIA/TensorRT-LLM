@@ -489,9 +489,11 @@ private:
 class ArenaGpuSlotPool : public SlotPoolBase
 {
 public:
-    //! `granularity` is the arena's physical chunk size, the grain its bytes are counted in.
-    ArenaGpuSlotPool(
-        size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity);
+    //! `granularity` is the arena's allocation unit, the grain its bytes are counted in. `medium` is what the
+    //! arena's memory is (a host arena reuses this pool type), and `fill`, when set, is a host arena filled in
+    //! the background, which a slot must wait for before it is used.
+    ArenaGpuSlotPool(size_t slotSize, MemAddress arenaBase, size_t arenaBytes, SlotWindow window, size_t granularity,
+        CacheTier medium = CacheTier::GPU_MEM, HostMem const* fill = nullptr);
 
     [[nodiscard]] size_t sizeGranularity() const noexcept override
     {
@@ -500,8 +502,10 @@ public:
 
     [[nodiscard]] CacheTier medium() const noexcept override
     {
-        return CacheTier::GPU_MEM;
+        return mMedium;
     }
+
+    void waitSlotUsable(SlotId slot) const override;
 
     SlotCount numSlots() const noexcept override
     {
@@ -563,6 +567,8 @@ private:
     size_t mArenaBytes;
     SlotWindow mWindow;
     size_t mGranularity;
+    CacheTier mMedium = CacheTier::GPU_MEM;
+    HostMem const* mFill = nullptr;
     bool mBound = false;
     std::vector<int32_t> mGroupToLocal; //!< by group slot id; -1 = unbound
     std::vector<int32_t> mLocalToGroup; //!< by own id; -1 = unbound
@@ -894,6 +900,11 @@ public:
     //! pool today, which makes the two equal.
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
         HostMemBackingOptions const& options = {});
+
+    //! Arena-backed group (copy-based rebalancing): one pool, a window into `arena`, whose start is slot id 0
+    //! of every group. The arena is filled from its start, so a slot is usable once the fill passes its end.
+    HostPoolGroup(
+        SlotWindow window, SlotAllocator::Growth growth, size_t slotSize, HostMem const& arena, size_t unitBytes);
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -1364,6 +1375,70 @@ public:
 private:
     HostMemBackingOptions mOptions;
     size_t mMaxQuota = 0;
+};
+
+// ---------------------------------------------------------------------------
+// ArenaHostCacheLevelStorage — host level for copy-based rebalancing (CoReba).
+//
+// The host counterpart of ArenaGpuCacheLevelStorage, for groups of one pool (every cold level has one pool per
+// group): one host range, committed and registered in full at construction (filled in the background, like a
+// host pool) and never resized, holds every pool group in a window of arena-relative slot ids, laid out by
+// computeArenaWindows. A rebalance moves the windows and the blocks in the parts that change owner, instead of
+// releasing one pool's memory and committing (populating and registering) another's.
+//
+// The range is registered in units of unitBytes, which no slot size need divide, so a page can straddle two
+// registrations; the range is listed with addHostCopySplitRange so that copy-engine copies are split there.
+// ---------------------------------------------------------------------------
+class ArenaHostCacheLevelStorage : public CacheLevelStorage
+{
+public:
+    //! arenaBytes must be a positive multiple of unitBytes.
+    ArenaHostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList, size_t arenaBytes,
+        size_t unitBytes, TypedVec<PoolGroupIndex, float> const& ratioList,
+        TypedVec<PoolGroupIndex, SlotCount> const& minSlots, HostMemBackingOptions const& options);
+    //! Destroys the pool groups before the arena they point into.
+    ~ArenaHostCacheLevelStorage() override;
+
+    CacheTier cacheTier() const noexcept override
+    {
+        return CacheTier::HOST_MEM;
+    }
+
+    //! The arena is the quota and cannot change size. Its pools count in mUnitBytes, so
+    //! poolSizeGranularity(HOST_MEM) is the unit.
+    [[nodiscard]] size_t roundedNumBytes(CacheTier medium) const override
+    {
+        return medium == CacheTier::HOST_MEM ? mArenaBytes : 0;
+    }
+
+    [[nodiscard]] std::optional<size_t> maxQuota() const noexcept override
+    {
+        return mArenaBytes;
+    }
+
+    void destroy() override;
+
+    [[nodiscard]] MemAddress arenaBase() const noexcept
+    {
+        return mArena.address();
+    }
+
+    //! Window of each pool group.
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> windows() const;
+
+    //! The windows this arena would get for `ratioList` (computeArenaWindows).
+    [[nodiscard]] TypedVec<PoolGroupIndex, SlotWindow> computeWindows(
+        TypedVec<PoolGroupIndex, float> const& ratioList, TypedVec<PoolGroupIndex, SlotCount> const& minSlots) const;
+
+    //! Registration unit for an arena of a host tier whose own commit unit is tierUnitBytes: large, so that
+    //! few pages straddle a unit and the arena needs few registrations, and under the per-call pinning limit.
+    static size_t arenaUnitBytes(size_t tierUnitBytes) noexcept;
+
+private:
+    size_t mArenaBytes;
+    size_t mUnitBytes;
+    HostMem mArena;
+    bool mSplitRangeAdded = false;
 };
 
 class DiskCacheLevelStorage : public CacheLevelStorage
