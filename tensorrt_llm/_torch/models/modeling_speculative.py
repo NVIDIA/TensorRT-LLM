@@ -31,6 +31,7 @@ from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
@@ -1711,11 +1712,21 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
+# The step-loop hooks of a model with the one-engine speculative fast paths.
+_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
 
     # Set per instance from supports_spec_decode_fast_paths in __init__.
     spec_decode_fast_paths: bool = False
+
+    @property
+    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+        """The fast paths run the overlap loop on the execution stream."""
+        return (_FAST_PATH_RUNTIME_HOOKS
+                if self.spec_decode_fast_paths else None)
 
     @classmethod
     def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:

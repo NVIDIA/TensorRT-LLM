@@ -589,10 +589,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.model_engine = model_engine
         hooks = runtime_hooks_of(model_engine.model)
-        # A model with the one-engine speculative fast paths opts in as well.
-        self._execution_stream_loop_armed = (
-            hooks.loop_on_execution_stream
-            or model_engine.spec_decode_fast_paths)
+        self._execution_stream_loop_armed = hooks.loop_on_execution_stream
         self._executor_events = hooks.executor_events
         self._enable_adp_dummy_fixes = enable_adp_dummy_fixes
         self._enable_scheduler_aware_adp_dummy = enable_scheduler_aware_adp_dummy
