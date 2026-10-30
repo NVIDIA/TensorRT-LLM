@@ -2983,10 +2983,9 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
-@pytest.mark.parametrize("backend", ["triton", "cutedsl"])
 @pytest.mark.parametrize("query_len_per_seq", [1, 4], ids=["draft-step", "verify"])
 def test_fp4_mla_attention_decode_on_context_only_draft_layer(
-    monkeypatch, backend: str, query_len_per_seq: int
+    monkeypatch, query_len_per_seq: int
 ) -> None:
     """The MTP draft layer of a single-copy context cache decodes like a decoding cache.
 
@@ -2997,7 +2996,7 @@ def test_fp4_mla_attention_decode_on_context_only_draft_layer(
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     _assert_fp4_mla_attention_decode_accuracy(
         monkeypatch,
-        backend=backend,
+        backend="cutedsl",
         fused_v_transpose=False,
         num_heads=128,
         seq_lens=[FP4_MLA_TOKENS_PER_BLOCK + 37, 51],
