@@ -229,6 +229,48 @@ def test_nvfp4_draft_layers_are_rejected() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_specs_decide_the_sparse_target_layers() -> None:
+    """A per-layer head list spanning the drafter does not make draft layers sparse targets."""
+    torch.cuda.init()
+    manager = MiniMaxM3KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=NUM_TARGET,
+        num_kv_heads=[HEADS] * (NUM_TARGET + NUM_DRAFT),
+        head_dim=HEAD_DIM,
+        tokens_per_block=128,
+        max_seq_len=1024,
+        max_batch_size=2,
+        max_num_tokens=256,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.NVFP4,
+        vocab_size=16,
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+            implementation="msa", indexer_kv_dtype="fp8"
+        ),
+        layer_specs=_specs(),
+    )
+    try:
+        assert manager.sparse_layer_ids == [3]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_target_specs_need_the_cache_dtype() -> None:
+    """Target views and block scales follow the manager dtype, so target specs must use it."""
+    specs = _specs()
+    fp8_target = replace(specs[3], dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
+    with pytest.raises(ValueError, match="target layer specs in the cache dtype"):
+        _manager((*specs[:3], fp8_target, *specs[NUM_TARGET:]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_draft_layers_need_their_own_lifecycle() -> None:
     """Unwindowed draft layers would share the target's lifecycle and pool offsets."""
     torch.cuda.init()

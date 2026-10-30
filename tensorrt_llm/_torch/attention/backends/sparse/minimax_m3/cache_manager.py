@@ -383,6 +383,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             kwargs.get("num_kv_heads"),
             shared_draft_layer_count(kwargs.get("spec_config"), kwargs.get("layer_mask")),
         )
+        layer_specs = kwargs.get("layer_specs")
+        if layer_specs is not None:
+            # Explicit specs declare which layers are the target's.
+            num_target_layers = sum(
+                1 for spec in layer_specs if spec.owner is KVCacheLayerOwner.TARGET
+            )
         if sparse_layer_ids is None:
             sparse_layer_ids = default_sparse_layer_ids(
                 kwargs.get("pretrained_config"), num_target_layers
@@ -409,7 +415,13 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         # Filled at the end of __init__; the base __init__ may already call get_buffers.
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
-        layer_specs = kwargs.get("layer_specs")
+        if layer_specs is not None and any(
+            spec.owner is KVCacheLayerOwner.TARGET
+            and spec.dtype != kwargs.get("dtype", DataType.HALF)
+            for spec in layer_specs
+        ):
+            # Target views and block scales follow the manager dtype.
+            raise ValueError(f"{type(self).__name__} needs target layer specs in the cache dtype.")
         if layer_specs is not None and any(
             spec.owner is KVCacheLayerOwner.DRAFT and spec.dtype == DataType.NVFP4
             for spec in layer_specs
