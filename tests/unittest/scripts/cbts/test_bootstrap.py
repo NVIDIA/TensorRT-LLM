@@ -76,6 +76,29 @@ def test_is_mpi_pool_worker_matches_the_spawn_signature(monkeypatch, orig_argv, 
     assert process_roles.is_mpi_pool_worker() is expected
 
 
+@pytest.mark.parametrize(
+    ("orig_argv", "expected"),
+    [
+        ([sys.executable, "-u", "/opt/site-packages/ray/_private/runtime_env/agent/main.py"], True),
+        ([sys.executable, "-m", "ray._private.runtime_env.agent.main"], True),
+        ([sys.executable, "/opt/site-packages/ray/_private/workers/default_worker.py"], True),
+        ([sys.executable, "/opt/myapp/main.py"], False),
+        ([sys.executable, "/opt/not-ray/_private/runtime_env/agent/main.py"], False),
+        (
+            [sys.executable, "-c", "print('x')", "/opt/ray/_private/runtime_env/agent/main.py"],
+            False,
+        ),
+        (
+            [sys.executable, "/opt/myapp/main.py", "/opt/ray/_private/runtime_env/agent/main.py"],
+            False,
+        ),
+    ],
+)
+def test_ray_infra_launch_targets(monkeypatch, orig_argv, expected):
+    monkeypatch.setattr(sys, "orig_argv", orig_argv, raising=False)
+    assert process_roles.is_ray_infra_process() is expected
+
+
 def test_note_taint_none_means_self_but_empty_string_is_preserved(tmp_path):
     """Regression: `process_uid or self.process_uid` conflated an unidentified subscriber.
 
@@ -236,10 +259,16 @@ def test_build_and_ray_processes_opt_out(cbts_env):
     (workdir / "setup.py").write_text(probe)
     (workdir / "default_worker.py").write_text(probe)
     (workdir / "regular.py").write_text(probe)
+    agent = workdir / "ray" / "_private" / "runtime_env" / "agent" / "main.py"
+    agent.parent.mkdir(parents=True)
+    agent.write_text(probe)
+    (workdir / "main.py").write_text(probe)
 
     for script, expected in (
         ("setup.py", "<unset>"),
         ("default_worker.py", "<unset>"),
+        (str(agent), "<unset>"),
+        ("main.py", env["CBTS_COVERAGE_CONFIG"]),
         ("regular.py", env["CBTS_COVERAGE_CONFIG"]),
     ):
         result = subprocess.run(
@@ -252,6 +281,22 @@ def test_build_and_ray_processes_opt_out(cbts_env):
             timeout=60,
         )
         assert result.stdout.strip() == expected, f"{script}: {result.stdout}"
+
+    agent.write_text(
+        "import os, subprocess, sys\n"
+        "print(os.environ.get('CBTS_COVERAGE_CONFIG', '<unset>'))\n"
+        "subprocess.run([sys.executable, '-c', "
+        "\"import os; print(os.environ.get('CBTS_COVERAGE_CONFIG', '<unset>'))\"], check=True)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, str(agent)],
+        cwd=workdir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert result.stdout.splitlines() == ["<unset>", "<unset>"]
 
 
 def _write_fakeprod(workdir):
