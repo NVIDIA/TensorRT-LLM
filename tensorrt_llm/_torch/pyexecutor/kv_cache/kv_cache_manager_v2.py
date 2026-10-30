@@ -3770,7 +3770,10 @@ class KVCacheManagerV2(BaseResourceManager):
             ]
             if initial_pool_ratio is None and typical_step is None:
                 initial_pool_ratio = self._windowed_draft_pool_ratio(
-                    layer_configs, cache_tiers[0].quota, tokens_per_block
+                    layer_configs,
+                    cache_tiers[0].quota,
+                    tokens_per_block,
+                    kv_cache_config.max_util_for_resume,
                 )
                 if initial_pool_ratio is not None:
                     # Allocation rounds the ratio's byte target; this floor keeps one fresh
@@ -3928,13 +3931,15 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_configs: List[AttentionLayerConfig],
         gpu_quota: int,
         tokens_per_block: int,
+        max_util_for_resume: float = 1.0,
     ) -> Optional[List[float]]:
         """Hot-tier ``[target, draft]`` byte ratios when the draft layers form one windowed lifecycle.
 
         Without a pool ratio or typical step the backend splits the hot tier for one 2048-token
         request, which says nothing about how many sequences hold a draft window at once. The
         draft layers need every admissible sequence's window plus one context chunk, which is
-        what the KV cache cost already charges for them, capped at an equal-token share.
+        what the KV cache cost already charges for them, over the resume watermark and capped
+        at an equal-token share.
         """
         if self.max_num_tokens is None or gpu_quota <= 0:
             # Without a context-chunk bound or a quota the backend's split is the safe one.
@@ -3979,7 +3984,7 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         draft_bytes = (
             window_bytes_per_sequence * num_sequences + sum(draft_sizes) * self.max_num_tokens
-        )
+        ) / max_util_for_resume
         bytes_per_block = {KVCacheLayerOwner.TARGET: 0, KVCacheLayerOwner.DRAFT: 0}
         for config, owner in zip(layer_configs, owners):
             bytes_per_block[owner] += sum(buffer.size for buffer in config.buffers)

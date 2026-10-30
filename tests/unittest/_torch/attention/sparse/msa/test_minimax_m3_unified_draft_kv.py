@@ -229,9 +229,22 @@ def test_nvfp4_draft_layers_are_rejected() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
-def test_specs_decide_the_sparse_target_layers() -> None:
-    """A per-layer head list spanning the drafter does not make draft layers sparse targets."""
+@pytest.mark.parametrize(
+    "sparse_attention_freq,expected",
+    [(None, [3]), ([0, 1, 0, 1], [1, 3])],
+    ids=["default", "config"],
+)
+def test_specs_decide_the_sparse_target_layers(
+    sparse_attention_freq: Optional[list[int]], expected: list[int]
+) -> None:
+    """A per-layer head list spanning the drafter keeps the target's sparse split."""
     torch.cuda.init()
+    pretrained_config = None
+    if sparse_attention_freq is not None:
+        pretrained_config = SimpleNamespace(
+            num_hidden_layers=NUM_TARGET,
+            sparse_attention_config={"sparse_attention_freq": sparse_attention_freq},
+        )
     manager = MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
             max_gpu_total_bytes=64 << 20,
@@ -254,9 +267,10 @@ def test_specs_decide_the_sparse_target_layers() -> None:
             implementation="msa", indexer_kv_dtype="fp8"
         ),
         layer_specs=_specs(),
+        pretrained_config=pretrained_config,
     )
     try:
-        assert manager.sparse_layer_ids == [3]
+        assert manager.sparse_layer_ids == expected
     finally:
         manager.shutdown()
 
@@ -374,6 +388,10 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     draft_bytes = (num_sequences * 3 * 128 + 256) * draft_bytes_per_token
     assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) == pytest.approx(
         [1 - draft_bytes / (1 << 30), draft_bytes / (1 << 30)]
+    )
+    # Resume refuses a pool above its watermark, so the share covers the windows below it.
+    assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128, 0.5)[1] == pytest.approx(
+        2 * draft_bytes / (1 << 30)
     )
     # A quota too small for the windows keeps the bytes-per-token split.
     token_share = draft_bytes_per_token / sum(

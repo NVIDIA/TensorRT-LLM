@@ -391,6 +391,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for spec in (layer_specs or ())
             if spec.owner is KVCacheLayerOwner.DRAFT
         }
+        if draft_ids:
+            # Draft layers follow every target layer, so the first one is the global target count.
+            num_target_layers = min(draft_ids)
         if sparse_layer_ids is None:
             sparse_layer_ids = default_sparse_layer_ids(
                 kwargs.get("pretrained_config"), num_target_layers
