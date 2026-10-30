@@ -8,9 +8,18 @@ each live row's pages drawn from a seeded permutation of the pool, `-1` past
 its allocation, rows past the batch holding a previous step's plausible page
 ids. Both planes are pre-filled with a sentinel so a stray write shows.
 A `hole` cell appends one row that resolves to no slot.
+
+The unified target's cells store into the stock manager's bf16 layout -- one
+layer's plane of the 12 sparse layers' coalesced index pool, the other 11
+checked untouched -- at the measured tep4 pool, with the batch's last row on the
+pool's last page. `test_the_stock_managers_planes_are_the_cells_layout` builds
+the stock manager itself (through the target's pool-layout test) and stores
+through its own views.
 """
 
+import importlib.util
 import zlib
+from pathlib import Path
 
 import pytest
 import torch
@@ -80,8 +89,43 @@ def _shared_page_planes(spec, extras: dict):
     return index_cache, position_cache
 
 
-def _build(spec, seed: int):
-    """Real planes, table and rows for one cell; returns the op's kwargs and extras."""
+def _coalesced_planes(spec, extras: dict):
+    """The bf16 index pool of the unified target: the `layers` sparse layers' INDEX_KEY buffers
+    coalesced into one allocation, so the cell's plane (layer `layer`) is a strided view, and the
+    position plane its own contiguous pool. The whole allocation holds `KEY_FILL`; the pool is
+    recorded for the untouched check."""
+    layers, layer, tpb, hkv, head_dim, axes, pages = (
+        spec[k] for k in ("layers", "layer", "tokens_per_block", "hkv", "head_dim", "axes", "pages")
+    )
+    pool = torch.full(
+        (pages, layers, tpb, hkv, head_dim), KEY_FILL, dtype=torch.bfloat16, device=DEV
+    )
+    index_cache = pool[:, layer]
+    assert index_cache.stride() == (spec["page_stride"], hkv * head_dim, head_dim, 1)
+    position_cache = torch.full((pages, tpb, axes), POS_FILL, dtype=torch.int32, device=DEV)
+    extras["coalesced"] = (pool, layer)
+    return index_cache, position_cache
+
+
+def _other_layers_untouched(pool: torch.Tensor, layer: int) -> None:
+    """Every other layer's plane in the coalesced pool still holds `KEY_FILL`, checked a band of
+    pages at a time so the check stays a fraction of the pool's size."""
+    fill = int(_bits(torch.tensor([KEY_FILL], dtype=torch.bfloat16))[0])
+    bits = pool.view(torch.int16)
+    for start in range(0, pool.shape[0], 16384):
+        band = bits[start : start + 16384]
+        for other in range(pool.shape[1]):
+            if other != layer:
+                assert bool((band[:, other] == fill).all()), (
+                    f"layer {other}'s index plane moved in pages {start}..{start + band.shape[0]}"
+                )
+
+
+def _build(spec, seed: int, planes=None):
+    """Real planes, table and rows for one cell; returns the op's kwargs and extras.
+
+    `planes`, if given, is an `(index_cache, position_cache)` pair to store into instead of the
+    cell's own (a stock manager's views)."""
     gen = torch.Generator(device="cpu").manual_seed(seed)
     tpb, hkv, head_dim, axes = (spec[k] for k in ("tokens_per_block", "hkv", "head_dim", "axes"))
     slots, width, pages = spec["slots"], spec["width"], spec["pages"]
@@ -99,7 +143,17 @@ def _build(spec, seed: int):
         table[r, :cols] = order[used : used + cols]
         used += cols
         allocated_cols.append(cols)
-    assert used <= pages and len(segments) < slots, "pool or table too small for the batch"
+    assert used <= pages and len(segments) <= slots, "pool or table too small for the batch"
+    if spec.get("straddle"):
+        # The batch's last row stores into the pool's last page; every other row keeps its page
+        # from the permutation, so the rows land on both sides of 2^31 elements of the plane.
+        last_start, last_rows = segments[-1]
+        column = (last_start + last_rows - 1) // tpb
+        live = table[: len(segments)]
+        holder = (live == pages - 1).nonzero()
+        if len(holder):
+            live[holder[0, 0], holder[0, 1]] = live[len(segments) - 1, column]
+        live[len(segments) - 1, column] = pages - 1
     if spec["hole"] is not None:
         request, position = _hole(spec, table, allocated_cols)
         requests.append(request)
@@ -113,9 +167,12 @@ def _build(spec, seed: int):
     token_k = projection[:, spec["index_heads"] :]
     if spec["key_layout"] == "fused_row":
         # The target's fused input projection row, [q | k | v | gate | index q, k |
-        # pad] = 110 heads of 128: the raw index key is head 108.
-        row = torch.randn(rows, 110, head_dim, generator=gen, dtype=torch.float32)
-        token_k = row.to(device=DEV, dtype=spec["key_dtype"])[:, 108 : 108 + hkv]
+        # pad of one index head], in heads of 128: the raw index key is the second to
+        # last (108 of 110 at 14080 wide; 32 of 34 at the unified target's 4352).
+        heads = spec.get("row_width", 14080) // head_dim
+        row = torch.randn(rows, heads, head_dim, generator=gen, dtype=torch.float32)
+        token_k = row.to(device=DEV, dtype=spec["key_dtype"])[:, heads - 2 : heads - 2 + hkv]
+        assert token_k.stride(0) == heads * head_dim
 
     request_indices = torch.tensor(requests, dtype=spec["request_dtype"], device=DEV)
     logical_positions = torch.tensor(positions, dtype=spec["position_dtype"], device=DEV)
@@ -131,8 +188,12 @@ def _build(spec, seed: int):
 
     extras = {}
     position_cache = None
-    if spec["cache_layout"] == "shared_page":
+    if planes is not None:
+        index_cache, position_cache = planes
+    elif spec["cache_layout"] == "shared_page":
         index_cache, position_cache = _shared_page_planes(spec, extras)
+    elif spec["cache_layout"] == "coalesced":
+        index_cache, position_cache = _coalesced_planes(spec, extras)
     else:
         index_cache = torch.full((pages, tpb, hkv, head_dim), KEY_FILL, device=DEV).to(
             torch.bfloat16
@@ -156,6 +217,9 @@ def _build(spec, seed: int):
 def test_certified_cells(cell, certifying):  # noqa: F811
     certifying(op)
     args, extras = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
+    if cell.spec.get("straddle"):
+        # The last row's page starts past 2^31 elements of the plane it is stored through.
+        assert (cell.spec["pages"] - 1) * args["index_cache"].stride(0) >= 2**31
     ref = op.reference(**args)
     out = op(**args)
     assert out[0] is args["index_cache"] and out[1] is args["position_cache"]
@@ -165,6 +229,8 @@ def test_certified_cells(cell, certifying):  # noqa: F811
         assert bool((extras["roles"].view(torch.int16) == fill).all()), (
             "another index-K role of the shared page moved"
         )
+    if "coalesced" in extras:
+        _other_layers_untouched(*extras["coalesced"])
 
 
 #: The cell of 32 MTP7 verify blocks (256 rows): the segments, pool and table it runs over.
@@ -202,6 +268,92 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph.replay()
     torch.cuda.synchronize()
     _compare((args["index_cache"], args["position_cache"]), ref)
+
+
+#: The unified target's 128-request decode cell, the largest batch its decode graphs capture.
+_UNIFIED_DECODE_128 = next(
+    c.spec for c in op.CELLS if c.why.startswith("unified tep4 decode: 128 requests")
+)
+
+
+def test_cuda_graph_capture_and_replay_unified_decode() -> None:
+    """Captured once at the unified target's 128-request decode on its coalesced plane, replayed
+    against new positions written into the same buffer."""
+    args, extras = _build(_UNIFIED_DECODE_128, seed=53)
+    positions = args["logical_positions"]
+    replayed = positions.clone()
+    positions.zero_()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        for _ in range(3):
+            op(**args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(**args)
+
+    positions.copy_(replayed)
+    pool, layer = extras["coalesced"]
+    pool.fill_(KEY_FILL)
+    args["position_cache"].fill_(POS_FILL)
+    ref = op.reference(**args)
+    graph.replay()
+    torch.cuda.synchronize()
+    _compare((args["index_cache"], args["position_cache"]), ref)
+    _other_layers_untouched(pool, layer)
+
+
+def _pool_layout():
+    """The target's pool-layout test, loaded by path: its `_manager` builds the stock manager the
+    engine builds on a rank of a member (core cache config, bf16 KV), and `ATTN_LAYERS` names the
+    sparse layers. Loaded rather than restated so the two cannot disagree on what the stock pool
+    is."""
+    path = Path(__file__).resolve().parents[1] / "test_pool_layout.py"
+    spec = importlib.util.spec_from_file_location("_r18_pool_layout", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("member", ("tp4", "tep4", "dep4"))
+def test_the_stock_managers_planes_are_the_cells_layout(member) -> None:
+    """The stock manager's own index and position planes at rank 0 of `member` have the layout
+    the member's cells model, and the op stores through them with the member's row width: four
+    rows, the last on the pool's last page, compared against `reference` over the whole plane,
+    every other sparse layer's plane untouched."""
+    layout = _pool_layout()
+    cell = next(c.spec for c in op.CELLS if c.spec.get("member") == member)
+    tpb, hkv, head_dim, axes = (cell[k] for k in ("tokens_per_block", "hkv", "head_dim", "axes"))
+    with layout._manager(member, 0) as cm:
+        planes = [cm.get_index_k_buffer(i) for i in layout.ATTN_LAYERS]
+        index_cache, position_cache = planes[cell["layer"]], cm.get_qsa_position_buffer()
+        assert len(planes) == cell["layers"]
+        assert index_cache.stride() == (cell["page_stride"], hkv * head_dim, head_dim, 1)
+        assert position_cache.stride() == (tpb * axes, axes, 1)
+        assert position_cache.shape[0] == index_cache.shape[0]
+        plane_bytes = tpb * hkv * head_dim * index_cache.element_size()
+        offsets = [p.data_ptr() - planes[0].data_ptr() for p in planes]
+        assert offsets == [j * plane_bytes for j in range(len(planes))]
+
+        for plane in planes:
+            plane.fill_(KEY_FILL)
+        position_cache.fill_(POS_FILL)
+        spec = dict(
+            cell,
+            segments=((0, 1), (31, 1), (33, 2)),
+            pages=index_cache.shape[0],
+            slots=8,
+        )
+        args, _ = _build(spec, seed=71, planes=(index_cache, position_cache))
+        assert int(args["block_table"][2, 1]) == index_cache.shape[0] - 1
+        ref = op.reference(**args)
+        op(**args)
+        _compare((index_cache, position_cache), ref)
+        fill = int(_bits(torch.tensor([KEY_FILL], dtype=torch.bfloat16))[0])
+        for j, plane in enumerate(planes):
+            if j != cell["layer"]:
+                assert bool((_bits(plane) == fill).all()), f"sparse layer {j}'s plane moved"
 
 
 def test_rejects_metadata_of_unequal_length() -> None:
