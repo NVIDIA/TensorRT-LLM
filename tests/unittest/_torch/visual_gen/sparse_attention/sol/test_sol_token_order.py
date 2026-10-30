@@ -65,34 +65,37 @@ def test_require_native_token_order_rejects_morton_for_other_models():
 
 
 @_CPU_ONLY
-def test_base_pipeline_rejects_morton_unless_supported():
-    """Any pipeline that does not declare ``supports_token_order`` rejects a non-native
-    order at construction, before it touches the rest of its config."""
-    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+def test_base_diffusion_model_rejects_non_native_order_unless_supported():
+    """A model that does not declare ``_supports_token_order`` rejects a non-native
+    order at construction; the native order is always accepted."""
+    from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
     from tensorrt_llm.visual_gen.args import AttentionConfig
 
-    class _StubPipeline(BasePipeline):
+    class _StubModel(BaseDiffusionModel):
         pass
 
-    morton_cfg = SimpleNamespace(
-        attention=AttentionConfig(
-            backend="CUTEDSL",
-            sparse_attention_config=SolAttentionConfig(tau=2.0, token_order="morton"),
+    def _config(order: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            parallel=SimpleNamespace(token_sharded_tp=False),
+            attention=AttentionConfig(
+                backend="CUTEDSL",
+                sparse_attention_config=SolAttentionConfig(tau=2.0, token_order=order),
+            ),
+            component_name="transformer",
+            pretrained_config=SimpleNamespace(),
         )
-    )
-    with pytest.raises(ValueError, match="_StubPipeline"):
-        _StubPipeline(morton_cfg)
+
+    _StubModel(_config("native"))
+    for order in ("morton", "hilbert"):
+        with pytest.raises(ValueError, match="_StubModel"):
+            _StubModel(_config(order))
 
 
 @_CPU_ONLY
-def test_wan_pipelines_declare_token_order_support():
-    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
-    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan import WanPipeline
-    from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
+def test_wan_transformer_declares_token_order_support():
+    from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 
-    assert WanPipeline.supports_token_order
-    assert WanImageToVideoPipeline.supports_token_order
-    assert WanDMDPipeline.supports_token_order
+    assert WanTransformer3DModel._supports_token_order
 
 
 @_CPU_ONLY

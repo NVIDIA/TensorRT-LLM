@@ -720,6 +720,7 @@ class WanBlock(nn.Module):
 class WanTransformer3DModel(BaseDiffusionModel):
     _supports_gradient_checkpointing = True
     _supports_token_sharded_tp = True
+    _supports_token_order = True
 
     def __init__(
         self,

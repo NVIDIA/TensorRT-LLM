@@ -124,8 +124,6 @@ _WAN_TWO_TRANSFORMER_OFFLOAD_STAGES = (
     supports_nvfp4_vae=True,
 )
 class WanPipeline(BasePipeline):
-    supports_token_order = True
-
     def __init__(self, pipeline_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None

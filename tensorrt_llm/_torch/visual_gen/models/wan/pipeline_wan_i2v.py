@@ -106,8 +106,6 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     supports_nvfp4_vae=True,
 )
 class WanImageToVideoPipeline(BasePipeline):
-    supports_token_order = True
-
     def __init__(self, pipeline_config):
         # Wan2.2 14B two-stage denoising parameters
         self.transformer_2 = None

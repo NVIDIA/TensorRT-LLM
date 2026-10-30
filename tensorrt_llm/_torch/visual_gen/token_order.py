@@ -148,19 +148,19 @@ def resolve_token_order(sparse_attention_config) -> TokenOrder:
     return getattr(sparse_attention_config, "token_order", None) or "native"
 
 
-def require_native_token_order(sparse_attention_config, pipeline_name: str) -> None:
-    """Raise when a config asks for a token order that ``pipeline_name`` does not wire.
+def require_native_token_order(sparse_attention_config, model_name: str) -> None:
+    """Raise when a config asks for a token order that ``model_name`` does not wire.
 
-    Only pipelines whose transformer applies :class:`TokenReorder` around its
-    block stack honor ``token_order`` (they set ``supports_token_order``);
-    everywhere else a non-native order would silently run as native, so
-    ``BasePipeline`` rejects it at construction.
+    Only models that apply :class:`TokenReorder` around their block stack honor
+    ``token_order`` (they set ``_supports_token_order``); everywhere else a
+    non-native order would silently run as native, so ``BaseDiffusionModel``
+    rejects it at construction.
     """
     order = resolve_token_order(sparse_attention_config)
     if order != "native":
         raise ValueError(
-            f"sparse_attention_config.token_order={order!r} is only supported by the "
-            f"Wan pipelines; use token_order='native' for {pipeline_name}."
+            f"sparse_attention_config.token_order={order!r} is not implemented for "
+            f"{model_name}; use token_order='native'."
         )
 
 

@@ -47,7 +47,6 @@ from .mapping import _VisualGenAutotuneDist
 from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .offloading import OffloadPipelineStage, PipelineOffloader, transformer_component_offload_name
 from .profiler import VisualGenProfiler
-from .token_order import require_native_token_order
 
 
 class ExtraParamSchema(StrictBaseModel):
@@ -116,10 +115,6 @@ class BasePipeline(nn.Module):
     """
 
     supports_image_edit: bool = False
-    # True when the transformer applies ``TokenReorder`` around its block stack, so
-    # ``sparse_attention_config.token_order`` takes effect; other pipelines reject a
-    # non-native order at construction instead of silently running native.
-    supports_token_order: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
@@ -135,10 +130,6 @@ class BasePipeline(nn.Module):
     def __init__(self, pipeline_config: "DiffusionPipelineConfig"):
         super().__init__()
         self.pipeline_config = pipeline_config
-        if not self.supports_token_order:
-            require_native_token_order(
-                pipeline_config.attention.sparse_attention_config, type(self).__name__
-            )
         self.config = pipeline_config.primary_pretrained_config
         self.mapping: Mapping = getattr(pipeline_config, "mapping", None) or Mapping()
         self._device = torch.device(getattr(pipeline_config, "device", "cuda"))

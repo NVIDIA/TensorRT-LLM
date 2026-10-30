@@ -296,11 +296,12 @@ attention_config:
 - `token_order: morton` permutes the video tokens (and their RoPE tables) into
   Morton / Z-order once before the transformer blocks and restores the raster
   order after them, so each 64-token routing block covers a compact 3D
-  neighborhood instead of a run along width. Dense attention is
+  neighborhood instead of a run along width; `hilbert` does the same along a
+  Hilbert curve, which has no octant jumps. Dense attention is
   permutation-equivariant in exact arithmetic, so only the block routing
   changes the math; in BF16 the permutation also changes the reduction order
-  inside every kernel. The Wan pipelines honor this knob; other pipelines
-  reject it at construction. It is opt-in and not recommended for
+  inside every kernel. The Wan transformer honors this knob; models that do
+  not wire the reorder reject it at construction. It is opt-in and not recommended for
   Wan2.2-T2V-A14B at the recipe above: with torch.compile and CUDA graphs on
   it is about 3 % slower than the native order at every `tau` from 0.5 to
   1.0, and the BF16 reduction-order change alone (every layer dense, Morton
