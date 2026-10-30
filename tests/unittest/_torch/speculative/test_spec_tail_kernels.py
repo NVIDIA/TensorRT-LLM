@@ -64,7 +64,11 @@ def test_strict_accept_matches_eager(num_ctx, num_gens, draft_len):
     assert torch.equal(accepted[num_ctx:], ref_accepted[num_ctx:])
 
 
-def test_decode_draft_block_table_matches_eager():
+def test_decode_draft_block_table_matches_eager() -> None:
+    """The decoded table is the clamped, divided offsets; the count is each
+    row's extent, one past its last backed entry, so a sliding window that
+    released the low entries leaves the count covering the positions the row
+    still addresses."""
     num_pools, rows, n_blocks, divisor = 2, 9, 3000, 6
     gen = torch.Generator(device="cuda").manual_seed(1)
     src = torch.randint(
@@ -77,12 +81,18 @@ def test_decode_draft_block_table_matches_eager():
     view = src[1, :rows, 0]
     view[0] = -torch.randint(1, 1 << 20, (n_blocks,), device="cuda", generator=gen).to(torch.int32)
     view[1] = 0
+    # A windowed row: entries 0..99 released, 100..139 backed, the rest unfunded.
+    view[2] = -1
+    view[2, 100:140] = torch.arange(100, 140, device="cuda", dtype=torch.int32) * divisor
     assert bool((view < 0).float().mean() > 0.3) and bool((view == 0).float().mean() > 0.2)
     table = torch.full((rows + 3, n_blocks), -7, dtype=torch.int32, device="cuda")
     counts = torch.full((rows + 3,), -7, dtype=torch.long, device="cuda")
     decode_draft_block_table(view, divisor, table, counts)
     encoded = view.to(torch.int64)
-    assert torch.equal(counts[:rows], (encoded >= 0).sum(dim=1))
+    ordinals = torch.arange(1, n_blocks + 1, device="cuda")
+    extent = torch.where(encoded >= 0, ordinals, 0).max(dim=1).values
+    assert torch.equal(counts[:rows], extent)
+    assert counts[2].item() == 140
     expected = encoded.clamp(min=0).div(divisor, rounding_mode="floor").to(torch.int32)
     assert torch.equal(table[:rows], expected)
     assert counts[0].item() == 0 and bool((table[0] == 0).all())
@@ -143,12 +153,18 @@ def _paged_worker(draft_len, page_size, max_blocks, num_slots, layers, head_dim,
     perm = torch.randperm(pages, device="cuda", generator=gen).to(torch.int32)
     worker._ctx_block_tables = perm[: num_slots * max_blocks].view(num_slots, max_blocks).clone()
     worker._ctx_block_counts = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+    worker._ctx_base_pages = torch.zeros(num_slots, dtype=torch.long, device="cuda")
+    worker._ctx_block_tables_read = torch.zeros_like(worker._ctx_block_tables)
     worker._resolved_mask_token_id = 3
     return worker, storage
 
 
+@pytest.mark.parametrize("based", [False, True], ids=["no_base", "based"])
 @pytest.mark.parametrize("draft_len", [3, 7])
-def test_paged_latent_prepare_matches_eager(draft_len):
+def test_paged_latent_prepare_matches_eager(draft_len: int, based: bool) -> None:
+    """The fused generation-step preparation matches the eager one, including
+    the read view rebased past each slot's base pages: the advertised context,
+    the rebased block-table rows and the block placement."""
     vocab, hidden, features, layers, head_dim = 100, 64, 128, 3, 96
     page_size, max_blocks, num_slots, max_ctx = 16, 6, 10, 70
     num_ctx_reqs, num_gens = 1, 6
@@ -166,6 +182,11 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     worker._batch_to_slot_buffer.tensor[:batch] = slots
     worker._ctx_len[:5] = torch.tensor([10, 3, 66, 5, 40], device="cuda")
     worker._ctx_block_counts[:batch] = torch.tensor([0, 3, 6, 2, 0, 1, 1], device="cuda")
+    if based:
+        # Slot 2 (row 2) advertises past its base, so its read row shifts by
+        # it; slot 4 (row 3) advertises less than its base, reads nothing and
+        # shifts only to the page holding its context. The dummy slot keeps 0.
+        worker._ctx_base_pages[:5] = torch.tensor([0, 1, 1, 1, 2], device="cuda")
     num_accepted = torch.tensor([1, 2, width, 3, 1, 2, 1], dtype=torch.int32, device="cuda")
     accepted = torch.randint(
         0, vocab, (batch, width), dtype=torch.int32, device="cuda", generator=gen
@@ -193,6 +214,7 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     def prepare(fused):
         w = copy.copy(worker)
         w._ctx_len = worker._ctx_len.clone()
+        w._ctx_block_tables_read = worker._ctx_block_tables_read.clone()
         pool_storage = storage.clone()
         w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
         w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
@@ -253,9 +275,13 @@ def test_paged_latent_prepare_matches_eager(draft_len):
     assert bool(shared.any()) and bool(untouched.any())
 
     rows = eager["ctx_cache_batch_idx"]
+    read_rows = eager["ctx_page_table"].index_select(0, rows)
+    assert torch.equal(fused["ctx_page_table"].index_select(0, rows), read_rows)
+    if based:
+        assert not torch.equal(read_rows, worker._ctx_block_tables.index_select(0, rows))
     fixup = _build_mla_block_fixup(
         eager["num_ctx_per_req"],
-        worker._ctx_block_tables.index_select(0, rows).long(),
+        read_rows.long(),
         draft_len,
         page_size,
     )

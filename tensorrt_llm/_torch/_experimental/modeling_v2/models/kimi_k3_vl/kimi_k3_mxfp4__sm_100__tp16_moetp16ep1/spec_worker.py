@@ -61,6 +61,9 @@ class KimiK3DFlashWorker(DFlashWorker):
     # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
     # K/V with trtllm::k3_ctx_kv.
     k3_decode = False
+    # The generation-step preparation below reads _ctx_block_tables, not the
+    # rebased view, so every drafter slot numbers from 0.
+    _ctx_reads_rebased_view = False
 
     def _mask_token_id(self, draft_model) -> int:
         """The drafter's mask token id, resolved once."""
