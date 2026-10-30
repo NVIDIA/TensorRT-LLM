@@ -69,6 +69,15 @@ public:
             auto cached = prefillComms.find(mGroup);
             if (cached == prefillComms.end())
             {
+                cudaStreamCaptureStatus captureStatus = cudaStreamCaptureStatusNone;
+                TLLM_CUDA_CHECK(cudaStreamIsCapturing(at::cuda::getCurrentCUDAStream(), &captureStatus));
+                if (captureStatus != cudaStreamCaptureStatusNone)
+                {
+                    // Capture can reuse the base communicator but cannot run the cold eligibility synchronization.
+                    // Leave the cache empty so a later eager call still agrees on eligibility across all ranks.
+                    TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, -1);
+                    return 0;
+                }
                 constexpr int kTargetSmMajor = 10;
                 constexpr int kTargetSmMinor = 3;
                 constexpr int kMinRuntimeVersion = NCCL_VERSION(2, 31, 0);
