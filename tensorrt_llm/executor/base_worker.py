@@ -548,6 +548,9 @@ class BaseWorker(GenerationExecutor):
                 PythonRequestInputs(
                     original_end_id=request.sampling_params.end_id,
                     num_logprobs=request.sampling_params.logprobs,
+                    context_logits_explicit=request.sampling_params.return_context_logits,
+                    prompt_logprobs=request.sampling_params.prompt_logprobs,
+                    prompt_logprobs_simple_format=request.sampling_params.prompt_logprobs_simple_format,
                     lora_path=py_lora_path,
                     lora_ckpt_source=py_lora_ckpt_source,
                     logprobs_mode=request.sampling_params.logprobs_mode,
@@ -1689,6 +1692,22 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
+    compact = response.result.context_prompt_logprobs
+    if compact is not None:
+        tail = response.result.context_prompt_last_logits
+        assert tail is not None, "Completed prompt must retain its last prediction row"
+        tail_result = compute_prompt_logprobs(
+            logprob_params.prompt_logprobs,
+            tail,
+            first_generation_token,
+            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format)
+        logprobs_result = LogProbsResult(
+            prompt=[*compact, *(tail_result.prompt or [])])
+        if generation_result._streaming:
+            generation_result._cached_prompt_logprobs = logprobs_result.prompt
+        return logprobs_result
+
+    assert context_logits is not None, "context_logits must not be None when prompt_logprobs is requested."
     logprobs_result = compute_prompt_logprobs(
         logprob_params.prompt_logprobs,
         context_logits,
