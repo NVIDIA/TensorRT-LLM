@@ -122,6 +122,20 @@ class NoTarget(Exception):
     """
 
 
+# The mode each target class was last resolved under (the loader builds the class right after resolving it).
+_RESOLVED_MODES: Dict[type, ModelingV2Mode] = {}
+
+
+def resolved_mode(target: type) -> ModelingV2Mode:
+    """The mode ``modeling_v2_resolve`` returned ``target`` under; ``auto`` for a class built without it.
+
+    A target reads it at construction: under ``require`` its in-target dispatch
+    raises where it would otherwise fall back to a built-in path inside the
+    shapes it claims.
+    """
+    return _RESOLVED_MODES.get(target, ModelingV2Mode.AUTO)
+
+
 def tp_reaches_across_nodes(mapping) -> bool:
     """Whether an attention-TP allreduce over ``mapping`` can reach every rank
     through the workspaces the default targets build.
@@ -197,7 +211,7 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
         if route is None:
             known = ", ".join(sorted(registered_routes())) or "(none)"
             raise NoTarget(f"no route for this architecture; routed architectures: {known}")
-        return route(config, llm_args, _device_compute_capability())
+        target = route(config, llm_args, _device_compute_capability())
     except NoTarget as why:
         if mode is ModelingV2Mode.REQUIRE:
             raise ValueError(f"modeling_v2='require', but no target fits {arch!r}: {why}") from None
@@ -205,6 +219,8 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             f"modeling_v2: no target fits {arch!r} ({why}); using the built-in implementation"
         )
         return None
+    _RESOLVED_MODES[target] = mode
+    return target
 
 
 def _qualified(target: Optional[type]) -> Optional[str]:
