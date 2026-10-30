@@ -516,6 +516,15 @@ class DriverConformance:
         with an event set once a put is stalled, or ``None`` for no such signal."""
         return None
 
+    def make_put_still_reading_the_source(
+        self,
+    ) -> tuple[StoreDriver, str, threading.Event | None, Unblock] | None:
+        """A driver whose store stalls every put of the returned key before it has read all of
+        the source, until the callable runs, with an event set once a put is stalled, or
+        ``None`` for no such signal. While the gate is closed the put can still touch the
+        caller's memory; a gate the store reaches only once the source is read does not qualify."""
+        return None
+
     def make_held_key(self) -> tuple[StoreDriver, str, Unblock] | None:
         """A driver whose store holds the returned key as another writer's unfinished object
         until the callable runs."""
@@ -1018,6 +1027,53 @@ class DriverConformance:
                 putter.join(h.timeout)
             (result,) = h.wait_for_results(seen["op"])
             assert result.status is RowStatus.READY
+
+    def test_a_put_keeps_its_access_open_while_the_store_still_reads_the_source(self) -> None:
+        """``access_ended`` is the caller's leave to overwrite a put's source. While the store has
+        yet to read it the answer is False, whatever the driver has recorded; a driver that
+        copied the payload into memory of its own cannot stage this and skips. One that hands
+        out the handle only once the store answered cannot be asked."""
+        if not self.returns_before_the_store_answers:
+            pytest.skip("this driver returns the handle of a put only once the store answered")
+        staged = self.make_put_still_reading_the_source()
+        if staged is None:
+            pytest.skip("this driver cannot stage a put with its source still to be read")
+        driver, key, reading, unblock = staged
+        with self.harness(driver) as h:
+            h.needs(put=True)
+            source = h.endpoint(["P"])
+            source.fill_row(0, b"pppppppp")
+            handed: dict[str, OpHandle] = {}
+            handle_back = threading.Event()
+            failures: list[BaseException] = []
+
+            def submit() -> None:
+                try:
+                    handed["op"] = h.put([RowIO(key, (source.span(0),))])
+                except BaseException as error:  # noqa: BLE001 - reported from the main thread
+                    failures.append(error)
+                finally:
+                    handle_back.set()
+
+            putter = threading.Thread(target=submit, daemon=True)
+            putter.start()
+            try:
+                assert handle_back.wait(h.timeout), "put waited for the store to answer"
+                if failures:
+                    raise AssertionError(f"put raised: {failures[0]!r}") from failures[0]
+                if reading is not None:
+                    assert reading.wait(h.timeout), "the put never reached its source"
+                # With the gate closed the source cannot have been read through, wherever the
+                # put is on its way there.
+                assert not driver.access_ended(handed["op"]), (
+                    "access ended with the source still to be read"
+                )
+            finally:
+                unblock()
+                putter.join(h.timeout)
+            (result,) = h.wait_for_results(handed["op"])
+            assert result.status is RowStatus.READY
+            wait_until(lambda: driver.access_ended(handed["op"]), "access to end", h.timeout)
 
     def test_cancel_of_a_get_inside_the_store_neither_waits_nor_lies(self) -> None:
         """Cancel is best effort, so only what it must not do is checked: wait for the store,

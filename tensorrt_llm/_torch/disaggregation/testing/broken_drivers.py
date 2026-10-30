@@ -500,6 +500,16 @@ class EndsAccessOnceARowStarted(MemoryDriver):
             return recorded.access_ended or any(row.started for row in recorded.rows)
 
 
+class EndsAccessBeforeTheSourceIsRead(MemoryDriver):
+    """Calls a put's access over as soon as it is recorded, while the store has yet to read the
+    source: a caller that trusts it overwrites what the store is about to take."""
+
+    def access_ended(self, op: OpHandle) -> bool:
+        with self._lock:
+            recorded = self._op(op)
+            return recorded.access_ended or recorded.kind == "put"
+
+
 class CancelEndsAccessWithTheRowInTheStore(MemoryDriver):
     """On cancel, a row the store holds is called FAULT and the access over, as if the transfer
     had been torn down; the transfer in the store goes on regardless."""
@@ -831,6 +841,11 @@ BROKEN_ASYNC_CONFORMANCE: dict[str, tuple[type[MemoryDriver], DriverCapabilities
         DrainSkipsOnChange,
         DEFAULT_CAPABILITIES,
         "test_a_drain_that_ends_an_operation_calls_its_on_change",
+    ),
+    "a put's access stays open while its source is still to be read": (
+        EndsAccessBeforeTheSourceIsRead,
+        DEFAULT_CAPABILITIES,
+        "test_a_put_keeps_its_access_open_while_the_store_still_reads_the_source",
     ),
 }
 

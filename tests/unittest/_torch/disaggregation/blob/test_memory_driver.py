@@ -132,11 +132,13 @@ class CrashingStore(MemoryStore):
 
 class GatedStore(MemoryStore):
     """Holds reads, writes and queries of ``held`` keys (every key when None) while the gate is
-    closed, and says when one is waiting."""
+    closed, and says when one is waiting. With ``at_the_source`` a put is held before the
+    driver reads the caller's memory, not only before it commits."""
 
-    def __init__(self, held: set[str] | None = None) -> None:
+    def __init__(self, held: set[str] | None = None, *, at_the_source: bool = False) -> None:
         super().__init__()
         self.held = held
+        self.at_the_source = at_the_source
         self.gate = threading.Event()
         self.gate.set()
         self.waiting = threading.Event()
@@ -145,6 +147,10 @@ class GatedStore(MemoryStore):
         if (self.held is None or key in self.held) and not self.gate.is_set():
             self.waiting.set()
             self.gate.wait()
+
+    def reading_source(self, key: str) -> None:
+        if self.at_the_source:
+            self._hold(key)
 
     def commit(self, key: str, payload: bytes, trailer: bytes) -> Commit:
         self._hold(key)
@@ -213,6 +219,13 @@ class TestMemoryDriverConformance(DriverConformance):
 
     def make_blocked_put(self) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
         store = GatedStore(held={STAGED_KEY})
+        store.gate.clear()
+        return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
+
+    def make_put_still_reading_the_source(
+        self,
+    ) -> tuple[StoreDriver, str, threading.Event | None, Unblock]:
+        store = GatedStore(held={STAGED_KEY}, at_the_source=True)
         store.gate.clear()
         return self._driver(store), STAGED_KEY, store.waiting, store.gate.set
 
@@ -1440,6 +1453,33 @@ def test_every_check_has_a_broken_driver_and_each_driver_one_pairing() -> None:
     assert checks == {name for name in dir(DriverConformance) if name.startswith("test_")}
     checks = {check for _, check in BROKEN_MEMORY.values()}
     assert checks <= {name for name in dir(TestMemoryDriver) if name.startswith("test_")}
+
+
+# The suite's scenario hooks.
+
+
+def test_the_source_gate_holds_a_put_before_the_source_is_read() -> None:
+    """What the hook promises, for the in-memory driver: while the gate is closed nothing of the
+    source was read, so the store ends up with what the source holds once the gate opens."""
+    suite = _conformance(MemoryDriver, DEFAULT_CAPABILITIES, TestAsyncMemoryDriverConformance)
+    staged = suite.make_put_still_reading_the_source()
+    assert staged is not None
+    driver, key, reading, unblock = staged
+    assert reading is not None
+    with suite.harness(driver) as h:
+        source = h.endpoint(["P"])
+        source.fill_row(0, b"pppppppp")
+        try:
+            op = h.put([RowIO(key, (source.span(0),))])
+            assert reading.wait(h.timeout), "the put never reached its source"
+            source.fill_row(0, b"qqqqqqqq")
+        finally:
+            unblock()  # on every exit, or the worker behind the gate never returns
+        (result,) = h.wait_for_results(op)
+        assert result.status is RowStatus.READY
+        reader = h.endpoint(["R"])
+        h.wait_for_results(h.get([RowIO(key, (reader.span(0),))]))
+        assert reader.read_row(0) == b"qqqqqqqq"
 
 
 # The suite's memory hooks.

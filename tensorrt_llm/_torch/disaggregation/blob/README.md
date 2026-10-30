@@ -66,7 +66,10 @@ The boundary is `store.py`; its docstrings are the specification. The rules that
 2. **Two questions, answered apart.** `poll` gives each row's logical result; `access_ended`
    says whether the operation can still touch the rows' memory. Neither implies the other. A
    row's result may land long before its access ended, and the memory is reused only on the
-   latter. `access_unprovable` is the driver's admission that it will never know. The driver
+   latter. For a put, `access_ended` is the caller's leave to overwrite the source: a driver
+   that copied the payload into memory of its own may answer True at once; one whose store
+   reads the source itself answers False until that read is done.
+   `access_unprovable` is the driver's admission that it will never know. The driver
    tells the caller of each change through the `on_change` it was handed, after the change
    shows through those queries; the backend never polls.
 3. **The driver owns the store's work.** `put` and `get` take a `RowBatch`, record and queue
