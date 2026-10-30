@@ -13,7 +13,9 @@ complete groups expanded to tokens, then the trailing partial group, then
 
 The call has two kernels behind it (and a merge). The `launches` fixture
 records which ones a call indexed with a grid, and whether each launched with
-PDL, so every cell asserts its branch.
+PDL, so every cell asserts its branch (and, where it names `splits`, the
+split count). A cell marked `capture` is also captured in a CUDA graph,
+refilled in place and replayed, as the engine's decode step is.
 """
 
 import math
@@ -42,7 +44,7 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     averaging a thousand tokens (outputs 0.14 to 0.4) and 1.2e-2 on rows
     averaging a handful (outputs to 5). Scaled by each head row's own
     magnitude that is one band. Against this reference (fp32, rounded once)
-    every cell measured at most 2.0 element ulp -- a single final-rounding
+    every ungated cell measured at most 2.0 element ulp -- a single final-rounding
     flip, since bf16's step is 2 of these units at the bottom of a binade --
     and at most 0.62 ulp RMS: 2x and 3.2x margin. Six wrong references (no
     scale, interleaved heads, padding attended, identity pages, K/V
@@ -54,6 +56,15 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     wrong references sit outside it at every one of them: the table shifted
     by one page (at least 414 ulp), the softmax scale dropped (at least 254),
     and one selected token dropped a row (at least 12.5, the single-row cell).
+
+    A gated output is rounded twice, the attention and then the gated
+    product, each by at most one bf16 ulp of the value rounded, so its bound
+    is near the band's 4 element ulp. The seven gated cells, 10 seeds each,
+    measured at most 3.32 element ulp and 0.667 ulp RMS; the same calls
+    ungated at most 2.00. Two gate variants sit outside the band at every
+    gated cell: the gate not applied (at least 207.8 ulp) and read one head
+    early (at least 234.8). One selected token dropped at the 1-row gated
+    cell measures 3.82 element and 2.89 RMS ulp, refused on the RMS gate.
     """
     assert out.dtype == ref.dtype, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -192,19 +203,22 @@ def _build(spec, seed):
     k_cache, v_cache = pool[:, 2 * layer], pool[:, 2 * layer + 1]
 
     q_dtype = spec["q_dtype"]
-    row_heads = q_heads + 2 * kv if spec["q_layout"] == "qkv_slice" else 55
-    qkv = torch.randn(rows, row_heads, d, generator=gen, device=DEV).to(q_dtype)
-    q = qkv[:, :q_heads]
+    fused = spec["q_layout"] == "fused_row"
+    # The row q is read off: the packed `[q | k | v]` buffer, or the target's fused input
+    # projection row `[q | k | v | gate | index q, k | pad]` (`row_heads` heads of D).
+    row_heads = spec.get("row_heads", 55 if fused else q_heads + 2 * kv)
+    row = torch.randn(rows, row_heads * d, generator=gen, device=DEV).to(q_dtype)
+    q = row.view(rows, row_heads, d)[:, :q_heads]
 
     selected = _selected_tokens(positions, seed + 3, spec["compress_ratio"], spec["token_topk"])
     request_indices = slot_of.to(DEV)[req].to(spec["request_dtype"])
 
     gate = None
     if spec.get("gate") == "fused_row":
-        # The gate columns of the target's fused projection row (55 heads of
-        # D): heads 28..51, after q, k and v.
-        fused = torch.randn(rows, 55 * d, generator=gen, device=DEV).to(q_dtype)
-        gate = fused[:, 28 * d : (28 + q_heads) * d]
+        assert fused, "the gate is read off the fused row"
+        # The gate columns of the same row, after q, k and v.
+        start = (q_heads + 2 * kv) * d
+        gate = row[:, start : start + q_heads * d]
 
     args = dict(
         q=q,
@@ -248,6 +262,48 @@ def _is_prefix_packed(table):
     return (valid == (columns < valid.sum(1)[:, None])).all(1)
 
 
+def _refill(args, spec, seed) -> None:
+    """The engine's next step, written into the call's own buffers: new q and gate values
+    (the fused row's columns), a new selection at the same positions, and new K/V in every
+    mapped page."""
+    gen = torch.Generator(device=DEV).manual_seed(seed)
+    for name in ("q", "output_gate"):
+        if name in args:
+            view = args[name]
+            view.copy_(torch.randn(view.shape, generator=gen, device=DEV).to(view.dtype))
+    positions = torch.cat([torch.arange(s, s + n, device=DEV) for s, n in spec["segments"]])
+    args["selected_tokens"].copy_(
+        _selected_tokens(positions, seed + 3, spec["compress_ratio"], spec["token_topk"])
+    )
+    table = args["block_table"]
+    pages = table[table >= 0].long()
+    for name in ("k_cache", "v_cache"):
+        plane = args[name]
+        bits = _NAN_BITS[plane.dtype][0]
+        fresh = torch.randn((pages.numel(), *plane.shape[1:]), generator=gen, device=DEV)
+        plane.view(bits)[pages] = fresh.to(plane.dtype).view(bits)
+
+
+def _replay_in_a_graph(args, spec, seed, launches, first) -> None:
+    """The decode site's capture: the call captured into a CUDA graph (its split-K partials
+    allocated from the graph's pool), the inputs refilled in place, the graph replayed.
+    The replay must take the eager call's launches (`first` is that call's output), answer
+    the new inputs within the band, and match an eager call on them bitwise."""
+    eager = [tuple(entry) for entry in launches]
+    del launches[:]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(**args)
+    assert [tuple(entry) for entry in launches] == eager, launches
+    _refill(args, spec, seed)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()
+    assert not torch.equal(replayed, first), "the replay did not read the refilled inputs"
+    _compare(replayed, op.reference(**args))
+    assert torch.equal(replayed, op(**args)), "the replay differs from an eager call"
+
+
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
 def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     certifying(op)
@@ -255,6 +311,14 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     args = _build(spec, seed=sum(map(ord, cell.why)))
     rows = args["q"].shape[0]
     assert rows == spec.get("rows", rows)
+    if "row_heads" in spec:
+        # q, and the gate when fused, are views of one fused row `row_heads` heads wide.
+        q = args["q"]
+        assert q.stride(0) == spec["row_heads"] * spec["head_dim"]
+        if "output_gate" in args:
+            gate = args["output_gate"]
+            assert gate.stride(0) == q.stride(0)
+            assert gate.untyped_storage().data_ptr() == q.untyped_storage().data_ptr()
     if "rows_per_request" in spec:
         assert {n for _, n in spec["segments"]} == {spec["rows_per_request"]}
     if "offset_edge" in spec:
@@ -270,11 +334,19 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
     out = op(**args)
     assert [name for name, _, _ in launches] == list(spec["launches"])
     assert launches[0][1][:2] == (rows, spec["kv_heads"])
+    if "splits" in spec:
+        assert launches[0][1][2] == spec["splits"], launches
     assert all(pdl == spec.get("pdl", False) for _, _, pdl in launches), launches
+    if "output_gate" in args:
+        gated = (args["q"], args["k_cache"], args["selected_tokens"], args["output_gate"])
+        assert op.fuses_output_gate(*gated)
     assert out.shape == (rows, spec["q_heads"], spec["head_dim"])
     assert out.dtype == args["q"].dtype and out.is_contiguous()
     assert not bool(out.isnan().any())
     _compare(out, op.reference(**args))
+    if spec.get("capture"):
+        seed = sum(map(ord, cell.why)) + 1
+        _replay_in_a_graph(args, spec, seed=seed, launches=launches, first=out)
 
 
 #: The first cell is this checkpoint's own decode geometry; the tests below

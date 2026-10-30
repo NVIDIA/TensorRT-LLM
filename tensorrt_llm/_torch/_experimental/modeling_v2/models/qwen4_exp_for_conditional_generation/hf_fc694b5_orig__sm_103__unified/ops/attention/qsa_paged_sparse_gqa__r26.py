@@ -78,11 +78,16 @@ _OFFSET_EDGE = 2**31
 #: 516 at MTP's 16384.
 _TP4 = dict(q_heads=6, kv_heads=1, slots=128, pages=292, **_TRUNK)
 _TP4_MTP = dict(_TP4, pages=516)
-#: One dep4 rank (attention DP): tp1's 24 / 2 heads, a 32-row table (128 requests over 4
-#: ranks), the kv_fp8 variant's e4m3 pool.
-_DEP4_FP8 = dict(
-    q_heads=24, kv_heads=2, slots=32, pages=292, cache_dtype=torch.float8_e4m3fn, **_TRUNK
-)
+#: One dep4 rank (attention DP): tp1's 24 / 2 heads and a 32-row table (128 requests over 4
+#: ranks); core's bf16 pool, or the kv_fp8 variant's e4m3 pool.
+_DEP4 = dict(q_heads=24, kv_heads=2, slots=32, pages=292, **_TRUNK)
+_DEP4_FP8 = dict(_DEP4, **_FP8)
+
+#: q and the output gate off one rank's fused input projection row, `[q | k | v | gate |
+#: index q, k | pad]` in heads of 256 (tp1's `weights._attn_in_w`): 6 + 1 + 1 + 6 + 3 = 17
+#: heads (row stride 4352) at a tp4 / tep4 rank, 24 + 2 + 2 + 24 + 3 = 55 (14080) at dep4.
+_TP4_ROW = dict(q_layout="fused_row", gate="fused_row", row_heads=17)
+_DEP4_ROW = dict(q_layout="fused_row", gate="fused_row", row_heads=55)
 
 
 def _straddling(segments, kv_heads: int) -> int:
@@ -213,6 +218,67 @@ class QsaPagedSparseGqa(OpWrapper):
             "over an e4m3 pool, 8-way split-K + merge, [32, 292] table",
             spec=_unified(_spread(32, 1, 9215), _DEP4_FP8, _SPLIT_K),
         ),
+        # ---- the gated decode / verify site: q and the gate off the fused row ------
+        Cell(
+            why="tep4 gated decode 1 row in a CUDA graph: q and the gate off the 17-head "
+            "(4352-wide) fused row, 64-way split-K + gated merge with PDL, captured, refilled "
+            "and replayed",
+            spec=_unified(
+                _spread(1, 1, 9215), _TP4, _SPLIT_K, splits=64, pdl=True, capture=True, **_TP4_ROW
+            ),
+        ),
+        Cell(
+            why="tep4 gated decode 3 rows (PDL's 2..4-row branch): 64-way split-K + gated merge "
+            "with PDL, 17-head fused row",
+            spec=_unified(_spread(3, 1, 9215), _TP4, _SPLIT_K, splits=64, pdl=True, **_TP4_ROW),
+        ),
+        Cell(
+            why="tep4 gated decode 16 rows (the 5..31-row branch): 32-way split-K + gated merge, "
+            "17-head fused row",
+            spec=_unified(_spread(16, 1, 9215), _TP4, _SPLIT_K, splits=32, **_TP4_ROW),
+        ),
+        Cell(
+            why="tep4 gated decode 128 x 1 row in a CUDA graph (the largest captured batch): "
+            "8-way split-K + gated merge, 17-head fused row, captured, refilled and replayed",
+            spec=_unified(
+                _spread(128, 1, 9215), _TP4, _SPLIT_K, splits=8, capture=True, **_TP4_ROW
+            ),
+        ),
+        Cell(
+            why="tep4 MTP3 gated verify 128 x 4 rows = 512 (the 257..512-row branch): 4-way "
+            "split-K + gated merge, [128, 516] table, rows to position 16383, 17-head fused row",
+            spec=_unified(
+                _spread(128, 4, 16380),
+                _TP4_MTP,
+                _SPLIT_K,
+                splits=4,
+                rows_per_request=4,
+                **_TP4_ROW,
+            ),
+        ),
+        Cell(
+            why="dep4 core gated decode 32 x 1 row: 24 q / 2 kv heads over a bf16 pool, q and "
+            "the gate off the 55-head (14080-wide) fused row, 8-way split-K + gated merge",
+            spec=_unified(_spread(32, 1, 9215), _DEP4, _SPLIT_K, splits=8, **_DEP4_ROW),
+        ),
+        Cell(
+            why="dep4 kv_fp8 context 8192 rows from position 0 with the prefill pair: 24 q / 2 "
+            "kv heads over an e4m3 pool on the prefill kernel, [32, 292] table",
+            spec=_unified(((0, 8192),), _DEP4_FP8, _PREFILL, prefill_pair=True),
+        ),
+        Cell(
+            why="tep4 8192-row context step (max_num_tokens) with the prefill pair, q off the "
+            "17-head fused row: a context request 0..8064 and 127 generation rows to position "
+            "9215, all on the prefill kernel",
+            spec=_unified(
+                ((0, 8065),) + _spread(127, 1, 9215),
+                _TP4,
+                _PREFILL,
+                prefill_pair=True,
+                q_layout="fused_row",
+                row_heads=17,
+            ),
+        ),
     )
 
     note = """
@@ -269,21 +335,62 @@ class QsaPagedSparseGqa(OpWrapper):
     `[32, 292]` tables, with pools whose mapped pages straddle 2^31 elements of
     the K and V planes: both kernels widen the page id to int64 before its
     stride product. Measured against `reference` on GB300 over the five
-    cells: at most 2.00 bf16 ulp of the row scale (p99.9 1.31), relative RMS
-    at most 0.572 ulp, cosine at least 0.9999975.
+    ungated cells: at most 2.00 bf16 ulp of the row scale (p99.9 1.31),
+    relative RMS at most 0.572 ulp, cosine at least 0.9999975.
 
-    Not certified: capture in a CUDA graph (the split-K path allocates its
-    partials inside the call); head geometries other than 24/2 and 6/1 x 256;
-    `tokens_per_block` other than 32; more than 8192 rows; the output gate at
-    6/1 heads (the gate is certified at 24/2 only, in the merge of a 4-way
-    split); q off the fused projection row at tp4's 17-head (4352-wide) row;
-    an fp8 pool on the prefill kernel at 24/2 beyond 272 rows, and at 6/1;
-    rows whose selection resolves no token (all padding, a foreign request,
-    unmapped pages); an fp16 pool or q; standalone contiguous K/V buffers;
-    int64 request indices; a measured dep4 pool page count (its cell's pool
-    is sized to straddle 2^31 elements, not to an engine's allocation).
-    Hard limits: not probed; the largest certified extent is 8192 rows x 2051
-    selected tokens, a [128, 516] table and a 33167-page trunk pool.
+    The gated decode and verify site. q and the output gate are views of one
+    rank's fused input projection row (`row_heads`): 17 heads of 256 at tp4 /
+    tep4 (q heads 0..5, the gate 8..13, row stride 4352), 55 at dep4 (q 0..23,
+    the gate 28..51, 14080). `q_stride_row` is a Triton constexpr, so each row
+    width compiles its own kernels. Cells assert their split count, so every
+    6/1 launch branch with a merge carries the gate: 64-way split with PDL at
+    1 and 3 rows, 32-way at 16, 8-way at 128 (core decode), 4-way at 512 (MTP3
+    verify, 128 x 4 rows to position 16383). dep4's core decode runs it at
+    24/2 over a bf16 pool (8-way, 32 rows).
+    The 1-row and 128-row cells are captured in a CUDA graph. The split-K partials
+    are then allocated from the graph's pool. The test refills q, the gate, the
+    selection and every mapped page's K/V in place and replays. The replay takes the
+    eager call's launches (PDL included), answers the new inputs within the
+    band and matches an eager call on them bitwise.
+    A gated output is rounded twice (the attention, then the gated
+    product), each at most one bf16 ulp of the value rounded, so its element
+    error is bounded near the band's 4 ulp rather than 2. Measured against
+    `reference` over 10 seeds of each of the seven gated cells (tp1's
+    included): at most 3.32 ulp of the row scale and 0.667 ulp relative RMS;
+    the same calls ungated at most 2.00. Wrong variants, max element / RMS
+    ulp over the eight new cells (the gate's over the six gated ones): gate
+    not applied at least 207.8 / 132.7, gate read one head early at least
+    234.8 / 136.4, table shifted a page at least 362.8 / 295.9, softmax
+    scale dropped at least 260.5 / 215.1, one selected token dropped a row
+    3.82 / 2.89 at 1 row (refused on RMS) and at least 79.1 / 47.5
+    elsewhere.
+    Context rows: dep4's kv_fp8 context step runs
+    8192 rows from position 0 on the prefill kernel over an e4m3 pool, and
+    tep4's 8192-row step (max_num_tokens) with q off the 17-head row. Both measured at most
+    2.00 ulp (p99.9 1.29) and 0.573 ulp RMS.
+
+    Pool page count. `NUM_CACHE_PAGES` is a constexpr that only bounds the
+    page id (`physical_pages < NUM_CACHE_PAGES`). The cells' pools straddle
+    2^31 elements at sizes a normal cell holds (5592 to 33167 pages). The
+    engines' K/V views hold more: 257109 pages (tep4 bf16), 119680 (dep4 bf16)
+    and 171362 (dep4 kv_fp8). As trunk pools those are 94.2, 87.7 and 62.8 GiB,
+    past a normal cell. Probed once at those exact counts (tep4's 1-row gated
+    decode, dep4's gated decode and its fp8 context, the mapped pages at up to
+    6.7e10 elements), each matched its cell's numbers; no cell carries them.
+
+    Not certified: head geometries other than 24/2 and 6/1 x 256;
+    `tokens_per_block` other than 32; more than 8192 rows; capture of the
+    one-split launch (the 1024-row MTP7 verify, which allocates only its
+    output), of the 512-row MTP3 verify and of the prefill kernel; dep4's
+    gated decode below 16 rows (its 64- and 32-way splits at 24/2); an fp8
+    pool at 6/1 (no tp4 / tep4 member stores one) and on the prefill kernel
+    with q off the 55-head row (the fp8 context cell reads the packed
+    `[q | k | v]` slice); positions past 16383 (the tune's max_seq_len
+    262144); rows whose selection resolves no token (all padding, a foreign
+    request, unmapped pages); an fp16 pool or q; standalone contiguous K/V
+    buffers; int64 request indices. Hard limits: not probed; the largest
+    certified extent is 8192 rows x 2051 selected tokens, a [128, 516] table
+    and a 33167-page trunk pool.
     """
 
     def __call__(
