@@ -334,15 +334,25 @@ def test_copy_over_hard_link_keeps_source(build_wheel_module, tmp_path):
     installed.write_bytes(b"patched\n")  # an in-place edit, as patchelf does
     assert build_output.read_bytes() == b"built\n"
 
-    # A folder synced with hard links, then synced again as copies
+    # A folder synced with hard links, then synced again as copies. In between,
+    # the symlink alias.so moves to a file with the same size and mtime.
     src, dst = tmp_path / "build", tmp_path / "pkg"
     src.mkdir()
-    (src / "lib.so").write_bytes(b"built\n")
+    aged = time.time() - 3600
+    for name, data in (("lib.so", b"built\n"), ("old.so", b"old-v1\n"), ("new.so", b"new-v2\n")):
+        (src / name).write_bytes(data)
+        os.utime(src / name, (aged, aged))
+    (src / "alias.so").symlink_to("old.so")
     build_wheel_module.sync_tree(src, dst, hard_link=True)
     assert os.path.samefile(dst / "lib.so", src / "lib.so")
+    (src / "alias.so").unlink()
+    (src / "alias.so").symlink_to("new.so")
     build_wheel_module.sync_tree(src, dst, hard_link=False)
-    (dst / "lib.so").write_bytes(b"patched\n")
+    for name in ("lib.so", "alias.so"):
+        assert (dst / name).read_bytes() == (src / name).read_bytes()
+        (dst / name).write_bytes(b"patched\n")
     assert (src / "lib.so").read_bytes() == b"built\n"
+    assert (src / "old.so").read_bytes() == b"old-v1\n"
 
 
 @pytest.mark.parametrize(

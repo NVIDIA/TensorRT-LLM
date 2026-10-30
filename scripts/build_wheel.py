@@ -786,8 +786,10 @@ def sync_tree(src: Path,
                 # Trust the match only once the source mtime has aged past the
                 # race window; a just-written source can be rewritten again
                 # without the mtime moving, which would strand a stale copy.
-                # With hard links, a matching copy is replaced by a link.
-                if (not hard_link and not same_inode
+                # With hard links, a matching copy is replaced by a link. A copy
+                # must have no other links: one left by an earlier hard-link
+                # sync shares its inode with some build output.
+                if (not hard_link and dst_stat.st_nlink == 1
                         and src_stat.st_size == dst_stat.st_size
                         and abs(src_stat.st_mtime - dst_stat.st_mtime) < 1e-3
                         and src_stat.st_mtime <= now - _MTIME_RACE_WINDOW):
