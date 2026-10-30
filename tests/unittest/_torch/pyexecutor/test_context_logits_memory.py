@@ -77,16 +77,16 @@ def test_storage_oom_and_chunk_output_oom(monkeypatch, host) -> None:
     expected = (hidden @ head.weight.t()).float()
     workspace = head.context_logits_workspace
     original_empty = torch.empty
+
+    def fail_storage(shape, *args, **kwargs):
+        if (
+            tuple(shape) == (95, 1, head.num_embeddings)
+            and torch.device(kwargs.get("device", "cpu")).type == "cuda"
+        ):
+            raise torch.OutOfMemoryError("injected context storage failure")
+        return original_empty(shape, *args, **kwargs)
+
     if host:
-
-        def fail_storage(shape, *args, **kwargs):
-            if (
-                tuple(shape) == (95, 1, head.num_embeddings)
-                and torch.device(kwargs.get("device", "cpu")).type == "cuda"
-            ):
-                raise torch.OutOfMemoryError("injected context storage failure")
-            return original_empty(shape, *args, **kwargs)
-
         monkeypatch.setattr(torch, "empty", fail_storage)
     attempts = []
 
@@ -114,8 +114,11 @@ def test_storage_oom_and_chunk_output_oom(monkeypatch, host) -> None:
     receiver = PyResult(
         prompt_len=95, max_new_tokens=2, return_context_logits=True, use_device_memory=True
     )
-    receiver.apply_diff(request.py_result.get_diff())
-    assert receiver.context_logits.device.type == ("cpu" if host else "cuda")
+    diff = request.py_result.get_diff()
+    assert diff.context_logits_on_cpu is host
+    monkeypatch.setattr(torch, "empty", fail_storage)
+    receiver.apply_diff(diff)
+    assert receiver.context_logits.device.type == "cpu"
     torch.testing.assert_close(receiver.context_logits.cpu(), expected.cpu())
 
 
@@ -139,20 +142,22 @@ def test_mixed_prefill_selects_only_requested_rows() -> None:
 
 @torch.inference_mode()
 def test_prompt_reduction_oom_falls_back_to_cpu(monkeypatch) -> None:
-    logits = torch.randn(7, 97, device="cuda")
-    expected = compute_prompt_logprobs(3, logits.cpu(), list(range(7))).prompt
+    # One row beyond the 16 MiB FP32 reduction chunk.
+    logits = torch.randn(17, 262144, device="cuda")
+    tokens = [11 + 7 * index for index in range(17)]
     original = torch.nn.functional.log_softmax
-    devices = []
+    expected = original(logits.cpu(), dim=-1)[torch.arange(17), tokens].tolist()
+    calls = []
 
     def fail_cuda(input, *args, **kwargs):
-        devices.append(input.device.type)
+        calls.append((input.device.type, input.shape[0]))
         if input.is_cuda:
             raise torch.OutOfMemoryError("injected reduction allocation failure")
         return original(input, *args, **kwargs)
 
     monkeypatch.setattr(torch.nn.functional, "log_softmax", fail_cuda)
-    result = compute_prompt_logprobs(3, logits, list(range(7)))
-    assert devices == ["cuda", "cpu"]
+    result = compute_prompt_logprobs(0, logits, tokens, True)
+    assert calls == [("cuda", 16), ("cpu", 16), ("cuda", 1), ("cpu", 1)]
     assert_logprobs_equal(result.prompt, expected)
 
 
@@ -173,13 +178,30 @@ def make_model_and_mapping() -> tuple[torch.nn.Module, SimpleNamespace]:
 
 @pytest.mark.parametrize("legacy_first", [False, True])
 @torch.inference_mode()
-def test_prompt_logprobs_survive_batch_dependent_projection_switch(legacy_first: bool) -> None:
+def test_prompt_logprobs_survive_batch_dependent_projection_switch(
+    monkeypatch, legacy_first: bool
+) -> None:
     from tensorrt_llm._torch.modules.context_logits import context_logits_scope
     from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
     from tensorrt_llm.executor.base_worker import _compute_pytorch_prompt_logprobs
 
+    # Compare chunk boundaries with full FP32 accumulation on every GEMM shape.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     model, mapping = make_model_and_mapping()
     model.lm_head.prepare_context_logits_workspace()
+    workspace = model.lm_head.context_logits_workspace
+    projected_rows = []
+    project = workspace.project
+
+    def fail_optional(rows):
+        raise torch.OutOfMemoryError("injected optional output failure")
+
+    def record_projection(head, hidden, buffers):
+        projected_rows.append(hidden.shape[0])
+        return project(head, hidden, buffers)
+
+    monkeypatch.setattr(workspace, "_allocate", fail_optional)
+    monkeypatch.setattr(workspace, "project", record_projection)
     request = make_request(91, 97, full=False, k=3)
     peer = make_request(1, 97, full=False)
     for item in (request, peer):
@@ -211,6 +233,7 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(legacy_first:
             True,
             context_logits_handled=handled,
         )
+    assert projected_rows == ([32, 22, 1] if legacy_first else [32, 5, 1])
     targets = request.get_tokens(0)[1:] + [13]
     expected = compute_prompt_logprobs(3, reference.cpu(), targets).prompt
     response = SimpleNamespace(
@@ -232,16 +255,52 @@ def test_prompt_logprobs_survive_batch_dependent_projection_switch(legacy_first:
     assert request.py_result._context_logits._storage is None
 
 
-@pytest.mark.parametrize("prepared", [False, True])
-def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(prepared: bool) -> None:
+@pytest.mark.parametrize("eligible", [False, True])
+def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(
+    monkeypatch, eligible: bool
+) -> None:
     from contextlib import nullcontext
     from unittest.mock import Mock
 
+    from transformers import Cohere2Config
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_cohere2 import Cohere2ForCausalLM
+    from tensorrt_llm._torch.modules.context_logits import (
+        context_logits_heads,
+        context_logits_scope,
+    )
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
 
     model, mapping = make_model_and_mapping()
-    if prepared:
-        model.lm_head.prepare_context_logits_workspace()
+    if not eligible:
+        config = Cohere2Config(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=0,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=8,
+            vocab_size=97,
+            logit_scale=0.5,
+            torch_dtype="float32",
+        )
+        model = Cohere2ForCausalLM(ModelConfig(pretrained_config=config)).cuda()
+        assert context_logits_heads(model, mapping, is_spec_decode=False) == ()
+    else:
+        assert context_logits_heads(model, mapping, is_spec_decode=False) == (model.lm_head,)
+    # Even a manually prepared head must not bypass model-level logit transforms.
+    model.lm_head.prepare_context_logits_workspace()
+    if not eligible:
+        hidden = torch.randn(3, 32, device="cuda", dtype=model.lm_head.weight.dtype)
+        monkeypatch.setattr(model.model, "forward", lambda **kwargs: hidden)
+        plan = ContextLogitsPlan(SimpleNamespace(context_requests=[make_request(3, 97)]))
+        with torch.inference_mode(), context_logits_scope(plan):
+            model.lm_head.weight.normal_()
+            logits = model(input_ids=None, return_context_logits=True)
+            expected = (hidden @ model.lm_head.weight.t()).float() * model.logit_scale
+        assert not plan.handled
+        torch.testing.assert_close(logits, expected)
     request = make_request(1, 97)
     batch = SimpleNamespace(
         context_requests=[request], num_context_requests=1, all_requests=lambda: [request]
@@ -304,7 +363,7 @@ def test_decoder_keeps_graph_replay_unless_bounded_projection_is_active(prepared
     )
     manager = SimpleNamespace(get_resource_manager=lambda kind: object())
     result = DecoderRunner._forward_decoder(runner, forward_inputs, manager, is_dummy=False)
-    bounded = prepared
+    bounded = eligible
     assert graphs.run.call_args.args[0] is (None if bounded else key)
     assert inputs.prepare_inputs.call_args.args[0] is (batch if bounded else promoted)
     assert inputs.prepare_inputs.call_args.args[7] is not bounded
