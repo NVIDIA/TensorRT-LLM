@@ -17,6 +17,7 @@ import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import fields, is_dataclass
+from functools import lru_cache, wraps
 from types import TracebackType
 from typing import Any, Iterable, Iterator, TypeVar
 
@@ -42,6 +43,16 @@ def is_nccl_window_tensor_scoped_module(module_type: type[torch.nn.Module]) -> b
     return getattr(module_type, _SCOPED_MODULE_MARKER, False)
 
 
+# Exact built-in scalar types cannot contain tensors. Subclasses still take the
+# generic path, including dataclass subclasses.
+_SCALAR_TYPES = frozenset((type(None), bool, int, float, complex, str, bytes))
+
+
+@lru_cache(maxsize=256)
+def _dataclass_field_names(cls: type) -> tuple[str, ...]:
+    return tuple(field.name for field in fields(cls))
+
+
 def _cuda_tensors(
     value: Any,
     tensors: list[torch.Tensor],
@@ -51,6 +62,8 @@ def _cuda_tensors(
     if isinstance(value, torch.Tensor):
         if value.is_cuda:
             tensors.append(value)
+        return
+    if type(value) in _SCALAR_TYPES:
         return
 
     if visited is None:
@@ -70,18 +83,65 @@ def _cuda_tensors(
     elif is_dataclass(value) and not isinstance(value, type):
         if not include_dataclasses:
             return
-        for field in fields(value):
+        value_type = type(value)
+        for name in _dataclass_field_names(value_type):
             # Computed metadata properties can require initialization or read CUDA values.
-            if isinstance(getattr(type(value), field.name, None), property):
+            if isinstance(getattr(value_type, name, None), property):
                 continue
             # ``init=False`` fields need not exist until the dataclass initializes them.
-            _cuda_tensors(getattr(value, field.name, None), tensors, visited, include_dataclasses)
+            _cuda_tensors(getattr(value, name, None), tensors, visited, include_dataclasses)
     elif isinstance(value, dict):
         for item in value.values():
-            _cuda_tensors(item, tensors, visited, include_dataclasses)
+            if type(item) not in _SCALAR_TYPES:
+                _cuda_tensors(item, tensors, visited, include_dataclasses)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _cuda_tensors(item, tensors, visited, include_dataclasses)
+            if type(item) not in _SCALAR_TYPES:
+                _cuda_tensors(item, tensors, visited, include_dataclasses)
+
+
+def _module_call_cuda_tensors(args: tuple, kwargs: dict[str, Any]) -> list[torch.Tensor]:
+    """Collect a module call's CUDA tensor inputs, excluding shared metadata.
+
+    Equivalent to ``_cuda_tensors((args, kwargs), tensors, include_dataclasses=False)``
+    with direct tensor arguments handled without recursion. Shared per-forward
+    metadata belongs to the enclosing scope, including when nested inside
+    activation containers.
+    """
+    tensors: list[torch.Tensor] = []
+    visited: set[int] | None = None
+    for container in (args, kwargs):
+        if visited is not None:
+            identity = id(container)
+            if identity in visited:
+                continue
+            visited.add(identity)
+        values = args if container is args else kwargs.values()
+        for value in values:
+            if type(value) is torch.Tensor:
+                if value.is_cuda:
+                    tensors.append(value)
+            elif type(value) not in _SCALAR_TYPES:
+                if visited is None:
+                    visited = {id(args), id(container)}
+                _cuda_tensors(value, tensors, visited, include_dataclasses=False)
+    return tensors
+
+
+def _output_cuda_tensors(value: Any, tensors: list[torch.Tensor]) -> None:
+    """Equivalent to ``_cuda_tensors(value, tensors)``; flat tensor tuples skip recursion."""
+    if type(value) is tuple or type(value) is list:
+        visited: set[int] | None = None
+        for item in value:
+            if type(item) is torch.Tensor:
+                if item.is_cuda:
+                    tensors.append(item)
+            elif type(item) not in _SCALAR_TYPES:
+                if visited is None:
+                    visited = {id(value)}
+                _cuda_tensors(item, tensors, visited)
+        return
+    _cuda_tensors(value, tensors)
 
 
 class _NCCLWindowTensorScope:
@@ -102,6 +162,15 @@ class _NCCLWindowTensorScope:
         self._outputs: list[torch.Tensor] = []
         self._entry_depth = 0
 
+    @classmethod
+    def _for_module_call(cls, args: tuple, kwargs: dict[str, Any]) -> "_NCCLWindowTensorScope":
+        """Scope one eager module call; its shared metadata stays with the enclosing scope."""
+        scope = cls.__new__(cls)
+        scope._inputs = _module_call_cuda_tensors(args, kwargs)
+        scope._outputs = []
+        scope._entry_depth = 0
+        return scope
+
     def __enter__(self) -> "_NCCLWindowTensorScope":
         if self._inputs:
             self._entry_depth = torch.ops.trtllm.begin_nccl_window_tensor_scope.tracked(
@@ -110,7 +179,7 @@ class _NCCLWindowTensorScope:
         return self
 
     def escape(self, outputs: Any) -> Any:
-        _cuda_tensors(outputs, self._outputs)
+        _output_cuda_tensors(outputs, self._outputs)
         return outputs
 
     def __exit__(
@@ -153,7 +222,7 @@ def install_module_nccl_window_tensor_scopes(
         def begin_scope(_module, args, kwargs, *, active_scopes=active_scopes):
             # Shared metadata belongs to the enclosing forward, including when
             # nested inside activation containers. Outputs still escape recursively.
-            scope = _NCCLWindowTensorScope((args, kwargs), include_dataclasses=False)
+            scope = _NCCLWindowTensorScope._for_module_call(args, kwargs)
             scope.__enter__()
             active_scopes.set((*active_scopes.get(), scope))
 
@@ -184,11 +253,46 @@ def install_module_nccl_window_tensor_scopes(
     return handles
 
 
+class _ForwardScopeHandle:
+    """Restore a forward replaced by :func:`install_eager_nccl_window_tensor_scopes`."""
+
+    def __init__(self, module: torch.nn.Module, previous: Any, wrapper: Any) -> None:
+        self._module = module
+        self._previous = previous
+        self._wrapper = wrapper
+
+    def remove(self) -> None:
+        module, self._module = self._module, None
+        if module is None or module.__dict__.get("forward") is not self._wrapper:
+            return
+        if self._previous is None:
+            del module.forward
+        else:
+            module.forward = self._previous
+
+
+def _install_forward_scope(module: torch.nn.Module) -> _ForwardScopeHandle:
+    # A per-instance forward keeps nn.Module calls on their hook-free fast path; eager
+    # decoder layers run once per layer per iteration.
+    previous = module.__dict__.get("forward")
+    forward = module.forward
+
+    @wraps(forward)
+    def forward_in_scope(*args: Any, **kwargs: Any) -> Any:
+        scope = _NCCLWindowTensorScope._for_module_call(args, kwargs)
+        with scope:
+            return scope.escape(forward(*args, **kwargs))
+
+    module.forward = forward_in_scope
+    return _ForwardScopeHandle(module, previous, forward_in_scope)
+
+
 def install_eager_nccl_window_tensor_scopes(
     model: torch.nn.Module,
-) -> list[torch.utils.hooks.RemovableHandle]:
+) -> list[_ForwardScopeHandle]:
     """Install eager model scopes without exposing Python hooks to Dynamo."""
-    modules = (
-        module for module in model.modules() if is_nccl_window_tensor_scoped_module(type(module))
-    )
-    return install_module_nccl_window_tensor_scopes(modules)
+    return [
+        _install_forward_scope(module)
+        for module in model.modules()
+        if is_nccl_window_tensor_scoped_module(type(module))
+    ]
