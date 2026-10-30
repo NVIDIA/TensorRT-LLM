@@ -319,7 +319,9 @@ class TestClaimModuleMemory:
 class TestNothingHappensWhenOff:
     """The monitor is off by default; loading a model must cost nothing."""
 
-    def test_claim_is_a_noop(self, monkeypatch):
+    def test_claim_only_takes_a_weak_reference(self, monkeypatch):
+        # Recorded even when off, so an on-demand report names the weights;
+        # but it must cost nothing and must not keep the model alive.
         from tensorrt_llm._torch.memory.monitor import tagging
 
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
@@ -329,9 +331,13 @@ class TestNothingHappensWhenOff:
             torch.cuda.memory, "_snapshot", lambda *a, **k: snapshots.append(1) or {"segments": []}
         )
 
-        assert tagging.claim_module_memory(torch.nn.Linear(4, 4), "WEIGHTS") is False
+        model = torch.nn.Linear(4, 4)
+        assert tagging.claim_module_memory(model, "WEIGHTS") is True
         assert snapshots == [], "a disabled monitor must not take an allocator snapshot"
-        assert tagging._claimed_modules == []
+        assert tagging.claimed_modules() == [model]
+        del model
+        assert tagging.claimed_modules() == []
+        tagging.clear_claims()
 
     def test_tag_does_not_touch_allocator_metadata(self, monkeypatch):
         from tensorrt_llm._torch.memory.monitor import tagging

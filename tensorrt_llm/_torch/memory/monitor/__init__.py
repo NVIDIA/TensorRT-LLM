@@ -352,8 +352,13 @@ def capture(
     record_baseline: bool = False,
     suggestion: str = "",
     startup_steps: bool = False,
+    force: bool = False,
 ) -> MonitorCapture | None:
     """Collect a snapshot, or ``None`` when the monitor is disabled.
+
+    ``force`` collects even then, for a report somebody asked for. Without
+    the monitor on during startup it has no startup steps or tags, but every
+    component, pool and the per-process total are still read.
 
     ``entries`` overrides what is collected; by default every available
     provider is read and the startup tags and claimed modules are resolved.
@@ -362,7 +367,7 @@ def capture(
     """
     if rank is None:
         rank = current_rank()
-    if not enabled(rank):
+    if not force and not enabled(rank):
         return None
     if not torch.cuda.is_available():
         return None
