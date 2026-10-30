@@ -80,13 +80,15 @@ CELLS_DEFAULT_WORLD = 4
 # with `cuda_graph_config.max_batch_size = 256` and the default list that is 35
 # graphs at [1..32, 64, 128, 256], all alive at once in one memory pool and
 # replayed interleaved as the served batch size moves. This op's input carries
-# every rank's rows, so its captured input is WORLD times that.
+# every rank's rows, so its captured input is WORLD times that. This target's
+# dep4 engine captures 1, 2, 4, 8, 16, 24 and 32 (max_batch_size 32), all
+# inside this list.
 GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(range(1, 33)) + (64, 128, 256)
 
-# Reduce-scatters inside one decode graph for this checkpoint: 30 layers with
-# `first_k_dense_replace = 1`, so 29 expert-parallel MoE calls, each followed
-# by one reduce-scatter of the four expert windows' partial outputs.
-SITES_PER_DECODE_GRAPH = 29
+# Reduce-scatters inside one decode graph for this checkpoint: all 48 layers
+# are MoE (no dense layer in config.json), so 48 attention-DP round trips per
+# step, each ending in one reduce-scatter of the expert windows' partial sums.
+SITES_PER_DECODE_GRAPH = 48
 
 # bf16 unit roundoff: the format carries 8 significand bits, so eps = 2^-8 and
 # a round-to-nearest step is off by at most 2^-9 of the running value. Used by
@@ -802,11 +804,11 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
 def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     """The decode graph this checkpoint captures, at all 35 batch sizes.
 
-    1015 captured reduce-scatters, one memory pool. The sites are independent —
-    each reads its own buffer and every one gets a distinct payload, so a site
-    that returned a neighbour's data would fail the bitwise gate. Two replay
-    orders rather than four: the per-order cost is 29x the single-site test's
-    and the axis this one adds is site count, not order.
+    1680 captured reduce-scatters (48 sites x 35 graphs), one memory pool. The
+    sites are independent — each reads its own buffer and every one gets a
+    distinct payload, so a site that returned a neighbour's data would fail the
+    bitwise gate. Two replay orders rather than four: the per-order cost is 48x
+    the single-site test's and the axis this one adds is site count, not order.
     """
     inputs, graphs, outputs = _capture_per_batch_size(sites=SITES_PER_DECODE_GRAPH, seed=21000)
     seed = 310000

@@ -67,7 +67,11 @@ class Reducescatter(OpWrapper):
         # maximum, gathered, run through this rank's 128- (dep4) or 256-expert
         # (dep2) window and reduce-scattered back at hidden 2560. Per-rank rows
         # span the decode capture share (dep4 [1..32], dep2 [1..64]) and one
-        # max_num_tokens prefill chunk.
+        # max_num_tokens prefill chunk. `round_trip` pads to
+        # max(all_rank_num_tokens): a decode graph to its captured batch (dep4
+        # captures 1, 2, 4, 8, 16, 24, 32), an eager step to any count up to
+        # 8192, so cells also sit between the capture batches and off every
+        # power of two.
         Cell(
             why="qwen4 dep4 decode: one padded row per rank, hidden 2560",
             spec=dict(world=4, rows_per_rank=1, trailing=(2560,), dtype=torch.bfloat16, sizes=None),
@@ -98,6 +102,46 @@ class Reducescatter(OpWrapper):
             why="qwen4 dep2 (disagg) prefill: one 8192-row max_num_tokens chunk per rank",
             spec=dict(
                 world=2, rows_per_rank=8192, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep4 decode graph at its second capture batch, 2 rows per rank",
+            spec=dict(world=4, rows_per_rank=2, trailing=(2560,), dtype=torch.bfloat16, sizes=None),
+        ),
+        Cell(
+            why="qwen4 dep4 decode graph at 24 rows per rank, a capture batch off the powers of two",
+            spec=dict(
+                world=4, rows_per_rank=24, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep4 eager step padded to 33 rows per rank, one past the largest capture",
+            spec=dict(
+                world=4, rows_per_rank=33, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep4 eager prefill padded to 1000 rows per rank, between 32 and 8192",
+            spec=dict(
+                world=4, rows_per_rank=1000, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep4 eager prefill at 4097 rows per rank, odd and one past 2^12",
+            spec=dict(
+                world=4, rows_per_rank=4097, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep2 (disagg) decode graph at 24 rows per rank",
+            spec=dict(
+                world=2, rows_per_rank=24, trailing=(2560,), dtype=torch.bfloat16, sizes=None
+            ),
+        ),
+        Cell(
+            why="qwen4 dep2 (disagg) eager prefill at 4097 rows per rank, odd and one past 2^12",
+            spec=dict(
+                world=2, rows_per_rank=4097, trailing=(2560,), dtype=torch.bfloat16, sizes=None
             ),
         ),
     )
