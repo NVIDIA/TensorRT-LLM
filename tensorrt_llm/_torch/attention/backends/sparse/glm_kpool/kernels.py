@@ -748,3 +748,66 @@ def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         triton.next_power_of_2(width),
     )
     return packed, lengths, nonempty
+
+
+@triton.jit
+def _merge_split_attention_kernel(
+    OUT,
+    LSE,
+    DST,
+    stride_out_row,
+    stride_out_head,
+    stride_lse_row,
+    stride_dst_tok,
+    stride_dst_head,
+    SPLITS: tl.constexpr,
+    DIM: tl.constexpr,
+):
+    tok = tl.program_id(0)
+    head = tl.program_id(1)
+    cols = tl.arange(0, DIM)
+    max_lse = float("-inf")
+    for s in range(SPLITS):
+        lse = tl.load(LSE + (tok * SPLITS + s) * stride_lse_row + head)
+        # A chunk without valid rows reports +inf (and a zero output).
+        lse = tl.where(lse == float("inf"), float("-inf"), lse)
+        max_lse = tl.maximum(max_lse, lse)
+    total = 0.0
+    acc = tl.zeros([DIM], dtype=tl.float32)
+    for s in range(SPLITS):
+        row = tok * SPLITS + s
+        lse = tl.load(LSE + row * stride_lse_row + head)
+        lse = tl.where(lse == float("inf"), float("-inf"), lse)
+        w = tl.where(max_lse == float("-inf"), 0.0, tl.exp(lse - max_lse))
+        part = tl.load(OUT + row * stride_out_row + head * stride_out_head + cols).to(tl.float32)
+        acc += w * part
+        total += w
+    acc = tl.where(total > 0.0, acc / total, 0.0)
+    tl.store(
+        DST + tok * stride_dst_tok + head * stride_dst_head + cols, acc.to(DST.dtype.element_ty)
+    )
+
+
+def merge_split_attention(
+    out: torch.Tensor, lse: torch.Tensor, num_tokens: int, splits: int, heads: int
+) -> torch.Tensor:
+    """Merge per-chunk attention ``[tokens * splits, H, D]`` by LSE into ``[tokens, heads, D]``.
+
+    ``lse`` is ``[tokens * splits, H]``; chunks without valid rows (LSE ``+inf``)
+    contribute nothing. Only the first ``heads`` query heads are merged.
+    """
+    dst = torch.empty((num_tokens, heads, out.shape[-1]), dtype=out.dtype, device=out.device)
+    if num_tokens:
+        _merge_split_attention_kernel[(num_tokens, heads)](
+            out,
+            lse,
+            dst,
+            out.stride(0),
+            out.stride(1),
+            lse.stride(0),
+            dst.stride(0),
+            dst.stride(1),
+            SPLITS=splits,
+            DIM=out.shape[-1],
+        )
+    return dst

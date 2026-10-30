@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import copy
 import re
+import weakref
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable
@@ -58,8 +59,9 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..pyexecutor.config_utils import unwrap_glm5_next_text_config
-from ..utils import AuxStreamType
+from ..utils import AuxStreamType, get_model_extra_attrs
 from .checkpoints.hf.glm5_next_weight_mapper import (
     Glm5NextHfWeightMapper,
     glm5_next_is_quantized,
@@ -83,6 +85,20 @@ LINEAR_ATTENTION = "linear_attention"
 SPARSE_ATTENTION = "deepseek_sparse_attention"
 DENSE_MLP = "dense"
 SPARSE_MLP = "sparse"
+
+
+def _register_graph_layer(
+    model_config: ModelConfig, registry: str, layer_idx: int, module: nn.Module
+) -> str:
+    """Register ``module`` under a unique key for breakable-CUDA-graph eager ops."""
+    layers = model_config.extra_attrs.setdefault(registry, {})
+    key = str(layer_idx)
+    suffix = 0
+    while key in layers:
+        key = f"{layer_idx}_{suffix}"
+        suffix += 1
+    layers[key] = weakref.ref(module)
+    return key
 
 
 @dataclass(frozen=True)
@@ -942,6 +958,7 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
         mapping: Mapping | None = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.ONESHOT,
         aux_stream: torch.cuda.Stream | None = None,
+        model_config: ModelConfig | None = None,
     ) -> None:
         del dtype  # the shared mixer is bf16 (fp32 gate parameters and pools)
         # The checkpoint's ``linear_attn_config`` does not name the gate rank:
@@ -961,6 +978,12 @@ class Glm5NextLinearAttention(KimiKDALinearAttention):
             allreduce_strategy=allreduce_strategy,
             aux_stream=aux_stream,
         )
+        # Join the shared mixer's breakable-CUDA-graph registry. model_config is
+        # not passed to the mixer itself, whose projections keep this module's
+        # quantization setup.
+        if model_config is not None:
+            self.layer_idx_str = _register_graph_layer(model_config, "kda_layers", layer_idx, self)
+            self.register_to_config = True
         # Preserve checkpoint FP32 gate parameters. MetaInitMode rejects detach
         # on meta tensors, so create empty FP32 parameters on that branch.
         for name in ("A_log", "dt_bias"):
@@ -1226,6 +1249,11 @@ class Glm5NextSparseAttention(nn.Module):
         )
         self.indexer = Glm5NextIndexer(
             config, layer_idx, mapping=mapping, model_config=model_config
+        )
+        self._graph_key = (
+            _register_graph_layer(model_config, "glm5_sparse_layers", layer_idx, self)
+            if model_config is not None
+            else None
         )
 
         # The production sparse-MLA backend, selected through the standard
@@ -1528,12 +1556,25 @@ class Glm5NextSparseAttention(nn.Module):
 
         Reuse the model's per-forward schedules and row cache across layers.
         Reduce the complete output once, including context/verify mixtures.
+        Inside a breakable prefill CUDA graph the phase split runs eagerly
+        between graph segments over the live rows of the padded batch.
         """
-        ctx = (
-            runtime_ctx
-            if runtime_ctx is not None
-            else build_glm5_next_runtime_context(attn_metadata)
-        )
+        if is_in_breakable_cuda_graph() and self._graph_key is not None:
+            out = hidden_states.new_empty((hidden_states.shape[0], self.hidden_size))
+            maybe_bcg_glm5_sparse_attention_inplace(hidden_states, self._graph_key, out)
+        else:
+            ctx = (
+                runtime_ctx
+                if runtime_ctx is not None
+                else build_glm5_next_runtime_context(attn_metadata)
+            )
+            out = self._forward_phases(hidden_states, ctx)
+        return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
+
+    def _forward_phases(
+        self, hidden_states: torch.Tensor, ctx: Glm5NextRuntimeContext
+    ) -> torch.Tensor:
+        """Run each batch phase and return the unreduced ``[tokens, hidden]`` output."""
         parts = []
         if ctx.num_contexts:
             parts.append(
@@ -1567,8 +1608,7 @@ class Glm5NextSparseAttention(nn.Module):
                     runtime_ctx=ctx,
                 )
             parts.append(out)
-        out = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
-        return out if self.tp_all_reduce is None else self.tp_all_reduce(out)
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
 
     def forward_verify(
         self,
@@ -1633,6 +1673,27 @@ class Glm5NextSparseAttention(nn.Module):
             request_ids=rows.request_ids,
             num_candidates=rows.num_candidates,
         )
+
+
+def glm5_sparse_attention_inplace(
+    hidden_states: torch.Tensor, layer_key: str, output: torch.Tensor
+) -> None:
+    """Run one sparse-attention layer's phases on the live rows into ``output``.
+
+    Rows past the live token count (CUDA-graph padding) are zeroed.
+    """
+    extra_attrs = get_model_extra_attrs()
+    metadata = extra_attrs["attention_metadata"]()
+    layer = extra_attrs["glm5_sparse_layers"][layer_key]()
+    num_tokens = metadata.num_tokens
+    out = layer._forward_phases(
+        hidden_states[:num_tokens], build_glm5_next_runtime_context(metadata)
+    )
+    output[:num_tokens].copy_(out)
+    output[num_tokens:].zero_()
+
+
+maybe_bcg_glm5_sparse_attention_inplace = eager_on_graph(glm5_sparse_attention_inplace)
 
 
 class Glm5NextGate(DeepseekV3Gate):
@@ -1889,6 +1950,7 @@ class Glm5NextDecoderLayer(DecoderLayer):
                 mapping=mapping,
                 allreduce_strategy=model_config.allreduce_strategy,
                 aux_stream=attention_aux_stream,
+                model_config=model_config,
             )
         else:
             self.self_attn = Glm5NextSparseAttention(
@@ -2034,6 +2096,10 @@ class Glm5NextModel(DecoderModel):
             raise ValueError("specify exactly one of input_ids or inputs_embeds")
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+        if attn_metadata.padded_num_tokens is not None and not is_in_breakable_cuda_graph():
+            # Eager passes over a CUDA-graph-padded batch run only the live rows;
+            # the speculative wrapper trims the output to the same rows.
+            inputs_embeds = inputs_embeds[: attn_metadata.num_tokens]
         if runtime_ctx is None:
             runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
         # Only the decoder stack: under one-model MTP the speculative base

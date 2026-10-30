@@ -1209,6 +1209,7 @@ def test_mixed_batches_keep_one_full_batch_moe_call(
                 create_autospec(implementation, side_effect=attend),
             )
         attention.forward = MethodType(Glm5NextSparseAttention.forward, attention)
+        attention._forward_phases = MethodType(Glm5NextSparseAttention._forward_phases, attention)
         connection = SimpleNamespace(
             pre_mapping=lambda streams: (None, None, streams.mean(dim=1)),
             post_mapping=lambda output, residual, post, comb: residual + output.unsqueeze(1),
@@ -1297,6 +1298,7 @@ def test_packed_attention_splits_phases_and_reduces_once(generation_phase, reduc
         forward_verify=Mock(return_value=gen),
         tp_all_reduce=reduction,
     )
+    attention._forward_phases = MethodType(Glm5NextSparseAttention._forward_phases, attention)
     metadata = SimpleNamespace()
     context = Glm5NextRuntimeContext(
         num_contexts=1,
@@ -1343,3 +1345,43 @@ def test_indexer_topk_without_cute_dsl(monkeypatch: pytest.MonkeyPatch) -> None:
         expected = torch.arange(max(0, count - indexer.select_k), count, dtype=torch.int32)
         assert torch.equal(valid, expected)
         assert int((selected[row] == -1).sum()) == indexer.select_k - min(count, indexer.select_k)
+
+
+@pytest.mark.cpu_only
+def test_breakable_graph_registry_keys_are_unique():
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+
+    model_config = SimpleNamespace(extra_attrs={})
+    first, second = torch.nn.Linear(1, 1), torch.nn.Linear(1, 1)
+    keys = [
+        glm._register_graph_layer(model_config, "glm5_sparse_layers", 3, module)
+        for module in (first, second)
+    ]
+    layers = model_config.extra_attrs["glm5_sparse_layers"]
+    assert keys == ["3", "3_0"]
+    assert layers["3"]() is first and layers["3_0"]() is second
+
+
+@pytest.mark.cpu_only
+def test_sparse_attention_graph_op_fills_live_rows_and_zeros_padding(monkeypatch):
+    from tensorrt_llm._torch.models import modeling_glm5_next as glm
+    from tensorrt_llm._torch.utils import model_extra_attrs
+
+    class _Layer:
+        def _forward_phases(self, hidden_states, ctx):
+            assert ctx == "ctx" and hidden_states.shape[0] == 3
+            return hidden_states * 2
+
+    layer = _Layer()
+    metadata = SimpleNamespace(num_tokens=3)
+    monkeypatch.setattr(glm, "build_glm5_next_runtime_context", lambda m: "ctx")
+    hidden = torch.arange(20, dtype=torch.float32).view(5, 4)
+    output = torch.full((5, 4), float("nan"))
+    attrs = {
+        "attention_metadata": lambda: metadata,
+        "glm5_sparse_layers": {"7": lambda: layer},
+    }
+    with model_extra_attrs(attrs):
+        glm.glm5_sparse_attention_inplace(hidden, "7", output)
+    torch.testing.assert_close(output[:3], hidden[:3] * 2)
+    assert torch.equal(output[3:], torch.zeros(2, 4))
