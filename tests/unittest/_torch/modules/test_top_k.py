@@ -13,6 +13,47 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from tensorrt_llm._torch.modules.top_k import _CUTE_DSL_PREFILL_COPY_BITS, TopK, TopKImplementation
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("is_prefill", [False, True])
+@pytest.mark.parametrize("implementation", list(TopKImplementation))
+@pytest.mark.parametrize(
+    "deterministic_env", ["FORCE_DETERMINISTIC", "FORCE_TOPK_KERNEL_DETERMINISTIC"]
+)
+def test_deterministic_topk_repeats_tied_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    is_prefill: bool,
+    implementation: TopKImplementation,
+    deterministic_env: str,
+) -> None:
+    monkeypatch.delenv("FORCE_DETERMINISTIC", raising=False)
+    monkeypatch.delenv("FORCE_TOPK_KERNEL_DETERMINISTIC", raising=False)
+    monkeypatch.setenv(deterministic_env, "1")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    scores = torch.randn(3, 2048, generator=generator, device="cuda").round()
+    output = torch.empty(3, 512, dtype=torch.int32, device="cuda")
+    lengths = torch.tensor([2048, 3, 0], dtype=torch.int32, device="cuda")
+    top_k = TopK(
+        512,
+        prefill_implementation=implementation,
+        decode_implementation=implementation,
+        compress_ratio=4,
+    )
+    kwargs = dict(
+        is_prefill=is_prefill,
+        row_starts=torch.zeros_like(lengths),
+        row_ends=lengths,
+        sequence_lengths=lengths * 4,
+        scan_lengths=lengths,
+    )
+    reference = top_k(scores, output, **kwargs).clone()
+    assert (reference >= 0).sum(dim=1).tolist() == [512, 3, 0]
+    selected_scores = scores[0, reference[0].long()].sort().values
+    torch.testing.assert_close(selected_scores, scores[0].topk(512).values.sort().values)
+    for _ in range(20):
+        actual = top_k(scores, output, **kwargs)
+        assert torch.equal(actual, reference)
+
+
 def test_prefill_torch_masks_dirty_scores_and_pads_output() -> None:
     scores = torch.tensor(
         [

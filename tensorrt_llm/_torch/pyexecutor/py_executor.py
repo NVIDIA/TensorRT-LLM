@@ -462,6 +462,8 @@ class PyExecutor:
     # The model's executor events (RuntimeHooks.executor_events); read once at
     # construction.
     _executor_events: Optional[ExecutorEvents] = None
+    # Whether the KV cache manager is a KVCacheManagerV2; set at construction.
+    _is_kv_manager_v2 = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.
@@ -3398,19 +3400,21 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
-                    self._maybe_record_hang_diagnostic_phase(
-                        "preparing_resources", scheduled_batch)
-                    self.resource_manager.prepare_resources(scheduled_batch)
-
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
                         key=lambda req: int(req.py_batch_idx is not None),
                     )
+
+                    self._maybe_record_hang_diagnostic_phase(
+                        "preparing_resources", scheduled_batch)
+                    self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -6335,6 +6339,18 @@ class PyExecutor:
 
                     self._handle_dynamic_draft_len(scheduled_batch)
 
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    # Sort before preparing resources, so the resource managers see
+                    # the requests in the order the forward runs them.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
                     self._maybe_record_hang_diagnostic_phase(
                         "preparing_resources", scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
@@ -6363,17 +6379,6 @@ class PyExecutor:
                 # and let the later iteration to update it.
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
-
-                    # The generation requests that do not have batch_idx
-                    # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
-
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
@@ -6706,10 +6711,12 @@ class PyExecutor:
         for resource_type, required_blocks, primary_capacity in (
                 self.resource_manager.get_request_kv_block_budgets(request)):
             if required_blocks > primary_capacity:
+                # The capacity is of the pool the budget checks: the GPU primary
+                # pool, or with sparse KV cache offload the host history pool.
                 raise ValueError(
                     f"{resource_type.value} requires {required_blocks} KV cache "
                     f"blocks to complete the request, which exceeds its "
-                    f"GPU-primary capacity of {primary_capacity} blocks "
+                    f"capacity of {primary_capacity} blocks "
                     f"(prompt_len={request.orig_prompt_len}, "
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
@@ -9042,6 +9049,11 @@ class PyExecutor:
             # before downstream operations use the outputs.
             if not self._loop_on_execution_stream:
                 torch.cuda.current_stream().wait_stream(self.execution_stream)
+
+            if self._is_kv_manager_v2:
+                self.kv_cache_manager.update_forward_resources(
+                    scheduled_requests,
+                    wait_for_input_copy=self._wait_for_model_engine_input_copy)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:

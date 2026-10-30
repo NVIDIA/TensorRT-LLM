@@ -1220,8 +1220,7 @@ BatchRow Batch::addKvCache(KvCache& kvCache, std::optional<BatchRow> requestedRo
     else
     {
         row = *requestedRow;
-        TLLM_CHECK_WITH_INFO(
-            row != kNoBatchRow && row < mMaxBatchSize, "Batch::addKvCache: row is beyond max_batch_size");
+        TLLM_CHECK_WITH_INFO(row >= 0 && row < mMaxBatchSize, "Batch::addKvCache: row is beyond max_batch_size");
         if (mRows[row] != nullptr)
         {
             throw LogicError("Batch::addKvCache: row is already occupied");

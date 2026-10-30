@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _estimate_full_attn_size_per_token,
     _estimate_swa_cache_size,
     _fill_kv_pages,
+    get_scratch_entry,
 )
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.bindings import DataType
@@ -789,10 +790,12 @@ class CSA2CacheManager(KVCacheManagerV2):
         pool_id = self.layer_to_pool_mapping_dict[layer_id]
         cache = self.kv_cache_map[request_id]
         converter = self._get_page_index_converter(layer_id, role.role)
+        scratch_range, scratch_slots = get_scratch_entry(cache, pool_id) or (None, ())
         return converter(
             cache.get_base_page_indices(pool_id).tolist(),
             role.index_mode,
-            cache.get_scratch_desc(pool_id),
+            scratch_range,
+            scratch_slots,
         )
 
     def compute_batch_page_tables(self, request_ids, num_contexts) -> None:
@@ -856,17 +859,17 @@ class CSA2CacheManager(KVCacheManagerV2):
         if not holders:
             return None
         descs = [
-            (index, row, desc)
+            (index, row, entry)
             for row, cache in holders
             for index, pool in enumerate(self._scratch_pools.tolist())
-            if (desc := cache.get_scratch_desc(pool))
+            if (entry := get_scratch_entry(cache, pool))
         ]
         ranges = np.zeros((len(self._scratch_pools), len(request_ids), 2), dtype=np.int32)
-        width = max((len(desc.slot_ids) for _, _, desc in descs), default=1)
+        width = max((len(slot_ids) for _, _, (_, slot_ids) in descs), default=1)
         slots = np.zeros((len(self._scratch_pools), len(request_ids), width), dtype=np.int32)
-        for index, row, desc in descs:
-            ranges[index, row] = (desc.range.beg, desc.range.end)
-            slots[index, row, : len(desc.slot_ids)] = desc.slot_ids
+        for index, row, (scratch_range, slot_ids) in descs:
+            ranges[index, row] = (scratch_range.beg, scratch_range.end)
+            slots[index, row, : len(slot_ids)] = slot_ids
         return ranges, slots
 
     def batch_page_table(self, spec, width: int) -> torch.Tensor:

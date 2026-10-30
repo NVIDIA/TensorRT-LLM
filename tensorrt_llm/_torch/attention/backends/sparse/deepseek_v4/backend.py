@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..offload import NVFP4_SCRATCH_TAIL_ROWS
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -43,25 +44,20 @@ from .params import DeepseekV4AttentionType, DeepSeekV4Params
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 
-# The trtllm-gen DSv4 dynamic sparse MLA FMHA can read its aux KV pool up to one KV tile
-# (tileSizeKv, 128 rows) past the rows named in the sparse indices. With FP8 KV the aux pool
-# is the whole compressed KV pool, so those reads stay inside it; with NVFP4 KV it is the
-# per-call FP8 scratch below, which is sized to the batch.
-_SPARSE_MLA_FMHA_KV_TILE_SIZE = 128
-
 
 def _alloc_nvfp4_compress_fp8_scratch(
     num_rows: int, head_dim: int, device: torch.device
 ) -> torch.Tensor:
     """Allocate the FP8 scratch the sparse MLA FMHA reads as its aux KV pool.
 
-    Rows [0, num_rows) receive the dequantized compressed KV. A zeroed tail of one FMHA KV tile
-    keeps the kernel's reads past the last indexed row inside the allocation; without it the
-    FMHA faults whenever the caching allocator places the scratch at the end of a mapped
-    segment (https://nvbugs/6796296).
+    Rows [0, num_rows) receive the dequantized compressed KV. With FP8 KV the aux pool is the
+    whole compressed KV pool, so the FMHA's reads past the last indexed row stay inside it;
+    this per-call scratch is sized to the batch, so it carries the same zeroed tail of one
+    FMHA KV tile as the offload scratch (``NVFP4_SCRATCH_TAIL_ROWS``). Without it the FMHA
+    faults whenever the caching allocator places the scratch at the end of a mapped segment.
     """
     scratch = torch.empty(
-        (num_rows + _SPARSE_MLA_FMHA_KV_TILE_SIZE, head_dim),
+        (num_rows + NVFP4_SCRATCH_TAIL_ROWS, head_dim),
         dtype=torch.float8_e4m3fn,
         device=device,
     )
@@ -221,7 +217,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         sparse_args.sparse_attn_kv_lens = metadata.sparse_mla_topk_lens[self.compress_ratio][
             start_idx:end_idx
         ]
-        if self.compress_ratio > 1:
+        if self.compress_ratio == 4 and metadata.sparse_offload_state is not None:
+            descriptor = metadata.sparse_offload_state.layers[self.layer_idx]
+            sparse_args.aux_kv_cache_pool_ptr = descriptor.arena_base_addresses[
+                descriptor.data_buffer_index
+            ]
+        elif self.compress_ratio > 1:
             sparse_args.aux_kv_cache_pool_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
         else:
             sparse_args.aux_kv_cache_pool_ptr = None
@@ -305,7 +306,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             local_layer_idx, DeepseekV4AttentionType.SWA.value
         ]
 
-        active_request_count = None
+        sparse_state = None
+        sparse_index_kwargs = {}
         if self.compress_ratio > 1:
             compressed_buffer_ptr = metadata.compressed_buffer_ptrs[layer_idx]
             compress_pool_base_ptr = metadata.sparse_mla_base_ptrs[self.compress_ratio]
@@ -318,28 +320,45 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 topk_indices = sparse_backend_args.topk_indices
                 assert topk_indices is not None, "topk_indices is required when compress_ratio=4"
                 compressed_local_indices = topk_indices
-                # Metadata setup and prepare() validate the dtype and batch layout.
-                # Fresh prefill already uses the resident write table.
-                if (
-                    self.sparse_attention_config.enable_kv_cache_offload
-                    and attention_input_type == AttentionInputType.generation_only
-                ):
-                    state = metadata.sparse_offload_state
-                    assert state is not None, "Sparse offload metadata must be initialized"
-                    # module.forward_sparse_attn has joined both producer
-                    # streams. Keep fetch before the conversion kernel's
-                    # FMHA scheduler prologue on this consuming stream.
-                    block_table_compressed = kv_cache_manager.fetch_sparse_read_table(
-                        state,
-                        layer_idx,
-                        topk_indices,
-                        req_id,
-                        metadata.compressed_kv_lens_cuda[self.compress_ratio],
-                        block_table_compressed,
+                if self.sparse_attention_config.enable_kv_cache_offload:
+                    sparse_state = metadata.sparse_offload_state
+                    if (
+                        sparse_state is None
+                        or attention_input_type != AttentionInputType.generation_only
+                    ):
+                        raise NotImplementedError(
+                            "Sparse arena attention requires prepared decode metadata"
+                        )
+                    descriptor = sparse_state.layers[layer_idx]
+                    if sparse_state.write_layer != layer_idx:
+                        raise RuntimeError(
+                            "Prepare this layer's compressor writes before sparse attention"
+                        )
+                    compressed_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                        : metadata.num_seqs
+                    ]
+                    fetched = kv_cache_manager.fetch_sparse_indices(
+                        sparse_state, layer_idx, topk_indices, req_id, compressed_lengths
                     )
-                    # Metadata counts include CUDA graph dummy rows. The active
-                    # count is refreshed in place before replay to mask them.
-                    active_request_count = state.active_request_count
+                    data_index = descriptor.data_buffer_index
+                    # Read at the slot: buffers whose arena indices coincide share one
+                    # slice, and the slices no buffer maps to are never written.
+                    data_slot = sparse_state.out_slots[layer_idx][data_index]
+                    sparse_index_kwargs = dict(
+                        compressed_fetched_indices=fetched[:, data_slot, :],
+                        compressed_write_indices=sparse_state.write_indices[
+                            len(descriptor.buffer_ids)
+                        ][:, data_slot],
+                        compressed_history_lengths=sparse_state.history_lengths,
+                        compressed_lengths=compressed_lengths,
+                        compressed_batch_rows=sparse_state.batch_rows,
+                        active_request_count=sparse_state.active_request_count,
+                        compressed_coverage=sparse_state.coverage,
+                    )
+                    compress_pool_base_ptr = descriptor.arena_base_addresses[data_index]
+                    forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (
+                        compress_pool_base_ptr
+                    )
             else:
                 compressed_local_indices = metadata.compressed_local_indices_cuda[start_idx:end_idx]
         else:
@@ -404,8 +423,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
             **sched_kwargs,
             split_extra=self.use_fp8_ds_mla,
-            active_request_count=active_request_count,
-            mask_invalid_pages=active_request_count is not None,
+            mask_invalid_pages=sparse_state is not None,
+            **sparse_index_kwargs,
         )
 
         if self.use_fp8_ds_mla:
@@ -415,69 +434,90 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         if self._uses_nvfp4_compress and self.compress_ratio > 1:
             num_compressed_indices = metadata.max_compressed_indices[self.compress_ratio]
             compressed_indices = global_indices[:, -num_compressed_indices:].contiguous()
-            data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(self.compress_ratio)
-            num_pool_tokens = data_pool.numel() // (
-                (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
-            )
-            # The previous layer has already enqueued its attention on this stream.
-            # Release its Python reference before allocating the next scratch so
-            # the caching allocator can reuse the storage in stream order.
-            metadata.nvfp4_compress_fp8_scratch = None
-            if attention_input_type == AttentionInputType.generation_only:
-                num_scratch_rows = compressed_indices.numel()
-                scratch = _alloc_nvfp4_compress_fp8_scratch(
-                    num_scratch_rows, self.head_dim, global_indices.device
-                )
+            if sparse_state is not None:
+                if descriptor.scale_buffer_index is None or sparse_state.nvfp4_scratch is None:
+                    raise RuntimeError(
+                        "Sparse NVFP4 attention requires block scales and gather scratch"
+                    )
+                scratch = sparse_state.nvfp4_scratch[: compressed_indices.shape[0]]
+                data_pool, scale_pool = kv_cache_manager.get_sparse_compress_buffers(layer_idx)
+                # Paired arena geometry gives data and scales the same row indices.
+                # The existing gather replaces those indices with FP8 scratch indices.
                 torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
                     data_pool,
                     scale_pool,
                     compressed_indices,
-                    scratch[:num_scratch_rows].view(*compressed_indices.shape, self.head_dim),
+                    scratch,
                     self._nvfp4_compress_scale_quant_orig,
                     kv_cache_manager.nvfp4_residual_dim,
-                    num_pool_tokens,
+                    data_pool.shape[0],
                 )
             else:
-                request_count = (
-                    metadata.num_contexts
-                    if attention_input_type == AttentionInputType.context_only
-                    else metadata.num_seqs
+                data_pool, scale_pool = kv_cache_manager.get_compress_pool_buffers(
+                    self.compress_ratio
                 )
-                compressed_kv_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
-                    :request_count
-                ].contiguous()
-                total_raw_kv_tokens = int(metadata.host_total_kv_lens[0].item())
-                if attention_input_type == AttentionInputType.mixed:
-                    total_raw_kv_tokens += int(metadata.host_total_kv_lens[1].item())
-                # Sum(floor(kv_len / ratio)) <= floor(sum(kv_len) / ratio).
-                # The latter is a host-known upper bound for the logical-token
-                # compaction workspace and avoids a device synchronization.
-                max_compressed_kv_tokens = total_raw_kv_tokens // self.compress_ratio
-                # Dynamic sparse FMHA may prefetch a full fixed-width Top-K
-                # tile even when only a short prefix is valid. Match the DSA
-                # context gather contract by keeping at least one index row's
-                # width addressable in the scratch pool.
-                scratch_capacity = max(
-                    compressed_indices.shape[1],
-                    min(max_compressed_kv_tokens, compressed_indices.numel()),
+                num_pool_tokens = data_pool.numel() // (
+                    (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
                 )
-                scratch = _alloc_nvfp4_compress_fp8_scratch(
-                    scratch_capacity, self.head_dim, global_indices.device
-                )
-                if max_compressed_kv_tokens > 0:
-                    torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather_direct(
+                # The previous layer has already enqueued its attention on this stream.
+                # Release its Python reference before allocating the next scratch so
+                # the caching allocator can reuse the storage in stream order.
+                metadata.nvfp4_compress_fp8_scratch = None
+                if attention_input_type == AttentionInputType.generation_only:
+                    num_scratch_rows = compressed_indices.numel()
+                    scratch = _alloc_nvfp4_compress_fp8_scratch(
+                        num_scratch_rows, self.head_dim, global_indices.device
+                    )
+                    torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
                         data_pool,
                         scale_pool,
-                        compressed_local_indices.contiguous(),
-                        req_id.contiguous(),
-                        compressed_kv_lengths,
                         compressed_indices,
-                        scratch[:scratch_capacity].unsqueeze(1),
+                        scratch[:num_scratch_rows].view(*compressed_indices.shape, self.head_dim),
                         self._nvfp4_compress_scale_quant_orig,
                         kv_cache_manager.nvfp4_residual_dim,
-                        max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
+                else:
+                    request_count = (
+                        metadata.num_contexts
+                        if attention_input_type == AttentionInputType.context_only
+                        else metadata.num_seqs
+                    )
+                    compressed_kv_lengths = metadata.compressed_kv_lens_cuda[self.compress_ratio][
+                        :request_count
+                    ].contiguous()
+                    total_raw_kv_tokens = int(metadata.host_total_kv_lens[0].item())
+                    if attention_input_type == AttentionInputType.mixed:
+                        total_raw_kv_tokens += int(metadata.host_total_kv_lens[1].item())
+                    # Sum(floor(kv_len / ratio)) <= floor(sum(kv_len) / ratio).
+                    # The latter is a host-known upper bound for the logical-token
+                    # compaction workspace and avoids a device synchronization.
+                    max_compressed_kv_tokens = total_raw_kv_tokens // self.compress_ratio
+                    # Dynamic sparse FMHA may prefetch a full fixed-width Top-K
+                    # tile even when only a short prefix is valid. Match the DSA
+                    # context gather contract by keeping at least one index row's
+                    # width addressable in the scratch pool.
+                    scratch_capacity = max(
+                        compressed_indices.shape[1],
+                        min(max_compressed_kv_tokens, compressed_indices.numel()),
+                    )
+                    scratch = _alloc_nvfp4_compress_fp8_scratch(
+                        scratch_capacity, self.head_dim, global_indices.device
+                    )
+                    if max_compressed_kv_tokens > 0:
+                        torch.ops.trtllm.nvfp4_mla_context_kv_cache_gather_direct(
+                            data_pool,
+                            scale_pool,
+                            compressed_local_indices.contiguous(),
+                            req_id.contiguous(),
+                            compressed_kv_lengths,
+                            compressed_indices,
+                            scratch[:scratch_capacity].unsqueeze(1),
+                            self._nvfp4_compress_scale_quant_orig,
+                            kv_cache_manager.nvfp4_residual_dim,
+                            max_compressed_kv_tokens,
+                            num_pool_tokens,
+                        )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()

@@ -626,7 +626,7 @@ public:
             TLLM_CHECK_WITH_INFO(findIter != functions.end(), "Trtllm-gen kernels not found: " + info);
 
             auto const& kernelMeta = mKernelMeta[findIter->second.mMetaInfoIndex];
-            const CUfunction func = findIter->second.mDeviceFunction;
+            CUfunction const func = findIter->second.mDeviceFunction;
 
             // mGroupsHeadsQ, mGroupsTokensHeadsQ, and mNumInsts{Q,Kv} are part of the hashID, so the
             // matched cubin already agrees with the AutoTuner decision. Re-assign from kernelMeta
@@ -1215,6 +1215,12 @@ private:
         // Multi-CTA KV mode (bool -> enum conversion)
         options.mMultiCtasKvMode = params.mMultiCtasKvMode ? tensorrt_llm::kernels::MultiCtasKvMode::GmemReduction
                                                            : tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+        if (tensorrt_llm::common::getEnvForceDeterministicAttention())
+        {
+            // Keep one KV reduction partition even when the selector considers CGA reduction.
+            options.mMultiCtasKvMode = tensorrt_llm::kernels::MultiCtasKvMode::Disabled;
+            options.mMaxNumCtasPerSeqKv = 1;
+        }
         options.mStoresSoftmaxStats = true;
 
         // Attention features
@@ -1577,7 +1583,7 @@ class TllmFmhaKernelFactory
 public:
     using KernelType = TllmGenFmhaKernel;
 
-    KernelType* getKernels(const typename KernelType::KernelMeta* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
+    KernelType* getKernels(typename KernelType::KernelMeta const* pKernelList, unsigned int nbKernels, Data_type dtypeQ,
         Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut, unsigned int sm, int numEltsPerSageAttnBlkQ = 0,
         int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0, int numEltsPerSageAttnBlkV = 0,
         bool fusesDsv4InvRopeFp8Quant = false)
@@ -1650,7 +1656,7 @@ private:
             | (static_cast<uint64_t>(fusesDsv4InvRopeFp8Quant) << 44);
     }
 
-    std::unordered_map<uint64_t, const std::unique_ptr<KernelType>> mKernels;
+    std::unordered_map<uint64_t, std::unique_ptr<KernelType> const> mKernels;
 };
 
 inline TllmGenFmhaKernel* getTllmFmhaKernels(Data_type dtypeQ, Data_type dtypeK, Data_type dtypeV, Data_type dtypeOut,

@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.backends.fmha.prims_ts_sparse_mla import (
     PrimsTSSparseMlaFmha,
     get_prims_ts_toolchain_unsupported_reason,
 )
+from tensorrt_llm._torch.attention.backends.interface import AttentionInputType
 from tensorrt_llm._utils import get_sm_version
 
 from ..test_sparse_mla_forward import HAS_FLASH_MLA
@@ -215,6 +216,40 @@ def test_plans_are_shared_through_the_metadata_cache(monkeypatch) -> None:
     grown = metadata.fmha_plan_caches[PrimsTSSparseMlaFmha.WORKSPACE_CACHE_KEY]["buffer"]
     assert larger is not plan_a and planned[2][4] is grown and grown.numel() == 3072
     assert len(planned) == 3 and len(cache) == 3
+
+
+@pytest.mark.parametrize(
+    "compress_ratio, offload, offloaded_reason",
+    [(4, True, True), (4, False, False), (128, True, False)],
+)
+def test_offloaded_compressed_rows_stay_on_the_fallback(
+    compress_ratio, offload, offloaded_reason
+) -> None:
+    """Offloaded ratio-4 rows sit in the sparse cache arena, which the kernel cannot read."""
+
+    class _Attn:
+        pass
+
+    attn = _Attn()
+    attn.compress_ratio = compress_ratio
+    library = PrimsTSSparseMlaFmha(attn)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(swa_pool_ptr=0),
+        sparse_offload_state=object() if offload else None,
+        # Rejected by the next check, so a layer that passes the offload check stops there.
+        beam_width=2,
+    )
+    reason = library._unsupported_reason(
+        SimpleNamespace(device=torch.device("cuda"), ndim=2),
+        None,
+        None,
+        metadata,
+        SimpleNamespace(attention_input_type=AttentionInputType.generation_only),
+    )
+    if offloaded_reason:
+        assert "sparse cache arena" in reason
+    else:
+        assert reason == "beam search is not supported."
 
 
 @pytest.mark.parametrize("offload, heuristic_topk", [(True, False), (False, True)])

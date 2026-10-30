@@ -48,6 +48,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     Mapping,
 )
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
 
 class DummyRankInfo:
@@ -291,7 +292,9 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
         pool_group_index=0,
         num_slots=4,
         pools=[
-            SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
+            SimpleNamespace(
+                pool_index=pi, base_address=base, slot_bytes=sb, storage_medium=CacheTier.GPU_MEM
+            )
             for pi, sb in enumerate(slot_bytes_list)
         ],
         slot_desc=SimpleNamespace(
@@ -550,8 +553,12 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
         pool_group_index=0,
         num_slots=4,
         pools=[
-            SimpleNamespace(pool_index=0, base_address=0x10000, slot_bytes=256),
-            SimpleNamespace(pool_index=1, base_address=0x20000, slot_bytes=32),
+            SimpleNamespace(
+                pool_index=0, base_address=0x10000, slot_bytes=256, storage_medium=CacheTier.GPU_MEM
+            ),
+            SimpleNamespace(
+                pool_index=1, base_address=0x20000, slot_bytes=32, storage_medium=CacheTier.GPU_MEM
+            ),
         ],
         slot_desc=SimpleNamespace(
             variants=[
@@ -579,7 +586,11 @@ def _make_fake_v2_mamba_manager(*, ple_on_layer=1):
     attention_pg = SimpleNamespace(
         pool_group_index=1,
         num_slots=8,
-        pools=[SimpleNamespace(pool_index=0, base_address=0x30000, slot_bytes=128)],
+        pools=[
+            SimpleNamespace(
+                pool_index=0, base_address=0x30000, slot_bytes=128, storage_medium=CacheTier.GPU_MEM
+            )
+        ],
         slot_desc=SimpleNamespace(
             variants=[
                 SimpleNamespace(

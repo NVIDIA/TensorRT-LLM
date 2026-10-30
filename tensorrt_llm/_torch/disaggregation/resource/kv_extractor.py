@@ -46,7 +46,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
+from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier, DataRole
 
 # Mapper kinds a V2 manager may declare via get_disagg_role_mapper_kinds().
 # A physical pool may mix kinds (V2 storage coalesces buffers purely by
@@ -418,6 +418,11 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                         base_address=int(pool.base_address),
                         slot_bytes=int(pool.slot_bytes),
                         num_slots=int(pg_desc.num_slots),
+                        # A sparse pool of the GPU tier is host memory mapped into the
+                        # device address space; the pool, not its group, reports that.
+                        memory_type=(
+                            "VRAM" if pool.storage_medium == CacheTier.GPU_MEM else "DRAM"
+                        ),
                     )
                     for pool in pg_desc.pools
                 ]

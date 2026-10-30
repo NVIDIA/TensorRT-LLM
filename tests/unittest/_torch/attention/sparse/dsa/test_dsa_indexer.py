@@ -584,15 +584,20 @@ def test_shared_topk_lifecycle(monkeypatch):
 
     context_topk = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.int32)
     generation_topk = torch.tensor([[2, 1, 0], [3, 2, 1]], dtype=torch.int32)
+    # Offload off: sparse_attn_predict routes decode batches to the arena when it is on,
+    # which is a different path from the topk sharing under test.
+    sparse_params = SimpleNamespace(enable_kv_cache_offload=False)
     full_backend = SimpleNamespace(
         indexer=SimpleNamespace(
             forward_from_projected=Mock(side_effect=[context_topk, generation_topk])
         ),
         get_local_layer_idx=Mock(return_value=0),
+        sparse_params=sparse_params,
     )
     shared_backend = SimpleNamespace(
         indexer=None,
         get_local_layer_idx=Mock(return_value=1),
+        sparse_params=sparse_params,
     )
     # sparse_attn_predict dispatches the local->global remap through the
     # backend's own _remap_topk_to_global; bind the real method onto the stubs.
