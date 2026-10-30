@@ -531,6 +531,10 @@ class PyExecutor:
     _executor_events: Optional[ExecutorEvents] = None
     # Shutdown publication is leader-only, while join/finalize runs on every rank.
     shutdown_all_ranks = True
+    # Defaults for executors built without __init__ (test stubs); __init__ sets
+    # the real values.
+    _packed_sync_enabled = False
+    _stage_timing = False
 
     # Minimum number of async micro batches for async PP execution.
     # This is a trade-off between memory usage and performance.

@@ -19,6 +19,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -1327,7 +1328,11 @@ class DecoderWarmup:
         # these needs the chunk-aligned variant (the two base shapes cover
         # both alignments).
         # Rank-local capacity, so the gate is agreed like the phase entry above.
-        if self._agreement.agree_flag(capped_num_tokens >= 32):
+        # Only models with GDN layers run those kernels; the odd token counts
+        # would otherwise add forward passes (and padding variants of the
+        # breakable prefill graph) that no other hybrid model needs.
+        has_gdn = any(isinstance(m, Qwen3NextGatedDeltaNet) for m in self.model.modules())
+        if self._agreement.agree_flag(capped_num_tokens >= 32 and has_gdn):
             mamba_warmup_shapes += [
                 # Prefill %16!=0 family, HAS_DECODE=False.
                 (capped_num_tokens - 4, 0, False, False, False),

@@ -724,6 +724,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
 
+    def setup_aliases(self) -> None:
+        """Move ``in_proj_qkvz.weight`` into the fused projection buffer.
+
+        Done before any weight address is published, so the address stays
+        stable through ``cache_derived_state`` and later reloads.
+        """
+        self._refresh_fused_in_proj()
+
     def cache_derived_state(self) -> None:
         """Attach downstream static quantization state after loading weights."""
         self.norm.fp8_scale = None

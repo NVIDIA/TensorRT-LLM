@@ -236,6 +236,8 @@ class CUDAGraphRunner:
     multiple graphs, keyed by batch shape and execution-path specializations.
     """
     WARMUP_STEPS = 1
+    # Default for runners built without __init__ (test stubs).
+    _adp_graph_batch_hint: Optional[List[Tuple[bool, int, int]]] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
