@@ -29,6 +29,7 @@ from tensorrt_llm._torch.pyexecutor._util import (
     _create_kv_cache_manager,
     _derive_v2_layer_type_attention_windows,
     _get_num_pool_groups_for_estimation,
+    _get_num_storage_pool_groups,
     get_mla_context_workspace_kv_len_cap,
 )
 from tensorrt_llm._torch.pyexecutor.config_utils import get_layer_attention_window
@@ -37,6 +38,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
+    _get_generation_kv_capacity,
+    _get_kv_alloc_extra_tokens,
     _get_static_cache_size_layer_components,
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
@@ -45,6 +48,7 @@ from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import (
+    DSparkDecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
     MultimodalConfig,
@@ -1310,6 +1314,85 @@ def test_v2_layer_spec_costing_preserves_sink_and_reuse_policy() -> None:
     ) == (0, (8 + 23) * 64 * 64)
 
 
+@pytest.mark.parametrize(
+    "shared_draft_block_width,full_tokens,window_tokens",
+    [(None, 96, 64), (7, 96, 64), (8, 128, 96)],
+    ids=["config_default", "dspark_shifted", "dspark_unshifted"],
+)
+def test_v2_dspark_resolved_width_sizes_shared_cache_costs(
+    shared_draft_block_width: int | None, full_tokens: int, window_tokens: int
+) -> None:
+    """One extra draft position can require a full page in every cost estimate."""
+    spec_config = DSparkDecodingConfig(max_draft_len=7, speculative_model="draft")
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=1024,
+        head_dim=16,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft = replace(
+        target, global_layer_id=1, owner=KVCacheLayerOwner.DRAFT, sliding_window_size=19
+    )
+    kwargs = dict(
+        tokens_per_block=32,
+        max_seq_len=81,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+            avg_seq_len=81,
+            max_util_for_resume=1.0,
+        ),
+        spec_config=spec_config,
+        layer_specs=[target, draft],
+        shared_draft_block_width=shared_draft_block_width,
+    )
+    # A page is 2 MiB, so allocator granularity preserves the boundary difference.
+    layer_bytes = 64 << 10
+    assert KVCacheManagerV2.get_cache_size_per_token(
+        None, Mapping(), max_batch_size=2, max_num_tokens=32, **kwargs
+    ) == (layer_bytes, layer_bytes * (2 * window_tokens + 32))
+    assert KVCacheManagerV2._get_per_request_layer_tokens(None, Mapping(), **kwargs) == (
+        [(layer_bytes, full_tokens, 0), (layer_bytes, window_tokens, window_tokens)],
+        full_tokens,
+    )
+    assert KVCacheManagerV2.get_cache_bytes_per_request(None, Mapping(), **kwargs) == (
+        layer_bytes * full_tokens
+    )
+    assert KVCacheManagerV2.get_cache_quota_per_request(None, Mapping(), **kwargs) == (
+        layer_bytes * (full_tokens + window_tokens)
+    )
+
+
+@pytest.mark.parametrize("with_target_layer", [False, True])
+def test_v2_resolved_draft_width_does_not_change_target_only_headroom(
+    with_target_layer: bool,
+) -> None:
+    spec_config = DSparkDecodingConfig(max_draft_len=7, speculative_model="draft")
+    layer_specs = None
+    if with_target_layer:
+        layer_specs = [
+            KVCacheLayerSpec(
+                global_layer_id=0,
+                owner=KVCacheLayerOwner.TARGET,
+                dtype=DataType.BF16,
+                num_kv_heads=1,
+                head_dim=16,
+                buffer_roles=(Role.KEY, Role.VALUE),
+            )
+        ]
+    assert _get_kv_alloc_extra_tokens(
+        spec_config, layer_specs, shared_draft_block_width=8
+    ) == _get_kv_alloc_extra_tokens(spec_config, layer_specs)
+    assert _get_generation_kv_capacity(
+        spec_config,
+        is_draft=False,
+        layer_specs=layer_specs,
+        shared_draft_block_width=8,
+    ) == _get_generation_kv_capacity(spec_config, is_draft=False, layer_specs=layer_specs)
+
+
 def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = None
@@ -1855,6 +1938,10 @@ def _create_manager_and_capture_config(
     class _RecordingManager(manager_cls):
         def __init__(self, kv_cache_config: KvCacheConfig, *args: object, **kwargs: object) -> None:
             captured.append(kv_cache_config)
+            assert kwargs.get("layer_specs") is factory_overrides.get("layer_specs")
+            assert kwargs.get("shared_draft_block_width") == factory_overrides.get(
+                "shared_draft_block_width"
+            )
 
     model_config = Mock()
     model_config.pretrained_config = pretrained
@@ -2044,6 +2131,58 @@ def test_create_kv_cache_manager_cross_pool_keeps_single_window_default(
     assert manager_config.max_attention_window is None
 
 
+def _fp8_target_bf16_draft_specs(*, draft_window):
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    return [
+        *(replace(target, global_layer_id=i) for i in range(3)),
+        replace(
+            target,
+            global_layer_id=3,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=draft_window,
+        ),
+    ]
+
+
+def test_unified_fp8_target_bf16_draft_scales_by_combined_pool_groups():
+    """The V2 pool-group count comes from the combined target and draft layout.
+
+    The FP8 target and the windowed BF16 draft differ in life cycle and slot
+    size, so they land in two pool groups; counting the target's model config
+    alone gives one.
+    """
+    tpb = 32
+    spec_config = SimpleNamespace(
+        tokens_per_gen_step=1,
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: True, use_one_engine=lambda: False),
+    )
+    baseline = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    baseline._speculative_config = spec_config
+    baseline._build_unified_dflash_layer_specs = lambda kv_cache_config: ()
+    unified = _make_creator(tpb, [_make_mock_request(128)], False, 1)
+    unified._speculative_config = spec_config
+    specs = _fp8_target_bf16_draft_specs(draft_window=128)
+    unified._build_unified_dflash_layer_specs = lambda kv_cache_config: tuple(specs)
+
+    assert _get_num_storage_pool_groups(specs, tpb) == 2
+    assert unified._get_token_num_for_estimation() == 2 * baseline._get_token_num_for_estimation()
+
+
+def test_unified_fp8_target_bf16_draft_in_one_life_cycle_is_one_pool_group():
+    """Pages of different sizes in one life cycle share a pool group."""
+    specs = _fp8_target_bf16_draft_specs(draft_window=None)
+
+    assert _get_num_storage_pool_groups(specs, 32) == 1
+
+
 @pytest.mark.parametrize("guard", ["draft", "explicit_window"])
 def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) -> None:
     kv_cache_config = KvCacheConfig(
@@ -2059,6 +2198,50 @@ def test_create_kv_cache_manager_layer_specs_preserve_window_guards(guard: str) 
 
     assert manager_config is kv_cache_config
     assert manager_config.max_attention_window == ([1024] if guard == "explicit_window" else None)
+
+
+@pytest.mark.parametrize("publish_layer_specs", [False, True])
+@pytest.mark.parametrize("shared_draft_block_width", [None, 7, 8])
+def test_create_kv_cache_manager_preserves_explicit_storage_specs(
+    publish_layer_specs: bool,
+    shared_draft_block_width: int | None,
+) -> None:
+    """Model geometry must not replace an explicit target and draft storage layout."""
+    specs = tuple(_fp8_target_bf16_draft_specs(draft_window=128))
+    _create_manager_and_capture_config(
+        _mixed_schedule_pretrained([_FULL] * 3),
+        KvCacheConfig(),
+        max_seq_len=2048,
+        publish_layer_specs=publish_layer_specs,
+        layer_specs=specs,
+        shared_draft_block_width=shared_draft_block_width,
+    )
+
+
+@pytest.mark.parametrize("attention_dp", [False, True])
+def test_unified_layout_uses_model_provided_geometry(attention_dp: bool) -> None:
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            num_attention_heads=16, num_key_value_heads=8, head_dim=128
+        ),
+        quant_config=None,
+        kv_cache_layer_specs=(ModelKVCacheLayerSpec(head_dim=256, num_kv_heads=4, num_q_heads=16),)
+        * 3,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = SimpleNamespace(tp_size=2, enable_attention_dp=attention_dp)
+
+    assert creator._dflash_kv_layout(model_config, torch.bfloat16) == (
+        4 if attention_dp else 2,
+        256,
+        DataType.BF16,
+        False,
+    )
+
+    model_config.kv_cache_layer_specs += (
+        ModelKVCacheLayerSpec(head_dim=512, num_kv_heads=4, num_q_heads=16),
+    )
+    assert creator._dflash_kv_layout(model_config, torch.bfloat16) is None
 
 
 def test_profiling_failure_releases_resources_and_restores_response_state():

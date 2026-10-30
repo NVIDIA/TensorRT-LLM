@@ -180,6 +180,29 @@ class PeerRegistrar:
             peer_ri.page_table,
         )
         AttentionPolicy.validate_peer_compatible(self_page_table, peer_ri.page_table)
+        if self._ri.num_draft_layers != peer_ri.num_draft_layers:
+            # The layer-count tolerance below would transfer only the target
+            # layers and leave the drafter's prompt KV unset on the receiver.
+            raise ValueError(
+                "PeerRegistrar: unified draft KV layer count differs "
+                f"(local={self._ri.num_draft_layers}, peer={peer_ri.num_draft_layers}); "
+                "both peers must use the same speculative decoding KV cache layout; "
+                "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
+            )
+        if self._ri.num_draft_layers:
+            if self._ri.tp_size != peer_ri.tp_size:
+                raise ValueError(
+                    "PeerRegistrar: a shared draft KV cache needs equal tp_size "
+                    f"(local={self._ri.tp_size}, peer={peer_ri.tp_size}); "
+                    "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or use the same TP on both workers."
+                )
+            if self._ri.attention.enable_attention_dp != peer_ri.attention.enable_attention_dp:
+                raise ValueError(
+                    "PeerRegistrar: a shared draft KV cache needs the same attention DP "
+                    f"setting (local={self._ri.attention.enable_attention_dp}, "
+                    f"peer={peer_ri.attention.enable_attention_dp}); unset "
+                    "TRTLLM_DISAGG_SHARED_DRAFT_KV or match it on both workers."
+                )
 
         self_layers = sum(self._ri.layer_num_per_pp)
         peer_layers = sum(peer_ri.layer_num_per_pp)

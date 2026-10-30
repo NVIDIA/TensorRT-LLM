@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.pyexecutor._util import _get_num_storage_pool_groups
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -33,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheManagerV2,
     Role,
     _extend_swa_windows_for_reuse,
+    _get_generation_kv_capacity,
+    _get_kv_alloc_extra_tokens,
     _KVCacheManagerInitStatus,
     _swa_branch_snapshot_point,
     _swa_endpoint_priority,
@@ -51,6 +54,7 @@ from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
     DFlashDecodingConfig,
+    DSparkDecodingConfig,
     Eagle3DecodingConfig,
     KvCacheConfig,
     MTPDecodingConfig,
@@ -762,6 +766,85 @@ def test_mixed_role_coalesced_pool_preserves_slot_stride(kv_first: bool, kv_layo
             assert torch.all(key_buffer[3 * slot, 0] == 10 + ordinal)
             assert torch.all(kv_buffer[slot, 0] == 20 + ordinal)
             assert torch.all(kv_buffer[slot, 1] == 30 + ordinal)
+    finally:
+        manager.shutdown()
+
+
+def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+
+    torch.cuda.init()
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=2,
+        head_dim=8,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    # Equal byte sizes coalesce the FP8 target and BF16 draft pages, placing
+    # the draft's K buffer at a nonzero offset within each physical slot.
+    draft = replace(
+        target,
+        global_layer_id=1,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.BF16,
+        num_kv_heads=1,
+    )
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_gpu_total_bytes=16 << 20,
+            host_cache_size=0,
+            enable_block_reuse=False,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=target.num_kv_heads,
+        head_dim=target.head_dim,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=MAX_SEQ_LEN,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.FP8,
+        layer_specs=[target, draft],
+    )
+    try:
+        assert manager._use_per_layer_page_tables
+        request_ids = [7, 9]
+        for request_id, num_blocks in zip(request_ids, (2, 3)):
+            cache = manager._create_kv_cache(request_id, None, None)
+            assert cache.resume(manager._stream.cuda_stream)
+            assert cache.resize(num_blocks * TOKENS_PER_BLOCK, 0)
+
+        worker = object.__new__(DFlashWorker)
+        worker._ctx_unified_cache = True
+        pool = worker._managed_ctx_pool(
+            manager, 1, draft.num_kv_heads, draft.head_dim, torch.bfloat16, 2
+        )
+        assert pool is not None
+        assert worker._init_ctx_block_tables(
+            manager, pool, len(request_ids), 1, draft.num_kv_heads, draft.head_dim, TOKENS_PER_BLOCK
+        )
+        assert worker._ctx_block_offset > 0
+
+        block_offsets = torch.empty(
+            (manager.num_attention_op_pools, len(request_ids), 2, manager.max_blocks_per_seq),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        manager.copy_batch_block_offsets(
+            block_offsets, request_ids, beam_width=1, num_contexts=0, num_seqs=len(request_ids)
+        )
+        metadata = SimpleNamespace(kv_cache_block_offsets=block_offsets)
+        assert worker._refresh_ctx_block_tables(metadata, len(request_ids))
+
+        expected = manager.get_batch_cache_indices(request_ids, layer_idx=draft.global_layer_id)
+        for row, indices in enumerate(expected):
+            assert len(indices) == (2, 3)[row]
+            assert worker._ctx_block_tables[row, : len(indices)].tolist() == indices
     finally:
         manager.shutdown()
 
@@ -3911,6 +3994,194 @@ def test_window_crossing_survives_unreadable_page_indices(monkeypatch) -> None:
 
     assert len(fake_logger.messages) == 1
     assert "unavailable" in fake_logger.messages[0]
+
+
+@pytest.mark.parametrize(
+    "target_dtype,target_layers,draft_windows",
+    [
+        (DataType.BF16, 2, [None]),
+        (DataType.FP8, 2, [None]),
+        (DataType.FP8, 3, [128]),
+        (DataType.BF16, 2, [128]),
+    ],
+    ids=["bf16_same_window", "fp8_same_window", "fp8_windowed_draft", "bf16_windowed_draft"],
+)
+def test_storage_pool_group_count_matches_manager(
+    target_dtype, target_layers, draft_windows
+) -> None:
+    """The estimator's pool-group count is what the manager creates."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=target_dtype,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    layer_specs = [replace(target, global_layer_id=i) for i in range(target_layers)]
+    layer_specs += [
+        replace(
+            target,
+            global_layer_id=target_layers + i,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            sliding_window_size=window,
+        )
+        for i, window in enumerate(draft_windows)
+    ]
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        max_gpu_total_bytes=64 << 20,
+        host_cache_size=0,
+        enable_swa_scratch_reuse=False,
+    )
+    manager = KVCacheManagerV2(
+        kv_cache_config,
+        CacheType.SELF,
+        num_layers=len(layer_specs),
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=32,
+        max_seq_len=1024,
+        max_batch_size=2,
+        max_num_tokens=128,
+        mapping=Mapping(),
+        dtype=target_dtype,
+        layer_specs=layer_specs,
+    )
+    try:
+        assert _get_num_storage_pool_groups(layer_specs, 32) == len(manager.impl.pool_group_descs)
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize("disagg", [False, True], ids=["aggregated", "disaggregated"])
+@pytest.mark.parametrize(
+    "spec_config_cls,shared_draft_block_width",
+    [(DFlashDecodingConfig, None), (DSparkDecodingConfig, 7), (DSparkDecodingConfig, 8)],
+    ids=["dflash", "dspark_shifted", "dspark_unshifted"],
+)
+def test_shared_draft_pages_cover_the_drafter_block_after_a_decode_resize(
+    disagg: bool, spec_config_cls: type, shared_draft_block_width: int | None
+) -> None:
+    """The drafter appends its block after the context, so its pages must reach it.
+
+    After a decode step accepts every draft token the context is ``prompt + K +
+    1`` long and the drafter's block follows it. The prompt is chosen so that
+    this furthest write is the first position of a third page.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    max_draft_len = 7
+    block_width = shared_draft_block_width or max_draft_len + 1
+    tokens_per_block = 32
+    prompt_len = 2 * tokens_per_block - (max_draft_len + 1) - block_width + 1
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.FP8,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft_layer = 2
+    layer_specs = [
+        target,
+        replace(target, global_layer_id=1),
+        replace(
+            target, global_layer_id=draft_layer, owner=KVCacheLayerOwner.DRAFT, dtype=DataType.BF16
+        ),
+    ]
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_gpu_total_bytes=64 << 20,
+            host_cache_size=0,
+            enable_swa_scratch_reuse=False,
+        ),
+        CacheType.SELF,
+        num_layers=len(layer_specs),
+        num_kv_heads=8,
+        head_dim=128,
+        tokens_per_block=tokens_per_block,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        layer_specs=layer_specs,
+        spec_config=spec_config_cls(max_draft_len=max_draft_len, speculative_model="draft"),
+        shared_draft_block_width=shared_draft_block_width,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    request = _ContextRequest(
+        1,
+        list(range(prompt_len)),
+        prompt_len,
+        "conversation",
+        use_conversation_params=False,
+        is_disagg_generation_init_state=disagg,
+    )
+    try:
+        assert manager._shared_draft_block_width == block_width
+        assert manager._generation_kv_capacity_headroom == max_draft_len + 1 + block_width
+        if disagg:
+            request.py_draft_tokens = []
+            request.is_disagg_generation_transmission_complete = False
+            request.context_phase_params = None
+            assert manager.prepare_disagg_gen_init(request)
+            request.is_disagg_generation_init_state = False
+        else:
+            _run_context(manager, request)
+        generation = SimpleNamespace(
+            py_request_id=request.py_request_id,
+            py_beam_width=1,
+            py_draft_tokens=[0] * max_draft_len,
+            state=LlmRequestState.GENERATION_IN_PROGRESS,
+            is_dummy_request=False,
+            is_disagg_generation_transmission_complete=False,
+            context_phase_params=None,
+            max_beam_num_tokens=prompt_len + 1,
+        )
+        assert manager.try_allocate_generation(generation)
+
+        furthest_write_end = prompt_len + max_draft_len + 1 + block_width
+        pages = manager.get_batch_cache_indices([request.py_request_id], layer_idx=draft_layer)[0]
+        assert len(pages) * tokens_per_block >= furthest_write_end
+    finally:
+        manager.free_resources(request)
+        manager.shutdown()
+
+
+def test_cost_headroom_counts_the_drafter_block_only_for_shared_layers() -> None:
+    """The budget charges the allocation headroom, not the position-side count."""
+    from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
+
+    max_draft_len = 7
+    spec_config = DFlashDecodingConfig(max_draft_len=max_draft_len, speculative_model="draft")
+    target = KVCacheLayerSpec(
+        global_layer_id=0,
+        owner=KVCacheLayerOwner.TARGET,
+        dtype=DataType.BF16,
+        num_kv_heads=8,
+        head_dim=128,
+        buffer_roles=(Role.KEY, Role.VALUE),
+    )
+    draft = replace(target, global_layer_id=1, owner=KVCacheLayerOwner.DRAFT)
+
+    _, own = _get_generation_kv_capacity(spec_config, is_draft=False, layer_specs=[target])
+    _, shared = _get_generation_kv_capacity(
+        spec_config, is_draft=False, layer_specs=[target, draft]
+    )
+
+    # The block is K + 1 = 8 wide against K - 1 = 6 extra positions.
+    assert shared - own == (max_draft_len + 1) - (max_draft_len - 1)
+    assert _get_kv_alloc_extra_tokens(spec_config, [target, draft]) == max_draft_len + 1
+    assert get_num_extra_kv_tokens(spec_config) == max_draft_len - 1
 
 
 def test_generation_token_slice_shares_token_view() -> None:

@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 
 def test_flashinfer_uses_v2_page_index_upper_bound_directly() -> None:
@@ -256,6 +257,93 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
 
     assert preprocess_calls[0][24] == batch_size
     assert len(decode_calls) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("local_layer_idx", [0, 1])
+def test_cute_dsl_mla_v2_per_layer_indices_read_correct_pages(
+    monkeypatch: pytest.MonkeyPatch, local_layer_idx: int
+) -> None:
+    """Per-layer indices and layer-origin buffers must select the same physical page."""
+    page_size, latent_dim, rope_dim = 2, 2, 2
+    layer_idx = 16 + local_layer_idx
+    physical_pool = (
+        torch.arange(10, dtype=torch.bfloat16)
+        .view(10, 1, 1, 1, 1)
+        .expand(-1, 1, page_size, 1, latent_dim + rope_dim)
+        .contiguous()
+    )
+    # Two MLA target layers share a pool. Mixed target/draft layouts use
+    # per-layer tables: slot 3 maps to physical pages 6 and 7 for these layers.
+    block_offsets = torch.tensor(
+        [[[[6, BAD_PAGE_INDEX]]], [[[7, BAD_PAGE_INDEX]]]], dtype=torch.int32
+    )
+    original_offsets = block_offsets.clone()
+    # V2 wraps the shifted raw pointer as storage origin; a slice alone would
+    # retain the full pool's storage and let an incorrect rebase hide the bug.
+    layer_buffer = physical_pool[local_layer_idx:].clone()
+
+    def get_buffers(requested_layer_idx: int) -> torch.Tensor:
+        assert requested_layer_idx == layer_idx
+        return layer_buffer
+
+    def get_page_index_converter(requested_local_idx: int, role: object) -> SimpleNamespace:
+        assert (requested_local_idx, role) == (local_layer_idx, Role.KEY)
+        return SimpleNamespace(layer_offset=local_layer_idx)
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager._use_per_layer_page_tables = True
+    manager.layer_offsets = {16: 0, 17: 1}
+    manager.get_buffers = get_buffers
+    manager.impl = SimpleNamespace(get_page_index_converter=get_page_index_converter)
+    metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        kv_cache_block_offsets=block_offsets,
+        host_kv_cache_pool_mapping=torch.tensor([[0, 0], [1, 0]], dtype=torch.int32),
+        num_contexts=0,
+        max_num_requests=1,
+        helix_position_offsets=None,
+    )
+    attn = SimpleNamespace(
+        layer_idx=layer_idx,
+        get_local_layer_idx=lambda meta: meta.kv_cache_manager.layer_offsets[layer_idx],
+        num_heads=1,
+        kv_lora_rank=latent_dim,
+        qk_rope_head_dim=rope_dim,
+        qk_nope_head_dim=latent_dim,
+        q_scaling=1.0,
+    )
+    q = torch.zeros((1, 1, latent_dim + rope_dim), dtype=torch.bfloat16)
+    output = torch.empty((1, 1, latent_dim), dtype=torch.bfloat16)
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=AttentionForwardArgs(
+            output=output, attention_input_type=AttentionInputType.generation_only
+        ),
+        workspace=torch.empty(0, dtype=torch.uint8),
+        sequence_lengths=torch.tensor([page_size], dtype=torch.int32),
+        tokens_per_block=page_size,
+        num_requests=1,
+    )
+    pages_read: list[torch.Tensor] = []
+
+    def read_page(q_latent, q_rope, c_latent, c_rope, page_table, *args) -> None:
+        assert page_table[1, 0].item() == BAD_PAGE_INDEX
+        page = page_table[0, 0].item()
+        pages_read.append(torch.cat((c_latent[:, :, page], c_rope[:, :, page]), dim=1))
+
+    monkeypatch.setattr(
+        torch.ops.trtllm, "cute_dsl_mla_decode_fp16_blackwell", read_page, raising=False
+    )
+    monkeypatch.setattr(CuteDslMlaFmha, "_required_workspace_size", staticmethod(lambda *args: 0))
+    monkeypatch.setattr(CuteDslMlaFmha, "_split_kv_plan", staticmethod(lambda *args: None))
+    fmha = object.__new__(CuteDslMlaFmha)
+    fmha._run_mla_decode(q, output, params, torch.bfloat16)
+
+    assert len(pages_read) == 1
+    torch.testing.assert_close(pages_read[0], physical_pool[6 + local_layer_idx, 0, :, 0, :])
+    torch.testing.assert_close(block_offsets, original_offsets)
 
 
 def _cute_dsl_mla_helix_support(

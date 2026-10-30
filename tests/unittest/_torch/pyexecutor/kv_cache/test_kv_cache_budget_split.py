@@ -336,6 +336,10 @@ class TestSplitGpuBudgetForDraft:
         # A Mock's truthy return would send get_num_extra_kv_tokens down the
         # one-engine arm; this test's config is a drafter outside the engine.
         mode.use_one_engine.return_value = False
+        # A truthy DFlash or DSpark check would route costing through the shared
+        # target and drafter cache path.
+        mode.is_dflash.return_value = False
+        mode.is_dspark.return_value = False
         costed_windows: list[tuple[object, list[int] | None]] = []
 
         class RecordingKVCacheManager(KVCacheManagerV2):

@@ -76,7 +76,7 @@ def _metadata(*, declares_max_seq_len):
 def _size_arena(metadata):
     """Run the sizing path and return the ``_max_ctx`` it settled on."""
     worker = _worker()
-    draft_model = MagicMock()
+    draft_model = MagicMock(block_size=8)
     draft_model.config = MagicMock(max_position_embeddings=POSITION_TABLE)
     spec_metadata = MagicMock(max_num_requests=32)
 

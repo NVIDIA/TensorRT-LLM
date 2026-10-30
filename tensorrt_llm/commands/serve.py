@@ -2682,6 +2682,32 @@ def set_cuda_device():
     torch.cuda.set_device(device_id)
 
 
+def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
+    """What keeps the context and generation servers from sharing draft KV, or None."""
+    with_spec = {
+        cfg.type
+        for cfg in server_configs if cfg.other_args.get("speculative_config")
+    }
+    if with_spec != {"ctx", "gen"}:
+        return ("speculative_config in both context_servers and "
+                "generation_servers")
+    if len({(cfg.other_args.get("tensor_parallel_size", 1),
+             bool(cfg.other_args.get("enable_attention_dp", False)))
+            for cfg in server_configs}) != 1:
+        return ("the same tensor_parallel_size and enable_attention_dp in "
+                "context_servers and generation_servers")
+    for cfg in server_configs:
+        spec = cfg.other_args["speculative_config"]
+        backend = spec.get("attention_backend")
+        if not ((spec.get("decoding_type") == "DFlash" and backend == "TRTLLM")
+                or (spec.get("decoding_type") == "DSpark"
+                    and backend in (None, "AUTO", "TRTLLM"))):
+            return ("speculative_config to be DFlash with attention_backend "
+                    "TRTLLM, or DSpark with attention_backend AUTO or TRTLLM, "
+                    "in both sections")
+    return None
+
+
 @click.command("disaggregated_mpi_worker")
 @stability_option(
     "-c",
@@ -2721,6 +2747,14 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
 
     disagg_cfg = parse_disagg_config_file(config_file)
+    blocker = _shared_draft_kv_blocker(disagg_cfg.server_configs)
+    if blocker is not None and os.environ.get(
+            "TRTLLM_DISAGG_SHARED_DRAFT_KV") == "1":
+        raise click.UsageError(
+            f"TRTLLM_DISAGG_SHARED_DRAFT_KV=1 requires {blocker}.")
+    if os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV") in (None, "auto"):
+        os.environ["TRTLLM_DISAGG_SHARED_DRAFT_KV"] = ("0"
+                                                       if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.
