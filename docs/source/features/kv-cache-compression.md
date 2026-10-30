@@ -253,9 +253,15 @@ history pool is quantized. The GPU keeps the full history at the active
 precision, plus one window-sized copy of the retained tokens per Attention
 layer.
 
+The active precision is the one `kv_cache_config.dtype` resolves to: FP8 below,
+or the checkpoint's KV type under the default `auto`. In the cold tiers the
+retained tokens stay in that type and the rest of the history becomes NVFP4; on
+the GPU the whole history stays in that type.
+
 ```yaml
 kv_cache_config:
   use_kv_cache_manager_v2: true
+  dtype: fp8
   host_cache_size: 8589934592
 kv_cache_compression_config:
   algorithm: quantization_for_cold_page
@@ -264,10 +270,13 @@ kv_cache_compression_config:
   mixed_precision_last_n: 256
 ```
 
-The option is a prototype and shares the mixed-precision KV cache's limits: the
-standard dense KV cache manager, the TRTLLM or FlashInfer Attention backend,
-single-beam decoding without speculative decoding, and no KV connector. It
-cannot be combined with `dtype="mixed_nvfp4_..."`.
+The option is a prototype and shares the limits of the mixed-precision KV cache
+(see [KV cache](kvcache.md)): `use_kv_cache_manager_v2: true` with the TRTLLM or
+FlashInfer Attention backend, the KV cache managers that support the
+mixed-precision KV cache, single-beam decoding, speculative decoding except
+dynamic-tree drafting, and no KV connector. MTP layers keep retained-token twins
+like the target layers; a drafter with its own architecture keeps a plain cache.
+It cannot be combined with `dtype="mixed_nvfp4_..."`.
 
 ### TriAttention
 
