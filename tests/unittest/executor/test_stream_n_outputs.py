@@ -55,10 +55,11 @@ class _Result(SimpleNamespace):
         return None
 
 
-def _response(seq_idx, ids, finish_reason, is_final):
+def _response(seq_idx, ids, finish_reason, is_final, cum_log_prob=None):
     result = _Result(sequence_index=seq_idx, output_token_ids=[ids], finish_reasons=[finish_reason],
                      is_final=is_final,
-                     log_probs=[[{t: Logprob(logprob=-0.5, rank=1)} for t in ids]])
+                     log_probs=[[{t: Logprob(logprob=-0.5, rank=1)} for t in ids]],
+                     cum_log_probs=None if cum_log_prob is None else [cum_log_prob])
     return SimpleNamespace(has_error=lambda: False, result=result)
 
 
@@ -104,3 +105,31 @@ def test_outputs_match_their_tokens(streaming, n, best_of):
         assert out.text == texts[j]
         if streaming:
             assert streamed[j] == texts[j]
+
+
+# (sequence, chunk, cumulative logprob after the chunk). Sequence 1 starts outside the top n=1 and is
+# selected later: in the first case after two responses of its own, in the second because the other
+# sequence's score drops.
+_RERANK_CASES = {
+    "selected_after_own_responses": [(0, "aaa", -1.0), (1, "bbb", -5.0), (0, "ccc", -3.0),
+                                      (1, "ddd", -2.0), (0, "eee", -9.0)],
+    "selected_by_other_response": [(0, "aaa", -1.0), (1, "bbb", -5.0), (0, "ccc", -9.0),
+                                   (1, "ddd", -6.0)],
+}
+
+
+@pytest.mark.parametrize("case", sorted(_RERANK_CASES))
+def test_streaming_best_of_rerank_keeps_text(case):
+    steps = _RERANK_CASES[case]
+    sp = SamplingParams(n=1, best_of=2, temperature=1.0, max_tokens=64, logprobs=1)
+    tok = CharTokenizer()
+    sp._setup(tok, None, None)
+    result = DetokenizedGenerationResultBase(0, sp, tokenizer=tok, streaming=True)
+    for i, (k, chunk, cum) in enumerate(steps):
+        last_of_k = all(kk != k for kk, _, _ in steps[i + 1:])
+        reason = tllm.FinishReason.LENGTH if last_of_k else tllm.FinishReason.NOT_FINISHED
+        result._handle_response(
+            _response(k, tok.encode(chunk), reason, i == len(steps) - 1, cum_log_prob=cum))
+    (selected,) = result.outputs
+    assert selected is result._outputs[1]
+    assert selected.text == tok.decode(selected.token_ids)
