@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the Morton / Z-order token ordering used by SOL block routing.
+"""Tests for the Morton (Z-order) and Hilbert token orderings used by SOL block routing.
 
-These are CPU-only: the permutation is a fixed index tensor per latent grid.
-The Wan forward equivalence (morton output == native output under dense
+These are CPU-only: each permutation is a fixed index tensor per latent grid.
+The Wan forward equivalence (reordered output == native output under dense
 attention) lives in ``test_wan_transformer.py``.
 """
 
