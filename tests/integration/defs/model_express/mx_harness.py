@@ -101,6 +101,11 @@ MIN_PROBE_NEW_TOKENS = 32
 # also byte-identical at the boundary.
 TRANSFER_TIER_KINDS = ("param",)
 FINAL_TIER_PAIRS = (("baseline", "donor"), ("baseline", "receiver"), ("donor", "receiver"))
+# Behavioral probes a row can request from `mx_e2e_worker.py`. The image probe
+# asks fixed questions about these images under
+# `<models root>/multimodals/test_data`.
+PROBES = ("text", "image")
+IMAGE_PROBE_FILES = ("seashore.png", "inpaint.png")
 
 ManifestKey = tuple[str, str, int]
 
@@ -113,6 +118,10 @@ class MxE2ECase:
     whose final-tier digest may legitimately differ between roles (never a
     numeric tolerance, never at the transfer tier). Every pattern needs a code
     comment explaining why; the qualified BF16 dense families use none.
+
+    `probe` selects the worker's behavioral probe: `text` sends token-ID
+    prompts, and `image` sends image prompts so that vision-language rows also
+    exercise the vision encoder on every role.
     """
 
     model_env: str
@@ -120,6 +129,12 @@ class MxE2ECase:
     repository_cache_prefix: str
     tp_size: int
     final_manifest_exempt_patterns: tuple[str, ...] = ()
+    probe: str = "text"
+
+    def __post_init__(self) -> None:
+        """Reject a probe that `mx_e2e_worker.py` does not implement."""
+        if self.probe not in PROBES:
+            raise ValueError(f"Unknown MX E2E probe {self.probe!r}; expected one of {PROBES}")
 
 
 @dataclass(frozen=True)
@@ -169,23 +184,45 @@ def skip_or_fail(message: str) -> NoReturn:
     pytest.skip(message)
 
 
+def models_root() -> Path:
+    """Return `LLM_MODELS_ROOT`, or the first existing well-known models root."""
+    models_root_env = os.environ.get("LLM_MODELS_ROOT")
+    if models_root_env:
+        return Path(models_root_env).expanduser()
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models")
+    if not root.exists():
+        root = Path("/scratch.trt_llm_data/llm-models")
+    return root
+
+
 def resolve_model_path(case: MxE2ECase) -> Path:
     configured = os.environ.get(case.model_env)
     if configured:
         model_path = Path(configured).expanduser()
     else:
-        models_root_env = os.environ.get("LLM_MODELS_ROOT")
-        if models_root_env:
-            models_root = Path(models_root_env).expanduser()
-        else:
-            models_root = Path("/home/scratch.trt_llm_data_ci/llm-models")
-            if not models_root.exists():
-                models_root = Path("/scratch.trt_llm_data/llm-models")
-        model_path = models_root / case.default_model_subdir
+        model_path = models_root() / case.default_model_subdir
 
     if not model_path.is_dir():
         skip_or_fail(f"MX E2E model directory does not exist: {model_path}. Set {case.model_env}.")
     return model_path.absolute()
+
+
+def probe_worker_args(case: MxE2ECase) -> tuple[str, ...]:
+    """Return the `mx_e2e_worker.py` arguments that select the row's probe.
+
+    Every role of a row gets the same arguments, so all roles use the same
+    prompts and engine limits.
+    """
+    if case.probe == "text":
+        return ()
+    args = ["--probe", case.probe]
+    test_data = models_root() / "multimodals" / "test_data"
+    for file_name in IMAGE_PROBE_FILES:
+        image_path = test_data / file_name
+        if not image_path.is_file():
+            skip_or_fail(f"MX E2E probe image does not exist: {image_path}. Set LLM_MODELS_ROOT.")
+        args.extend(("--image", str(image_path.absolute())))
+    return tuple(args)
 
 
 def require_mx_environment(required_gpus: int) -> tuple[str, tuple[str, ...]]:
@@ -836,11 +873,13 @@ def archive_run_artifacts(
 __all__ = [
     "DEFAULT_MX_METADATA_PORT",
     "FINAL_TIER_PAIRS",
+    "IMAGE_PROBE_FILES",
     "MIN_PROBE_NEW_TOKENS",
     "MIN_PROBE_PROMPTS",
     "MINIMUM_MODELEXPRESS_VERSION",
     "MX_PREFLIGHT_SCRIPT",
     "MX_ROLES",
+    "PROBES",
     "ROLES",
     "SELF_CHECK_FAILED_EXIT_CODE",
     "TRANSFER_TIER_KINDS",
@@ -863,7 +902,9 @@ __all__ = [
     "donor_session",
     "load_payload",
     "log_tail",
+    "models_root",
     "mx_metadata_ports",
+    "probe_worker_args",
     "qualification_required",
     "report_timings",
     "require_mx_environment",

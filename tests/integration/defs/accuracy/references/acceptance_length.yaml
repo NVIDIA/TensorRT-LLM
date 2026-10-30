@@ -12,7 +12,10 @@ TestNemotronV3Super::test_nvfp4_4gpus_block_reuse:
 TestGPTOSS::test_dflash:
   ref_al: 2.925596923467016
   min_al: 2.779317077293665
-TestDeepSeekV4ProDSpark::test_gsm8k_dep8_megamoe_deepgemm:
+TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp8]:
+  ref_al: 4.448784989234082
+  min_al: 4.226345739772378
+TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4]:
   ref_al: 4.448784989234082
   min_al: 4.226345739772378
 # Not a copy of the DeepGEMM row above: that one is measured on the FP8 export,
@@ -134,6 +137,16 @@ ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3:
 TestGLM53FlashFP8::test_mtp:
   ref_al: 3.384
   min_al: 3.215
+# Read by TestModelingV2Glm52Nvfp4Sm103Tep4::
+# test_gsm8k_identity_vs_mtp1_and_acceptance. Keyed by target and variant for
+# the same reason as the ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry
+# above. max_draft_len is 1, so acceptance length lives in [1.0, 2.0].
+ModelingV2Glm52Nvfp4Sm103Tep4::mtp1:
+  # Full gsm8k on B300 under the test's MTP1 config: stock (modeling_v2="off")
+  # 1.942, modeling_v2 1.943. ref_al is the STOCK reading, so the gate is not
+  # self-referential; min_al is the automatic 95% of it.
+  ref_al: 1.942036
+  min_al: 1.844935
 # Read by the acceptance-length cases of TestModelingV2Qwen38FlashNextNvfp4Sm103Tp1
 # (test_qwen4_exp.py). Keyed by target and variant for the same reason as the
 # ModelingV2DeepseekR10528Nvfp4Sm10xDefault::mtp3 entry above, and one key per variant:

@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from tensorrt_llm._utils import prefer_pinned
-
 if sys.version_info[:2] >= (3, 12):
     from typing import override
 else:
@@ -26,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaRole,
     MambaStateLayout,
     _get_local_mamba_cache_layout,
+    _host_slots_to_device,
     _mamba_effective_tp_size,
     _promote_intermediate_states,
     _stack_state_views,
@@ -116,6 +115,15 @@ _KDA_BETA_CACHE_ALIGNMENT_BYTES = 16
 _KDA_REPLAY_COUNT_BYTES = 16
 _KDA_REPLAY_COUNT_ROLE = DataRole("prev_num_accepted_tokens")
 _KDA_REPLAY_CONV_ROLES = ("kda_conv_q", "kda_conv_k", "kda_conv_v")
+# Replay buffers a transferred slot is seeded or cleared in. The drafts'
+# records (_KDA_DRAFT_RECORDS_ROLE) need no reset.
+_KDA_SEEDED_ROLES = (
+    *_KDA_REPLAY_CONV_ROLES,
+    "kda_k_cache",
+    "kda_g_cache",
+    "kda_v_cache",
+    "kda_beta_cache",
+)
 _KDA_DRAFT_RECORDS_ROLE = "kda_state_tok"
 
 
@@ -171,16 +179,6 @@ def _kda_replay_bytes_per_slot(
         return 0
     layer_bytes = sum(dtype.itemsize * math.prod(shape) for dtype, shape in layout.values())
     return num_local_layers * layer_bytes + _KDA_REPLAY_COUNT_BYTES
-
-
-def _host_slots_to_device(slots: list[int], device: torch.device) -> torch.Tensor:
-    """Copy host slot IDs without synchronizing queued GPU work.
-
-    Each copy uses fresh pinned storage so later host writes cannot race it.
-    """
-    return torch.tensor(
-        slots, dtype=torch.long, pin_memory=device.type == "cuda" and prefer_pinned()
-    ).to(device, non_blocking=True)
 
 
 def _kda_beta_cache_padded_heads(num_heads: int) -> int:
@@ -425,6 +423,11 @@ class KDAReplayState:
         self._seed_request_counter = 0
         self._seed_rank_offset = 0
         self._conv_section_dims: tuple[int, ...] = ()
+        # ``[num_layers, num_slots, ...]`` views of the conv states and of the
+        # seeded replay buffers when the per-layer views are affine (see
+        # _stack_state_views); None otherwise.
+        self._stacked_seed_conv: torch.Tensor | None = None
+        self._stacked_seed_replay: dict[str, torch.Tensor] | None = None
 
     def validate(self, context: MambaStateLayout) -> None:
         if context.spec_config is None:
@@ -597,7 +600,24 @@ class KDAReplayState:
                 self._seed_rank_offset,
                 device,
             )
+        self._stack_seed_views()
         logger.info(f"Mamba Cache (kda-replay) is allocated for {cache_size} state slots")
+
+    def _stack_seed_views(self) -> None:
+        """Stack what seed_transferred_slots writes, so it runs on all layers at once."""
+        self._stacked_seed_conv = _stack_state_views(list(self._conv_states))
+        self._stacked_seed_replay = None
+        if self._stacked_seed_conv is None:
+            return
+        layers = [self._layer_cache_fields(layer) for layer in range(len(self._conv_states))]
+        stacked = {}
+        for name in _KDA_SEEDED_ROLES:
+            if layers[0].get(name) is None:
+                continue
+            stacked[name] = _stack_state_views([layer[name] for layer in layers])
+            if stacked[name] is None:
+                return
+        self._stacked_seed_replay = stacked
 
     def _layer_cache_fields(self, layer_offset: int) -> dict[str, torch.Tensor | None]:
         if self.pool_layers is not None:
@@ -702,15 +722,24 @@ class KDAReplayState:
             section_offsets.append(section_offsets[-1] + section_dim)
 
         self.prev_num_accepted_tokens.index_fill_(0, state_indices, 0)
+        stacked_replay = self._stacked_seed_replay
+        if stacked_replay is not None:
+            # All layers at once: one launch per replay buffer and section.
+            for buffer in stacked_replay.values():
+                buffer.index_fill_(1, state_indices, 0)
+            selected_conv = self._stacked_seed_conv.index_select(1, state_indices)
+            for section_idx, name in enumerate(_KDA_REPLAY_CONV_ROLES):
+                buffer = stacked_replay[name]
+                section = selected_conv[
+                    :, :, section_offsets[section_idx] : section_offsets[section_idx + 1], :
+                ]
+                buffer[..., :committed_window].index_copy_(
+                    1, state_indices, section.to(buffer.dtype)
+                )
+            return
         for layer_offset, conv_state in enumerate(self._conv_states):
             replay = self._layer_cache_fields(layer_offset)
-            for name in (
-                *_KDA_REPLAY_CONV_ROLES,
-                "kda_k_cache",
-                "kda_g_cache",
-                "kda_v_cache",
-                "kda_beta_cache",
-            ):
+            for name in _KDA_SEEDED_ROLES:
                 buffer = replay.get(name)
                 if buffer is not None:
                     buffer.index_fill_(0, state_indices, 0)
@@ -775,7 +804,7 @@ class KDAReplayState:
                 num_accepted,
                 state_tok=replay.get(_KDA_DRAFT_RECORDS_ROLE),
             )
-        self.prev_num_accepted_tokens[slot] = 0
+        self.prev_num_accepted_tokens[slot].zero_()
 
     def _layer_replay_buffers(self) -> tuple[torch.Tensor, ...]:
         buffers = (
@@ -796,6 +825,8 @@ class KDAReplayState:
         self.pool_layers = None
         self._ssm_states = ()
         self._conv_states = ()
+        self._stacked_seed_conv = None
+        self._stacked_seed_replay = None
         self.suspended_requests.clear()
         self.acceptance_pending.clear()
         self.unseeded_requests.clear()

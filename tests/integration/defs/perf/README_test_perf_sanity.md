@@ -26,9 +26,17 @@ For the underlying regression pipeline architecture (three-layer design, baselin
 
 | List | Count | Contents |
 |------|-------|----------|
-| `MAXIMIZE_METRICS` | 8 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + TPOT (`d_mean_tpot`, `d_median_tpot`, `d_p99_tpot`) + spec-decoding `d_al` |
-| `MINIMIZE_METRICS` | 14 + 108 | TTFT, ITL, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
+| `MAXIMIZE_METRICS` | 5 | Throughputs (`d_seq_throughput`, `d_token_throughput`, `d_total_token_throughput`, `d_user_throughput`) + spec-decoding `d_al` |
+| `MINIMIZE_METRICS` | 17 + 108 | TTFT, ITL, TPOT, E2EL latencies (mean/median/P99 for each) + the five `d_{mean,median,std,p75,p99}_gen_worker_per_iter_device_step_time` (every mode in `DEVICE_STEP_TIME_MODES`) + the 108 `d_tb_*` lifecycle spans of the `time_breakdown` modifier |
 | `REGRESSION_METRICS` | 2 default | `d_token_throughput`, `d_total_token_throughput` — gate pass/fail for all modes **except disagg gen_only**. `d_al` is appended at runtime when any client runs spec decoding. |
+
+TPOT is time per output token, so lower values are better. Its reported delta is
+negative when latency exceeds the selected baseline. A stored `d_baseline_*`
+override takes precedence; otherwise, the baseline is recalculated as P5 of the
+smoothed history, as for the other latency metrics. Calculated baselines are not
+automatically stored as overrides. Historical TPOT measurements remain valid
+when the comparison direction changes. TPOT is not in `REGRESSION_METRICS`, so
+these statistics are diagnostic and do not determine the default pass/fail verdict.
 
 **Disagg gen_only override**: For `disagg_upload-gen_only-*` tests, regression is gated on `d_mean_gen_worker_per_iter_device_step_time` **and** `d_median_gen_worker_per_iter_device_step_time`. Token-based throughput numbers are dominated by KV-cache transfer time in gen_only mode and are not a useful regression signal there. The two are gated together because they fail on different shapes of slowdown: the mean catches a cost spread thinly across many iterations, the median catches a shift in the typical iteration while ignoring outliers. A real slowdown moves both; a single anomalous iteration moves only the mean. `d_{std,p75,p99}_...` are uploaded for diagnosis but are **not** gated.
 
@@ -338,6 +346,17 @@ queue (nvbugs/6564113). Notes:
   connection-warmup iterations; start the range later to profile only measured
   iterations.
 
+### Warmup pass
+
+Before each measured client of a normal aggregated, `ctx_only` or disaggregated `e2e`
+test, the harness sends one un-measured wave (`concurrency` requests) of the client's
+own `benchmark_serving` command with `--seed` + 1, so JIT kernels for the real prefill
+shapes compile outside the measured window. `gen_only` modes, AgentX and accuracy-only
+clients get none. Its log (`trtllm-benchmark-warmup-pass.*.log`) is not parsed, and its
+records stay out of `d_tb_*` and the device step time; with the time breakdown on, only
+the first measured client gets one. `TRTLLM_PERF_WARMUP_PASS=0` turns it off (locally,
+via `EXTRA_CONTAINER_EXPORTS`).
+
 ### The optional instrumentation modifier
 
 The three shapes that read a disaggregated config (2, 3 and 4 above) take one
@@ -399,8 +418,9 @@ to run after the writers are done. Only the **gen** workers announce that
 workers and the disaggregated server do not. `wait_for_perf_metrics_files` therefore
 polls the discovered set until its total size holds still for
 `PERF_METRICS_SETTLE_SECONDS`, bounded by `PERF_METRICS_SETTLE_TIMEOUT`, before
-anything is read, and then compares the largest file's complete-record count against
-the client's `--num-prompts`. Both a still-growing set at the timeout and a census
+anything is read, and then compares the census (the complete records of one server
+role, summed over its files) against the client's `--num-prompts`. Both a
+still-growing set at the timeout and a census
 shortfall are logged as warnings, not failures — a nearly-complete file still yields
 usable statistics, and the numbers are not regression-gated. This matters because a
 truncated read is otherwise **invisible**: all 108 fields are still populated and the
@@ -409,13 +429,14 @@ mid-record) costs only that line, never the whole file: dropping the disagg serv
 file would silently reroute the per-request groups to same-role worker fallbacks,
 which produce plausible values for the wrong phase.
 
-The servers also append records of the e2e connection warmup's requests to these
-files. The harness therefore waits until the largest file holds a record for every
-successful warmup request and the files hold still, then notes each file's line count; the aggregation skips those leading lines and leaves
+The servers also append records of the e2e connection warmup's and the warmup pass's
+requests to these files. The harness therefore waits until the census holds a record
+for every successful warmup request and the files hold still, then notes each
+file's line count; the aggregation skips those leading lines and leaves
 them out of the census. Unlike the measured run's census, this one is a failure: if
 the count is not reached within `PERF_METRICS_SETTLE_TIMEOUT`, the test fails rather
 than mixing late warmup records into the breakdown. The log line
-`Time breakdown: excluded connection-warmup records from {...}` prints the counts as
+`Time breakdown: excluded warmup records from {...}` prints the counts as
 JSON. To reproduce the uploaded numbers offline, run
 `time_breakdown_metrics.py --mode e2e --output-dir <test output dir>/perf_metrics
 --drop-warmup-request --leading-lines-to-skip '<that JSON>'`.
@@ -495,7 +516,7 @@ rule and how to force gating back on.
 
 Use this for pre-merge stages whose goal is to catch functional regressions on paths that only had post-merge coverage before. It preserves the data-continuity benefit of running in pre-merge (baselines still update from PR data points) without the flakiness cost of gating on the noisier disagg perf numbers.
 
-**No stage currently sets this flag.** Pre-merge perf-sanity is single-node `ctx_only` only, and every `ctx_only` case gates on perf; the multi-node disagg cases that used it are post-merge only. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
+**No stage currently sets this flag**, and no perf-sanity stage currently runs in pre-merge. The mechanism is kept for the next pre-merge stage that needs non-gating coverage.
 
 Detection is by substring match on `os.environ["stageName"]` inside `test_perf_sanity.py`; no changes to `perf_regression_utils.py`.
 
