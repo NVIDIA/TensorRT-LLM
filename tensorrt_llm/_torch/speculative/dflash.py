@@ -1561,14 +1561,18 @@ class DFlashWorker(SpecWorkerBase):
         the tail reaches the capture buffer.
 
         On the managed pool the block table is indexed by target position, so
-        the tail is stored at ``first_pos``. The private arena numbers every
-        request from 0, where the tail is all the context there is.
+        the tail is stored at ``first_pos``: always on a pool paired with the
+        target's reuse, which holds the prefix's drafter K/V below it, and on
+        an unpaired pool when the worker reads the rebased view, which hides
+        the empty prefix. Otherwise (the private arena, or an unpaired pool
+        read from position 0) every request numbers from 0, where the tail is
+        all the context there is.
         """
         if (
             cur == 0
             and first_pos > 0
             and self._ctx_block_tables is not None
-            and self._ctx_reads_rebased_view
+            and (self._ctx_reuse_addressable or self._ctx_reads_rebased_view)
         ):
             return first_pos
         return cur
