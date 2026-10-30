@@ -31,11 +31,59 @@ CKPT_DIM = 10240
 ENGINE_SLOTS = 461
 #: The engine's `max_num_sequences`: the snapshot buffer's row count.
 ENGINE_SNAPSHOT_ROWS = 32
+#: Row stride of tp1's (and a dep4 rank's) input-projection output `[q|k|v|z|a|b]`.
+CKPT_X_STRIDE = 16480
+
+#: A tp4/tep4 rank's GDN conv width (`[q | k | v]` of 4 key and 12 value heads of 128) and
+#: the row stride of its input-projection output, `[q | k | v | z | a | b]` = 2560 + 1536 +
+#: 12 + 12.
+RANK_DIM = 2560
+RANK_X_STRIDE = 4120
+#: Conv-pool slots of one tep4 rank's stock engine: the larger of the two core-config boots
+#: (1784 and 1874; the count is memory-derived), read off the V2 hybrid manager's final
+#: "PLE state views bound" line on all four ranks (the PLE and GDN pools share one slot
+#: space).
+TEP4_SLOTS = 1874
+#: GDN layers whose conv states share one slot's page in the V2 manager: a layer's view
+#: `[slots, dim, 3]` has slot stride 36 * dim * 3 (276480 at 2560) and layer `i` sits
+#: `i * dim * 3` elements into the page.
+GDN_PAGE_LAYERS = 36
+#: The stock GDN speculative state's snapshot buffer is `[36 layers, max_batch_size,
+#: tokens_per_gen_step, dim, 3]`, a layer's view `[max_batch_size, p, dim, 3]`, with
+#: `intermediate_state_indices = arange(max_batch_size)` (`GDNReplayState.bind`).
+MAX_BATCH_SIZE = 128
 
 
 def _pinned(batch: int) -> tuple[int, ...]:
     """`batch` distinct slots of the engine pool, slot 0 and the last pinned in."""
     return (0,) + tuple(i * 14 + 3 for i in range(1, batch - 1)) + (ENGINE_SLOTS - 1,)
+
+
+def _spread(batch: int, pool_slots: int) -> tuple[int, ...]:
+    """`batch` distinct slots of a `pool_slots` pool: the top slot (the page's highest
+    addresses) and slot 0 first, then a stride-37 walk over the interior (37 is coprime to
+    `pool_slots - 2`), so batch row `b` is not slot `b`."""
+    rest = tuple((i * 37 + 4) % (pool_slots - 2) + 1 for i in range(max(batch - 2, 0)))
+    slots = ((pool_slots - 1, 0) + rest)[:batch]
+    assert len(set(slots)) == batch
+    return slots
+
+
+def _tep4(batch: int, seqlen: int) -> dict:
+    """A tep4 rank's verify call: 2560 channels of x at row stride 4120, the layer's conv
+    view the last of the manager's 36-layer page of 1874 slots, and its snapshots into a
+    layer's `[128, seqlen, 2560, 3]` view of the stock buffer."""
+    return dict(
+        dim=RANK_DIM,
+        x_row_stride=RANK_X_STRIDE,
+        batch=batch,
+        seqlen=seqlen,
+        pool_slots=TEP4_SLOTS,
+        pool_layers=GDN_PAGE_LAYERS,
+        slots=_spread(batch, TEP4_SLOTS),
+        snapshots=MAX_BATCH_SIZE,
+        snapshot_layers=2,
+    )
 
 
 class CausalConv1dTritonUpdate(OpWrapper):
@@ -68,10 +116,13 @@ class CausalConv1dTritonUpdate(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec keys: dim, batch, seqlen, pool_slots, slots, snapshots (rows of the
-    # snapshot buffer), snapshot_steps (the buffer's step depth, default
-    # seqlen). Every cell is the call site: `x` the token-major q|k|v columns
-    # of a [n * p, 16480] projection seen as [n, C, p], bf16, W 4, no bias,
+    # spec keys: dim, x_row_stride (default 16480), batch, seqlen, pool_slots,
+    # pool_layers (the pool the last layer's view of a page this many layers
+    # deep, default 1), slots, snapshots (rows of the snapshot buffer),
+    # snapshot_steps (the buffer's step depth, default seqlen), snapshot_layers
+    # (the buffer the first layer's view of one this many layers deep, default
+    # 1). Every cell is the call site: `x` the token-major q|k|v columns of a
+    # [n * p, x_row_stride] projection seen as [n, C, p], bf16, W 4, no bias,
     # SiLU, pad_slot_id -1, no accepted-token roll.
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
@@ -100,6 +151,23 @@ class CausalConv1dTritonUpdate(OpWrapper):
                 snapshot_steps=8,
             ),
         ),
+        # This target's tep4 member (the MTP unit's): a rank's 4 k / 12 v heads.
+        Cell(
+            why="tep4 verify, 1 row x 4 tok (MTP3) at 2560 / stride 4120, the 1874-slot page",
+            spec=_tep4(1, 4),
+        ),
+        Cell(
+            why="tep4 verify, 128 rows (max_batch_size) x 4 tok (MTP3) at 2560 / stride 4120",
+            spec=_tep4(128, 4),
+        ),
+        Cell(
+            why="tep4 verify, 128 rows x 2 tok (draft length 1) at 2560 / stride 4120",
+            spec=_tep4(128, 2),
+        ),
+        Cell(
+            why="tep4 verify, 128 rows x 8 tok (draft length 7, the envelope's largest step)",
+            spec=_tep4(128, 8),
+        ),
     )
 
     note = """
@@ -116,8 +184,34 @@ class CausalConv1dTritonUpdate(OpWrapper):
     of the projection: 32 rows at seqlen 3 and at seqlen 8 (the widest verify
     step), and 8 rows at seqlen 5 into an 8-step buffer (a buffer deeper than
     seqlen keeps its later steps untouched); bf16, W 4, no bias, SiLU only.
-    Not certified: a contiguous `x`, other seqlens, and pad-sentinel rows
-    (the target never sends one).
+
+    This target's tep4 member (the MTP unit's verify, `DecodeTarget._gdn_verify`):
+    a rank's 4 k / 12 v heads, so `x` is the `[n, 2560, p]` view of the q|k|v
+    columns of the `[n * p, 4120]` in_proj output (strides `(p * 4120, 1,
+    4120)`); the pool is one layer's view of the V2 manager's 36-layer conv page
+    at the measured 1874 slots (slot stride 276480, the last layer's view); the
+    snapshots go to a layer's `[128, p, 2560, 3]` view of the GDN speculative
+    state's `[36, max_batch_size, p, 2560, 3]` buffer with
+    `intermediate_state_indices = arange(n)`. Certified at 1 row x 4 tokens and
+    at 128 rows (max_batch_size) x 2, 4 and 8 tokens (draft lengths 1, 3 and 7;
+    128 x 8 = 1024 rows is the envelope's largest verify step). Measured: the
+    result has one-ulp bf16 differences in 0 / 2 / 4 / 10 elements of 10240 /
+    655360 / 1310720 / 2621440 (relative L2 <= 2.0e-5, cosine >= 0.99999988),
+    the pool and the snapshots are bitwise the reference, and no other layer's
+    conv page or snapshots, nor x's buffer, is written. GB300 graph replay
+    measured 2.0 us a call at 1 x 4 and 4.5 / 5.5 / 8.8 us at 128 x 2 / 4 / 8.
+
+    The kernel is Triton, JIT-compiled at the first call; the cells ran that
+    path on sm_103. The x strides, the seqlen and the snapshot strides are
+    `tl.constexpr`, so each (p, row stride) the target sends is its own
+    compile.
+
+    Not certified: a contiguous `x`, other seqlens, pad-sentinel rows (the
+    target never sends one), a dep4 rank (10240 channels at row stride 16480
+    over its 850-slot page) and tp4 (no MTP member). The tep4 slot count is the
+    larger of two core-config boots (1784 and 1874, memory-derived); no
+    MTP-config tep4 engine has been measured. The kernel addresses a slot by
+    its index alone, so the pool's size does not change the path.
 
     Raise loudly, so not guarded: width 1 (triton CompilationError); a missing
     `intermediate_state_indices` with snapshots and slot indices given.
@@ -134,7 +228,12 @@ class CausalConv1dTritonUpdate(OpWrapper):
     `conv_state` dtype different from `x` is accepted and uncertified.
 
     Hard limits
-      none probed.
+      slot offset  int64 in the kernel (`conv_state_indices` loaded `.to(tl.int64)`):
+                   at the 1874-slot page the last slot's offset is 517.8 M
+                   elements, below 2^31 either way.
+      x offset     `row * stride_x_seq` in int32: 128 x 8 x 4120 = 4.2 M
+                   elements at the envelope, far below 2^31.
+      none probed beyond the cells.
     """
 
     def __call__(
