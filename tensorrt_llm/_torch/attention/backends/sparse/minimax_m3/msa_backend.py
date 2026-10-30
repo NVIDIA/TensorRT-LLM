@@ -980,6 +980,9 @@ class MiniMaxM3MsaSparseAttentionMetadata(TrtllmAttentionMetadata):
         # branch; output_maxscore feeds the indexer's top-k block selection.
         # Its rows are a batch prefix, so their pages prefix msa_kv_indices.
         proxy_rows = self._msa_proxy_plan_rows()
+        if self._msa_index_kv_dtype() == torch.float8_e4m3fn:
+            # The FP8 indexer scores context rows with the CuTe DSL context scorer, which takes no plan.
+            proxy_rows = None
         segmented = proxy_rows is not None and segmented_proxy_plan(
             fmha_sm100,
             qo_lens_cpu[: proxy_rows[1]],
