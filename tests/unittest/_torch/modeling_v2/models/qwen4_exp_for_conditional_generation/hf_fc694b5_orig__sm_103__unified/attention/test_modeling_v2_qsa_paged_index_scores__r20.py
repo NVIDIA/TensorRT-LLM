@@ -8,6 +8,11 @@ int32 block table whose rows are request *slots* -- more of them than the batch 
 seeded permutation -- with shuffled physical pages and `-1` past each
 sequence on the serving layouts, which is what the engine's table carries.
 
+The 4-GPU target's cells add one rank's measured pool: every attention layer's
+plane in one page (the last layer's plane taken), NaN wherever no request maps a
+page, with the pool's first and last page among those the cell reads -- the last
+one past 2^31 elements from the plane's base.
+
 The call has two kernels behind it. `_watch_launches` swaps the two Triton
 entry points for recording proxies that still launch the real kernel, so every
 cell asserts the branch it names.
@@ -39,6 +44,11 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     relu, mean over heads, first group member as key, unscaled,
     1/head_dim scale, block table ignored) were measured 3e5x to 4e6x
     outside it. Columns the reference marks NaN are unspecified and not read.
+
+    The measured-pool cells (GB300): at most 2.9e-6 (the 8192-row chunk ending
+    at 9215, scores to 10.7; 2.4e-6 on the fresh 8192-row prompt, 1.9e-6 on
+    the 1024 verify rows), relative L2 below 6.4e-8, p99.9 9.5e-7, no NaN on a
+    specified column. The unscaled variant lands 76 to 116 away on them.
     """
     assert out.dtype == ref.dtype == torch.float32, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -157,27 +167,39 @@ def _build(spec, seed):
     assert len(mapped) <= slots
 
     slot_of = torch.randperm(slots, generator=torch.Generator().manual_seed(seed))[: len(mapped)]
-    pool_pages = sum(mapped) + 3
-    page_ids = torch.randperm(pool_pages, generator=gen, device=DEV).to(torch.int32)
+    total = sum(mapped)
+    pool_pages = spec.get("pool_pages", total + 3)
+    page_ids = torch.randperm(pool_pages, generator=gen, device=DEV)
+    if "pool_pages" in spec:
+        # A measured pool: its first and last page go to the first request's first two
+        # logical pages, so the cell reads both ends.
+        ends = torch.tensor([pool_pages - 1, 0], device=DEV)
+        page_ids = torch.cat([ends, page_ids[(page_ids != 0) & (page_ids != pool_pages - 1)]])
+    page_ids = page_ids[:total].to(torch.int32)
     block_table = torch.full((slots, spec["pages"]), -1, dtype=torch.int32, device=DEV)
     cursor = 0
     for slot, count in zip(slot_of.tolist(), mapped):
         block_table[slot, :count] = page_ids[cursor : cursor + count]
         cursor += count
     tpb = spec["tokens_per_block"]
-    keys = torch.randn(pool_pages, tpb, 1, head_dim, generator=gen, device=DEV).to(dtype)
     if "page_pad" in spec:
-        # The NVFP4 pool's page: the other index buffers, this layer's, then the position
-        # page, so the plane is a view at page stride buffers * tpb * dim + page_pad.
+        # The trunk pool's page: every attention layer's index buffer (the fp8 and NVFP4
+        # pools then the position page), so one layer's plane is a view at page stride
+        # buffers * tpb * dim + page_pad -- the last layer's here. Pages no request maps
+        # hold NaN: a read of one shows up in the scores.
         buffers, buffer = spec["pool_buffers"], tpb * head_dim
-        page = torch.zeros(pool_pages, buffers * buffer + spec["page_pad"], dtype=dtype, device=DEV)
+        page = torch.full(
+            (pool_pages, buffers * buffer + spec["page_pad"]), float("nan"), dtype=dtype, device=DEV
+        )
         index_cache = page[:, (buffers - 1) * buffer : buffers * buffer].view(
             pool_pages, tpb, 1, head_dim
         )
-        index_cache.copy_(keys)
+        index_cache[page_ids.long()] = torch.randn(
+            total, tpb, 1, head_dim, generator=gen, device=DEV
+        ).to(dtype)
         assert index_cache.stride() == (page.stride(0), head_dim, head_dim, 1)
     else:
-        index_cache = keys
+        index_cache = torch.randn(pool_pages, tpb, 1, head_dim, generator=gen, device=DEV).to(dtype)
 
     if spec["q_layout"] == "scratch_slice":
         # [T, index heads | 1 k | 1 v, D], q is the first `heads` slots.
@@ -198,7 +220,24 @@ def _build(spec, seed):
         compress_ratio=spec["compress_ratio"],
         only_visible_blocks=spec["only_visible_blocks"],
         context_rows=spec["context_rows"],
+        use_pdl=spec.get("use_pdl", False),
+        prefetch=spec.get("prefetch", False),
     )
+
+
+def _assert_reaches_the_pool_ends(args, spec) -> None:
+    """A measured-pool cell scores keys on the pool's first and last page, and the last page
+    lies past 2^31 elements from the plane's base, so a 32-bit offset would wrap."""
+    cache, pool_pages = args["index_cache"], spec["pool_pages"]
+    tpb, dim = spec["tokens_per_block"], spec["head_dim"]
+    page_stride = spec["pool_buffers"] * tpb * dim + spec["page_pad"]
+    assert cache.shape[0] == pool_pages and cache.stride() == (page_stride, dim, dim, 1)
+    assert (pool_pages - 1) * page_stride >= 2**31
+    cr = args["compress_ratio"]
+    logical = (torch.arange(_columns(args), device=DEV) * cr + cr - 1) // tpb
+    pages = args["block_table"][args["request_indices"].long()][:, logical]
+    read = pages[_visible(args)]
+    assert bool((read == 0).any()) and bool((read == pool_pages - 1).any()), "a pool end is unread"
 
 
 def _branch_rule(rows, spec):
@@ -224,12 +263,47 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811
     args = _build(cell.spec, seed=sum(map(ord, cell.why)))
     rows = args["q"].shape[0]
     assert cell.spec["branch"] == _branch_rule(rows, cell.spec), "the cell names the wrong kernel"
+    if "pool_pages" in cell.spec:
+        _assert_reaches_the_pool_ends(args, cell.spec)
     with _watch_launches() as watcher:
         out = op(**args)
         torch.cuda.synchronize()
     assert watcher.branch == cell.spec["branch"]
     assert out.shape == (rows, _columns(args)) and out.dtype == torch.float32
     _compare(out, op.reference(**args))
+
+
+#: The decode and verify cells over a measured pool: the sites the step's CUDA graph captures.
+_CAPTURED = tuple(c for c in op.CELLS if "pool_pages" in c.spec and not c.spec["context_rows"])
+
+
+@pytest.mark.parametrize("cell", _CAPTURED, ids=[c.why[:44] for c in _CAPTURED])
+def test_captured_call_replays_like_eager(cell) -> None:
+    """Capture the call at the cell's batch and flags over the measured pool, rewrite q and
+    every mapped key in place, replay, and match an eager call bitwise on every specified
+    column."""
+    args = _build(cell.spec, seed=sum(map(ord, cell.why)) + 1)
+    visible = _visible(args)
+    table = args["block_table"]
+    mapped = torch.unique(table[table >= 0]).long()
+    warmup = torch.cuda.Stream()
+    warmup.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup):
+        op(**args)
+    torch.cuda.current_stream().wait_stream(warmup)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = op(**args)
+    gen = torch.Generator(device=DEV).manual_seed(7)
+    q, cache = args["q"], args["index_cache"]
+    for trial in range(2):
+        q.copy_(torch.randn(q.shape, generator=gen, device=DEV).to(q.dtype))
+        cache[mapped] = torch.randn(
+            (mapped.numel(), *cache.shape[1:]), generator=gen, device=DEV
+        ).to(cache.dtype)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured[visible], op(**args)[visible]), f"replay {trial}"
 
 
 def test_prefetch_reads_the_fresh_anchor_key_and_q_after_the_wait() -> None:

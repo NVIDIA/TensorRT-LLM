@@ -45,6 +45,36 @@ _WIDTH = 260
 #: `[pages, 32, 1, 128]` at page stride 12 x 4096 + 192 = 49344.
 _TRUNK_POOL_NVFP4 = dict(pool_buffers=12, page_pad=192)
 
+#: Core's plane (bf16 K/V) on every member of the 4-GPU target, as the stock manager allocates it:
+#: the 12 attention layers' `[32, 1, 128]` INDEX_KEY buffers coalesce into one pool, layer k at
+#: byte 8192 k of a 98304-byte page, so one layer's view is `[pages, 32, 1, 128]` at page stride
+#: 12 x 4096 = 49152. Measured on the stock `Qwen4ExpHybridCacheManager` at tep4 and dep4 rank 0.
+#: The cells take the last layer's plane.
+_TRUNK_POOL_BF16 = dict(pool_buffers=12, page_pad=0)
+
+#: Pages in one rank's pool: the stock engine's `maxNumBlocks` at core's configuration (bf16 K/V
+#: and recurrent state, KV fraction 0.6, max_batch_size 128, max_seq_len 9216, the n-gram table
+#: host-resident). The largest measured per member; the index plane shares the attention pages.
+_TEP4_POOL_PAGES = 258983
+_DEP4_POOL_PAGES = 120530
+
+#: `QSAAttentionMetadata.qsa_block_table` is `[max_num_requests, max_blocks_per_seq]`: 128 rows
+#: on a tep4 or dep4 rank (the engine's max_num_requests), and ceil((max_seq_len + generation
+#: headroom) / 32) padded to a multiple of 4 -- 292 at core's 9216, 516 at MTP's 16384.
+_TABLE_SLOTS = 128
+_CORE_TABLE_WIDTH = 292
+_MTP_TABLE_WIDTH = 516
+
+#: The longest histories each envelope serves: the last position below max_seq_len.
+_CORE_LAST_POSITION = 9216 - 1
+_MTP_LAST_POSITION = 16384 - 1
+
+
+def _decode_positions(requests: int, last: int, rows_per_request: int = 1) -> tuple[int, ...]:
+    """Each request's first row position; the first request's last row sits at `last`."""
+    first = last - rows_per_request + 1
+    return (first,) + tuple(1 + (7919 * g) % first for g in range(1, requests))
+
 
 class QsaPagedIndexScores(OpWrapper):
     """Score every causally visible compressed block of each query row.
@@ -120,9 +150,112 @@ class QsaPagedIndexScores(OpWrapper):
                 branch="query_tile",
             ),
         ),
+        # The 4-GPU target's sites over one rank's measured pool: the call-site flags each
+        # site passes (the decode block's PDL launch, with prefetch at up to 4 rows), the
+        # engine's [128, width] table with requests on seeded rows, and pages drawn over the
+        # whole pool, both ends included.
+        Cell(
+            why="tep4 decode: one request at position 9215, prefetch, 258983-page pool",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(1, _CORE_LAST_POSITION),
+                rows_per_request=1,
+                slots=_TABLE_SLOTS,
+                pages=_CORE_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                prefetch=True,
+                branch="row_wise",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="tep4 decode: 128 requests x 1 row, the largest captured batch",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(128, _CORE_LAST_POSITION),
+                rows_per_request=1,
+                slots=_TABLE_SLOTS,
+                pages=_CORE_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                branch="row_wise",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows = 1024, table 516, to 16383",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(128, _MTP_LAST_POSITION, rows_per_request=8),
+                rows_per_request=8,
+                slots=_TABLE_SLOTS,
+                pages=_MTP_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                branch="row_wise",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="tep4 context: one fresh 8192-token prompt (max_num_tokens)",
+            spec=_spec(
+                layout="capture",
+                lengths=(8192,),
+                slots=_TABLE_SLOTS,
+                pages=_CORE_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=True,
+                branch="query_tile",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="dep4 decode: 32 requests x 1 row over a 120530-page pool",
+            spec=_spec(
+                layout="decode",
+                gen_positions=_decode_positions(32, _CORE_LAST_POSITION),
+                rows_per_request=1,
+                slots=_TABLE_SLOTS,
+                pages=_CORE_TABLE_WIDTH,
+                pool_pages=_DEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=False,
+                use_pdl=True,
+                branch="row_wise",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
+        Cell(
+            why="envelope: an 8192-row chunk at positions 1024..9215, table column 287",
+            spec=_spec(
+                layout="decode",
+                gen_positions=(_CORE_LAST_POSITION + 1 - 8192,),
+                rows_per_request=8192,
+                slots=_TABLE_SLOTS,
+                pages=_CORE_TABLE_WIDTH,
+                pool_pages=_TEP4_POOL_PAGES,
+                only_visible_blocks=True,
+                context_rows=True,
+                branch="query_tile",
+                **_TRUNK_POOL_BF16,
+            ),
+        ),
     )
 
     note = """
+    Source: the engine's Triton kernels beside the wrapped callable
+    (`_qsa_paged_index_scores_kernel`, `_qsa_paged_index_scores_qtile_kernel`),
+    JIT-compiled for the running device on first call; the cells ran that JIT
+    path on sm_103.
+
     Metadata consumed: none -- every input is an argument. What the target
     passes: `block_table` is `QSAAttentionMetadata.qsa_block_table` (raw
     pool-page ids, int32, -1 past each sequence); `query_positions` /
@@ -151,7 +284,13 @@ class QsaPagedIndexScores(OpWrapper):
 
     CUDA graphs: the test captures the decode launch (`use_pdl`, `prefetch`) at
     4 rows and replays it after `q` and the anchor keys were rewritten in
-    place; every replay matches an eager call bitwise.
+    place; every replay matches an eager call bitwise. The same holds captured
+    at each measured-pool decode and verify cell (1, 128 and 1024 rows at tep4,
+    32 at dep4, with their sites' flags) after q and every mapped key changed.
+
+    Measured on GB300 at the measured-pool cells: at most 2.9e-6 against the
+    reference (scores to 11.3), relative L2 below 6.4e-8. A cell's peak is 24.5
+    GiB at tep4 (the pool alone is 23.7) and 11.2 GiB at dep4, each under a second.
 
     `prefetch` (with `use_pdl` and `only_visible_blocks`, at generation-sized
     batches) reads the pages and compressed keys before the PDL wait and q after
@@ -160,16 +299,37 @@ class QsaPagedIndexScores(OpWrapper):
     visible block's, at a row whose position ends a group; that key is read again
     after the wait.
 
+    `prefetch` takes effect only where the call is one tile a program -- 256 rows or
+    fewer -- and is otherwise dropped silently: a 1024-row verify step passing it
+    runs the plain PDL kernel.
+
     Every cell runs `only_visible_blocks=True` (the target never passes False),
     4 index heads x 128, compress ratio 4, 32-token pages, bf16 operands, int64
-    positions and int32 request indices. The NVFP4-pool page stride is
-    certified on the row-wise kernel only.
+    positions and int32 request indices. The NVFP4-pool page stride (49344) is
+    certified on the row-wise kernel only, at the tp1 cell's small pool.
 
-    Not certified: more than 8191 rows, tables wider than 260 pages, more than
-    32 table rows, any other head geometry, compress ratio, page size or
-    operand dtype, a context step's mixed request rows, and the `-inf` padded
-    mode. Hard limits: not probed; the largest certified extent is 8191 x 2080
-    output elements.
+    The 4-GPU target's cells run over one rank's measured pool, core's coalesced
+    plane at page stride 49152 (`page_stride` is a compile-time constant, so this
+    is its own kernel variant): 258983 pages at tep4, 120530 at dep4, the plane
+    poisoned with NaN outside the mapped pages, which include page 0 and the
+    pool's last page. The last page's elements sit near 1.27e10 elements from the
+    plane's base: both kernels widen the page and request index to int64 before
+    the stride product, and the cells prove it.
+
+    Index arithmetic left in int32: `row * q_stride_row` and the output's
+    `row * output_stride_row` (program ids times compile-time strides). The output
+    term passes 2^31 at rows x columns >= 2^31 -- 919k rows at 2336 columns; the
+    envelope's 8192 rows x 65568 columns (max_seq_len 262144) is 5.4e8. Positions
+    are read at their own width (int64 here), so the fp32 2^24 bound does not apply.
+
+    Certified: up to 8192 rows (one request's 8192-row context, fresh or ending at
+    position 9215, on the query-tile kernel; 1024 verify rows on the row-wise
+    kernel with 8 tiles a program), tables of 128 x 292 and 128 x 516 pages,
+    positions to 16383. Not certified: more than 8192 rows, tables wider than 516
+    pages (the tune's 262144-token envelope), any other head geometry, compress
+    ratio, page size or operand dtype, a context step's mixed request rows on the
+    pool layout, the fp8/NVFP4 side-planes stride at a measured pool, and the
+    `-inf` padded mode.
     """
 
     def __call__(
