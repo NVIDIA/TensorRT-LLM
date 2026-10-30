@@ -163,6 +163,11 @@ routes is never served by a dense kernel. Both the contiguous prefill path,
 used by diffusion models that keep no KV cache, and the paged generation path
 are provided by the vendored PrimTS kernels.
 
+Both `k_summary` and `v_summary` are arithmetic means over the tokens present
+in each KV block. A partial final block excludes padding from its mean. The
+kernel weights each proxy by its represented token count; do not pass V sums
+or pre-weight the summaries.
+
 This is an attention capability, not a standalone public
 `SparseAttentionConfig` algorithm. A user-facing algorithm must also provide
 the selector, metadata, and backend integration.

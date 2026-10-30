@@ -531,9 +531,8 @@ def get_model_yaml_config(model_label: str,
             }
         },
         # Gemma 4 NVFP4: VSWA (1024-token sliding window) plus per-layer
-        # head_dim 256/512. The FLASHINFER backend is selected by the model's
-        # own get_model_defaults(), so it is not repeated here. KV-cache reuse
-        # is disabled to match the validated accuracy configuration.
+        # head_dim 256/512. KV-cache reuse is disabled to match the validated
+        # accuracy configuration.
         {
             'patterns': ['gemma_4_'],
             'config': {
@@ -954,6 +953,13 @@ def get_model_yaml_config(model_label: str,
                     recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
+    # Gemma4 NVFP4 needs FlashInfer for its 512-wide attention heads on SM107.
+    if (model_label.lower().startswith(
+        ('gemma_4_26b_a4b_nvfp4-', 'gemma_4_31b_it_nvfp4-'))
+            and '-pytorch-' in model_label.lower()
+            and _get_sm_version_safe() == 107):
+        base_config['attn_backend'] = 'FLASHINFER'
+
     # DeepSeek FP8 (block-scale) models on Blackwell (SM100+) must use the
     # DEEPGEMM MoE backend; the default CUTLASS backend's FP8 block-scale path
     # JIT-compiles DeepGEMM kernels that only target Hopper (SM90).
@@ -964,8 +970,9 @@ def get_model_yaml_config(model_label: str,
             moe_config = base_config.setdefault('moe_config', {})
             moe_config.setdefault('backend', 'DEEPGEMM')
 
-    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly; other
-    # GPUs keep the model's own get_model_defaults() choice.
+    # Gemma 4 on SM121 (GB10/Spark) needs FLASHINFER set explicitly. Gemma 4
+    # NVFP4 on SM107 is forced to FLASHINFER above; other GPUs keep the
+    # model's own get_model_defaults() choice.
     if 'gemma_4_' in model_label.lower() and _get_sm_version_safe() == 121:
         base_config['attn_backend'] = 'FLASHINFER'
 

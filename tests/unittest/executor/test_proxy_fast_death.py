@@ -689,6 +689,16 @@ def test_abandon_mpi_pool_threads_tolerates_missing_pool():
     _abandon_mpi_pool_threads(object())  # no _pool attribute
 
 
+def test_pool_session_reports_dead_manager_thread():
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = object.__new__(MpiPoolSession)
+    session.mpi_pool = _Mock(_shutdown=False)
+    session.mpi_pool._pool.thread.is_alive.return_value = False
+    assert isinstance(session.check_worker_error(), RuntimeError)
+    session.mpi_pool = None  # keep __del__ from shutting down the fake pool
+
+
 def test_mark_engine_dead_releases_exit_joins_immediately():
     """Exit-join release must happen at detection time, not at teardown.
 

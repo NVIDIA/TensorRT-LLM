@@ -228,6 +228,7 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_gtest(fmhaHead104Test fmhaHead104Test.cpp)
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

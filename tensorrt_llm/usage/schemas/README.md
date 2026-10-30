@@ -109,7 +109,7 @@ exclude these sentinel values from parallelism averages and distributions.
 | `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
-| `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
+| `deploymentId` | ShortString | Shared disaggregated deployment UUID, normalized to lowercase hex. Empty if unset or invalid. | `""`, `"7cd46f928e324879b82a7cabd3c0ecde"` |
 
 ##### Architecture privacy policy
 
@@ -163,7 +163,7 @@ exit, a terminal report, or telemetry opt-out, with no heartbeat-count limit.
 | `seq` | PositiveInt | Zero-based heartbeat sequence number, saturating at uint32 max. | `0`, `1`, `42` |
 | `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
 | `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
-| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment UUID. | `"7cd46f928e324879b82a7cabd3c0ecde"` |
 
 Every heartbeat also contains the five aggregate LLM lifecycle counters above.
 
@@ -183,7 +183,7 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
 | `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
-| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment UUID. |
 
 Every terminal report also contains the five aggregate LLM lifecycle counters
 above. Delivery is best-effort and waits no more than 0.5 seconds; the local
@@ -310,7 +310,13 @@ over time.
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
 | `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`). |
-| `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
+| `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment UUID across disaggregated workers. Invalid values are reported as an empty ID. |
+
+The disaggregated launcher generates a random deployment UUID and shares it
+through the environment. Custom launchers can also supply a shared UUID via
+`TRTLLM_DISAGG_DEPLOYMENT_ID`. Telemetry validates it with `uuid.UUID` and emits
+32 lowercase hexadecimal characters, or an empty string if invalid. This checks
+format, not who generated the UUID or whether it contains encoded identifying data.
 
 ## For Developers: Adding a New Field
 

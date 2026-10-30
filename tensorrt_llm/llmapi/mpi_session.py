@@ -657,6 +657,18 @@ class MpiPoolSession(MpiSession):
                     return
                 time.sleep(0.05)
 
+    def check_worker_error(self) -> Optional[BaseException]:
+        """Detect a dead pool manager thread, e.g. after a failed spawn.
+
+        mpi4py leaves the futures pending forever in that case.
+        """
+        pool = self.mpi_pool
+        thread = getattr(getattr(pool, '_pool', None), 'thread', None)
+        if thread is None or thread.is_alive() or pool._shutdown:
+            return None
+        return RuntimeError(
+            "MPI pool manager thread died (worker spawn failed?)")
+
     def release_exit_joins(self):
         if self.mpi_pool is not None:
             _abandon_mpi_pool_threads(self.mpi_pool)

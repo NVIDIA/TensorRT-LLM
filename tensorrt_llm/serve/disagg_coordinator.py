@@ -57,6 +57,7 @@ from tensorrt_llm.serve.cluster_storage import (
     ClusterStorage,
     WatchEventType,
     create_cluster_storage,
+    validate_http_cluster_storage_scope,
 )
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -143,6 +144,10 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._config = config
         self._client_factory = client_factory
         self._metadata_config = metadata_config
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname
+            )
         # The coordinator owns routing state, so it builds the owner routers here
         # (is_delegating_client=False): one shared namespace-aware core + a single
         # ZMQ ingest server. Sole place owner routers are created (fleet workers

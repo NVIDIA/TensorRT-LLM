@@ -1791,6 +1791,62 @@ def test_kv_build_failure_reports_safe_pre_submission_failure(monkeypatch) -> No
 
 
 @pytest.mark.cpu_only
+def test_bounce_rejects_unregistered_final_destination_before_build() -> None:
+    rid = 104
+    peer_rank = 2
+    sender = _make_owned_sender()
+    sender._device_id = 0
+    sender._agent = Mock()
+    sender._agent.check_remote_descs.return_value = False
+    sender._bounce = Mock()
+    dealer = Mock()
+    sender._get_result_dealer = Mock(return_value=dealer)
+    task = transfer_mod.KVSendTask(
+        _sole_piece(),
+        DisaggregatedParams(disagg_request_id=rid),
+        slice_id=0,
+    )
+    assert task.begin_physical_operation(peer_rank)
+    sender._sessions = {
+        rid: SimpleNamespace(
+            kv_tasks=[task],
+            lock=threading.Lock(),
+            status=SessionStatus.READY,
+        )
+    }
+    write_meta = transfer_mod.WriteMeta(
+        task=task,
+        expected_transfers=1,
+        peer_name="gen2",
+        peer_rank=peer_rank,
+        peer_endpoint="receiver",
+        unique_rid=rid,
+        src_ptrs=np.array([0x1000], dtype=np.int64),
+        dst_ptrs=np.array([0x2000], dtype=np.int64),
+        sizes=np.array([0x100], dtype=np.int64),
+        dst_device_id=0,
+        slice_id=0,
+        receiver_slice_id=7,
+        is_last_slice=False,
+        bounce_dst_base=0x3000,
+    )
+
+    sender._deliver_kv_to_agent(write_meta)
+
+    peer_name, checked_descs = sender._agent.check_remote_descs.call_args.args
+    assert peer_name == "gen2"
+    assert [(desc.addr, desc.len, desc.device_id) for desc in checked_descs.descs] == [
+        (0x2000, 0x100, 0)
+    ]
+    sender._bounce.build_request.assert_not_called()
+    sender._agent.submit_transfer_requests.assert_not_called()
+    assert task.resources_drained
+    assert task.status == transfer_mod.TaskStatus.ERROR
+    status_code = transfer_mod._KV_RESULT_PREFIX.unpack(dealer.send.call_args.args[0][1])[4]
+    assert transfer_mod._AGENT_RESULT_BY_CODE[status_code] == AgentResult.FAILED
+
+
+@pytest.mark.cpu_only
 def test_owned_kv_build_failure_settles_every_published_peer(monkeypatch) -> None:
     rid = 100
     sender = _make_owned_sender()
@@ -1901,6 +1957,7 @@ def test_ambiguous_sender_result_retains_source_and_reports_in_doubt(
     sender._agent = SimpleNamespace(
         name="nixl",
         submit_transfer_requests=submit,
+        check_remote_descs=lambda _name, _descs: True,
     )
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
@@ -2243,6 +2300,59 @@ def test_sender_physical_operation_rejects_unproven_retirement(submitted: bool) 
         task.retire_unsubmitted_physical_operation(peer_rank)
     with pytest.raises(RuntimeError, match="IN_DOUBT"):
         task.retire_backend_done_physical_operation(peer_rank)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("lookup_raises", [False, True])
+def test_rejected_descriptor_does_not_poison_later_write(lookup_raises: bool) -> None:
+    rejected = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
+    assert rejected.begin_physical_operation(7)
+    sender = _make_owned_sender()
+    sender._shutdown = True
+    status = Mock(wait=Mock(return_value=True))
+    sender._agent = Mock(submit_transfer_requests=Mock(return_value=status))
+    sender._agent.check_remote_descs.side_effect = [
+        RuntimeError("metadata lookup failed") if lookup_raises else False,
+        True,
+    ]
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    with pytest.raises(transfer_mod._TransferNotSubmittedError):
+        sender._submit_transfer(rejected, 7, request)
+    sender._agent.check_remote_descs.assert_called_once_with("peer", request.dst_descs)
+    sender._agent.submit_transfer_requests.assert_not_called()
+    operation = rejected._physical_operations[7]
+    assert operation.state is transfer_mod._PhysicalOperationState.NOT_SUBMITTED
+    assert operation.request is None
+    assert operation.status is None
+    assert rejected.resources_drained
+    assert sender._ownership_poisoned is None
+
+    later = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=13))
+    assert later.begin_physical_operation(8)
+    valid = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    assert sender._submit_transfer(later, 8, valid) == (True, None)
+    sender._agent.submit_transfer_requests.assert_called_once_with(valid)
+    assert later._physical_operations[8].state is transfer_mod._PhysicalOperationState.BACKEND_DONE
+    assert later.resources_drained
+    assert sender._ownership_poisoned is None
+
+
+@pytest.mark.cpu_only
+def test_submission_exception_after_preflight_remains_in_doubt() -> None:
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=12))
+    assert task.begin_physical_operation(7)
+    sender = _make_owned_sender()
+    sender._shutdown = True
+    error = RuntimeError("submission outcome unknown")
+    sender._agent = Mock(
+        check_remote_descs=Mock(return_value=True),
+        submit_transfer_requests=Mock(side_effect=error),
+    )
+    request = Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+    assert sender._submit_transfer(task, 7, request) == (False, str(error))
+    assert sender._ownership_poisoned is error
+    assert task._physical_operations[7].state is transfer_mod._PhysicalOperationState.IN_DOUBT
+    assert not task.resources_drained
 
 
 @pytest.mark.cpu_only
