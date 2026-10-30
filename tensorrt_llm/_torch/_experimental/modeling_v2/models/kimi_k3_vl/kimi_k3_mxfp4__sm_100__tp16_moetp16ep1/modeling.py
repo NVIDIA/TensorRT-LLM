@@ -95,6 +95,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Literal, NamedTuple, Opti
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_mla.decode_view import (
     k3_mla_decode_view,
 )
@@ -159,6 +160,8 @@ from . import weights as _weights
 
 # >>> route B: no KDA verify kernels, and no trtllm::kda_mtp_decode (the built-in KDA verify's)
 # <<< route B
+
+native_ops = load_family_ops(__name__)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -646,13 +649,9 @@ def _apply_attn_res_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_rmsnorm_op = torch.ops.trtllm.k3_attn_res_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    output = attn_res_rmsnorm_op(
+    output = native_ops.k3_attn_res_rmsnorm_fwd(
         layer_kernel,
         block_kernel,
         proj.weight.reshape(-1).to(torch.bfloat16).contiguous(),
@@ -720,14 +719,10 @@ def _apply_attn_res_add_rmsnorm_fused(
     if M > max_fused_tokens or H != 7168 or N > 12:
         _note_attn_res_fusion("add+attn_res+norm", False, M, H, N)
         return None
-    try:
-        attn_res_add_rmsnorm_op = torch.ops.trtllm.k3_attn_res_add_rmsnorm_fwd
-    except (AttributeError, RuntimeError):
-        return None
     layer_kernel = prefix_sum.reshape(M, 1, H).contiguous()
     addend_kernel = addend.reshape(M, 1, H).contiguous()
     block_kernel = block_residual.reshape(K, M, 1, H).contiguous()
-    updated_prefix_sum, output = attn_res_add_rmsnorm_op(
+    updated_prefix_sum, output = native_ops.k3_attn_res_add_rmsnorm_fwd(
         layer_kernel,
         addend_kernel,
         block_kernel,
