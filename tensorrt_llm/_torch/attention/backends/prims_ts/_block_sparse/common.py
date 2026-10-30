@@ -14,7 +14,8 @@
 
 """Dependency-neutral semantic contract for PrimTS block-sparse attention."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import TypeVar
 
 _FINE_KV_BLOCK_SIZES = (8, 16, 32)
 _PREPARED_KV_ROUTE_SIZE = 128
@@ -22,6 +23,47 @@ _MAX_KV_ATOM_SIZE = 64
 _SIGNED_INT32_MAX = (1 << 31) - 1
 _BLOCK_SPARSE_Q_TILE_SIZES = (8, 16, 32, 64, 128)
 _BLOCK_SPARSE_MAX_HEADS_Q_PER_KV = 32
+# Q and KV block sizes of a dense plan that names none; they select the
+# Q128/KV128 Keeps tile.
+_DENSE_Q_BLOCK_SIZE = 128
+_DENSE_KV_BLOCK_SIZE = 128
+# Sage scale slots of the block-sparse attention adapter, in ABI order.
+SAGE_ADAPTER_SLOTS = ("q_scale", "k_scale", "k_summary_scale", "v_scale", "v_mean")
+
+_T = TypeVar("_T")
+
+
+def sage_adapter_slots(values: Mapping[str, _T | None]) -> tuple[_T | None, ...]:
+    """Arrange Sage values named by scale into the adapter slots.
+
+    An absent name leaves its slot ``None``, which the adapter binds as a null
+    pointer.
+    """
+    return tuple(values.get(name) for name in SAGE_ADAPTER_SLOTS)
+
+
+def _resolve_plan_block_sizes(
+    q_block_size: int | None,
+    kv_block_size: int | None,
+    *,
+    use_block_sparse: bool,
+) -> tuple[int, int]:
+    """Return a plan's Q and KV block sizes.
+
+    A block-sparse plan names both, since they give its routes their meaning;
+    a dense plan may omit either, which then takes the dense default.
+    """
+
+    if use_block_sparse:
+        if q_block_size is None or kv_block_size is None:
+            raise ValueError(
+                "q_block_size and kv_block_size are required by a block-sparse plan"
+            )
+        return q_block_size, kv_block_size
+    return (
+        _DENSE_Q_BLOCK_SIZE if q_block_size is None else q_block_size,
+        _DENSE_KV_BLOCK_SIZE if kv_block_size is None else kv_block_size,
+    )
 
 
 def _num_sparse_pattern_heads(
