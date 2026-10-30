@@ -75,6 +75,8 @@ add_th_common_family(
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+target_include_directories(th_common_attention
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 
 target_sources(
   th_common_attention
