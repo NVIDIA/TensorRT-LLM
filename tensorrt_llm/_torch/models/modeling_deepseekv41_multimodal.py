@@ -41,6 +41,9 @@ class DeepseekV41ForConditionalGeneration(MultimodalModelMixin, PreTrainedModel)
     Attention, Engram, and DSpark remain in the text model.
     """
 
+    # The vision encoder calls SDPA directly.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     def __init__(self, model_config: ModelConfig) -> None:
         config = model_config.pretrained_config
         super().__init__(config)

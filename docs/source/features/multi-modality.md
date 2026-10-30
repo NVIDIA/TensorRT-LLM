@@ -27,6 +27,72 @@ TensorRT LLM incorporates some key optimizations to enhance the performance of m
 
 Further optimizations are under development and will be updated as they become available.
 
+## Encoder attention backends
+
+`multimodal_config.encoder_attention_backend` selects a TensorRT-LLM attention backend for each logical encoder. The public values are `VANILLA` (PyTorch scaled dot product attention), `TRTLLM`, and `FLASHINFER`; values are case-insensitive. Image and video inputs share the `vision` encoder.
+
+```yaml
+multimodal_config:
+  encoder_attention_backend:
+    vision: FLASHINFER
+```
+
+The same setting is available in the Python API:
+
+```python
+from tensorrt_llm import LLM
+
+llm = LLM(
+    model="Qwen/Qwen3-VL-8B-Instruct",
+    multimodal_config={"encoder_attention_backend": {"vision": "VANILLA"}},
+)
+```
+
+Omitted entries preserve the model's existing encoder defaults, including inheritance from `attn_backend` where applicable. An encoder override leaves the language model's backend unchanged. Backend availability and supported tensor shapes still depend on the installed kernels and hardware; floating-point differences between backends are expected.
+
+The table covers every registered multimodal model implementation; model aliases share the same declaration. Image/video share `vision`, and `audio` names a separate encoder. "Not supported" means this option cannot change that encoder's attention backend; it does not mean the model or modality is unsupported. Gemma 4 Unified uses encoder-free projections, and Mllama's vision input is not implemented. The CPU registry test checks this table against each model's explicit `supported_encoder_attention_backends` declaration.
+
+<!-- encoder-attention-backends:start -->
+| Model | Logical encoder | Supported backends |
+| --- | --- | --- |
+| `Cosmos3EdgeModel` | `vision` | Not supported |
+| `Cosmos3Model` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `DeepseekV41ForConditionalGeneration` | `vision` | Not supported |
+| `Exaone4_5_ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Gemma3VLM` | `vision` | Not supported |
+| `Gemma4ForConditionalGeneration` | `audio` | Not supported |
+| `Gemma4ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Gemma4UnifiedForConditionalGeneration` | None (encoder-free) | Not supported |
+| `Glm5NextVLM` | `vision` | `TRTLLM` |
+| `HCXVisionForCausalLM` | `vision` | Not supported |
+| `KimiK25ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `KimiK3ForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Llama4ForConditionalGeneration` | `vision` | Not supported |
+| `LlavaNextModel` | `vision` | Not supported |
+| `MiniCPMV4_6Model` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `MiniMaxM3VLForConditionalGeneration` | `vision` | Not supported |
+| `Mistral3VLM` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `MllamaForConditionalGeneration` | `vision` | Not supported |
+| `NemotronHMultimodalModel` | `audio` | Not supported |
+| `NemotronHMultimodalModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Phi4MMForCausalLM` | `audio` | Not supported |
+| `Phi4MMForCausalLM` | `vision` | Not supported |
+| `Qwen2VLModel` | `vision` | Not supported |
+| `Qwen2_5_VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3MoeVLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3_5MoeVLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen3_5VLModel` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Qwen4ExpForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `Step3p7VLForConditionalGeneration` | `vision` | `VANILLA`, `TRTLLM`, `FLASHINFER` |
+| `VilaModel` | `vision` | Not supported |
+| `WhisperForConditionalGeneration` | `audio` | Not supported |
+<!-- encoder-attention-backends:end -->
+
+For MiniCPM-V 4.6, the selection applies to its TensorRT-LLM attention layers; its fixed window-merger attention is unchanged.
+
+Supported entries use TensorRT-LLM's `Attention` and apply encoder overrides explicitly. Other encoders keep their fixed implementation, including Hugging Face attention, direct SDPA, and custom attention paths. Overrides for entries marked "Not supported" fail during initialization, even if the requested value is `VANILLA`. Unknown encoder names and unsupported backends also fail during initialization; Hugging Face `attn_implementation` names are not accepted.
+
 ## Model Support Matrix
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).

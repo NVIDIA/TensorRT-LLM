@@ -1574,3 +1574,60 @@ def test_qwen3vl_vision_block_forward_end_to_end():
         attn_metadata=attn_metadata,
     )
     assert out.shape == hidden.shape
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("decoder_backend", "override"),
+    [("TRTLLM", None), ("TRTLLM", "VANILLA"), ("FLASHINFER", "VANILLA")],
+)
+def test_qwen_encoder_backend_preserves_decoder(decoder_backend: str, override: str | None) -> None:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+    class RecordingVisionEncoder(torch.nn.Module):
+        def __init__(self, model_config: ModelConfig) -> None:
+            super().__init__()
+            self.model_config = model_config
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+    config = ModelConfig(
+        pretrained_config=PretrainedConfig(
+            text_config=PretrainedConfig(dtype=torch.float32),
+            vision_config=PretrainedConfig(),
+        ),
+        attn_backend=decoder_backend,
+        multimodal_config=MultimodalConfig(
+            encoder_attention_backend={"vision": override} if override else None
+        ),
+    )
+    config._frozen = True
+    encoder = Qwen3VisionModelBase(config, RecordingVisionEncoder)
+    assert encoder.visual.model_config.attn_backend == (override or decoder_backend)
+    assert encoder.model_config.extra_attrs is config.extra_attrs
+    assert encoder.model_config._frozen
+    if override is None:
+        assert encoder.model_config is config
+    assert config.attn_backend == decoder_backend
+
+
+@pytest.mark.cpu_only
+def test_qwen_encoder_backend_declarations_preserve_fixed_hf_encoder() -> None:
+    from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
+    from tensorrt_llm._torch.models.modeling_qwen3vl_moe import Qwen3MoeVLModel
+    from tensorrt_llm._torch.pyexecutor.model_loader import (
+        _validate_encoder_attention_backend_support,
+    )
+    from tensorrt_llm.llmapi.llm_args import MultimodalConfig
+
+    public_backends = frozenset({"TRTLLM", "FLASHINFER", "VANILLA"})
+    for model_cls in (Qwen2_5_VLModel, Qwen3VLModel, Qwen3MoeVLModel):
+        assert model_cls.supported_encoder_attention_backends == {"vision": public_backends}
+    assert Qwen2VLModel.supported_encoder_attention_backends == {"vision": frozenset()}
+    with pytest.raises(ValueError, match="vision.*cannot be changed"):
+        _validate_encoder_attention_backend_support(
+            Qwen2VLModel,
+            MultimodalConfig(encoder_attention_backend={"vision": "VANILLA"}),
+        )

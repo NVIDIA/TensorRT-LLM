@@ -798,6 +798,10 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
     `tensorrt_llm/inputs/utils.py`).
     """
 
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"})
+    }
+
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
 
@@ -854,7 +858,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
             vision_model_config = self._get_sub_model_config(
                 model_config_cp,
                 "vision_config",
-                attn_backend="TRTLLM",
+                attn_backend=model_config.get_encoder_attention_backend(
+                    "vision", "TRTLLM"),
                 quant_config=None)
 
             self._vision_tower = modeling_pixtral.PixtralVisionModel(

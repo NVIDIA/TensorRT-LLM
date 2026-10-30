@@ -642,6 +642,10 @@ class LlavaNextVisionModel(nn.Module):
                               content_format=ContentFormat.OPENAI,
                           ))
 class LlavaNextModel(PreTrainedModel):
+
+    # The native vision path does not apply encoder overrides.
+    supported_encoder_attention_backends = {"vision": frozenset()}
+
     config_class = LlavaNextConfig
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

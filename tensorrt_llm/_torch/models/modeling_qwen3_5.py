@@ -743,6 +743,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     decorators (outer arch string + input-processor `model_type`).
     """
 
+    supported_encoder_attention_backends = Qwen3VLModelBase.supported_encoder_attention_backends
+
     supports_encoder_cache = True
 
     @classmethod
@@ -832,6 +834,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
 class Qwen3_5MoeVLModel(_Qwen3_5VLModel):
     """VLM wrapper composing Qwen3 vision encoder with Qwen3.5 MoE text decoder."""
 
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends
+
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
         return _get_qwen35_moe_model_defaults(llm_args)
@@ -854,3 +858,5 @@ class Qwen3_5VLModel(_Qwen3_5VLModel):
     instead of `SparseMoeBlock` (the dense text config has a native `intermediate_size`
     and no `num_experts`).
     """
+
+    supported_encoder_attention_backends = _Qwen3_5VLModel.supported_encoder_attention_backends

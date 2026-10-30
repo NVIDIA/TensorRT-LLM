@@ -955,6 +955,9 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
     ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
+    # Both encoders use Hugging Face implementations.
+    supported_encoder_attention_backends = {"vision": frozenset(), "audio": frozenset()}  # yapf: disable
+
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 

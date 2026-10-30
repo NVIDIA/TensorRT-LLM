@@ -203,6 +203,30 @@ def test_branch_snapshot_field_types(
     assert (not errors) == valid, [error.message for error in errors]
 
 
+@pytest.mark.parametrize(
+    ("backend", "valid"),
+    [
+        ("VANILLA", True),
+        ("TRTLLM", True),
+        ("FLASHINFER", True),
+        ("vanilla", True),
+        ("fLaShInFeR", True),
+        ("VANILLA\n", False),
+        ("SDPA", False),
+        ("FLASH_ATTENTION_2", False),
+        ("unknown", False),
+        (None, False),
+        (1, False),
+    ],
+)
+def test_encoder_attention_backend_schema(
+    schemas: dict[str, dict], backend: object, valid: bool
+) -> None:
+    config = {"multimodal_config": {"encoder_attention_backend": {"vision": backend}}}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
     """Check literal top-level config accesses, without tracing aliases or dynamic keys."""
     function = next(
