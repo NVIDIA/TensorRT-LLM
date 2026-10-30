@@ -2628,7 +2628,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # the rendered tokens the model extension excludes from it.
                 excluded = prompt_tokens_excluded_from_usage(
                     chat_request, resources)
-                return len(rendered.token_ids) - excluded
+                return max(0, len(rendered.token_ids) - excluded)
 
             input_tokens = await asyncio.to_thread(_count)
         except Exception:

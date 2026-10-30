@@ -40,7 +40,6 @@ from pydantic import ValidationError
 
 from tensorrt_llm.inputs.tokenization import tokenize_prompt
 from tensorrt_llm.inputs.utils import (
-    _has_python_chat_template,
     apply_chat_template,
     async_apply_chat_template,
     uses_tokenizer_native_renderer,
@@ -250,23 +249,13 @@ async def render_conversation(
     tokenizer-native renderer's own ids when they are the prompt (see
     :func:`_prompt_is_native_ids`), and the text otherwise.
     """
-    if tokenize:
-        # A tokenizer-native template tokenizes segment by segment, so control-token strings
-        # inside user or tool text stay text. Encoding the finished string would turn them into
-        # special tokens, so keep the tokenizer's own ids when nothing is added after the template.
-        native_ids = (
-            forced_prefix is None
-            and truncate_prompt_tokens is None
-            and _has_python_chat_template(getattr(res.tokenizer, "tokenizer", res.tokenizer))
-        )
-    else:
-        native_ids = prefer_native_ids and _prompt_is_native_ids(
-            res,
-            chat_template=chat_template,
-            forced_prefix=forced_prefix,
-            add_special_tokens=add_special_tokens,
-            truncate_prompt_tokens=truncate_prompt_tokens,
-        )
+    native_ids = (tokenize or prefer_native_ids) and _prompt_is_native_ids(
+        res,
+        chat_template=chat_template,
+        forced_prefix=forced_prefix,
+        add_special_tokens=add_special_tokens,
+        truncate_prompt_tokens=truncate_prompt_tokens,
+    )
     rendered = await async_apply_chat_template(
         **_template_kwargs(
             res,

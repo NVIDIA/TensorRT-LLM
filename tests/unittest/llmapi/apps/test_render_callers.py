@@ -798,15 +798,16 @@ class TestCountTokens:
         )
         assert templated != plain
 
+    @pytest.mark.parametrize("excluded", [2, 1000000])
     def test_the_count_leaves_out_the_tokens_the_usage_leaves_out(
-        self, tokenizer, monkeypatch
+        self, tokenizer, monkeypatch, excluded
     ) -> None:
         from tensorrt_llm.serve import serving_extensions
         from tensorrt_llm.serve.serving_extensions import ServingExtension
 
         class ExcludingExtension(ServingExtension):
             def prompt_tokens_excluded_from_usage(self, request) -> int:
-                return 2
+                return excluded
 
         monkeypatch.setitem(serving_extensions._BY_MODEL_TYPE, MODEL_TYPE, ExcludingExtension())
 
@@ -817,7 +818,7 @@ class TestCountTokens:
             assert response.status_code == 200, response.text
             return response.json()["input_tokens"]
 
-        assert count(model_type=MODEL_TYPE) == count() - 2
+        assert count(model_type=MODEL_TYPE) == max(0, count() - excluded)
         # A server-level chat template may end differently, so its usage is not adjusted.
         assert count(model_type=MODEL_TYPE, chat_template=SERVER_TEMPLATE) == count(
             chat_template=SERVER_TEMPLATE
