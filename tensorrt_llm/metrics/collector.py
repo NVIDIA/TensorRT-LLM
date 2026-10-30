@@ -16,7 +16,13 @@
 
 import math
 import time
-from typing import Dict, List, Optional, Union
+from functools import partial
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from prometheus_client import CollectorRegistry
+
+    from tensorrt_llm.llmapi.llm_args import BaseLlmArgs
 
 from .enums import MetricNames
 
@@ -116,6 +122,36 @@ class MetricsCollector:
     labelname_cache_level = "cache_level"
     labelname_cache_tier = "cache_tier"
 
+    @classmethod
+    def from_args(
+        cls,
+        args: "BaseLlmArgs",
+        model: str,
+        *,
+        registry: "Optional[CollectorRegistry]" = None,
+        gauge_multiprocess_mode: str = "all",
+    ) -> "MetricsCollector":
+        """Build a collector using the shared serving labels and bucket configuration."""
+        config = getattr(args, "prometheus_metrics_config", None)
+        buckets = {
+            name: getattr(config, name, None)
+            for name in ("e2e_request_latency_buckets",
+                         "time_to_first_token_buckets",
+                         "time_per_output_token_buckets",
+                         "request_queue_time_buckets",
+                         "request_prefill_time_buckets",
+                         "request_decode_time_buckets",
+                         "request_inference_time_buckets")
+        }
+        return cls(
+            {
+                "model_name": model,
+                "engine_type": args.backend or "unknown"
+            },
+            **buckets,
+            registry=registry,
+            gauge_multiprocess_mode=gauge_multiprocess_mode)
+
     def __init__(
         self,
         labels: Dict[str, str],
@@ -126,8 +162,17 @@ class MetricsCollector:
         request_prefill_time_buckets: Optional[List[float]] = None,
         request_decode_time_buckets: Optional[List[float]] = None,
         request_inference_time_buckets: Optional[List[float]] = None,
+        registry: "Optional[CollectorRegistry]" = None,
+        gauge_multiprocess_mode: str = "all",
     ) -> None:
-        from prometheus_client import Counter, Gauge, Histogram
+        from prometheus_client import REGISTRY, Counter, Gauge, Histogram
+        self._registry = REGISTRY if registry is None else registry
+        self._gauge_multiprocess_mode = gauge_multiprocess_mode
+        Counter = partial(Counter, registry=self._registry)
+        Histogram = partial(Histogram, registry=self._registry)
+        Gauge = partial(Gauge,
+                        registry=self._registry,
+                        multiprocess_mode=gauge_multiprocess_mode)
         _bucket_params = {
             "e2e_request_latency_buckets": e2e_request_latency_buckets,
             "time_to_first_token_buckets": time_to_first_token_buckets,
@@ -530,6 +575,95 @@ class MetricsCollector:
             documentation="Total request errors, labeled by HTTP status code.",
             labelnames=self.labels_with_http_code.keys())
 
+    def log_config_from_args(self, args: "BaseLlmArgs", model: str) -> None:
+        """Extract configuration from generator args and log as Prometheus info gauges."""
+        from tensorrt_llm.logger import logger
+
+        # Model config
+        model_config = {
+            "model": str(args.model),
+            "served_model_name": model,
+            "dtype": str(args.dtype),
+        }
+        quant_config = getattr(args, "quant_config", None)
+        if quant_config is not None:
+            quant_algo = getattr(quant_config, "quant_algo", None)
+            model_config["quantization"] = str(
+                quant_algo) if quant_algo else "none"
+        else:
+            model_config["quantization"] = "none"
+        max_seq_len = getattr(args, "max_seq_len", None)
+        if max_seq_len is not None:
+            model_config["max_model_len"] = str(max_seq_len)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                model_config["gpu_type"] = torch.cuda.get_device_name(0)
+        except (ImportError, RuntimeError) as e:
+            logger.debug("Could not detect GPU type for config metrics: %s", e)
+
+        # Parallel config — prefer parallel_config from generator args
+        # for accurate values including cp_size and world_size.
+        par_cfg = getattr(args, "parallel_config", None)
+        if par_cfg is not None:
+            tp_size = getattr(par_cfg, "tp_size", 1) or 1
+            pp_size = getattr(par_cfg, "pp_size", 1) or 1
+            cp_size = getattr(par_cfg, "cp_size", 1) or 1
+            world_size = getattr(par_cfg, "world_size",
+                                 tp_size * pp_size * cp_size)
+        else:
+            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
+            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
+            cp_size = 1
+            world_size = tp_size * pp_size * cp_size
+        parallel_config = {
+            "tensor_parallel_size": str(tp_size),
+            "pipeline_parallel_size": str(pp_size),
+            "context_parallel_size": str(cp_size),
+            "gpu_count": str(world_size),
+        }
+        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
+            getattr(args, "moe_expert_parallel_size", None)
+        if ep_size is not None and ep_size > 0:
+            parallel_config["expert_parallel_size"] = str(ep_size)
+
+        # Speculative decoding config
+        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
+            args, "decoding_config", None)
+        speculative_config = None
+        if spec_config_obj is not None:
+            speculative_config = {"spec_enabled": "true"}
+            decoding_type = getattr(spec_config_obj, "decoding_type", None)
+            if decoding_type is not None:
+                speculative_config["spec_method"] = str(decoding_type)
+            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
+            if max_draft_len is not None:
+                speculative_config["spec_num_tokens"] = str(max_draft_len)
+            draft_model = getattr(spec_config_obj, "speculative_model", None)
+            if draft_model is not None:
+                speculative_config["spec_draft_model"] = str(draft_model)
+
+        # KV cache config
+        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
+        kv_cache_config = None
+        if kv_cache_config_obj is not None:
+            kv_cache_config = {}
+            for field in ("page_size", "enable_block_reuse",
+                          "enable_partial_reuse", "free_gpu_memory_fraction"):
+                val = getattr(kv_cache_config_obj, field, None)
+                if val is not None:
+                    kv_cache_config[field] = str(val)
+            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
+            if kv_dtype is not None:
+                kv_cache_config["cache_dtype"] = str(kv_dtype)
+
+        self.log_config_info(
+            model_config=model_config,
+            parallel_config=parallel_config,
+            speculative_config=speculative_config,
+            kv_cache_config=kv_cache_config if kv_cache_config else None,
+        )
+
     def log_config_info(
             self,
             model_config: Optional[Dict[str, str]] = None,
@@ -548,6 +682,9 @@ class MetricsCollector:
             kv_cache_config: KV cache configuration labels (page_size, enable_block_reuse, etc.)
         """
         from prometheus_client import Gauge
+        Gauge = partial(Gauge,
+                        registry=self._registry,
+                        multiprocess_mode=self._gauge_multiprocess_mode)
 
         if model_config:
             info_labels = {**self.labels, **model_config}

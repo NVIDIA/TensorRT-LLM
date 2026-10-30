@@ -39,7 +39,7 @@ from .capabilities import supported_guides
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
 from .errors import AbortFailedError
 from .kv_events import data_parallel_size, events_config
-from .request_mapping import conversation_affinity_enabled
+from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
 
 __all__ = ["OpenEngineControlServicer"]
 
@@ -289,7 +289,7 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             served_model_name=self._model,
             # Without a tokenizer the input processor rejects every string prompt.
             supports_text_input=getattr(self._llm, "tokenizer", None) is not None,
-            supports_token_ids_input=True,
+            supports_token_ids_input=token_ids_input_supported(self._llm),
             # Generate rejects `lora_name` even on an enable_lora build.
             supports_lora=False,
             supports_multimodal=bool(media_modalities),
@@ -476,6 +476,15 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     async def _run_inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
         from tensorrt_llm.sampling_params import SamplingParams
 
+        if not token_ids_input_supported(self._llm):
+            return lifecycle_pb2.HealthCheck(
+                name="inference_probe",
+                state=lifecycle_pb2.HEALTH_STATE_READY,
+                message=(
+                    "probe not applicable: model does not accept token-ID input; "
+                    "inference liveness was not tested"
+                ),
+            )
         handle = None
         reservation = None
         # Counted by GetLoad and reachable by Abort(all_requests): a probe

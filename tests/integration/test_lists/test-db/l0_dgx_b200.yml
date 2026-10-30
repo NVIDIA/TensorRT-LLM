@@ -36,6 +36,8 @@ l0_dgx_b200:
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_eviction
   # ------------- VisualGen multi-GPU tests ---------------
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_lpips_against_golden[bf16-2gpu]
+  - examples/visual_gen/test_visual_gen_ltx23.py::test_ltx23_retake_lpips_against_golden[bf16-2gpu]
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[VANILLA-2-1]
   - unittest/_torch/visual_gen/multi_gpu/test_minimax_h3_parallel.py::test_h3_tensor_parallel[FA4-2-1]
@@ -241,6 +243,7 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/multi_gpu/test_flux2_transformer_parallel.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_tp.py
   - unittest/_torch/visual_gen/multi_gpu/test_flux_ulysses.py
+  - unittest/_torch/visual_gen/multi_gpu/test_block_causal_attention_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_async_ulysses.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_parallel_vae.py
   - unittest/_torch/visual_gen/multi_gpu/test_ltx2_ulysses.py

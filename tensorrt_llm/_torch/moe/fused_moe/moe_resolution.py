@@ -139,7 +139,7 @@ IMPL_PRIORITY: Tuple[MoEImplClass, ...] = (
 # DeepGEMM families, so a run reports one name either way.
 BACKEND_FAMILY: Dict[str, FrozenSet[MoEImplClass]] = {
     # Includes the two ``fp8_block_scales`` leaves, whose technique is not
-    # ``cutlass``: the literal serves FP8 block scales on SM90 and SM120.
+    # ``cutlass``: the literal serves FP8 block scales on SM90 and SM120/121.
     "CUTLASS": frozenset(CUTLASS_LEAVES),
     "VANILLA": frozenset({VanillaMoE}),
     "MARLIN": frozenset({MarlinCudaNvfp4Impl, MarlinCudaW4a16Nvfp4Impl}),

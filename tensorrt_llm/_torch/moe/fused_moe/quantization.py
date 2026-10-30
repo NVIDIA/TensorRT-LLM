@@ -32,7 +32,8 @@ from tensorrt_llm._torch.modules.linear import (TensorParallelMode,
 from tensorrt_llm._torch.utils import (ActivationType,
                                        replace_parameter_and_save_metadata,
                                        swizzle_sf, unswizzle_sf)
-from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
+from tensorrt_llm._utils import (get_sm_version, is_device_integrated,
+                                 is_sm_100f, is_sm_120f)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.functional import \
@@ -1466,7 +1467,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def _needs_e8m0_resmooth(self):
-        return is_sm_100f() or get_sm_version() == 120
+        return is_sm_100f() or is_sm_120f()
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
         if self._needs_e8m0_resmooth():

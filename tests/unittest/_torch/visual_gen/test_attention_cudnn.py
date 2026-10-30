@@ -25,7 +25,11 @@ from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import (
     _quantize_mxfp8_qk,
     _quantize_mxfp8_v,
 )
-from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import (
+    AttentionTensorLayout,
+    as_fused_qkv,
+    is_fused_qkv,
+)
 from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
 
 # Quantization dtype -> quant_attention_config accepted by AttentionConfig.
@@ -221,14 +225,14 @@ def test_cudnn_fp8_attention_with_fused_qkv(num_kv_heads):
         x.view(batch, seq_len, -1, head_dim) for x in qkv.split([q_dim, kv_dim, kv_dim], dim=-1)
     )
 
-    assert CuDNNAttention._is_fused_qkv(q, k, v)
-    fused_qkv = CuDNNAttention._as_fused_qkv(q, k, v)
+    assert is_fused_qkv(q, k, v)
+    fused_qkv = as_fused_qkv(q, k, v)
     assert fused_qkv.data_ptr() == qkv.data_ptr(), "fused view must alias, not copy"
     torch.testing.assert_close(fused_qkv, qkv, atol=0.0, rtol=0.0)
 
     # Cloning breaks the shared storage, so equal values take the per-tensor path.
     separate = tuple(x.contiguous() for x in (q, k, v))
-    assert not CuDNNAttention._is_fused_qkv(*separate)
+    assert not is_fused_qkv(*separate)
 
     attention = CuDNNAttention(
         num_heads=num_heads,

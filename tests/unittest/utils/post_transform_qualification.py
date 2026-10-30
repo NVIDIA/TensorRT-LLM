@@ -18,9 +18,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 
 import torch
 from torch import nn
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -32,8 +34,67 @@ from tensorrt_llm._torch.weight_sharing import (
 ModelFactory = Callable[[], nn.Module]
 ModelQualifier = Callable[[nn.Module], PostTransformQualificationDecision]
 ReceiverPreparer = Callable[[nn.Module, nn.Module], None]
+ProducerPreparer = Callable[[nn.Module], None]
 StateProbe = Callable[[nn.Module], object]
 OutputProbe = Callable[[nn.Module], object]
+
+
+class AllReduceStub(nn.Module):
+    """Identity all-reduce for simulating one tensor-parallel rank in a single process."""
+
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        super().__init__()
+
+    def uses_nccl_symmetric_memory_window(self) -> bool:
+        """Report that no NCCL symmetric memory window is in use."""
+        return False
+
+    def forward(self, tensor: torch.Tensor, **_kwargs: object) -> torch.Tensor:
+        """Return the local partial result unchanged."""
+        return tensor
+
+
+def mx_canonical_parameter_catalog(
+    model: nn.Module,
+) -> dict[str, tuple[int, tuple[int, ...], torch.dtype]]:
+    """Mirror the parameter view that MX registers and transfers, without importing MX.
+
+    MX walks `named_parameters(remove_duplicate=False)`, skips the runtime
+    alias names, and deduplicates by storage.
+    """
+    catalog = {}
+    seen_storages = set()
+    runtime_alias_components = {"next_attn", "next_layer_layernorm"}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        storage = (parameter.device.type, parameter.device.index, parameter.data_ptr())
+        if runtime_alias_components.intersection(name.split(".")):
+            continue
+        if storage in seen_storages:
+            continue
+        seen_storages.add(storage)
+        catalog[name] = (parameter.data_ptr(), tuple(parameter.shape), parameter.dtype)
+    return catalog
+
+
+def module_state_snapshot(model: nn.Module) -> dict[str, object]:
+    """Snapshot the non-tensor state of every module for a state probe.
+
+    Captures scalar, string, enum, and `None` attributes of each module and the
+    contents of every Hugging Face config that a module holds. A staged
+    receiver never runs `load_weights()`, so any of this state that only the
+    load path sets differs from a producer prepared with `prepare_producer`.
+    """
+    state: dict[str, object] = {}
+    seen_configs: set[int] = set()
+    for module_name, module in model.named_modules():
+        for attribute, value in vars(module).items():
+            key = f"{module_name}.{attribute}"
+            if isinstance(value, (bool, int, float, str, Enum, type(None))):
+                state[key] = value
+            elif isinstance(value, PretrainedConfig) and id(value) not in seen_configs:
+                seen_configs.add(id(value))
+                state[key] = value.to_dict()
+    return state
 
 
 def copy_post_transform_parameters(producer: nn.Module, receiver: nn.Module) -> None:
@@ -86,6 +147,11 @@ class PostTransformQualificationCase:
     `prepare_receiver` simulates installation of a producer's post-transform
     tensors when a family needs value-level coverage. A real MX donor/receiver
     test is still required before enabling a production profile.
+
+    `prepare_producer`, when set, runs the family's real checkpoint load path
+    on the producer before its full post-load walk. The receiver never loads,
+    as on a staged MX receiver, so the state and output probes then also cover
+    any state that only `load_weights()` or the weight mapper sets.
     """
 
     profile_id: str
@@ -95,6 +161,7 @@ class PostTransformQualificationCase:
     state_probes: tuple[tuple[str, StateProbe], ...]
     output_probes: tuple[tuple[str, OutputProbe], ...]
     prepare_receiver: ReceiverPreparer = copy_post_transform_parameters
+    prepare_producer: ProducerPreparer | None = None
 
     def __post_init__(self) -> None:
         if not self.profile_id:
@@ -228,6 +295,8 @@ def assert_post_transform_lifecycle_equivalent(
     )
 
     transform_calls = _install_transform_call_recorders(receiver)
+    if case.prepare_producer is not None:
+        case.prepare_producer(producer)
     ModelLoader._walk_full_post_load(producer)
     ModelLoader._setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)

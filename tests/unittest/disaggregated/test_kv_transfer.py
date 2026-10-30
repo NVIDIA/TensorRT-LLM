@@ -2247,5 +2247,284 @@ def test_shutdown_setup_allows_collection_without_worker_cuda_context() -> None:
         _shutdown_transfer_worker_setup(healthy)
 
 
+def _helix_kv_write_meta_block_pairs(src_table, dst_table, cp_rank, cp_size, prompt_len, tpb):
+    """Run Sender._build_kv_write_meta for one Helix receiver; return (src, dst) block pairs.
+
+    Block ids stand in for region pointers, so each emitted fragment pair is the
+    (sender block, receiver block) the real routing selected.
+    """
+    peer_ri = SimpleNamespace(
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dp_rank=0,
+        device_id=0,
+        instance_name="gen",
+        instance_rank=cp_rank,
+        self_endpoint="gen-endpoint",
+    )
+    self_ri = SimpleNamespace(cp_size=1, cp_rank=0)
+
+    class _BlockExtractor:
+        def __init__(self, kind):
+            self.page_table = SimpleNamespace(
+                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=kind)}
+            )
+
+        def extract(self, block_ids, layer_group, pool_idx):
+            return np.asarray(block_ids, dtype=np.int64)
+
+    class _IdentityMapper:
+        def map(self, src_region, dst_region):
+            return SimpleNamespace(
+                src=SimpleNamespace(memory=SimpleNamespace(ptrs=src_region, bytes_per_region=1)),
+                dst=SimpleNamespace(memory=SimpleNamespace(ptrs=dst_region)),
+            )
+
+    registrar = SimpleNamespace(
+        self_rank_info=self_ri,
+        self_extractor=_BlockExtractor(CacheKind.PAGED),
+        get_peer_rank_info=lambda name, rank: peer_ri,
+        get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
+        peer_extractor=lambda name, rank: _BlockExtractor(CacheKind.PAGED),
+        get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
+        should_send_pool=lambda targets, ri, lg, pi: True,
+        get_kv_map=lambda ri, src, dst: _IdentityMapper(),
+    )
+    task = SimpleNamespace(
+        _chunk=SimpleNamespace(
+            token_range=SimpleNamespace(start=0, end=prompt_len),
+            block_ids_per_layer_groups={0: np.asarray(src_table, dtype=np.int64)},
+            excluded_pool_views=(),
+            is_last=True,
+        ),
+        _prompt_len=prompt_len,
+        _perf_timer=None,
+        _unique_rid=1,
+        slice_id=0,
+    )
+    req_info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=cp_rank,
+        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
+        dst_start_token=None,
+        slice_id=0,
+        bounce_dst_base=None,
+    )
+    meta = transfer_mod.Sender._build_kv_write_meta(
+        SimpleNamespace(_registrar=registrar), task, req_info
+    )
+    return list(zip(meta.src_ptrs.tolist(), meta.dst_ptrs.tolist()))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("prompt_len", [863, 1030, 1401])
+def test_helix_windowed_hp_tail_routes_to_last_page_owner(prompt_len):
+    """A windowed (HP tail ring) block reaches only the Helix rank owning its ordinal.
+
+    The context side holds just the last pages of a windowed layer group, as a
+    positional table with -1 holes. Every Helix generation rank owns the global
+    block ordinals congruent to its CP rank; the last page must land on rank
+    ``(num_blocks - 1) % cp_size`` at local ordinal ``(num_blocks - 1) // cp_size``.
+    """
+    tpb, cp_size, window = 128, 8, 21
+    num_blocks = (prompt_len + tpb - 1) // tpb
+    first_held = max(0, (prompt_len - window) // tpb)
+    src_table = [1000 + o if o >= first_held else -1 for o in range(num_blocks)]
+    routed = {}
+    for cp_rank in range(cp_size):
+        num_local = len(range(cp_rank, num_blocks, cp_size))
+        dst_table = [5000 + cp_rank * 100 + local for local in range(num_local)]
+        routed[cp_rank] = _helix_kv_write_meta_block_pairs(
+            src_table, dst_table, cp_rank, cp_size, prompt_len, tpb
+        )
+
+    for cp_rank, pairs in routed.items():
+        expected = [
+            (1000 + o, 5000 + cp_rank * 100 + o // cp_size)
+            for o in range(first_held, num_blocks)
+            if o % cp_size == cp_rank
+        ]
+        assert pairs == expected
+    last = num_blocks - 1
+    owner = last % cp_size
+    assert (1000 + last, 5000 + owner * 100 + last // cp_size) in routed[owner]
+
+
+def _helix_ring_write_meta(
+    src_table, dst_table, cp_rank, cp_size, prompt_len, tpb, mapper, src_base, dst_base
+):
+    """Run Sender._build_kv_write_meta for a ring view; return the write meta.
+
+    Block ``b`` of each side lives at ``base + b * 1_000_000``.
+    """
+    peer_ri = SimpleNamespace(
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dp_rank=0,
+        device_id=0,
+        instance_name="gen",
+        instance_rank=cp_rank,
+        self_endpoint="gen-endpoint",
+    )
+
+    class _PtrExtractor:
+        def __init__(self, base):
+            self.base = base
+            self.page_table = SimpleNamespace(
+                tokens_per_block=tpb, layer_groups={0: SimpleNamespace(kind=CacheKind.PAGED)}
+            )
+
+        def extract(self, block_ids, layer_group, pool_idx):
+            ptrs = self.base + np.asarray(block_ids, dtype=np.int64) * 1_000_000
+            return SimpleNamespace(memory=SimpleNamespace(ptrs=ptrs))
+
+    registrar = SimpleNamespace(
+        self_rank_info=SimpleNamespace(cp_size=1, cp_rank=0),
+        self_extractor=_PtrExtractor(src_base),
+        get_peer_rank_info=lambda name, rank: peer_ri,
+        get_peer_overlap=lambda ri, dp_rank: SimpleNamespace(ranks=[0]),
+        peer_extractor=lambda name, rank: _PtrExtractor(dst_base),
+        get_pool_mapping=lambda ri: {(0, 0): (0, 0)},
+        should_send_pool=lambda targets, ri, lg, pi: True,
+        get_kv_map=lambda ri, src, dst: mapper,
+    )
+    task = SimpleNamespace(
+        _chunk=SimpleNamespace(
+            token_range=SimpleNamespace(start=0, end=prompt_len),
+            block_ids_per_layer_groups={0: np.asarray(src_table, dtype=np.int64)},
+            excluded_pool_views=(),
+            is_last=True,
+        ),
+        _prompt_len=prompt_len,
+        _perf_timer=None,
+        _unique_rid=1,
+        slice_id=0,
+    )
+    req_info = SimpleNamespace(
+        instance_name="gen",
+        instance_rank=cp_rank,
+        block_ids_per_layer_groups={0: np.asarray(dst_table, dtype=np.int64)},
+        dst_start_token=None,
+        slice_id=0,
+        bounce_dst_base=None,
+    )
+    return transfer_mod.Sender._build_kv_write_meta(
+        SimpleNamespace(_registrar=registrar), task, req_info
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("prompt_len", [863, 1030, 1401, 1024, 1027])
+@pytest.mark.parametrize("src_slots,dst_slots", [(16, 21), (21, 16), (16, 16)])
+def test_helix_hp_ring_moves_tail_positions_between_ring_sizes(prompt_len, src_slots, dst_slots):
+    """Each retained HP position lands in its slot of the receiver's ring.
+
+    A context worker without speculative decoding keeps a 16-slot ring while a
+    generation worker with five draft tokens keeps 21 slots, so the same global
+    position ``p`` sits in slot ``p % 16`` on one side and ``p % 21`` on the
+    other. The transfer must move every position both rings retain, slot by
+    slot, to the Helix rank that owns its page.
+    """
+    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import RingMapper
+
+    tpb, cp_size, slot_bytes = 128, 8, 4
+    layer_offsets = np.array([0, 4096], dtype=np.int64)
+    mapper = RingMapper(
+        layer_offsets,
+        layer_offsets + 8,
+        slot_bytes=slot_bytes,
+        src_num_slots=src_slots,
+        dst_num_slots=dst_slots,
+    )
+    src_base, dst_base = 1 << 40, 1 << 41
+    num_blocks = (prompt_len + tpb - 1) // tpb
+    window = max(src_slots, dst_slots)
+    first_held = max(0, (prompt_len - window) // tpb)
+    src_table = [10 + o if o >= first_held else -1 for o in range(num_blocks)]
+
+    moved = {}
+    for cp_rank in range(cp_size):
+        local_ordinals = list(range(cp_rank, num_blocks, cp_size))
+        dst_table = [
+            20 + local if o >= first_held else -1 for local, o in enumerate(local_ordinals)
+        ]
+        meta = _helix_ring_write_meta(
+            src_table, dst_table, cp_rank, cp_size, prompt_len, tpb, mapper, src_base, dst_base
+        )
+        for src, dst, size in zip(meta.src_ptrs, meta.dst_ptrs, meta.sizes):
+            assert size % slot_bytes == 0
+            for i in range(size // slot_bytes):
+                moved[int(src) + i * slot_bytes] = (cp_rank, int(dst) + i * slot_bytes)
+
+    retained = min(src_slots, dst_slots)
+    expected = {}
+    for p in range(max(0, prompt_len - retained), prompt_len):
+        ordinal = p // tpb
+        owner = ordinal % cp_size
+        for layer, layer_offset in enumerate(layer_offsets):
+            src = (
+                src_base + (10 + ordinal) * 1_000_000 + layer_offset + (p % src_slots) * slot_bytes
+            )
+            dst = (
+                dst_base
+                + (20 + ordinal // cp_size) * 1_000_000
+                + layer_offset
+                + 8
+                + (p % dst_slots) * slot_bytes
+            )
+            expected[int(src)] = (owner, int(dst))
+    assert moved == expected
+
+
+@pytest.mark.cpu_only
+def test_failed_write_build_reports_failure_to_the_receiver():
+    """A write that cannot be built still gives its receiver a terminal result.
+
+    The receiver waits for one result from every writer it asked. When the
+    sender cannot build the write (here a geometry mismatch), the request
+    must fail at once instead of waiting out its KV transfer timeout.
+    """
+    import queue
+
+    sender = object.__new__(transfer_mod.Sender)
+    sender._enforce_physical_ownership = False
+    sender._instance_rank = 3
+    sender._num_threads = 1
+    sender._send_task_queues = [queue.Queue()]
+    sender._registrar = SimpleNamespace(
+        get_peer_rank_info=lambda name, rank: SimpleNamespace(self_endpoint="gen-endpoint")
+    )
+
+    def _raise(task, info):
+        raise ValueError("Replicated cache region size mismatch: local=18432, peer=24192")
+
+    sender._build_kv_write_meta = _raise
+    task = transfer_mod.KVSendTask(
+        Chunk(
+            block_ids_per_layer_groups=[[0]],
+            kind_per_layer_group=[CacheKind.PAGED],
+            token_range=TokenRange(start=0, end=128),
+            is_last=True,
+        ),
+        DisaggregatedParams(disagg_request_id=42),
+        slice_id=0,
+    )
+    task._unique_rid = 42
+    info = SimpleNamespace(instance_name="gen", instance_rank=5, unique_rid=42, slice_id=0)
+
+    with pytest.raises(ValueError, match="size mismatch"):
+        sender._dispatch_task_to_peer(task, info)
+
+    endpoint, message = sender._send_task_queues[0].get_nowait()
+    assert endpoint == "gen-endpoint"
+    assert message[0] == transfer_mod.MessageType.KV_AGENT_RESULT
+    peer_rank, rid, slice_id, is_last, status, size = transfer_mod._KV_RESULT_PREFIX.unpack(
+        message[1]
+    )
+    assert (peer_rank, rid, slice_id, is_last, size) == (3, 42, 0, True, 0)
+    assert status == transfer_mod._AGENT_RESULT_CODE[transfer_mod.AgentResult.FAILED]
+    assert task.status == transfer_mod.TaskStatus.ERROR
+
+
 if __name__ == "__main__":
     test_transfer_worker_v2(1, 1, False, 1, 1, False, False)
