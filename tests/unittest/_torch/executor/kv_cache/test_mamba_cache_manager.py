@@ -5623,6 +5623,7 @@ def _kda_replay_slot(mgr, slot):
         (KimiK3HybridCacheManager, False),
         (KimiK3HybridCacheManager, True),
         (Glm5NextCacheManager, False),
+        (Glm5NextCacheManager, True),
     ],
 )
 def test_v2_kda_replay_suspended_request_resumes_from_its_v2_states(

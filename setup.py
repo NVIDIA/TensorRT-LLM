@@ -216,6 +216,9 @@ package_data += [
     'grpc/openengine/_generated/*.pyi',
     'grpc/openengine/proto/manifest.json',
     'grpc/openengine/proto/openengine/v1/*.proto',
+    # CUDA sources a modeling_v2 target compiles at first use (and their vendored dependencies)
+    '_torch/_experimental/modeling_v2/models/*/*/kernels/csrc/**/*',
+    '_torch/_experimental/modeling_v2/models/*/*/kernels/third_party/**/*',
 ]
 
 

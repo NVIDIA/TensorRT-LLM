@@ -8,7 +8,7 @@ from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 import torch
-from transformers import AutoConfig, PretrainedConfig
+from transformers import AutoConfig, BatchEncoding, PretrainedConfig
 
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import Glm5NextMamba2Metadata
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
@@ -126,6 +126,58 @@ def test_text_processing_without_native_processor(monkeypatch):
         load_processor.assert_not_called()
         with pytest.raises(RuntimeError, match="transformers==5.17.0"):
             processor.get_mm_max_tokens_per_item()
+
+
+class _MergeTokenizer:
+    """A fast tokenizer stand-in: characters with two-character merges, so a prompt's tail
+    tokenizes differently from the same characters inside the whole prompt, as with BPE."""
+
+    is_fast = True
+    MERGES = frozenset({"ab", "cd", "th", "he", "in", "er"})
+
+    def __init__(self, special_tokens: int = 0):
+        self.special_tokens = special_tokens
+
+    def num_special_tokens_to_add(self) -> int:
+        return self.special_tokens
+
+    def __call__(self, text, **kwargs):
+        ids, offsets, i = [], [], 0
+        while i < len(text):
+            width = 2 if text[i : i + 2] in self.MERGES else 1
+            ids.append(sum(ord(c) << (8 * k) for k, c in enumerate(text[i : i + width])))
+            offsets.append((i, i + width))
+            i += width
+        return BatchEncoding({"input_ids": ids, "offset_mapping": offsets})
+
+
+@pytest.mark.cpu_only
+def test_text_processing_prefix_token_cache():
+    from tensorrt_llm._torch.models.modeling_glm5_next_vision import Glm5NextInputProcessor
+    from tensorrt_llm.llmapi import SamplingParams
+
+    tokenizer = _MergeTokenizer()
+    cached = Glm5NextInputProcessor(
+        "unused", _config(), tokenizer=tokenizer, enable_tokenization_cache=True
+    )
+    plain = Glm5NextInputProcessor("unused", _config(), tokenizer=tokenizer)
+    chat = SamplingParams(add_special_tokens=False)  # the chat endpoint's default
+    prompt = "the cache in their header " * 400
+    for turn in range(4):
+        prompt += f"turn {turn}: abcd other " * 50
+        assert cached.call_with_text_prompt({"prompt": prompt}, chat) == (
+            plain.call_with_text_prompt({"prompt": prompt}, chat)
+        )
+    cache = cached._prefix_token_cache
+    assert (cache.hits, cache.misses) == (3, 1)
+    # special tokens requested (the completions endpoint's default): the whole prompt is tokenized
+    cached.call_with_text_prompt({"prompt": prompt + "abcd"}, SamplingParams())
+    assert (cache.hits, cache.misses) == (3, 1)
+    # a tokenizer that adds special tokens would give the cache other ids than the full tokenization
+    adds_bos = Glm5NextInputProcessor(
+        "unused", _config(), tokenizer=_MergeTokenizer(1), enable_tokenization_cache=True
+    )
+    assert adds_bos._prefix_token_cache is None
 
 
 @pytest.mark.cpu_only
@@ -911,6 +963,7 @@ def test_kv_cache_dtype_reaches_manager_construction(fp8_kv_cache, verify_kernel
     manager = object.__new__(Glm5NextCacheManager)
     manager._requested_num_spec = None
     manager._requested_draft_records = False
+    manager._kda_commit_pending_drafts = None
     manager._kda_replay = None
     manager._mamba_ssm_stochastic_rounding = False
     manager.spec_config = spec_config

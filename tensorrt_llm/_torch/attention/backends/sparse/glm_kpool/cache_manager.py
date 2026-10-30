@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 
@@ -49,6 +49,20 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
 from .params import glm_kpool_cache_row_dim
 
 
+def glm_kpool_index_state_dim(model_config: ModelConfig) -> int:
+    """BF16 values per token of a sparse layer's indexer cache row.
+
+    A built model whose kernels lay the row out differently declares the width in
+    ``model_config.extra_attrs["glm_kpool_index_state_dim"]``; otherwise the row is
+    :func:`glm_kpool_cache_row_dim` of the checkpoint's ``index_head_dim``.
+    """
+    declared = model_config.extra_attrs.get("glm_kpool_index_state_dim")
+    if declared is not None:
+        return int(declared)
+    config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+    return glm_kpool_cache_row_dim(int(config.index_head_dim))
+
+
 class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """Manage KDA state, latent KV and indexer buffers in one V2 lifecycle.
 
@@ -67,6 +81,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         sparse_layer_ids: Sequence[int] | None = None,
         index_state_dim: int = 0,
         kda_replay_num_spec: int | None = None,
+        kda_draft_records: bool = False,
+        kda_commit_pending_drafts: Callable[..., None] | None = None,
         use_replay_state_update: bool = False,
         **kwargs,
     ) -> None:
@@ -77,7 +93,13 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 Defaults to every attention layer in ``layer_mask``: each GLM
                 attention layer, including appended MTP layers, is sparse.
             index_state_dim: BF16 width of one indexer cache row, see
-                :func:`glm_kpool_cache_row_dim`.
+                :func:`glm_kpool_index_state_dim`.
+            kda_draft_records: With the KDA replay caches, also keep the
+                records of every draft of the last verify round
+                (``kda_state_tok``) for a model whose verify replays from them.
+            kda_commit_pending_drafts: That model's commit of a suspended
+                request's pending drafts (``commit_kda_pending_drafts``'
+                signature), called in place of the runtime's.
         """
         # Set before super().__init__: the base _build_base_config calls
         # _extra_buffers_per_layer, which reads both of these.
@@ -101,6 +123,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._mamba_ssm_stochastic_rounding = kwargs.pop("mamba_ssm_stochastic_rounding", False)
         self.kda_context_only = _is_disagg_context_server(kwargs.get("is_disagg", False))
         self._requested_num_spec = kda_replay_num_spec
+        self._requested_draft_records = kda_draft_records
+        self._kda_commit_pending_drafts = kda_commit_pending_drafts
         self._kda_replay: KDAReplayState | None = None
         kwargs.setdefault("conv_state_layout", "q_k_v")
         super().__init__(*args, **kwargs)
@@ -115,7 +139,10 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             return None
         if num_spec is not None:
             self._kda_replay = KDAReplayState(
-                num_spec, stochastic_rounding=self._mamba_ssm_stochastic_rounding
+                num_spec,
+                stochastic_rounding=self._mamba_ssm_stochastic_rounding,
+                draft_records=self._requested_draft_records,
+                commit_pending_drafts=self._kda_commit_pending_drafts,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
@@ -421,12 +448,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
             sum(layer_mask), mapping, spec_config=spec_config, layer_mask=layer_mask
         )
         local_attention_layers = sum(attention_mask[layer] for layer in local_layers)
-        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
         # All GLM full-attention layers, including MTP layers, use the sparse indexer.
         # Indexer pages remain BF16 even when latent KV is quantized.
         index_bytes_per_token = (
             local_attention_layers
-            * glm_kpool_cache_row_dim(int(config.index_head_dim))
+            * glm_kpool_index_state_dim(model_config)
             * torch.bfloat16.itemsize
         )
         state_config = kv_cache_config.mamba_state_config
