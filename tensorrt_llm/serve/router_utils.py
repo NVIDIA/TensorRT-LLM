@@ -66,6 +66,20 @@ KV_CACHE_HASH_ALGOS = frozenset(
 hash_v1_block_key = kv_cache_hash.hash_v1_block_key
 truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
 
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _to_uint64(value: Optional[int]) -> Optional[int]:
+    """Reduce an id modulo 2**64 so the native uint64 LoRA id fields accept it.
+
+    The worker holds the LoRA id as a uint64 ``LlmRequest.lora_task_id`` and
+    rejects an out-of-range id itself; this only keeps the router's own native
+    bindings from raising while it routes such a request. For in-range ids it
+    is the identity.
+    """
+    return None if value is None else value & _UINT64_MASK
+
+
 OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest, ResponsesRequest]
 BlockHash = Union[int, str]
 
@@ -202,12 +216,13 @@ def block_key_hasher(
     parent = 0 if parent_hash is None else parent_hash
     # Fast path: the native C++ BlockKeyHasher is bit-exact with
     # hash_v1_block_key and avoids the per-token Python loop. The native
-    # BlockKey carries the LoRA task id, but its hash() binding takes no
+    # BlockKey carries the LoRA task id (a uint64, reduced here the same way
+    # hash_v1_block_key reduces it), but its hash() binding takes no
     # cache_salt_id, so fall back to Python only when a salt is set (rare
     # opt-in; never in the unsalted agent/chat completion path).
     if cache_salt_id is None:
         return _NativeBlockKeyHasher.hash(
-            _NativeBlockKey(token_ids, lora_task_id=lora_task_id), parent
+            _NativeBlockKey(token_ids, lora_task_id=_to_uint64(lora_task_id)), parent
         )
     return hash_v1_block_key(
         token_ids, parent_hash=parent, lora_task_id=lora_task_id, cache_salt_id=cache_salt_id
@@ -589,7 +604,7 @@ class BlockHashMixin:
             # V2 keys chain from a reuse-scope root, which is exactly what
             # sequence_to_blockchain_keys yields; its first pair is the root itself, so
             # skip it. In KvCacheManager the last token is not part of any block key.
-            reuse_scope = ReuseScope(lora_id=lora_task_id, salt=cache_salt)
+            reuse_scope = ReuseScope(lora_id=_to_uint64(lora_task_id), salt=cache_salt)
             to_hash = truncate_sha256_hash_to_int64
             if hash_algo == KV_CACHE_HASH_ALGO_V2:
 
