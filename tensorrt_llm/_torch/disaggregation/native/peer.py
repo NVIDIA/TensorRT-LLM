@@ -75,7 +75,7 @@ class PeerRegistrar:
         ] = {}  # key: (peer_key, self_lg_pool_key, peer_lg_pool_key)
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
-        self._overlap_cache: Dict[str, PeerOverlap] = {}
+        self._overlap_cache: dict[tuple[str, int, int], PeerOverlap] = {}
         self._aux_transfer_layout_cache: Dict[str, AuxTransferLayout] = {}
         self._lg_pool_mapping_cache: Dict[
             str, Dict[LGPoolKey, LGPoolKey]
@@ -599,7 +599,8 @@ class PeerRegistrar:
 
     def get_peer_overlap(self, peer_rank_info: RankInfo, peer_dp_rank: int) -> PeerOverlap:
         peer_ri = peer_rank_info
-        key = self._unique_key(peer_ri.instance_name, peer_dp_rank)
+        # Per-view duplication factors depend on the specific peer rank's page table.
+        key = (peer_ri.instance_name, peer_ri.instance_rank, peer_dp_rank)
         if key in self._overlap_cache:
             return self._overlap_cache[key]
 
