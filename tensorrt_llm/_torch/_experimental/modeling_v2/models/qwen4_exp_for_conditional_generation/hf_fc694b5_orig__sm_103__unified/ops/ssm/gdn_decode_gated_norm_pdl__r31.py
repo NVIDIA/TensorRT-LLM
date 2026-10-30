@@ -3,8 +3,10 @@
 """One Gated-DeltaNet decode step per row, and the gated RMS norm on its output, in
 one PDL launch.
 
-Tier 5 (CuTe DSL written for this target; the recurrence is the gated delta rule of
-FlashInfer's `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here). At one
+A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target and copied unchanged, with
+this file, from its `ops/ssm/gdn_decode_gated_norm_pdl.py` (this target's variant r31); the
+recurrence is the gated delta rule of FlashInfer's
+`gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here. At one
 decode row the step reads and writes each v-head's 64 KB fp32 state once and
 otherwise does a few hundred flops per state row; the rest of its time is latency.
 The state is not produced by anything in the step ahead of this kernel -- the
@@ -386,15 +388,36 @@ class GdnDecodeGatedNormPdl(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows; pool (default a contiguous 461-slot pool | "coalesced": the
-    # cache manager's pool, slot stride 36 layers' states, slots 100 and 101);
-    # pad (row 1 given slot -1).
+    # spec: rows; k_heads / v_heads (default 16 / 48); pool (default a contiguous 461-slot
+    # pool | "coalesced": the cache manager's page, slot stride 36 layers' states -- 102 slots
+    # (slots 100 and 101), or with pool_slots the engine's measured slot count, the view the
+    # last layer's sub-page and the top slots named); pad (row 1 given slot -1; at one row, a
+    # second call over slot -1).
     CELLS: tuple[Cell, ...] = (
         Cell(why="qwen3.8 decode, 1 row (con 1), 461-slot pool", spec=dict(rows=1)),
         Cell(why="qwen3.8 decode, 4 rows (MAX_ROWS), scattered slots", spec=dict(rows=4)),
         Cell(
             why="2 rows, coalesced pool (slot stride 36 layers, slot 100), row 1 a pad slot (-1)",
             spec=dict(rows=2, pool="coalesced", pad=True),
+        ),
+        Cell(
+            why="tp4/tep4 decode, 1 row at 4 k / 12 v heads, slot 1873 of tep4's 1874-slot "
+            "engine page, then a pad slot",
+            spec=dict(rows=1, k_heads=4, v_heads=12, pool="coalesced", pad=True, pool_slots=1874),
+        ),
+        Cell(
+            why="tp4/tep4, 2 rows at 4 / 12 heads, the engine page's top slots, row 1 a pad "
+            "slot (-1)",
+            spec=dict(rows=2, k_heads=4, v_heads=12, pool="coalesced", pad=True, pool_slots=1874),
+        ),
+        Cell(
+            why="tp4/tep4, 4 rows (MAX_ROWS) at 4 / 12 heads, scattered over the 1874-slot page",
+            spec=dict(rows=4, k_heads=4, v_heads=12, pool="coalesced", pool_slots=1874),
+        ),
+        Cell(
+            why="dep4 decode, 1 row at 16 / 48 heads, slot 849 of dep4's 850-slot engine page, "
+            "then a pad slot",
+            spec=dict(rows=1, k_heads=16, v_heads=48, pool="coalesced", pad=True, pool_slots=850),
         ),
     )
 
@@ -415,10 +438,40 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     rounded once. Inside torch's default band for bf16 / fp32 of the fp64 composition.
     Deterministic. Graph-capturable after the first call per geometry (compiled then).
 
-    Certified: 1 and 4 rows over a contiguous 461-slot pool, and 2 rows over the cache
-    manager's coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past
-    the base) with the second row a pad slot (-1). Under graph replay the op reads the
-    projection after `griddepcontrol.wait` (1 row). Not certified: 3 rows, `pdl=False`.
+    Source: the CuTe DSL kernel in this file, JIT-compiled (`cute_ext.compile`) for the
+    running device at the first call per geometry; the cells ran that path on sm_103.
+
+    This target: its routing admits a bf16 recurrent-state cache only, and this kernel takes
+    an fp32 pool only -- a bf16 pool fails its compile loudly ("`copy` currently only
+    supports equal source and destination element type bit width") -- so this target's
+    decode step does not launch it. Its bf16 decode recurrence is
+    `gdn_decode_rows_gated_norm`, which reads this entry's `reference` and
+    `_recurrence_reference` (both round the state to the pool's own dtype) and not its
+    kernel.
+
+    Certified, sm_103:
+    - tp1's 16 / 48 heads: 1 and 4 rows over a contiguous 461-slot pool, and 2 rows over a
+      102-slot coalesced page (slot stride 36 layers' states, slot 100 ~2.8G elements past
+      the base) with the second row a pad slot (-1).
+    - A tp4/tep4 rank's 4 / 12 heads (proj width 4120): 1 row, 2 rows (row 1 a pad) and 4
+      rows over tep4's engine page -- 1874 slots, slot stride 36 layers' states (7077888
+      elements), the view the last GDN layer's sub-page; slot 1873 sits ~1.3e10 elements
+      past the base.
+    - dep4's 16 / 48 heads: 1 row at slot 849 of its 850-slot engine page (~2.4e10 elements
+      past the base).
+    - A one-row call over a pad slot (-1) writes zeros and no state; under graph replay the
+      op reads the projection after `griddepcontrol.wait`, at 16 / 48 and at 4 / 12 heads.
+    Against the fp64 reference: at 4 / 12 heads every output element is bitwise its
+    bf16-rounded reference and the state is within 1.2e-7 (relative L2 <= 7.8e-8); at
+    16 / 48 at most 5 of 24576 output elements differ (max 9.8e-4, relative L2 1.2e-5). On
+    the engine pages every other byte of a touched slot's page stays unchanged.
+
+    The engine slot counts are the stock engines' with a bf16 state cache at
+    `max_batch_size` 128 (the PLE / GDN slot space the manager sizes from memory); an fp32
+    pool in that memory holds about half as many, so the certified slots bound it.
+
+    Not certified: 3 rows; `pdl=False`; tp4's own engine slot count (tep4's 1874 stands in:
+    a tp4 rank's GDN pools are the same shape); a bf16 pool (refused, above).
     """
 
     def __call__(
