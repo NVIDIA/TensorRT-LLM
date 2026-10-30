@@ -275,6 +275,10 @@ RUN --mount=type=bind,source=docker/common/validate_wheel_metadata.py,target=/tm
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
+# Check the completed release image after installation and content copying.
+RUN --mount=type=bind,source=docker/common/verify_system_ca.py,target=/tmp/verify_system_ca.py \
+    python3 /tmp/verify_system_ca.py
+
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm

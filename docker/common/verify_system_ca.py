@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Verify that the default Python/OpenSSL stores exclude revoked CA roots."""
+"""Verify that the default Python/OpenSSL stores exclude distrusted CA roots."""
 
 import hashlib
 import os
@@ -21,7 +21,7 @@ import ssl
 from pathlib import Path
 
 # DER fingerprint of emSign ECC Root CA - G3.
-_REVOKED_ROOTS = frozenset(
+_DISTRUSTED_ROOTS = frozenset(
     {
         "86a1ecba089c4a8d3bbe2734c612ba341d813e043cf9e8a862cd5c57a36bbe6b",
     }
@@ -32,8 +32,8 @@ _HASHED_CERTIFICATE = re.compile(r"[0-9a-f]{8}\.[0-9]+")
 def _verify_context(context: ssl.SSLContext, label: str) -> None:
     for certificate in context.get_ca_certs(binary_form=True):
         fingerprint = hashlib.sha256(certificate).hexdigest()
-        if fingerprint in _REVOKED_ROOTS:
-            raise RuntimeError(f"Revoked CA in {label}: {fingerprint}")
+        if fingerprint in _DISTRUSTED_ROOTS:
+            raise RuntimeError(f"Distrusted CA in {label}: {fingerprint}")
 
 
 def verify_system_ca() -> None:

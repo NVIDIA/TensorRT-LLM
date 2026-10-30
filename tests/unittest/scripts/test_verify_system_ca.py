@@ -38,7 +38,7 @@ _SPEC.loader.exec_module(verifier)
 def certificates(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     root = tmp_path_factory.mktemp("system-ca")
     paths = []
-    for name in ("revoked", "custom"):
+    for name in ("distrusted", "custom"):
         certificate = root / f"{name}.crt"
         subprocess.run(
             [
@@ -77,14 +77,14 @@ def context(certificate: Path) -> ssl.SSLContext:
 def trust_store(
     certificates: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[tuple[Path, Path, Path]]:
-    revoked, custom = certificates
-    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(revoked.read_text())).hexdigest()
-    monkeypatch.setattr(verifier, "_REVOKED_ROOTS", frozenset({fingerprint}))
+    distrusted, custom = certificates
+    fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(distrusted.read_text())).hexdigest()
+    monkeypatch.setattr(verifier, "_DISTRUSTED_ROOTS", frozenset({fingerprint}))
     monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path))
     default = context(custom)
     default.load_verify_locations(capath=str(tmp_path))
     with patch.object(verifier.ssl, "create_default_context", return_value=default):
-        yield revoked, custom, tmp_path
+        yield distrusted, custom, tmp_path
 
 
 def hashed_name(certificate: Path) -> str:
@@ -94,17 +94,17 @@ def hashed_name(certificate: Path) -> str:
     return f"{value}.0"
 
 
-def test_rejects_revoked_default_root(trust_store: tuple[Path, Path, Path]) -> None:
-    revoked, _, _ = trust_store
-    with patch.object(verifier.ssl, "create_default_context", return_value=context(revoked)):
+def test_rejects_distrusted_default_root(trust_store: tuple[Path, Path, Path]) -> None:
+    distrusted, _, _ = trust_store
+    with patch.object(verifier.ssl, "create_default_context", return_value=context(distrusted)):
         with pytest.raises(RuntimeError, match="default CA store"):
             verifier.verify_system_ca()
 
 
 def test_checks_lazy_hashed_directory(trust_store: tuple[Path, Path, Path]) -> None:
-    revoked, _, directory = trust_store
-    (directory / hashed_name(revoked)).symlink_to(revoked)
-    with pytest.raises(RuntimeError, match="Revoked CA"):
+    distrusted, _, directory = trust_store
+    (directory / hashed_name(distrusted)).symlink_to(distrusted)
+    with pytest.raises(RuntimeError, match="Distrusted CA"):
         verifier.verify_system_ca()
 
 
@@ -121,16 +121,16 @@ def test_preserves_custom_roots(trust_store: tuple[Path, Path, Path]) -> None:
 def test_checks_every_configured_directory(
     trust_store: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    revoked, _, directory = trust_store
+    distrusted, _, directory = trust_store
     second = directory / "second"
     second.mkdir()
-    (second / hashed_name(revoked)).symlink_to(revoked)
+    (second / hashed_name(distrusted)).symlink_to(distrusted)
     monkeypatch.setenv("SSL_CERT_DIR", os.pathsep.join([str(directory), str(second)]))
     with pytest.raises(RuntimeError, match="second"):
         verifier.verify_system_ca()
 
 
 def test_does_not_scan_unloaded_files(trust_store: tuple[Path, Path, Path]) -> None:
-    revoked, _, directory = trust_store
-    (directory / "not-a-hashed-trust-entry.pem").write_bytes(revoked.read_bytes())
+    distrusted, _, directory = trust_store
+    (directory / "not-a-hashed-trust-entry.pem").write_bytes(distrusted.read_bytes())
     verifier.verify_system_ca()
