@@ -1233,7 +1233,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
-        executor.request_broadcaster.broadcast.return_value = ([], {})
+        executor.request_broadcaster.broadcast.return_value = []
         executor._pop_from_waiting_queue = MagicMock(return_value=[])
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True

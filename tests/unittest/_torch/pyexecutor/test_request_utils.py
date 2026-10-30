@@ -23,9 +23,9 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest, PythonRequestInputs
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
-    attach_py_objects_to_requests,
     can_process_attention_dp_request,
     derive_attention_dp_per_rank_request_cap,
     executor_request_to_llm_request,
@@ -70,17 +70,7 @@ def test_multimodal_payload_broadcast_and_children_keep_the_same_contract():
     )
     source.py_multimodal_data = payload
     source.py_conversation_params = None
-    objects = RequestBroadcaster._collect_py_objects(None, [RequestQueueItem(42, source)])
-    # Reproduce the existing Python-object rank handoff, without adding the
-    # request aggregate, CUDA event, or cache state to its wire format.
-    restored_objects = pickle.loads(pickle.dumps(objects))
-    restored = trtllm.Request(
-        input_token_ids=[1, 2, 3],
-        max_tokens=2,
-        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
-    )
-    queue_items = [RequestQueueItem(42, restored)]
-    attach_py_objects_to_requests(queue_items, restored_objects)
+    restored = pickle.loads(pickle.dumps(RequestQueueItem(42, source))).request
     request = executor_request_to_llm_request(
         42, restored, child_req_ids=[43], exclude_last_generation_logits=False
     )
@@ -132,46 +122,17 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     return mock_request
 
 
-def test_request_broadcaster_collects_conversation_params_with_none():
-    conversation_params = ConversationParams(conversation_id="conv")
-    source_items = [
-        RequestQueueItem(1, SimpleNamespace(py_conversation_params=conversation_params)),
-        RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
-    ]
-
-    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
-
-    py_objects = dict(py_request_objects)
-    assert py_objects["py_conversation_params"] == {
-        1: conversation_params,
-        2: None,
-    }
-
-    target_items = [
-        RequestQueueItem(1, SimpleNamespace()),
-        RequestQueueItem(2, SimpleNamespace()),
-    ]
-    attach_py_objects_to_requests(target_items, py_request_objects)
-
-    assert target_items[0].request.py_conversation_params is conversation_params
-    assert hasattr(target_items[1].request, "py_conversation_params")
-    assert target_items[1].request.py_conversation_params is None
+@pytest.mark.parametrize("conversation_params", [None, ConversationParams(conversation_id="conv")])
+def test_request_envelope_preserves_conversation_params(conversation_params):
+    request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
+    request.py_conversation_params = conversation_params
+    restored = _broadcast_round_trip(request)
+    assert restored.inputs.conversation_params == conversation_params
 
 
-def test_request_broadcaster_requires_conversation_params_attr():
-    source_items = [RequestQueueItem(1, SimpleNamespace())]
-
-    with pytest.raises(AttributeError):
-        RequestBroadcaster._collect_py_objects(None, source_items)
-
-
-def _broadcast_round_trip(request: trtllm.Request) -> trtllm.Request:
-    request.py_conversation_params = None
+def _broadcast_round_trip(request: trtllm.Request | ExecutorRequest) -> ExecutorRequest:
     items = [RequestQueueItem(42, request)]
-    sidecar = RequestBroadcaster._collect_py_objects(None, items)
-    restored_items, restored_sidecar = pickle.loads(pickle.dumps((items, sidecar)))
-    attach_py_objects_to_requests(restored_items, restored_sidecar)
-    return restored_items[0].request
+    return pickle.loads(pickle.dumps(items))[0].request
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -197,7 +158,9 @@ def test_request_broadcast_preserves_python_inputs(enabled, original_end_id) -> 
         "py_original_end_id",
         "py_arrival_time",
     ):
-        assert getattr(restored, attribute) == getattr(request, attribute)
+        assert getattr(restored.inputs, attribute.removeprefix("py_")) == getattr(
+            request, attribute
+        )
 
     translated = executor_request_to_llm_request(42, restored, [], False)
     assert translated.py_logprobs_mode == request.py_logprobs_mode
@@ -215,7 +178,7 @@ def test_request_broadcast_preserves_absent_python_input_defaults() -> None:
     restored = _broadcast_round_trip(
         trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10, end_id=7)
     )
-    assert not hasattr(restored, "py_original_end_id")
+    assert restored.inputs.original_end_id == 7
     translated = executor_request_to_llm_request(42, restored, [], False)
     assert translated.py_logprobs_mode == LogprobMode.RAW
     assert translated.py_logprobs_simple_format is False
@@ -973,9 +936,9 @@ def test_single_round_empty_iteration_is_one_collective():
     hang_detector = MagicMock()
     broadcaster = RequestBroadcaster(dist, hang_detector)
 
-    new_requests, py_request_objects = broadcaster.broadcast([])
+    new_requests = broadcaster.broadcast([])
 
-    assert (new_requests, py_request_objects) == ([], None)
+    assert new_requests == []
     assert dist.calls == [("broadcast_or_none", None)]
     hang_detector.pause.assert_called_once()
 
@@ -985,28 +948,23 @@ def test_single_round_busy_iteration_sends_requests_and_py_objects_once():
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1), _make_broadcast_item(2)]
 
-    new_requests, py_request_objects = broadcaster.broadcast(items)
+    new_requests = broadcaster.broadcast(items)
 
     assert new_requests == items
-    assert py_request_objects == broadcaster._collect_py_objects(items)
     assert len(dist.calls) == 1
     kind, payload = dist.calls[0]
     assert kind == "broadcast_or_none"
-    assert payload == (items, py_request_objects)
+    assert payload == items
 
 
 def test_single_round_non_root_receives_payload_or_nothing():
     items = [_make_broadcast_item(7)]
-    py_objects = RequestBroadcaster(_SingleRoundDist(rank=0), MagicMock())._collect_py_objects(
-        items
-    )
-
-    dist = _SingleRoundDist(rank=1, received=(items, py_objects))
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == (items, py_objects)
+    dist = _SingleRoundDist(rank=1, received=items)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == items
     assert dist.calls == [("broadcast_or_none", None)]
 
     dist = _SingleRoundDist(rank=1, received=None)
-    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == ([], None)
+    assert RequestBroadcaster(dist, MagicMock()).broadcast([]) == []
 
 
 @pytest.mark.parametrize(
@@ -1022,7 +980,7 @@ def test_single_round_falls_back_to_probe_when_not_applicable(kwargs, reason):
     broadcaster = RequestBroadcaster(dist, MagicMock())
     items = [_make_broadcast_item(1)]
 
-    new_requests, _ = broadcaster.broadcast(items)
+    new_requests = broadcaster.broadcast(items)
 
     assert new_requests == items, reason
     assert all(kind != "broadcast_or_none" for kind, *_ in dist.calls), reason
@@ -1035,9 +993,9 @@ def test_single_round_idle_path_keeps_cpu_probe():
     dist = _SingleRoundDist(rank=0)
     broadcaster = RequestBroadcaster(dist, MagicMock())
 
-    new_requests, py_request_objects = broadcaster.broadcast([], prefer_cpu=True)
+    new_requests = broadcaster.broadcast([], prefer_cpu=True)
 
-    assert (new_requests, py_request_objects) == ([], None)
+    assert new_requests == []
     assert dist.calls == [("broadcast_int64", [0], True)]
 
 
@@ -1639,7 +1597,7 @@ class TestBroadcasterClock:
         dist = self._dist(rank=1)
         dist.broadcast_int64 = Mock(return_value=[0])
         b = RequestBroadcaster(dist, self._hang_detector())
-        assert b.broadcast([]) == ([], None)
+        assert b.broadcast([]) == []
         (values,), _ = dist.broadcast_int64.call_args
         assert list(values) == [0]
         assert b.rank0_now is None
@@ -1652,7 +1610,7 @@ class TestBroadcasterClock:
             dist.broadcast_or_none = Mock(return_value=None)
             dist.broadcast_int64 = Mock(return_value=[0, 1_000_000, -1])
             b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=sync_clock)
-            assert b.broadcast([]) == ([], None)
+            assert b.broadcast([]) == []
             assert dist.broadcast_int64.call_count == probes
             assert dist.broadcast_or_none.call_count == 1 - probes
 
@@ -1666,14 +1624,14 @@ class TestBroadcasterClock:
         dist.recv_object = Mock(return_value=[0])
         dist.send_object = Mock()
         b = RequestBroadcaster(dist, self._hang_detector())
-        assert b.broadcast([]) == ([], None)
+        assert b.broadcast([]) == []
         dist.send_object.assert_called_once_with([0], 1, 3)
         assert b.rank0_now is None
 
     def test_sync_clock_single_rank(self):
         dist = self._dist(rank=0, world_size=1)
         b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
-        assert b.broadcast([]) == ([], None)
+        assert b.broadcast([]) == []
         assert b.rank0_now is not None and b.rank0_now > 0
 
     def test_sync_clock_pp_forwards_header(self):
@@ -1686,7 +1644,7 @@ class TestBroadcasterClock:
         dist.recv_object = Mock(return_value=[0, 5_000_000, -1])
         dist.send_object = Mock()
         b = RequestBroadcaster(dist, self._hang_detector(), sync_clock=True)
-        assert b.broadcast([]) == ([], None)
+        assert b.broadcast([]) == []
         dist.send_object.assert_called_once_with([0, 5_000_000, -1], 1, 3)
         assert b.rank0_now == pytest.approx(5.0)
 
@@ -1711,3 +1669,119 @@ class TestBroadcasterClock:
         (values,), _ = other.broadcast_int64.call_args
         assert list(values) == [0, 0, -1]
         assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("route", ["local", "pickle", "rpc", "ipc"])
+def test_typed_request_inputs_transport_and_child_policy(route):
+    from tensorrt_llm.executor.ipc import IpcQueue
+
+    features = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    envelope = ExecutorRequest(
+        trtllm.Request(
+            input_token_ids=[1, 2, 3],
+            max_tokens=2,
+            position_ids=[4, 5, 6],
+            encoder_input_features=features,
+            encoder_output_length=2,
+            sampling_config=trtllm.SamplingConfig(num_return_sequences=3, seed=17),
+        ),
+        PythonRequestInputs(
+            multimodal_data={"embedding": torch.ones(2, 4)},
+            conversation_params=ConversationParams(conversation_id="conv"),
+            logprobs_mode=LogprobMode.PROCESSED,
+            logprobs_simple_format=True,
+            return_routed_experts=True,
+            original_end_id=None,
+            num_logprobs=3,
+            arrival_time=123.0,
+            uncached_prefill_tokens=2,
+        ),
+    )
+    if route == "pickle":
+        envelope = pickle.loads(pickle.dumps(envelope))
+    elif route == "rpc":
+        # Ray RPC uses cloudpickle for Python arguments.
+        import cloudpickle
+
+        envelope = cloudpickle.loads(cloudpickle.dumps(envelope))
+    elif route == "ipc":
+        sender = IpcQueue(is_server=True)
+        receiver = IpcQueue(address=sender.address, is_server=False)
+        try:
+            receiver.setup_lazily()
+            sender.put(envelope)
+            envelope = receiver.get(timeout=5)
+        finally:
+            sender.close()
+            receiver.close()
+    parent = executor_request_to_llm_request(42, envelope, [43, 44], False)
+    for request in (parent, *parent.child_requests):
+        assert request.py_logprobs_mode == LogprobMode.PROCESSED
+        assert request.py_logprobs_simple_format
+        assert request.py_return_routed_experts
+        assert request.py_original_end_id is None
+        assert request.py_num_logprobs == 3
+        assert request.py_uncached_prefill_tokens == 2
+        assert request.py_position_ids == [4, 5, 6]
+        assert request.encoder_output_len == 2
+        assert request.py_encoder_input_features is parent.py_encoder_input_features
+        assert request.py_conversation_params.conversation_id == "conv"
+    parent.child_requests[0].py_multimodal_data["embedding"].zero_()
+    assert parent.py_multimodal_data["embedding"].sum() == 8
+    assert parent.child_requests[1].py_multimodal_data["embedding"].sum() == 8
+
+
+@pytest.mark.parametrize("route", ["tp", "tp_single_round", "pp", "pp_async"])
+def test_broadcaster_transports_complete_envelopes(route, monkeypatch):
+    wire = {}
+    monkeypatch.setenv("TRTLLM_PP_REQ_SEND_ASYNC", "1" if route == "pp_async" else "0")
+
+    class PickleDist:
+        world_size = 2
+        pp_size = 2 if route.startswith("pp") else 1
+        has_pp = pp_size > 1
+        supports_single_round_broadcast = route == "tp_single_round"
+        prev_pp_rank = 0
+        next_pp_rank = 1
+
+        def __init__(self, rank):
+            self.rank = rank
+            self.is_first_pp_rank = rank == 0
+            self.is_last_pp_rank = rank == 1
+
+        def broadcast(self, value, root=0):
+            if self.rank == root:
+                wire["broadcast"] = pickle.dumps(value)
+                return value
+            return pickle.loads(wire["broadcast"])
+
+        broadcast_or_none = tp_cp_broadcast = broadcast
+
+        def broadcast_int64(self, value, root=0, prefer_cpu=False):
+            if self.rank == root:
+                wire["header"] = pickle.dumps(value)
+                return value
+            return pickle.loads(wire["header"])
+
+        tp_cp_broadcast_int64 = broadcast_int64
+
+        def send_object(self, value, dest, tag):
+            wire[tag] = pickle.dumps(value)
+            return SimpleNamespace(wait=lambda: None)
+
+        isend_object = send_object
+
+        def recv_object(self, source, tag):
+            return pickle.loads(wire[tag])
+
+    request = trtllm.Request(input_token_ids=[1, 2], max_tokens=2)
+    request.py_logprobs_mode = LogprobMode.PROCESSED
+    request.py_original_end_id = None
+    items = [RequestQueueItem(42, request)]
+    root = RequestBroadcaster(PickleDist(0), MagicMock())
+    peer = RequestBroadcaster(PickleDist(1), MagicMock())
+    assert root.broadcast(items) is items
+    restored = peer.broadcast([])
+    translated = executor_request_to_llm_request(42, restored[0].request, [], False)
+    assert translated.py_logprobs_mode == LogprobMode.PROCESSED
+    assert translated.py_original_end_id is None

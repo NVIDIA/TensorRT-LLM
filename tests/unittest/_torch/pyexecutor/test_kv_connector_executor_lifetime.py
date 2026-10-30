@@ -425,7 +425,7 @@ def test_empty_iteration_keeps_request_broadcast_fast_path() -> None:
     broadcaster = RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext))
     broadcaster._broadcast_requests = Mock(side_effect=AssertionError("Unexpected payload"))
 
-    assert broadcaster.broadcast([]) == ([], None)
+    assert broadcaster.broadcast([]) == []
 
 
 def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> None:

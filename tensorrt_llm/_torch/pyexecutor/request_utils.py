@@ -5,7 +5,7 @@
 
 import os
 import time
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
@@ -34,52 +34,6 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
     """
     sampling_config = request.sampling_config
     return 0 if sampling_config.beam_width > 1 else (sampling_config.num_return_sequences or 1) - 1
-
-
-def collect_py_objects_from_requests(
-    requests: List, attribute_name: str, include_none: bool = False, *, allow_missing: bool = False
-) -> Optional[Tuple[str, Dict]]:
-    """Collect Python-only objects from requests.
-
-    Args:
-        requests: List of RequestQueueItem objects.
-        attribute_name: Name of the attribute to collect.
-        include_none: Include requests whose attribute value is None. When
-            enabled, the source request must have the attribute unless
-            allow_missing is True.
-        allow_missing: Skip absent attributes when include_none is enabled.
-
-    Returns:
-        Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
-    """
-    req_id_to_obj = {}
-    for item in requests:
-        if not item.is_normal_request:
-            continue
-        if item.request:
-            if include_none:
-                if allow_missing and not hasattr(item.request, attribute_name):
-                    continue
-                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
-            else:
-                obj = getattr(item.request, attribute_name, None)
-                if obj is not None:
-                    req_id_to_obj[item.id] = obj
-    return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
-
-
-def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> None:
-    """Attach Python-only objects to each request.
-
-    Args:
-        requests: List of RequestQueueItem objects.
-        py_request_objects: Tuple of (attribute_name, dict) pairs.
-    """
-    for attr_name, req_obj_dict in py_request_objects:
-        for item in requests:
-            if item.request:
-                if item.id in req_obj_dict:
-                    setattr(item.request, attr_name, req_obj_dict[item.id])
 
 
 def derive_attention_dp_per_rank_request_cap(
@@ -391,10 +345,8 @@ class RequestBroadcaster:
         self.aux: Optional[float] = None
         self.rank0_aux: Optional[float] = None
 
-    def broadcast(
-        self, new_requests: List, prefer_cpu: bool = False
-    ) -> Tuple[List, Optional[Tuple]]:
-        """Broadcast requests and Python objects across ranks.
+    def broadcast(self, new_requests: List, prefer_cpu: bool = False) -> List:
+        """Broadcast self-contained request envelopes across ranks.
 
         Args:
             new_requests: Requests fetched on rank 0 (ignored on other ranks).
@@ -414,23 +366,15 @@ class RequestBroadcaster:
             request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
 
         if request_count == 0:
-            return [], None
+            return []
 
         if self.dist.rank == 0:
-            py_request_objects = self._collect_py_objects(new_requests)
-        else:
-            py_request_objects = None
-
-        if self.dist.rank == 0:
-            # Preserve original `new_requests` on rank 0
-            _ = self._broadcast_requests(new_requests, py_request_objects)
+            # Preserve the original envelopes on rank 0.
+            self._broadcast_requests(new_requests)
         else:
             with self.hang_detector.pause():
-                new_requests, py_request_objects = self._broadcast_requests(
-                    new_requests, py_request_objects
-                )
-
-        return new_requests, py_request_objects
+                new_requests = self._broadcast_requests(new_requests)
+        return new_requests
 
     def _single_round(self, prefer_cpu: bool) -> bool:
         """Whether the count probe + payload pair collapses into one collective.
@@ -450,8 +394,8 @@ class RequestBroadcaster:
         )
 
     @nvtx_range("broadcast_requests")
-    def _broadcast_single_round(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
-        """One collective: rank 0 sends (requests, py objects) or "nothing".
+    def _broadcast_single_round(self, new_requests: List) -> List:
+        """One collective: rank 0 sends request envelopes or "nothing".
 
         Empty iterations cost one size exchange instead of the count probe's
         two collectives; iterations with new requests cost two collectives
@@ -463,14 +407,14 @@ class RequestBroadcaster:
         """
         payloads = None
         if self.dist.rank == 0 and new_requests:
-            payloads = (new_requests, self._collect_py_objects(new_requests))
+            payloads = new_requests
         with self.hang_detector.pause():
             received = self.dist.broadcast_or_none(payloads, root=0)
         if received is None:
-            return [], None
+            return []
         if self.dist.rank == 0:
             # Preserve the original objects on rank 0.
-            return new_requests, payloads[1]
+            return new_requests
         return received
 
     def _broadcast_request_count(self, request_count: int, prefer_cpu: bool = False) -> int:
@@ -512,42 +456,10 @@ class RequestBroadcaster:
 
         return header
 
-    def _collect_py_objects(self, new_requests: List) -> Tuple:
-        """Collect Python-only objects from requests."""
-        py_objects = [
-            collect_py_objects_from_requests(new_requests, attribute_name)
-            for attribute_name in (
-                "py_logits_post_processors",
-                "py_multimodal_data",
-                "py_scheduling_params",
-                "py_num_logprobs",
-                "py_disaggregated_params",
-                "py_lora_path",
-                "py_lora_ckpt_source",
-                "py_logprobs_mode",
-                "py_logprobs_simple_format",
-                "py_return_routed_experts",
-                "py_arrival_time",
-            )
-        ]
-        py_objects.extend(
-            [
-                collect_py_objects_from_requests(
-                    new_requests, "py_conversation_params", include_none=True
-                ),
-                collect_py_objects_from_requests(
-                    new_requests, "py_original_end_id", include_none=True, allow_missing=True
-                ),
-            ]
-        )
-        return tuple(filter(None, py_objects))
-
     @nvtx_range("broadcast_requests")
-    def _broadcast_requests(
-        self, new_requests: List, py_request_objects
-    ) -> Tuple[List, Optional[Dict]]:
-        """Broadcast requests across pipeline stages."""
-        payloads = (new_requests, py_request_objects)
+    def _broadcast_requests(self, new_requests: List) -> List:
+        """Broadcast request envelopes across pipeline stages."""
+        payloads = new_requests
 
         if self.dist.world_size == 1:
             return payloads
