@@ -501,6 +501,12 @@ the resolved package versions in `trtllm-benchmark.json` inside that environment
 The pinned AgentX fork uses its own dependencies and is not a replacement for the
 stock `aiperf` command.
 
+The current pins are provisional fork revisions, not official AIPerf or AgentX releases:
+[stock `a3033142`](https://github.com/BowenFu/aiperf/commit/a3033142f8a03b5d19903fa86bc3399d6d279876)
+and [AgentX `8cde0829`](https://github.com/BowenFu/aiperf/commit/8cde0829edf28aa49d2018412c33b118c675c7b5).
+They include the dependency updates, offline local-tokenizer support and integer
+TIFF-to-PNG compatibility with Pillow 13.
+
 The CI and disaggregated benchmark adapters save the selected client's current
 software in `client_environment.json` alongside its benchmark outputs, before
 the timed workload. Custom interpreters can be selected with

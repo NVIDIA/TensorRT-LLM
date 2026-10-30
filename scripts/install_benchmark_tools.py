@@ -14,8 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_ROOT = Path("/opt/trtllm-benchmark-tools")
-STOCK_REF = "git+https://github.com/BowenFu/aiperf.git@9900c8ad61fea80afbe09c33a00ce693a562c798"
-AGENTX_REF = "git+https://github.com/BowenFu/aiperf.git@2d03814bd25dcadca867b82bbe2cdbd1aaa773fa"
+STOCK_REF = "git+https://github.com/BowenFu/aiperf.git@a3033142f8a03b5d19903fa86bc3399d6d279876"
+AGENTX_REF = "git+https://github.com/BowenFu/aiperf.git@8cde0829edf28aa49d2018412c33b118c675c7b5"
 REQUIREMENTS = {
     "stock": [f"aiperf @ {STOCK_REF}", "aiohttp>=3.14.4,<4"],
     "agentx": [
