@@ -79,6 +79,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
                                                 InputTokensDetails,
+                                                NamespacedFunctionToolParam,
                                                 OpenAIBaseModel,
                                                 OutputTokensDetails,
                                                 ReasoningAssistantMessage,
@@ -1296,21 +1297,24 @@ def _get_chat_completion_function_tools(
     if tools is None:
         return function_tools
 
+    def definition(name: str, description: Optional[str],
+                   parameters: Optional[Any]) -> FunctionDefinition:
+        return FunctionDefinition(
+            name=name,
+            description=description,
+            # A tool with no schema still has to present an object schema,
+            # or the chat template renders a call the model cannot fill in.
+            parameters=parameters if parameters is not None else {
+                "type": "object",
+                "properties": {},
+            },
+        )
+
     def as_function(name: str, description: Optional[str],
                     parameters: Optional[Any]) -> ChatCompletionToolsParam:
-        return ChatCompletionToolsParam(
-            type="function",
-            function=FunctionDefinition(
-                name=name,
-                description=description,
-                # A tool with no schema still has to present an object schema,
-                # or the chat template renders a call the model cannot fill in.
-                parameters=parameters if parameters is not None else {
-                    "type": "object",
-                    "properties": {},
-                },
-            ),
-        )
+        return ChatCompletionToolsParam(type="function",
+                                        function=definition(
+                                            name, description, parameters))
 
     def custom_parameters() -> dict[str, Any]:
         # A custom tool takes one freeform string rather than JSON arguments -
@@ -1345,7 +1349,9 @@ def _get_chat_completion_function_tools(
             # Skipping it drops every tool inside, which is most of an agentic
             # client's toolset: the model then has nothing to call, announces
             # an action and does nothing. Names are qualified with the
-            # namespace so two namespaces can define the same tool name.
+            # namespace so two namespaces can define the same tool name. The
+            # declaration is kept beside the flattened function, for a model
+            # whose renderer shows namespaces itself.
             for inner in getattr(tool, "tools", None) or []:
                 inner_name = getattr(inner, "name", None)
                 if not inner_name:
@@ -1360,11 +1366,18 @@ def _get_chat_completion_function_tools(
                     inner_parameters = custom_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
+                inner_description = getattr(inner, "description", None)
                 function_tools.append(
-                    as_function(
-                        f"{tool.name}.{inner_name}",
-                        getattr(inner, "description", None) or tool.description,
-                        inner_parameters,
+                    NamespacedFunctionToolParam(
+                        function=definition(
+                            f"{tool.name}.{inner_name}",
+                            inner_description or tool.description,
+                            inner_parameters,
+                        ),
+                        namespace=tool.name,
+                        namespace_description=tool.description,
+                        declared_name=inner_name,
+                        declared_description=inner_description,
                     ))
         elif tool_type in ("custom", ):
             function_tools.append(
