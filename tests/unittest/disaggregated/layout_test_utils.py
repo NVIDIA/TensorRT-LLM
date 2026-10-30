@@ -14,7 +14,10 @@
 # limitations under the License.
 """Manager page tables built around hand-written page layouts."""
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import (
+    DevicePool,
+    ManagerLayout,
+)
 
 
 def manager_layout(layout, pool_bases, kv_heads=0, num_slots=128):

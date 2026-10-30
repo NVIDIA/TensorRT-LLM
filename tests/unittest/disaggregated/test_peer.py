@@ -28,7 +28,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.runs import RunsMapper
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,

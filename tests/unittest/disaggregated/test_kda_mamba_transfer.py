@@ -58,7 +58,11 @@ from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.pyexecutor.config_utils import extract_mamba_kv_cache_params
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, sent_bytes
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
+    check_compatible,
+    sent_bytes,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -199,7 +203,7 @@ def test_kda_layer_group_descriptors(enable_attention_dp):
     """V2 page table must describe BOTH KDA slots with exact byte extents."""
     mgr = _create_kda_managers(1, enable_attention_dp=enable_attention_dp)[0]
     try:
-        pt = mgr.get_page_table()
+        pt = adapter_for(mgr).page_table()
         state = _state_group(pt)
 
         layer_id = next(iter(mgr.mamba_layer_offsets))
@@ -255,8 +259,8 @@ def test_kda_hetero_tp_sharded_accepted():
     gen_mgrs = _create_kda_managers(4, enable_attention_dp=False)
     ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[1]
     try:
-        ctx_pt = ctx_mgr.get_page_table()
-        gen_pt = gen_mgr.get_page_table()
+        ctx_pt = adapter_for(ctx_mgr).page_table()
+        gen_pt = adapter_for(gen_mgr).page_table()
 
         # Production per-rank slots are the global sizes divided by tp.
         ctx_conv_bpl = _state_buffer(ctx_pt, MambaRole.CONV_STATE).size
@@ -300,8 +304,8 @@ def test_kda_peer_validation_accepts_supported_shapes(ctx_cfg, gen_cfg):
     gen_mgrs = _create_kda_managers(gen_tp, enable_attention_dp=gen_adp)
     ctx_mgr, gen_mgr = ctx_mgrs[0], gen_mgrs[-1]
     try:
-        ctx_pt = ctx_mgr.get_page_table()
-        gen_pt = gen_mgr.get_page_table()
+        ctx_pt = adapter_for(ctx_mgr).page_table()
+        gen_pt = adapter_for(gen_mgr).page_table()
         check_compatible(ctx_pt.page_layout, gen_pt.page_layout)
     finally:
         for mgr in ctx_mgrs + gen_mgrs:
@@ -313,7 +317,7 @@ def _synthetic_kda_layout(tp: int, adp: bool, denom: int, layer_ids=None):
 
     Each per-rank slot is ``1 / denom`` of the full one (no CUDA needed).
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
         BufferDesc,
         LayerGroupDesc,
         PageLayout,

@@ -98,6 +98,7 @@ from .hang_detector import (HangDetector, all_ranks_crashed,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
 from .kv_cache import _lender_hooks
+from .kv_cache.cache_layout.adapter import adapter_for
 from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            MixedMambaHybridCacheManager)
@@ -8170,13 +8171,15 @@ class PyExecutor:
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
         # Caches the generation worker derives from the imported ones (FP4 MLA
-        # V sidecars, KDA replay conv windows) are not transferred; the cache
-        # manager rebuilds them before the first forward reads them. The
-        # sampler setup above may have terminated requests, whose caches must
-        # not be touched.
+        # V sidecars, KDA replay conv windows) are not transferred; the
+        # manager's layout adapter rebuilds them before the first forward
+        # reads them, or a V1 manager does itself. The sampler setup above may
+        # have terminated requests, whose caches must not be touched.
         kv_mgr = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)
+        layout = adapter_for(kv_mgr)
+        rebuild = (layout.rebuild_imported if layout is not None else getattr(
+            kv_mgr, "rebuild_disagg_imported_cache", None))
         if rebuild is not None:
             rebuild([
                 req for req in cache_trans_complete_requests

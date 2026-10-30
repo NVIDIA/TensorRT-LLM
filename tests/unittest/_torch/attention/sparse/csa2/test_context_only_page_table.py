@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Page tables of CSA2 context-only workers (``context_swa_layer_limit``) against full workers,
-built by the real ``CSA2CacheManager`` over stand-in storage. Under bounded replay on generation
-the two register both ways, and every generation buffer of a model layer the context worker holds
-is written unless a remote-tail request leaves it to the generation worker; a generation worker
-without replay, which would leave it unwritten, is refused."""
+built by the layout adapter of the real ``CSA2CacheManager`` over stand-in storage. Under bounded
+replay on generation the two register both ways, and every generation buffer of a model layer the
+context worker holds is written unless a remote-tail request leaves it to the generation worker; a
+generation worker without replay, which would leave it unwritten, is refused."""
 
 from types import SimpleNamespace
 
@@ -13,7 +13,8 @@ from utils.page_layout_oracle import assert_layouts_reshard
 
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
-from tensorrt_llm._torch.pyexecutor.kv_cache import layout_mapping
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout import layout_mapping
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm.bindings import DataType
 
 NUM_LAYERS = 40
@@ -102,8 +103,8 @@ def _manager(limit: int | None, replay: bool = True) -> CSA2CacheManager:
 @pytest.mark.parametrize("limit", [2, 20, 21, 39])
 def test_a_context_only_worker_pairs_with_a_replaying_generation_worker(limit):
     context, generation = _manager(limit), _manager(None)
-    ctx = context.get_page_table().page_layout
-    gen = generation.get_page_table().page_layout
+    ctx = adapter_for(context).page_table().page_layout
+    gen = adapter_for(generation).page_table().page_layout
     layout_mapping.check_compatible(ctx, gen)
     layout_mapping.check_compatible(gen, ctx)
     held = {model for group in ctx.layer_groups for model in group.model_layers}
@@ -112,7 +113,7 @@ def test_a_context_only_worker_pairs_with_a_replaying_generation_worker(limit):
         for group in gen.layer_groups
         for layer, model in zip(group.layers, group.model_layers)
     }
-    excluded = generation.disagg_untransferred_buffers(
+    excluded = adapter_for(generation).untransferred_buffers(
         SimpleNamespace(py_csa2_remote_tail_split=limit)
     )
     written = {(r.dst.layer, r.dst.role) for r in layout_mapping.map_buffers(ctx, gen)}
@@ -123,7 +124,7 @@ def test_a_context_only_worker_pairs_with_a_replaying_generation_worker(limit):
 
 @pytest.mark.cpu_only
 def test_a_context_only_worker_is_refused_by_a_generation_worker_without_replay():
-    ctx = _manager(20).get_page_table().page_layout
-    gen = _manager(None, replay=False).get_page_table().page_layout
+    ctx = adapter_for(_manager(20)).page_table().page_layout
+    gen = adapter_for(_manager(None, replay=False)).page_table().page_layout
     with pytest.raises(ValueError, match="transferred by one rank only"):
         layout_mapping.check_compatible(ctx, gen)

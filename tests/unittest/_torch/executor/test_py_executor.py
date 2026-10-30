@@ -37,6 +37,8 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout import adapter as layout_adapter
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import CacheLayoutAdapter
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache_load import KvLoadTracker
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -781,7 +783,11 @@ def test_disagg_generation_model_state_is_prepared_after_first_token(accepted: b
         assert events == []
 
 
-def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> None:
+@pytest.mark.parametrize("rebuilder", ["layout_adapter", "v1_manager"])
+def test_disagg_generation_rebuilds_imported_cache_before_first_forward(
+    monkeypatch, rebuilder
+) -> None:
+    """A V2 manager's layout adapter rebuilds what the import left out, a V1 manager itself."""
     events = []
     received = types.SimpleNamespace(
         is_disagg_generation_transmission_complete=True,
@@ -802,11 +808,24 @@ def test_disagg_generation_rebuilds_imported_cache_before_first_forward() -> Non
         events.append(("finish", req.py_request_id))
         return False
 
-    kv_cache_manager = types.SimpleNamespace(
-        rebuild_disagg_imported_cache=lambda requests: events.append(
-            ("rebuild", [req.py_request_id for req in requests])
+    def rebuild(requests):
+        events.append(("rebuild", [req.py_request_id for req in requests]))
+
+    if rebuilder == "v1_manager":
+        kv_cache_manager = types.SimpleNamespace(rebuild_disagg_imported_cache=rebuild)
+    else:
+
+        class Manager:
+            pass
+
+        class Rebuilds(CacheLayoutAdapter):
+            def rebuild_imported(self, requests):
+                rebuild(requests)
+
+        monkeypatch.setitem(
+            layout_adapter._ADAPTERS, f"{Manager.__module__}.{Manager.__qualname__}", Rebuilds
         )
-    )
+        kv_cache_manager = Manager()
     executor = types.SimpleNamespace(
         enable_spec_decode=False,
         resource_manager=types.SimpleNamespace(

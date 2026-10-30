@@ -29,7 +29,7 @@ import numpy as np
 import pytest
 from utils.page_layout_oracle import assert_layouts_reshard
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
     BufferRuns,
     check_compatible,
     fan,
@@ -37,7 +37,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import (
     merge_runs,
     sent_bytes,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     Axis,
     BufferDesc,
     LayerGroupDesc,

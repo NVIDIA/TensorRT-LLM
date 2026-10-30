@@ -27,9 +27,8 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_unique_pool_memory_descs,
     slot_pointers,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,
@@ -38,10 +37,12 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     sectioned,
     token_major,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import (
     page_table_from_dict,
     page_table_to_dict,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
     DataType,
@@ -90,7 +91,7 @@ def test_slot_pointers_address_a_manager_s_pool():
         vocab_size=32000,
     )
 
-    page_table = manager.get_page_table()
+    page_table = adapter_for(manager).page_table()
     region_ids = np.array([0, -1, 1], dtype=np.int64)
     pointers = slot_pointers(page_table, 0, 0, region_ids)
 
@@ -129,7 +130,7 @@ def test_a_manager_s_page_table_places_its_buffers():
         max_num_tokens=max_tokens,
     )
 
-    page_table = manager.get_page_table()
+    page_table = adapter_for(manager).page_table()
     layout = page_table.page_layout
 
     assert layout.tokens_per_page == 64

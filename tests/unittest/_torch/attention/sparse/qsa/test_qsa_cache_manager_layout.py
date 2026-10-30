@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.cache_manager import (
     QSA_INDEX_POSITION,
     QSA_SIDE_PLANES,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm.bindings import DataType
@@ -271,8 +272,9 @@ def test_transfer_views_do_not_depend_on_the_kv_head_split(dtype: DataType) -> N
             views["position"] = cm.get_qsa_position_buffer()
             logical = {key: _logical_page(view) for key, view in views.items()}
             # How each side buffer spreads over ranks, as the page table declares it.
+            adapter = adapter_for(cm)
             tensors = {
-                (layer, role): cm._page_buffer_tensors(
+                (layer, role): adapter.buffer_tensors(
                     cm.layer_offsets[layer], role, size, _TPB, False
                 )
                 for layer, layer_roles in roles.items()

@@ -25,7 +25,12 @@ import pytest
 import torch
 from utils.util import skip_pre_blackwell, skip_pre_hopper
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import ShardDesc, head_major, replicated
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
+    ShardDesc,
+    head_major,
+    replicated,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.sharing import (
     MemoryKind,
     StagingOptions,
@@ -539,7 +544,7 @@ def test_the_public_layout_matches_what_native_builds(
         lender = attach(mgr)
         layout, regions = lender.page_layout, lender.regions
         spec.check(mgr, layout)
-        page_table = mgr.get_page_table()
+        page_table = adapter_for(mgr).page_table()
         native = native_groups(page_table)
         derived = public_groups(layout, regions)
 

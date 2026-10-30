@@ -37,6 +37,7 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     _cutedsl_backend_available,
 )
 from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -255,7 +256,7 @@ def _verify_cache(
             v_packed_base = manager.get_mla_v_packed_pool_base()
             if v_packed_base is not None:
                 v_packed_base.zero_()
-            manager.rebuild_disagg_imported_cache(
+            adapter_for(manager).rebuild_imported(
                 [
                     SimpleNamespace(py_request_id=request_ids[req_idx], prompt_len=prompt_len)
                     for req_idx, prompt_len in enumerate(request_lengths)

@@ -23,7 +23,7 @@ destination transfers of a model layer the sources hold, of a role they transfer
 is one the destination rebuilds per request (``PageLayout.request_rebuilt_roles``).
 
 Use it on hand-written layouts, or on the page layouts real managers build
-(``manager.get_page_table().page_layout``) to check a new cache's declarations across the
+(``adapter_for(manager).page_table().page_layout``) to check a new cache's declarations across the
 topologies it is served with. It checks that the ranks' declarations agree with one another; that
 they describe what the kernels write is for tests running the kernels to show.
 """
@@ -32,8 +32,12 @@ from typing import Dict, Sequence, Tuple
 
 import numpy as np
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import fan, layer_group_of, map_buffers
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
+    fan,
+    layer_group_of,
+    map_buffers,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     GRID_DIMENSIONS,
     BufferDesc,
     PageLayout,

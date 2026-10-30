@@ -63,7 +63,7 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
 
     HOST supports NAMED; DEVICE supports NAMED and ALL. HOST/ALL or HOST without staging raises
     ``ValueError``. Host regions precede device regions; ``Lender.page_layout`` locates each pool.
-    Import layout types from ``tensorrt_llm._torch.pyexecutor.kv_cache.page_layout``.
+    Import layout types from ``tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout``.
 
     Names cover ``scope``, committed prefix tokens, multimodal digests and reuse scope, excluding
     other request inputs. Naming requires committed blocks, a lossless cold-page codec, no model
@@ -113,8 +113,8 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
           missing window margins. NAMED always transfers the whole object. Buffers the manager
           derives from the others (``PageLayout.rebuilds_untransferred``) that the source holds
           none of, such as KDA replay caches a context rank does not allocate, are filled by
-          calling the manager's ``rebuild_disagg_imported_cache`` on the request before its
-          first forward.
+          calling the ``rebuild_imported`` of the manager's layout adapter
+          (``cache_layout.adapter.adapter_for``) on the request before its first forward.
         - Treat failed leases and empty bounds as request-level outcomes, including permanent local
           states such as reuse reset. Validation ``ValueError``/``TypeError`` from lends and
           returns and misuse-related ``RuntimeError`` from lease methods and returns are caller
@@ -221,9 +221,9 @@ def attach_lender(manager: "KVCacheManagerV2", *, scope: bytes, staging: Staging
         ValueError: Already attached; CROSS cache; non-Helix context parallelism; model windows or
             recurrent state under Helix; model sparse buffers (``is_sparse``), whose pages can live
             in host memory; a non-REQUIRED attention group without a window; inconsistent groups,
-            configs or declarations, such as a buffer role the manager does not declare or
-            tensors whose pieces do not add up to a buffer's size
-            (``KVCacheManagerV2.get_page_table``);
+            configs or declarations, such as a buffer role the manager's layout adapter does not
+            declare or tensors whose pieces do not add up to a buffer's size
+            (``CacheLayoutAdapter.page_table``);
             no pages to stage; ``max_bytes`` below one local fetch; a malformed region, or two of
             one memory kind that overlap; or scope over 65535 bytes. Unmarked sparse-attention
             buffers are not rejected as sparse.

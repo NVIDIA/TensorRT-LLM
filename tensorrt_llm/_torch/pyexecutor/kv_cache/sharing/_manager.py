@@ -76,8 +76,10 @@ def require_v2(manager: object) -> None:
 
 def model_has_recurrent_state(manager: KVCacheManagerV2) -> bool:
     """Whether the manager serves a model with recurrent state, on every pipeline stage, whichever
-    layers this stage holds (``KVCacheManagerV2.model_has_recurrent_state``)."""
-    return bool(manager.model_has_recurrent_state)
+    layers this stage holds (``CacheLayoutAdapter.model_has_recurrent_state``)."""
+    from ..cache_layout.adapter import adapter_for
+
+    return bool(adapter_for(manager).model_has_recurrent_state)
 
 
 def model_has_attention_window(manager: KVCacheManagerV2) -> bool:

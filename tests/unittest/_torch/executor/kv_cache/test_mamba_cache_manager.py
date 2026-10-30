@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     extract_mamba_kv_cache_params,
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
@@ -3654,7 +3655,7 @@ def test_v2_hybrid_swa_scratch_keeps_ssm_placeholder_rows():
 def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
     mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
     try:
-        page_table = mgr.get_page_table()
+        page_table = adapter_for(mgr).page_table()
 
         groups = page_table.page_layout.layer_groups
         assert len(groups) == len(mgr.impl.layer_grouping)
@@ -3677,7 +3678,7 @@ def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
         conv_state_layout="q_k_v",
     )
     try:
-        page_table = mgr.get_page_table()
+        page_table = adapter_for(mgr).page_table()
         mamba_group = page_table.page_layout.layer_groups[0]
 
         assert mamba_group.kind == "state"
@@ -3805,7 +3806,7 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
             "kda_state_tok",
         }
         # A KVCM state buffer of the SSM layers, kept out of disaggregated transfers like the other replay buffers.
-        assert DataRole("kda_state_tok") in mgr._page_derived_roles()
+        assert DataRole("kda_state_tok") in adapter_for(mgr).derived_roles()
         assert len(mgr.kda_state_tok) == 2
         for layer_idx in range(2):
             layer_cache = mgr.mamba_layer_cache(layer_idx)
@@ -4579,7 +4580,7 @@ def test_v2_kda_replay_buffers_are_kvcm_state_buffers():
         assert mgr._mamba_state_bytes_per_slot() == (
             2 * (mgr.ssm_bytes + mgr.conv_bytes) + 2 * layer_bytes + 16
         )
-        ignored = {str(role) for role in mgr._page_derived_roles()}
+        ignored = {str(role) for role in adapter_for(mgr).derived_roles()}
         assert replay_roles | {"prev_num_accepted_tokens"} <= ignored
     finally:
         mgr.shutdown()
@@ -4729,7 +4730,9 @@ def test_v2_kda_worker_role_cache(monkeypatch, role, is_disagg):
         if ctx_only:
             assert mgr.get_intermediate_ssm_states(0) is None
             assert mgr.get_intermediate_conv_states(0) is None
-            assert not mgr._page_derived_roles() & {DataRole(name) for name in _KDA_REPLAY_FIELDS}
+            assert not adapter_for(mgr).derived_roles() & {
+                DataRole(name) for name in _KDA_REPLAY_FIELDS
+            }
             mgr.update_mamba_states(
                 SimpleNamespace(num_seqs=1, num_contexts=1),
                 torch.ones(1, device="cuda", dtype=torch.int32),
@@ -4825,7 +4828,10 @@ def test_v2_kda_replay_survives_cache_lifecycle(snapshot, kda_draft_records):
 def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
     """A context server without replay caches and a generation server with them describe the same transferable
     recurrent state, and the generation server seeds its replay caches from the transferred conv state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible, sent_bytes
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import (
+        check_compatible,
+        sent_bytes,
+    )
 
     monkeypatch.setenv("TRTLLM_DISAGG_ROLE", "context")
     ctx = _build_kda_replay_manager(is_disagg=True)
@@ -4837,8 +4843,8 @@ def test_v2_kda_asymmetric_context_generation_transfer(monkeypatch):
             _run_v2_hybrid_context(mgr, _make_v2_conversation_request(101, [1, 2], "transfer"))
         src_slot = ctx.get_state_indices([101])[0]
         dst_slot = gen.get_state_indices([101])[0]
-        src_table = ctx.get_page_table()
-        dst_table = gen.get_page_table()
+        src_table = adapter_for(ctx).page_table()
+        dst_table = adapter_for(gen).page_table()
         check_compatible(src_table.page_layout, dst_table.page_layout)
         for table in (src_table, dst_table):
             group = next(g for g in table.page_layout.layer_groups if g.kind == "state")
@@ -4987,13 +4993,14 @@ def test_kda_cache_budget_counts_live_dummy_and_fixed_snapshot_slots(
 
 
 def test_imported_requests_are_rebuilt_by_seeding_their_kda_replay_caches():
-    """The executor's one post-import call seeds the KDA replay caches, on either manager."""
+    """The executor's one post-import call, through the V2 manager's layout adapter or to the V1
+    manager, seeds the KDA replay caches."""
     requests = [SimpleNamespace(py_request_id=101), SimpleNamespace(py_request_id=202)]
 
     v2 = object.__new__(MambaHybridCacheManagerV2)
     seeded = []
     v2.seed_kda_replay_caches_for_disagg_gen = seeded.append
-    v2.rebuild_disagg_imported_cache(iter(requests))
+    adapter_for(v2).rebuild_imported(iter(requests))
     assert seeded == [[101, 202]]
 
     v1 = object.__new__(MambaCacheManager)

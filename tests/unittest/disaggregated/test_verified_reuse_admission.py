@@ -49,7 +49,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import slot_pointers
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
     BufferDesc,
     LayerGroupDesc,
     PageLayout,
@@ -57,7 +57,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
     replicated,
     token_major,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import ManagerLayout
 
 pytestmark = pytest.mark.cpu_only
 

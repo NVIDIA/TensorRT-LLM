@@ -37,7 +37,8 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     TaskStatus,
     TxSession,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import CacheLayoutAdapter
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import DevicePool
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, LlmRequestType
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
@@ -462,11 +463,10 @@ def test_pipelined_transfer_disabled_by_default():
 
 
 def _manager_allowing_pieces():
-    """A cache manager whose pages can move in pieces."""
-    return MagicMock(
-        enable_block_reuse=False,
-        disagg_pipelined_transfer_blocker=MagicMock(return_value=None),
-    )
+    """A cache manager whose pages can move in pieces, and its layout adapter saying so."""
+    manager = MagicMock(enable_block_reuse=False)
+    layout = MagicMock(pipelined_transfer_blocker=MagicMock(return_value=None))
+    return manager, layout
 
 
 def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
@@ -475,7 +475,7 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=2, cp_size=1)
-    transceiver._kv_cache_manager = _manager_allowing_pieces()
+    transceiver._kv_cache_manager, transceiver._layout = _manager_allowing_pieces()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -490,7 +490,7 @@ def test_pipelined_transfer_rejects_bounce_buffer():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = _manager_allowing_pieces()
+    transceiver._kv_cache_manager, transceiver._layout = _manager_allowing_pieces()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -514,7 +514,7 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = _manager_allowing_pieces()
+    transceiver._kv_cache_manager, transceiver._layout = _manager_allowing_pieces()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -528,15 +528,16 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
 def test_pipelined_transfer_rejects_a_manager_whose_pages_cannot_move_in_pieces():
     """A manager whose pages cannot move in pieces turns pipelined transfer down.
 
-    The manager says why (disagg_pipelined_transfer_blocker), as the recurrent-state manager does.
+    The manager's layout adapter says why (pipelined_transfer_blocker), as the recurrent-state
+    manager's does.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock(
-        enable_block_reuse=False,
-        disagg_pipelined_transfer_blocker=MagicMock(return_value="a Mamba/hybrid cache manager"),
+    transceiver._kv_cache_manager = MagicMock(enable_block_reuse=False)
+    transceiver._layout = MagicMock(
+        pipelined_transfer_blocker=MagicMock(return_value="a Mamba/hybrid cache manager"),
     )
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
@@ -594,7 +595,7 @@ def test_pipelined_transfer_rejects_context_parallelism():
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=2)
-    transceiver._kv_cache_manager = _manager_allowing_pieces()
+    transceiver._kv_cache_manager, transceiver._layout = _manager_allowing_pieces()
     cache_transceiver_config = CacheTransceiverConfig(
         backend="NIXL",
         enable_pipelined_transfer=True,
@@ -959,6 +960,8 @@ def test_pipelined_multiple_chunks_use_real_builder_and_tx_session():
         )
     )
     transceiver._kv_cache_manager = SimpleNamespace(tokens_per_block=tokens_per_block)
+    # The base adapter: the transfer moves the whole prompt and every buffer.
+    transceiver._layout = CacheLayoutAdapter(transceiver._kv_cache_manager)
     transceiver._dp_rank = 0
     transceiver._context_info_endpoint = "ctx"
 

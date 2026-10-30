@@ -119,8 +119,9 @@ def _build_transceiver_for_kv_slice(
     """Stub a KvCacheTransceiverV2 so _create_chunk runs without dist setup.
 
     Wires only the attributes the method touches:
-      - reuse adapter: tokens_per_block, per-layer-group cached count, ordinals
-      - page table:    layer groups
+      - reuse adapter:  tokens_per_block, per-layer-group cached count, ordinals
+      - page table:     layer groups
+      - layout adapter: transfer length, untransferred buffers, state slots
 
     `block_ids` is beam-0's stale-stripped chain (valid window followed by any
     speculative / ctx first-token over-hang). The adapter's positional table is
@@ -163,17 +164,18 @@ def _build_transceiver_for_kv_slice(
         start = getattr(req, "py_csa2_remote_tail_start", None)
         return req.prompt_len if start is None else start
 
-    cache_manager = SimpleNamespace(
-        num_extra_kv_tokens=num_extra_kv_tokens,
-        disagg_transfer_length=transfer_length,
-        disagg_untransferred_buffers=lambda req: frozenset(),
-        disagg_state_slot=lambda req, layer_group: None,
+    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+    layout = SimpleNamespace(
+        transfer_length=transfer_length,
+        untransferred_buffers=lambda req: frozenset(),
+        state_slot=lambda req, layer_group: None,
     )
 
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._reuse_adapter = reuse_adapter
     transceiver._page_table = page_table
     transceiver._kv_cache_manager = cache_manager
+    transceiver._layout = layout
 
     req = SimpleNamespace(
         prompt_len=prompt_len,
@@ -695,7 +697,7 @@ class TestTransceiverContextManager:
 
 
 def test_a_state_layer_group_carries_its_slot_or_the_transfer_is_refused():
-    """A recurrent-state group moves the one slot the cache manager names.
+    """A recurrent-state group moves the one slot the manager's layout adapter names.
 
     Naming none would leave the state behind while both sides expect no bytes of it, so the
     transfer refuses it.
@@ -704,8 +706,8 @@ def test_a_state_layer_group_carries_its_slot_or_the_transfer_is_refused():
     transceiver._page_table = SimpleNamespace(
         page_layout=SimpleNamespace(layer_groups=[SimpleNamespace(kind="state", kept_window=None)])
     )
-    transceiver._kv_cache_manager.disagg_state_slot = lambda req, layer_group: 5 + layer_group
+    transceiver._layout.state_slot = lambda req, layer_group: 5 + layer_group
     assert transceiver._create_chunk(req).block_ids_per_layer_groups[0].tolist() == [5]
-    transceiver._kv_cache_manager.disagg_state_slot = lambda req, layer_group: None
+    transceiver._layout.state_slot = lambda req, layer_group: None
     with pytest.raises(RuntimeError, match="names no slot of layer group 0's recurrent state"):
         transceiver._create_chunk(req)

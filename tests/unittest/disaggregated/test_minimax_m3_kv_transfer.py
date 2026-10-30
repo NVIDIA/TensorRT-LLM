@@ -36,8 +36,17 @@ import torch
 from tensorrt_llm import Mapping
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KVCacheManagerV2
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import (
+    CacheLayoutAdapter,
+    adapter_class_for,
+    adapter_for,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
+    head_major,
+    replicated,
+    token_major,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import head_major, replicated, token_major
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
@@ -85,22 +94,26 @@ def test_minimax_cache_indices_support_block_count_limit() -> None:
     ]
 
 
-def _with_two_of_four_heads(manager: KVCacheManagerV2) -> KVCacheManagerV2:
-    """The manager as rank 0 of TP2 holding 2 of a layer's 4 KV heads."""
+def _with_two_of_four_heads(manager: KVCacheManagerV2) -> CacheLayoutAdapter:
+    """The manager's layout adapter, as rank 0 of TP2 holding 2 of a layer's 4 KV heads."""
     manager.mapping = SimpleNamespace(tp_size=2, tp_rank=0)
-    manager._page_kv_heads = lambda layer: (2, 4)
-    return manager
+
+    class TwoOfFourHeads(adapter_class_for(type(manager))):
+        def kv_heads(self, layer: int) -> tuple[int, int | None]:
+            return 2, 4
+
+    return TwoOfFourHeads(manager)
 
 
 @pytest.mark.cpu_only
-def test_v2_page_buffer_tensor_defaults() -> None:
-    manager = _with_two_of_four_heads(object.__new__(KVCacheManagerV2))
+def test_v2_buffer_tensor_defaults() -> None:
+    adapter = _with_two_of_four_heads(object.__new__(KVCacheManagerV2))
 
-    # K/V split by head, head-major; the index-key side cache spreads as its manager declares it
-    # (MiniMax M3 below), so the base declares none.
-    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
+    # K/V split by head, head-major; the index-key side cache spreads as its manager's adapter
+    # declares it (MiniMax M3 below), so the base declares none.
+    assert adapter.buffer_tensors(0, Role.KEY, 256, 16, False) == head_major(256, 2, 4)
     with pytest.raises(ValueError, match="does not declare how its bytes spread"):
-        manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
+        adapter.buffer_tensors(0, Role.INDEX_KEY, 128, 16, False)
 
 
 @pytest.mark.cpu_only
@@ -112,7 +125,7 @@ def test_v2_page_buffer_tensor_defaults() -> None:
         ("triton", DataType.NVFP4, "NHD"),
     ],
 )
-def test_minimax_page_buffer_tensors(
+def test_minimax_buffer_tensors(
     monkeypatch: pytest.MonkeyPatch,
     implementation: str,
     cache_dtype: DataType,
@@ -138,12 +151,12 @@ def test_minimax_page_buffer_tensors(
     )
 
     assert manager._main_kv_layout_name() == expected_main_layout
-    _with_two_of_four_heads(manager)
+    adapter = _with_two_of_four_heads(manager)
     expected_kv = (
         token_major(256, 16, 2, 4) if expected_main_layout == "NHD" else head_major(256, 2, 4)
     )
-    assert manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == expected_kv
-    assert manager._page_buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
+    assert adapter.buffer_tensors(0, Role.KEY, 256, 16, False) == expected_kv
+    assert adapter.buffer_tensors(0, Role.INDEX_KEY, 128, 16, False) == replicated(128)
     if implementation == "triton":
         fp8_manager = MiniMaxM3KVCacheManagerV2(
             num_layers=0,
@@ -154,10 +167,8 @@ def test_minimax_page_buffer_tensors(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
-        _with_two_of_four_heads(fp8_manager)
-        assert fp8_manager._page_buffer_tensors(0, Role.KEY, 256, 16, False) == token_major(
-            256, 16, 2, 4
-        )
+        fp8_adapter = _with_two_of_four_heads(fp8_manager)
+        assert fp8_adapter.buffer_tensors(0, Role.KEY, 256, 16, False) == token_major(256, 16, 2, 4)
         assert fp8_manager._dense_native_layer_ids == ()
 
 
@@ -259,7 +270,7 @@ def test_minimax_m3_buffer_placement_coalesced_vs_separate() -> None:
     """
 
     def transferred(manager):
-        layout = manager.get_page_table().page_layout
+        layout = adapter_for(manager).page_table().page_layout
         return {(b.layer, b.role): b for b in layout.buffers if b.transferred}
 
     key, value, index = str(Role.KEY), str(Role.VALUE), str(Role.INDEX_KEY)
@@ -331,7 +342,7 @@ def _create_managers(
 
 def _zero_physical_pools(manager: MiniMaxM3KVCacheManagerV2) -> None:
     unique_pools = {}
-    for pools in manager.get_page_table().device_pools.values():
+    for pools in adapter_for(manager).page_table().device_pools.values():
         for pool in pools:
             unique_pools[pool.base] = max(
                 unique_pools.get(pool.base, 0), pool.slot_bytes * pool.num_slots
@@ -346,7 +357,7 @@ def _get_nvfp4_scale_view(
 ) -> torch.Tensor | None:
     if not manager.is_nvfp4_layer(layer_idx):
         return None
-    page_table = manager.get_page_table()
+    page_table = adapter_for(manager).page_table()
     local_layer_id = manager.layer_offsets[layer_idx]
     scale_roles = frozenset({"key_block_scale", "value_block_scale"})
     for layer_group_id, local_layers in enumerate(page_table.local_layers):

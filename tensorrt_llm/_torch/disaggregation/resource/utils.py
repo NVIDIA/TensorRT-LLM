@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Where a rank's pages lie, read off its page table (``KVCacheManagerV2.get_page_table``): layer
+"""Where a rank's pages lie, read off its page table (``CacheLayoutAdapter.page_table``): layer
 group ``i`` of the table is the manager's layer group ``i``, and pool ``p`` of a layer group is pool
 ``p`` of the group's device pool group."""
 
@@ -24,7 +24,10 @@ from typing import List
 import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base import CacheKind
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import DevicePool, ManagerLayout
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import (
+    DevicePool,
+    ManagerLayout,
+)
 
 
 def get_cache_kinds(page_table: ManagerLayout) -> List[CacheKind]:

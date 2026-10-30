@@ -301,7 +301,7 @@ def _state_layout(*, side_bytes=128):
     Each layer has conv state of three sections and SSM state of 64-byte heads; with
     ``side_bytes``, layer 2 also has replicated PLE n-gram context.
     """
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import (
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_layout import (
         BufferDesc,
         LayerGroupDesc,
         PageLayout,
@@ -333,7 +333,7 @@ def _state_layout(*, side_bytes=128):
 
 def test_sent_state_bytes_matched_tp():
     """A rank of the same layout sends all of its recurrent state."""
-    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import sent_bytes
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import sent_bytes
 
     layout = _state_layout()
     # Standard state covers both layers; the side role exists only on layer 2.
@@ -341,7 +341,7 @@ def test_sent_state_bytes_matched_tp():
 
 
 def test_incompatible_replicated_side_state_is_refused():
-    from tensorrt_llm._torch.pyexecutor.kv_cache.layout_mapping import check_compatible
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.layout_mapping import check_compatible
 
     # Side state one rank lacks would leave the other's zeroed.
     with pytest.raises(ValueError, match="ple_ngram_context.*transferred by one rank only"):

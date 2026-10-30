@@ -47,6 +47,10 @@ import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import (
+    CacheLayoutAdapter,
+    adapter_for,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, get_size_in_bytes
@@ -78,6 +82,7 @@ def test_assert_disagg_history_declared_passes_when_contract_met():
     cache_manager = SimpleNamespace(get_history_length=lambda r: 17)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
+    transceiver._layout = CacheLayoutAdapter(cache_manager)
 
     # Should not raise — history_length matches prompt_len exactly.
     transceiver._assert_disagg_history_declared(req)
@@ -92,6 +97,7 @@ def test_assert_disagg_history_declared_raises_on_contract_violation():
     cache_manager = SimpleNamespace(get_history_length=lambda r: 0)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
+    transceiver._layout = CacheLayoutAdapter(cache_manager)
 
     with pytest.raises(RuntimeError, match="history_length=0 < prompt_len=17"):
         transceiver._assert_disagg_history_declared(req)
@@ -103,6 +109,7 @@ def test_assert_disagg_history_declared_noops_when_cache_released():
     cache_manager = SimpleNamespace(get_history_length=lambda r: None)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._kv_cache_manager = cache_manager
+    transceiver._layout = CacheLayoutAdapter(cache_manager)
 
     transceiver._assert_disagg_history_declared(req)
 
@@ -422,7 +429,7 @@ def _init_pool_data_v2(
     for rank, mgr in enumerate(managers):
         pp_rank = rank // tp
         tp_rank = rank % tp
-        page_table = mgr.get_page_table()
+        page_table = adapter_for(mgr).page_table()
 
         unique_pools: Dict[int, int] = {}
         for pools in page_table.device_pools.values():
@@ -748,7 +755,7 @@ def _get_layer_to_window_size(
     for pp_rank in range(pp):
         manager = managers[pp_rank * tp]
 
-        for desc in manager.get_page_table().page_layout.layer_groups:
+        for desc in adapter_for(manager).page_table().page_layout.layer_groups:
             for layer_id in desc.layers:
                 layer_to_window[layer_id] = desc.kept_window
 

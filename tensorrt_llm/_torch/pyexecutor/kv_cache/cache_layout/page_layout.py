@@ -723,11 +723,11 @@ class PageLayout:
             lender stages nothing.
         rebuilds_untransferred: Whether some buffers peers do not transfer derive from the others,
             which the manager rebuilds after the native transfer imports a request's pages
-            (``KVCacheManagerV2._page_derived_roles``). The lender, which invokes no rebuild, then
+            (``CacheLayoutAdapter.derived_roles``). The lender, which invokes no rebuild, then
             lends every buffer, and where the source holds none of the derived ones, the importer
             invokes the rebuild (``attach_lender``).
         request_rebuilt_roles: Roles whose buffers this rank, receiving, rebuilds for some requests
-            rather than receiving them (``KVCacheManagerV2._page_request_rebuilt_roles``), so a
+            rather than receiving them (``CacheLayoutAdapter.request_rebuilt_roles``), so a
             peer may hold none of them for a model layer it holds.
 
     Raises:

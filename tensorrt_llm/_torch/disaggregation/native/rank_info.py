@@ -19,24 +19,26 @@ from typing import List, Optional
 import msgpack
 
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.adapter import adapter_for
+from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import (
     ManagerLayout,
     page_table_from_dict,
     page_table_to_dict,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 
 
 def manager_page_table(manager: KVCacheManager) -> ManagerLayout:
-    """The page table of a cache manager (``KVCacheManagerV2.get_page_table``).
+    """The page table of a cache manager, as its layout adapter reads it
+    (``CacheLayoutAdapter.page_table``).
 
     Raises:
         ValueError: If the manager is not a ``KVCacheManagerV2``.
     """
     if not isinstance(manager, KVCacheManagerV2):
         raise ValueError("Python KV cache transfer requires KVCacheManagerV2; V1 is unsupported.")
-    return manager.get_page_table()
+    return adapter_for(manager).page_table()
 
 
 @dataclass

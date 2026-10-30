@@ -44,7 +44,7 @@ from .core import BounceTransport, Disposition, Settlement, TransferContext
 from .gather_scatter import Plan, gather_contiguous, scatter_contiguous
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ManagerLayout
+    from tensorrt_llm._torch.pyexecutor.kv_cache.cache_layout.page_table import ManagerLayout
 
 RidSlice = tuple  # the request id and slice id a region serves
 _MIB = 1024 * 1024

@@ -14,7 +14,7 @@
 # limitations under the License.
 """A ``KVCacheManagerV2``'s page table as plain values: how its pages are laid out (``PageLayout``),
 where its device pools lie and what each layer group is; and what a layer config or a rank's place
-says about it. The manager builds the table itself (``KVCacheManagerV2.get_page_table``); readers
+says about it. The manager's layout adapter builds the table (``CacheLayoutAdapter.page_table``); readers
 of the table, such as the lender, never look into the manager."""
 
 from __future__ import annotations

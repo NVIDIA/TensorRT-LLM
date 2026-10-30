@@ -33,7 +33,6 @@ from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_layout import Tensor, replicated
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -687,17 +686,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
-
-    def _page_buffer_tensors(
-        self, layer_id: int, role: str, size: int, tokens: int, state: bool
-    ) -> tuple[Tensor, ...]:
-        """K/V and their block scales split by head as the backend writes them, head-major (MSA)
-        or token-major (Triton); index-K alike on every rank."""
-        if role == Role.INDEX_KEY:
-            return replicated(size)
-        return self._page_head_split(
-            layer_id, size, tokens, state, token_major_=self._main_kv_storage_layout == "NHD"
-        )
 
     def _main_kv_layout_name(self) -> str:
         """Return the layout name of the main K/V storage, ``"HND"`` or ``"NHD"``."""

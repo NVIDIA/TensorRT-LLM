@@ -38,7 +38,7 @@ import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base.memory import MemoryKind
 
-from ..page_layout import PageLayout
+from ..cache_layout.page_layout import PageLayout
 
 if TYPE_CHECKING:
     import torch

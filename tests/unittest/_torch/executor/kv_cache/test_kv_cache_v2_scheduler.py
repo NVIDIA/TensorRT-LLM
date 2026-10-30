@@ -673,7 +673,9 @@ def make_kv_cache_manager(
     mgr.probe_context_reuse.side_effect = lambda req: None
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
     mgr.try_allocate_draft_context.side_effect = lambda req, n: True
-    mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (lambda req: True)
+    mgr.prepare_disagg_gen_init.side_effect = prepare_disagg_gen_init_fn or (
+        lambda req, transfer_length=None: True
+    )
     mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     # An unpaired draft pool is created-and-resumed through this during
     # admission; a real manager answers False when either step fails.
@@ -3077,7 +3079,7 @@ class TestDisagg:
         """Disagg is limited by KV cache / IndexMapper, not batch budget."""
         call_count = [0]
 
-        def prepare_fn(req):
+        def prepare_fn(req, transfer_length=None):
             call_count[0] += 1
             return call_count[0] <= 2  # first 2 succeed, rest fail
 
@@ -3110,7 +3112,7 @@ class TestDisagg:
         """prepare_disagg_gen_init failure skips the request, loop continues."""
         call_count = [0]
 
-        def prepare_fn(req):
+        def prepare_fn(req, transfer_length=None):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
 
@@ -3126,7 +3128,7 @@ class TestDisagg:
         the SWA history pre-declaration internally."""
         called = []
 
-        def prepare_disagg_fn(req):
+        def prepare_disagg_fn(req, transfer_length=None):
             called.append(req.py_request_id)
             return True
 
@@ -3208,7 +3210,7 @@ class TestDisagg:
         """prepare_disagg_gen_init failure for one disagg does not stop other disaggs."""
         call_count = [0]
 
-        def selective_prepare(req):
+        def selective_prepare(req, transfer_length=None):
             call_count[0] += 1
             # Fail for request 0 and 2, succeed for 1 and 3
             return req.request_id in (1, 3)
@@ -3237,7 +3239,7 @@ class TestDisagg:
         """
         prepare_count = [0]
 
-        def counting_prepare(req):
+        def counting_prepare(req, transfer_length=None):
             prepare_count[0] += 1
             return True
 
