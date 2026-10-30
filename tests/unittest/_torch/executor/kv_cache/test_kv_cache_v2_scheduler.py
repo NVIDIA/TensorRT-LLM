@@ -5366,3 +5366,199 @@ class TestShortestPrefillFirstBounds:
         # The protection applies to requests that have not started prefilling;
         # between started requests the usual newest-first preemption holds.
         assert ids(out.recompute_paused_requests) == [2]
+
+
+# ===========================================================================
+# Opt-in context page backoff and admission diagnostics
+# ===========================================================================
+
+
+_BACKOFF_ENV = "TRTLLM_SCHED_CTX_PAGE_BACKOFF_PASSES"
+_DIAG_ENV = "TRTLLM_SCHED_ADMISSION_DIAG"
+_DIAG_PASSES_ENV = "TRTLLM_SCHED_ADMISSION_DIAG_PASSES"
+
+
+@pytest.fixture
+def backoff_env(monkeypatch):
+    for name in (
+        _INTERVAL_ENV,
+        _SPF_ENV,
+        _SPF_WAIT_ENV,
+        _BACKOFF_ENV,
+        _DIAG_ENV,
+        _DIAG_PASSES_ENV,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def _refusing_manager(refused_ids):
+    """Manager whose pool refuses the context pages of every id in *refused_ids*."""
+    return make_kv_cache_manager(
+        resize_context_fn=lambda req, n: req.py_request_id not in refused_ids
+    )
+
+
+def _resize_attempts(mgr):
+    return [c.args[0].py_request_id for c in mgr.resize_context.call_args_list]
+
+
+class TestContextPageBackoff:
+    def test_off_by_default_retries_every_pass(self, backoff_env):
+        mgr = _refusing_manager({1, 2})
+        sched = make_scheduler(mgr)
+        assert sched._ctx_page_backoff is None
+        assert sched._admission_diag is None
+        gen = make_gen_request(0)
+        pending = [make_ctx_request(1, 100), make_ctx_request(2, 100)]
+        for _ in range(3):
+            out = sched.schedule_request([gen, *pending], set())
+            assert ids(out.generation_requests) == [0]
+            assert ids(out.context_requests) == []
+        assert _resize_attempts(mgr) == [1, 2] * 3
+
+    @pytest.mark.parametrize("value", ["-1", "x", "2.5"])
+    def test_invalid_value_rejected(self, backoff_env, value):
+        backoff_env.setenv(_BACKOFF_ENV, value)
+        with pytest.raises(ValueError, match=_BACKOFF_ENV):
+            make_scheduler(make_kv_cache_manager())
+
+    def test_zero_disables(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "0")
+        assert make_scheduler(make_kv_cache_manager())._ctx_page_backoff is None
+
+    @pytest.mark.parametrize("passes", [1, 3])
+    def test_refusal_holds_first_chunks_for_n_generation_passes(self, backoff_env, passes):
+        backoff_env.setenv(_BACKOFF_ENV, str(passes))
+        mgr = _refusing_manager({1, 2})
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        pending = [make_ctx_request(1, 100), make_ctx_request(2, 100)]
+        attempted_passes = []
+        for step in range(2 * (passes + 1)):
+            before = len(mgr.resize_context.call_args_list)
+            out = sched.schedule_request([gen, *pending], set())
+            # Decoding never waits on the backoff.
+            assert ids(out.generation_requests) == [0]
+            assert ids(out.context_requests) == []
+            attempts = _resize_attempts(mgr)[before:]
+            if attempts:
+                # The first refusal ends first-chunk admission for the pass.
+                assert attempts == [1]
+                attempted_passes.append(step)
+        assert attempted_passes == [0, passes + 1]
+
+    def test_admission_resumes_once_pages_return(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "2")
+        refused = {1}
+        mgr = _refusing_manager(refused)
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, 100)
+        assert ids(sched.schedule_request([gen, ctx], set()).context_requests) == []
+        refused.clear()
+        assert ids(sched.schedule_request([gen, ctx], set()).context_requests) == []
+        assert ids(sched.schedule_request([gen, ctx], set()).context_requests) == []
+        assert ids(sched.schedule_request([gen, ctx], set()).context_requests) == [1]
+        assert sched._ctx_page_backoff.remaining == 0
+
+    def test_successful_admission_does_not_arm(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "4")
+        sched = make_scheduler(_refusing_manager(set()))
+        gen = make_gen_request(0)
+        for request_id in (1, 2, 3):
+            out = sched.schedule_request([gen, make_ctx_request(request_id, 100)], set())
+            assert ids(out.context_requests) == [request_id]
+        assert sched._ctx_page_backoff.remaining == 0
+
+    def test_chunk_continuations_are_not_held(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "4")
+        mgr = _refusing_manager({2})
+        sched = make_scheduler(mgr, max_num_tokens=1000, ctx_chunk_config=(None, 64))
+        gen = make_gen_request(0)
+        refused = make_ctx_request(2, 100)
+        sched.schedule_request([gen, refused], set())
+        assert sched._ctx_page_backoff.remaining == 4
+        started = make_ctx_request(
+            1, context_remaining_length=500, prompt_len=5000, is_first_context_chunk=False
+        )
+        fresh = make_ctx_request(3, 100)
+        out = sched.schedule_request([gen, started, fresh], set())
+        assert ids(out.context_requests) == [1]
+        assert 3 not in _resize_attempts(mgr)
+
+    def test_not_held_without_generation(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "4")
+        mgr = _refusing_manager({1})
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        assert sched._ctx_page_backoff.remaining == 4
+        # Nothing decodes: the step has no other use, so admission is tried.
+        out = sched.schedule_request([make_ctx_request(2, 100)], set())
+        assert ids(out.context_requests) == [2]
+        assert sched._ctx_page_backoff.remaining == 4
+
+    def test_held_context_is_not_a_stall(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "64")
+        sched = make_scheduler(_refusing_manager({1}))
+        gen = make_gen_request(0)
+        for _ in range(64):
+            sched.schedule_request([gen, make_ctx_request(1, 100)], set())
+        assert sched._stalled_schedules == 0
+
+    def test_composes_with_prefill_decode_interval(self, backoff_env):
+        backoff_env.setenv(_BACKOFF_ENV, "2")
+        backoff_env.setenv(_INTERVAL_ENV, "1")
+        mgr = _refusing_manager({1})
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        ctx = make_ctx_request(1, 100)
+        attempted = []
+        for step in range(6):
+            before = len(mgr.resize_context.call_args_list)
+            sched.schedule_request([gen, ctx], set())
+            if _resize_attempts(mgr)[before:]:
+                attempted.append(step)
+        # The interval never arms (nothing is admitted); the backoff alone
+        # spaces the refused attempts.
+        assert attempted == [0, 3]
+
+
+class TestAdmissionDiagnostics:
+    def test_window_summary_counts_attempts_and_refusals(self, backoff_env):
+        backoff_env.setenv(_DIAG_ENV, "1")
+        backoff_env.setenv(_DIAG_PASSES_ENV, "3")
+        mgr = _refusing_manager({1})
+        sched = make_scheduler(mgr)
+        gen = make_gen_request(0)
+        with patch("tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger") as log:
+            for request_id in (2, 3, 4):
+                sched.schedule_request(
+                    [gen, make_ctx_request(1, 100), make_ctx_request(request_id, 10)], set()
+                )
+        summaries = [
+            c.args[0] for c in log.info.call_args_list if "admission diagnostics" in c.args[0]
+        ]
+        assert len(summaries) == 1
+        assert "over 3 passes: attempts 6, page refusals 3 in 3 passes" in summaries[0]
+        assert "allocate 6 calls" in summaries[0]
+        assert "prepare 6 calls" in summaries[0]
+
+    def test_diagnostics_do_not_change_decisions(self, backoff_env):
+        def run():
+            mgr = _refusing_manager({1})
+            sched = make_scheduler(mgr)
+            gen = make_gen_request(0)
+            return [
+                ids(
+                    sched.schedule_request(
+                        [gen, make_ctx_request(1, 100), make_ctx_request(r, 10)], set()
+                    ).context_requests
+                )
+                for r in (2, 3, 4)
+            ]
+
+        plain = run()
+        backoff_env.setenv(_DIAG_ENV, "1")
+        assert run() == plain

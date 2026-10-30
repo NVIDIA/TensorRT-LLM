@@ -83,6 +83,8 @@ from ...dispatch import LAUNCH_PDL
 from ...ops.attention.multi_request_prep_append import (
     MAX_ROWS_PER_SEQ,
     MAX_SEQS,
+    PACKED_GEOMETRY,
+    launch_kind,
     multi_request_prep_append,
 )
 
@@ -690,10 +692,17 @@ def install(model: torch.nn.Module, min_seqs: int = MIN_SEQS) -> int:
         attention._mr_append_folded = None
         attention._mr_append_census = census
         attention._mr_append_min_seqs = min_seqs
+    grid = (
+        "packed grid (last rows, items per program): "
+        f"{[(last, items) for last, items, _, _ in PACKED_GEOMETRY]}, one item per program on "
+        "o_proj-prefetching steps"
+        if not torch.cuda.is_available() or launch_kind(torch.device("cuda")) == "packed"
+        else "grid of one program per (row, head)"
+    )
     logger.info(
         f"[musespark_open] multi_request_prep_append: the K/V append, E4M3 query and FMHA scales "
         f"of {len(attentions)} layers run in the decode prep on steps of {min_seqs}..{MAX_SEQS} sequences "
         f"of up to {MAX_ROWS_PER_SEQ} rows each; their trtllm-gen generation preprocess launch "
-        "(decoder-info + append) is skipped"
+        f"(decoder-info + append) is skipped; {grid}"
     )
     return len(attentions)

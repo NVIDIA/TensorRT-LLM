@@ -58,7 +58,10 @@ SM107_SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
 #: coefficient projection is the tep8 one. The fastest split-K tactic of each shape in
 #: chains of cold weights with PDL on; it beats cuBLAS on the qkv, gate_up and
 #: convolution shapes, ties it on down_proj and trails it slightly on o_proj in
-#: isolation, where ``drafter_pdl_chain``'s early weight load is what it is for.
+#: isolation, where ``drafter_pdl_chain``'s early weight load is what it is for. Besides the
+#: one-request block (8 rows) the table lists the blocks of 2..4 requests (16, 24 and 32
+#: rows), each the fastest split-K tactic at that row count on GB300's 152 SMs over cold
+#: weights with PDL on; every one is a single wave of at most 128 CTAs.
 SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     # DFlash 2 convolution coefficient projection (replicated).
     (8, 8192, 2048): (64, 8, 4, 10),
@@ -70,16 +73,48 @@ SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 7168, 8192): (64, 8, 1, 11),
     # drafter gate_up_proj per rank.
     (8, 8192, 14336): (128, 8, 1, 6),
+    (16, 8192, 2048): (64, 16, 4, 8),
+    (16, 8192, 2560): (64, 16, 2, 10),
+    (16, 2048, 8192): (64, 16, 1, 10),
+    (16, 7168, 8192): (64, 16, 1, 10),
+    (16, 8192, 14336): (128, 16, 1, 6),
+    (24, 8192, 2048): (64, 16, 2, 11),
+    (24, 8192, 2560): (64, 32, 2, 9),
+    (24, 2048, 8192): (64, 32, 1, 9),
+    (24, 7168, 8192): (64, 32, 1, 9),
+    (24, 8192, 14336): (128, 32, 1, 5),
+    (32, 8192, 2048): (64, 16, 2, 11),
+    (32, 8192, 2560): (64, 32, 2, 9),
+    (32, 2048, 8192): (64, 32, 1, 9),
+    (32, 7168, 8192): (64, 32, 1, 9),
+    (32, 8192, 14336): (128, 32, 1, 5),
 }
 
 #: The tep4 drafter shapes on sm107 (212 SMs), each the fastest split-K tactic there in
-#: the same chains; every one beats cuBLAS at its shape.
+#: the same chains; every one beats cuBLAS at its shape. Besides the one-request block
+#: (8 rows) the table lists the blocks of 2..4 requests (16, 24 and 32 rows), each the
+#: fastest split-K tactic at that row count over cold weights with PDL on.
 SM107_SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (8, 8192, 2048): (64, 8, 4, 10),
     (8, 8192, 2560): (64, 8, 4, 12),
     (8, 2048, 8192): (128, 16, 2, 6),
     (8, 7168, 8192): (64, 8, 2, 10),
     (8, 8192, 14336): (64, 8, 2, 11),
+    (16, 8192, 2048): (64, 16, 4, 10),
+    (16, 8192, 2560): (64, 16, 4, 10),
+    (16, 2048, 8192): (64, 16, 1, 11),
+    (16, 7168, 8192): (64, 32, 1, 8),
+    (16, 8192, 14336): (128, 16, 1, 6),
+    (24, 8192, 2048): (64, 32, 4, 8),
+    (24, 8192, 2560): (64, 32, 4, 8),
+    (24, 2048, 8192): (64, 32, 1, 9),
+    (24, 7168, 8192): (64, 32, 1, 9),
+    (24, 8192, 14336): (128, 32, 1, 5),
+    (32, 8192, 2048): (64, 32, 4, 8),
+    (32, 8192, 2560): (64, 32, 4, 8),
+    (32, 2048, 8192): (64, 32, 1, 9),
+    (32, 7168, 8192): (64, 32, 2, 9),
+    (32, 8192, 14336): (64, 32, 2, 8),
 }
 
 #: The measured table of each ``(compute capability, drafter TP size)``.

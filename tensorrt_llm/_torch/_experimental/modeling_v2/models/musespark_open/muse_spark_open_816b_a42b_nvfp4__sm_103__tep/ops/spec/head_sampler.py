@@ -598,3 +598,468 @@ def shared_gather_workspace(mapping: Mapping, shard: int) -> HeadGatherWorkspace
         workspace = HeadGatherWorkspace(mapping, shard)
         _SHARED[key] = workspace
     return workspace
+
+
+# ---------------------------------------------------------------------------------------
+# The vocabulary-parallel head (fast path ``vocab_parallel_head``): no logits all-gather.
+
+#: Fewest rows the vocabulary-parallel head takes (two K=7 verify blocks); 8-row steps keep
+#: the ``lm_head_inbox`` gather.
+VP_MIN_ROWS = 16
+#: Claimants of a row whose crossings the ranks exchange (``kVpClaimants``).
+VP_CLAIMANTS = 4
+#: Greedy words per (rank, row): one per ``vp_fold`` CTA of the 1024-thread block.
+VP_GREEDY_SLOTS = VIRTUAL_THREADS // FOLD_THREADS
+#: ``vp_draw``'s per-row record for ``vp_decide`` (int32 words).
+VP_INFO_WORDS = 2 + VP_CLAIMANTS
+#: Most ranks (``kVpMaxRanks``).
+VP_MAX_RANKS = 8
+
+
+class VocabParallelLayout:
+    """The exchange buffer of the vocabulary-parallel head for ``ranks`` shards of ``shard``
+    elements and calls of at most ``max_rows`` rows.
+
+    One copy per rank, every 32-bit word the sentinel ``0xFFFFFFFF`` between calls:
+    ``[ranks][state_stride]`` 16-byte states (``vp_fold``'s per-virtual-thread partials), then
+    ``[ranks][greedy_stride]`` 8-byte greedy words at ``greedy_offset``, then
+    ``[ranks][cand_stride]`` 4-byte candidates at ``cand_offset``; ``nbytes`` in all.
+    """
+
+    def __init__(self, ranks: int, shard: int, max_rows: int):
+        if not 1 <= ranks <= VP_MAX_RANKS:
+            raise ValueError(f"1..{VP_MAX_RANKS} ranks, got {ranks}")
+        if shard % 4:
+            raise ValueError(f"shard {shard} is not a whole number of 4-element vectors")
+        if not VP_MIN_ROWS <= max_rows <= WIDE_MAX_ROWS:
+            raise ValueError(f"max_rows must be in {VP_MIN_ROWS}..{WIDE_MAX_ROWS}, got {max_rows}")
+        self.ranks = int(ranks)
+        self.shard = int(shard)
+        self.shard_vecs = self.shard // 4
+        self.vocab = self.ranks * self.shard
+        self.max_rows = int(max_rows)
+        widest = max(
+            -(-self.shard_vecs // virtual_threads(r)) for r in {min(max_rows, MAX_ROWS), max_rows}
+        )
+        if widest > 64:
+            raise ValueError(f"shard {shard} is too wide for the walk stage")
+        self.state_stride = max(r * virtual_threads(r) for r in {min(max_rows, MAX_ROWS), max_rows})
+        self.greedy_stride = self.max_rows * VP_GREEDY_SLOTS
+        self.cand_stride = self.max_rows * VP_CLAIMANTS
+        self.greedy_offset = self.ranks * self.state_stride * 16
+        self.cand_offset = self.greedy_offset + self.ranks * self.greedy_stride * 8
+        self.nbytes = -(-(self.cand_offset + self.ranks * self.cand_stride * 4) // 16) * 16
+        self.staging_bytes = self.max_rows * self.shard * 2
+
+    def strides(self) -> dict:
+        return dict(
+            state_stride=self.state_stride,
+            greedy_stride=self.greedy_stride,
+            cand_stride=self.cand_stride,
+        )
+
+
+class _VocabParallelRank:
+    """One rank's view: its exchange copy, the publish targets, every rank's staging rows."""
+
+    def __init__(
+        self,
+        layout: VocabParallelLayout,
+        rank: int,
+        copy: int,
+        publish: list,
+        staging: int,
+        staging_of: list,
+        info: torch.Tensor,
+        status: torch.Tensor,
+    ):
+        self.layout = layout
+        self.rank = int(rank)
+        self.copy = int(copy)
+        self.publish = [int(x) for x in publish]
+        self.staging = int(staging)
+        self.staging_of = [int(x) for x in staging_of]
+        self.info = info
+        self.status = status
+
+    def fold(self, local, temperatures, top_ks, top_ps, min_ps, multiplier, soft_cap, greedy, pdl):
+        m, inv, cap = cap_constants(multiplier, soft_cap)
+        lay = self.layout
+        torch.ops.musespark_open_head_sampler.vp_fold(
+            local,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            self.staging,
+            self.publish,
+            self.rank,
+            lay.ranks,
+            lay.state_stride,
+            lay.greedy_offset,
+            lay.greedy_stride,
+            lay.cand_stride,
+            greedy,
+            m,
+            inv,
+            cap,
+            pdl,
+        )
+
+    def draw(
+        self,
+        pending,
+        local,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        pdl,
+    ):
+        m, inv, cap = cap_constants(multiplier, soft_cap)
+        lay = self.layout
+        return torch.ops.musespark_open_head_sampler.vp_draw(
+            pending,
+            local,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            self.info,
+            self.status,
+            self.copy,
+            self.staging_of,
+            self.publish,
+            self.rank,
+            lay.ranks,
+            lay.state_stride,
+            lay.greedy_stride,
+            lay.cand_offset,
+            lay.cand_stride,
+            POLL_TIMEOUT_S,
+            m,
+            inv,
+            cap,
+            pdl,
+        )
+
+    def decide(self, tokens, pdl):
+        lay = self.layout
+        torch.ops.musespark_open_head_sampler.vp_decide(
+            tokens,
+            self.info,
+            self.status,
+            self.copy,
+            self.rank,
+            lay.ranks,
+            lay.shard_vecs,
+            lay.state_stride,
+            lay.greedy_stride,
+            lay.cand_offset,
+            lay.cand_stride,
+            POLL_TIMEOUT_S,
+            pdl,
+        )
+
+    def argmax(self, rows, pdl):
+        lay = self.layout
+        return torch.ops.musespark_open_head_sampler.vp_argmax(
+            self.status,
+            rows,
+            self.copy,
+            self.rank,
+            lay.ranks,
+            lay.shard_vecs,
+            lay.state_stride,
+            lay.greedy_offset,
+            lay.greedy_stride,
+            lay.cand_stride,
+            POLL_TIMEOUT_S,
+            pdl,
+        )
+
+
+def vocab_parallel_sample(
+    view: _VocabParallelRank,
+    pending: torch.Tensor,
+    local: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    seed: Optional[torch.Tensor],
+    offset: Optional[torch.Tensor],
+    multiplier: float,
+    soft_cap: float,
+    pdl: bool = False,
+) -> torch.Tensor:
+    """One rank's sampled tokens (int32 ``[rows]``) of the step whose shard ``local`` is.
+
+    ``vp_fold``, ``vp_draw`` and ``vp_decide`` in order; every rank of the group makes the same
+    call with its own shard. ``pending`` is the ``[rows, vocab]`` BF16 row: written for rows with
+    a top-k / top-p / min-p filter only (gathered from the ranks' staging rows), left as it is
+    otherwise.
+    """
+    rows = local.shape[0]
+    view.fold(local, temperatures, top_ks, top_ps, min_ps, multiplier, soft_cap, False, pdl)
+    tokens = view.draw(
+        pending,
+        local,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        pdl,
+    )
+    view.decide(tokens[:rows], pdl)
+    return tokens
+
+
+def vocab_parallel_argmax(
+    view: _VocabParallelRank,
+    local: torch.Tensor,
+    multiplier: float,
+    soft_cap: float,
+    pdl: bool = False,
+) -> torch.Tensor:
+    """One rank's greedy tokens (int64 ``[rows]``): ``torch.argmax`` of the soft-capped FP32 row."""
+    view.fold(
+        local, view.status, view.status, view.status, view.status, multiplier, soft_cap, True, pdl
+    )
+    return view.argmax(local.shape[0], pdl)
+
+
+def vocab_parallel_reference(
+    locals_: list,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    seed: Optional[torch.Tensor],
+    offset: Optional[torch.Tensor],
+    multiplier: float,
+    soft_cap: float,
+    greedy: bool,
+) -> torch.Tensor:
+    """The built-in head on the rank-order concatenation of the shards: ``torch.argmax`` of the
+    soft-capped FP32 row (greedy) or ``fused_sample_from_logits`` on it."""
+    capped = reference_capped(torch.cat(list(locals_), dim=1), multiplier, soft_cap)
+    if greedy:
+        return torch.argmax(capped, dim=-1)
+    return torch.ops.trtllm.fused_sample_from_logits(
+        capped, temperatures, top_ks, top_ps, min_ps, seed, offset
+    )
+
+
+class VocabParallelEmulation:
+    """``ranks`` virtual ranks on one GPU: every value is stored into each rank's copy (instead
+    of one multicast store), every rank's staging rows are plain tensors. The kernels are the
+    served ones; a call runs every rank's ``vp_fold``, then every ``vp_draw``, then every
+    ``vp_decide`` (so no poll waits)."""
+
+    def __init__(self, ranks: int, shard: int, max_rows: int, device):
+        load_library()
+        self.layout = VocabParallelLayout(ranks, shard, max_rows)
+        lay = self.layout
+        self.device = torch.device(device)
+        self.copies = [
+            torch.full((lay.nbytes // 4,), -1, dtype=torch.int32, device=self.device)
+            for _ in range(ranks)
+        ]
+        self.staging = [
+            torch.empty((max_rows, shard), dtype=torch.bfloat16, device=self.device)
+            for _ in range(ranks)
+        ]
+        publish = [c.data_ptr() for c in self.copies]
+        staging_of = [s.data_ptr() for s in self.staging]
+        self.status = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self.views = [
+            _VocabParallelRank(
+                lay,
+                r,
+                self.copies[r].data_ptr(),
+                publish,
+                staging_of[r],
+                staging_of,
+                torch.empty(max_rows * VP_INFO_WORDS, dtype=torch.int32, device=self.device),
+                self.status,
+            )
+            for r in range(ranks)
+        ]
+
+    def sample(
+        self,
+        locals_,
+        temperatures,
+        top_ks,
+        top_ps,
+        min_ps,
+        seed,
+        offset,
+        multiplier,
+        soft_cap,
+        pdl=False,
+    ):
+        """Every rank's tokens (list of int32 ``[rows]``) and pending rows."""
+        rows = locals_[0].shape[0]
+        pendings = [
+            torch.zeros((rows, self.layout.vocab), dtype=torch.bfloat16, device=self.device)
+            for _ in self.views
+        ]
+        for view, local in zip(self.views, locals_):
+            view.fold(local, temperatures, top_ks, top_ps, min_ps, multiplier, soft_cap, False, pdl)
+        tokens = [
+            view.draw(
+                pending,
+                local,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed,
+                offset,
+                multiplier,
+                soft_cap,
+                pdl,
+            )
+            for view, pending, local in zip(self.views, pendings, locals_)
+        ]
+        for view, t in zip(self.views, tokens):
+            view.decide(t, pdl)
+        return tokens, pendings
+
+    def argmax(self, locals_, multiplier, soft_cap, pdl=False):
+        for view, local in zip(self.views, locals_):
+            view.fold(
+                local,
+                self.status,
+                self.status,
+                self.status,
+                self.status,
+                multiplier,
+                soft_cap,
+                True,
+                pdl,
+            )
+        return [view.argmax(locals_[0].shape[0], pdl) for view in self.views]
+
+    def all_sentinel(self) -> bool:
+        return all(bool((c == -1).all()) for c in self.copies)
+
+
+class VocabParallelWorkspace:
+    """The vocabulary-parallel head's fabric buffers for one tensor-parallel group.
+
+    ``exchange``: the multicast exchange buffer (``VocabParallelLayout``), each rank's copy filled
+    with the sentinel; values are stored through the multicast address, read and reset in the
+    own copy. ``staging``: ``[max_rows, shard]`` BF16 per rank (unicast; peers read it), written
+    by ``vp_fold`` for rows with a filter only.
+
+    Protocol: (1) every exchange slot has one writer per call (``vp_fold`` per (rank, row,
+    virtual thread) or (rank, row, CTA); ``vp_draw`` per (rank, row, claimant)); every rank
+    reads each slot of its own copy once per call and resets it. (2) At the start of every call
+    every word of every copy is the sentinel: after construction (fill, synchronize, agreement)
+    and restored by the call's readers. (3) Reuse across calls: a peer stores into this copy (and
+    into its staging rows) again only in a later call, which it reaches after a collective of
+    the group issued between the two calls (the decode step's all-reduces and hops, the
+    drafter's hops). This rank publishes into that collective only after this call's last
+    kernel has completed: every kernel between them is a plain launch or waits for its
+    predecessor (``griddepcontrol.wait``) before it completes, and the collective publishes
+    after its own wait -- so an all-PDL chain (the Lamport hops) orders it as an NCCL call
+    does. Two calls with no collective between them are not ordered: a peer's next fold can
+    overwrite a word this rank has not read. (4) Every rank makes the same calls: the path
+    depends only on rank-uniform facts.
+
+    Construction is collective over the group and succeeds or raises on every rank.
+    """
+
+    def __init__(self, mapping: Mapping, shard: int, max_rows: int):
+        from tensorrt_llm._torch.distributed.ops import (
+            _get_mnnvl_workspace_comm,
+            _make_mnnvl_mcast_buffer,
+            _mnnvl_device_index,
+            _mnnvl_workspace_all_succeeded,
+        )
+
+        self.ranks = mapping.tp_size
+        self.rank = mapping.tp_rank
+        self.device = torch.device("cuda", _mnnvl_device_index(mapping))
+        self._comm = _get_mnnvl_workspace_comm(mapping)
+        self.library = ""
+        error: Optional[BaseException] = None
+        try:
+            self.layout = VocabParallelLayout(self.ranks, shard, max_rows)
+            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
+                raise RuntimeError("the vocabulary-parallel head runs on SM103 or SM107 only")
+            self.library = load_library()
+        except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
+            error = exc
+        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
+            raise RuntimeError(
+                "[musespark_open] vocab_parallel_head: the head sampler library failed to load on at "
+                "least one rank"
+                f"{f' (this rank: {error!r})' if error is not None else ''}"
+            ) from error
+        lay = self.layout
+        try:
+            multi_node = mapping.is_multi_node()
+            self._exchange = _make_mnnvl_mcast_buffer(self._comm, lay.nbytes, mapping, multi_node)
+            self._staging = _make_mnnvl_mcast_buffer(
+                self._comm, lay.staging_bytes, mapping, multi_node
+            )
+            self.copy = self._exchange.get_uc_buffer(self.rank, (lay.nbytes // 4,), torch.int32, 0)
+            self._mc = self._exchange.get_mc_buffer((lay.nbytes // 4,), torch.int32, 0)
+            self.staging_of = [
+                self._staging.get_uc_buffer(peer, (lay.staging_bytes // 2,), torch.bfloat16, 0)
+                for peer in range(self.ranks)
+            ]
+            with torch.cuda.device(self.device):
+                self.copy.fill_(-1)
+                self.info = torch.empty(
+                    lay.max_rows * VP_INFO_WORDS, dtype=torch.int32, device=self.device
+                )
+                self.status = torch.zeros(1, dtype=torch.int32, device=self.device)
+                torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
+            error = exc
+        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
+            raise RuntimeError(
+                "[musespark_open] vocab_parallel_head: workspace failed on at least one rank"
+                f"{f' (this rank: {error!r})' if error is not None else ''}"
+            ) from error
+        self.view = _VocabParallelRank(
+            lay,
+            self.rank,
+            self.copy.data_ptr(),
+            [self._mc.data_ptr()],
+            self.staging_of[self.rank].data_ptr(),
+            [t.data_ptr() for t in self.staging_of],
+            self.info,
+            self.status,
+        )
+
+    @property
+    def max_rows(self) -> int:
+        return self.layout.max_rows
+
+    @property
+    def vocab(self) -> int:
+        return self.layout.vocab
+
+    def nbytes(self) -> int:
+        """Device memory this rank holds for the head (exchange copy + staging rows)."""
+        return self.layout.nbytes + self.layout.staging_bytes
+
+    def errors(self) -> int:
+        """The poll status word (synchronizes)."""
+        return int(self.status.item())

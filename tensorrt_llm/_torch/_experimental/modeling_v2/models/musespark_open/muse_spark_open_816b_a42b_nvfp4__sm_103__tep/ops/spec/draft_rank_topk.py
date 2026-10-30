@@ -15,6 +15,11 @@ slot holds them as exact 16-bit halves in fp32, every other rank's slot +0.0.
 ``draft_topk_merge`` over the sum of all ranks' outputs gives the result it
 gives over the per-chunk keys, bit for bit (selection, tie order and the
 selector's operands), from 1/13 of the bytes at TP4.
+
+``canon`` and ``canon_band`` (a drafter logit transform's canonical keys) go to
+the per-chunk stage unchanged; the rank's top ``top_k`` of canonical keys holds
+every key of the global top ``top_k`` under the transformed order for the same
+reason.
 """
 
 from __future__ import annotations
@@ -23,9 +28,9 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 
-from .draft_shard_topk import CHUNK, NUM_WARPS, TOP_K, DraftShardTopK
+from .draft_shard_topk import CHUNK, FULL_BAND, NUM_WARPS, SHARD, TOP_K, DraftShardTopK
 
 #: Per-chunk keys one row program reduces.
 MAX_KEYS = 4096
@@ -78,6 +83,8 @@ class DraftRankTopK(OpWrapper):
         chunk      columns per program of the per-chunk stage (a power of two >= top_k)
         num_warps  warps per program of the per-chunk stage
         rank, num_ranks
+        canon, canon_band
+                   ``draft_shard_topk``'s canonical-key table and its identity band
 
     Returns ``[M, num_ranks * top_k * 2]`` fp32: rank ``rank``'s keys at columns
     ``[rank * top_k * 2, (rank + 1) * top_k * 2)`` as (high, low) 16-bit halves,
@@ -87,6 +94,20 @@ class DraftRankTopK(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            "five requests at TP8 (35 rows, the fewest wide_draft_topk takes)",
+            {"rows": 35, "shard": SHARD, "transform": None},
+        ),
+        Cell(
+            "five requests at TP8, the Muse Spark Open drafter transform's canon",
+            {"rows": 35, "shard": SHARD, "transform": "musespark"},
+        ),
+        Cell(
+            "24 requests at TP4 (a 50512-column shard), the drafter transform",
+            {"rows": 168, "shard": 2 * SHARD, "transform": "musespark"},
+        ),
+    )
     note = (
         "Used with draft_topk_merge after the draft head's MNNVL fp32 all-reduce "
         "(wide_draft_topk's RankTopKExchange, from 33 rows): the sum of "
@@ -103,9 +124,13 @@ class DraftRankTopK(OpWrapper):
         num_warps: int = NUM_WARPS,
         rank: int = 0,
         num_ranks: int = 1,
+        canon: torch.Tensor | None = None,
+        canon_band: tuple[int, int] = FULL_BAND,
     ) -> torch.Tensor:
         rows = logits.shape[0]
-        keys = _draft_shard_topk(logits, top_k, chunk, num_warps)
+        keys = _draft_shard_topk(
+            logits, top_k, chunk, num_warps, canon=canon, canon_band=canon_band
+        )
         out = torch.empty((rows, num_ranks * top_k * 2), dtype=torch.float32, device=logits.device)
         _draft_rank_topk_kernel[(rows,)](
             keys,
@@ -129,11 +154,15 @@ class DraftRankTopK(OpWrapper):
         num_warps: int = NUM_WARPS,
         rank: int = 0,
         num_ranks: int = 1,
+        canon: torch.Tensor | None = None,
+        canon_band: tuple[int, int] = FULL_BAND,
     ) -> torch.Tensor:
         """The rank's top ``top_k`` keys over the whole shard, from torch ops; geometry ignored."""
         rows = logits.shape[0]
         # One chunk spanning the shard: draft_shard_topk's encoding of the rank's top_k.
-        keys = _draft_shard_topk.reference(logits, top_k, 1 << 16).to(torch.int64)
+        keys = _draft_shard_topk.reference(
+            logits, top_k, 1 << 16, canon=canon, canon_band=canon_band
+        ).to(torch.int64)
         unsigned = torch.where(keys < 0, keys + 2**32, keys)
         halves = torch.stack(((unsigned >> 16) & 0xFFFF, unsigned & 0xFFFF), dim=-1).float()
         packed = torch.zeros((rows, num_ranks, top_k, 2), device=logits.device)
@@ -148,9 +177,13 @@ class DraftRankTopK(OpWrapper):
         num_warps: int = NUM_WARPS,
         rank: int = 0,
         num_ranks: int = 1,
+        canon: torch.Tensor | None = None,
+        canon_band: tuple[int, int] = FULL_BAND,
         **unused,
     ) -> None:
-        _draft_shard_topk.is_valid(logits, top_k, chunk, num_warps)
+        _draft_shard_topk.is_valid(
+            logits, top_k, chunk, num_warps, canon=canon, canon_band=canon_band
+        )
         if not 0 <= rank < num_ranks:
             raise ValueError(f"rank {rank} outside [0, {num_ranks})")
         if triton.cdiv(logits.shape[1], chunk) * top_k > MAX_KEYS:

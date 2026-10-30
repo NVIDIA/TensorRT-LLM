@@ -16,6 +16,14 @@ The fast paths change both ends, and nothing in between:
   ``[8, shard]`` output straight into this rank's slot of the multicast inbox
   (``HeadGatherWorkspace``) and the sampler's first kernel gathers the row
   from the inbox (``gather_split_sample``), instead of the NCCL all-gather.
+* ``vocab_parallel_head`` -- on decode steps of ``head_sampler.VP_MIN_ROWS`` (16) rows or more,
+  no gather at all: the processor runs only the local LM-head GEMM and leaves a
+  ``[rows, vocab]`` BF16 placeholder pending (allocated, not written); the worker samples
+  the step from the ranks' shards (``head_sampler.vocab_parallel_sample``: each rank folds
+  its own shard, the ranks exchange per-virtual-thread partial states and crossings over a
+  multicast buffer) and argmaxes greedy batches the same way
+  (``vocab_parallel_argmax``, ``torch.argmax``'s token exactly). Every other consumer
+  gathers the shards with the built-in all-gather first (``materialize``).
 
 The processor instance is re-classed as ``SplitSamplerLogitsProcessor`` (only the
 target's: the drafter has its own processor), and the worker as a class
@@ -191,6 +199,11 @@ def context_kv_head_fork(lm_head) -> tuple:
 class TargetHead:
     """The state the re-classed processor and worker share: the step's pending BF16 row."""
 
+    #: ``vocab_parallel_head``'s fabric buffers (None: the head gathers every row).
+    vp: Optional[_hs.VocabParallelWorkspace] = None
+    #: This rank's ``[rows, shard]`` LM-head output while a vocab-parallel row is pending.
+    pending_local: Optional[torch.Tensor] = None
+
     def __init__(
         self,
         processor: MuseSparkOpenLogitsProcessor,
@@ -198,6 +211,7 @@ class TargetHead:
         worker: DFlashWorker,
         mapping,
         gather: bool,
+        vocab_parallel: bool = False,
     ) -> None:
         self.multiplier = float(processor.logit_multiplier)
         self.soft_cap = float(processor.soft_cap)
@@ -219,9 +233,19 @@ class TargetHead:
         self.max_rows = _hs.MAX_ROWS
         self.states = _hs.new_states(self.max_rows, self.device)
         self.wide_states: Optional[torch.Tensor] = None
+        # vocab_parallel_head: the fabric buffers for steps of VP_MIN_ROWS..max_rows rows
+        # (collective; rebuilt for the wider steps by ``widen``).
+        self.mapping = mapping
+        self.lm_head = lm_head
+        self.vp = None
+        if vocab_parallel:
+            self.vp = _hs.VocabParallelWorkspace(
+                mapping, int(lm_head.weight.shape[0]), self.max_rows
+            )
         self.load_seconds = time.perf_counter() - start
         self.pending: Optional[torch.Tensor] = None
         self.pending_inbox = False
+        self.pending_local = None
         self._bypass_logged = False
         self._wide_capture_logged = False
         self.hook_handle = None
@@ -298,6 +322,17 @@ class TargetHead:
                 "drained within its step"
             )
         rows = hidden_states.shape[0]
+        if self.vp is not None and _hs.VP_MIN_ROWS <= rows <= self.vp.max_rows:
+            # The built-in Linear.forward's local GEMM (column-parallel: apply_linear, then the
+            # all-gather this path leaves out), through the instance's apply_linear.
+            local = lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
+            logits = torch.empty(
+                (rows, self.vp.vocab), dtype=torch.bfloat16, device=hidden_states.device
+            )
+            self.pending_local = local
+            self.pending_inbox = False
+            self.pending = logits
+            return logits
         if self.workspace is not None and rows == GATHER_ROWS:
             admitted, fork = context_kv_head_fork(lm_head)
             if not admitted:
@@ -347,9 +382,26 @@ class TargetHead:
         offset: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """The fused sampler's tokens for the pending row; consumes it."""
+        local = self.pending_local
         inbox = self.pending_inbox
         self.pending = None
         self.pending_inbox = False
+        self.pending_local = None
+        if local is not None:
+            return _hs.vocab_parallel_sample(
+                self.vp.view,
+                logits,
+                local,
+                temperatures,
+                top_ks,
+                top_ps,
+                min_ps,
+                seed,
+                offset,
+                self.multiplier,
+                self.soft_cap,
+                self.pdl,
+            )
         if inbox:
             ws = self.workspace
             return _hs.gather_split_sample(
@@ -384,7 +436,29 @@ class TargetHead:
             self.pdl,
         )
 
-    def _gather_now(self, logits: torch.Tensor) -> None:
+    def vocab_parallel(self, logits) -> bool:
+        """Whether ``logits`` is the pending row of a vocab-parallel step."""
+        return self.owns(logits) and self.pending_local is not None
+
+    def argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        """``torch.argmax`` of the built-in capped row of a vocab-parallel pending row (int64); consumes it."""
+        local = self.pending_local
+        self.pending = None
+        self.pending_local = None
+        return _hs.vocab_parallel_argmax(
+            self.vp.view, local, self.multiplier, self.soft_cap, self.pdl
+        )
+
+    def _gather_now(self, logits: torch.Tensor) -> Optional[torch.Tensor]:
+        """Consume the pending row; returns the gathered BF16 row of a vocab-parallel one."""
+        if self.pending_local is not None:
+            from tensorrt_llm._torch.distributed import allgather
+
+            local = self.pending_local
+            self.pending = None
+            self.pending_local = None
+            # The built-in Linear.forward's gather of the column-parallel output.
+            return allgather(local, self.lm_head.mapping, sizes=self.lm_head.gather_output_sizes)
         if self.pending_inbox:
             ws = self.workspace
             empty = ws.status  # unread by the gather-only kernel
@@ -408,15 +482,22 @@ class TargetHead:
             )
         self.pending = None
         self.pending_inbox = False
+        return None
 
     def materialize(self, logits: torch.Tensor) -> torch.Tensor:
         """The built-in processor's FP32 capped logits for the pending row; consumes it."""
-        self._gather_now(logits)
-        return _hs.reference_capped(logits, self.multiplier, self.soft_cap)
+        gathered = self._gather_now(logits)
+        return _hs.reference_capped(
+            logits if gathered is None else gathered, self.multiplier, self.soft_cap
+        )
 
     def drain(self) -> None:
-        """Consume a pending row nothing sampled (resets its inbox words)."""
-        if self.pending is not None:
+        """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel row
+        has none, and is dropped without a gather)."""
+        if self.pending_local is not None:
+            self.pending = None
+            self.pending_local = None
+        elif self.pending is not None:
             self._gather_now(self.pending)
 
 
@@ -475,6 +556,13 @@ class TargetHeadDFlashWorker(DFlashWorker):
         head = self._split_sampler_head
         head.check_routed(logits, "_sample_tokens_for_batch")
         if head.owns(logits):
+            if (
+                spec_metadata is not None
+                and spec_metadata.is_all_greedy_sample
+                and head.vocab_parallel(logits)
+            ):
+                # The built-in greedy branch: torch.argmax of the capped row.
+                return head.argmax(logits)
             if (
                 spec_metadata is not None
                 and not spec_metadata.is_all_greedy_sample
@@ -635,6 +723,13 @@ def widen(llm) -> bool:
     if head.pending is not None:
         raise RuntimeError("[musespark_open] wide_split_sampler: a head row is pending")
     head.max_rows = _hs.WIDE_MAX_ROWS
+    if head.vp is not None:
+        # Collective: every rank widens at the same point of the load.
+        head.vp = _hs.VocabParallelWorkspace(head.mapping, head.vp.layout.shard, head.max_rows)
+        logger.info(
+            f"[musespark_open] vocab_parallel_head: decode steps of {_hs.VP_MIN_ROWS}..{head.max_rows} "
+            f"rows; {head.vp.nbytes() / 2**20:.1f} MiB of fabric buffers on this rank"
+        )
     logger.info(
         f"[musespark_open] wide_split_sampler: the split sampler takes decode steps of up to "
         f"{head.max_rows} rows (the shipped 512-thread block above {_hs.MAX_ROWS}); its state "
@@ -643,7 +738,7 @@ def widen(llm) -> bool:
     return True
 
 
-def install(llm, mapping, gather: bool) -> None:
+def install(llm, mapping, gather: bool, vocab_parallel: bool = False) -> None:
     """Install the split sampler on the target's processor and DFlash worker. Idempotent.
 
     With ``gather`` (``lm_head_inbox``) the LM-head GEMM also writes into the multicast
@@ -671,7 +766,7 @@ def install(llm, mapping, gather: bool) -> None:
     if reason is not None:
         raise ValueError(reason)
     processor, worker, lm_head = llm.logits_processor, llm.spec_worker, llm.lm_head
-    head = TargetHead(processor, lm_head, worker, mapping, gather)
+    head = TargetHead(processor, lm_head, worker, mapping, gather, vocab_parallel)
     processor.__class__ = SplitSamplerLogitsProcessor
     processor._split_head = head
     composed = attach_worker(worker, head)
@@ -681,6 +776,13 @@ def install(llm, mapping, gather: bool) -> None:
             ", LM-head GEMM into a multicast inbox gathered by the sampler "
             f"(poll timeout {_hs.POLL_TIMEOUT_S} s)"
             if gather
+            else ""
+        )
+        + (
+            f"; vocab_parallel_head: decode steps of {_hs.VP_MIN_ROWS}..{head.max_rows} rows sample "
+            f"each rank's own shard (no logits all-gather), {head.vp.nbytes() / 2**20:.1f} MiB of "
+            "fabric buffers on this rank"
+            if head.vp is not None
             else ""
         )
         + f"; library {head.library} (load {head.load_seconds:.2f} s); "

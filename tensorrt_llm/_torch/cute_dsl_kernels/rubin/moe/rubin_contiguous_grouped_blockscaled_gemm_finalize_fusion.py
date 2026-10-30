@@ -118,6 +118,24 @@ def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
+def blk_store(dst_gemm, src_smem, size, loc=None, ip=None):
+    """Bulk copy of ``size`` bytes from shared to global memory (cp.async.bulk)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
     """Block reduce for FP16 using cp.reduce.async.bulk."""
     llvm.inline_asm(
@@ -171,9 +189,30 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         cluster_shape_mn: Tuple[int, int],
         raster_along_m: bool = False,
         topK: int = 1,
+        store_permuted: bool = False,
+        trtllm_gen_n_shuffle: bool = False,
+        mma_k64: bool = False,
     ):
+        # store_permuted: the epilogue stores each valid permuted row
+        # (alpha * acc, no token scale) to row ``permuted_row`` of C, which then
+        # has one row per permuted row, instead of scatter-adding the
+        # token-scaled row into its token's row.
+        # trtllm_gen_n_shuffle: B (and SFB) rows are in TRTLLM-gen's
+        # shuffle_matrix_a order (epilogue_tile_m 128: within every 32 rows,
+        # stored row p is logical row 4 * (p % 8) + p // 8); the epilogue writes
+        # C columns back in logical order.
+        # mma_k64: issue the 64-deep tcgen05 kind::mxf4nvf4 MMA (the SM100 family
+        # instruction) instead of the 128-deep SM107 one. The fp32 accumulators
+        # then equal those of SM100-family NVFP4 GEMMs (e.g. TRTLLM-gen's) bit
+        # for bit; the K=128 instruction rounds its partial sums differently.
+        # mma_tiler[2] stays 256 (four MMAs per k-tile).
+        self.store_permuted = store_permuted
+        self.trtllm_gen_n_shuffle = trtllm_gen_n_shuffle
+        self.mma_k64 = mma_k64
         self.sf_vec_size = sf_vec_size
         self.acc_dtype = cutlass.Float32
+        if mma_k64:
+            mma_inst_shape = (mma_inst_shape[0], mma_inst_shape[1], 64)
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
         self.cluster_shape_mn = cluster_shape_mn
@@ -231,6 +270,49 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # B-reuse pattern control
         self.enable_breuse = True if mma_tiler[0] // mma_inst_shape[0] == 2 else False
+        if mma_k64 and self.enable_breuse:
+            raise ValueError("mma_k64 does not support the B-reuse pattern")
+
+    def _make_tiled_mma(self, cta_group, mma_inst_shape, permutation_mnk=None):
+        """The block-scaled tiled MMA (SM107 K=128, or the SM100-family K=64 one with mma_k64)."""
+        if cutlass.const_expr(self.mma_k64):
+            return sm100_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                cta_group,
+                mma_inst_shape[:2],
+            )
+        if cutlass.const_expr(permutation_mnk is None):
+            return sm107_utils.make_blockscaled_trivial_tiled_mma(
+                self.a_dtype,
+                self.b_dtype,
+                self.a_major_mode,
+                self.b_major_mode,
+                self.sf_dtype,
+                self.sf_vec_size,
+                cta_group,
+                mma_inst_shape,
+                a_collector_op=CollectorOp.DISCARD,
+                b_collector_op=CollectorOp.DISCARD,
+            )
+        return sm107_utils.make_blockscaled_trivial_tiled_mma(
+            self.a_dtype,
+            self.b_dtype,
+            self.a_major_mode,
+            self.b_major_mode,
+            self.sf_dtype,
+            self.sf_vec_size,
+            cta_group,
+            mma_inst_shape,
+            a_collector_op=CollectorOp.DISCARD,
+            b_collector_op=CollectorOp.DISCARD,
+            atom_layout_mnk=(1, 1, 1),
+            permutation_mnk=permutation_mnk,
+        )
 
     def _get_mma_permutation_mnk(self):
         if cutlass.const_expr(self.use_2cta_instrs and self.enable_breuse):
@@ -312,32 +394,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.mma_inst_shape[2],
         )
 
-        tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape,
-            a_collector_op=CollectorOp.DISCARD,
-            b_collector_op=CollectorOp.DISCARD,
-            atom_layout_mnk=(1, 1, 1),
-            permutation_mnk=self._get_mma_permutation_mnk(),
+        tiled_mma = self._make_tiled_mma(
+            self.cta_group, self.mma_inst_shape, self._get_mma_permutation_mnk()
         )
 
-        tiled_mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_sfb,
-            a_collector_op=CollectorOp.DISCARD,
-            b_collector_op=CollectorOp.DISCARD,
+        tiled_mma_sfb = self._make_tiled_mma(
+            cute.nvgpu.tcgen05.CtaGroup.ONE, self.mma_inst_shape_sfb
         )
 
         # Compute mma/cluster/tile shapes
@@ -633,35 +695,14 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         atom_layout_mnk = (1, 1, 1)
         permutation_mnk = self._get_mma_permutation_mnk()
 
-        tiled_mma = sm107_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            self.cta_group,
-            self.mma_inst_shape,
-            a_collector_op=CollectorOp.DISCARD,
-            b_collector_op=CollectorOp.DISCARD,
-            atom_layout_mnk=atom_layout_mnk,
-            permutation_mnk=permutation_mnk,
-        )
+        assert atom_layout_mnk == (1, 1, 1)
+        tiled_mma = self._make_tiled_mma(self.cta_group, self.mma_inst_shape, permutation_mnk)
 
         tiled_mma.set(tcgen05.Field.NEGATE_A, False)
         tiled_mma.set(tcgen05.Field.NEGATE_B, False)
 
-        tiled_mma_sfb = sm107_utils.make_blockscaled_trivial_tiled_mma(
-            self.a_dtype,
-            self.b_dtype,
-            self.a_major_mode,
-            self.b_major_mode,
-            self.sf_dtype,
-            self.sf_vec_size,
-            cute.nvgpu.tcgen05.CtaGroup.ONE,
-            self.mma_inst_shape_sfb,
-            a_collector_op=CollectorOp.DISCARD,
-            b_collector_op=CollectorOp.DISCARD,
+        tiled_mma_sfb = self._make_tiled_mma(
+            cute.nvgpu.tcgen05.CtaGroup.ONE, self.mma_inst_shape_sfb
         )
         tiled_mma_sfb.set(tcgen05.Field.NEGATE_A, False)
         tiled_mma_sfb.set(tcgen05.Field.NEGATE_B, False)
@@ -1587,11 +1628,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     # Compute token info and scaled alpha for this row
                     token_idx = cutlass.Int32(0)
                     alpha_val_iter = alpha_val
-                    if is_valid_row:
-                        token_idx = expanded_idx // self.topK
-                        topk_idx = expanded_idx % self.topK
-                        token_scale = token_final_scales[(token_idx, topk_idx)]
-                        alpha_val_iter = alpha_val * token_scale
+                    if cutlass.const_expr(not self.store_permuted):
+                        if is_valid_row:
+                            token_idx = expanded_idx // self.topK
+                            topk_idx = expanded_idx % self.topK
+                            token_scale = token_final_scales[(token_idx, topk_idx)]
+                            alpha_val_iter = alpha_val * token_scale
 
                     for n_iter_idx in cutlass.range(n_subtile_cnt):
                         # Load accumulator from tensor memory buffer to register
@@ -1600,7 +1642,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
 
                         # For block reduce: retile then load, compute, store
-                        acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
+                        if cutlass.const_expr(self.trtllm_gen_n_shuffle):
+                            acc_vec = tiled_copy_r2s.retile(
+                                self._trtllm_gen_n_unshuffle(tTR_rAcc)
+                            ).load()
+                        else:
+                            acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         acc_vec_final = (alpha_val_iter * acc_vec).to(self.c_dtype)
                         tRS_rC.store(acc_vec_final)
                         if is_valid_row:
@@ -1628,32 +1675,38 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     is_valid_row = permuted_row < tile_info[4]
 
                     if is_valid_row:
-                        expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                        token_idx = expanded_idx // self.topK
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
-
                         # sC row index: m_iter_idx * 128 + epi_tidx
                         sC_row = m_iter_idx * 128 + epi_tidx
-
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
+                        if cutlass.const_expr(self.store_permuted):
+                            store_out_offset = cute.domain_offset((permuted_row, coord_n, 0), c)
+                            blk_store(
+                                store_out_offset,
                                 sC[sC_row, None, 0],
                                 cutlass.Int32(self.copy_size),
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
+                        else:
+                            expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
+                            token_idx = expanded_idx // self.topK
+                            scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
+                            if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    cutlass.Int32(self.copy_size),
+                                )
 
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
@@ -1675,6 +1728,20 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+    @cute.jit
+    def _trtllm_gen_n_unshuffle(self, tAcc: cute.Tensor) -> cute.Tensor:
+        """One thread's accumulator columns back in logical order (trtllm_gen_n_shuffle).
+
+        Column q of every 32-column group takes accumulator column
+        ``8 * (q % 4) + q // 4``. Only register indices move.
+        """
+        tOut = cute.make_rmem_tensor(tAcc.shape, self.acc_dtype)
+        for q in cutlass.range_constexpr(cute.size(tAcc)):
+            base = q - q % 32
+            r = q % 32
+            tOut[q] = tAcc[base + 8 * (r % 4) + r // 4]
+        return tOut
 
     @staticmethod
     def _compute_grid(

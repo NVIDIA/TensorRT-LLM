@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import hashlib
 import math
 import os
@@ -24,6 +25,7 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     NamedTuple,
     Optional,
@@ -1488,6 +1490,13 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # Deferred close (opt-in, TRTLLM_KV_DEFER_CLOSE=1): see arm_deferred_close().
+    # Declared on the class so free_resources and shutdown also work on
+    # instances built without running __init__.
+    _defer_close_enabled: bool = False
+    _defer_close_armed: bool = False
+    _defer_close_scope: bool = False
+    _deferred_closes: Tuple[Tuple[int, _KVCache], ...] = ()
 
     def __init__(
         self,
@@ -2241,6 +2250,9 @@ class KVCacheManagerV2(BaseResourceManager):
             index_mapper_capacity, max_beam_width, self.max_copy_beam_width
         )
         self._early_freed_index_requests: set[int] = set()
+        self._defer_close_enabled = (
+            os.environ.get("TRTLLM_KV_DEFER_CLOSE", "0") == "1" and not self.is_draft
+        )
         # Requests whose pages a connector is still reading from, so the
         # release half of `preempt_request` has to wait.
         self._pending_preemption: Dict[int, LlmRequest] = {}
@@ -6264,14 +6276,70 @@ class KVCacheManagerV2(BaseResourceManager):
             # mirrored, and the target may release the same request twice.
             return
         if kv_cache is not None:
-            if self.sparse_metadata_batch is not None:
-                self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
-                self.sparse_metadata_batch.remove(kv_cache)
-            for beam_idx in range(int(kv_cache.beam_width)):
-                for pool_idx in range(self.num_pools):
-                    kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
+            self._detach_index_slot(kv_cache)
         self.index_mapper.remove_sequence(request_id)
         self._early_freed_index_requests.add(request_id)
+
+    def _detach_index_slot(self, kv_cache: _KVCache) -> None:
+        """Unbind a cache from its IndexMapper slot's page-index buffers (and
+        the sparse metadata batch) so the slot can be reused while the cache
+        stays open."""
+        if self.sparse_metadata_batch is not None:
+            self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
+            self.sparse_metadata_batch.remove(kv_cache)
+        for beam_idx in range(int(kv_cache.beam_width)):
+            for pool_idx in range(self.num_pools):
+                kv_cache.set_base_page_index_buf(BeamIndex(beam_idx), pool_idx, None)
+
+    def arm_deferred_close(self, armed: bool) -> bool:
+        """Arm or disarm deferred closing of finished requests' caches.
+
+        While armed, free_resources called inside deferring_closes() releases
+        the (non-dummy) request's IndexMapper slot at once (as
+        release_index_slot does) and queues the cache; its close(), which
+        commits the last block and releases the pages, runs in
+        flush_deferred_closes(). Every other release (preemption, admission
+        rollbacks, reservation drops) closes at once, since its caller counts
+        on the pages being free when it returns. The overlap executor arms this
+        only for its loop, releases terminated requests inside
+        deferring_closes(), and flushes right after launching each forward
+        step, where the GPU still has queued work to cover the close, before it
+        waits on an empty request queue with no request left, and before it
+        fires a control request. Takes effect only with TRTLLM_KV_DEFER_CLOSE=1
+        on a target-model manager. Disarming flushes. Returns whether deferred
+        closing is armed.
+        """
+        was_armed = self._defer_close_armed
+        self._defer_close_armed = bool(armed) and self._defer_close_enabled
+        if self._defer_close_armed and not was_armed:
+            logger.info(
+                "KVCacheManagerV2: deferred close armed (TRTLLM_KV_DEFER_CLOSE=1): finished "
+                "requests' caches close after the next forward step is launched"
+            )
+        if not self._defer_close_armed:
+            self.flush_deferred_closes()
+        return self._defer_close_armed
+
+    @contextlib.contextmanager
+    def deferring_closes(self) -> Iterator[None]:
+        """Let free_resources defer the close of the requests it releases for
+        the duration, while deferred closing is armed (arm_deferred_close).
+        For the release of requests that have terminated only."""
+        outer = self._defer_close_scope
+        self._defer_close_scope = True
+        try:
+            yield
+        finally:
+            self._defer_close_scope = outer
+
+    def flush_deferred_closes(self) -> int:
+        """Close the caches whose close() free_resources deferred, in the order
+        their requests finished. Returns how many were closed."""
+        pending, self._deferred_closes = self._deferred_closes, ()
+        for request_id, kv_cache in pending:
+            kv_cache.close()
+            self.impl.clear_stats_excluded(request_id)
+        return len(pending)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # A request awaiting preemption can still be cancelled or fail while
@@ -6309,6 +6377,16 @@ class KVCacheManagerV2(BaseResourceManager):
             self.impl.clear_stats_excluded(request.py_request_id)
             return
         kv_cache.discard_pending_stats()
+        # Dummy requests reuse their ids, which the stats-exclusion bookkeeping
+        # done after close() is keyed on, so they always close at once.
+        if self._defer_close_armed and self._defer_close_scope and not request.is_dummy:
+            if request.py_request_id in self._early_freed_index_requests:
+                self._early_freed_index_requests.discard(request.py_request_id)
+            else:
+                self._detach_index_slot(kv_cache)
+                self.index_mapper.remove_sequence(request.py_request_id)
+            self._deferred_closes = (*self._deferred_closes, (request.py_request_id, kv_cache))
+            return
         kv_cache.close()
         self.impl.clear_stats_excluded(request.py_request_id)
         if request.py_request_id in self._early_freed_index_requests:
@@ -6614,6 +6692,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return bool(has_invalid_values)
 
     def shutdown(self):
+        self._defer_close_armed = False
+        self.flush_deferred_closes()
         if self.sparse_metadata_batch is not None:
             self.sparse_metadata_batch.record_read(self._stream.cuda_stream)
             self.sparse_metadata_batch.close()

@@ -9,7 +9,7 @@ record; the comments here say what each role does.
 The per-tile machinery is ``full_attention_split_kv_kernel``'s (the one-sequence kernel): a CTA
 serves one pair of KV heads (``blockIdx.y``) with 384 threads -- two softmax warpgroups that
 take alternating 128-key tiles, one MMA warp, one TMA loader warp, two other warps -- over a
-16-stage ring of 32-key pages (K in two 2 KB boxes, one per head, V in one 4 KB box). Q' is
+ring of stages 32-key pages (K in two 2 KB boxes, one per head, V in one 4 KB box). Q' is
 block-diagonal over the pair's two heads (row = head * 64 + token * 8 + q-head-in-group), so
 one M=128 MMA per Q term and K block scores a 128-key tile; P goes to TMEM in E4M3 in two
 halves; each warpgroup keeps its own running max / sum and TMEM O accumulator.

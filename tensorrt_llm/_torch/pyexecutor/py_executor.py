@@ -400,6 +400,10 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+    # True while the overlap loop has armed KVCacheManagerV2's opt-in deferred
+    # close (TRTLLM_KV_DEFER_CLOSE=1). Declared on the class so instances built
+    # without running __init__ read it too.
+    _kv_defer_close_armed = False
 
     def __init__(
             self,
@@ -4902,6 +4906,10 @@ class PyExecutor:
                      f"drain={pending.control_requires_drain} "
                      f"active_requests={len(self.active_requests)} "
                      f"waiting_queue={len(self.waiting_queue)}")
+        if self._kv_defer_close_armed:
+            # The action must not run while a finished request's cache is
+            # still open: its close() commits the last block and frees pages.
+            self.kv_cache_manager.flush_deferred_closes()
         # Quiesce the device before the action mutates GPU state. Under the
         # overlap scheduler a previous batch's forward/sample kernels may still
         # be in flight, so an in-place update_weights reload (or sleep/wakeup
@@ -5222,6 +5230,8 @@ class PyExecutor:
 
         torch.cuda.current_stream().synchronize()
         self._consume_previous_batch_for_rebalance()
+        if self._kv_defer_close_armed:
+            self.kv_cache_manager.flush_deferred_closes()
         self._rebalance_kv_pools_now()
 
     def _rebalance_kv_pools_now(self) -> None:
@@ -5422,6 +5432,9 @@ class PyExecutor:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
+        self._kv_defer_close_armed = (
+            self._is_kv_manager_v2
+            and self.kv_cache_manager.arm_deferred_close(True))
         with self._profiler() as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
@@ -5639,6 +5652,12 @@ class PyExecutor:
                         self._maybe_prefetch_next_iter_mm_encoders(
                             scheduled_batch)
 
+                if self._kv_defer_close_armed:
+                    # Close the caches of requests that finished in the
+                    # previous iteration here, after this iteration's forward
+                    # step is queued and before waiting for the previous one.
+                    self.kv_cache_manager.flush_deferred_closes()
+
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
                     # Turning off speculative decoding when Acceptance Rate is low.
@@ -5773,6 +5792,9 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self.iter_counter += 1
+        if self._kv_defer_close_armed:
+            self._kv_defer_close_armed = False
+            self.kv_cache_manager.arm_deferred_close(False)
 
     @nvtx_range("_accept_draft_tokens")
     def _accept_draft_tokens(
@@ -6097,6 +6119,11 @@ class PyExecutor:
         idle = (total_num_live_requests == 0 and len(waiting_queue) == 0
                 and not self.is_shutdown
                 and not self._has_pending_connector_transfers())
+        if idle and self._kv_defer_close_armed:
+            # No forward step is coming to flush the caches of the requests
+            # that just finished, so close them before waiting: the next
+            # request then sees their pages and last blocks when scheduled.
+            self.kv_cache_manager.flush_deferred_closes()
         if idle:
             # In Ray path (TLLM_DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
             # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
@@ -8436,7 +8463,11 @@ class PyExecutor:
         self.disagg.forget_request(request.py_request_id)
 
     def _do_terminate_request(self, request: LlmRequest) -> None:
-        self._free_request_resources(request)
+        # Only a terminated request's cache may close late; preemption and
+        # recompute pauses release theirs through other paths, at once.
+        with (self.kv_cache_manager.deferring_closes()
+              if self._kv_defer_close_armed else nullcontext()):
+            self._free_request_resources(request)
         # Cancellation and request-scoped failures can terminate before the
         # normal post-prefill release point, including with a partial buffer.
         _strip_py_multimodal_data_post_prefill(request)

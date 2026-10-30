@@ -37,10 +37,19 @@ these is launched or removes it; none changes an arithmetic operation:
   right before the draft LM-head GEMM and joined where the projection is
   called, after the key all-reduce, instead of on the main stream after it.
 
-Scope: the one-request step, whose successors are known. ``pdl_conv`` /
-``pdl_merge`` / ``pdl_silu`` act on the block decode's 8 rows (K + 1,
+Scope: block decodes whose successors are known. ``pdl_conv`` /
+``pdl_merge`` / ``pdl_silu`` act on the block decode's 8 rows (one request, K + 1,
 K = 7), where ``drafter_fixed_gemms`` has a fixed tactic for ``qkv_proj`` / ``gate_up_proj`` /
-``o_proj`` / ``down_proj`` / the first convolution's ``kernel_projection``.
+``o_proj`` / ``down_proj`` / the first convolution's ``kernel_projection``. ``pdl_conv``
+also acts on every other block width of ``ENTRY_ROW_CANDIDATES`` (2..4 requests: 16, 24
+and 32 rows) at which the drafter's table lists a fixed tactic for all four of those
+successors (``entry_rows``); a width without one runs the base launches. ``pdl_silu``
+and ``pdl_merge`` act on the widths their device's table lists among those
+(``SILU_ENTRY_ROWS_BY_SM`` / ``MERGE_ENTRY_ROWS_BY_SM``), each measured in the in-model
+drafter chain on that GPU. On GB300 all three triggers together are the fastest chain at
+1..4 requests. On Rubin an entry-released ``o_proj`` competes with the multi-request merge
+it follows (the chain is slower with the merge trigger at 2..4 requests), and the silu
+trigger on top of the conv trigger gains nothing at two requests and loses at three.
 ``pdl_head`` acts on a one-request step whose K slots are one contiguous row
 range (any K); its successor is the low-M dispatcher's runner for the LM
 head (cuBLAS through ``torch.mm``, which has no programmatic attribute, or
@@ -93,11 +102,49 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm.logger import logger
 
+from ...ops.gemm.fixed_low_m_gemm import device_capability
 from ...ops.spec.drafter_silu_and_mul import drafter_silu_and_mul
 
-#: The drafter block rows these launches act on: one request of K + 1 = 8 rows,
-#: the only width ``drafter_fixed_gemms`` lists a tactic for.
+#: The drafter block rows of one request, K + 1 = 8: the width ``pdl_conv`` / ``pdl_merge`` /
+#: ``pdl_silu`` require a fixed tactic at, and the ``pdl_head`` / ``selector_fork`` step.
 ROWS = 8
+
+#: The block widths the conv / merge / silu entry triggers may act on: 1..4 requests at
+#: K = 7, at most the fixed GEMM's ``MAX_M`` of 32 rows. A width is taken when the
+#: drafter's tactic table covers every successor at it (``entry_rows``).
+ENTRY_ROW_CANDIDATES = (8, 16, 24, 32)
+
+#: The block widths of the merge trigger per compute capability (``trigger_rows``), among
+#: those of ``entry_rows``. sm103: one to four requests. sm107: the one-request block only.
+MERGE_ENTRY_ROWS_BY_SM: dict[tuple[int, int], frozenset] = {
+    (10, 3): frozenset(ENTRY_ROW_CANDIDATES),
+    (10, 7): frozenset({ROWS}),
+}
+
+#: The block widths of the silu trigger per compute capability (``trigger_rows``), among
+#: those of ``entry_rows``. sm103: one to four requests. sm107: one and four requests.
+SILU_ENTRY_ROWS_BY_SM: dict[tuple[int, int], frozenset] = {
+    (10, 3): frozenset(ENTRY_ROW_CANDIDATES),
+    (10, 7): frozenset({ROWS, 4 * ROWS}),
+}
+
+
+def trigger_rows(table: dict, capability: Optional[tuple] = None) -> frozenset:
+    """The block widths ``table`` (``MERGE_ENTRY_ROWS_BY_SM`` / ``SILU_ENTRY_ROWS_BY_SM``)
+    lists for ``capability`` (the drafter GEMMs' device, ``fixed_low_m_gemm.device_capability``,
+    when None).
+
+    Raises:
+        ValueError: on a device the table does not list.
+    """
+    key = tuple(device_capability() if capability is None else capability)
+    rows = table.get(key)
+    if rows is None:
+        raise ValueError(
+            f"drafter_pdl_chain: no trigger widths for SM {key} (supported: {sorted(table)})"
+        )
+    return rows
+
 
 #: The draft head's rows for that request: its K = 7 draft slots. ``selector_fork``
 #: forks the selector projection only for this many rows.
@@ -160,8 +207,29 @@ def _merge_reason(draft_model: nn.Module) -> Optional[str]:
     return None
 
 
+def entry_rows(draft_model: nn.Module) -> frozenset:
+    """The widths of ``ENTRY_ROW_CANDIDATES`` at which every successor of the conv / merge /
+    silu triggers (``qkv_proj``, ``gate_up_proj``, ``o_proj``, ``down_proj`` of every layer)
+    has a fixed tactic. A function of the drafter's shapes and TP table: rank-uniform."""
+    rows = []
+    for width in ENTRY_ROW_CANDIDATES:
+        if all(
+            _fixed_tactic_reason(linear, width, "") is None
+            for layer in draft_model.model.layers
+            for linear in (
+                layer.self_attn.qkv_proj,
+                layer.mlp.gate_up_proj,
+                layer.self_attn.o_proj,
+                layer.mlp.down_proj,
+            )
+        ):
+            rows.append(width)
+    return frozenset(rows)
+
+
 class EntryTriggerGatedMLP(GatedMLP):
-    """The built-in ``GatedMLP`` whose 8-row ``silu(gate) * up`` releases ``down_proj`` at entry.
+    """The built-in ``GatedMLP`` whose ``silu(gate) * up`` releases ``down_proj`` at entry on the
+    widths of ``_pdl_entry_rows`` (``entry_rows``; 8 rows when unset).
 
     Never constructed: ``install`` re-classes the drafter's ``GatedMLP``
     modules in place. Every other call is the built-in method's.
@@ -172,7 +240,7 @@ class EntryTriggerGatedMLP(GatedMLP):
             not has_lora
             and isinstance(x, torch.Tensor)
             and x.dim() == 2
-            and x.shape[0] == ROWS
+            and x.shape[0] in self.__dict__.get("_pdl_entry_rows", (ROWS,))
             and x.dtype == torch.bfloat16
             and x.is_contiguous()
         ):
@@ -385,6 +453,9 @@ def unsupported_reason(llm: nn.Module) -> Optional[str]:
     bound = draft_model.__dict__.get("dflash_forward")
     if getattr(bound, "__func__", None) is not _draft.windowed_block_decode:
         return "the drafter does not run the windowed block decode"
+    capability = device_capability()
+    if capability not in MERGE_ENTRY_ROWS_BY_SM or capability not in SILU_ENTRY_ROWS_BY_SM:
+        return f"no merge / silu trigger widths for SM {capability}"
     reason = _conv_reason(draft_model)
     if reason is not None:
         return f"pdl_conv: {reason}"
@@ -435,6 +506,10 @@ def installed(llm: nn.Module) -> frozenset:
     return frozenset(found)
 
 
+def _widths(widths) -> str:
+    return ",".join(str(w) for w in sorted(widths)) or "none"
+
+
 def install(llm: nn.Module, mapping=None) -> frozenset:
     """Install the five PDL chain launches; return the names this call installed.
 
@@ -458,12 +533,18 @@ def install(llm: nn.Module, mapping=None) -> frozenset:
         raise ValueError(reason)
     before = installed(llm)
     draft_model = llm.draft_model
+    widths = entry_rows(draft_model)
     for conv in list(draft_model.attention_convs) + list(draft_model.mlp_convs):
         conv._pdl_conv = True
+        conv._pdl_entry_rows = widths
+    merge_rows = widths & trigger_rows(MERGE_ENTRY_ROWS_BY_SM)
+    silu_rows = widths & trigger_rows(SILU_ENTRY_ROWS_BY_SM)
     draft_model._pdl_merge = True
+    draft_model._pdl_merge_rows = merge_rows
     for layer in draft_model.model.layers:
         if type(layer.mlp) is GatedMLP:
             layer.mlp.__class__ = EntryTriggerGatedMLP
+        layer.mlp._pdl_entry_rows = silu_rows
     llm.spec_worker._pdl_head = True
     projection = draft_model.candidate_selector.hidden_projection
     if type(projection) is nn.Linear:
@@ -476,6 +557,8 @@ def install(llm: nn.Module, mapping=None) -> frozenset:
     if changed:
         logger.info(
             f"[musespark_open] {','.join(sorted(changed))}: drafter PDL chain installed "
-            f"(in place: {','.join(sorted(now))})"
+            f"(in place: {','.join(sorted(now))}; block rows with the conv trigger "
+            f"{_widths(widths)}, the silu trigger {_widths(silu_rows)}, "
+            f"the merge trigger {_widths(merge_rows)})"
         )
     return changed

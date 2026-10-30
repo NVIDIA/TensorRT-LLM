@@ -164,6 +164,10 @@ class DecodeKvSplits:
         self.kv_heads = kv_heads
         self.q_heads = q_heads
         self.fallback: Optional[str] = None
+        #: Decode calls that reached the armed stand-in: how many were split, how many kept
+        #: flashinfer's own split.
+        self.split_calls = 0
+        self.kept_calls = 0
         #: The multi-CTA counters of every call the rule splits (zeroed once; the
         #: kernel resets what it used at the end of each launch).
         self.counter = torch.zeros(
@@ -250,7 +254,9 @@ class _DecodeStandIn:
     def trtllm_batch_decode_with_kv_cache(self, *args, **kwargs):
         presented = None if args else self._splits.presented_sm_count(kwargs)
         if presented is None:
+            self._splits.kept_calls += 1
             return self._real.trtllm_batch_decode_with_kv_cache(*args, **kwargs)
+        self._splits.split_calls += 1
         kwargs["multi_ctas_kv_counter_buffer"] = self._splits.counter
         decode = self._real
         device_sm_count = decode.get_device_sm_count

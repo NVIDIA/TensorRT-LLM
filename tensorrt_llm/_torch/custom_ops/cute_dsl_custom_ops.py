@@ -14784,8 +14784,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     scaling_vector_size: int = 16,
                     activation_type: ActivationType = ActivationType.Swiglu,
                     situ_beta: Optional[float] = None,
-                    situ_linear_beta: Optional[float] = None):
+                    situ_linear_beta: Optional[float] = None,
+                    trtllm_gen_gated_layout: bool = False):
                 super().__init__()
+                # trtllm_gen_gated_layout: the weights are TRTLLM-gen's gated FC1
+                # tensors, alpha is [gate scales | output scales] (2 * L values)
+                # and the epilogue follows TRTLLM-gen's arithmetic.
+                self.trtllm_gen_gated_layout = trtllm_gen_gated_layout
                 self.num_experts = num_experts
                 self.top_k = top_k
                 self.num_local_experts = num_local_experts
@@ -14819,6 +14824,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     int(self.activation_type),
                     self.situ_beta,
                     self.situ_linear_beta,
+                    self.trtllm_gen_gated_layout,
                 )
 
             def get_valid_tactics(
@@ -14998,7 +15004,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert b_sf.size(0) == l
                 assert b_sf.size(1) == n
                 assert b_sf.size(2) == scale_k
-                assert alpha.size(0) == l
+                assert alpha.size(0) == l * (2 if self.trtllm_gen_gated_layout
+                                             else 1)
 
                 num_tiles = m // self.tile_size
                 assert tile_idx_to_group_idx.dtype == torch.int32
@@ -15122,7 +15129,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              cluster_shape_mn, raster_along_m,
                              locality_domain_half_gemm, a_path,
                              int(self.activation_type), self.situ_beta,
-                             self.situ_linear_beta, max_active_clusters)
+                             self.situ_linear_beta, max_active_clusters,
+                             self.trtllm_gen_gated_layout)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -15137,6 +15145,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         activation_type=self.activation_type,
                         situ_beta=self.situ_beta,
                         situ_linear_beta=self.situ_linear_beta,
+                        trtllm_gen_gated_layout=self.trtllm_gen_gated_layout,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,
@@ -16161,8 +16170,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          local_expert_offset: int,
                          tile_size: int,
                          output_dtype: torch.dtype,
-                         scaling_vector_size: int = 16):
+                         scaling_vector_size: int = 16,
+                         store_permuted: bool = False,
+                         trtllm_gen_n_shuffle: bool = False,
+                         mma_k64: bool = False):
                 super().__init__()
+                # store_permuted: C gets one row per permuted row (alpha * acc,
+                # no token scale, no scatter); see the kernel class.
+                # trtllm_gen_n_shuffle: the weights are TRTLLM-gen's FC2 tensors
+                # (shuffle_matrix_a row order); C columns come out in logical order.
+                # mma_k64: the 64-deep SM100-family MMA (fp32 accumulators
+                # equal to SM100-family NVFP4 GEMMs'); see the kernel class.
+                self.store_permuted = store_permuted
+                self.trtllm_gen_n_shuffle = trtllm_gen_n_shuffle
+                self.mma_k64 = mma_k64
                 self.num_experts = num_experts
                 self.top_k = top_k
                 self.num_local_experts = num_local_experts
@@ -16192,6 +16213,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self.tile_size,
                     self.output_dtype,
                     self.scaling_vector_size,
+                    self.store_permuted,
+                    self.trtllm_gen_n_shuffle,
+                    self.mma_k64,
                 )
 
             @staticmethod
@@ -16291,13 +16315,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                      self.num_local_experts,
                                                      self.local_expert_offset,
                                                      self.tile_size)
+                    # Stored permuted rows: C has as many rows as A.
+                    c_rows = ((lambda shapes: shapes[0][0])
+                              if self.store_permuted else
+                              helper.infer_shape_num_tokens)
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         dynamic_tensor_specs=(DynamicTensorSpec(
                             0, 0, helper.gen_tuning_buckets,
                             helper.map_to_tuning_buckets), ),
                         constraint_specs=(
                             ConstraintSpec(2, 0, fp4_scale_infer_shape),
-                            ConstraintSpec(5, 0, helper.infer_shape_num_tokens),
+                            ConstraintSpec(5, 0, c_rows),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(7, 0,
@@ -16342,6 +16370,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert c.dim() == 2
                 num_tokens = c.size(0)
                 assert c.size(1) == n or c.size(1) == n * 2
+                if self.store_permuted:
+                    assert num_tokens == m, (
+                        "store_permuted needs one C row per permuted row")
 
                 num_tiles = m // self.tile_size
                 assert tile_idx_to_group_idx.dtype == torch.int32
@@ -16354,7 +16385,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 assert num_non_exiting_tiles.numel() == 1
                 assert token_final_scales.dtype == torch.float32
                 assert token_final_scales.dim() == 2
-                assert token_final_scales.size() == (num_tokens, self.top_k)
+                if not self.store_permuted:
+                    assert token_final_scales.size() == (num_tokens, self.top_k)
 
                 locality_domain_id = get_current_locality_domain()
                 locality_domain_half_gemm = locality_domain_id is not None
@@ -16434,7 +16466,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cache_key = (self.scaling_vector_size, self.tile_size,
                              self.top_k, mma_tiler, mma_inst_shape,
                              cluster_shape_mn, raster_along_m,
-                             locality_domain_half_gemm, max_active_clusters)
+                             locality_domain_half_gemm, max_active_clusters,
+                             self.store_permuted, self.trtllm_gen_n_shuffle,
+                             self.mma_k64)
                 if cache_key not in self.__class__.kernel_cache:
                     gemm = self.__class__.kernel_class(
                         sf_vec_size=self.scaling_vector_size,
@@ -16443,6 +16477,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         cluster_shape_mn=cluster_shape_mn,
                         raster_along_m=raster_along_m,
                         topK=self.top_k,
+                        store_permuted=self.store_permuted,
+                        trtllm_gen_n_shuffle=self.trtllm_gen_n_shuffle,
+                        mma_k64=self.mma_k64,
                     )
                     compiled_gemm = cute.compile(
                         gemm.wrapper,

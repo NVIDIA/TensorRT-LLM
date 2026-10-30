@@ -27,8 +27,10 @@ install wraps the draft head's all-reduce (the worker's
 the row count only, the same on every rank). Before wrapping it,
 ``tie_order_reason`` runs the rank top-k layout with every launch of this
 fast path against the running ``torch.topk`` on the draft head's tie-heavy
-probe (``draft_head.tie_order_probe_logits``) and refuses the install if they
-disagree.
+probes (``draft_head.tie_order_probes``) and refuses the install if they
+disagree. With the drafter's logit transform installed on the draft head
+(``draft_head/logit_transform.py``) ``keys`` takes its canonical keys, and the
+probes and their reference are the transformed ones.
 """
 
 from __future__ import annotations
@@ -42,8 +44,9 @@ from torch import nn
 from tensorrt_llm.logger import logger
 
 from ...ops.spec.draft_rank_topk import MAX_KEYS, draft_rank_topk
-from ...ops.spec.draft_shard_topk import CHUNK
+from ...ops.spec.draft_shard_topk import CHUNK, FULL_BAND
 from ..draft_head import head as _draft_head
+from ..draft_head.logit_transform import DraftLogitTransform
 
 #: Fewest draft rows (requests x K) the exchange takes: five requests at K = 7. Fewer
 #: rows are the one-request path and the 9..32-row band.
@@ -67,9 +70,23 @@ class RankTopKExchange:
         """Whether a draft step of ``rows`` rows exchanges the rank top-k (``keys``)."""
         return rows >= MIN_ROWS
 
-    def keys(self, local: torch.Tensor, top_k: int, rank: int, num_ranks: int) -> torch.Tensor:
-        """This rank's own top ``top_k`` keys of ``local`` in the all-reduce layout."""
-        return draft_rank_topk(local, top_k, CHUNK, CHUNK_WARPS, rank, num_ranks)
+    def keys(
+        self,
+        local: torch.Tensor,
+        top_k: int,
+        rank: int,
+        num_ranks: int,
+        canon: Optional[torch.Tensor] = None,
+        canon_band: tuple[int, int] = FULL_BAND,
+    ) -> torch.Tensor:
+        """This rank's own top ``top_k`` keys of ``local`` in the all-reduce layout.
+
+        ``canon`` / ``canon_band``: a drafter logit transform's canonical keys
+        (``draft_shard_topk``'s), passed by ``draft_head.selector_draft_tokens``.
+        """
+        return draft_rank_topk(
+            local, top_k, CHUNK, CHUNK_WARPS, rank, num_ranks, canon=canon, canon_band=canon_band
+        )
 
     def merge_launch(self, rows: int) -> dict:
         """``draft_topk_merge``'s launch geometry for a step of ``rows`` rows."""
@@ -82,14 +99,21 @@ class RankTopKExchange:
         return self.allreduce(packed)
 
 
-def tie_order_reason(selector: nn.Module, num_ranks: int, topk=torch.topk) -> Optional[str]:
+def tie_order_reason(
+    selector: nn.Module,
+    num_ranks: int,
+    topk=torch.topk,
+    transform: Optional[DraftLogitTransform] = None,
+) -> Optional[str]:
     """Why the rank top-k exchange would differ from this torch's ``torch.topk``, or None.
 
-    ``draft_head.tie_order_reason``'s probe for the rank top-k layout: the
+    ``draft_head.tie_order_reason``'s probes for the rank top-k layout: the
     probe logits split into ``num_ranks`` shards, each shard's ``keys``, their
     sum (what the all-reduce returns) merged with every ``MERGE_LAUNCH``
     geometry, ids and values compared bit for bit with ``topk`` as the built-in
-    selector runs it. ``topk`` is a parameter so a test can stand in another order.
+    selector runs it. With ``transform`` (the draft head's) the keys are
+    canonical, the merge reads its values table and the reference transforms
+    the logits first. ``topk`` is a parameter so a test can stand in another order.
     """
     predecessor_codebook = selector.predecessor_codebook
     vocab, rank_dim = predecessor_codebook.shape
@@ -97,42 +121,48 @@ def tie_order_reason(selector: nn.Module, num_ranks: int, topk=torch.topk) -> Op
     top_k = selector.top_k
     device = predecessor_codebook.device
     exchange = RankTopKExchange(None)
+    canon = _draft_head.canon_kwargs(transform)
     with torch.cuda.device(device):
-        full = _draft_head.tie_order_probe_logits(vocab, shard).to(device)
-        rows = full.shape[0]
-        ref_values, ref_ids = topk(full.float().view(1, rows, vocab), top_k, dim=-1)
-        keys = torch.stack(
-            [
-                exchange.keys(
-                    full[:, r * shard : (r + 1) * shard].contiguous(), top_k, r, num_ranks
+        for probe, full in enumerate(_draft_head.tie_order_probes(vocab, shard, transform, device)):
+            rows = full.shape[0]
+            ref_values, ref_ids = _draft_head.probe_reference(full, top_k, transform, topk)
+            keys = torch.stack(
+                [
+                    exchange.keys(
+                        full[:, r * shard : (r + 1) * shard].contiguous(),
+                        top_k,
+                        r,
+                        num_ranks,
+                        **canon,
+                    )
+                    for r in range(num_ranks)
+                ]
+            ).sum(dim=0)
+            gate = torch.zeros(1, rows, rank_dim, dtype=torch.bfloat16, device=device)
+            anchor = torch.zeros(1, dtype=torch.int64, device=device)
+            for _, rank_block, num_warps in MERGE_LAUNCH:
+                ids, values, _, _ = _draft_head.draft_topk_merge(
+                    keys,
+                    shard,
+                    1,
+                    rows,
+                    anchor,
+                    gate,
+                    predecessor_codebook,
+                    selector.successor_codebook,
+                    top_k,
+                    num_ranks,
+                    rank_block=rank_block,
+                    num_warps=num_warps,
+                    **_draft_head.values_kwargs(transform),
                 )
-                for r in range(num_ranks)
-            ]
-        ).sum(dim=0)
-        gate = torch.zeros(1, rows, rank_dim, dtype=torch.bfloat16, device=device)
-        anchor = torch.zeros(1, dtype=torch.int64, device=device)
-        for _, rank_block, num_warps in MERGE_LAUNCH:
-            ids, values, _, _ = _draft_head.draft_topk_merge(
-                keys,
-                shard,
-                1,
-                rows,
-                anchor,
-                gate,
-                predecessor_codebook,
-                selector.successor_codebook,
-                top_k,
-                num_ranks,
-                rank_block=rank_block,
-                num_warps=num_warps,
-            )
-            if not (torch.equal(ids, ref_ids) and _draft_head._same_bits(values, ref_values)):
-                differ = (ids != ref_ids).any(dim=-1).view(-1).nonzero().view(-1).tolist()
-                return (
-                    f"torch {torch.__version__} orders top-k ties differently from the merge over "
-                    f"rank top-k keys (rank_block {rank_block}, {num_warps} warps; probe rows "
-                    f"{differ} differ)"
-                )
+                if not (torch.equal(ids, ref_ids) and _draft_head._same_bits(values, ref_values)):
+                    differ = (ids != ref_ids).any(dim=-1).view(-1).nonzero().view(-1).tolist()
+                    return (
+                        f"torch {torch.__version__} orders top-k ties differently from the merge "
+                        f"over rank top-k keys (rank_block {rank_block}, {num_warps} warps; probe "
+                        f"{probe} rows {differ} differ)"
+                    )
     return None
 
 
@@ -168,7 +198,11 @@ def install(llm: nn.Module) -> bool:
         return False
     reason = unsupported_reason(llm)
     if reason is None:
-        reason = tie_order_reason(llm.draft_model.candidate_selector, worker.mapping.tp_size)
+        reason = tie_order_reason(
+            llm.draft_model.candidate_selector,
+            worker.mapping.tp_size,
+            transform=worker.__dict__.get(_draft_head.TRANSFORM_ATTR),
+        )
     if reason is not None:
         raise ValueError(f"[musespark_open] wide_draft_topk cannot run here: {reason}")
     worker.__dict__[ATTRIBUTE] = RankTopKExchange(worker.__dict__[ATTRIBUTE])

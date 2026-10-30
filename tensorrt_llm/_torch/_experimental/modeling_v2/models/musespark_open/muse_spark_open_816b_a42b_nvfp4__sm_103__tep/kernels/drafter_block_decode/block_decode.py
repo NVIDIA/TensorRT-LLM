@@ -69,9 +69,11 @@ from ...ops.spec.dflash_window_attention import (
 #: Operand dtypes the fused convolution takes; anything else runs the built-in.
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
-#: Block rows on which the PDL chain's conv / merge entry triggers apply (``chain.ROWS``):
-#: one request of K + 1 = 8 rows, whose successor GEMMs run the ``drafter_fixed_gemms`` tactic.
-_ENTRY_ROWS = 8
+#: Block rows on which the PDL chain's conv / merge entry triggers apply when the chain's
+#: install did not record their widths (``_pdl_entry_rows`` / ``_pdl_merge_rows``,
+#: ``chain.entry_rows`` / ``chain.MERGE_ENTRY_ROWS_BY_SM``): one request of K + 1 = 8 rows, whose
+#: successor GEMMs run the ``drafter_fixed_gemms`` tactic.
+_ENTRY_ROWS = (8,)
 
 
 class FusedDFlash2BlockConv(DFlash2BlockConv):
@@ -96,9 +98,13 @@ class FusedDFlash2BlockConv(DFlash2BlockConv):
             or hidden_states.dtype not in SUPPORTED_DTYPES
         ):
             return super()._convolve(hidden_states, delta, side, block_size)
-        if side == 0 and hidden_states.shape[0] == _ENTRY_ROWS and self.__dict__.get("_pdl_conv"):
-            # PDL chain conv trigger (drafter_pdl_chain/chain.py): the prepare side of an 8-row block, whose
-            # successor GEMM loads only its weight before its own wait.
+        if (
+            side == 0
+            and self.__dict__.get("_pdl_conv")
+            and hidden_states.shape[0] in self.__dict__.get("_pdl_entry_rows", _ENTRY_ROWS)
+        ):
+            # PDL chain conv trigger (drafter_pdl_chain/chain.py): the prepare side of a block whose
+            # successor GEMM runs a fixed tactic, which loads only its weight before its own wait.
             return dflash2_block_conv(
                 hidden_states, delta, base_kernel, block_size, self.group_size, True
             )
@@ -323,7 +329,9 @@ def windowed_block_decode(
     layers = self.model.layers
     prenormed = None
     # PDL chain merge trigger (drafter_pdl_chain/chain.py): the merge releases o_proj's GEMM at its entry.
-    merge_entry = bool(self.__dict__.get("_pdl_merge")) and B * block_size == _ENTRY_ROWS
+    merge_entry = bool(self.__dict__.get("_pdl_merge")) and B * block_size in self.__dict__.get(
+        "_pdl_merge_rows", _ENTRY_ROWS
+    )
     # wide_drafter_window_attention: a block decode of several requests on the wide op.
     wide = self.__dict__.get("_wide_window_attention")
     if wide is not None and not wide.takes(B * block_size):

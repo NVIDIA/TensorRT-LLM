@@ -80,6 +80,34 @@ TP4_WIDE_KERNELS: Mapping[str, Tuple[Tuple[int, str], ...]] = {
     "pool": ((WIDE_ROWS, "splitk:64,16,4,10"),),
     "unpool": ((16, "splitk:64,16,4,10"), (WIDE_ROWS, "splitk:64,16,2,11")),
 }
+
+
+def wide_kernel_steps(
+    capability: Optional[Tuple[int, int]],
+) -> Mapping[str, Tuple[Tuple[int, str], ...]]:
+    """The 9..32-row table of the device of ``capability`` (None: the target's own sm103,
+    as ``dense_gemms.device_capability`` reads a host without CUDA).
+
+    Raises:
+        ValueError: on sm107, whose TEP4 composition serves its 9..32-row projections on
+            ``wide_dense_gemms``' R200 table instead (``dense_gemms`` ``SM107_TP4_WIDE_KERNELS``),
+            and on any other device.
+    """
+    capability = (10, 3) if capability is None else tuple(capability)
+    if capability == (10, 3):
+        return TP4_WIDE_KERNELS
+    elif capability == (10, 7):
+        raise ValueError(
+            "[musespark_open] wide_projection_gathers has no sm107 table: sm107 TEP4 runs its "
+            "9..32-row projections on wide_dense_gemms"
+        )
+    else:
+        raise ValueError(
+            f"[musespark_open] wide_projection_gathers has no table for SM {capability} "
+            "(measured on sm103 only)"
+        )
+
+
 #: The per-rank ``(K, N)`` of each site at TP4.
 TP4_SHAPES: Mapping[str, Tuple[int, int]] = {
     "qkv": (8192, 4608),
@@ -166,7 +194,8 @@ def check(model: torch.nn.Module, plan: Optional[DenseGemmPlan]) -> None:
     """Whether ``install`` may run on ``model`` with ``dense_gemms``' ``plan``; changes nothing.
 
     Raises:
-        ValueError: if the model is not TP4, a layer's MoE or post-FFN join is not
+        ValueError: if the plan's device has no 9..32-row table (``wide_kernel_steps``: sm103
+            only), the model is not TP4, a layer's MoE or post-FFN join is not
             ``projection_gathers``' class with both sites fused, ``dense_gemms`` is not
             installed, or its plan prefetches (``dense_gemm_prefetch``): that prefetch's
             row exemptions (``skip_prefetch_rows``) are derived from the 1..8-row table, so
@@ -200,7 +229,7 @@ def check(model: torch.nn.Module, plan: Optional[DenseGemmPlan]) -> None:
                 f"[musespark_open] wide_projection_gathers widens projection_gathers' unpool site, "
                 f"which layer {layer.layer_idx} does not run ({type(join).__name__})"
             )
-    for site, by_rows in wide_kernels().items():
+    for site, by_rows in wide_kernels(wide_kernel_steps(plan.capability)).items():
         k, n = TP4_SHAPES[site]
         for rows, kernel in enumerate(by_rows, start=WIDE_MIN_ROWS):
             error = kernel_error(kernel, rows, k, n)
@@ -226,7 +255,8 @@ def install(model: torch.nn.Module, plan: DenseGemmPlan) -> WideProjections:
     pool_inbox = ProjectionInbox(
         mapping, row_words=_pool.local_columns(world) // 2, max_rows=WIDE_ROWS
     )
-    plan.set_wide_kernels(wide_kernels())
+    kernels = wide_kernels(wide_kernel_steps(plan.capability))
+    plan.set_wide_kernels(kernels)
     wide = WideProjections(plan)
     for layer in layers:
         moe, join = layer.feed_forward, layer.add_ffn
@@ -239,7 +269,7 @@ def install(model: torch.nn.Module, plan: DenseGemmPlan) -> WideProjections:
         f"in {len(layers)} layers: pool/unpool slices with their gathers fused into the "
         "pre-expert quantization and the post-FFN boundary (32-row inboxes); split-K for "
         + ", ".join(
-            f"{site} {'|'.join(dict.fromkeys(by_rows))}" for site, by_rows in wide_kernels().items()
+            f"{site} {'|'.join(dict.fromkeys(by_rows))}" for site, by_rows in kernels.items()
         )
     )
     return wide

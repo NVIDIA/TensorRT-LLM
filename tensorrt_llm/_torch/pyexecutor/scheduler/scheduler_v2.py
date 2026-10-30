@@ -15,6 +15,7 @@
 
 import enum
 import os
+import time
 from collections import Counter
 from typing import Callable, Optional
 
@@ -249,6 +250,138 @@ class PrefillDecodeInterval:
         return True
 
 
+class ContextPageBackoff:
+    """Stop retrying context admission that the KV pool keeps refusing.
+
+    Admitting a first context chunk is not a cheap check. ``prepare_context``
+    creates the request's cache and claims its reusable prefix, the resume
+    brings that prefix onto the GPU (onboarding pages that live on a lower
+    tier and evicting others to make room), and when the chunk's own pages
+    then do not fit, the whole claim is rolled back and freed. The cost grows
+    with the prompt, not with the chunk. With the pool near full, every
+    pending request repeats this on every pass and is refused every time, so
+    host time per step grows with the number of pending requests while no
+    context work is admitted.
+
+    With ``passes`` N, once a pass that schedules generation sees a context
+    admission refused for pages, the rest of that pass tries no more first
+    chunks, and the next N passes that schedule generation try none either.
+    One pass in N + 1 then probes whether pages have come back. Chunk
+    continuations of started prefills are always tried, and passes without
+    generation are never held: with nothing decoding, nothing else can use
+    the step.
+
+    The state is a pure function of the sequence of scheduling decisions, so
+    ranks that schedule the same requests stay in lockstep.
+    """
+
+    def __init__(self, passes: int):
+        if passes <= 0:
+            raise ValueError(f"passes must be positive, got {passes}")
+        self.passes = passes
+        self._remaining = 0
+
+    @property
+    def remaining(self) -> int:
+        """Generation passes left before first chunks are tried again."""
+        return self._remaining
+
+    def holds_first_chunks(self, has_generation: bool, refused_this_pass: bool) -> bool:
+        """Whether this pass must skip first-chunk context admission."""
+        return has_generation and (self._remaining > 0 or refused_this_pass)
+
+    def record_pass(self, has_generation: bool, refused_this_pass: bool) -> None:
+        """Advance the backoff by one scheduling pass."""
+        if not has_generation:
+            return
+        if refused_this_pass:
+            self._remaining = self.passes
+        elif self._remaining > 0:
+            self._remaining -= 1
+
+
+class _AdmissionDiagnostics:
+    """Opt-in host-time accounting of phase-2 context admission.
+
+    Logs, every ``log_passes`` scheduling passes, how many context admissions
+    were attempted and refused for pages, and where the host time of the
+    admission phase went. A pass slower than ``slow_pass_ms`` is also logged
+    on its own, at most ``max_slow_logs`` times per window.
+    """
+
+    _SECTIONS = ("prepare", "allocate", "release")
+
+    def __init__(self, log_passes: int = 1024, slow_pass_ms: float = 100.0, max_slow_logs: int = 4):
+        self.log_passes = log_passes
+        self.slow_pass_ms = slow_pass_ms
+        self.max_slow_logs = max_slow_logs
+        self._window: Counter = Counter()
+        self._pass: Counter = Counter()
+        self._pass_start = 0.0
+        self._slow_logged = 0
+
+    def wrap(self, name: str, fn: Callable) -> Callable:
+        """Return *fn* timed into section *name* of the current pass."""
+
+        def timed(*args, **kwargs):
+            start = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self._pass[f"{name}_ms"] += (time.perf_counter() - start) * 1e3
+                self._pass[f"{name}_calls"] += 1
+
+        return timed
+
+    def begin_pass(self) -> None:
+        self._pass.clear()
+        self._pass_start = time.perf_counter()
+
+    def count(self, key: str, n: int = 1) -> None:
+        self._pass[key] += n
+
+    def end_pass(self, num_pending: int, num_scheduled_ctx: int) -> None:
+        pass_ms = (time.perf_counter() - self._pass_start) * 1e3
+        stats = self._pass
+        stats["phase2_ms"] = pass_ms
+        window = self._window
+        window["passes"] += 1
+        window.update(stats)
+        window["max_phase2_ms"] = max(window["max_phase2_ms"], pass_ms)
+        if stats["page_refused"]:
+            window["refused_passes"] += 1
+            window["refused_pass_ms"] += pass_ms
+        if pass_ms > self.slow_pass_ms:
+            window["slow_passes"] += 1
+            window["slow_pass_ms"] += pass_ms
+            if self._slow_logged < self.max_slow_logs:
+                self._slow_logged += 1
+                logger.info(
+                    f"[V2Scheduler] slow admission pass {pass_ms:.1f} ms: pending {num_pending}, "
+                    f"attempts {stats['attempts']}, page refusals {stats['page_refused']}, "
+                    f"admitted {num_scheduled_ctx}, held by backoff {stats['held']}, "
+                    + ", ".join(
+                        f"{s} {stats[s + '_calls']} calls {stats[s + '_ms']:.1f} ms"
+                        for s in self._SECTIONS
+                    )
+                )
+        if window["passes"] >= self.log_passes:
+            logger.info(
+                f"[V2Scheduler] admission diagnostics over {window['passes']} passes: "
+                f"attempts {window['attempts']}, page refusals {window['page_refused']} "
+                f"in {window['refused_passes']} passes ({window['refused_pass_ms']:.0f} ms), "
+                f"held by backoff {window['held']}, phase-2 total {window['phase2_ms']:.0f} ms, "
+                f"max {window['max_phase2_ms']:.1f} ms, passes > {self.slow_pass_ms:.0f} ms "
+                f"{window['slow_passes']} ({window['slow_pass_ms']:.0f} ms), "
+                + ", ".join(
+                    f"{s} {window[s + '_calls']} calls {window[s + '_ms']:.0f} ms"
+                    for s in self._SECTIONS
+                )
+            )
+            window.clear()
+            self._slow_logged = 0
+
+
 class ShortestPrefillFirstOrder:
     """Order pending context requests by the prefill work they still need.
 
@@ -480,6 +613,31 @@ class KVCacheV2Scheduler(RequestScheduler):
                 _read_non_negative_int_env("TRTLLM_SCHED_SPF_MAX_WAIT_PASSES", 128)
             )
         self._context_admission_stats: Counter = Counter()
+
+        # Opt-in (default off): back off first-chunk context admission after
+        # the KV pool refuses one; see ContextPageBackoff.
+        backoff_passes = _read_non_negative_int_env("TRTLLM_SCHED_CTX_PAGE_BACKOFF_PASSES", 0)
+        self._ctx_page_backoff = ContextPageBackoff(backoff_passes) if backoff_passes > 0 else None
+        # Set by the context admission paths when the KV pool refused pages
+        # during the current pass.
+        self._ctx_page_refused = False
+        # Opt-in (default off) host-time accounting of context admission.
+        self._admission_diag = None
+        if os.environ.get("TRTLLM_SCHED_ADMISSION_DIAG", "0") == "1":
+            diag = _AdmissionDiagnostics(
+                log_passes=_read_non_negative_int_env("TRTLLM_SCHED_ADMISSION_DIAG_PASSES", 1024)
+                or 1024
+            )
+            self._prepare_context_pair = diag.wrap("prepare", self._prepare_context_pair)
+            self._try_allocate_context = diag.wrap("allocate", self._try_allocate_context)
+            self.release_context_admission = diag.wrap("release", self.release_context_admission)
+            self._admission_diag = diag
+        if self._ctx_page_backoff is not None or self._admission_diag is not None:
+            logger.info(
+                "KVCacheV2Scheduler context page backoff: "
+                f"passes={backoff_passes}, admission_diagnostics="
+                f"{self._admission_diag is not None}"
+            )
         if self._prefill_decode_interval is not None or self._shortest_prefill_first is not None:
             logger.info(
                 "KVCacheV2Scheduler context admission: "
@@ -722,6 +880,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         ctx_candidates, deferred_by_interval = self._admissible_pending_ctx(
             pending_ctx, requests_list, has_generation
         )
+        self._ctx_page_refused = False
+        backoff = self._ctx_page_backoff
+        diag = self._admission_diag
+        if diag is not None:
+            diag.begin_pass()
 
         # Prefix-aware skip: when several first-chunk context requests would
         # contribute the same not-yet-cached block, admitting them together
@@ -753,6 +916,15 @@ class KVCacheV2Scheduler(RequestScheduler):
             ):
                 continue
             if req.py_request_id in preempted_ids:
+                continue
+            if (
+                backoff is not None
+                and req.state_value == self._context_init_state_value
+                and req.is_first_context_chunk
+                and backoff.holds_first_chunks(has_generation, self._ctx_page_refused)
+            ):
+                if diag is not None:
+                    diag.count("held")
                 continue
             # Fast path: a pending context request whose draft-mirror admission
             # is certainly refused this iteration cannot be scheduled, so the
@@ -796,6 +968,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 scheduled_encoder.append(req)
                 budget.commit(req, tokens, peft_pages)
             else:
+                if diag is not None:
+                    diag.count("attempts")
                 action, tokens, chunking_flag = self._try_schedule_context(
                     req, budget, preempt_for_pages
                 )
@@ -820,6 +994,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if first_new_block is not None:
                     contributed_blocks.add(first_new_block)
 
+        if backoff is not None:
+            backoff.record_pass(has_generation, self._ctx_page_refused)
+        if diag is not None:
+            diag.end_pass(len(ctx_candidates), len(scheduled_ctx))
         if self._prefill_decode_interval is not None:
             self._record_context_admission(scheduled_ctx, has_generation, deferred_by_interval)
         if self._shortest_prefill_first is not None:
@@ -1138,6 +1316,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # before budget check.
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for context request {req.py_request_id}")
+            self._note_page_refusal()
             return ScheduleAction.STOP, 0, False
 
         context_tokens = req.context_remaining_length
@@ -1160,6 +1339,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # prepare_context to resume it.
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
+            self._note_page_refusal()
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)
@@ -1168,6 +1348,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             return cross_action, 0, False
 
         return ScheduleAction.SCHEDULED, req_tokens, False
+
+    def _note_page_refusal(self) -> None:
+        """Record that the KV pool refused a context admission this pass."""
+        self._ctx_page_refused = True
+        if self._admission_diag is not None:
+            self._admission_diag.count("page_refused")
 
     def _has_context_chunk_budget(self, budget: BudgetTracker) -> bool:
         remaining = budget.remaining_tokens
@@ -1203,6 +1389,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Prepare context (create _KVCache, block reuse, resume — no resize)
         if not self._prepare_context_pair(req):
             logger.debug(f"prepare_context failed for chunked context request {req.py_request_id}")
+            self._note_page_refusal()
             return ScheduleAction.SKIP, 0, False
 
         # Calculate chunk size from remaining budget
@@ -1274,6 +1461,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             # Out of pages, as in _try_schedule_context_full.
             if preempt_for_pages(req):
                 return ScheduleAction.STOP, 0, False
+            self._note_page_refusal()
             return ScheduleAction.SKIP, 0, False
 
         cross_action = self._try_schedule_cross_context(req)

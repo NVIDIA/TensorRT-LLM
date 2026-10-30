@@ -116,16 +116,30 @@ Target attention (installed by the shell's constructor, ``layers.adopt_model``):
   decode steps run it, while prefill and mixed steps keep the built-in
   selection (the ``thop`` attention). The drafter's attention is not a target
   layer and keeps the built-in selection.
-* ``decode_kv_splits`` (tep4 on sm_103 only) re-classes nothing: ``DecodeTarget``
+* ``decode_kv_splits`` (tep4 on sm_103 only): ``DecodeTarget``
   arms it for a forward of 72..512 rows (9 to 64 requests), and while armed the
   full-attention layers' trtllm-gen decode FMHA calls present flashinfer's
   KV-split selection with the SM count of a grid of about
   ``TARGET_CTAS_PER_SM`` CTAs per SM (``kernels/decode_kv_splits``), so those
-  steps keep multi-CTA KV at every batch size. Decode steps of up to 8
-  requests and prefill steps run what they ran before. Where
+  steps keep multi-CTA KV at every batch size. It also re-classes the
+  full-attention layers' attention with ``MixedStepKvSplitsAttention`` in front
+  of all of the above (``kernels/decode_kv_splits/mixed``): an attention call of
+  a mixed step with 9 to 64 generation requests runs with the same rule armed,
+  so the generation phase's decode FMHA of those steps keeps multi-CTA KV too.
+  Decode steps of up to 8 requests, mixed steps of up to 8 generation requests
+  and pure prefill steps run what they ran before. Where
   ``multi_request_split_kv`` serves a full-attention layer, its stand-in sits
   inside this one and launches its own kernel, so this split only acts on the
   calls that path declines.
+* ``mixed_step_gen_rows`` (tep4 on sm_107 only) takes the generation rows of
+  mixed steps with 9..64 generation requests off the thop attention on the
+  full-attention layers: a ``ThopContextPhaseFmha`` before each such layer's
+  thop fallback offers the context phase, so those steps run
+  ``CombinedFmha(context=thop, generation=DecodeTrtllmGenFmha)``, and
+  ``MixedStepGenRowsAttention`` in front of the layer's attention intercepts
+  the generation phase's decode call with ``multi_request_split_kv``'s
+  stand-in (``kernels/mixed_step_gen_rows``). Sliding-window layers, pure
+  context steps and mixed steps outside the band keep the thop attention.
 
 Dense projections and prefetch:
 
@@ -305,11 +319,13 @@ installed by the shell's ``load_weights`` after the built-in loader
   ``ring_buddy.install(windows=1)``), with nothing replicated.
 * ``three_window_placement`` stacks a third ring window on them.
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
-  them, which the prologue's routed kernel places onto; only up to the
+  them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
+  that reach the routing method, ``ring_buddy_assign``'s half flow); only up to the
   ``max_batch_size`` of its capacity gate (``dispatch.CAPACITY_GATES``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
-* ``hot_replicas`` (tep4 on sm_103 only) hooks the NVFP4 layers' expert and routing
+* ``hot_replicas`` (tep4, in a plan without ``half_window_experts``:
+  ``dispatch.YIELDS``) hooks the NVFP4 layers' expert and routing
   calls after the owner-window install; the copies themselves are gathered on the
   first forward of a deployment whose largest decode step (``max_batch_size`` times
   the verify width) reaches 33 rows (``HotReplicas.decide``), and ``DecodeTarget``
@@ -380,7 +396,9 @@ decode steps' head logits stay BF16 and are sampled by
 write into a multicast inbox that the sampler gathers from (and fires the
 context-K/V fork's head fork point right after that GEMM); ``wide_split_sampler``
 (tep4 on sm_103 only) widens the head to decode steps of 129..1024 rows, which the
-sampler takes on the shipped sampler's 512-thread block (``target_head.widen``).
+sampler takes on the shipped sampler's 512-thread block (``target_head.widen``);
+``vocab_parallel_head`` (tep4 on sm_103 only) samples and argmaxes decode steps of
+16 rows or more from each rank's own vocabulary shard, without the logits all-gather.
 """
 
 from __future__ import annotations
@@ -734,12 +752,18 @@ class DecodeTarget:
             self.qkv_prefetch.graph_start(
                 int((input_ids if input_ids is not None else inputs_embeds).shape[0])
             )
-        if inputs_embeds is None:
-            inputs_embeds = core.embed_tokens(input_ids)
-        embeds = core.embed_norm(inputs_embeds.to(core.dtype))
-        if core.m_emb != 1.0:
-            embeds = embeds * core.m_emb
-        hidden_states = embeds.to(torch.float32)
+        # Installed at weight load, after this target was built.
+        model_boundary = getattr(core, "_model_boundary", None)
+        first_attn_input = None
+        if model_boundary is not None and model_boundary.takes(input_ids, inputs_embeds):
+            hidden_states, first_attn_input = model_boundary.input(input_ids)
+        else:
+            if inputs_embeds is None:
+                inputs_embeds = core.embed_tokens(input_ids)
+            embeds = core.embed_norm(inputs_embeds.to(core.dtype))
+            if core.m_emb != 1.0:
+                embeds = embeds * core.m_emb
+            hidden_states = embeds.to(torch.float32)
         if self.preattn_prep is not None:
             kwargs = dict(kwargs, preattn_prep=self.preattn_prep)
         if self.decode_attention is not None:
@@ -787,7 +811,7 @@ class DecodeTarget:
         batch_armed = batch is not None and batch.takes(rows)
 
         layers = core.layers
-        precomputed_attn_input = None
+        precomputed_attn_input = first_attn_input
         if hop_armed:
             arming = hop.armed(hidden_states.shape[0], hidden_states)
         elif wide_hop_armed:
@@ -806,6 +830,7 @@ class DecodeTarget:
             two_shot.armed() if two_shot_armed else contextlib.nullcontext(),
             hot.armed() if hot_armed else contextlib.nullcontext(),
             batch.armed() if batch_armed else contextlib.nullcontext(),
+            model_boundary.armed() if model_boundary is not None else contextlib.nullcontext(),
         ):
             for index, decoder_layer in enumerate(layers):
                 next_norm = layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
@@ -858,7 +883,10 @@ _TEP4_ONLY_PATHS = frozenset(
 #: prefetch and PDL norm-gate of 33..512-row decode steps, the drafter window attention of
 #: 33..1024-row block decodes on a multi-request split geometry, the draft head's rank top-k
 #: key exchange on draft steps of 33 or more rows, the split verify sampler on
-#: 129..1024-row decode steps, and the context steps' pre-attention prep in one launch.
+#: 129..1024-row decode steps, the context steps' pre-attention prep in one launch, the
+#: verify head of 16..1024-row decode steps on each rank's own vocabulary shard over the
+#: tray's multicast, and the drafter hops of 9..56-row block decodes on a wide one-shot
+#: transport.
 _SM103_TEP4_ONLY_PATHS = frozenset(
     {
         "hot_replicas",
@@ -878,10 +906,18 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
         "wide_draft_topk",
         "wide_split_sampler",
         "context_prep",
+        "vocab_parallel_head",
+        "wide_drafter_hops",
     }
 )
+#: The fast paths validated at a tep4 rank's shape on sm107 only: the generation rows of
+#: mixed steps on the multi-request decode FMHA (on sm103 flashinfer's trtllm-gen FMHA
+#: already serves both phases of a mixed step).
+_SM107_TEP4_ONLY_PATHS = frozenset({"mixed_step_gen_rows"})
 #: TEP8: every fast path but the TP4-only ones of either architecture.
-_TEP8_PATHS = _dispatch.FAST_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS
+_TEP8_PATHS = (
+    _dispatch.FAST_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS - _SM107_TEP4_ONLY_PATHS
+)
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
 _TEP4_BITWISE_PATHS = frozenset(
@@ -892,6 +928,7 @@ _TEP4_BITWISE_PATHS = frozenset(
         "deferred_input_prep",
         "sampler_store",
         "replicated_embedding",
+        "model_boundary",
         "fused_accept",
         "verify_fold",
         "draft_head",
@@ -917,11 +954,20 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: decode steps on the tray's MNNVL two-shot; on decode steps of 9..1024 rows, the
 #: post-attention hop on its own one-shot transport; large context steps
 #: sequence-parallel over the tray; and the context steps' pre-attention prep in one launch.
+#: Its NVFP4 expert layers also hold their ring predecessor's upper expert half
+#: (``half_window_experts``): decode steps of at most 8 rows are placed by the
+#: prologue's routed kernel, those of 9..32 rows (two to four requests, behind the
+#: multi-request router GEMM and projection gathers) by ``ring_buddy_assign``'s half
+#: flow, both balancing the selected experts over the four ranks. As on sm107 the
+#: window costs 45 GiB of KV cache per rank and is carried only up to
+#: ``max_batch_size`` 8 (``dispatch.CAPACITY_GATES``); a plan carrying it leaves
+#: ``hot_replicas`` out (``dispatch.YIELDS``).
 _SM103_TEP4_PATHS = (
     _TEP4_PATHS
     | _SM103_TEP4_ONLY_PATHS
     | frozenset(
         {
+            "half_window_experts",
             "swa_paged_decode",
             "swa_block",
             "full_attention_split_kv",
@@ -1023,7 +1069,7 @@ _SM107_TEP4_PATHS = _TEP4_PATHS | frozenset(
 #: decode FMHA of steps of five or more requests (``multi_request_split_kv``; steps of two to
 #: four requests stay on ``wide_full_attention``).
 _SM107_TEP4_ATTENTION_PATHS = frozenset({"multi_request_split_kv"})
-_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_ATTENTION_PATHS
+_SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_ATTENTION_PATHS | _SM107_TEP4_ONLY_PATHS
 _SM107_TEP4_PATHS |= _SM107_TEP4_COMM_PATHS
 #: The GB300 TEP4 GEMM and expert-balance paths also served at sm107 TEP4, tuned for
 #: R200: the router GEMM of decode steps of five or more requests (33..512 rows; 16..32
@@ -1040,13 +1086,15 @@ _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_GEMM_EXPERT_PATHS
 #: the two-to-four-request steps' append themselves), the drafter window attention of
 #: 33..1024-row block decodes on the multi-request split geometry (sized by the device's
 #: SM count), the draft head's rank top-k key exchange on draft steps of 33 or more rows,
-#: and the split verify sampler on 129..1024-row decode steps.
+#: the split verify sampler on 129..1024-row decode steps, and the drafter hops of
+#: 9..64-row block decodes on a wide one-shot transport.
 _SM107_TEP4_DRAFTER_AT_BATCH_PATHS = frozenset(
     {
         "multi_request_prep_append",
         "wide_drafter_window_attention",
         "wide_draft_topk",
         "wide_split_sampler",
+        "wide_drafter_hops",
     }
 )
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_DRAFTER_AT_BATCH_PATHS
@@ -1162,7 +1210,9 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         plan = self._plan
         if not plan:
             return result
-        _weights.install_loaded_features(self.llm.model, self.model_config.mapping, plan)
+        _weights.install_loaded_features(
+            self.llm.model, self.model_config.mapping, plan, device_compute_capability()
+        )
         # The token embedding after the experts, so the expert replication's
         # all-gather and this one's never interleave.
         _weights.install_embedding_features(self.llm.model, self.model_config.mapping, plan)

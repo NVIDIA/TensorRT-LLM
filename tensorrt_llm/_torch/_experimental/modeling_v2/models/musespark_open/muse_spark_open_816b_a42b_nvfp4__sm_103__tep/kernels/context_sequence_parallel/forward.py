@@ -22,7 +22,14 @@ of the experts (``moe.ContextSequenceParallelMoE``, the built-in arm's expert in
 bit for bit) and reduce-scatters the experts' partial sums in place of their
 all-reduce. Attention and experts still see every row of the step, so the generation
 rows of a mixed step are served as the context rows are. After the last layer the
-final norm runs on the shard and the step's rows are all-gathered.
+final norm runs on the shard and the step's rows are all-gathered. On sm103
+(``SHARD_PARTS_BY_SM``) each rank also routes its own rows and gathers their top-8 ids
+and weights instead of the router logits (``moe.shard_routing``), and the attention-side
+residual join writes the router's FP32 input next to the pre-FFN norm output
+(``router_input``); both are bitwise. There the attention input of steps of at least
+``ce_gather.MIN_ROWS`` rows is gathered by the copy engines and the QKV projection runs
+in row blocks behind per-peer flags (``ce_gather``); also bitwise. On sm107 the router
+logits and the attention input are all-gathered.
 
 DFlash taps the residual stream after its capture layers, and that stream is
 sharded here. For the forward the step's capture buffer
@@ -139,23 +146,52 @@ def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     return None
 
 
-def install(model: MuseSparkOpenModel, sm: Optional[int] = None) -> "ContextSequenceParallel":
+#: The SM versions ``install`` wires, each with its own set of the path's parts
+#: (``SHARD_PARTS_BY_SM``).
+SHARD_PARTS_BY_SM = {
+    # sm103: the MoE re-class with routing on the shard, the router's FP32 input from the
+    # attention-side join, and the copy-engine gather of the attention input.
+    103: ("moe", "shard_routing", "router_input", "ce_gather"),
+    # sm107: the MoE re-class only; the router logits are gathered and every row of the
+    # step is routed, as the built-in arm does, and the attention input is all-gathered.
+    107: ("moe",),
+}
+
+
+def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":
     """The path's forward for ``model``, with every layer's MoE re-classed (``moe.install``).
 
-    ``sm`` is the SM version the model's composition was built for; it picks the eager
-    threshold (``EAGER_MIN_ROWS_BY_SM``).
+    ``sm`` is the SM version the model's composition was built for
+    (``dispatch.sm_of``), required: the parts differ per SM, so none is assumed. It
+    picks the eager threshold (``EAGER_MIN_ROWS_BY_SM``) and the parts installed
+    beside the MoE re-class (``SHARD_PARTS_BY_SM``).
 
     The MNNVL all-reduce workspaces are grown on the first prefill step
     (``ContextSequenceParallel.reserve``).
 
     Raises:
         ValueError: when ``refusal`` names a reason, a layer's MoE is not the built-in one,
-            or a layer's fused finalize all-reduce serves ``MIN_ROWS`` rows.
+            a layer's fused finalize all-reduce serves ``MIN_ROWS`` rows, or ``sm`` is
+            neither 103 nor 107 (None included).
     """
     from . import moe as _moe
 
+    parts = SHARD_PARTS_BY_SM.get(sm)
+    if parts is None:
+        got = "no SM version" if sm is None else f"sm{sm}"
+        raise ValueError(
+            f"[musespark_open] context_sequence_parallel is written for sm103 and sm107, got {got}"
+        )
     path = ContextSequenceParallel(model, sm)
-    _moe.install(model, min_rows=MIN_ROWS)
+    _moe.install(model, min_rows=MIN_ROWS, shard_routing="shard_routing" in parts)
+    if "router_input" in parts:
+        from . import router_input as _router_input
+
+        _router_input.install(model, path.step)
+    if "ce_gather" in parts:
+        from . import ce_gather as _ce_gather
+
+        path.ce_gather = _ce_gather.install(model)
     return path
 
 
@@ -223,11 +259,19 @@ class ContextSequenceParallel:
     """
 
     def __init__(self, model: MuseSparkOpenModel, sm: Optional[int] = None) -> None:
+        from .router_input import SequenceParallelStep
+
         reason = refusal(model)
         if reason is not None:
             raise ValueError(f"[musespark_open] context_sequence_parallel: {reason}")
         self.mapping = model._sp_mapping
         self.reserved = False
+        # The copy-engine gather of the attention input (``ce_gather.install``); None when
+        # a layer's QKV projection cannot run in row blocks.
+        self.ce_gather = None
+        # Set while ``forward`` runs the layers: the attention-side joins then also write
+        # the router's FP32 input (``router_input``).
+        self.step = SequenceParallelStep()
         #: The fewest rows of an eager step that runs sequence-parallel on this SM.
         self.eager_min_rows = EAGER_MIN_ROWS_BY_SM.get(sm, EAGER_MIN_ROWS)
 
@@ -247,6 +291,9 @@ class ContextSequenceParallel:
                 "on an eager prefill step before any capture"
             )
         _reserve_all_reduce_workspaces(model)
+        if self.ce_gather is not None:
+            self.ce_gather.build()
+            self.ce_gather.start_watch()
         self.reserved = True
 
     def takes(self, attn_metadata: Any, rows: int, kwargs: Dict[str, Any]) -> bool:
@@ -293,24 +340,39 @@ class ContextSequenceParallel:
             embeds = embeds * core.m_emb
         # The FP32 residual stream of this rank's rows, entered once.
         hidden_states = embeds.to(torch.float32)
+        ce_gather = (
+            self.ce_gather if self.ce_gather is not None and self.ce_gather.takes(rows) else None
+        )
         with _shard_capture(kwargs.get("spec_metadata"), shard) as (capture, step_capture):
             layers = core.layers
             precomputed_attn_input = None
-            for index, decoder_layer in enumerate(layers):
-                next_norm = layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
-                result = decoder_layer(
-                    position_ids=position_ids,
-                    hidden_states=hidden_states,
-                    attn_metadata=attn_metadata,
-                    precomputed_attn_input=precomputed_attn_input,
-                    next_layer_norm=next_norm,
-                    sp_num_tokens=rows,
-                    **kwargs,
-                )
-                if next_norm is None:
-                    hidden_states = result
-                else:
-                    hidden_states, precomputed_attn_input = result
+            self.step.active = True
+            if ce_gather is not None:
+                ce_gather.begin()
+            try:
+                for index, decoder_layer in enumerate(layers):
+                    next_norm = (
+                        layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
+                    )
+                    result = decoder_layer(
+                        position_ids=position_ids,
+                        hidden_states=hidden_states,
+                        attn_metadata=attn_metadata,
+                        precomputed_attn_input=precomputed_attn_input,
+                        next_layer_norm=next_norm,
+                        sp_num_tokens=rows,
+                        **kwargs,
+                    )
+                    if next_norm is None:
+                        hidden_states = result
+                    else:
+                        hidden_states, precomputed_attn_input = result
+            finally:
+                self.step.active = False
+                # Also counted when a layer raised: the watch then sees the forward end once
+                # its queued work does, rather than a forward that never ends.
+                if ce_gather is not None:
+                    ce_gather.end()
         output = core.norm(hidden_states.to(core.dtype))
         if capture is None:
             return allgather(output, mapping, dim=0)[:rows]

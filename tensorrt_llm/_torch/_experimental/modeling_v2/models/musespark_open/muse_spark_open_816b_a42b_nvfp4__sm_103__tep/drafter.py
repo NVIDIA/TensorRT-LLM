@@ -71,6 +71,8 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.drafter_hops import hops as _drafter_hops
 
         _drafter_hops.install(getattr(shell.llm, "draft_model", None), shell._mapping)
+        if plan.enabled("wide_drafter_hops"):
+            _drafter_hops.install_wide(getattr(shell.llm, "draft_model", None), shell._mapping)
     if plan.enabled("drafter_pdl_chain"):
         # After the drafter_fixed_gemms GEMM methods and the drafter_hops hops:
         # the entry triggers rely on both.
@@ -82,7 +84,12 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
     if plan.enabled("split_sampler"):
         from .kernels.split_sampler import target_head as _target_head
 
-        _target_head.install(shell.llm, shell._mapping, plan.enabled("lm_head_inbox"))
+        _target_head.install(
+            shell.llm,
+            shell._mapping,
+            plan.enabled("lm_head_inbox"),
+            plan.enabled("vocab_parallel_head"),
+        )
         if plan.enabled("wide_split_sampler"):
             _target_head.widen(shell.llm)
     # Last: the arena compaction derives its worker class from whatever class every

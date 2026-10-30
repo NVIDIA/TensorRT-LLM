@@ -2524,6 +2524,11 @@ class MuseSparkOpenMoE(nn.Module):
 
 
 class MuseSparkOpenDecoderLayer(DecoderLayer):
+    #: The sequence-parallel arm's attention-input all-gather, ``(attn_input, sp_num_tokens) ->
+    #: rows``; None (the default) runs the NCCL all-gather. A model-specific path may set it
+    #: on a layer, together with a QKV projection that consumes what it returns.
+    _sp_attn_input_gather = None
+
     def __init__(
         self,
         model_config: ModelConfig[MuseSparkOpenConfig],
@@ -2627,7 +2632,11 @@ class MuseSparkOpenDecoderLayer(DecoderLayer):
                 and not torch.cuda.is_current_stream_capturing()
             )
             if sp_num_tokens is not None:
-                attn_input = allgather(attn_input, self.mapping, dim=0)[:sp_num_tokens]
+                gather = self._sp_attn_input_gather
+                if gather is None:
+                    attn_input = allgather(attn_input, self.mapping, dim=0)[:sp_num_tokens]
+                else:
+                    attn_input = gather(attn_input, sp_num_tokens)
                 kwargs = dict(kwargs, all_reduce_params=AllReduceParams(enable_allreduce=False))
             attn_out = self.self_attn(
                 position_ids=position_ids,

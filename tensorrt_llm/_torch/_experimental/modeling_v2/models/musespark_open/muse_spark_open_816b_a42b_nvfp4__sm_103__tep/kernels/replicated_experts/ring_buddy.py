@@ -458,6 +458,9 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
         fp4_block_scale_moe_runner,
     )
+    from tensorrt_llm._torch.autotuner import AutoTuner
+
+    from ...ops.moe import decode_expert_tactics as _decode_tactics
 
     intermediate = backend.w3_w1_weight.shape[-2] // 2
     tune_max_num_tokens = backend.max_num_tokens
@@ -520,6 +523,48 @@ def _nvfp4_call(backend, routing, persistent: bool = False, stacks=None, persist
                 stacks["fc31_scale_c"],
                 stacks["fc31_alpha"],
                 stacks["fc2_alpha"],
+            )
+        tactic = None
+        if not AutoTuner.get().is_tuning_mode:
+            tactic = _decode_tactics.fixed_tactic(
+                x.fp4_tensor.device,
+                act_type,
+                TOP_K,
+                2 * x.fp4_tensor.shape[1],
+                intermediate,
+                window,
+                x.fp4_tensor.shape[0],
+            )
+        if tactic is not None:
+            return _decode_tactics.run_fixed(
+                tactic,
+                [
+                    None,
+                    None,
+                    x.fp4_tensor,
+                    x_sf,
+                    stacks["w3_w1_weight"],
+                    stacks["w3_w1_weight_scale"].view(torch.float8_e4m3fn),
+                    None,
+                    None,
+                    None,
+                    None,
+                    stacks["w2_weight"],
+                    stacks["w2_weight_scale"].view(torch.float8_e4m3fn),
+                    None,
+                    stacks["fc31_scale_c"],
+                    stacks["fc31_alpha"],
+                    stacks["fc2_alpha"],
+                    weights_bf16,
+                    local_ids,
+                ],
+                EXPERTS,
+                TOP_K,
+                intermediate,
+                window,
+                routing.routing_method_type,
+                act_type,
+                tune_max_num_tokens,
             )
         return fp4_block_scale_moe_runner(
             None,
