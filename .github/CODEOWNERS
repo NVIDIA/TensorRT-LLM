@@ -62,6 +62,7 @@
 /tests/integration/test_lists/test-db/*multi_gpu* @NVIDIA/trt-llm-multi-gpu-ci-review
 /tests/integration/test_lists/test-db/*multi_node* @NVIDIA/trt-llm-multi-gpu-ci-review
 /tests/integration/test_lists/test-db/l0_dgx_* @NVIDIA/trt-llm-multi-gpu-ci-review
+/tests/integration/test_lists/test-db/l0_gb300.yml @NVIDIA/trt-llm-multi-gpu-ci-review
 
 # ===== INFRA =====
 /.coderabbit.yaml @NVIDIA/trt-llm-infra-devs
