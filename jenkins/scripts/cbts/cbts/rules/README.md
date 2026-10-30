@@ -111,6 +111,33 @@ For each file under `tests/` in the diff:
    `unittest/api_stability/references/llmapi.yaml` lifts to
    `unittest/api_stability/`.
 
+### Shared perf model paths
+
+When `_model_paths.py` changes only literal entries of `MODEL_PATH_DICT`,
+`perf_model_paths.py` reconstructs and verifies the pre-image from the raw
+patch and computes the added, removed, and modified keys. Other module
+statements must remain AST-equivalent. Direct import discovery must be
+complete and restricted to the known perf consumers, whose table usages
+must be model-name membership checks or lookups (including the historical
+sanity-side dictionary copy with literal overrides).
+
+Explicit `test_perf` parameters identify the model directly. For
+`test_perf_sanity::test_e2e`, the adapter reads the default aggregated or
+disaggregated config YAML and includes all its `model_name` fields, including
+server and client overrides. Server selection is deliberately over-included.
+Only cases with resolved model names disjoint from the changed keys are
+removed. Missing, malformed, dynamic, or unfamiliar configs, runtime config
+directory overrides, changed default config locations, coarse test targets,
+and unsupported table usages retain the affected consumer's cases. Unknown
+importers, module edits beyond the table, or an unverifiable patch restore
+the existing helper-selection fallback.
+
+Selected parameterized cases remain exact filters through YAML rendering
+and stage test counts; file-level contributions from other changed files
+still combine by union. This refinement does not change multi-GPU scheduling
+or approval gates. Recipe matching and model-specific branches in
+`test_perf.py` are outside this adapter's scope.
+
 ### Deletion-only diffs
 
 Deleted lines have no post-image position. `iter_diff_post_line_numbers`

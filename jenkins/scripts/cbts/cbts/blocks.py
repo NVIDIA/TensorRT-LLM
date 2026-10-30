@@ -202,6 +202,16 @@ def _target_in_filter_subtree(target: str, filter_prefix: str) -> bool:
     )
 
 
+def _entry_in_filter_subtree(entry: str, filter_prefix: str) -> bool:
+    """Match parameter-specific filters without discarding the entry's parameters."""
+    target = (
+        _strip_pytest_options(normalize_test_id(entry))
+        if "[" in filter_prefix
+        else _entry_target(entry)
+    )
+    return _target_in_filter_subtree(target, filter_prefix)
+
+
 def _path_lookup_anchor(yaml_path: str) -> str:
     """Return the lineage anchor for a YAML-namespace path.
 
@@ -624,10 +634,9 @@ def _kept_entries_for_stage(
             continue
         kept: list[str] = []
         for t in block.tests:
-            target = _entry_target(t)
             matched_waives: set[str] = set()
             for prefix, waives in prefix_to_waives.items():
-                if _target_in_filter_subtree(target, prefix):
+                if _entry_in_filter_subtree(t, prefix):
                     matched_waives |= waives
             if not matched_waives:
                 continue
@@ -782,10 +791,9 @@ def write_filtered_test_db(
                 prefix_to_waives = block_filters[key]
                 kept = []
                 for t in original:
-                    target = _entry_target(t)
                     matched_waives: set[str] = set()
                     for prefix, waives in prefix_to_waives.items():
-                        if _target_in_filter_subtree(target, prefix):
+                        if _entry_in_filter_subtree(t, prefix):
                             matched_waives |= waives
                     if not matched_waives:
                         continue
