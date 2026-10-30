@@ -937,6 +937,11 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
         assert r is True
 
 
+# About 10 ms of GPU time: long enough for the other ranks' Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+LATE_RANK_SLEEP_CYCLES = 20_000_000
+
+
 @torch.inference_mode()
 def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
                                         dtype_order: str) -> bool:
@@ -947,6 +952,8 @@ def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
     calls of the other dtype must clear exactly what the large call wrote:
     clearing more runs into the buffer a later call is using, clearing less
     leaves stale values that a later large call reads as already arrived.
+    One rank per round starts each call late, so the other ranks read its
+    part of the buffer before it arrives and any stale value is taken.
     """
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -977,6 +984,7 @@ def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
         # Four calls per round on a triple buffer, so each round starts on a
         # different sub-buffer.
         for step, (rows, dtype) in enumerate(calls * 3):
+            late_rank = step // len(calls) % tensor_parallel_size
             # Small integers sum exactly in both dtypes, so the comparison is
             # exact and any stale or cleared element shows up.
             parts = [
@@ -988,6 +996,8 @@ def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
                 for r in range(tensor_parallel_size)
             ]
             expected = torch.stack(parts).float().sum(dim=0)
+            if rank == late_rank:
+                torch.cuda._sleep(LATE_RANK_SLEEP_CYCLES)
             output = allreduce[dtype](parts[rank])
             torch.cuda.synchronize()
             torch.testing.assert_close(
@@ -1002,6 +1012,9 @@ def run_lamport_mixed_dtype_single_rank(tensor_parallel_size: int,
     return True
 
 
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="Requires at least 2 GPUs for this test")
 @pytest.mark.parametrize("dtype_order", ["bf16_then_fp32", "fp32_then_bf16"])

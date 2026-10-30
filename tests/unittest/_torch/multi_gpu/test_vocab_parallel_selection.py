@@ -27,6 +27,7 @@ import platform
 import sys
 import traceback
 from types import SimpleNamespace
+from typing import Callable
 
 import cloudpickle
 import pytest
@@ -333,4 +334,89 @@ def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
 def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    assert all(results)
+
+
+# About 10 ms of GPU time: long enough for the other rank's Lamport kernel to
+# read the late rank's part of its buffer before that rank writes it.
+_LATE_RANK_SLEEP_CYCLES = 20_000_000
+_MODEL_HIDDEN = 6144
+
+
+@torch.inference_mode()
+def _after_large_allreduce_check(rank: int, tp: int, order: str) -> None:
+    """The pair exchange right after a large bf16 one-shot all-reduce, and the reverse.
+
+    The model's bf16 all-reduces and the float32 pair exchange share the
+    mapping's Lamport workspace, and each call clears the sub-buffer of the
+    call before it by the size that call left there. ``bf16_then_fp32`` runs
+    the exchange right after a bf16 call filling 0.9x the workspace, where
+    clearing more than the bf16 call wrote runs into a live sub-buffer.
+    ``fp32_then_bf16`` runs a large exchange, then small bf16 calls and a
+    large bf16 call on the exchange's sub-buffer, where clearing less leaves
+    stale values that the large call takes as already arrived. One rank per
+    round starts each call late, so the other rank reads its part of the
+    buffer before it arrives and takes any stale value.
+    """
+    from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
+    from tensorrt_llm._torch.distributed.allreduce_helper import CustomAllReduceHelper
+    from tensorrt_llm._torch.speculative.vocab_parallel import tp_pair_exchange
+
+    head, vocab = _make_head(rank, tp, mnnvl=False)
+    mapping = head.lm_head.mapping
+    # Untuned AUTO runs the exchange on NCCL; the autotuner profiles it on the
+    # one-shot kernel at warm-up, right after the model's bf16 all-reduces.
+    head._exchange = tp_pair_exchange(mapping, AllReduceStrategy.ONESHOT)
+    model_allreduce = AllReduce(mapping, strategy=AllReduceStrategy.ONESHOT, dtype=torch.bfloat16)
+    max_bytes = CustomAllReduceHelper.max_workspace_size_auto(tp, support_deterministic=False)
+    big_rows = int(0.9 * max_bytes) // (_MODEL_HIDDEN * torch.bfloat16.itemsize)
+
+    def exchange(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        full = torch.randint(-4, 4, (rows, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+        expected = torch.argmax(full.float(), dim=-1)
+        return lambda: head.argmax(_shard(full, rank)), expected
+
+    def model(rows: int, seed: int) -> tuple[Callable[[], torch.Tensor], torch.Tensor]:
+        # Small integers sum exactly in bf16, so any stale or cleared element
+        # shows up.
+        parts = [
+            torch.randint(
+                -8,
+                9,
+                (rows, _MODEL_HIDDEN),
+                device="cuda",
+                generator=torch.Generator(device="cuda").manual_seed(seed + r),
+            ).to(torch.bfloat16)
+            for r in range(tp)
+        ]
+        expected = torch.stack(parts).float().sum(dim=0).to(torch.bfloat16)
+        return lambda: model_allreduce(parts[rank]), expected
+
+    if order == "bf16_then_fp32":
+        calls = [(model, big_rows), (exchange, 64), (exchange, 1), (model, 8)]
+    else:
+        # The large call lands on the exchange's sub-buffer three calls later.
+        calls = [(exchange, 8192), (model, 8), (model, 8), (model, big_rows), (model, 8)]
+    for step, (make, rows) in enumerate(calls * 3):
+        run, expected = make(rows, 100 * step)
+        if rank == step // len(calls) % tp:
+            torch.cuda._sleep(_LATE_RANK_SLEEP_CYCLES)
+        out = run()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected), (
+            f"step {step} {make.__name__} rows={rows}: "
+            f"{(out != expected).sum().item()} of {expected.numel()} differ"
+        )
+
+
+# A wrong clear size can hang the ranks inside the kernel; the thread method
+# ends the session with a failure instead of waiting on the MPI pool.
+@pytest.mark.timeout(300, method="thread")
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("order", ["bf16_then_fp32", "fp32_then_bf16"])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_vocab_parallel_exchange_after_large_allreduce(order: str, mpi_pool_executor) -> None:
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_after_large_allreduce_check, tp, order)] * tp))
     assert all(results)
