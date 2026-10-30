@@ -6700,6 +6700,7 @@ class PyExecutor:
             key="kv_block_budget_unchecked")
 
     def _validate_request_budget(self, request: LlmRequest) -> None:
+        self._validate_encoder_output_len(request)
         # Compare worst-case, beam-aware demand against every supported KV
         # pool. Reject requests that can never fit so they fail cleanly instead
         # of stalling the scheduler forever.
@@ -6713,6 +6714,36 @@ class PyExecutor:
                     f"(prompt_len={request.orig_prompt_len}, "
                     f"max_new_tokens={request.max_new_tokens}, "
                     f"beam_width={request.py_beam_width}).")
+
+    def _validate_encoder_output_len(self, request: LlmRequest) -> None:
+        """Reject an encoder input that no iteration can serve.
+
+        An encoder input is never chunked: it runs whole in one iteration,
+        which the scheduler limits to max_num_tokens and the encoder step to
+        encoder_max_num_tokens, and its output must fit one sequence of the
+        cross-attention KV cache. A longer input is rejected here, where only
+        this request fails.
+        """
+        encoder_output_len = request.try_get_encoder_output_len()
+        if encoder_output_len is None:
+            return
+        limits = {
+            "max_num_tokens": self.model_engine.max_num_tokens,
+            "encoder_max_num_tokens": self.model_engine.encoder_max_num_tokens,
+        }
+        cross_kv_cache_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
+        if cross_kv_cache_manager is not None:
+            limits["cross KV cache max_seq_len"] = (
+                cross_kv_cache_manager.max_seq_len)
+        limits = {name: value for name, value in limits.items() if value}
+        if limits and encoder_output_len > min(limits.values()):
+            details = ", ".join(f"{name}={value}"
+                                for name, value in limits.items())
+            raise ValueError(
+                f"The number of encoder tokens ({encoder_output_len}) exceeds "
+                f"the limit value ({min(limits.values())}) of one encoder "
+                f"iteration ({details}).")
 
     def _configure_csa2_remote_tail(self, request: LlmRequest) -> None:
         """Attach the model-derived remote-tail contract to a disagg request."""
