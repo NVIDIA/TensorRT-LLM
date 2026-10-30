@@ -29,7 +29,7 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
     """Why the Beam target cannot run ``spec_config``, or None when it can.
 
     The one speculative mode is DFlash with a separate drafter checkpoint, the TRTLLM draft
-    attention backend (the drafter's context in the engine's paged draft KV pool), a fixed
+    attention backend (the drafter's context in its paged KV-cache layers), a fixed
     draft length of ``DFLASH_MAX_DRAFT_LEN`` and strict greedy verification (no rejection
     sampling, no draft-length schedule). The engine must run it eagerly: the overlap
     scheduler would hand the target device-corrected positions and KV lengths its host-side
@@ -45,7 +45,7 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
     if spec_config.attention_backend != "TRTLLM":
         return (
             f"DFlash attention_backend {spec_config.attention_backend!r}; the drafter's context "
-            "lives in the paged draft KV pool, which only the TRTLLM backend reads"
+            "lives in paged KV-cache layers, which only the TRTLLM backend reads"
         )
     if spec_config.max_draft_len != DFLASH_MAX_DRAFT_LEN:
         return f"DFlash max_draft_len {spec_config.max_draft_len}, not {DFLASH_MAX_DRAFT_LEN}"
@@ -55,6 +55,46 @@ def speculation_refusal(spec_config: Any, llm_args: Optional[Any] = None) -> Opt
         return "DFlash rejection sampling; verification is strict greedy"
     if llm_args is not None and not llm_args.disable_overlap_scheduler:
         return "the overlap scheduler with DFlash"
+    return None
+
+
+def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
+    """Why the engine's per-step token budget exceeds what the target computes, or None.
+
+    The target runs at most ``model.MAX_NUM_TOKENS`` tokens per call (the attention op's
+    measured step size), so ``max_num_tokens`` must lie in ``[1, MAX_NUM_TOKENS]``.
+    """
+    if llm_args is None or getattr(llm_args, "max_num_tokens", None) is None:
+        return None
+    from .full_model_nvfp4__sm_103__tp4.model import MAX_NUM_TOKENS
+
+    if not 1 <= llm_args.max_num_tokens <= MAX_NUM_TOKENS:
+        return f"max_num_tokens {llm_args.max_num_tokens} is outside [1, {MAX_NUM_TOKENS}]"
+    return None
+
+
+def checkpoint_refusal(pretrained_config: Any, spec_config: Optional[Any]) -> Optional[str]:
+    """Why the target's construction would refuse this checkpoint or its drafter, or None.
+
+    Runs the target's own validators on the files its construction reads: the checkpoint's
+    ``config.json`` and NVFP4 recipe (``layout.check_checkpoint``) and, with DFlash, the
+    drafter's ``config.json`` against them (``layout.check_drafter_config``). Pure file reads;
+    nothing is allocated.
+    """
+    from .full_model_nvfp4__sm_103__tp4 import layout
+
+    try:
+        config = layout.check_checkpoint(layout.checkpoint_dir_of(pretrained_config))
+        if spec_config is not None:
+            drafter = layout.read_config(spec_config.speculative_model)
+            # Unset capture layers resolve from the drafter checkpoint, as the runtime
+            # resolves them (DFlashDecodingConfig.resolve_from_checkpoint).
+            layers = spec_config.target_layer_ids
+            if layers is None:
+                layers = (drafter.get("dflash_config") or {}).get("target_layer_ids")
+            layout.check_drafter_config(drafter, config, layers)
+    except ValueError as exc:
+        return str(exc)
     return None
 
 
@@ -94,27 +134,34 @@ def route(
     )
     quant_algo = _quant_algo(pretrained_config)
     speculation = speculation_refusal(spec_config, llm_args)
+    engine = engine_refusal(llm_args)
+    refusal = None
     if (
         compute_capability == (10, 3)
         and shape == (52, 5120, 256)
         and layout == (4, 4, 1, 4, 1, False)
         and quant_algo == "NVFP4"
         and speculation is None
+        and engine is None
         and kv_cache_quant_algo in (None, QuantAlgo.FP8)
     ):
-        from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
+        refusal = checkpoint_refusal(pretrained_config, spec_config)
+        if refusal is None:
+            from .full_model_nvfp4__sm_103__tp4.modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
 
-        return ModelingV2BeamFullModelNvfp4Sm103Tp4
+            return ModelingV2BeamFullModelNvfp4Sm103Tp4
 
     raise NoTarget(
+        f"{f'the checkpoint is not one the target computes: {refusal}; ' if refusal else ''}"
         f"compute capability {compute_capability}, config shape {shape}, quantization "
         f"{quant_algo}, layout (world, tp, pp, moe_tp, moe_ep, attention_dp) {layout}, "
         f"speculative decoding {type(spec_config).__name__ if spec_config is not None else 'off'}"
         f"{f' ({speculation})' if speculation else ''}; "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
+        f"{f'{engine}; ' if engine else ''}"
         "the one Beam target is the 52-layer NVFP4 checkpoint on sm103, attention TP4, MoE "
-        "TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, with speculative "
-        "decoding "
+        "TP4/EP1, PP1, with a BF16 or FP8 KV cache and without attention DP, at most 8192 "
+        "tokens per engine step, with speculative decoding "
         f"off or DFlash (TRTLLM draft attention, max_draft_len {DFLASH_MAX_DRAFT_LEN}, strict "
         "greedy verification, no overlap scheduler)"
     )

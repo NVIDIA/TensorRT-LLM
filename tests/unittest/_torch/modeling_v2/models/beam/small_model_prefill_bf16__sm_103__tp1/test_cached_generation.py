@@ -56,7 +56,9 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
+    _attention,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefill_bf16__sm_103__tp1 import (  # noqa: E501
     generation,
 )

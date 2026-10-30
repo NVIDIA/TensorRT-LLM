@@ -38,7 +38,9 @@ from typing import Callable
 
 import torch
 
-from .ops.moe.beam_dispatch_combine import beam_dispatch_combine_op
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (
+    beam_dispatch_combine_op,
+)
 
 HIDDEN_SIZE = 5120
 NUM_EXPERTS = 256

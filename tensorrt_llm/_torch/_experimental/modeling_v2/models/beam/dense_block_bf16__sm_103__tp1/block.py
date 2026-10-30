@@ -29,7 +29,6 @@ Every RMSNorm computes its statistics, normalization and affine in fp32 and roun
 
 from __future__ import annotations
 
-import math
 from collections import OrderedDict
 from typing import Mapping
 
@@ -45,10 +44,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
     beam_depth_residual,
+    depth_scales,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from .. import _attention
+from ..full_model_nvfp4__sm_103__tp4 import _attention
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.
@@ -104,18 +104,6 @@ def weight_shapes(config) -> "OrderedDict[str, tuple[int, ...]]":
 
 def _attribute(name: str) -> str:
     return name.removesuffix(".weight").replace(".", "_")
-
-
-def depth_scales(layer_idx: int, is_attention: bool) -> tuple[float, float]:
-    """(branch, residual) scales of a block's attention or feed-forward residual add.
-
-    The n-th add of the residual stream scales the branch by 1 / sqrt(n) and the stream
-    by sqrt(n - 1) / sqrt(n); block i's attention add is the 2(i + 1)-th, its
-    feed-forward add the next one.
-    """
-    num_adds = 2 * (layer_idx + 1) + (0 if is_attention else 1)
-    denom = math.sqrt(num_adds)
-    return 1.0 / denom, math.sqrt(num_adds - 1) / denom
 
 
 def check_config(config, layer_idx: int) -> None:

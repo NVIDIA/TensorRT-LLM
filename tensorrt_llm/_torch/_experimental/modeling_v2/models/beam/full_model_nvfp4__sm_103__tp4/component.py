@@ -1,19 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam NVFP4-expert checkpoint layout / sm_103 / tp4: packed experts and representative blocks.
+"""Beam NVFP4-expert checkpoint-layout component / sm_103 / tp4: packed experts and blocks.
 
-A component, not a routed target. There is no ``routing.py`` and no ``ForCausalLM``: a caller on
-each of four ranks constructs this class with the checkpoint's configuration and its rank's
-``Mapping`` (attention TP4, MoE TP4/EP1, PP1), loads a caller-supplied ModelOpt NVFP4 checkpoint
-directory into the rank's slices, and runs representative computations. It does not run a
-full-depth forward, prefill/decode loop or sampler.
+Owned by the routed NVFP4 target (this directory); the full model (``model``) builds on it.
+Constructed on its own it is a component, not a target: a caller on each of four ranks
+constructs this class with the checkpoint's configuration and its rank's ``Mapping`` (attention
+TP4, MoE TP4/EP1, PP1), loads a caller-supplied ModelOpt NVFP4 checkpoint directory into the
+rank's slices, and runs representative computations. It does not run a full-depth forward,
+prefill/decode loop or sampler.
 
-This is the BF16 layout component (``checkpoint_layout_bf16__sm_103__tp4``) with NVFP4 expert
+This is the BF16 layout component (``component_bf16``) with NVFP4 expert
 storage and execution. Everything outside the routed experts -- ownership, the embedding,
 attention on TRTLLM attention and KVCacheManagerV2 metadata, the dense feed-forward, the
-replicated FP32 router with its all-rank agreement check, dispatch/combine, the norms, depth
-residuals, head and every collective -- is that component's code, unchanged, on the
-checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed:
+replicated FP32 router with its diagnostic-mode all-rank agreement check, dispatch/combine, the
+norms, depth residuals, head and every collective -- is that component's code, unchanged, on
+the checkpoint's BF16/FP32 tensors copied byte for byte. The experts stay packed:
 
     storage   per sparse layer and projection kind, banks indexed by global expert id: packed
               E2M1 codes ``[256, rows, K/2]`` u8 and E4M3 block scales in the GEMM's 128x4
@@ -49,7 +50,9 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from ..checkpoint_layout_bf16__sm_103__tp4.model import (
+from . import dispatch_combine
+from . import expert as nvfp4_expert
+from .component_bf16 import (
     MAX_TOKENS,
     BeamCheckpointLayoutBf16Sm103Tp4,
     LoadError,
@@ -58,11 +61,10 @@ from ..checkpoint_layout_bf16__sm_103__tp4.model import (
     _rec,
     check_max_tokens,
 )
-from ..moe_dispatch_combine_bf16__sm_103__tp1 import dispatch_combine
-from . import expert as nvfp4_expert
 from .layout import (
     EMBED,
     PROJECTIONS,
+    QUANT_CONFIG_FILE,
     WORLD_SIZE,
     QuantSpec,
     check_config,
@@ -85,7 +87,6 @@ from .loader import (
 )
 
 _SM = (10, 3)
-QUANT_CONFIG_FILE = "hf_quant_config.json"
 #: Bank fields of one projection kind of one sparse layer.
 BANK_FIELDS = ("weight", "weight_scale", "input_scale", "weight_scale_2", "g", "alpha")
 _KINDS = tuple(p.removesuffix("_proj") for p in PROJECTIONS)
@@ -184,6 +185,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         self.usable = False
         self.load_record: Optional[dict] = None
         self._init_kv_cache_mode()
+        self._init_diagnostics()
         #: Per sparse layer, per global expert: gate and up input scales bitwise equal.
         self._shared_fc1: dict = {}
 
@@ -308,6 +310,7 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         complete load; a failure on any rank raises ``LoadError`` on all ranks. Returns the
         load record (recipe, coverage, source digests, bytes read).
         """
+        self._check_diagnostics_agree()
         error: Optional[BaseException] = None
         catalog = None
         recipe = None
@@ -408,14 +411,14 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
     def moe(self, layer: int, h: torch.Tensor, capture: Optional[dict] = None) -> torch.Tensor:
         """Normalized input ``[T, hidden]`` -> MoE output after the one all-reduce.
 
-        The replicated FP32 router, the all-rank agreement on its input, ids and weights and
-        the combination are the BF16 component's; each selected expert runs
+        The replicated FP32 router, the diagnostic-mode all-rank agreement on its input, ids
+        and weights and the combination are the BF16 component's; each selected expert runs
         ``expert.nvfp4_swiglu_expert`` on this rank's packed slice. The rank partials are
         reduced once, in FP32, then rounded to BF16.
         """
         routing = self.route(layer, h)
         ids, weights = routing["ids"], routing["weights"]
-        digests = self._digests_agree((h, ids, weights))
+        digests = self._digests_agree((h, ids, weights)) if self.diagnostics else None
         bank = self.expert_bank(layer)
         shared = self._shared_fc1[layer]
         calls = [] if capture is not None else None
@@ -428,7 +431,8 @@ class BeamCheckpointLayoutNvfp4Sm103Tp4(BeamCheckpointLayoutBf16Sm103Tp4):
         out = self.all_reduce(local.float()).to(torch.bfloat16)
         if capture is not None:
             _rec(capture, _moe_capture(routing, calls, local, out))
-            capture["moe.agreement_sha256"] = digests
+            if digests is not None:
+                capture["moe.agreement_sha256"] = digests
         return out
 
 

@@ -28,7 +28,8 @@ With a DFlash speculative config (``routing.route`` admits only the DFlash 2 dra
 TRTLLM draft-attention backend) the target composes the native one-model pieces rather than a
 second scheduler, verifier or cache: the drafter ``get_draft_model`` builds from the drafter
 checkpoint (``modeling_dflash.DFlashForCausalLM``), the ``DFlashWorker`` ``get_spec_worker``
-builds, and the engine's separate draft ``KVCacheManagerV2`` pool. Every step is then a
+builds, and the drafter's layers of the engine's ``KVCacheManagerV2`` (one manager for the
+target and draft layers, with one page table per request). Every step is then a
 ``VerifyTarget`` step: one target forward over the context rows and each generation request's
 ``P = runtime_draft_len + 1`` rows (the pending token and its proposals), with the completed
 block outputs of the drafter's capture layers copied into the step's DFlash capture buffer and
@@ -51,29 +52,34 @@ from typing import Optional
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4.layout import (  # noqa: E501
-    EMBED,
-    HEAD,
-)
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .layout import (
+    EMBED,
+    HEAD,
+    check_checkpoint,
+    check_drafter_config,
+    checkpoint_dir_of,
+    read_config,
+)
 from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4
 
 
 def _checkpoint_config(pretrained_config) -> tuple:
-    """The checkpoint directory and its ``config.json`` mapping, read as stored."""
-    checkpoint_dir = getattr(pretrained_config, "name_or_path", None) or getattr(
-        pretrained_config, "_name_or_path", None
-    )
-    if not checkpoint_dir or not os.path.isfile(os.path.join(checkpoint_dir, "config.json")):
+    """The checkpoint directory and its ``config.json`` mapping, read as stored and validated.
+
+    ``layout.check_checkpoint`` is the validator routing applies too, so a checkpoint routing
+    accepted is never refused here and one it would refuse never reaches construction.
+    """
+    checkpoint_dir = checkpoint_dir_of(pretrained_config)
+    if not checkpoint_dir:
         raise ValueError(
             "the Beam NVFP4 target is built from the checkpoint's own config.json; the "
-            f"configuration names no readable checkpoint directory ({checkpoint_dir!r})"
+            "configuration names no checkpoint directory"
         )
-    with open(os.path.join(checkpoint_dir, "config.json")) as f:
-        return checkpoint_dir, json.load(f)
+    return checkpoint_dir, check_checkpoint(checkpoint_dir)
 
 
 def _log_trace(phase: str, trace: list) -> None:
@@ -88,46 +94,6 @@ def _log_trace(phase: str, trace: list) -> None:
         f"{sum(r.get('mlp') == 'sparse' for r in trace)} sparse, "
         f"{sum(r.get('attention') == 'full' for r in trace)} full-attention"
     )
-
-
-def check_drafter_config(draft_config, target_config: dict, target_layer_ids) -> None:
-    """Raise ValueError unless ``draft_config`` is a DFlash 2 drafter this target can serve.
-
-    The drafter reads the target's completed block outputs at ``target_layer_ids`` (zero-based
-    logical layers, ascending), shares the target's vocabulary, embedding and head (no draft
-    to target id map), runs the DFlash 2 recipe (block convolutions and the candidate
-    selector) at the target's hidden size, and declares its own unary logit softcap.
-    """
-    pretrained = draft_config.pretrained_config
-    dflash = getattr(pretrained, "dflash_config", None) or {}
-    problems = []
-    if pretrained.hidden_size != target_config["hidden_size"]:
-        problems.append(f"hidden_size {pretrained.hidden_size} != {target_config['hidden_size']}")
-    vocab = target_config["vocab_size"]
-    for key in ("vocab_size", "draft_vocab_size"):
-        value = getattr(pretrained, key, vocab)
-        if value != vocab:
-            problems.append(f"{key} {value} != the target's {vocab}")
-    layers = list(target_layer_ids or [])
-    if (
-        not layers
-        or layers != sorted(set(layers))
-        or not all(type(i) is int and 0 <= i < NUM_LAYERS for i in layers)
-        or layers != list(dflash.get("target_layer_ids") or [])
-    ):
-        problems.append(
-            f"target_layer_ids {layers} must be the drafter's own ascending, distinct layers in "
-            f"0..{NUM_LAYERS - 1} (dflash_config: {dflash.get('target_layer_ids')})"
-        )
-    for key in ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"):
-        if not int(dflash.get(key, 0) or 0) > 0:
-            problems.append(f"dflash_config.{key} is missing")
-    if dflash.get("final_logit_softcapping") is None:
-        problems.append("dflash_config.final_logit_softcapping is missing")
-    if problems:
-        raise ValueError(
-            "the drafter is not a DFlash 2 drafter of this target: " + "; ".join(problems)
-        )
 
 
 class _Target:
@@ -225,8 +191,9 @@ class VerifyTarget(_Target):
 
 
 # Version of the disaggregated handoff: the cache identity both workers compare and the
-# context-request record (``ModelingV2BeamFullModelNvfp4Sm103Tp4.export_disagg_context_request``).
-DISAGG_HANDOFF_VERSION = 1
+# context-request record (``ModelingV2BeamFullModelNvfp4Sm103Tp4.export_disagg_context_request``),
+# whose drafter pages travel as draft layers of the target's KV cache manager.
+DISAGG_HANDOFF_VERSION = 2
 
 # Checkpoint files whose bytes define the target's weights layout, quantization recipe and
 # vocabulary; hashed once per worker, never the weights themselves.
@@ -348,7 +315,11 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         )
         _set_draft_kv_cache_quant_algo(self.draft_config, model_config)
         self.draft_config.extra_attrs = model_config.extra_attrs
-        check_drafter_config(self.draft_config, checkpoint_config, spec_config.target_layer_ids)
+        check_drafter_config(
+            read_config(spec_config.speculative_model),
+            checkpoint_config,
+            spec_config.target_layer_ids,
+        )
         draft_algo = self.draft_config.quant_config.kv_cache_quant_algo
         if (None if draft_algo is None else QuantAlgo(draft_algo)) != self.kv_cache_quant_algo:
             raise ValueError(
@@ -356,8 +327,9 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
                 f"{self.kv_cache_quant_algo or 'BF16'}; the Beam DFlash deployment keeps both "
                 "caches in one precision"
             )
-        # The draft pages live in the engine's separate draft KV cache manager, which the
-        # worker reads through its own pool views (TRTLLM draft attention).
+        # The draft pages live in a KV cache manager apart from the drafter (the target's,
+        # when it owns the draft layers), which the worker reads through its own pool views
+        # (TRTLLM draft attention).
         self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(spec_config)
         self.draft_model = get_draft_model(model_config, self.draft_config, None, self)
         self.draft_model.logits_processor = DFlashSoftcapLogitsProcessor(
@@ -523,8 +495,9 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
 
     @property
     def transfers_draft_kv_cache(self) -> bool:
-        """Whether a disaggregated handoff must carry the drafter's context: its K/V live in
-        the engine's separate draft KV cache manager, built from the target's prefill."""
+        """Whether a disaggregated handoff must carry the drafter's context: its K/V, built
+        from the target's prefill, live in the draft layers ``NUM_LAYERS..`` of the target's
+        KV cache manager and move with the target's pages."""
         return self.spec_worker is not None and self.use_separate_draft_kv_cache
 
     def disagg_cache_identity(self) -> dict:
@@ -534,8 +507,9 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         quantization recipe, weight index), the tokenizer files, the cache layout (layers,
         windows, heads per rank, head size, cache dtype), the per-layer FP8 scales actually
         applied (FP32 values, for target and drafter), the speculation settings, the drafter
-        checkpoint's manifests and the handoff contract (version, transferred managers,
-        draft transport-layer base). Digests only, so no scale or weight leaves the worker.
+        checkpoint's manifests and the handoff contract (version, transferred layers: the
+        target's and, with a drafter, the draft layers that follow them in the one KV cache
+        manager). Digests only, so no scale or weight leaves the worker.
         Requires a completed load; computed once.
         """
         if self._disagg_identity is not None:
@@ -576,8 +550,10 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
             "handoff": _canonical_sha256(
                 {
                     "version": DISAGG_HANDOFF_VERSION,
-                    "members": ["target", "draft"] if self.transfers_draft_kv_cache else ["target"],
-                    "draft_transport_layer_base": NUM_LAYERS
+                    "draft_layers": [
+                        NUM_LAYERS,
+                        NUM_LAYERS + int(self.draft_config.pretrained_config.num_hidden_layers),
+                    ]
                     if self.transfers_draft_kv_cache
                     else None,
                 }
@@ -613,8 +589,8 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         drafter slot can be recycled; it travels in the request's auxiliary slot of the same
         transfer session as the KV pages (``native.auxiliary.encode_handoff_record``). It
         binds the transfer to this worker's identity, the request's transfer id and prompt
-        length and, with a drafter, the draft-context cursor whose K/V travel as draft
-        KV cache manager pages (``DFlashWorker.export_disagg_context``).
+        length and, with a drafter, the draft-context cursor whose K/V travel as the draft
+        layers' pages of the same KV cache manager (``DFlashWorker.export_disagg_context``).
         """
         from tensorrt_llm._torch.disaggregation.base.transfer import get_unique_rid
 
@@ -750,5 +726,4 @@ __all__ = [
     "ModelingV2BeamFullModelNvfp4Sm103Tp4",
     "PrefillTarget",
     "VerifyTarget",
-    "check_drafter_config",
 ]

@@ -41,8 +41,14 @@ from collections import OrderedDict
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (  # noqa: E501
+    beam_logit_softcap,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
+    swiglu_fp32,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
     beam_neox_rope,
@@ -57,20 +63,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (  # noqa: E501
+    beam_dispatch_combine_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
+    beam_grouped_topk_router,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
     beam_depth_residual,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_dispatch_combine_bf16__sm_103__tp1.ops.moe.beam_dispatch_combine import (  # noqa: E501
-    beam_dispatch_combine_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import (  # noqa: E501
-    swiglu_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_router_bf16__sm_103__tp1.ops.moe.beam_grouped_topk_router import (  # noqa: E501
-    beam_grouped_topk_router,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefill_bf16__sm_103__tp1 import (  # noqa: E501
     model as model_module,
@@ -78,9 +81,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefi
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefill_bf16__sm_103__tp1.model import (  # noqa: E501
     BeamSmallModelPrefillBf16Sm103Tp1,
     prefill_context,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefill_bf16__sm_103__tp1.ops.activation.beam_logit_softcap import (  # noqa: E501
-    beam_logit_softcap,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType

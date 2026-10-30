@@ -11,18 +11,21 @@ under test:
   and names the differing parts otherwise;
 * the Beam model's validation of a received record: identity, transfer id, prompt length and
   full draft-context coverage, each fault refused, and its import into the DFlash worker;
-* the coordinator publishes a receive only after every manager's admission event completes;
+* the worker recipes' transceiver setting refuses a transfer timeout that is not positive;
+* the coordinator publishes a receive only once the admission event of the target's KV cache
+  manager, which holds the draft layers too, completes;
 * the executor ends generation requests no batch reaches yet: an abort of a pending receive
   only once the transceiver reports it safe to free, without a decode; an expired receive is
   failed, also when it completed after its deadline; a received request whose context token
   already ends it (budget, end id) is finished with that token instead of being scheduled.
 
-CUDA checks (one device, no model files): the composite page table of a target and a draft
-``KVCacheManagerV2`` (transport layer ids, pool groups, provenance, collision refusal); the V2
-scheduler's paired generation-init admission (one settled cursor, the incoming prompt declared
-as history in both pools, a readiness event per pool, SKIP with both pools released when the
-draft pool refuses, and no second draft allocation in resource preparation); and the DFlash
-worker binding an imported draft-context cursor to a fresh slot at the first generation step.
+CUDA checks (one device, no model files): the transfer page table of one ``KVCacheManagerV2``
+holding target and draft layers (the draft layers after the target's, in their own pool group);
+the V2 scheduler's generation-init admission of both together (the incoming prompt declared as
+history, one readiness event, SKIP leaving no active cache when the cache refuses, admission
+once capacity frees); and the DFlash worker binding an imported draft-context cursor to a fresh
+slot at the first generation step, without a second seed from positions when the draft layers
+share the target's cache.
 """
 
 from __future__ import annotations
@@ -276,23 +279,25 @@ def test_an_ordinary_worker_refuses_a_drafting_peer_and_accepts_its_own():
     model.prepare_disagg_generation_request(_generation_request(_record(draft=None)))  # no-op
 
 
-def test_launcher_args_select_the_python_nixl_transceiver_only_for_a_worker(monkeypatch):
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
-        serving,
-    )
+def test_a_worker_transfer_timeout_must_be_positive():
+    """The worker recipes' transceiver setting; a transfer that cannot complete is refused."""
+    from pydantic import ValidationError
 
-    monkeypatch.setattr(serving, "load_tokenizer", lambda checkpoint: "tokenizer")
-    assert "cache_transceiver_config" not in serving.llm_args("/target", max_seq_len=8192)
-    worker = serving.llm_args("/target", max_seq_len=8192, kv_transfer_timeout_ms=60000)
-    config = worker["cache_transceiver_config"]
+    from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=60000
+    )
     assert (config.backend, config.transceiver_runtime, config.kv_transfer_timeout_ms) == (
         "NIXL",
         "PYTHON",
         60000,
     )
-    assert {k: worker[k] for k in serving.DEPLOYMENT} == serving.DEPLOYMENT
-    with pytest.raises(ValueError, match="positive"):
-        serving.llm_args("/target", max_seq_len=8192, kv_transfer_timeout_ms=0)
+    for timeout in (0, -1):
+        with pytest.raises(ValidationError, match="greater than 0"):
+            CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON", kv_transfer_timeout_ms=timeout
+            )
 
 
 # ------------------------------------------------------------------- receive publication
@@ -315,10 +320,9 @@ class _Manager:
         return event
 
 
-def _coordinator(target_event, draft_event, transfers_draft=True):
+def _coordinator(target_event):
     published = []
     transceiver = types.SimpleNamespace(
-        _draft_kv_cache_manager=object() if transfers_draft else None,
         kv_transfer_timeout_ms=None,
         request_and_receive_async=published.append,
     )
@@ -331,33 +335,21 @@ def _coordinator(target_event, draft_event, transfers_draft=True):
         registry=None,
         enable_attention_dp=False,
         force_terminate_ctx_for_partial_reuse=False,
-        draft_kv_cache_manager=_Manager(draft_event),
+        draft_kv_cache_manager=None,
         is_kv_manager_v2=True,
         defer_unready_gen_receives=True,
     )
     return coordinator, published
 
 
-def test_a_receive_waits_for_both_admission_events():
-    target, draft = _Event(done=True), _Event(done=False)
-    coordinator, published = _coordinator(target, draft)
-    req = types.SimpleNamespace(py_request_id=3, state=LlmRequestState.DISAGG_GENERATION_INIT)
-    fences = coordinator._take_receive_fences([req])
-    assert fences[3] == (target, draft)
-    coordinator._unpublished_gen_receives[3] = (req, fences[3])
-    coordinator._publish_ready_gen_receives()
-    assert published == [], "published while the draft pool's admission was pending"
-    draft.done = True
-    coordinator._publish_ready_gen_receives()
-    assert published == [req]
-
-
-def test_a_target_only_transfer_waits_for_the_target_event_alone():
+def test_a_receive_waits_for_the_one_admission_event():
+    """The target's KV cache manager admits the target and draft layers together, so one
+    readiness event gates the receive."""
     target = _Event(done=False)
-    coordinator, published = _coordinator(target, _Event(done=False), transfers_draft=False)
+    coordinator, published = _coordinator(target)
     req = types.SimpleNamespace(py_request_id=4, state=LlmRequestState.DISAGG_GENERATION_INIT)
     fences = coordinator._take_receive_fences([req])
-    assert fences[4] == (target,)
+    assert fences[4] is target
     coordinator._unpublished_gen_receives[4] = (req, fences[4])
     coordinator._publish_ready_gen_receives()
     assert published == []
@@ -372,22 +364,47 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA de
 PAGE = 32
 
 
-def _manager(num_layers, windows, max_tokens, max_seq_len, is_draft):
-    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+#: Target layers 0 (full attention) and 1 (512-token window), then five draft layers 2..6
+#: (1024-token window), all FP8 with 2 KV heads of 128: one manager, three lifecycles.
+TARGET_WINDOWS = (None, 512)
+DRAFT_LAYERS = 5
+DRAFT_WINDOW = 1024
+
+
+def _unified_manager(max_tokens, max_seq_len=2048):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+        KVCacheLayerOwner,
+        KVCacheLayerSpec,
+        KVCacheManagerV2,
+        Role,
+    )
     from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
     from tensorrt_llm.bindings import DataType
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig
     from tensorrt_llm.mapping import Mapping
 
+    def spec(layer_id, owner, window):
+        return KVCacheLayerSpec(
+            global_layer_id=layer_id,
+            owner=owner,
+            dtype=DataType.FP8,
+            num_kv_heads=2,
+            head_dim=128,
+            buffer_roles=(Role.KEY, Role.VALUE),
+            sliding_window_size=window,
+        )
+
+    specs = [
+        spec(layer_id, KVCacheLayerOwner.TARGET, window)
+        for layer_id, window in enumerate(TARGET_WINDOWS)
+    ] + [
+        spec(len(TARGET_WINDOWS) + i, KVCacheLayerOwner.DRAFT, DRAFT_WINDOW)
+        for i in range(DRAFT_LAYERS)
+    ]
     return KVCacheManagerV2(
-        KvCacheConfig(
-            max_tokens=max_tokens,
-            enable_block_reuse=True,
-            enable_partial_reuse=False,
-            max_attention_window=list(windows),
-        ),
+        KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=True, enable_partial_reuse=False),
         CacheTypeCpp.SELF,
-        num_layers=num_layers,
+        num_layers=len(TARGET_WINDOWS),
         num_kv_heads=2,
         head_dim=128,
         tokens_per_block=PAGE,
@@ -395,42 +412,35 @@ def _manager(num_layers, windows, max_tokens, max_seq_len, is_draft):
         max_batch_size=4,
         mapping=Mapping(world_size=1, tp_size=1, rank=0),
         dtype=DataType.FP8,
-        is_draft=is_draft,
         is_disagg=True,
-        joint_kv_cache_reuse=True,
+        layer_specs=specs,
     )
 
 
 @cuda
-def test_composite_page_table_appends_the_draft_member():
+def test_the_transfer_page_table_carries_the_draft_layers_after_the_target():
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
-        build_composite_page_table,
         build_page_table_from_manager,
     )
 
-    target = _manager(2, [1024, 512], 64 * PAGE, 1024, is_draft=False)
-    draft = _manager(5, [1024] * 5, 64 * PAGE, 1024, is_draft=True)
-    alone_t = build_page_table_from_manager(target)
-    alone_d = build_page_table_from_manager(draft)
-    table, owners = build_composite_page_table([(target, 0), (draft, target.num_layers)])
-    nt, nd = len(alone_t.layer_groups), len(alone_d.layer_groups)
-    assert owners == [(0, i) for i in range(nt)] + [(1, i) for i in range(nd)]
-    assert len(table.pool_groups) == len(alone_t.pool_groups) + len(alone_d.pool_groups)
-    ids = sorted(ll.global_layer_id for lg in table.layer_groups for ll in lg.local_layers)
-    assert ids == list(range(2 + 5)), "target ids 0..1, draft ids 2..6"
-    for i, lg in enumerate(table.layer_groups[nt:]):
-        own = alone_d.layer_groups[i]
-        assert lg.pool_group_idx == own.pool_group_idx + len(alone_t.pool_groups)
-        assert [ll.local_layer_id for ll in lg.local_layers] == [
-            ll.local_layer_id for ll in own.local_layers
-        ]
-        assert lg.sliding_window_size == own.sliding_window_size
-        assert (
-            table.pool_groups[lg.pool_group_idx].pools[0].base_address
-            == alone_d.pool_groups[own.pool_group_idx].pools[0].base_address
-        )
-    with pytest.raises(ValueError, match="collides"):
-        build_composite_page_table([(target, 0), (draft, 0)])
+    mgr = _unified_manager(64 * PAGE)
+    try:
+        num_target = len(TARGET_WINDOWS)
+        assert mgr.draft_layer_ids == tuple(range(num_target, num_target + DRAFT_LAYERS))
+        assert mgr.get_draft_kv_cache_view() is mgr
+        table = build_page_table_from_manager(mgr)
+        ids = sorted(ll.global_layer_id for lg in table.layer_groups for ll in lg.local_layers)
+        assert ids == list(range(num_target + DRAFT_LAYERS))
+        groups = {
+            ll.global_layer_id: lg.pool_group_idx
+            for lg in table.layer_groups
+            for ll in lg.local_layers
+        }
+        draft_groups = {groups[i] for i in mgr.draft_layer_ids}
+        assert len(draft_groups) == 1, "the drafter's uniform window is one lifecycle"
+        assert draft_groups.isdisjoint(groups[i] for i in range(num_target))
+    finally:
+        mgr.shutdown()
 
 
 def _generation_only_request(rid, prompt_len):
@@ -459,8 +469,10 @@ def _generation_only_request(rid, prompt_len):
 
 
 @cuda
-def test_paired_admission_declares_both_pools_and_releases_both_on_refusal():
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import ScheduledRequests
+def test_a_generation_init_admits_target_and_draft_layers_together():
+    """One admission sizes the request's cache for the target and draft layers, declares the
+    incoming prompt once and records one readiness event; a refused request keeps no active
+    cache and no event, and is admitted once capacity frees."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import (
         KVCacheV2Scheduler,
         ScheduleAction,
@@ -469,57 +481,45 @@ def test_paired_admission_declares_both_pools_and_releases_both_on_refusal():
 
     prompt = 600
     pages = -(-prompt // PAGE)
-    target = _manager(2, [1024, 512], 16 * pages * PAGE, 1024, is_draft=False)
-    # Room for a few draft caches but far fewer than the target's.
-    draft = _manager(5, [1024] * 5, 3 * pages * PAGE + PAGE // 2, 1024, is_draft=True)
-    scheduler = KVCacheV2Scheduler(
-        max_batch_size=4,
-        max_num_tokens=8192,
-        kv_cache_manager=target,
-        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-        draft_kv_cache_manager=draft,
-        enable_recompute_pause=False,
-    )
-    admitted, refused = [], None
-    for rid in range(1, 9):
-        req = _generation_only_request(rid, prompt)
-        assert req.state == LlmRequestState.DISAGG_GENERATION_INIT
-        action, tokens = scheduler._try_schedule_disagg_gen_init(req, None)
-        assert tokens == 0
-        if action is ScheduleAction.SKIP:
-            refused = req
-            break
-        assert action is ScheduleAction.SCHEDULED
-        admitted.append(req)
-    assert admitted, "no paired admission succeeded"
-    assert refused is not None, "the draft pool never refused before the target ran out"
-    for req in admitted:
-        for mgr in (target, draft):
+    mgr = _unified_manager(3 * pages * PAGE + PAGE // 2)
+    try:
+        scheduler = KVCacheV2Scheduler(
+            max_batch_size=4,
+            max_num_tokens=8192,
+            kv_cache_manager=mgr,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+            enable_recompute_pause=False,
+        )
+        admitted, refused = [], None
+        for rid in range(1, 9):
+            req = _generation_only_request(rid, prompt)
+            assert req.state == LlmRequestState.DISAGG_GENERATION_INIT
+            action, tokens = scheduler._try_schedule_disagg_gen_init(req, None)
+            assert tokens == 0
+            if action is ScheduleAction.SKIP:
+                refused = req
+                break
+            assert action is ScheduleAction.SCHEDULED
+            admitted.append(req)
+        assert admitted, "no admission succeeded"
+        assert refused is not None, "the cache never refused"
+        for req in admitted:
             assert mgr.get_history_length(req) == prompt
             assert mgr.take_disagg_receive_ready(req) is not None
-        assert req.context_current_position == 0  # cold: nothing reused
-    # The refused request holds nothing in either pool, no readiness event, no cursor.
-    for mgr in (target, draft):
-        assert refused.py_request_id not in mgr.kv_cache_map
+            assert mgr.take_disagg_receive_ready(req) is None
+            assert req.context_current_position == 0  # cold: nothing reused
+        refused_cache = mgr.kv_cache_map.get(refused.py_request_id)
+        assert refused_cache is None or not refused_cache.is_active
         assert mgr.take_disagg_receive_ready(refused) is None
-    assert refused.context_current_position == 0 and refused.py_ctx_pre_resize_cap is None
-    # Resource preparation of an admitted receive does not allocate the draft again.
-    first = admitted[0]
-    capacity = draft.kv_cache_map[first.py_request_id].capacity
-    batch = ScheduledRequests()
-    batch.context_requests_last_chunk = [first]
-    draft.prepare_resources(batch)
-    assert draft.kv_cache_map[first.py_request_id].capacity == capacity
-    assert draft.get_history_length(first) == prompt
-    # Releasing one admitted pair makes the refused request admissible.
-    for mgr in (target, draft):
+        # Releasing one admitted request makes the refused one admissible.
         mgr.free_resources(admitted[-1])
-    action, _ = scheduler._try_schedule_disagg_gen_init(refused, None)
-    assert action is ScheduleAction.SCHEDULED
-    assert draft.get_history_length(refused) == target.get_history_length(refused) == prompt
-    for req in admitted[:-1] + [refused]:
-        for mgr in (target, draft):
+        action, _ = scheduler._try_schedule_disagg_gen_init(refused, None)
+        assert action is ScheduleAction.SCHEDULED
+        assert mgr.get_history_length(refused) == prompt
+        for req in admitted[:-1] + [refused]:
             mgr.free_resources(req)
+    finally:
+        mgr.shutdown()
 
 
 # --------------------------------------------------------------------------- CUDA: DFlash
@@ -541,6 +541,8 @@ def _bare_dflash_worker(num_slots):
     worker._dummy_slot = num_slots
     worker._graph_dummy_id_floor = 1 << 62
     worker._pending_disagg_imports = {}
+    worker._ctx_unified_cache = False
+    worker._max_ctx = 1 << 20
     worker._batch_to_slot_buffer = DeviceCopyBuffer(
         torch.zeros(num_slots, dtype=torch.long, device="cuda"), pin_memory=prefer_pinned()
     )
@@ -580,6 +582,39 @@ def test_an_imported_cursor_is_bound_at_the_first_generation_step():
     assert worker.export_disagg_context(21) == {"draft_ctx_len": PROMPT, "next_position": PROMPT}
     assert worker.export_disagg_context(77) is None
     np.testing.assert_array_equal(worker._ctx_len.cpu().numpy()[[imported, plain]], [PROMPT, 0])
+
+
+@cuda
+def test_shared_draft_cache_seeds_from_the_cursor_once():
+    """Draft layers in the target's KV cache manager: a received cursor binds as before and is
+    not also seeded from positions; a request without one starts at its first position."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
+    from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+
+    worker = _bare_dflash_worker(4)
+    worker._ctx_unified_cache = True
+    metadata = DFlashSpecMetadata(
+        max_num_requests=4,
+        max_draft_len=7,
+        max_total_draft_tokens=7,
+        spec_dec_mode=SpeculativeDecodingMode.DFLASH,
+    )
+    metadata._dflash_worker = worker
+    worker.import_disagg_context(21, PROMPT, PROMPT)
+    metadata.request_ids = [21, 22]
+    metadata.num_generations = 2
+    metadata.seq_lens = [8, 8]
+    # Request 21's first position is not its cursor, so a second (position) seed would show.
+    metadata.host_position_ids = torch.tensor(
+        list(range(PROMPT + 5, PROMPT + 13)) + list(range(300, 308)), dtype=torch.int32
+    )
+    metadata.prepare()
+    torch.cuda.synchronize()
+    imported, plain = worker._req_to_slot[21], worker._req_to_slot[22]
+    assert int(worker._ctx_len[imported]) == worker._ctx_len_host[imported] == PROMPT
+    assert worker._req_ctx_pos[21] == PROMPT
+    assert int(worker._ctx_len[plain]) == worker._ctx_len_host[plain] == 300
+    assert worker._pending_disagg_imports == {}
 
 
 # ------------------------------------------------- executor: requests no batch reaches yet

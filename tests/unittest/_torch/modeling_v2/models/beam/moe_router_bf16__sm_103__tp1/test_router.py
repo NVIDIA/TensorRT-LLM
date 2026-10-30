@@ -52,7 +52,7 @@ from torch.overrides import TorchFunctionMode, resolve_name
 
 import tensorrt_llm
 import tensorrt_llm._torch.models.modeling_beam as builtin_beam
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_router_bf16__sm_103__tp1.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
     BeamGroupedTopkRouter,
     beam_grouped_topk_router,
 )

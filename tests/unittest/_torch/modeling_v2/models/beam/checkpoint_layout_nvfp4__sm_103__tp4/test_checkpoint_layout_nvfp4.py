@@ -29,12 +29,12 @@ import struct
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4 import (  # noqa: E501
-    layout as bf16_layout,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
     layout,
     loader,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    layout_bf16 as bf16_layout,
 )
 
 NUM_LAYERS = 52
@@ -521,7 +521,7 @@ def _assert_gemm(out: torch.Tensor, a_codes, a_sf, w_packed, w_sf, alpha) -> Non
 @needs_sm103
 @pytest.mark.parametrize("shared_fc1", [True, False])
 def test_expert_provider_matches_independent_reference(shared_fc1) -> None:
-    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4.expert import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.expert import (  # noqa: E501
         nvfp4_swiglu_expert,
     )
 

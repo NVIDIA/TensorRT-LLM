@@ -9,14 +9,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_bf16__sm_103__tp4 import (  # noqa: E501
-    model as bf16,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4 import (  # noqa: E501
-    model as nvfp4,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as dense,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    component as nvfp4,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
+    component_bf16 as bf16,
 )
 from tensorrt_llm._torch.models import modeling_beam
 
@@ -55,6 +55,7 @@ def layout_loader(request, monkeypatch, tmp_path):
         return ok
 
     component._agree = agree
+    component._check_diagnostics_agree = lambda: None
     catalog = SimpleNamespace(
         entries={"weight": SimpleNamespace(path="part", begin=0)},
         validate=lambda *args, **kwargs: None,

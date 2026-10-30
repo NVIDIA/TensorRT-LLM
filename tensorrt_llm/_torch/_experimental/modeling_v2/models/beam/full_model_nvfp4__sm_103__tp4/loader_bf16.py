@@ -30,7 +30,7 @@ from typing import Mapping, Optional
 
 import torch
 
-from .layout import BF16, F32, FP8, TensorSpec
+from .layout_bf16 import BF16, F32, FP8, TensorSpec
 
 INDEX_FILE = "model.safetensors.index.json"
 TILE_BYTES = 16 << 20

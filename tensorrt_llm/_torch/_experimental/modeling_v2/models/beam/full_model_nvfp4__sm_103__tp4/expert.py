@@ -33,12 +33,12 @@ from typing import Mapping, Optional
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import swiglu_fp32
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.nvfp4_gemm import nvfp4_gemm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
 
-from ..moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import swiglu_fp32
 from .layout import GROUP
 
 #: The only NVFP4 GEMM backend this provider runs.

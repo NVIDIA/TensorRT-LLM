@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Beam full model, NVFP4 experts / sm_103 / tp4: token ids to logits through all 52 layers.
 
-The packed NVFP4 checkpoint-layout component (``checkpoint_layout_nvfp4__sm_103__tp4``) with a
-full-depth forward. Every operation is the component's own: the masked embedding with its
-all-reduce, each logical layer's ``block`` (attention on TRTLLM attention and the call's
+The packed NVFP4 checkpoint-layout component (``component``) with a full-depth forward. Every
+operation is the component's own: the masked embedding with its all-reduce, each logical
+layer's ``block`` (attention on TRTLLM attention and the call's
 ``KVCacheManagerV2`` slot for that layer, the dense SwiGLU on layers 0-2, the replicated FP32
 router and packed W4A4 experts on layers 3-51, the four sandwich norms and the depth residuals),
 the final norm, the untied head with its vocabulary all-gather and the FP32 softcap. This class
@@ -37,9 +37,11 @@ sequence (``max_seq_len``) on the full-attention layers 5, 11, 17, 23, 29, 35, 4
 runs; a call with T above ``max_tokens`` is rejected (the default ``MAX_NUM_TOKENS`` matches
 the supported deployment's native ``max_num_tokens``).
 
-Host synchronization: the position check reads one device comparison back per call (and the
-``gather_ids`` check, when given, one more); the component's router agreement and expert
-dispatch synchronize per sparse layer.
+Validation runs once per call: the step's metadata and request lengths, the token-id range (one
+device comparison read back), the cache manager's geometry once per manager. The expert
+dispatch synchronizes with the host per sparse layer. Diagnostic mode (``diagnostics``,
+``TRTLLM_MODELING_V2_VALIDATE``) adds the position and ``gather_ids`` value comparisons, the
+per-layer metadata re-checks and the per-sparse-layer router agreement across ranks.
 """
 
 from __future__ import annotations
@@ -48,12 +50,11 @@ from typing import Any, Callable, Mapping, Optional, Sequence, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam import _attention
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.checkpoint_layout_nvfp4__sm_103__tp4.model import (  # noqa: E501
-    BeamCheckpointLayoutNvfp4Sm103Tp4,
-)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.mapping import Mapping as ParallelMapping
+
+from . import _attention
+from .component import BeamCheckpointLayoutNvfp4Sm103Tp4
 
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = 52
@@ -86,6 +87,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         if self.layers != tuple(range(NUM_LAYERS)):
             raise ValueError(f"the full model holds logical layers 0..{NUM_LAYERS - 1}")
         self.vocab_size = config["vocab_size"]
+        # The last manager check_cache_manager accepted: its layers, heads, windows and dtype
+        # are fixed at its construction, so a call on the same manager need not re-read them.
+        self._checked_manager = None
 
     def attention_windows(self, max_seq_len: int) -> list:
         """Per logical layer: the attention window its cache must keep (512 or ``max_seq_len``)."""
@@ -100,22 +104,31 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         Required: the model's KV-cache dtype (BF16, or FP8 after ``set_kv_cache_fp8``),
         ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers 0..51 in local
         slots 0..51, the sliding window on sliding layers and the whole sequence on
-        full-attention layers. Reads host-side manager state only.
+        full-attention layers. A manager that also owns the drafter's layers (one manager for
+        the target and draft KV) holds exactly those draft layers after the target's, as
+        layers 52.. in slots 52..; the drafter checks their own geometry. Reads host-side
+        manager state only.
         """
         offsets = getattr(manager, "layer_offsets", None)
-        if not isinstance(offsets, Mapping) or dict(offsets) != {
-            layer: layer for layer in range(NUM_LAYERS)
-        }:
+        draft_layers = tuple(getattr(manager, "draft_layer_ids", None) or ())
+        num_layers = NUM_LAYERS + len(draft_layers)
+        if (
+            not isinstance(offsets, Mapping)
+            or dict(offsets) != {layer: layer for layer in range(num_layers)}
+            or draft_layers != tuple(range(NUM_LAYERS, num_layers))
+        ):
             held = sorted(offsets) if isinstance(offsets, Mapping) else None
             raise ValueError(
                 f"the KV cache manager must hold logical layers 0..{NUM_LAYERS - 1} in slots "
-                f"0..{NUM_LAYERS - 1}; it holds {held}"
+                f"0..{NUM_LAYERS - 1}, followed only by draft layers; it holds {held} with "
+                f"draft layers {list(draft_layers)}"
             )
         heads = list(getattr(manager, "num_kv_heads_per_layer", None) or [])
         if (
             manager.dtype != self.kv_cache_dtype
             or manager.head_dim != self.head_dim
-            or heads != [self.local_kv_heads] * NUM_LAYERS
+            or len(heads) != num_layers
+            or heads[:NUM_LAYERS] != [self.local_kv_heads] * NUM_LAYERS
         ):
             raise ValueError(
                 f"the KV cache must be {self.kv_cache_dtype.name} with {self.local_kv_heads} kv "
@@ -123,9 +136,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                 f"{manager.head_dim}"
             )
         windows = list(getattr(manager, "max_attention_window_vec", None) or [])
-        if len(windows) != NUM_LAYERS:
+        if len(windows) != num_layers:
             raise ValueError(f"the KV cache manager states {len(windows)} attention windows")
-        for layer, window in enumerate(windows):
+        for layer, window in enumerate(windows[:NUM_LAYERS]):
             if self.schedule.is_sliding(layer):
                 ok = window is not None and int(window) == self.window
             else:
@@ -187,8 +200,13 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         on a manager that passes ``check_cache_manager``, ``generation_rows`` rows per
         generation request and ``extra_kv_tokens`` reserved KV slots per request;
         ``position_ids``: an integer tensor of T positions, each request's
-        ``past .. past + n - 1`` in request order. Returns the spans ``[(past, n), ...]`` of
-        ``_attention.check_batch_metadata``. Raises ValueError otherwise.
+        ``past .. past + n - 1`` in request order. Returns the flat ids, the flat int64
+        positions and the spans ``[(past, n), ...]`` of ``_attention.check_batch_metadata``.
+        Raises ValueError otherwise.
+
+        Every call re-validates its requests (the step's metadata changes every step); the
+        manager's fixed geometry is checked once per manager. Comparing the positions' values
+        with the spans reads the device back, so it runs in diagnostic mode only.
         """
         if not isinstance(input_ids, torch.Tensor) or input_ids.dtype != torch.int64:
             raise ValueError("input_ids must be a torch.int64 tensor")
@@ -217,9 +235,12 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             raise ValueError(
                 f"attn_metadata must be TrtllmAttentionMetadata, got {type(attn_metadata).__name__}"
             )
-        if attn_metadata.kv_cache_manager is None:
+        manager = attn_metadata.kv_cache_manager
+        if manager is None:
             raise ValueError("attn_metadata needs a KV cache manager")
-        self.check_cache_manager(attn_metadata.kv_cache_manager)
+        if manager is not self._checked_manager:
+            self.check_cache_manager(manager)
+            self._checked_manager = manager
         spans = _attention.check_batch_metadata(
             attn_metadata,
             num_tokens,
@@ -231,6 +252,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
             kv_cache_dtype=self.kv_cache_dtype,
         )
         positions = position_ids.reshape(-1).to(torch.int64)
+        if not self.diagnostics:
+            return input_ids, positions, spans
         expected = torch.cat([torch.arange(past, past + n, dtype=torch.int64) for past, n in spans])
         if not torch.equal(positions, expected.to(self.device, non_blocking=True)):
             got, start = positions.cpu(), 0
@@ -297,6 +320,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                 capture,
                 generation_rows=generation_rows,
                 extra_kv_tokens=extra_kv_tokens,
+                call_checked=True,
             )
             if block_output is not None:
                 block_output(layer, x)
@@ -324,7 +348,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
     def _check_gather_ids(self, gather_ids: torch.Tensor, rows: list) -> None:
         """Raise ValueError unless the engine's ``gather_ids`` are exactly ``rows``, in order.
 
-        One device comparison read back per call.
+        The tensor's kind, length and device are checked on every call; its values, one
+        device comparison read back, in diagnostic mode only.
         """
         if (
             not isinstance(gather_ids, torch.Tensor)
@@ -339,6 +364,8 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                 f"on {getattr(gather_ids, 'device', None)}; this step's verifier reads "
                 f"{len(rows)} rows on {self.device}"
             )
+        if not self.diagnostics:
+            return
         expected = torch.tensor(rows, dtype=torch.int64).to(self.device, non_blocking=True)
         if not torch.equal(gather_ids.to(torch.int64), expected):
             raise ValueError(

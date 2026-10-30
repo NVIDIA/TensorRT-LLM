@@ -64,6 +64,9 @@ import numpy as np
 import torch
 from torch import nn
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (
+    beam_logit_softcap,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
@@ -77,12 +80,11 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX, LayerId, PageIndexMode
 
-from .. import _attention
 from ..dense_block_bf16__sm_103__tp1 import block as dense_block
+from ..full_model_nvfp4__sm_103__tp4 import _attention
 from ..moe_bf16__sm_103__tp1.moe import check_weights
 from ..moe_bf16__sm_103__tp1.moe import weight_shapes as moe_weight_shapes
 from ..sparse_block_bf16__sm_103__tp1 import block as sparse_block
-from .ops.activation.beam_logit_softcap import beam_logit_softcap
 
 NUM_LAYERS = 6
 DENSE_LAYERS = (0, 1, 2)

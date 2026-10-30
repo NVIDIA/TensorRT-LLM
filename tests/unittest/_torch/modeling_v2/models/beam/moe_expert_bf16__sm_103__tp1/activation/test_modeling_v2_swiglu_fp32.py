@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_expert_bf16__sm_103__tp1.ops.activation.swiglu_fp32 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
     swiglu_fp32 as op,
 )
 
