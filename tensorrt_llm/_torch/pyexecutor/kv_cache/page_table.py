@@ -134,10 +134,11 @@ def virtual_layers(
 ) -> tuple[dict[int, tuple[int, int]], int] | None:
     """(internal id -> (model layer, attention type), type count) of a manager keeping several
     caches per model layer, from its (model layer, attention type) -> internal id map; None for an
-    empty map. An internal id shared by several types takes its first: under DeepSeek-V4.1
-    long-range layers sharing a compressed cache resolve to the layer that allocated it, which
-    comes first on every pipeline stage. Every member of the attention-type enum counts, so stages
-    holding different attention types agree."""
+    empty map. An internal id shared by several attention types of one model layer, as DeepSeek-V4
+    keeps them, takes the first. A cache several model layers share enters the map only under the
+    model layer that owns it, as CSA2's does, so its name does not depend on which layers a stage
+    holds. Every member of the attention-type enum counts, so stages holding different attention
+    types agree."""
     if not attn_to_layer_id:
         return None
     types_of: dict[int, tuple[int, int]] = {}
