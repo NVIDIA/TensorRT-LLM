@@ -6,6 +6,7 @@ import math
 import zlib
 from typing import List
 
+import _kda_reference as kr
 import pytest
 import torch
 
@@ -13,8 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.ssm.kda
     kda_prefill,
 )
 
-__extra_import_path__ = ["..", "."]
-import _kda_reference as kr
+__extra_import_path__ = [".."]
 from _validating import validating
 
 assert torch.cuda.is_available(), "kda_prefill requires a CUDA device"

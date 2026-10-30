@@ -7,9 +7,10 @@ beside this file."""
 import importlib
 import zlib
 
-__extra_import_path__ = ["..", "."]
 import _k3_moe_engines as engines
 import pytest
+
+__extra_import_path__ = [".."]
 from _validating import validating
 
 k3_moe_m2 = importlib.import_module(

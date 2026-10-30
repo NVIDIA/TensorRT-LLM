@@ -20,11 +20,11 @@ kernels: the head CTAs read the slots' pools before their grid-dependency wait.
 import importlib
 import zlib
 
+import _kda_cells as kc
 import pytest
 import torch
 
-__extra_import_path__ = ["..", "."]
-import _kda_cells as kc
+__extra_import_path__ = [".."]
 from _validating import validating
 
 k3_kda_verify = importlib.import_module(
