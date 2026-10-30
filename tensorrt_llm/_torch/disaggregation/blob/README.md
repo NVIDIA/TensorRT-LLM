@@ -32,6 +32,8 @@ store SDK
 | `backend.py` | `BlobBackend`, `BlobAttempt`, `BlobConfig`, `DriverCallLimit`, `RegionBinding`, `ConstructionRejected` |
 | `store.py` | the driver boundary: `StoreDriver`, the optional `RegistersRegionsTogether`, `RowBatch`, `RowIO`, `OnChange`, `RowStatus`, `DriverCapabilities`, `DriverRejected`, `RegistrationError` |
 | `keys.py` | the store key encoding |
+| `mooncake.py` | `MooncakeDriver`, a `StoreDriver` over a set-up Mooncake 0.3.13 SDK client |
+| `mooncake_setup.py` | `open_mooncake_driver`: reads a store config and opens the SDK client and the driver |
 | `../testing/` | what a driver's own CI imports from the wheel: the conformance suite, the in-memory store and drivers, the broken drivers that prove every check bites |
 
 ## Running the tests
@@ -40,7 +42,7 @@ store SDK
 pytest tests/unittest/_torch/disaggregation/blob
 ```
 
-All of it is CPU-only. The files, top down:
+All of it is CPU-only; `test_mooncake_real.py` also needs a Mooncake pool. The files, top down:
 
 - `test_blob_example.py`: the backend end to end, each test the smallest example of one part
   of the picture: two endpoints sharing objects, a lease holder's decisions and leases, the
@@ -52,6 +54,12 @@ All of it is CPU-only. The files, top down:
   rule it guards.
 - `test_blob_format.py`: keys, spans, layouts, row batches, the object trailer.
 - `test_testing_isolation.py`: no engine module imports the test tooling.
+- `test_mooncake_driver.py`: the Mooncake driver over a fake SDK (`fake_mooncake.py`) that
+  answers as 0.3.13 does, the conformance suite included.
+- `test_mooncake_setup.py`: the store config, the SDK's setup and the refused settings and builds,
+  and that each module imports only its layer.
+- `test_mooncake_real.py`: the Mooncake driver and the backend over a real pool; runs only with
+  `TRTLLM_MOONCAKE_REAL=1`.
 
 ## Writing a driver
 
@@ -75,8 +83,9 @@ The boundary is `store.py`; its docstrings are the specification. The rules that
    name a key twice, and every span lies inside one registered extent, so a driver checks memory
    once per extent. A driver that cannot take a call refuses it with `DriverRejected`.
 4. **Only READY and FAULT are verdicts.** MISS, NOT_READY, DECLINED and CANCELLED say that
-   nothing was delivered and nothing went wrong, each under a condition the store confirmed;
-   an error the driver cannot place is FAULT.
+   nothing was delivered and charge the row no fault, each only under the conditions `RowStatus`
+   names for it. RPC, transfer and integrity errors are FAULT, and so is any error the driver
+   cannot place.
 5. **`drain` is one-way and never forces an end.** After it the driver accepts no new work;
    it returns True only when nothing can still touch memory. `close` is allowed only after a
    True drain and with every registration revoked.
