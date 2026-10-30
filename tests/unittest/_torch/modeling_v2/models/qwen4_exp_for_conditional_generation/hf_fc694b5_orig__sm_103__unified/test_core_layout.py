@@ -264,9 +264,8 @@ def test_a_spread_fc1_input_scale_is_refused() -> None:
     "layout, spec_config, missing",
     [
         (_DEP4, MTPDecodingConfig(max_draft_len=3), "MTP under attention DP"),
-        (_TP4, MTPDecodingConfig(max_draft_len=3), "split by intermediate"),
     ],
-    ids=["mtp-dep4", "mtp-tp4"],
+    ids=["mtp-dep4"],
 )
 def test_what_this_core_does_not_assemble_is_refused_at_construction(
     layout, spec_config, missing
@@ -434,6 +433,112 @@ def test_a_tep4_rank_holds_its_share_of_the_draft_layer(rank) -> None:
     assert tuple(w[f"{p}fc1_s"].shape) == (128, 2 * 640 // 128, 2560 // 128)
     assert tuple(w[f"{p}fc2_w"].shape) == (128, 2560, 640)
     assert tuple(w[f"{p}fc2_s"].shape) == (128, 2560 // 128, 640 // 128)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tp4_rank_holds_whole_expert_draft_windows_beside_its_intermediate_slice(rank) -> None:
+    """At tp4 the trunk's routed experts are every expert at a 160-row intermediate slice
+    stored 256 wide, but the draft layer's FP8 experts cannot be cut that way (their 128x128
+    weight blocks would split mid-block). They are the rank's whole-expert window
+    `[128r, 128r + 128)` over the TP group, exactly tep4's, and the four windows partition
+    the routing space. The draft attention is cut as at tep4."""
+    max_draft_len = 3
+    core = _core(rank, _TP4, MTPDecodingConfig(max_draft_len=max_draft_len))
+    assert core.mtp_enabled and core.max_verify_rows == max_draft_len + 1
+    assert (core.local_experts, core.expert_offset, core.expert_inter) == (512, 0, 256)
+    assert (core.mtp_local_experts, core.mtp_expert_offset, core.moe_inter) == (
+        128,
+        128 * rank,
+        640,
+    )
+    p = f"l{NUM_LAYERS}_mtp_"
+    w = core.w
+    assert tuple(w[f"{p}fc1_w"].shape) == (128, 2 * 640, 2560)
+    assert w[f"{p}fc1_w"].dtype == torch.float8_e4m3fn
+    assert tuple(w[f"{p}fc1_s"].shape) == (128, 2 * 640 // 128, 2560 // 128)
+    assert tuple(w[f"{p}fc2_w"].shape) == (128, 2560, 640)
+    assert tuple(w[f"{p}fc2_s"].shape) == (128, 2560 // 128, 640 // 128)
+    assert tuple(w[f"{p}q_w"].shape) == (2 * 1536, 2560)
+    assert tuple(w[f"{p}k_w"].shape) == tuple(w[f"{p}v_w"].shape) == (256, 2560)
+    assert tuple(w[f"{p}o_w"].shape) == (2560, 1536)
+    assert tuple(w[f"{p}router"].shape) == (512, 2560)
+    windows = [_core(r, _TP4, MTPDecodingConfig(max_draft_len=1)) for r in range(WORLD)]
+    covered = sorted(
+        e
+        for c in windows
+        for e in range(c.mtp_expert_offset, c.mtp_expert_offset + c.mtp_local_experts)
+    )
+    assert covered == list(range(512))
+
+
+def test_the_tp4_draft_windows_sum_to_the_whole_draft_moe(monkeypatch) -> None:
+    """`_mtp_moe_block` at tp4 hands the FP8 runner this rank's whole-expert window -- the
+    draft layer's `local_expert_offset` / `local_num_experts` and the whole 640-row
+    intermediate, never the trunk's 256-wide padded slice -- and completes the window's
+    partial with the TP sum once. The entries are stood in for by arithmetic that names the
+    expert a slot routes to, so the four ranks' partials sum to the all-expert output."""
+    tokens, hidden, num_experts, topk = 5, 2560, 512, 10
+    gen = torch.Generator().manual_seed(0)
+    x = torch.randn(tokens, hidden, generator=gen)
+    router = torch.randn(hidden, num_experts, generator=gen)
+    logits = x @ router
+    top_logits, top_ids = torch.topk(logits, topk, dim=-1)
+    top_w = torch.softmax(top_logits, dim=-1)
+
+    def expert_out(ids, wts, start, count):
+        keep = ((ids >= start) & (ids < start + count)).to(x.dtype)
+        return (wts * keep * (ids + 1).to(x.dtype)).sum(-1, keepdim=True) * x
+
+    full = expert_out(top_ids, top_w, 0, num_experts)
+
+    def fake_cublas_mm(a, b, *args, **kwargs):
+        return a @ b
+
+    def fake_routing(lg, topk, output_dtype):
+        assert topk == 10 and lg.shape == (tokens, num_experts)
+        return top_ids, top_w
+
+    def fake_runner(**kw):
+        core = seen["core"]
+        assert kw["intermediate_size"] == core.moe_inter == 640
+        assert kw["local_expert_offset"] == core.mtp_expert_offset
+        assert kw["local_num_experts"] == core.mtp_local_experts == 128
+        assert tuple(kw["gemm1_weights"].shape) == (128, 2 * 640, hidden)
+        assert tuple(kw["gemm2_weights"].shape) == (128, hidden, 640)
+        assert kw["num_experts"] == num_experts and kw["top_k"] == topk
+        return expert_out(
+            kw["topk_ids"], kw["topk_weights"], kw["local_expert_offset"], kw["local_num_experts"]
+        )
+
+    monkeypatch.setattr(M, "cublas_mm", fake_cublas_mm)
+    monkeypatch.setattr(M, "renorm_moe_routing_op", fake_routing)
+    monkeypatch.setattr(M, "fp8_quantize_1x128", lambda t, use_ue8m0: (t, None))
+    monkeypatch.setattr(M, "fp8_block_scale_moe_runner", fake_runner)
+    monkeypatch.setattr(M, "silu_and_mul_rows", lambda gug, inter: gug[:, :inter])
+    # The shared expert and its gate are replicated and checked elsewhere: keep the routed sum.
+    monkeypatch.setattr(M, "fused_sigmoid_gate_mul_add", lambda routed, gate, shared: routed)
+
+    seen = {}
+    partials = []
+    for rank in range(WORLD):
+        core = _core(rank, _TP4, MTPDecodingConfig(max_draft_len=3))
+        seen["core"] = core
+        summed = []
+        core.tp_sum = lambda t: summed.append(t) or t
+        p = f"l{NUM_LAYERS}_mtp_"
+        views = SimpleNamespace(
+            router=router,
+            fc1_w=core.w[f"{p}fc1_w"],
+            fc1_s=core.w[f"{p}fc1_s"],
+            fc2_w=core.w[f"{p}fc2_w"],
+            fc2_s=core.w[f"{p}fc2_s"],
+            sh_gug=torch.zeros(hidden, 2 * 640 + 8),
+            sh_dn=torch.zeros(640, hidden),
+        )
+        out = M._mtp_moe_block(core, views, x)
+        assert len(summed) == 1, "the window's partial is summed over the TP group once"
+        partials.append(out)
+    torch.testing.assert_close(sum(partials), full)
 
 
 def test_the_draft_layer_views_are_the_trunks_gemm_operands() -> None:

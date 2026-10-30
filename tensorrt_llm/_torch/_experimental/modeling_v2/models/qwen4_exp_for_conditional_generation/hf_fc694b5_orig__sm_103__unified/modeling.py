@@ -80,7 +80,10 @@ runs every generation request's `max_draft_len + 1` verify rows:
   pages hold the draft layer alone (`_bind_draft_cache_manager`). Its front end, router,
   shared expert and hyper-connections are replicated; its FP8 block-scale experts run as this
   rank's window of `num_experts / tp_size` experts (`fp8_block_scale_moe_runner`'s window), and
-  the o_proj and expert partials are completed by the same plain sum as the trunk's.
+  the o_proj and expert partials are completed by the same plain sum as the trunk's. That
+  window is the same at tp4 as at tep4: the FP8 experts' 128x128 weight blocks do not take the
+  trunk's 160-row intermediate split, and a sum of whole-expert windows is the layer's output
+  whichever way the trunk's experts are cut.
 * A verify step's Gated-DeltaNet rows take the multi-token conv with per-step window snapshots
   and the stock Triton cached replay over the bf16 pool, which commits a full history in the
   kernel below `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and leaves it to the
@@ -94,9 +97,8 @@ runs every generation request's `max_draft_len + 1` verify rows:
   theirs from it (`qsa_mtp_reuse_topk`).
 
 Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`), and
-MTP under attention DP (dep4) or with the routed experts split by intermediate (tp4): the
-draft layer is cut for attention TP with whole experts only. Each refusal names what is
-missing.
+MTP under attention DP (dep4, dep2): the draft layer's experts are completed by the TP sum,
+not the attention-DP round trip. Each refusal names what is missing.
 
 Integration facts this file depends on:
 
@@ -416,12 +418,9 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
                 "MTP under attention DP (dep4): the draft layer's attention-DP MoE round trip "
                 "and per-rank draft batch are not assembled in this target yet"
             )
-        if self.mtp_enabled and mapping.moe_tp_size != 1:
-            raise NotImplementedError(
-                f"MTP with routed experts split by intermediate (moe_tp_size "
-                f"{mapping.moe_tp_size}, tp4): the draft layer's FP8 block-scale experts are "
-                "cut by whole experts only in this target"
-            )
+        # The draft layer's FP8 block-scale experts are whole-expert windows over the TP group
+        # at every attention-TP layout, tp4 included: their 128x128 weight blocks do not take
+        # the trunk's 160-row intermediate split (`weights.rank_dims`, `mtp_local_experts`).
         # Rows per generation request of the widest verify step (`max_draft_len + 1`); 1
         # without MTP.
         self.max_verify_rows = spec_config.max_draft_len + 1 if self.mtp_enabled else 1
