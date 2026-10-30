@@ -5,6 +5,7 @@
 
 import pickle
 import sys
+from types import SimpleNamespace
 
 import cloudpickle
 import pytest
@@ -13,8 +14,16 @@ from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.context_logits import (
+    ContextLogitsPlan,
+    context_logits_heads,
+    context_logits_scope,
+)
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.llm_request import PyResult
+from tensorrt_llm.executor.result import compute_prompt_logprobs
 from tensorrt_llm.mapping import Mapping
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -22,6 +31,92 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 # The shared MPI executor keeps its worker thread alive between tests.
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@torch.inference_mode()
+def _check_bounded_context(lm_head: LMHead, hidden: torch.Tensor, rank: int) -> None:
+    """Keep TP chunks aligned when only one rank runs out of output or storage memory."""
+    model = torch.nn.Module()
+    model.lm_head = lm_head
+    model.logits_processor = LogitsProcessor()
+    assert context_logits_heads(model, lm_head.mapping, is_spec_decode=False) == (lm_head,)
+    lm_head.prepare_context_logits_workspace()
+    workspace = lm_head.context_logits_workspace
+    pointers = [buffer.data_ptr() for buffer in workspace.resident]
+    hidden = hidden.repeat(21, 1)
+    reference = lm_head(hidden).float()
+    vocab_size = lm_head.num_embeddings
+
+    for host_storage in (False, True):
+        requests = []
+        for length, full, k in ((70, True, None), (70, False, 0), (5, False, None)):
+            tokens = [index % vocab_size for index in range(length)]
+            requests.append(
+                SimpleNamespace(
+                    context_chunk_size=length,
+                    context_current_position=0,
+                    py_prompt_len=length,
+                    py_return_context_logits=full or k is not None,
+                    py_context_logits_explicit=full,
+                    py_prompt_logprobs=k,
+                    py_prompt_logprobs_simple_format=True,
+                    is_last_context_chunk=True,
+                    get_tokens=lambda beam, tokens=tokens: tokens,
+                    py_result=PyResult(
+                        prompt_len=length,
+                        max_new_tokens=2,
+                        return_context_logits=full or k is not None,
+                    ),
+                )
+            )
+        allocate = workspace._allocate
+        empty = torch.empty
+        project = workspace.project
+        projected_rows = []
+
+        def allocate_output(rows):
+            if rank == 1 and not host_storage and rows > 35:
+                raise torch.OutOfMemoryError("injected rank-local workspace OOM")
+            return allocate(rows)
+
+        def allocate_storage(shape, *args, **kwargs):
+            if (
+                host_storage
+                and rank == 0
+                and tuple(shape) == (70, 1, vocab_size)
+                and torch.device(kwargs.get("device", "cpu")).type == "cuda"
+            ):
+                raise torch.OutOfMemoryError("injected rank-local storage OOM")
+            return empty(shape, *args, **kwargs)
+
+        def record_projection(head, rows, buffers):
+            projected_rows.append(rows.shape[0])
+            return project(head, rows, buffers)
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(workspace, "_allocate", allocate_output)
+            patch.setattr(torch, "empty", allocate_storage)
+            patch.setattr(workspace, "project", record_projection)
+            batch = SimpleNamespace(context_requests=requests, all_requests=lambda: requests)
+            plan = ContextLogitsPlan.for_batch(model, lm_head.mapping, batch, is_spec_decode=False)
+            assert plan is not None
+            with context_logits_scope(plan):
+                sampling = model.logits_processor(hidden, lm_head, None, return_context_logits=True)
+            assert plan.handled
+        assert projected_rows == ([32, 32, 6, 70, 1, 2] if host_storage else [35, 35] * 2 + [1, 2])
+        assert [buffer.data_ptr() for buffer in workspace.resident] == pointers
+        # Both returned outputs must survive reuse of the resident collective buffers.
+        for buffer in workspace.resident:
+            buffer.zero_()
+        full_result = requests[0].py_result.context_logits
+        assert full_result.device.type == ("cpu" if host_storage and rank == 0 else "cuda")
+        torch.testing.assert_close(full_result.cpu(), reference[:70].cpu())
+        torch.testing.assert_close(sampling, reference[[69, 139, 144, 145, 146]])
+        compact = requests[1].py_result
+        assert compact.context_logits is None
+        expected = compute_prompt_logprobs(0, reference[70:139].cpu(), list(range(1, 70)), True)
+        assert compact.context_prompt_logprobs == pytest.approx(expected.prompt, abs=1e-5)
+        torch.testing.assert_close(compact.context_prompt_last_logits, reference[139:140].cpu())
 
 
 @torch.inference_mode()
@@ -54,6 +149,9 @@ def _run_column_lm_head(
     assert logits.shape == (hidden.shape[0], vocab_size)
     torch.testing.assert_close(logits.double(), reference, rtol=1e-4, atol=1e-4)
     assert not torch.equal(logits, logits.to(weight.dtype).float())
+    # Reuse one existing padded-vocabulary case for the distributed fallback checks.
+    if hidden.shape[0] == 7 and vocab_size == 127 and weight.dtype == torch.bfloat16:
+        _check_bounded_context(lm_head, hidden, rank)
     return True
 
 
