@@ -26,8 +26,7 @@ from tensorrt_llm._torch.disaggregation.base import CacheKind
 BUFFER_ENTRY_DTYPE = np.dtype(
     [
         ("local_layer_id", np.uint32),
-        # 64-bit: layer-major recurrent-state pools address a layer at
-        # layer_index * num_slots * slot_bytes, which exceeds 4 GiB.
+        # Byte offsets within coalesced pools use 64 bits.
         ("offset", np.uint64),
         ("size", np.uint32),
     ]
@@ -45,7 +44,7 @@ class MapperKind(IntEnum):
     bytes move between heterogeneous topologies:
 
     INDEXED/HND: Head-major (HND) K/V — the layout written by the TRTLLM
-        attention kernels and the default for V1 and standard V2 managers.
+        attention kernels and the default for standard V2 managers.
         Heterogeneous-head transfer selects one contiguous head-major range
         per K/V buffer.
     REPLICATED: The pool holds bytes that are identical on every TP rank
@@ -90,42 +89,36 @@ class RoleLayout:
     ``section_bytes`` describes a SECTIONED role (one entry per section, in
     slot order); ``bytes_per_head`` describes an INDEXED role whose head
     count is not derivable from ``RankInfo.attention`` (recurrent SSM state).
-    Roles with neither need no geometry (REPLICATED, attention K/V).
+    ``ring_slot_bytes`` describes a REPLICATED role whose per-layer region is
+    a ring of token slots addressed by global token position modulo the slot
+    count (see :attr:`PoolView.ring_slot_bytes`). Roles with none of these need
+    no geometry (plain REPLICATED, attention K/V).
     """
 
     section_bytes: Optional[Tuple[int, ...]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
 
 @dataclass
 class PhysicalPool:
-    """Affine view of a physical pool over logical layers and slots.
+    """Physical storage for a V2 pool's slots.
 
-    ``slot_bytes`` is the transferable payload for one ``(layer, slot)`` and
-    ``num_slots`` is the number of logical slots. The payload address is
-    ``base_address + layer * layer_stride_bytes + slot * slot_stride_bytes``.
-    The strides describe the physical layout independently of payload size and
-    slot count. Their defaults describe dense layer-major storage, where
-    ``slot_stride_bytes == slot_bytes`` and
-    ``layer_stride_bytes == num_slots * slot_stride_bytes``. V2 Mamba supplies
-    both explicitly for its slot-major, role-interleaved pools.
+    ``slot_bytes`` spans all layers and roles coalesced into one slot.
+    The slot address is ``base_address + slot * slot_stride_bytes``;
+    per-layer and per-role offsets are carried by each PoolView.
     """
 
     base_address: int  # uint64
     slot_bytes: int
     num_slots: int
     slot_stride_bytes: Optional[int] = None
-    layer_stride_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.slot_stride_bytes is None:
             self.slot_stride_bytes = self.slot_bytes
-        if self.layer_stride_bytes is None:
-            self.layer_stride_bytes = self.num_slots * self.slot_stride_bytes
         if self.slot_stride_bytes < self.slot_bytes:
             raise ValueError("slot_stride_bytes must be greater than or equal to slot_bytes")
-        if self.layer_stride_bytes < self.slot_bytes:
-            raise ValueError("layer_stride_bytes must be greater than or equal to slot_bytes")
 
     def to_dict(self) -> dict:
         return {
@@ -133,7 +126,6 @@ class PhysicalPool:
             "slot_bytes": int(self.slot_bytes),
             "num_slots": int(self.num_slots),
             "slot_stride_bytes": int(self.slot_stride_bytes),
-            "layer_stride_bytes": int(self.layer_stride_bytes),
         }
 
     @staticmethod
@@ -145,11 +137,6 @@ class PhysicalPool:
             slot_stride_bytes=(
                 int(data["slot_stride_bytes"])
                 if data.get("slot_stride_bytes") is not None
-                else None
-            ),
-            layer_stride_bytes=(
-                int(data["layer_stride_bytes"])
-                if data.get("layer_stride_bytes") is not None
                 else None
             ),
         )
@@ -219,6 +206,13 @@ class PoolView:
             ``RankInfo.attention`` (recurrent SSM state). ``bytes_per_layer //
             bytes_per_head`` is the per-rank head count. Attention K/V leaves
             it ``None`` and uses ``kv_heads_per_rank`` instead.
+        ring_slot_bytes: REPLICATED views only. When set, each layer's region
+            is a ring of ``bytes_per_layer // ring_slot_bytes`` token slots,
+            and the token at global position ``p`` lives in slot
+            ``p % num_slots`` of the ring in the page that holds ``p``. The two
+            sides may size their rings differently, so the transfer moves the
+            positions both rings retain slot by slot instead of copying the
+            region verbatim.
     """
 
     pool_idx: int
@@ -228,6 +222,7 @@ class PoolView:
     bytes_per_layer: Optional[int] = None
     section_bytes: Optional[List[int]] = None
     bytes_per_head: Optional[int] = None
+    ring_slot_bytes: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -243,6 +238,9 @@ class PoolView:
             ),
             "bytes_per_head": (
                 int(self.bytes_per_head) if self.bytes_per_head is not None else None
+            ),
+            "ring_slot_bytes": (
+                int(self.ring_slot_bytes) if self.ring_slot_bytes is not None else None
             ),
         }
 
@@ -269,6 +267,9 @@ class PoolView:
             ),
             bytes_per_head=(
                 int(data["bytes_per_head"]) if data.get("bytes_per_head") is not None else None
+            ),
+            ring_slot_bytes=(
+                int(data["ring_slot_bytes"]) if data.get("ring_slot_bytes") is not None else None
             ),
         )
 
@@ -334,7 +335,7 @@ class AttentionLayerGroup(LayerGroup):
 
 # Native role names of the hybrid Mamba managers (``MambaRole.CONV_STATE`` /
 # ``MambaRole.SSM_STATE``), spelled out here because page.py must not import
-# the manager. The V1 builder stamps them so V1 and V2 peers match by role.
+# the manager.
 MAMBA_CONV_ROLE = frozenset({"conv_state"})
 MAMBA_SSM_ROLE = frozenset({"ssm_state"})
 
@@ -353,12 +354,8 @@ class MambaLayerGroup(LayerGroup):
     mix of recurrent roles (Mamba2 / GDN conv and SSM state, KDA state, PLE
     side state) without the group knowing which is which.
 
-    ``slot_major_layout`` records whether the group's pools pack all layers
-    of one slot together (V2) or one layer's slots together (V1); it only
-    affects how the pools are registered with the transfer agent.
+    Each physical slot packs its coalesced layers and roles together.
     """
-
-    slot_major_layout: bool = False
 
     def __post_init__(self) -> None:
         self.kind = CacheKind.STATE
@@ -369,16 +366,20 @@ class MambaLayerGroup(LayerGroup):
             "pool_group_idx": int(self.pool_group_idx),
             "local_layers": [ll.to_dict() for ll in self.local_layers],
             "pool_views": [pv.to_dict() for pv in self.pool_views],
-            "slot_major_layout": self.slot_major_layout,
+            "slot_major_layout": True,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
+        if data.get("slot_major_layout", True) is not True:
+            raise ValueError(
+                "Python transceiver does not support the layer-major recurrent-state "
+                "layout of KV cache manager V1; use a V2 slot-major peer."
+            )
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             local_layers=[LocalLayer.from_dict(x) for x in data["local_layers"]],
             pool_views=[PoolView.from_dict(pv) for pv in data["pool_views"]],
-            slot_major_layout=bool(data.get("slot_major_layout", False)),
         )
 
 

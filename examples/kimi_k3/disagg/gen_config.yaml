@@ -28,11 +28,9 @@ kv_cache_config:
   free_gpu_memory_fraction: 0.25
 cache_transceiver_config:
   backend: NIXL
-  # Mandatory for K3: `auto` resolves to the C++ transceiver, which
-  # throws for K3's MixedMambaHybridCacheManager.
+  # K3's model preference selects Python during standard auto resolution.
+  # Keep this recipe explicit for MixedMambaHybridCacheManager.
   transceiver_runtime: PYTHON
-  # Must be >= the target max ISL and match the ctx side.
-  max_tokens_in_buffer: 8448
   # Fabric-VMM bounce buffer (recv side); must match the ctx server.
   # Without it, cross-node V2 pool-to-pool transfers fall back to
   # ~0.4 GB/s host-staged tcp; 512 MiB measured at ~455 GB/s/GPU.

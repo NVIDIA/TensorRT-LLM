@@ -33,20 +33,22 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
+  - unittest/_torch/modeling/test_modeling_glm.py
   - unittest/_torch/modeling/test_modeling_minicpmv4_6.py
   - unittest/_torch/modeling/test_multimodal_encoder_mixin.py
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/sampler/test_in_graph_sampling.py
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
-  - unittest/_torch/executor/kv_cache/test_kv_cache_compression_manager.py
-  - unittest/_torch/executor/kv_cache/test_kv_cache_v2_capacity_only.py
-  - unittest/_torch/executor/kv_cache/sharing
-  - unittest/_torch/executor/test_kv_cache_layout.py
-  - unittest/_torch/executor/test_kv_connector_v2_prefix_real_manager.py
-  - unittest/_torch/executor/test_error_classification.py
-  - unittest/_torch/executor/test_resource_manager.py
-  - unittest/_torch/executor/test_seq_slot_sizing.py
-  - unittest/_torch/executor/test_profile_endpoints.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_compression_manager.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py
+  - unittest/_torch/pyexecutor/kv_cache/sharing
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
+  - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
+  - unittest/_torch/pyexecutor/test_error_classification.py
+  - unittest/_torch/pyexecutor/test_resource_manager.py
+  - unittest/_torch/pyexecutor/test_seq_slot_sizing.py
+  - unittest/_torch/pyexecutor/test_profile_endpoints.py
   - unittest/_torch/moe/test_communication_factory.py
   # NOTE: this is a CPU-only test, but we do not have a dedicated job for this (and therefore no
   # test list either).
@@ -59,15 +61,16 @@ l0_a10:
   - unittest/inputs/test_prefix_token_cache.py
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
+  - unittest/others/test_cuda_architecture_check.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
   - unittest/grpc/smg/test_smg.py
-  # The one OpenEngine test needing a GPU: it builds a real LLM, because a
-  # stubbed engine would accept whatever its fake generate_async accepts and so
-  # would agree with an advertisement the real engine rejects. Any GPU will do
-  # -- the model is TinyLlama-1.1B -- so it sits with the other gateway tests.
+  # OpenEngine capability conformance needs real loaded models: a stub would
+  # accept whatever its fake generate_async tolerates and could agree with a
+  # false advertisement by construction. The image case uses Qwen3-VL-2B.
   - unittest/grpc/openengine/test_capability_conformance.py
+  - unittest/grpc/openengine/test_multimodal_conformance.py
   - unittest/disaggregated/test_coordinator_e2e.py
   - unittest/disaggregated/test_coordinator_worker.py
   - unittest/disaggregated/test_agent_multi_backends.py
@@ -83,9 +86,8 @@ l0_a10:
   # Only files with at least one non-cpu_only test belong here: this stage runs
   # unittests with `-m not cpu_only`, and one pytest invocation is made per
   # entry, so a file whose tests are all cpu_only collects nothing and errors.
-  # The fully-cpu_only ones (test_config_database_sync, test_periodic_junit,
-  # test_prepare_dataset, test_test_to_stage_mapping) are covered by
-  # l0_cpu.yml, which lists unittest/tools as a directory.
+  # Files whose tests are all cpu_only are covered by l0_cpu.yml, which lists
+  # unittest/tools as a directory.
   - unittest/tools/test_host_profiler.py
   - unittest/tools/test_infra_dry_run_pipeline.py
   - unittest/tools/test_infra_dry_run_pytest.py
@@ -165,9 +167,7 @@ l0_a10:
   # by hand. test_connector_runs_on_kv_cache_manager_v2 is what makes the V2
   # entries meaningful -- the creator silently falls back to the V1 manager for
   # combinations it cannot serve, so without it every V2 id below could pass
-  # while running V1. test_connector_priorities[kv_cache_manager_v2] is
-  # xfail(strict=True) in the suite, not omitted here, so the retention gap
-  # stays counted. The two e2e cases below are the only multi-layer-group ones
+  # while running V1. The two e2e cases below are the only multi-layer-group ones
   # that move bytes -- the rest drive a MagicMock and assert routing.
   # test_connector_vswa_e2e_gemma3 is the interleaved-attention run (Gemma-3
   # asks for KVCacheManagerV2 itself, and its layer groups come out different
@@ -216,7 +216,6 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_disagg_prefill[kv_cache_manager_v2-True]
   - llmapi/test_llm_api_connector.py::test_connector_multi_request[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities[kv_cache_manager_v2]
-  - llmapi/test_llm_api_connector.py::test_connector_warns_that_retention_is_ignored_on_v2[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_priorities_default[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-host_offloading]
   - llmapi/test_llm_api_connector.py::test_connector_rejects_unsupported_config[kv_cache_manager_v2-beam_search]
@@ -241,6 +240,7 @@ l0_a10:
   - llmapi/test_llm_api_connector.py::test_connector_uniform_sliding_window[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_sliding_window_prefix_is_backed_by_real_pages[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_vswa_reports_page_indices_per_layer_group[kv_cache_manager_v2]
+  - llmapi/test_llm_api_connector.py::test_capacity_only_connector_accepts_multigroup_retention[kv_cache_manager_v2]
   - llmapi/test_llm_api_connector.py::test_connector_multi_pool_e2e_persistent_cache
   - llmapi/test_llm_api_connector.py::test_connector_vswa_e2e_gemma3
   - llmapi/test_llm_api_connector.py::test_connector_vswa_out_of_window_blocks_reach_the_connector

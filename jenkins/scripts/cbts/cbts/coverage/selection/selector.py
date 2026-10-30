@@ -25,7 +25,6 @@ from cbts.coverage.selection.python_change_analysis import (
     ImportTarget,
     PythonChangeFacts,
     analyze_python_changes,
-    closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
@@ -129,7 +128,10 @@ class CoverageSelector:
         return out
 
     def _impacted_tests(
-        self, residual_files: list[str], diffs: dict[str, str]
+        self,
+        residual_files: list[str],
+        diffs: dict[str, str],
+        selection_diffs: dict[str, str] | None = None,
     ) -> tuple[set[str], list[str], list[str], list[str], str | None]:
         """Return impacted tests, diagnostics, and an optional decline reason."""
         impacted: set[str] = set()
@@ -150,7 +152,10 @@ class CoverageSelector:
                     no_diff,
                     f"no usable diff: {path}",
                 )
-            lines = iter_diff_post_line_numbers(diff)
+            selection_diff = (
+                selection_diffs.get(path, diff) if selection_diffs is not None else diff
+            )
+            lines = iter_diff_post_line_numbers(selection_diff)
             qualnames, ok = qualnames_for_lines(source, lines)
             if not ok:
                 return (
@@ -161,15 +166,27 @@ class CoverageSelector:
                     f"unparsable source: {path}",
                 )
             if not lines:
-                continue  # comment / blank only: nothing executable changed, so nothing runs
+                continue  # selection diff has no remaining executable edits
             import_executed = import_executed_qualnames(source)
-            closures = closure_attributed_qualnames(source, lines)
             dependencies = analyze_python_changes(
                 source,
                 lines,
-                iter_diff_deleted_post_lines(diff),
+                iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
+            if dependencies.new_class_bindings:
+                # Every method of an added data class is reached through a
+                # consumer of that new class binding. Its declaration has no
+                # old rows; resolve the class and its methods through those
+                # consumers together with the other module-level changes.
+                qualnames = {
+                    qualname
+                    for qualname in qualnames
+                    if not any(
+                        qualname == name or qualname.startswith(name + ".")
+                        for name in dependencies.new_class_bindings
+                    )
+                } | {"<module>"}
             import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
@@ -198,15 +215,16 @@ class CoverageSelector:
                                 why,
                             )
                         impacted |= target_tests
-                        # A binding that did not exist in the pre-image cannot
-                        # be an existing external dependency.  Keep the
-                        # repository-wide fail-closed check for every removed
-                        # or rebound name, while bounding pure imports and
-                        # declarations through their targets and consumers.
+                        # Bound new imports and functions through their targets
+                        # and consumers. New class names also retain the external
+                        # reference check, including reflective module consumers.
                         checked_bindings = (
                             dependencies.changed_bindings
                             - dependencies.new_import_bindings
-                            - dependencies.new_declaration_bindings
+                            - (
+                                dependencies.new_declaration_bindings
+                                - dependencies.new_class_bindings
+                            )
                         )
                         external_paths: dict[str, set[str]] = {}
                         if self._external_reference_paths is not None:
@@ -281,13 +299,6 @@ class CoverageSelector:
                                 if bounded:
                                     caller_bounded.add(f"{cf}::{consumer}")
                         import_resolved = True
-                    continue
-                if qualname in closures:
-                    tests = self._underrecorded_bound(cf, qualname)
-                    if tests is None:
-                        why = f"closure change, no wider row set: {path}::{qualname}"
-                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
-                    impacted |= tests
                     continue
                 tests, bounded, limitation = self._qualname_impact(
                     cf,
@@ -516,13 +527,6 @@ class CoverageSelector:
             bound |= transitive
         return bound or None, None
 
-    def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
-        """File row set when it is wider than a closure's enclosing qualname's, else None."""
-        file_tests = self.db.tests_touching_file(cf)
-        if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
-            return file_tests
-        return None
-
     def _no_data_fallback(self, cf: str) -> set[str]:
         """Tests to force-run for a changed function the DB never captured."""
         if self._no_data_policy == "file":
@@ -537,8 +541,14 @@ class CoverageSelector:
         except (OSError, UnicodeDecodeError):
             return None
 
-    def decide(self, residual_files: list[str], diffs: dict[str, str]) -> CoverageResult:
-        """Decide over residual files; ok=False for non-core, not-in-DB, or import-executed changes."""
+    def decide(
+        self,
+        residual_files: list[str],
+        diffs: dict[str, str],
+        *,
+        selection_diffs: dict[str, str] | None = None,
+    ) -> CoverageResult:
+        """Resolve impact from raw source images and optional executable selection diffs."""
         for path in residual_files:
             # Gate on the repo path: canon() matches `tensorrt_llm/` anywhere.
             if not (path.endswith(".py") and path.startswith("tensorrt_llm/")):
@@ -550,7 +560,7 @@ class CoverageSelector:
                 )
 
         impacted_tests, no_data_funcs, caller_bounded_funcs, no_diff_files, decline = (
-            self._impacted_tests(residual_files, diffs)
+            self._impacted_tests(residual_files, diffs, selection_diffs)
         )
         if decline is not None:
             return CoverageResult(ok=False, reason=decline, no_diff_files=no_diff_files)

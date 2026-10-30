@@ -28,9 +28,10 @@ import pytest
 import tensorrt_llm._torch.disaggregation.native.transfer as transfer_mod
 import tensorrt_llm._torch.disaggregation.transceiver as transceiver_mod
 from tensorrt_llm import DisaggregatedParams
-from tensorrt_llm._torch.disaggregation.base import CacheExtent, CacheKind, Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import CacheKind, TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus, WaitResult
 from tensorrt_llm._torch.disaggregation.native.bounce.core import TransferContext
+from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.transfer import (
     AgentResult,
     KVRecvTask,
@@ -2488,6 +2489,8 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     receiver._recv_sessions = {}
     receiver._recv_reqs = {}
     receiver._kv_size_rank_factor = 1
+    receiver._page_table = None
+    receiver._mapping = SimpleNamespace(cp_size=1)
 
     recv_tasks = []
 
@@ -2500,7 +2503,6 @@ def test_fp4_mla_bridge_roots_send_and_receive_requests_before_admission() -> No
     )
     receiver._transfer_worker = SimpleNamespace(create_rx_session=Mock(return_value=recv_session))
     receiver._create_cache_extent = Mock(return_value=CacheExtent(name=rid, local=kv_slice))
-    receiver._chunk_num_bytes = Mock(return_value=0)
 
     receiver.request_and_receive_async(recv_req)
 

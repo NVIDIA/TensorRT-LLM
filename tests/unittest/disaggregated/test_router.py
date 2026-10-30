@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import asyncio
+import base64
 import copy
+import os
 import random
 import threading
 from pathlib import Path
@@ -11,31 +13,38 @@ from unittest import mock
 
 import aiohttp
 import msgpack
+import numpy as np
 import pytest
+from llmapi.apps.render_helpers import use_harmony_vocab
+from utils.llm_data import llm_datasets_root, llm_models_root
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
-from tensorrt_llm.runtime.kv_cache_hash import (get_cache_salt_id,
-                                                hash_v1_block_key,
+from tensorrt_llm.runtime.kv_cache_hash import (hash_v1_block_key,
                                                 truncate_sha256_hash_to_int64)
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    ReuseScope, sequence_to_blockchain_keys)
+    KVCacheEventManager, ReuseScope, sequence_to_blockchain_keys)
 # yapf: disable
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionToolsParam,
                                                 CompletionRequest,
                                                 ConversationParams,
                                                 DisaggregatedParams,
-                                                FunctionDefinition)
-from tensorrt_llm.serve.router import (COORDINATOR_SELECT_MAX_ATTEMPTS,
+                                                FunctionDefinition,
+                                                ResponsesRequest)
+from tensorrt_llm.serve.responses_utils import request_preprocess
+from tensorrt_llm.serve.router import (CONVERSATION_CONTENT_STRIDE,
+                                       COORDINATOR_SELECT_MAX_ATTEMPTS,
                                        KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
-                                       BlockHashMixin, ConversationRouter,
+                                       ROUTING_CONTENT_REQUIRED, BlockHashMixin,
+                                       ConversationRouter,
                                        CoordinatorDelegatingRouter,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
-                                       block_key_hasher, create_router)
+                                       block_key_hasher, create_router,
+                                       responses_request_text)
 
 # yapf: enable
 
@@ -500,18 +509,18 @@ def test_v2_sha256_64_block_hashes_match_truncated_kv_cache_manager_v2(servers):
     assert all(isinstance(block_hash, int) for block_hash in block_hashes[0])
 
 
-def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
+@pytest.mark.parametrize("cache_salt", ["", "tenant-a", "租户", "a\0b"])
+def test_cache_aware_router_block_hashes_include_cache_salt(
+        servers, cache_salt):
     tokens_per_block = 4
-    cache_salt_id = 123
+    cache_salt_id = KVCacheEventManager._hash_cache_salt(cache_salt)
     token_lists = [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=tokens_per_block)
 
     salted_v1_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V1,
-        cache_salt_id=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V1, cache_salt=cache_salt)
     expected_v1_block_hashes = []
     parent_hash = None
     for t in range(0, len(token_lists[0]) - 1, tokens_per_block):
@@ -523,10 +532,8 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         expected_v1_block_hashes.append(parent_hash)
 
     salted_v2_block_hashes = router._compute_block_hashes(
-        token_lists,
-        hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
-    reuse_scope = ReuseScope(salt=cache_salt_id)
+        token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2, cache_salt=cache_salt)
+    reuse_scope = ReuseScope(salt=cache_salt)
     expected_v2_block_hashes = [
         block_key.hex()
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -536,7 +543,7 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
     salted_v2_64_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64,
-        cache_salt_id=cache_salt_id)
+        cache_salt=cache_salt)
     expected_v2_64_block_hashes = [
         truncate_sha256_hash_to_int64(block_key)
         for token_block, block_key in sequence_to_blockchain_keys(
@@ -552,16 +559,6 @@ def test_cache_aware_router_block_hashes_include_cache_salt_id(servers):
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     assert salted_v2_64_block_hashes != router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2_SHA256_64)
-
-
-def test_cache_salt_id_derivation_matches_worker_path():
-    from tensorrt_llm.inputs.utils import \
-        get_cache_salt_id as worker_get_cache_salt_id
-
-    assert get_cache_salt_id("abc") == 3697813978277427044
-    assert get_cache_salt_id("tenant-a") == get_cache_salt_id("tenant-a")
-    assert get_cache_salt_id("tenant-a") != get_cache_salt_id("tenant-b")
-    assert get_cache_salt_id("tenant-a") == worker_get_cache_salt_id("tenant-a")
 
 
 @pytest.mark.asyncio
@@ -666,8 +663,7 @@ async def test_kv_cache_aware_router_routes_to_v2_server(servers):
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_routes_with_cache_salt(
-        servers, monkeypatch):
+async def test_kv_cache_aware_router_routes_with_cache_salt(servers):
 
     class SaltedRequest:
         model = "TinyLlama"
@@ -677,15 +673,12 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
             self.prompt = prompt
 
     tokens_per_block = 4
-    cache_salt_id = 123
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block)
-    monkeypatch.setattr("tensorrt_llm.serve.router_utils.get_cache_salt_id",
-                        lambda cache_salt: cache_salt_id)
     for server in servers:
         router._server_info[server] = {
             "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2
@@ -694,7 +687,7 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
     salted_block_hashes = router._compute_block_hashes(
         token_lists,
         hash_algo=KV_CACHE_HASH_ALGO_V2,
-        cache_salt_id=cache_salt_id)
+        cache_salt=SaltedRequest.cache_salt)
     unsalted_block_hashes = router._compute_block_hashes(
         token_lists, hash_algo=KV_CACHE_HASH_ALGO_V2)
     salted_server = servers[1]
@@ -1829,6 +1822,402 @@ async def test_conversation_router_hash_skip_count():
     assert sb2 != sa2, "With skip, different content should not match"
 
 
+# ── ConversationRouter: placement of new conversation_ids by content ──
+
+# 16-token hash blocks; a new conversation follows a match of >= 16 blocks.
+_NEW_CONV_ARGS = dict(tokens_per_block=16, new_conversation_min_match_blocks=16)
+_SHARED_PREFIX = list(range(1000, 1256))  # 16 blocks of 16 tokens
+
+
+def _conv_token_request(conversation_id, tokens):
+    return CompletionRequest(
+        model="TinyLlama",
+        prompt=list(tokens),
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
+        conversation_params=ConversationParams(conversation_id=conversation_id))
+
+
+def _count_hashing(router):
+    calls = []
+    original = router._conversation_content_hashes
+
+    def counting(request):
+        calls.append(request.conversation_params.conversation_id)
+        return original(request)
+
+    router._conversation_content_hashes = counting
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_new_conversation_follows_matching_prefix():
+    """A new conversation_id follows the longest matching conversation.
+
+    It joins that conversation's server even when the server is the busiest.
+    """
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    server_a, _ = await router.get_next_server(sibling_a)
+
+    # Unrelated conversation: least-loaded, i.e. not the busy server_a.
+    other = _conv_token_request("t2", list(range(5000, 5300)))
+    server_other, _ = await router.get_next_server(other)
+    assert server_other != server_a
+
+    # Sibling sharing 16 blocks: follows server_a although it is loaded.
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
+    server_b, _ = await router.get_next_server(sibling_b)
+    assert server_b == server_a
+
+    # A shorter shared prefix (8 blocks < 16) falls back to least-loaded.
+    short = _conv_token_request("t::sa:c", _SHARED_PREFIX[:128] + [3] * 200)
+    server_short, _ = await router.get_next_server(short)
+    assert server_short not in (server_a, server_other)
+
+    # An excluded match server is skipped.
+    sibling_d = _conv_token_request("t::sa:d", _SHARED_PREFIX + [4] * 40)
+    server_d, _ = await router.get_next_server(sibling_d,
+                                               exclude_server=server_a)
+    assert server_d != server_a
+
+    for request in (sibling_a, other, sibling_b, short, sibling_d):
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_shared_preamble_does_not_pin_new_conversations(
+):
+    """A preamble that every conversation shares spreads them over servers.
+
+    The first follower of a single conversation still joins it; once the
+    preamble is shared by more than a 1/N share of the remembered
+    conversations, new conversations go to the least-loaded server.
+    """
+    servers = ["server1", "server2", "server3", "server4"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    requests = [
+        _conv_token_request(f"conv-{index}", _SHARED_PREFIX + [index + 1] * 200)
+        for index in range(16)
+    ]
+    placed = [(await router.get_next_server(request))[0]
+              for request in requests]
+    assert placed[1] == placed[0]
+    counts = {server: placed.count(server) for server in servers}
+    assert max(counts.values()) <= 5, counts
+    assert min(counts.values()) >= 3, counts
+    for request in requests:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_follows_conversation_specific_prefix():
+    """A prefix that belongs to one conversation family is followed.
+
+    All conversations share a system prompt, which does not pin them, but a
+    new conversation_id that extends the content of exactly one earlier
+    conversation follows it, and so does a second sibling while the family
+    stays within a 1/N share of the remembered conversations.
+    """
+    servers = ["server1", "server2", "server3", "server4"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    roots = [
+        _conv_token_request(f"root-{index}",
+                            _SHARED_PREFIX + [index + 1] * 256 + [0] * 40)
+        for index in range(8)
+    ]
+    root_servers = [(await router.get_next_server(request))[0]
+                    for request in roots]
+    assert len(set(root_servers)) == len(servers)
+
+    family_prefix = _SHARED_PREFIX + [4] * 256
+    sibling_1 = _conv_token_request("root-3::sub-1",
+                                    family_prefix + [100] * 256)
+    sibling_2 = _conv_token_request("root-3::sub-2",
+                                    family_prefix + [200] * 256)
+    assert (await router.get_next_server(sibling_1))[0] == root_servers[3]
+    assert (await router.get_next_server(sibling_2))[0] == root_servers[3]
+    for request in roots + [sibling_1, sibling_2]:
+        await router.finish_request(request)
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_hashes_only_new_conversations():
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    calls = _count_hashing(router)
+
+    first = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 8)
+    server, _ = await router.get_next_server(first)
+    await router.finish_request(first)
+    assert calls == ["conv-a"]
+    for turn in range(3):
+        request = _conv_token_request("conv-a",
+                                      _SHARED_PREFIX + [1] * (16 + turn))
+        assert (await router.get_next_server(request))[0] == server
+        await router.finish_request(request)
+    assert calls == ["conv-a"], "known conversation_ids must not be hashed"
+
+    # Disabled: explicit conversation_ids are never hashed.
+    disabled = ConversationRouter(server_role=None,
+                                  servers=servers,
+                                  new_conversation_min_match_blocks=0)
+    disabled_calls = _count_hashing(disabled)
+    for conv_id in ("conv-a", "conv-b"):
+        request = _conv_token_request(conv_id, _SHARED_PREFIX)
+        await disabled.get_next_server(request)
+        await disabled.finish_request(request)
+    assert disabled_calls == []
+    assert not disabled._conv_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("router_args", "shared_blocks", "follows"),
+    [
+        ({
+            "new_conversation_min_match_blocks": 24
+        }, 16, False),
+        ({
+            "new_conversation_min_match_blocks": 24
+        }, 24, True),
+        # The default threshold is 32 blocks.
+        ({}, 24, False),
+        ({}, 32, True),
+    ],
+    ids=["custom-below", "custom-met", "default-below", "default-met"])
+async def test_conversation_router_new_conversation_min_match_blocks(
+        router_args, shared_blocks, follows):
+    """A new conversation_id follows a prefix match that meets the threshold.
+
+    A shorter match falls back to the least-loaded server.
+    """
+    router = create_router(
+        RouterConfig(type="conversation",
+                     args={
+                         "tokens_per_block": 16,
+                         **router_args
+                     }), ["server1", "server2"])
+    prefix = list(range(1000, 1000 + 16 * shared_blocks))
+    first = _conv_token_request("t::sa:a", prefix + [1] * 40)
+    server_a, _ = await router.get_next_server(first)
+
+    # server_a is busier, so a fallback picks the other server.
+    sibling = _conv_token_request("t::sa:b", prefix + [2] * 40)
+    server_b, _ = await router.get_next_server(sibling)
+    assert (server_b == server_a) is follows
+
+
+def test_conversation_router_rejects_a_negative_min_match():
+    with pytest.raises(ValueError):
+        ConversationRouter(server_role=None,
+                           servers=["s"],
+                           new_conversation_min_match_blocks=-1)
+
+
+def _conv_text_request(conversation_id, text):
+    return CompletionRequest(
+        model="TinyLlama",
+        prompt=text,
+        disaggregated_params=DisaggregatedParams(request_type="context_only"),
+        conversation_params=ConversationParams(conversation_id=conversation_id))
+
+
+def _common_prefix_len(a, b):
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def test_conversation_content_keys_chain_over_the_prefix():
+    """Each content key covers the whole prefix up to its chunk."""
+    # tokens_per_block=4: one key per 32 code points.
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    base = "".join(chr(0x41 + i % 26) for i in range(100))
+    keys = router._conversation_content_hashes(_conv_text_request("a", base))
+    assert len(keys) == 3
+    longer = router._conversation_content_hashes(
+        _conv_text_request("b", base + "z" * 64))
+    assert len(longer) == 5 and longer[:3] == keys
+    changed = router._conversation_content_hashes(
+        _conv_text_request("c", "#" + base[1:]))
+    assert all(x != y for x, y in zip(changed, keys))
+
+
+def test_conversation_content_keys_are_stable():
+    """Workers and the coordinator of a two-step setup compare these keys."""
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    text = "".join(chr(0x61 + i % 26) for i in range(64))
+    text_keys = router._conversation_content_hashes(
+        _conv_text_request("a", text))
+    assert text_keys == [0x6036382F7AB6B531, 0x1F704CBF233854E5]
+    token_keys = router._conversation_content_hashes(
+        _conv_token_request("b", list(range(64))))
+    assert token_keys == [0x88A907F253DA0B03, 0xC684840ED9185A7A]
+
+
+def test_conversation_content_keys_follow_the_hashed_input():
+    """Token ids when the request carries them; hash_skip_count is applied."""
+    tokens = list(range(1000, 1100))
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    skipping = ConversationRouter(server_role=None,
+                                  servers=["s"],
+                                  tokens_per_block=4,
+                                  hash_skip_count=4)
+    keys = router._conversation_content_hashes(
+        _conv_token_request("a", tokens[4:]))
+    assert len(keys) == 3
+    assert skipping._conversation_content_hashes(
+        _conv_token_request("b", tokens)) == keys
+    text = "".join(chr(0x41 + i % 26) for i in range(120))
+    skip = 4 * ConversationRouter.CHAR_PER_TOKEN
+    assert skipping._conversation_content_hashes(_conv_text_request(
+        "c", text)) == router._conversation_content_hashes(
+            _conv_text_request("d", text[skip:]))
+
+
+def test_conversation_content_keys_match_as_deep_as_block_hashes():
+    """A pair shares as many content keys as strided block hashes."""
+    rng = random.Random(7)
+    stride = CONVERSATION_CONTENT_STRIDE
+    router = ConversationRouter(server_role=None,
+                                servers=["s"],
+                                tokens_per_block=4)
+    for _ in range(50):
+        prefix = [rng.randrange(1, 50000) for _ in range(rng.randrange(0, 600))]
+        tail = [rng.randrange(1, 50000) for _ in range(200)]
+        a = _conv_token_request("a", prefix + tail)
+        b = _conv_token_request("b", prefix + [tail[0] + 1] + tail[1:])
+        old = _common_prefix_len(
+            router._request_to_block_hashes(a)[stride - 1::stride],
+            router._request_to_block_hashes(b)[stride - 1::stride],
+        )
+        new = _common_prefix_len(router._conversation_content_hashes(a),
+                                 router._conversation_content_hashes(b))
+        assert new == old
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_content_memory_is_bounded(monkeypatch):
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.router."
+        "CONVERSATION_CONTENT_CACHE_SIZE", 2)
+    servers = ["server1", "server2"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    for index in range(3):
+        request = _conv_token_request(f"conv-{index}",
+                                      [index] * 128 + _SHARED_PREFIX)
+        await router.get_next_server(request)
+        await router.finish_request(request)
+    assert list(router._conv_content) == ["conv-1", "conv-2"]
+    assert len(router._conv_content_trie._root.children) == 2
+
+    # Removing a server forgets the content of its conversations.
+    server_1 = router._session_table["conv-1"][0]
+    await router.remove_server(server_1)
+    assert "conv-1" not in router._conv_content
+    assert (len(router._conv_content_trie._root.children) == len(
+        router._conv_content))
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_by_key_requests_content_for_new_ids():
+    """Coordinator path: new conversation_ids are placed by content.
+
+    A new conversation_id is placed only once the worker sends its content;
+    known ids are routed by id alone.
+    """
+    servers = ["server1", "server2", "server3"]
+    router = ConversationRouter(server_role=None,
+                                servers=servers,
+                                **_NEW_CONV_ARGS)
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
+
+    key = router.routing_key(sibling_a)
+    assert key == "t::sa:a"
+    server, info, req_id = await router.get_next_server_by_key(key, req_id=1)
+    assert server is None and req_id == 1
+    assert info == {ROUTING_CONTENT_REQUIRED: True}
+    assert sum(router._server_content_load.values()) == 0
+    assert "t::sa:a" not in router._session_table
+
+    server_a, _, _ = await router.get_next_server_by_key(
+        router.content_routing_key(sibling_a), req_id=1)
+    assert server_a in servers
+    # Known id: placed from the id alone.
+    again, _, _ = await router.get_next_server_by_key("t::sa:a", req_id=2)
+    assert again == server_a
+
+    content_key = router.content_routing_key(sibling_b)
+    assert content_key["conversation_id"] == "t::sa:b"
+    server_b, _, _ = await router.get_next_server_by_key(content_key, req_id=3)
+    assert server_b == server_a
+
+    # Disabled: the id alone always places.
+    disabled = ConversationRouter(server_role=None,
+                                  servers=servers,
+                                  new_conversation_min_match_blocks=0)
+    server, _, _ = await disabled.get_next_server_by_key("t::sa:a", req_id=4)
+    assert server in servers
+
+
+@pytest.mark.asyncio
+async def test_coordinator_delegating_router_repeats_select_with_content():
+    local_router = ConversationRouter(server_role=None,
+                                      servers=["server1"],
+                                      **_NEW_CONV_ARGS)
+    router = CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                         "context")
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(side_effect=[
+        _msgpack_response(200, {
+            "server": None,
+            "info": {
+                ROUTING_CONTENT_REQUIRED: True
+            },
+            "req_id": 5
+        }),
+        _msgpack_response(200, {
+            "server": "server1",
+            "info": {},
+            "req_id": 5
+        }),
+    ])
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    request = _conv_token_request("conv-a", _SHARED_PREFIX)
+    server, _ = await router.get_next_server(request, req_id=5)
+
+    assert server == "server1"
+    keys = [
+        msgpack.unpackb(call.kwargs["data"], raw=False)["routing_key"]
+        for call in session.post.call_args_list
+    ]
+    assert keys == ["conv-a", local_router.content_routing_key(request)]
+
+
 @pytest.mark.asyncio
 async def test_kv_cache_aware_router_polls_kv_cache_events(
         servers, mock_aiohttp_session):
@@ -1882,7 +2271,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
     tokenize prompts differently from the rest of TRT-LLM when computing
     block hashes for cache hits. The request's model is client-controlled, so
     it must not enable remote tokenizer code unless an operator configured a
-    fixed tokenizer directory.
+    fixed tokenizer directory. The router loads through ``load_hf_tokenizer``,
+    the loader a worker uses, so its tokenizer options (and rendering
+    fingerprint) are the worker's.
     """
 
     class _Probe(BlockHashMixin):
@@ -1898,7 +2289,11 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=wrapper) as routed:
         out = probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("dummy/model", trust_remote_code=False)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("dummy/model", )
+    assert routed.call_args.kwargs["trust_remote_code"] is False
+    # The worker's loader options, which the fingerprint's tokenizer identity includes.
+    assert routed.call_args.kwargs["legacy"] is False
     # The cached tokenizer must be the raw HF tokenizer used by _tokenize,
     # not the TransformersTokenizer wrapper.
     assert out is inner
@@ -1914,7 +2309,9 @@ def test_block_hash_mixin_routes_through_transformers_tokenizer():
             return_value=fixed_wrapper) as routed:
         fixed_out = fixed_probe._get_tokenizer("dummy/model")
 
-    routed.assert_called_once_with("/trusted/tokenizer", trust_remote_code=True)
+    routed.assert_called_once()
+    assert routed.call_args.args == ("/trusted/tokenizer", )
+    assert routed.call_args.kwargs["trust_remote_code"] is True
     assert fixed_out is fixed_inner
     assert fixed_probe._tokenizers["dummy/model"] is fixed_inner
 
@@ -2002,8 +2399,13 @@ def test_router_model_type_uses_checkpoint_config(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
+async def test_gpt_oss_router_tokens_match_chat_harmony_server_input(
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """KV-cache routing must hash the same Harmony tokens used by the server."""
+    use_harmony_vocab(monkeypatch)
+    from tensorrt_llm.serve.chat_tokenization import \
+        tokenize_harmony_chat_request
+    from tensorrt_llm.serve.harmony_adapter import get_harmony_adapter
     from tensorrt_llm.serve.openai_server import OpenAIServer
 
     router = KvCacheAwareRouter(server_role=None,
@@ -2013,10 +2415,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
                                 tokens_per_block=32,
                                 model_path="/models/gpt-oss-checkpoint")
     router_tokenizer = _mock_tokenizer(token_ids=[900, 901, 902])
-    harmony_tokens = [100, 101, 102, 103]
-    harmony_adapter = mock.MagicMock()
-    harmony_adapter.openai_to_harmony_tokens.return_value = harmony_tokens
-    harmony_adapter.get_stop_tokens.return_value = [42]
+    harmony_adapter = get_harmony_adapter()
     promise = mock.MagicMock()
     promise.prompt_token_ids = []
 
@@ -2037,6 +2436,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     )
     router_request = copy.deepcopy(request)
     server_request = copy.deepcopy(request)
+    harmony_tokens = tokenize_harmony_chat_request(copy.deepcopy(request))
 
     server = OpenAIServer.__new__(OpenAIServer)
     server.allow_request_chat_template = False
@@ -2050,15 +2450,20 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
     server.tokenizer = SimpleNamespace(tokenizer=SimpleNamespace(
         vocab_size=1000))
 
-    with mock.patch.object(
-            router, "_get_tokenizer",
-            return_value=router_tokenizer), mock.patch(
-                "tensorrt_llm.serve.harmony_adapter."
-                "get_harmony_adapter",
-                return_value=harmony_adapter), mock.patch(
-                    "tensorrt_llm.serve.router_utils."
-                    "resolve_model_type_from_config",
-                    return_value="gpt_oss") as resolve_model_type:
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=router_tokenizer), mock.patch(
+                               "tensorrt_llm.serve.router_utils."
+                               "resolve_model_type_from_config",
+                               return_value="gpt_oss") as resolve_model_type:
+        # Tokens are forwarded only to workers that report the router's
+        # rendering fingerprint.
+        router._server_info = {
+            "server1": {
+                "render_fingerprint":
+                router._render_resources(request.model).fingerprint()
+            }
+        }
         router_token_ids = router._tokenize(router_request)[0]
         await server.chat_harmony(server_request, raw_request=None)
 
@@ -2066,9 +2471,7 @@ async def test_gpt_oss_router_tokens_match_chat_harmony_server_input() -> None:
         "inputs"]
     assert router_token_ids == server_token_ids
     assert router_request.prompt_token_ids == harmony_tokens
-    first_call, second_call = harmony_adapter.openai_to_harmony_tokens.call_args_list
-    assert first_call.args == second_call.args
-    assert first_call.kwargs == second_call.kwargs
+    assert server_token_ids == harmony_tokens
     resolve_model_type.assert_called_once_with("/models/gpt-oss-checkpoint")
     router_tokenizer.apply_chat_template.assert_not_called()
 
@@ -2327,6 +2730,11 @@ class _PrefixCacheFakeTokenizer:
 
     _SPECIAL = {"<bos>": 1, "<sys>": 2, "<user>": 3, "<asst>": 4, "<eot>": 5}
 
+    # A stable serialization of the encoding, so the rendering fingerprint can
+    # identify this tokenizer (one without it is never trusted for write-back).
+    backend_tokenizer = SimpleNamespace(
+        to_str=lambda: '{"fake": "prefix-cache"}')
+
     def apply_chat_template(self,
                             messages,
                             add_generation_prompt=False,
@@ -2390,6 +2798,15 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
                                 tokens_per_block=4)
     tok = _PrefixCacheFakeTokenizer()
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
+        # Tokens are forwarded only when every active worker reports the
+        # router's rendering fingerprint.
+        fingerprint = router._render_resources("mock").fingerprint()
+        router._server_info = {
+            server: {
+                "render_fingerprint": fingerprint
+            }
+            for server in servers
+        }
         for convo in _grow_conversation():
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(
@@ -2525,23 +2942,23 @@ _V2_GOLDEN_PARTIAL_TAIL = [
     "2c2a73c72b0bccbf74a5d46d131499ca726b1d2a650836cb548a10fb3c8acf2e",
 ]
 _V2_GOLDEN_SALTED = [
-    "db459ee4f851fc0f200670146f089ab0ec5180332f6e5ef79c89f005da17d385",
-    "4a7983401932bc87d9894dd530d5f5e4aa998d7a71e457d8b6e049669962db4c",
-    "1a5e8d70d15180a91358f33109a4caf41be7bf78597a1263dbaf73a54433aff9",
+    "a4d74f1c7ca3c3fb866d0fb1751a3e4431cc384c95dbe6539b858939667f311c",
+    "dc54b040e0ffc44a80522d97de70e1c399ceaf3d9d48fca3f2acae3de49e15d6",
+    "05267ddc7c6829554466d192b19827fa7be6a1db807a60d89cb6a6978dabed11",
 ]
 
 
 @pytest.mark.parametrize(
-    "tokens,cache_salt_id,expected",
+    "tokens,cache_salt,expected",
     [
         ([1, 2, 3, 4, 5, 6, 7, 8], None, _V2_GOLDEN_BOUNDARY_EXACT),
         ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], None, _V2_GOLDEN_PARTIAL_TAIL),
-        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4242, _V2_GOLDEN_SALTED),
+        ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "4242", _V2_GOLDEN_SALTED),
     ],
     ids=["boundary_exact", "partial_tail", "salted"],
 )
-def test_v2_block_hashes_match_frozen_wire_values(servers, tokens,
-                                                  cache_salt_id, expected):
+def test_v2_block_hashes_match_frozen_wire_values(servers, tokens, cache_salt,
+                                                  expected):
     """Pin the V2 routing hash to fixed values, not to whatever the engine computes.
 
     The other V2 cases here build their expectation with the same
@@ -2556,7 +2973,7 @@ def test_v2_block_hashes_match_frozen_wire_values(servers, tokens,
 
     block_hashes = router._compute_block_hashes([tokens],
                                                 hash_algo=KV_CACHE_HASH_ALGO_V2,
-                                                cache_salt_id=cache_salt_id)
+                                                cache_salt=cache_salt)
 
     assert block_hashes == [expected]
 
@@ -2577,3 +2994,137 @@ def test_v2_sha256_64_block_hashes_are_big_endian_prefix_of_frozen_values(
         for key in _V2_GOLDEN_PARTIAL_TAIL
     ]
     assert block_hashes == [expected]
+
+
+# ── ResponsesRequest routing ──
+
+
+def _message(role: str, content: str) -> dict[str, str]:
+    return {"role": role, "content": content}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("use_harmony", [False, True])
+async def test_kv_cache_aware_router_routes_responses_turns(
+        servers, use_harmony, monkeypatch):
+    """A later turn of a Responses conversation follows its cached prefix."""
+    if use_harmony:
+        # Load the Harmony vocab from the datasets root instead of downloading it.
+        cache_dir = os.path.join(llm_datasets_root(), "tiktoken_vocab")
+        monkeypatch.setenv("TIKTOKEN_RS_CACHE_DIR", cache_dir)
+        monkeypatch.setenv("TIKTOKEN_ENCODINGS_BASE", cache_dir)
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                use_harmony=use_harmony)
+    history = [_message("user", "plan a trip " * 10)]
+    turn1 = ResponsesRequest(model="m", instructions="Be brief.", input=history)
+    turn2 = ResponsesRequest(
+        model="m",
+        instructions="Be brief.",
+        input=history +
+        [_message("assistant", "day one"),
+         _message("user", "add food")])
+    with mock.patch.object(router,
+                           "_get_tokenizer",
+                           return_value=_PrefixCacheFakeTokenizer()):
+        home, _ = await router.get_next_server(turn1)
+        await router.finish_request(turn1)
+        server, info = await router.get_next_server(turn2)
+    assert server == home and info["match_length"] > 0
+    # Routing ids are not stored on the request: the context worker renders
+    # the prompt itself.
+    assert turn1.prompt_token_ids is None
+    if use_harmony:
+        worker_ids, _ = await request_preprocess(turn2,
+                                                 None,
+                                                 None,
+                                                 enable_store=False,
+                                                 use_harmony=True)
+        assert router._tokenize(turn2) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_responses_routing_tokens_match_the_worker_for_a_developer_message(
+        servers):
+    """Qwen3's chat template has no developer role; both sides render it as system."""
+    from transformers import AutoConfig
+
+    from tensorrt_llm.tokenizer import tokenizer_factory
+
+    model_dir = os.path.join(llm_models_root(), "Qwen3", "Qwen3-0.6B")
+    router = KvCacheAwareRouter(server_role=None,
+                                servers=servers,
+                                tokens_per_block=4,
+                                tokenizer_dir=model_dir,
+                                use_harmony=False)
+    request = ResponsesRequest(model="m",
+                               input=[
+                                   _message("developer", "Answer in French."),
+                                   _message("user", "plan a trip")
+                               ])
+    worker_ids, _ = await request_preprocess(
+        request,
+        None,
+        None,
+        enable_store=False,
+        use_harmony=False,
+        tokenizer=tokenizer_factory(model_dir),
+        model_config=AutoConfig.from_pretrained(model_dir))
+    assert router._tokenize(request) == [worker_ids]
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_tells_responses_conversations_apart():
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2", "server3"])
+    home_a, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic A " * 200))
+    home_b, _ = await router.get_next_server(
+        ResponsesRequest(model="m", input="topic B " * 200))
+    later_a = ResponsesRequest(model="m",
+                               input=[
+                                   _message("user", "topic A " * 200),
+                                   _message("assistant", "done"),
+                                   _message("user", "again")
+                               ])
+    assert home_b != home_a
+    assert (await router.get_next_server(later_a))[0] == home_a
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("relay",
+                         [None, "prompt_token_ids", "prompt_token_ids_b64"])
+async def test_responses_request_relayed_prompt_token_ids(relay):
+    """Routers use relayed prompt ids, plain or base64, and count the text without them."""
+    token_ids = list(range(40))
+    request = ResponsesRequest(
+        model="m",
+        input="hello " * 10,
+        disaggregated_params=DisaggregatedParams(
+            request_type="generation_only" if relay else "context_only"))
+    if relay == "prompt_token_ids_b64":
+        request.prompt_token_ids_b64 = base64.b64encode(
+            np.asarray(token_ids, dtype=np.int32).tobytes()).decode()
+    elif relay:
+        request.prompt_token_ids = token_ids
+    relayed = [token_ids] if relay else None
+
+    router = LoadBalancingRouter(server_role=None,
+                                 servers=["server1"],
+                                 use_tokens=True)
+    await router.get_next_server(request)
+    assert router._server_state["server1"]._num_active_tokens == (
+        len(token_ids) if relay else len(responses_request_text(request)))
+    await router.finish_request(request)
+    assert router._server_state["server1"]._num_active_tokens == 0
+    assert ConversationRouter._try_extract_token_ids(request) == relayed
+    if relay:
+        kv_router = KvCacheAwareRouter(server_role=None, servers=["server1"])
+        with mock.patch.object(kv_router,
+                               "_get_tokenizer",
+                               side_effect=AssertionError):
+            assert kv_router._tokenize(request) == relayed
+    # A base64 relay is decoded for routing, not expanded onto the request.
+    assert request.prompt_token_ids == (token_ids if relay == "prompt_token_ids"
+                                        else None)

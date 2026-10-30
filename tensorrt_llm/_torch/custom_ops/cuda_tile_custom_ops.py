@@ -23,15 +23,17 @@ from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 if IS_CUDA_TILE_AVAILABLE:
     import cuda.tile as ct
 
-    from ..cuda_tile_kernels import (
-        rms_norm_fuse_residual_kernel,
-        rms_norm_fuse_residual_kernel_gather,
-        rms_norm_fuse_residual_kernel_static_persistent,
+    from ..cuda_tile_utils import ceil_div, next_power_of_2
+    from ..kernels.rms_norm import (
         rms_norm_kernel,
         rms_norm_kernel_gather,
         rms_norm_kernel_static_persistent,
     )
-    from ..cuda_tile_utils import ceil_div, next_power_of_2
+    from ..kernels.rms_norm_fuse_residual import (
+        rms_norm_fuse_residual_kernel,
+        rms_norm_fuse_residual_kernel_gather,
+        rms_norm_fuse_residual_kernel_static_persistent,
+    )
 
     @torch.library.custom_op("trtllm::cuda_tile_rms_norm", mutates_args=())
     def cuda_tile_rms_norm(

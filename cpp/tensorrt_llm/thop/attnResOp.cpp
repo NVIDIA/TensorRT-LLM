@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <torch/library.h>
 
+#include <limits>
 #include <optional>
 #include <tuple>
 
@@ -296,6 +297,9 @@ std::tuple<at::Tensor, at::Tensor> attn_res_add_rmsnorm_persistent_fwd(at::Tenso
     // Unlike the per-token kernels there is no N == 1 form: the persistent
     // kernel always mixes at least one snapshot with the layer residual.
     TORCH_CHECK(N >= 2 && N <= 9, "attn_res_add_rmsnorm_persistent_fwd: supported N values are [2, 9], got ", N);
+    // AttnResFwdParams carries T as int; the launcher bounds it further by its grid size.
+    TORCH_CHECK(T <= std::numeric_limits<int>::max(), "attn_res_add_rmsnorm_persistent_fwd: T=", T,
+        " does not fit the kernel's int token count");
     TORCH_CHECK(layer_residual.scalar_type() == at::kBFloat16
             && (!has_add || layer_residual_add->scalar_type() == at::kBFloat16)
             && block_residual.scalar_type() == at::kBFloat16 && res_weight.scalar_type() == at::kBFloat16

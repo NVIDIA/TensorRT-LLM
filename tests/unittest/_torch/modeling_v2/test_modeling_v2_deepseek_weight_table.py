@@ -2,13 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """deepseek's weight table declares what the hand-written code did.
 
-The declaration reference below is a transcription of the __init__ block the table
-replaced. The checkpoint-key side was proven differently: while the hand-written
-`_manifest` still existed, a test compared the generated manifest against it, per key
-and per source, with MTP on and off -- green in CI job 1081689 -- and both the
-function and that test were deleted together. One renaming was deliberate: the
-hand-written manifest called the MTP module's rows `mtp_*`; the table addresses it as
-layer `num_hidden_layers`, which is what the checkpoint calls it, so they are `l61_*`.
+The declaration reference below is a transcription of the __init__ block the first
+(dep4) table replaced, held against the default table at the dep4 layout -- attention
+DP with the experts split four ways, where nothing but the expert window is per rank,
+so the hand-written block is that layout's declaration exactly. The checkpoint-key side
+was proven differently: while the hand-written `_manifest` still existed, a test
+compared the generated manifest against it, per key and per source, with MTP on and off
+-- green in CI job 1081689 -- and both the function and that test were deleted
+together. One renaming was deliberate: the hand-written manifest called the MTP
+module's rows `mtp_*`; the table addresses it as layer `num_hidden_layers`, which is
+what the checkpoint calls it, so they are `l61_*`.
 
 No GPU: nothing here allocates, and `dims` reads `model_config` alone.
 """
@@ -22,7 +25,7 @@ import torch
 
 __extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_103__dep4 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.deepseek_v3.r1_0528_nvfp4__sm_10x__default import (  # noqa: E501
     weights as W,
 )
 
@@ -43,31 +46,40 @@ _CFG = dict(
     moe_intermediate_size=2048,
     n_shared_experts=1,
     intermediate_size=18432,
+    num_nextn_predict_layers=1,
 )
 _EP_SIZE, _EP_RANK = 4, 1
 
 
 def _core(mtp: bool):
-    """The configuration surface both manifests read.
+    """The configuration surface the table reads, at the dep4 layout: attention DP over
+    four ranks, the experts split four ways, this rank the second.
 
-    `local_experts` and `expert_offset` are set on the core by its `__init__` and read
-    by the hand-written manifest; `dims` derives the same two from the mapping, so the
-    comparison also checks that those two derivations agree.
+    `dims` derives the expert window from the mapping; the reference below hard-codes
+    the hand-written `local_experts`, so the comparison also checks that the two agree.
     """
     cfg = SimpleNamespace(**_CFG)
-    mapping = SimpleNamespace(moe_ep_size=_EP_SIZE, moe_ep_rank=_EP_RANK)
-    local = _CFG["n_routed_experts"] // _EP_SIZE
-    return SimpleNamespace(
+    mapping = SimpleNamespace(
+        world_size=_EP_SIZE,
+        rank=_EP_RANK,
+        tp_size=_EP_SIZE,
+        tp_rank=_EP_RANK,
+        enable_attention_dp=True,
+        moe_tp_size=1,
+        moe_tp_rank=0,
+        moe_ep_size=_EP_SIZE,
+        moe_ep_rank=_EP_RANK,
+    )
+    core = SimpleNamespace(
         model_config=SimpleNamespace(
             pretrained_config=cfg,
             mapping=mapping,
             torch_dtype=torch.bfloat16,
             spec_config=object() if mtp else None,
         ),
-        local_experts=local,
-        expert_offset=local * _EP_RANK,
-        mtp_enabled=mtp,
     )
+    core.dims = W.MODEL_WEIGHTS.dims(core)
+    return core
 
 
 @pytest.mark.parametrize("mtp", [False, True], ids=["no_mtp", "mtp"])
@@ -182,8 +194,9 @@ def _reference_declaration(mtp: bool) -> dict:
 def test_the_table_declares_what_the_init_block_did(mtp):
     """Shape and dtype per key, so a failure names the weight that drifted."""
     core = _core(mtp)
-    got = W.MODEL_WEIGHTS.declare(W.MODEL_WEIGHTS.dims(core))
-    want = _reference_declaration(mtp)
+    with torch.device("meta"):
+        got = W.MODEL_WEIGHTS.declare(core.dims)
+        want = _reference_declaration(mtp)
     assert set(got.keys()) == set(want.keys())
     for key in sorted(want):
         assert tuple(got[key].shape) == tuple(want[key].shape), key

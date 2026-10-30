@@ -61,6 +61,14 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import (
 from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
     transform_local_topk_and_prepare_pool_view_grouped,
 )
+from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
+    use_cute_dsl_paged_mqa_logits as resolve_cute_dsl_paged_mqa_logits,
+)
+from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
+from tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend import (
+    DSAVanillaAttention,
+    DSAVanillaIndexer,
+)
 from tensorrt_llm._torch.attention.backends.sparse.params import use_self_sampling_gvr
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -88,6 +96,8 @@ from tensorrt_llm.quantization.utils import fp8_utils
 __extra_import_path__ = ["..", "~/tests/unittest"]
 
 from utils.util import check_accuracy, skip_pre_blackwell, skip_pre_hopper
+
+from ._indexer_reference import mqa_logits, paged_mqa_logits
 
 
 def has_deep_gemm():
@@ -129,6 +139,489 @@ def _set_torch_top_k(indexer: Indexer) -> None:
         decode_implementation=TopKImplementation.TORCH,
         compress_ratio=indexer.compress_ratio,
     )
+
+
+def test_vanilla_indexer_q_projection_supports_fp8_qdq_weight():
+    qr = torch.tensor([[0.25, -0.5, 0.75, -1.0]], dtype=torch.float32)
+    input_scale = torch.tensor(0.125)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor([[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]], dtype=torch.float32).to(
+        torch.float8_e4m3fn
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8(qr, input_scale)
+    expected = torch.nn.functional.linear(qdq_qr, weight.float() * weight_scale)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_uses_linear_dtype_for_prequantized_input():
+    input_scale = torch.tensor(0.125)
+    qr = torch.tensor([[2.0, -4.0, 6.0, -8.0]], dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor(0.25)
+    weight = torch.tensor(
+        [[1.0, -2.0, 3.0, -4.0], [4.0, 3.0, -2.0, -1.0]],
+        dtype=torch.float8_e4m3fn,
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=input_scale,
+        force_dynamic_quantization=False,
+        in_features=4,
+        out_features=2,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    expected = torch.nn.functional.linear(
+        (qr.float() * input_scale).to(torch.bfloat16),
+        (weight.float() * weight_scale).to(torch.bfloat16),
+    )
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "sm_version,use_cute_dsl,disable_deep_gemm,rubin_available,int32_scale,expected_ue8m0",
+    [
+        (90, False, False, True, False, False),
+        (100, False, False, True, False, True),
+        (100, True, False, True, False, False),
+        (100, False, True, True, False, False),
+        (103, False, False, True, False, True),
+        (103, True, False, True, False, False),
+        (107, False, False, True, False, True),
+        (107, True, False, True, False, True),
+        (107, False, True, True, False, True),
+        (107, True, False, False, False, False),
+        (120, False, False, True, False, True),
+        (90, False, False, True, True, True),
+    ],
+)
+def test_vanilla_indexer_q_projection_supports_fp8_block_weight(
+    monkeypatch,
+    sm_version,
+    use_cute_dsl,
+    disable_deep_gemm,
+    rubin_available,
+    int32_scale,
+    expected_ue8m0,
+):
+    import tensorrt_llm._torch.attention.backends.sparse.dsa.vanilla_backend as vanilla_mod
+    import tensorrt_llm._torch.modules.linear as linear_mod
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+    monkeypatch.setattr(vanilla_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "get_sm_version", lambda: sm_version)
+    monkeypatch.setattr(linear_mod, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", rubin_available)
+    # Pick an amax where amax / 448.0 is not a power of two so UE8M0 vs
+    # float32 activation scales produce distinct QDQ values. The range is
+    # asymmetric so quantization errors do not cancel in the all-ones projection.
+    qr = torch.linspace(-120.0, 300.0, 128, dtype=torch.bfloat16).reshape(1, 128)
+    weight = torch.ones(129, 128, dtype=torch.float8_e4m3fn)
+    raw_weight_scale = torch.tensor([[0.25], [0.5]], dtype=torch.float32)
+    weight_scale = (
+        transform_sf_into_required_layout(
+            raw_weight_scale,
+            mn=129,
+            k=128,
+            recipe=(1, 128, 128),
+            is_sfa=False,
+        )
+        if int32_scale
+        else raw_weight_scale
+    )
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=128,
+        out_features=129,
+        dtype=torch.bfloat16,
+        use_cute_dsl_blockscaling_mm=use_cute_dsl,
+        disable_deep_gemm=disable_deep_gemm,
+    )
+
+    assert DSAVanillaIndexer._fp8_block_scales_uses_ue8m0(linear) is expected_ue8m0
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=expected_ue8m0)
+    other_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=not expected_ue8m0)
+    assert not torch.equal(qdq_qr, other_qdq_qr)
+    expanded_scale = raw_weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        qdq_qr.to(torch.bfloat16),
+        (weight.float() * expanded_scale[:129, :128]).to(torch.bfloat16),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@skip_pre_hopper
+@pytest.mark.parametrize("use_ue8m0", [False, True])
+def test_vanilla_indexer_fp8_block_qdq_matches_native_quantizer(monkeypatch, use_ue8m0):
+    num_tokens = 4
+    in_features = 256
+    out_features = 129
+    num_blocks = in_features // 128
+    torch.manual_seed(0)
+    # Rows span several magnitudes so block scales cover small, unit, and
+    # large amax values in both scale formats.
+    row_scales = torch.tensor([[1e-3], [1.0], [30.0], [300.0]])
+    qr = (torch.randn(num_tokens, in_features) * row_scales).to(torch.bfloat16)
+
+    q_fp8, activation_scales = torch.ops.trtllm.fp8_quantize_1x128(qr.cuda(), use_ue8m0=use_ue8m0)
+    # fp8_quantize_1x128 stores scales block-major as [num_blocks, M padded to
+    # 4]; M == 4 keeps that layout identical on SM90 and SM100.
+    native_scales = activation_scales.reshape(-1)[: num_blocks * num_tokens]
+    native_scales = native_scales.view(num_blocks, num_tokens).T
+    native_qdq_qr = (
+        (q_fp8.float().view(num_tokens, num_blocks, 128) * native_scales.unsqueeze(-1))
+        .reshape(num_tokens, in_features)
+        .to(qr.dtype)
+        .cpu()
+    )
+
+    # Compare QDQ values directly so the projection cannot hide a mismatch.
+    vanilla_qdq_qr = DSAVanillaIndexer._qdq_fp8_blocks(qr, use_ue8m0=use_ue8m0)
+    if use_ue8m0:
+        torch.testing.assert_close(vanilla_qdq_qr, native_qdq_qr, atol=0, rtol=0)
+    else:
+        # The kernel is built with --use_fast_math, so its float32 448 / amax
+        # and reciprocal can differ from IEEE division by one ulp. Compare E4M3
+        # codes and allow only rare moves to an adjacent code.
+        vanilla_codes = (
+            (
+                vanilla_qdq_qr.float().view(num_tokens, num_blocks, 128)
+                / native_scales.cpu().unsqueeze(-1)
+            )
+            .to(torch.float8_e4m3fn)
+            .view(torch.uint8)
+            .int()
+        )
+        native_codes = q_fp8.cpu().view(num_tokens, num_blocks, 128).view(torch.uint8).int()
+        code_diff = (vanilla_codes - native_codes).abs()
+        assert code_diff.max().item() <= 1
+        assert (code_diff != 0).float().mean().item() <= 0.01
+
+    monkeypatch.setattr(
+        DSAVanillaIndexer,
+        "_fp8_block_scales_uses_ue8m0",
+        staticmethod(lambda linear: use_ue8m0),
+    )
+    weight = torch.randn(out_features, in_features).to(torch.float8_e4m3fn)
+    weight_scale = torch.tensor([[0.25, 0.125], [0.5, 1.0]], dtype=torch.float32)
+    linear = SimpleNamespace(
+        weight=weight,
+        weight_scale=weight_scale,
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        in_features=in_features,
+        out_features=out_features,
+        dtype=torch.bfloat16,
+    )
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The QDQ input is pinned to the native quantizer above, so the projection
+    # check covers how _wq_projection_reference applies it and the weight scales.
+    expanded_scale = weight_scale.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    expected = torch.nn.functional.linear(
+        vanilla_qdq_qr,
+        (weight.float() * expanded_scale[:out_features, :in_features]).to(torch.bfloat16),
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_weighted_relu_scores_query_tiling_matches_single_pass():
+    torch.manual_seed(0)
+    num_queries = DSAVanillaIndexer._SCORE_QUERY_TILE * 2 + 17
+    num_keys = 37
+    num_heads = 4
+    head_dim = 8
+    q = torch.randn(num_queries, num_heads, head_dim, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(num_keys, head_dim, dtype=torch.float32)
+    weights = torch.randn(num_queries, num_heads, dtype=torch.float32)
+    mask = torch.tril(torch.ones(num_queries, num_keys, dtype=torch.bool), diagonal=3)
+
+    actual = DSAVanillaIndexer.weighted_relu_scores(q, k, weights, mask)
+
+    scores = torch.matmul(q.float().transpose(0, 1), k.float().T)
+    scores = torch.where(mask.unsqueeze(0), scores, scores.new_zeros(())).relu()
+    expected = (weights.T.unsqueeze(-1) * scores).sum(dim=0)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_weight():
+    in_features = 16
+    out_features = 2
+    packed_weight = torch.tensor(
+        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * out_features,
+        dtype=torch.uint8,
+    )
+    linear_scales = torch.tensor([[1.0], [2.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scales[0, 0]
+    interleaved_scales[16] = linear_scales[1, 0]
+    weight_scale_2 = torch.tensor(0.5)
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=weight_scale_2,
+        input_scale=None,
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=False),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=out_features,
+    )
+    qr = torch.arange(in_features, dtype=torch.float32).reshape(1, -1) / in_features
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    real_scales = linear_scales.view(torch.float8_e4m3fn).float() * weight_scale_2
+    dequant_weight = DSAVanillaIndexer.dequantize_fp4(packed_weight, real_scales, gran_k=16)
+    expected = torch.nn.functional.linear(qr, dequant_weight)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_vanilla_nvfp4_activation_qdq_matches_rne_and_satfinite():
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    actual_codes = DSAVanillaIndexer._to_e2m1_rne(midpoints)
+    expected_codes = torch.tensor([0, 2, 2, 4, 4, 6, 6], dtype=torch.int8)
+    torch.testing.assert_close(actual_codes, expected_codes)
+
+    e4m3_values = torch.tensor([1.0625, 1.1875, 448.0, 449.0, 500.0])
+    actual_scales = DSAVanillaIndexer._round_to_e4m3_rne_satfinite(e4m3_values)
+    torch.testing.assert_close(actual_scales, torch.tensor([1.0, 1.25, 448.0, 448.0, 448.0]))
+
+
+def test_vanilla_indexer_q_projection_supports_nvfp4_activation_qdq():
+    in_features = 16
+    packed_weight = torch.full((1, in_features // 2), 0x22, dtype=torch.uint8)
+    linear_scale = torch.tensor([[1.0]], dtype=torch.float8_e4m3fn).view(torch.uint8)
+    interleaved_scales = torch.zeros(128 * 4, dtype=torch.uint8)
+    interleaved_scales[0] = linear_scale[0, 0]
+    linear = SimpleNamespace(
+        weight=packed_weight,
+        weight_scale=interleaved_scales,
+        weight_scale_2=torch.tensor(1.0),
+        input_scale=torch.tensor(1.0),
+        force_dynamic_quantization=False,
+        pre_quant_scale=None,
+        quant_method=SimpleNamespace(quantizes_nvfp4_activations=True),
+        scaling_vector_size=16,
+        in_features=in_features,
+        out_features=1,
+    )
+    qr = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0] * 2], dtype=torch.float32)
+
+    actual = DSAVanillaIndexer._wq_projection_reference(qr, linear)
+
+    # The RNE E2M1 values sum to 20 per eight inputs; the dequantized weight
+    # is all ones, so two repetitions produce 40.
+    torch.testing.assert_close(actual, torch.tensor([[40.0]]))
+
+
+@pytest.mark.parametrize(
+    "use_fp8_ds_mla,skip_rope,expected_rope_calls,expected_append",
+    [
+        pytest.param(False, False, 0, False, id="regular-rope-already-appended"),
+        pytest.param(False, True, 0, True, id="regular-pre-rotated"),
+        pytest.param(True, False, 1, True, id="fp8-ds-mla-deferred-rope"),
+        pytest.param(True, True, 0, True, id="fp8-ds-mla-pre-rotated"),
+    ],
+)
+def test_vanilla_generation_forward_respects_rope_and_cache_ownership(
+    use_fp8_ds_mla,
+    skip_rope,
+    expected_rope_calls,
+    expected_append,
+):
+    attention = DSAVanillaAttention.__new__(DSAVanillaAttention)
+    attention.layer_idx = 0
+
+    q = torch.empty(1, 1)
+    latent_cache = torch.empty(1, 1)
+    q_pe = torch.empty(1, 1)
+    topk = torch.tensor([[0]], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        multi_item_part_lens=None,
+        kv_cache_manager=SimpleNamespace(
+            use_fp8_ds_mla=use_fp8_ds_mla,
+            layer_offsets={0: 0},
+        ),
+        num_contexts=0,
+        num_seqs=1,
+        num_ctx_tokens=0,
+        num_tokens=1,
+        seq_lens=torch.tensor([1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([4], dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        attention_input_type=AttentionInputType.generation_only,
+        latent_cache=latent_cache,
+        q_pe=q_pe,
+        skip_mla_rope_generation=skip_rope,
+        sparse_backend_args=DSABackendForwardArgs(topk_indices=topk),
+    )
+    expected = torch.empty(1, 1)
+
+    with (
+        patch.object(attention, "_apply_mla_rope") as apply_rope,
+        patch.object(attention, "_select_local_topk", return_value=topk) as select_local_topk,
+        patch.object(attention, "_local_topk_to_global", return_value=topk) as local_topk_to_global,
+        patch.object(attention, "_forward_sparse", return_value=expected) as forward_sparse,
+    ):
+        actual = attention.forward(q, None, None, metadata, forward_args=forward_args)
+
+    assert actual is expected
+    assert apply_rope.call_count == expected_rope_calls
+    if expected_rope_calls:
+        # The single generation token follows three cached tokens.
+        torch.testing.assert_close(
+            apply_rope.call_args.args[3], torch.tensor([3], dtype=torch.int32)
+        )
+    assert forward_sparse.call_args.kwargs["append_cache"] is expected_append
+    select_local_topk.assert_called_once_with(q, None, metadata, forward_args)
+    local_topk_to_global.assert_called_once_with(topk, metadata, 0, True)
+
+
+def test_vanilla_fp4_cache_write_preserves_packed_scale_bytes():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.layer_idx = 0
+    indexer.head_dim = 4
+    indexer.use_fp4 = True
+    cache = torch.zeros(32, dtype=torch.uint8)
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(get_indexer_k_cache_buffers=lambda layer_idx: cache),
+        slot_mapping_fp8=torch.tensor([0, 2], dtype=torch.int64),
+        slot_mapping_scale=torch.tensor([8, 12], dtype=torch.int64),
+    )
+    packed_k = torch.tensor([[0x21, 0x43], [0x65, 0x07]], dtype=torch.uint8)
+    packed_scale = torch.tensor([[0x04030201], [0x08070605]], dtype=torch.int32)
+
+    indexer._update_k_cache(packed_k, packed_scale, metadata)
+
+    torch.testing.assert_close(cache[:4], packed_k.flatten())
+    torch.testing.assert_close(cache[8:16], packed_scale.view(torch.uint8).flatten())
+
+
+def test_vanilla_local_topk_uses_trtllm_pool_coordinates():
+    metadata = SimpleNamespace(
+        kv_cache_manager=SimpleNamespace(
+            get_primary_pool_page_index_params=lambda layer_idx: (2, layer_idx)
+        ),
+        _ensure_pool_view_cached=Mock(),
+        _cached_tokens_per_block=64,
+        _cached_block_table_ctx=torch.tensor([[3, 7], [5, 9]], dtype=torch.int32),
+        _cached_block_table_gen=None,
+        _cached_req_idx_ctx=torch.tensor([0, 1], dtype=torch.int32),
+        _cached_req_idx_gen=None,
+    )
+    local_topk = torch.tensor([[0, 65, -1], [63, 64, 130]], dtype=torch.int32)
+
+    actual = DSAVanillaAttention._local_topk_to_global(
+        local_topk, metadata, layer_idx=1, is_generation=False
+    )
+
+    expected = torch.tensor([[448, 961, -1], [767, 1216, -1]], dtype=torch.int32)
+    torch.testing.assert_close(actual, expected)
+    metadata._ensure_pool_view_cached.assert_called_once_with()
+
+
+@pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
+def test_vanilla_inline_scale_latent_round_trip(kv_layout):
+    latent = torch.randn(3, 576, dtype=torch.bfloat16)
+
+    packed = DSAVanillaAttention._pack_inline_scale_latent(latent, torch.bfloat16)
+    # Logical pages are physically reordered, with padding between valid IDs
+    # and only one live token in the final two-token page.
+    kv_cache = torch.zeros(3, 1, 2, 1, packed.shape[-1], dtype=packed.dtype)
+    kv_cache[2, 0, :, 0, :] = packed[:2]
+    kv_cache[0, 0, 0, 0, :] = packed[2]
+    if kv_layout == "HND":
+        kv_cache = kv_cache.transpose(2, 3)
+    actual = DSAVanillaAttention._load_latent_cache(
+        kv_cache, [2, -1, 0], latent.shape[0], kv_layout, use_fp8_ds_mla=True
+    )
+
+    assert packed.shape == (3, 328)
+    torch.testing.assert_close(actual[:, 512:], latent[:, 512:].float())
+    torch.testing.assert_close(actual[:, :512], latent[:, :512].float(), atol=0.05, rtol=0.05)
+
+
+def _make_vanilla_scoring_metadata(*, skip_context=False):
+    dense_topk = torch.tensor([[0, -1], [0, 1], [0, 1]], dtype=torch.int32)
+    return SimpleNamespace(
+        num_contexts=1,
+        num_generations=1,
+        num_seqs=2,
+        num_ctx_tokens=2,
+        num_tokens=3,
+        seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        seq_lens_cuda=torch.tensor([2, 1], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([3, 3], dtype=torch.int32),
+        compress_ratios=[1],
+        skip_indexer_for_ctx_reqs=skip_context,
+        skip_indexer_for_gen_reqs=False,
+        topk_indices_buffer=dense_topk,
+        in_mtp_draft_loop=False,
+        indexer_skip_topk=False,
+        shared_topk_indices=None,
+        mtp_num_accepted=None,
+        cuda_graph_buffers={},
+        is_cuda_graph=False,
+        get_empty=Mock(
+            side_effect=lambda _, shape, **kwargs: torch.empty(shape, dtype=kwargs["dtype"])
+        ),
+    )
+
+
+def _make_vanilla_scoring_indexer():
+    indexer = DSAVanillaIndexer.__new__(DSAVanillaIndexer)
+    torch.nn.Module.__init__(indexer)
+    indexer.index_topk = 2
+    indexer.use_fp4 = False
+    indexer.mtp_index_share = False
+    indexer._gather_keys = MethodType(
+        lambda _self, metadata, seq_idx, kv_len: torch.tensor(
+            [[1.0], [3.0], [2.0]] if seq_idx == 0 else [[4.0], [1.0], [2.0]]
+        )[:kv_len],
+        indexer,
+    )
+    return indexer
+
+
+def test_vanilla_indexer_uses_dense_topk_when_context_scoring_is_skipped():
+    indexer = _make_vanilla_scoring_indexer()
+    metadata = _make_vanilla_scoring_metadata(skip_context=True)
+    indexer._gather_keys = Mock(side_effect=AssertionError("indexer scoring was not skipped"))
+
+    actual = indexer.sparse_attn_indexer(
+        metadata,
+        hidden_states=torch.empty(2, 1),
+        q_fp8=torch.ones(2, 1, 1),
+        k_fp8=torch.empty(0),
+        k_scale=torch.empty(0),
+        weights=torch.ones(2, 1),
+        is_generation=False,
+    )
+
+    torch.testing.assert_close(actual, metadata.topk_indices_buffer[:2])
 
 
 @pytest.mark.parametrize("use_self_sampling", [True, False])
@@ -175,6 +668,97 @@ def test_metadata_cache_geometry_comes_from_sparse_metadata_params(use_self_samp
     # The metadata mirror of the two-level dispatch drives prior allocation.
     assert metadata.use_self_sampling_topk == use_self_sampling
     assert metadata.needs_gvr_prior == (not use_self_sampling)
+
+
+@pytest.mark.parametrize(
+    "requested,cute_dsl_available,sm_100f,expected",
+    [
+        (True, True, True, True),
+        (True, True, False, False),  # Hopper / SM120: the custom op raises
+        (True, False, True, False),  # cutlass-dsl not installed
+        (False, True, True, False),
+    ],
+)
+def test_cute_dsl_paged_mqa_logits_gate(requested, cute_dsl_available, sm_100f, expected):
+    """Metadata and Indexer take the same decision: metadata builds the DSL
+    atom-split buffers and skips the sm90 MTP expansion off it."""
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        index_topk=512,
+        indexer_k_dtype="fp8",
+        use_cute_dsl_paged_mqa_logits=requested,
+    )
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    indexer_mod = "tensorrt_llm._torch.attention.backends.sparse.dsa.indexer"
+    with (
+        patch(
+            "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.TrtllmAttentionMetadata.__post_init__"
+        ),
+        patch(f"{indexer_mod}.IS_CUTLASS_DSL_AVAILABLE", cute_dsl_available),
+        patch(f"{indexer_mod}.is_sm_100f", return_value=sm_100f),
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+        indexer_decision = resolve_cute_dsl_paged_mqa_logits(
+            sparse_config.to_sparse_params().use_cute_dsl_paged_mqa_logits
+        )
+        assert metadata.use_cute_dsl_paged_mqa_logits is expected
+    assert indexer_decision is expected
+
+
+@pytest.mark.parametrize(
+    "next_n,kernel_atoms,batch_size,max_ctx,expected",
+    [
+        (4, (1, 2, 3, 4), 32, 65536, (1, 4, 1)),  # exact atom: caller-side, unchanged
+        (6, (1, 2, 3), 32, 65536, (2, 3, 1)),  # exact divisor 3: caller-side
+        (7, (1, 2, 3, 4), 128, 65536, (1, 4, 2)),  # in-kernel 4 + 3: fewer waves
+        (7, (1, 2, 3), 128, 65536, (1, 3, 3)),  # FP4: 3 + 2 + 2
+        (5, (1, 2, 3, 4), 128, 65536, (1, 3, 2)),  # tile = widest atom (3 + 2)
+        (7, (1, 2, 3, 4), 1, 4096, (7, 1, 1)),  # wave tie: keep atom 1
+        (7, (1, 2, 3), 1, 65536, (7, 1, 1)),  # B=1: too few waves for the split to pay
+        (7, (1, 2, 3), 32, 4096, (1, 3, 3)),  # 24 atom-1 waves: split
+        (7, (1, 2, 3, 4), 0, 0, (1, 4, 2)),  # workload unknown: fewer KV passes
+    ],
+)
+def test_pick_dsl_split(next_n, kernel_atoms, batch_size, max_ctx, expected):
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _pick_dsl_split
+
+    got = _pick_dsl_split(
+        next_n, num_sms=148, batch_size=batch_size, max_ctx=max_ctx, kernel_atoms=kernel_atoms
+    )
+    assert got == expected
+
+
+@pytest.mark.parametrize("next_n,num_atoms", [(4, 2), (5, 2), (7, 2), (7, 3), (8, 3)])
+def test_atom_ctx_offsets_match_kernel(next_n, num_atoms):
+    """The indexer's stagger must equal the kernel's _atom_ctx_len stagger."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import _atom_ctx_offsets
+    from tensorrt_llm._torch.attention.kernels.blackwell.paged_mqa_logits.mqa_logits_util import (
+        atom_tokens_after,
+    )
+
+    base, rem = divmod(next_n, num_atoms)
+    assert _atom_ctx_offsets(next_n, num_atoms) == [
+        atom_tokens_after(i, num_atoms, base, rem, next_n) for i in range(num_atoms)
+    ]
+
+
+def test_cute_dsl_paged_mqa_logits_default_is_aligned():
+    """ModelConfig.from_pretrained's no-config fallback reads the config
+    default, so the config classes and DSAParams must agree on it."""
+    assert DeepSeekSparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DeepSeekV4SparseAttentionConfig().use_cute_dsl_paged_mqa_logits is True
+    assert DSAParams().use_cute_dsl_paged_mqa_logits is True
 
 
 @pytest.mark.parametrize(
@@ -309,11 +893,10 @@ def test_metadata_warmup_selfsampling_prefill_leg(
         kv_cache_manager=SimpleNamespace(),
         get_indexer_max_seq_len=Mock(return_value=msl_c),
         sparse_metadata_params=SimpleNamespace(use_cute_dsl_paged_mqa_logits=True),
+        use_cute_dsl_paged_mqa_logits=True,
         num_sms=148,
     )
-    ss_host = (
-        "tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
-    )
+    ss_host = "tensorrt_llm._torch.kernels.blackwell.top_k.gvr_topk_decode_self_sampling_host"
     with (
         patch(
             "tensorrt_llm._torch.attention.backends.sparse.dsa.metadata.IS_CUTLASS_DSL_AVAILABLE",
@@ -386,7 +969,6 @@ def test_gvr_prior_writeback_uses_aux_stream():
             request_ids,
             kv_lens.tolist(),
             is_gen=False,
-            prepare_resource=True,
         )
         metadata = _create_mock_metadata(
             request_ids,
@@ -785,22 +1367,6 @@ def test_metadata_spec_update_resizes_radix_workspace(
     metadata._create_radix_aux_buffers.assert_called_once_with(True)
 
 
-def _ceil_to_ue8m0(x: torch.Tensor):
-    """Round tensor values up to the nearest power of two (UE8M0 format)."""
-    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
-
-
-def cdiv(a: int, b: int) -> int:
-    """Ceiling division."""
-    return (a + b - 1) // b
-
-
-def _load_cast_back_from_fp4():
-    from .test_cute_dsl_fp4_paged_mqa_logits import cast_back_from_fp4
-
-    return cast_back_from_fp4
-
-
 def create_dsa_cache_manager(
     batch_size: int,
     head_dim: int,
@@ -850,6 +1416,26 @@ def create_dsa_cache_manager(
     )
 
     return cache_manager, sparse_attn_config
+
+
+@pytest.fixture
+def dsa_cache_manager():
+    """Factory for DSA cache managers that shuts every one down on teardown.
+
+    KV cache manager V2 owns CUDA reservations that must be released
+    deterministically; a manager left to the garbage collector is destroyed on
+    a thread without a current CUDA context.
+    """
+    managers = []
+
+    def make(**kwargs):
+        manager, sparse_attn_config = create_dsa_cache_manager(**kwargs)
+        managers.append(manager)
+        return manager, sparse_attn_config
+
+    yield make
+    for manager in reversed(managers):
+        manager.shutdown()
 
 
 def test_transform_local_topk_uses_v2_page_mapping():
@@ -1497,146 +2083,6 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor):
     return 1 - sim
 
 
-def per_custom_dims_cast_to_fp8(x: torch.Tensor, dims, use_ue8m0=False):
-    """
-    Cast tensor to FP8 per custom dimensions.
-    For kv, we quantize along dimension 0 (sequence dimension).
-    """
-    excluded_dims = tuple([i for i in range(x.dim()) if i not in set(dims)])
-    x_amax = x.abs().float().amax(dim=excluded_dims, keepdim=True).clamp(1e-4)
-    sf = x_amax / 448.0
-    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
-    x_scaled = (x * (1.0 / sf)).to(torch.float8_e4m3fn)
-    return x_scaled, sf.squeeze()
-
-
-def _ref_fp8_paged_mqa_logits(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    num_tokens: torch.Tensor,
-    num_kv_tokens: torch.Tensor,
-    block_tables: torch.Tensor,
-    max_model_len: int,
-    compress_ratio: int = 1,
-):
-    """
-    Reference implementation of fp8_paged_mqa_logits (optimized version).
-
-    Args:
-        q: [batch_size, next_n, num_heads, head_dim]
-        kv_cache: [num_blocks, block_size, 1, head_dim]
-        weights: [batch_size * next_n, num_heads]
-        num_tokens: [batch_size]
-        num_kv_tokens: [batch_size]
-        block_tables: [batch_size, max_num_blocks]
-        max_model_len: Maximum sequence length
-        compress_ratio: Compression ratio for the KV cache
-
-    Returns:
-        logits: [batch_size * next_n, max_model_len]
-    """
-    batch_size, next_n, _, _ = q.size()
-    _, block_size, _, _ = kv_cache.size()
-
-    logits = torch.full(
-        [batch_size * next_n, max_model_len],
-        float("-inf"),
-        device=q.device,
-        dtype=torch.float32,
-    )
-
-    num_tokens_list = num_tokens.tolist()
-    num_kv_tokens_list = num_kv_tokens.tolist()
-
-    for i in range(batch_size):
-        num_token = num_tokens_list[i]
-        num_kv_token = num_kv_tokens_list[i]
-
-        # Query positions: [num_token - next_n, ..., num_token - 1]
-        q_offsets = torch.arange(num_token - next_n, num_token, device="cuda")
-
-        # Transpose weights for this sequence: [num_heads, next_n]
-        weight_slice = weights[i * next_n : (i + 1) * next_n, :].transpose(0, 1).contiguous()
-
-        # Process each block in the sequence
-        for block_rk in range(cdiv(num_kv_token, block_size)):
-            block_idx = block_tables[i][block_rk]
-            qx, kx = q[i], kv_cache[block_idx]
-
-            # Key positions in this block
-            k_offsets = torch.arange(
-                block_rk * block_size,
-                (block_rk + 1) * block_size,
-                device="cuda",
-            )
-
-            # Causal mask: k_pos < num_token AND k_pos < (q_pos + 1) // compress_ratio
-            k_mask = k_offsets[None, :] < num_kv_token
-            causal_mask = k_offsets[None, :] < (q_offsets[:, None] + 1) // compress_ratio
-            mask = k_mask & causal_mask
-
-            # Compute attention scores: [num_heads, next_n, block_size]
-            s = torch.where(
-                mask[None, :, :],
-                (qx.transpose(0, 1) @ kx.transpose(0, 1).transpose(1, 2)).to(logits.dtype),
-                float("-inf"),
-            )
-
-            # Apply ReLU, multiply by weights, and sum over heads
-            s = torch.relu(s) * weight_slice[..., None]
-            s = s.sum(dim=0)  # [next_n, block_size]
-
-            # Write to output with additional causal mask
-            logits[
-                i * next_n : (i + 1) * next_n,
-                block_rk * block_size : (block_rk + 1) * block_size,
-            ] = torch.where(causal_mask, s, float("-inf"))
-
-    return logits
-
-
-def _ref_fp8_mqa_logits(
-    q: torch.Tensor,
-    kv: torch.Tensor,
-    weights: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-):
-    """
-    Reference implementation of fp8_mqa_logits.
-    out_ij = q[i, :, :] @ kv[j, :] # [num_heads]
-    out_ij = out_ij.relu() * weights[i, :]
-    out_ij = out_ij.sum()  # Scalar
-
-    Args:
-        q: [seq_len, num_heads, head_dim]
-        kv: [seq_len_kv, head_dim]
-        weights: [seq_len, num_heads]
-        cu_seqlen_ks: [seq_len]
-        cu_seqlen_ke: [seq_len]
-
-    Returns:
-        logits: [seq_len, seq_len_kv]
-    """
-
-    seq_len_kv = kv.shape[0]
-
-    k = kv
-    q = q.float()
-    k = k.float()
-
-    mask_lo = torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
-    mask_hi = torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
-    mask = mask_lo & mask_hi
-
-    score = torch.einsum("mhd,nd->hmn", q, k)
-    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
-    logits = logits.masked_fill(~mask, float("-inf"))
-
-    return logits
-
-
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
 @pytest.mark.parametrize("compress_ratio", [1, 4])
@@ -1685,7 +2131,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
 
     # Convert to FP8
     q_fp8 = q.to(torch.float8_e4m3fn)
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,))
     logits = deep_gemm.fp8_mqa_logits(q_fp8, kv_fp8, weights, ks, ke)  # -> [seq_len, seq_len_kv]
 
     # Basic sanity checks
@@ -1694,7 +2140,7 @@ def test_deepgemm_fp8_mqa_logits_basic(compress_ratio):
     )
     assert logits.dtype == torch.float32, f"Expected dtype torch.float32, got {logits.dtype}"
 
-    ref_logits = _ref_fp8_mqa_logits(
+    ref_logits = mqa_logits(
         q=q,
         kv=kv,
         weights=weights,
@@ -1730,7 +2176,7 @@ def test_deepgemm_prefill_logits_pass_selfsampling_format_gate(seq_len_kv):
     weights = torch.randn(seq_len, num_heads, device="cuda", dtype=torch.float32)
     ks = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device="cuda")
-    kv_fp8 = per_custom_dims_cast_to_fp8(kv, (0,), False)
+    kv_fp8 = DSAVanillaIndexer.quantize_fp8(kv, (0,), use_ue8m0=False)
 
     logits = deep_gemm.fp8_mqa_logits(
         q.to(torch.float8_e4m3fn), kv_fp8, weights, ks, ke, clean_logits=False
@@ -1757,12 +2203,18 @@ def _create_mock_metadata(
     enable_context_mla_with_cached_kv=False,
     index_topk=2048,
     enable_indexer_skip=False,
-    use_cute_dsl_paged_mqa_logits=False,
+    use_cute_dsl_paged_mqa_logits=None,
     compress_ratio=1,
     indexer_head_dim=128,
     max_num_tokens=8192,
 ):
     """Helper to create mock metadata for testing."""
+    if use_cute_dsl_paged_mqa_logits is None:
+        # Match the indexer built from the config default: the buffer layout
+        # (separate full-next_n schedule) differs between the two kernels.
+        use_cute_dsl_paged_mqa_logits = resolve_cute_dsl_paged_mqa_logits(
+            DeepSeekSparseAttentionConfig.model_fields["use_cute_dsl_paged_mqa_logits"].default
+        )
 
     class MockKVCacheParams:
         """Mock KV cache parameters holding per-sequence cached token counts."""
@@ -1774,7 +2226,7 @@ def _create_mock_metadata(
     class MockMetadata(DSAtrtllmAttentionMetadata):
         """Mock DSA attention metadata for unit testing indexer operations."""
 
-        def __init__(self, cache_manager):
+        def __init__(self, cache_manager: DSACacheManager | DSACacheManagerV2) -> None:
             """Initialize mock metadata with buffers, block tables, and indexer state.
 
             `cache_manager` is a parameter rather than a capture of the enclosing
@@ -1813,7 +2265,7 @@ def _create_mock_metadata(
             self._tokens_per_block = tpb
             self.kv_lens_cuda_runtime = kv_lens.cuda()
             self.indexer_k_cache_block_offsets = torch.zeros(
-                [batch_size, cache_manager.max_blocks_per_seq],
+                [batch_size, self.kv_cache_manager.max_blocks_per_seq],
                 device="cuda",
                 dtype=torch.int32,
             )
@@ -1822,7 +2274,7 @@ def _create_mock_metadata(
                 device="cpu",
                 pin_memory=True,
             )
-            block_ids = cache_manager.get_batch_cache_indices(request_ids)
+            block_ids = self.kv_cache_manager.get_batch_cache_indices(request_ids)
             for i in range(len(block_ids)):
                 self.host_indexer_k_cache_block_offsets[i, : len(block_ids[i])] = torch.tensor(
                     block_ids[i], dtype=torch.int32
@@ -2072,7 +2524,7 @@ def validate_topk_indices(topk_indices_0, topk_indices_1, total_tokens):
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
+def test_recompute_slot_mappings_matches_prepare_with_cached_tokens(dsa_cache_manager):
     """Recompute slot mappings without re-running full Indexer.prepare()."""
     head_dim = 128
     block_size = 64
@@ -2083,16 +2535,14 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
     num_ctx_tokens = seq_lens[0].item()
     num_tokens = seq_lens.sum().item()
 
-    cache_manager, _ = create_dsa_cache_manager(
+    cache_manager, _ = dsa_cache_manager(
         batch_size=len(request_ids),
         head_dim=head_dim,
         tokens_per_block=block_size,
         max_seq_len=256,
         num_layers=1,
     )
-    cache_manager.add_dummy_requests(
-        request_ids, kv_lens.tolist(), is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, kv_lens.tolist(), is_gen=False)
     metadata = _create_mock_metadata(
         request_ids,
         len(request_ids),
@@ -2123,7 +2573,7 @@ def test_recompute_slot_mappings_matches_prepare_with_cached_tokens():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_indexer_k_cache_scatter_custom_op():
+def test_indexer_k_cache_scatter_custom_op(dsa_cache_manager):
     """
     Direct comparison: CUDA kernel vs Python reference for k_cache scatter.
 
@@ -2144,7 +2594,7 @@ def test_indexer_k_cache_scatter_custom_op():
     layer_idx_python = 2
 
     # Create cache manager with multiple layers
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2155,9 +2605,7 @@ def test_indexer_k_cache_scatter_custom_op():
     # Allocate blocks
     request_ids = list(range(batch_size))
     tokens_per_req = [32, 32, 32]
-    cache_manager.add_dummy_requests(
-        request_ids, tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, tokens_per_req, is_gen=False)
 
     # Create metadata
     metadata = _create_mock_metadata(
@@ -2314,7 +2762,7 @@ def test_indexer_k_cache_scatter_custom_op():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_fp8_k_cache_roundtrip():
+def test_fp8_k_cache_roundtrip(dsa_cache_manager):
     """Verify FP8 quantization scales survive write/read cycle for multiple requests."""
     torch.manual_seed(42)
 
@@ -2324,7 +2772,7 @@ def test_fp8_k_cache_roundtrip():
     max_seq_len = 512
     num_tokens_per_req = [150, 100]  # Request 0: 3 blocks, Request 1: 2 blocks
 
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2335,9 +2783,7 @@ def test_fp8_k_cache_roundtrip():
 
     # Allocate blocks for both requests
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, num_tokens_per_req, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, num_tokens_per_req, is_gen=False)
 
     # Prepare and write data for each request
     total_tokens = sum(num_tokens_per_req)
@@ -2417,7 +2863,13 @@ def test_fp8_k_cache_roundtrip():
     ],
 )
 @pytest.mark.parametrize("compress_ratio", [1, 4])
-def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compress_ratio):
+def test_indexer_decode_with_paged_kv_cache(
+    batch_size,
+    next_n,
+    backend,
+    compress_ratio,
+    dsa_cache_manager,
+):
     """
     Test FP8 paged KV cache with two-phase workflow and variable context lengths.
 
@@ -2470,7 +2922,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         print(f"  Compress ratio: {compress_ratio}")
 
     # Setup: Create cache manager and indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2485,7 +2937,6 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         request_ids=request_ids,
         token_nums=final_kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     # Generate test data with variable lengths
@@ -2645,7 +3096,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_kv_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q,
         kv_cache_bf16,
         weights,
@@ -2703,7 +3154,7 @@ def test_indexer_decode_with_paged_kv_cache(batch_size, next_n, backend, compres
         ),
     ],
 )
-def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
+def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend, dsa_cache_manager):
     """FP4 indexer paged decode test (DeepGEMM + CuTe DSL backends).
 
     Mirrors test_indexer_decode_with_paged_kv_cache but exercises the FP4
@@ -2723,14 +3174,12 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
       bytes the kernel sees) so FP4 quantization noise cancels in the
       diff check.
     """
-    # Lazy import: cast_back_from_fp4 is a pure-Python helper in the
-    # kernel-layer FP4 test file. Pulling it in here avoids duplicating
-    # the ~50-line FP4 quant/dequant family. byte-for-byte equivalence
-    # between fused_cat_fp4 and per_token_cast_to_fp4(use_ue8m0=True,
-    # gran_k=32, use_packed_ue8m0=True) is asserted by
-    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm, so
-    # cast_back_from_fp4 can decode fused_cat_fp4's outputs directly.
-    cast_back_from_fp4 = _load_cast_back_from_fp4()
+    # The golden reference owns the FP4 quant/dequant family. fused_cat_fp4
+    # is byte-for-byte equal to DeepGEMM's per_token_cast_to_fp4(use_ue8m0=True,
+    # gran_k=32, use_packed_ue8m0=True) -- asserted by
+    # test_cpp_custom_ops.py::test_fused_cat_fp4_matches_deepgemm -- so the
+    # reference dequantizer decodes fused_cat_fp4's output directly.
+    cast_back_from_fp4 = DSAVanillaIndexer.dequantize_fp4
     from tensorrt_llm._torch.attention.backends.sparse.dsa import _pick_dsl_expand
     from tensorrt_llm.deep_gemm import fp8_fp4_paged_mqa_logits
 
@@ -2764,7 +3213,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
     print(f"  Final lengths: {final_lens.tolist()}")
 
     # Setup: FP4 cache manager + indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -2776,7 +3225,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     total_context_tokens = context_lens_context.sum().item()
@@ -3054,7 +3503,7 @@ def test_indexer_decode_with_paged_kv_cache_fp4(batch_size, next_n, backend):
 
     num_tokens_cuda = final_lens.cuda()
     num_kv_tokens_cuda = final_lens.cuda()
-    ref_logits = _ref_fp8_paged_mqa_logits(
+    ref_logits = paged_mqa_logits(
         q_simulated.float(),
         kv_cache_sim,
         weights,
@@ -3604,7 +4053,13 @@ def test_plan_mla_chunked_prefill_chunks_covers_tp_shares(tp_size):
         (1000, [400, 600, 2200, 500], "two_level"),  # Mixed: request 2 needs Q-blocks
     ],
 )
-def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compress_ratio):
+def test_indexer_chunked_prefill(
+    chunk_size,
+    seq_lens_list,
+    chunking_type,
+    compress_ratio,
+    dsa_cache_manager,
+):
     """
     Tests for indexer chunked prefill:
     1. Request-level chunking: Multiple small requests packed together
@@ -3668,7 +4123,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
                 print(f"    Request {req_idx}: {seq_len} tokens → {num_q_blocks} Q-blocks")
 
     # Create cache manager and indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -3681,7 +4136,7 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
     # Allocate blocks for all sequences
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens_list, is_gen=False
     )
 
     # Generate test data
@@ -3869,7 +4324,13 @@ def test_indexer_chunked_prefill(chunk_size, seq_lens_list, chunking_type, compr
 @pytest.mark.parametrize("next_n", [1, 2, 4])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("seq_len_range", [(2048, 8192), (512, 1024)])
-def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_len_range):
+def test_indexer_decode_custom_vs_fallback(
+    batch_size,
+    next_n,
+    index_topk,
+    seq_len_range,
+    dsa_cache_manager,
+):
     """
     Test that the production and Torch Top-K modules produce identical results
     in the decode phase of sparse_attn_indexer.
@@ -3928,7 +4389,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
     num_cached_tokens = kv_lens.tolist()
 
     # Create cache manager and indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -3942,7 +4403,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
     request_ids = list(range(batch_size))
     final_lens = kv_lens + next_n  # Historical + new decode tokens
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=final_lens.tolist(), is_gen=False
     )
 
     # Populate KV cache with historical context
@@ -4103,7 +4564,7 @@ def test_indexer_decode_custom_vs_fallback(batch_size, next_n, index_topk, seq_l
 @skip_pre_hopper
 @pytest.mark.parametrize("step0_mode", ["gen", "context"])
 @pytest.mark.parametrize("batch_size", [1, 2])
-def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
+def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size, dsa_cache_manager):
     """Verify mtp_index_share: draft step 0 stashes each request's last-token
     Top-K and draft steps > 0 reuse it verbatim (bit-exact), across > 1 draft
     step. Covers both step-0 shapes: "gen" (steady state, next_n > 1) and
@@ -4119,7 +4580,7 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
     # path, which assumes num_gen_tokens == num_generations * (1 + md).
     md = 1
 
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4137,7 +4598,6 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
         request_ids=request_ids,
         token_nums=reserve,
         is_gen=False,
-        prepare_resource=True,
     )
 
     def make_inputs(n_tokens):
@@ -4262,7 +4722,12 @@ def test_indexer_decode_mtp_topk_reuse(step0_mode, batch_size):
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("chunk_size", [1024, 2048])
-def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chunk_size):
+def test_indexer_prefill_chunked_custom_vs_fallback(
+    batch_size,
+    index_topk,
+    chunk_size,
+    dsa_cache_manager,
+):
     """
     Test chunked prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks != None.
@@ -4289,7 +4754,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
     total_tokens = seq_lens.sum().item()
 
     # Create cache manager and indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4302,7 +4767,7 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
     # Allocate cache blocks
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4380,7 +4845,12 @@ def test_indexer_prefill_chunked_custom_vs_fallback(batch_size, index_topk, chun
 @pytest.mark.parametrize("batch_size", [4, 16])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("seq_len_range", [(1, 512)])
-def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, seq_len_range):
+def test_indexer_prefill_single_pass_custom_vs_fallback(
+    batch_size,
+    index_topk,
+    seq_len_range,
+    dsa_cache_manager,
+):
     """
     Test single-pass prefill: production Top-K vs Torch Top-K
     with metadata.indexer_prefill_chunks == None (else branch).
@@ -4399,7 +4869,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
     total_tokens = seq_lens.sum().item()
 
     # Create cache manager and indexer
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4411,7 +4881,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
     request_ids = list(range(batch_size))
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=seq_lens.tolist(), is_gen=False
     )
 
     # Generate test data
@@ -4543,7 +5013,7 @@ def test_indexer_prefill_single_pass_custom_vs_fallback(batch_size, index_topk, 
 
 @skip_pre_hopper
 @pytest.mark.parametrize("enable_indexer_skip", [True, False])
-def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
+def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip, dsa_cache_manager):
     """
     Test that custom topk kernel handles multi-request batches with different cached amounts.
     """
@@ -4571,7 +5041,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
     print(f"  Req1: {cached_tokens[1]} cached + {seq_lens[1]} new = {total_kv_lens[1]} total")
 
     # Create cache manager
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4583,9 +5053,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
 
     # Allocate blocks
     request_ids = [0, 1]
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Generate test data
     q = torch.randn((total_tokens, heads, head_dim), device="cuda", dtype=torch.bfloat16)
@@ -4722,7 +5190,7 @@ def test_indexer_topk_multi_request_with_different_cache(enable_indexer_skip):
         )
 
 
-def _mla_prefill_reuse_case(monkeypatch):
+def _mla_prefill_reuse_case(monkeypatch, dsa_cache_manager):
     """Build a reuse-hit MLA chunked-prefill batch; return a runner over it.
 
     Four context requests bring few new tokens each on top of long cached
@@ -4741,7 +5209,7 @@ def _mla_prefill_reuse_case(monkeypatch):
     total_kv_lens = [s + c for s, c in zip(seq_lens, cached_tokens)]
     total_tokens = sum(seq_lens)
 
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -4751,9 +5219,7 @@ def _mla_prefill_reuse_case(monkeypatch):
     )
     indexer = create_indexer(sparse_attn_config, layer_idx=0)
     request_ids = list(range(batch_size))
-    cache_manager.add_dummy_requests(
-        request_ids, total_kv_lens, is_gen=False, prepare_resource=True
-    )
+    cache_manager.add_dummy_requests(request_ids, total_kv_lens, is_gen=False)
 
     # Write distinct K for every position first, so the cached prefixes hold
     # real values rather than ties that either chunking may break differently.
@@ -4820,7 +5286,7 @@ def _mla_prefill_reuse_case(monkeypatch):
 
 
 @skip_pre_hopper
-def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
+def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch, dsa_cache_manager):
     """Grouping reuse-hit requests into separate chunks must not change top-k.
 
     Under MLA chunked prefill, packing every context request into one indexer
@@ -4830,7 +5296,9 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
     splits such batches; each query row still scores only its own request's
     window, so the selected indices must match the packed run.
     """
-    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    run, seq_lens, total_kv_lens, total_tokens = _mla_prefill_reuse_case(
+        monkeypatch, dsa_cache_manager
+    )
     packed_metadata, topk_packed = run(1 << 62)
     split_metadata, topk_split = run(0)
     packed_chunks = packed_metadata.indexer_prefill_chunks
@@ -4852,7 +5320,7 @@ def test_indexer_mla_prefill_groups_requests_by_logits_budget(monkeypatch):
 
 @skip_pre_hopper
 @pytest.mark.parametrize("tp_size", [2, 4])
-def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
+def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size, dsa_cache_manager):
     """Splitting a grouped MLA prefill batch across TP ranks must not change top-k.
 
     Each emulated rank plans chunks for its share of the context queries only,
@@ -4860,7 +5328,7 @@ def test_indexer_mla_prefill_tp_split_matches_unsplit(monkeypatch, tp_size):
     rows once. Concatenating the gathered shares must reproduce the top-k of
     the unsplit run.
     """
-    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(monkeypatch)
+    run, seq_lens, _, total_tokens = _mla_prefill_reuse_case(monkeypatch, dsa_cache_manager)
     # Pairs of requests fit the budget. With TP2 the second rank's share holds
     # a cut request followed by two whole ones grouped into one chunk; with TP4
     # every share is too short to hold two whole requests.
@@ -5029,7 +5497,7 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_blackwell
-def test_cutedsl_mqa_logits_output_buffer_persistent():
+def test_cutedsl_mqa_logits_output_buffer_persistent(dsa_cache_manager):
     """Regression: the CuteDSL paged-MQA-logits output must have a STABLE address
     across calls, not be a per-forward ``torch.empty``.
 
@@ -5050,7 +5518,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
     heads = 32
     kv_len = 4096
 
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -5063,7 +5531,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
     request_ids = list(range(batch_size))
     kv_lens = torch.full((batch_size,), kv_len, dtype=torch.int32)
     cache_manager.add_dummy_requests(
-        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False, prepare_resource=True
+        request_ids=request_ids, token_nums=kv_lens.tolist(), is_gen=False
     )
 
     metadata = _create_mock_metadata(
@@ -5114,7 +5582,7 @@ def test_cutedsl_mqa_logits_output_buffer_persistent():
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
 @skip_pre_hopper
-def test_topk_indices_buffer_cuda_graph():
+def test_topk_indices_buffer_cuda_graph(dsa_cache_manager):
     from tensorrt_llm._torch.memory_buffer_utils import Buffers
 
     batch_size, next_n = 4, 3
@@ -5124,7 +5592,7 @@ def test_topk_indices_buffer_cuda_graph():
     layer_idx = 0
     num_tokens = batch_size * next_n
 
-    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+    cache_manager, sparse_attn_config = dsa_cache_manager(
         batch_size=batch_size,
         head_dim=head_dim,
         tokens_per_block=block_size,
@@ -5140,7 +5608,6 @@ def test_topk_indices_buffer_cuda_graph():
         request_ids=request_ids,
         token_nums=kv_lens.tolist(),
         is_gen=False,
-        prepare_resource=True,
     )
 
     metadata = _create_mock_metadata(
@@ -5191,3 +5658,103 @@ def test_topk_indices_buffer_cuda_graph():
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+# --- The subclass seams of Indexer.sparse_attn_indexer ----------------------------------------
+
+
+def _seam_indexer():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    return indexer
+
+
+def test_reused_topk_copy_is_the_row_copy():
+    gen = torch.Generator().manual_seed(0)
+    shared = torch.randint(0, 1000, (4, 16), generator=gen, dtype=torch.int32)
+    buffer = torch.full((12, 16), -1, dtype=torch.int32)
+    expected = buffer.clone()
+    expected[2:5, :] = shared[:3, :]
+
+    _seam_indexer()._copy_reused_topk(
+        SimpleNamespace(shared_topk_indices=shared), buffer, 2, 3, 3, False, None
+    )
+
+    assert torch.equal(buffer, expected)
+
+
+def test_fill_decode_topk_leaves_the_rows_to_the_decode_branch():
+    buffer = torch.full((6, 8), -1, dtype=torch.int32)
+
+    filled = _seam_indexer()._fill_decode_topk(SimpleNamespace(), None, None, buffer, 0, 6)
+
+    assert filled is False
+    assert bool((buffer == -1).all())
+
+
+def _stored_rows_inline(
+    indexer,
+    topk_indices_buffer,
+    metadata,
+    num_contexts,
+    num_generations,
+    num_gen_tokens,
+    token_offset,
+    has_prefill,
+    has_decode,
+    is_generation,
+):
+    """The statements ``sparse_attn_indexer`` ran in place of ``_store_mtp_shared_rows``."""
+    rows = None
+    if has_decode:
+        next_n = num_gen_tokens // num_generations
+        gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+        rows = indexer._mtp_last_accepted_rows(
+            gen_topk, metadata, num_contexts, num_generations, next_n
+        )
+    if has_prefill:
+        ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+        ctx_rows = topk_indices_buffer[ctx_last]
+        rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+    if rows is not None:
+        shared_topk_indices = metadata.shared_topk_indices
+        if shared_topk_indices is None:
+            metadata.shared_topk_indices = rows.contiguous()
+        else:
+            row_start = num_contexts if is_generation else 0
+            shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(rows)
+
+
+@pytest.mark.parametrize("has_prefill, has_decode", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("is_generation", [True, False])
+@pytest.mark.parametrize("preset", [False, True], ids=["unset", "preset"])
+@pytest.mark.parametrize("accepted", [None, (0, 0, 1, 4, 2)], ids=["no_counts", "counts"])
+def test_mtp_shared_rows_are_the_inline_statements(
+    has_prefill, has_decode, is_generation, preset, accepted
+):
+    num_contexts, num_generations, next_n = 2, 3, 4
+    seq_lens = torch.tensor([5, 3] + [next_n] * num_generations, dtype=torch.int32)
+    token_offset = int(seq_lens[:num_contexts].sum())
+    num_gen_tokens = num_generations * next_n
+    gen = torch.Generator().manual_seed(1)
+    buffer = torch.randint(
+        0, 1000, (token_offset + num_gen_tokens, 6), generator=gen, dtype=torch.int32
+    )
+
+    def metadata():
+        return SimpleNamespace(
+            seq_lens_cuda=seq_lens.clone(),
+            mtp_num_accepted=None if accepted is None else torch.tensor(accepted),
+            shared_topk_indices=(torch.full((8, 8), -7, dtype=torch.int32) if preset else None),
+        )
+
+    args = (num_contexts, num_generations, num_gen_tokens, token_offset)
+    flags = (has_prefill, has_decode, is_generation)
+    expected, got = metadata(), metadata()
+    indexer = _seam_indexer()
+    _stored_rows_inline(indexer, buffer.clone(), expected, *args, *flags)
+    seam_buffer = buffer.clone()
+    indexer._store_mtp_shared_rows(seam_buffer, got, *args, *flags)
+
+    assert torch.equal(seam_buffer, buffer)
+    assert torch.equal(got.shared_topk_indices, expected.shared_topk_indices)

@@ -64,6 +64,7 @@ short and not repeat it.
 |---|---|---|
 | `exec-` | Execution infra | Environment setup and job execution (compile, run, container) |
 | `kernel-` | Kernel development | Kernel writing, generation, and kernel-specific transforms |
+| `modeling-` | Modeling workflow | Model onboarding, validation, smoke tests, and evaluation |
 | `perf-` | Performance work | Profiling, analysis, and tuning above the kernel layer (kernel modifications belong under `kernel-`) |
 | `trtllm-` | TRT-LLM project workflows | Project-specific workflows: codebase exploration, contribution, dependency upgrades, and serving configuration (static subsystem knowledge belongs in repo docs) |
 

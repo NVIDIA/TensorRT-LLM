@@ -25,15 +25,16 @@ from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, Callable, ClassVar, Dict,
-                    List, Literal, Optional, Set, Tuple, Type, TypeAlias,
-                    TypeVar, Union, get_args, get_origin)
+                    List, Literal, NamedTuple, Optional, Set, Tuple, Type,
+                    TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict
 from pydantic import Field as PydanticField
 from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
-                      PrivateAttr, StrictInt, field_validator, model_validator)
+                      PrivateAttr, StrictInt, TypeAdapter, field_validator,
+                      model_validator)
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -51,14 +52,12 @@ from .._utils import (_str_to_torch_dtype_dict, is_sm_100f, mpi_rank,
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (BatchingType as _BatchingType,
-                                 CacheTransceiverBackendType as _CacheTransceiverBackendType,
+from ..bindings.executor import (CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
                                  DecodingConfig,
                                  DynamicBatchConfig as _DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig as _ExtendedRuntimePerfKnobConfig,
                                  KvCacheConfig as _KvCacheConfig,
                                  PeftCacheConfig as _PeftCacheConfig,
                                  SchedulerConfig as _SchedulerConfig) # isort: skip
@@ -680,14 +679,36 @@ CudaGraphConfigType: TypeAlias = Annotated[
 class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
     """CUDA graph capture for multimodal vision / audio encoders.
 
-    One graph is captured per `buckets` entry; replay falls back to eager when the live workload's
-    padded shape does not match any bucket.
+    Set `max_batch_size` to generate capture shapes automatically. Advanced users can instead
+    specify `buckets`. Replay falls back to eager when no captured shape fits the live workload.
 
     NOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for
     `buckets` corresponding to lesser compute.
     """
 
-    buckets: list[tuple[PositiveInt, PositiveInt]] = Field(
+    max_batch_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        ("Maximum number of encoder contexts per CUDA graph. Automatically captures every "
+         "context count from 1 to this limit, with token capacities derived from the encoder "
+         "token budget. Contexts are encoder sequences, such as image or video frame groups "
+         "and audio chunks; they are not concurrent requests. Mutually exclusive with buckets."
+         ),
+        status="prototype",
+    )
+
+    max_num_tokens: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        ("Optional total token capacity for automatically generated graphs. Defaults to "
+         "encoder_max_num_tokens, or max_num_tokens when the encoder limit is unset. The "
+         "encoder adapter defines token units and layout. Larger workloads run eagerly. "
+         "Mutually exclusive with buckets."),
+        status="prototype",
+    )
+
+    buckets: Optional[list[tuple[PositiveInt, PositiveInt]]] = Field(
+        default=None,
         min_length=1,
         description=
         ("Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair "
@@ -723,6 +744,13 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
 
     @model_validator(mode='after')
     def _normalize(self) -> 'MultimodalEncoderCudaGraphConfig':
+        if self.buckets is None:
+            if self.max_batch_size is None:
+                raise ValueError("Set max_batch_size or explicit buckets.")
+            return self
+        if self.max_batch_size is not None or self.max_num_tokens is not None:
+            raise ValueError("Explicit buckets cannot be combined with "
+                             "max_batch_size or max_num_tokens.")
         for total_tokens, num_contexts in self.buckets:
             if total_tokens < num_contexts:
                 raise ValueError("`buckets` entries must have total_tokens >= "
@@ -1308,10 +1336,11 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
         "Whether to use CuTE DSL top-k kernel instead of the CUDA C++ indexer_topk_decode."
     )
     use_cute_dsl_paged_mqa_logits: bool = Field(
-        default=False,
+        default=True,
         description=
-        "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM."
-    )
+        "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family "
+        "GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 "
+        "family or when the cutlass-dsl package is missing.")
     q_split_threshold: int = Field(
         default=8192,
         description=
@@ -1821,61 +1850,42 @@ class SkipSoftmaxAttentionConfig(BaseSparseAttentionConfig):
                                  uses_spcompress=self.uses_spcompress)
 
 
-class MoeLoadBalancerConfig(StrictBaseModel):
-    """Pydantic configuration model for the Mixture of Experts (MoE) load balancer.
+class _MoeLoadBalancerConfigBase(StrictBaseModel):
+    """Common slot layout and expert-parallel runtime state for EPLB."""
 
-    This model holds configuration data (`num_slots`, etc.) as well as
-    runtime state (`_ep_rank`, `_ep_size`) which must be set via the
-    `setup()` method before use.
-    """
-
-    num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
+    num_slots: Optional[int] = Field(
         default=None,
-        repr=False  # Exclude this large dict from model representation
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots."
     )
-    layer_updates_per_iter: int = 0
     _ep_rank: Optional[int] = PrivateAttr(default=None)
     _ep_size: Optional[int] = PrivateAttr(default=None)
 
-    # --- Methods ---
-
     def setup(self, ep_rank: int, ep_size: int) -> None:
-        """Initializes the runtime state of the configuration.
-        This must be called before accessing properties like `num_local_slots`.
-        """
+        """Bind the process-local expert-parallel rank and size."""
         self._ep_rank = ep_rank
         self._ep_size = ep_size
-
-        # This assertion was in the original and is critical.
         if self.num_slots is None:
             raise ValueError("`num_slots` cannot be None when calling setup().")
-
         if self.num_slots % ep_size != 0:
             raise ValueError(
                 f"`num_slots` ({self.num_slots}) must be divisible by `ep_size` ({ep_size})."
             )
 
-    # --- Computed Properties ---
-    # These properties depend on the runtime state set by setup()
-
     @property
     def ep_rank(self) -> int:
-        """Public accessor for the private expert parallel rank."""
         if self._ep_rank is None:
             raise AttributeError("ep_rank is not set. Call setup() first.")
         return self._ep_rank
 
     @property
     def ep_size(self) -> int:
-        """Public accessor for the private expert parallel size."""
         if self._ep_size is None:
             raise AttributeError("ep_size is not set. Call setup() first.")
         return self._ep_size
 
     @property
     def num_local_slots(self) -> int:
-        """Calculates the number of slots local to this rank."""
         if self.num_slots is None or self._ep_size is None:
             raise ValueError(
                 "Cannot calculate `num_local_slots`. "
@@ -1884,7 +1894,6 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     @property
     def slot_start(self) -> int:
-        """Calculates the starting global slot index for this rank."""
         if self._ep_rank is None:
             raise ValueError(
                 "Cannot calculate `slot_start`. Call setup() first.")
@@ -1892,32 +1901,137 @@ class MoeLoadBalancerConfig(StrictBaseModel):
 
     @property
     def slot_end(self) -> int:
-        """Calculates the ending global slot index (exclusive) for this rank."""
         return self.slot_start + self.num_local_slots
+
+
+class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure the standard asynchronous EPLB implementation."""
+
+    mode: Literal["standard"] = Field(
+        default="standard",
+        description=
+        "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+        status="prototype")
+    initial_global_assignments: Optional[Dict[int, List[int]]] = Field(
+        default=None,
+        repr=False,
+        description=
+        "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert."
+    )
+    layer_updates_per_iter: int = Field(
+        default=0,
+        description=
+        "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB."
+    )
 
     def get_layer_initial_global_assignments(
             self, layer_idx: int) -> Optional[List[int]]:
-        """Retrieves the initial global assignments for a specific layer."""
         if self.initial_global_assignments is None:
             return None
-
         if layer_idx not in self.initial_global_assignments:
             raise KeyError(
                 f"layer_idx {layer_idx} not found in `initial_global_assignments`."
             )
-
         assignments = self.initial_global_assignments[layer_idx]
-
         if self.num_slots is None:
             raise ValueError(
                 "`num_slots` is not set, cannot verify assignment length.")
-
         if len(assignments) != self.num_slots:
             raise ValueError(
                 f"Assignment length ({len(assignments)}) for layer {layer_idx} "
                 f"does not match `num_slots` ({self.num_slots}).")
-
         return assignments
+
+
+class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
+    """Configure per-layer dynamic EPLB with Halo-Q scheduling."""
+
+    mode: Literal["per_layer_dynamic"] = Field(
+        default="per_layer_dynamic",
+        description=
+        "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+        status="prototype")
+    num_slots: PositiveInt = Field(
+        description=
+        "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not static replicas: every forward pass refills them from that layer's routing; see `helper_slot_mode` for their storage.",
+        status="prototype")
+    auxiliary_sms: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description=
+        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
+        status="prototype")
+    helper_slot_mode: Literal["per_layer_resident", "shared_banks"] = Field(
+        default="per_layer_resident",
+        description=
+        "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+        status="prototype")
+
+    def validate_expert_capacity(self, num_experts: int) -> None:
+        """Validate that every EP rank has at least one helper slot."""
+        if self._ep_size is None:
+            raise ValueError("Call setup() before validating expert capacity.")
+        if num_experts <= 0:
+            raise ValueError("`num_experts` must be positive.")
+        if num_experts % self._ep_size != 0:
+            raise ValueError(
+                f"`num_experts` ({num_experts}) must be divisible by "
+                f"`ep_size` ({self._ep_size}) for per-layer dynamic EPLB.")
+        if self.num_slots <= num_experts:
+            raise ValueError(
+                f"`num_slots` ({self.num_slots}) must exceed `num_experts` "
+                f"({num_experts}) for per-layer dynamic EPLB.")
+
+
+MoeLoadBalancerConfigType = Annotated[
+    Union[MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig],
+    PydanticField(discriminator="mode"),
+]
+_MOE_LOAD_BALANCER_ADAPTER = TypeAdapter(MoeLoadBalancerConfigType)
+
+
+def _normalize_load_balancer_config(value: Any) -> Any:
+    """Preserve legacy standard-EPLB dictionaries that predate ``mode``."""
+    if isinstance(value, dict) and "mode" not in value:
+        return {"mode": "standard", **value}
+    return value
+
+
+def _parse_load_balancer_config(value: Any) -> MoeLoadBalancerConfigType:
+    return _MOE_LOAD_BALANCER_ADAPTER.validate_python(
+        _normalize_load_balancer_config(value))
+
+
+def _resolve_load_balancer_config(value: Any) -> Any:
+    """Resolve inline or YAML-backed EPLB input to its typed config."""
+    if value is None or isinstance(
+            value,
+        (MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig)):
+        return value
+
+    if isinstance(value, str):
+        config_path = value
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"MoE load balancer config file not found: {config_path}")
+        try:
+            with open(config_path) as f:
+                value = yaml.safe_load(f)
+            return _parse_load_balancer_config(value)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load MoE load balancer config file: {config_path}"
+            ) from e
+
+    if isinstance(value, dict):
+        try:
+            return _parse_load_balancer_config(value)
+        except Exception as e:
+            raise ValueError(
+                f"Failed to load MoE load balancer config: {value}") from e
+
+    return value
 
 
 _MoeBackend = Literal["AUTO", "CUTLASS", "CUTEDSL", "CUTEDSL_FC12", "TRTLLM",
@@ -1939,10 +2053,9 @@ class MoeConfig(StrictBaseModel):
         "If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time. If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used."
     )
 
-    load_balancer: Optional[Union[object, str]] = Field(
+    load_balancer: Optional[Union[MoeLoadBalancerConfigType, str]] = Field(
         default=None,
-        description="Configuration for MoE load balancing.",
-        json_schema_extra={"type": "Union[MoeLoadBalancerConfig, dict, str]"})
+        description="Configuration for standard or per-layer dynamic EPLB.")
 
     disable_finalize_fusion: bool = Field(
         default=False,
@@ -1955,6 +2068,23 @@ class MoeConfig(StrictBaseModel):
         description=
         "Use low precision combine in MoE operations (only for NVFP4 quantization). When enabled, uses lower precision for combining expert outputs to improve performance."
     )
+
+    @field_validator("load_balancer", mode="before")
+    @classmethod
+    def resolve_load_balancer_config(cls, value: Any) -> Any:
+        return _resolve_load_balancer_config(value)
+
+    @model_validator(mode="after")
+    def resolve_load_balancer_compatibility(self) -> "MoeConfig":
+        """Resolve the backend required by per-layer dynamic EPLB."""
+        if getattr(self.load_balancer, "mode", None) != "per_layer_dynamic":
+            return self
+        if self.backend == "AUTO":
+            self.backend = "MEGAMOE_CUTEDSL"
+        elif self.backend != "MEGAMOE_CUTEDSL":
+            raise ValueError("per-layer dynamic EPLB requires "
+                             "backend='MEGAMOE_CUTEDSL'")
+        return self
 
 
 Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
@@ -1971,12 +2101,9 @@ Nvfp4Backend = Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']
 class Nvfp4GemmConfig(StrictBaseModel):
     """Configuration for NVFP4 GEMM backend selection."""
     allowed_backends: List[Nvfp4Backend] = Field(
-        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'],
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'],
         min_length=1,
-        description="List of backends to consider for auto-selection. "
-        "Default excludes 'cutedsl' for faster build time. "
-        "Add 'cutedsl' for extreme performance at the cost of longer server launch time."
-    )
+        description="List of backends to consider for auto-selection.")
 
 
 class AttentionDpConfig(StrictBaseModel):
@@ -1988,6 +2115,20 @@ class AttentionDpConfig(StrictBaseModel):
     batching_wait_iters: int = Field(
         default=10,
         description="The number of iterations to wait for batching.")
+    enable_kv_balanced_admission: bool = Field(
+        default=False,
+        description=
+        "Admit generation-only requests by per-rank KV load. When True and "
+        "the first 32 queued requests are all generation-only requests "
+        "without an attention_dp_rank, the attention DP router chooses which "
+        "of them to admit and which rank takes each, keeping the largest "
+        "per-rank request count and KV token count low, instead of admitting "
+        "them in queue order. Request priorities are respected, and a request "
+        "passed over in 64 admitting rounds is admitted next. Useful on "
+        "disaggregated generation workers. Has no effect with "
+        "kv_cache_routing_conversation_affinity, or with "
+        "enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+        status="prototype")
     enable_kv_cache_aware_routing: bool = Field(
         default=False,
         description="Enable internal KV cache-aware routing for attention DP. "
@@ -2597,8 +2738,8 @@ class MooncakeStoreConfig(StrictBaseModel):
         "both",
         description="What this server does with the pool. 'both' reads and "
         "writes, 'producer' only writes, 'consumer' only reads, and "
-        "'capacity' does neither: its ranks lend memory without moving any "
-        "KV, so they pin no staging buffers and pay no per-request cost.")
+        "'capacity' does neither: its ranks lend memory without registering "
+        "any KV cache, so it needs no GPUDirect RDMA.")
     segment_size: Union[int, str] = Field(
         "16GiB",
         description="Host memory each of this server's ranks contributes to "
@@ -2622,12 +2763,12 @@ class MooncakeStoreConfig(StrictBaseModel):
         "disagree read each other's pages as their own, so it has no default "
         "and must be unique per checkpoint.")
     stage_through_host: bool = Field(
-        True,
+        False,
         telemetry=False,
         description="Copy pages through a pinned host buffer instead of "
-        "registering the KV pools with Mooncake. The only transfer path "
-        "supported today, so 'false' is ignored with a warning. Costs a copy "
-        "each way and needs no GPUDirect RDMA.")
+        "registering the KV pools with Mooncake. For a host whose HCA cannot "
+        "pin GPU pages; costs a copy each way. Ignored when role is "
+        "'capacity'.")
     local_hostname: Optional[str] = Field(
         None,
         telemetry=False,
@@ -2650,17 +2791,6 @@ class MooncakeStoreConfig(StrictBaseModel):
         "master to accept connections. Raise it when the wait spans a "
         "container start on another node. Expiring fails the server at "
         "startup.")
-
-    @field_validator("stage_through_host", mode="after")
-    @classmethod
-    def _force_host_staging(cls, value):
-        """Say here what the workers would otherwise each say after bringup."""
-        if not value:
-            logger.warning(
-                "Ignoring mooncake_store.stage_through_host=False: pages pass "
-                "through pinned host memory, which is the only transfer path "
-                "this connector supports today.")
-        return True
 
     @field_validator("segment_size", mode="after")
     @classmethod
@@ -2713,6 +2843,23 @@ class KvCacheConnectorConfig(StrictBaseModel):
         description="Pool topology for the 'mooncake-store' connector. When "
         "set, trtllm-serve provisions the pool during bringup instead of "
         "requiring MOONCAKE_CONFIG_PATH from an external script.")
+
+    transfer_timeout_sec: float = Field(
+        default=600.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Deadline in seconds for an outstanding ADP KV connector "
+        "transfer. Checked at polling gates; cannot interrupt blocking callbacks. "
+        "Expiration fails all ADP owners and requires process restart. Unused without attention DP."
+    )
+    control_grace_sec: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Grace period in seconds for pending ADP KV connector "
+        "transfers after cancellation or shutdown. Can only shorten the "
+        "existing transfer deadline. Expiration fails all ADP owners and requires process restart. "
+        "Unused without attention DP.")
 
     @model_validator(mode="after")
     def _resolve_preset(self) -> "KvCacheConnectorConfig":
@@ -2784,11 +2931,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
         "The topK value for each layer when dynamic tree is enabled. Required "
         "when use_dynamic_tree is True; ignored (with a warning) when "
         "use_dynamic_tree is False.")
-    num_eagle_layers: Optional[int] = Field(
-        default=None,
-        description=
-        "Deprecated TensorRT-only field with different semantics from draft model "
-        "layer count. Do not use on the PyTorch backend.")
     _num_draft_hidden_layers: Optional[int] = PrivateAttr(default=None)
     max_non_leaves_per_layer: Optional[int] = Field(
         default=None, description="The number of non-leaves in each layer.")
@@ -2810,7 +2952,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
-        self.num_eagle_layers = self.max_draft_len
 
         if self.eagle3_model_arch == "mistral_large3" and self.eagle3_layers_to_capture is None:
             # FIXME find a better way to setup it.
@@ -3261,14 +3402,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @property
     def num_capture_layers(self) -> int:
-        # MTP_EAGLE (two-model) feeds captured target hidden states into the
-        # separate draft engine, so the shared Eagle3ResourceManager must
-        # allocate a hidden_states buffer for it. MTP_EAGLE_ONE_MODEL passes
-        # the target model's hidden_states straight to the MTP layer
-        # (see Eagle3OneModelWorker.prepare_1st_drafter_inputs / _run_draft_forward,
-        # both gated on self.is_mtp_eagle), so no capture buffer is needed
-        # and we should skip allocation to avoid disabling post-MLP/MoE
-        # fusion via the layer-capture hook.
+        # MTP_EAGLE_ONE_MODEL passes the target model's hidden_states straight
+        # to the MTP layer (see Eagle3OneModelWorker.prepare_1st_drafter_inputs
+        # / _run_draft_forward, both gated on self.is_mtp_eagle), so no capture
+        # buffer is needed and we skip allocation to avoid disabling
+        # post-MLP/MoE fusion via the layer-capture hook.
         return 0
 
     @property
@@ -3408,14 +3546,17 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
             "speculators DSpark drafters are supported with a qwen3 backbone; "
             f"this one has model_type {layer.get('model_type')!r}")
     aux_layer_ids = config_dict.get("aux_hidden_state_layer_ids")
-    if not aux_layer_ids or min(aux_layer_ids) < 1:
+    if (not isinstance(aux_layer_ids, list) or not aux_layer_ids or any(
+            type(layer_id) is not int or layer_id < 1
+            for layer_id in aux_layer_ids)):
         raise ValueError(
-            "a speculators DSpark drafter needs aux_hidden_state_layer_ids >= 1 "
+            "a speculators DSpark drafter needs aux_hidden_state_layer_ids to be "
+            "a non-empty list of positive integers (>= 1, excluding bool) "
             "(layer 0's input is the embedding output, which is not captured); "
             f"got {aux_layer_ids}")
     num_layers = layer["num_hidden_layers"]
     dflash_config = {
-        "target_layer_ids": [int(layer_id) - 1 for layer_id in aux_layer_ids]
+        "target_layer_ids": [layer_id - 1 for layer_id in aux_layer_ids]
     }
     if config_dict.get("mask_token_id") is not None:
         dflash_config["mask_token_id"] = config_dict["mask_token_id"]
@@ -4232,15 +4373,6 @@ class PybindMirrorEnumMeta(EnumMeta, PybindMirrorMeta):
     """Combined metaclass for Enum and PybindMirror.  This is crucial."""
 
 
-@PybindMirror.mirror_pybind_enum(_BatchingType)
-class BatchingType(StrEnum, metaclass=PybindMirrorEnumMeta):
-    STATIC = "STATIC"
-    INFLIGHT = "INFLIGHT"
-
-    def _to_pybind(self):
-        return getattr(_BatchingType, self.value)
-
-
 @PybindMirror.mirror_pybind_enum(_CapacitySchedulerPolicy)
 class CapacitySchedulerPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     MAX_UTILIZATION = "MAX_UTILIZATION"
@@ -4644,15 +4776,12 @@ class MambaStateConfig(StrictBaseModel):
 
     enable_branch_snapshot: bool = Field(
         default=False,
-        status="prototype",
-        telemetry=True,
-        description=
-        "Snapshot the Mamba recurrent state where a request's content "
-        "diverges from the prefix cache, so that later requests sharing the "
-        "same prefix can reuse up to the fork instead of being truncated to "
-        "an earlier snapshot. If no periodic or additional snapshot point "
-        "applies to the prompt, the prompt end is snapshotted as a fallback. "
-        "Requires KV cache manager V2.")
+        status="deprecated",
+        telemetry=False,
+        exclude=True,
+        description="Deprecated alias for "
+        "kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes "
+        "effect only when block reuse is enabled.")
 
 
 class KVEventsConfig(StrictBaseModel):
@@ -4754,6 +4883,22 @@ class BlockReuseConfig(StrictBaseModel):
         "This preference does not guarantee residency or change attention windows "
         "or prefix matching. Dummy and draft requests are excluded.")
 
+    enable_branch_snapshot: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep reusable state where a request's prompt diverges from the prefix "
+        "cache, so later requests sharing that prefix can reuse up to the fork. "
+        "For sliding-window attention (SWA), the SWA window at the fork is "
+        "committed. This helps when only the SWA window at a chunk end is kept: "
+        "policy 'per_request' or 'per_conversation', or SWA scratch reuse. The "
+        "fork is aligned down to a block boundary and becomes a forced context "
+        "chunk boundary. SWA layers skip this with joint target/draft KV cache "
+        "reuse. For hybrid Mamba models, the recurrent state is snapshotted at "
+        "the fork. If no periodic or additional snapshot point applies to the "
+        "prompt, the prompt end is snapshotted as a fallback. Requires KV cache "
+        "manager v2 and block reuse.")
+
     @model_validator(mode="after")
     def validate_swa_endpoint_policy(self) -> 'BlockReuseConfig':
         if self.swa_endpoint_rewind_tokens > 0 and self.policy != "all_reusable":
@@ -4824,6 +4969,23 @@ class KvPoolRebalanceConfig(StrictBaseModel):
         "should be attempted.")
 
 
+# Mixed-precision KV dtype: "mixed_<history dtype>_<retained dtype>". The
+# first/last retained tokens and the attention inputs use the second dtype;
+# the full history is stored in the first. Requires KV cache manager V2.
+_MIXED_PRECISION_KV_DTYPE = re.compile(
+    r"^mixed_(?P<low>nvfp4)_(?P<high>fp8|float16|bfloat16)$")
+_MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
+                                   for high in ("fp8", "float16", "bfloat16"))
+
+
+class MixedPrecisionKV(NamedTuple):
+    """Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""
+    low: str
+    high: str
+    first_n: int
+    last_n: int
+
+
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
 class KvCacheConfig(StrictBaseModel, PybindMirror):
     """Configuration for the KV cache."""
@@ -4876,11 +5038,19 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The fraction of the KV Cache memory should be reserved for cross attention. If set to p, self attention will use 1-p of KV Cache memory and cross attention will use p of KV Cache memory. Defaults to None (unset); must be set when using an encoder-decoder model and must not be set otherwise."
     )
-    secondary_offload_min_priority: Optional[int] = Field(
+    cold_tier_offload_min_priority: Optional[int] = Field(
         default=None,
         description=
-        "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory."
+        "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. "
+        "Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset."
     )
+    secondary_offload_min_priority: Optional[int] = Field(
+        default=None,
+        status="deprecated",
+        deprecated="Use cold_tier_offload_min_priority instead.",
+        telemetry=False,
+        exclude=True,
+        description="Deprecated alias for cold_tier_offload_min_priority.")
     event_buffer_max_size: int = Field(
         default=0,
         description=
@@ -4933,12 +5103,31 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
         "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
+        "keeps the first and last N tokens of every sequence in <dtype> "
+        "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
+        "mixed_precision_last_n; requires KV cache manager V2. "
         "Resolved at "
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
                                              "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4"))
+                                             "nvfp4",
+                                             *_MIXED_PRECISION_KV_DTYPES))
+
+    mixed_precision_first_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of leading tokens per sequence kept at the "
+        "retained dtype. Retention follows the cache page granularity.")
+
+    mixed_precision_last_n: NonNegativeInt = Field(
+        default=256,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: number of most recent tokens per sequence kept at "
+        "the retained dtype. Retention follows the cache page granularity.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5095,7 +5284,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             free_gpu_memory_fraction=self.free_gpu_memory_fraction,
             host_cache_size=self.host_cache_size,
             cross_kv_cache_fraction=self.cross_kv_cache_fraction,
-            secondary_offload_min_priority=self.secondary_offload_min_priority,
+            secondary_offload_min_priority=self.cold_tier_offload_min_priority,
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
@@ -5104,6 +5293,30 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
         return config
+
+    @model_validator(mode='after')
+    def migrate_legacy_offload_min_priority(self) -> 'KvCacheConfig':
+        legacy = self.__dict__.get('secondary_offload_min_priority')
+        if legacy is None:
+            return self
+        if (self.cold_tier_offload_min_priority is not None
+                and self.cold_tier_offload_min_priority != legacy):
+            raise ValueError(
+                "cold_tier_offload_min_priority and secondary_offload_min_priority "
+                "must match when both are set.")
+        logger.warning(
+            "'kv_cache_config.secondary_offload_min_priority' is deprecated; "
+            "use 'kv_cache_config.cold_tier_offload_min_priority' instead.")
+        self.cold_tier_offload_min_priority = legacy
+        return self
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        super().__setattr__(name, value)
+        if name == 'secondary_offload_min_priority':
+            super().__setattr__('cold_tier_offload_min_priority', value)
+        elif (name == 'cold_tier_offload_min_priority'
+              and 'secondary_offload_min_priority' in self.model_fields_set):
+            self.__dict__['secondary_offload_min_priority'] = value
 
     @field_validator('free_gpu_memory_fraction')
     @classmethod
@@ -5133,10 +5346,23 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         if v in ("auto", "fp8", "fp8_ds_mla",
                  "nvfp4") or v in _str_to_torch_dtype_dict.keys():
             return v
+        if _MIXED_PRECISION_KV_DTYPE.match(v):
+            return v
 
         raise ValueError(
             'kv_cache_config.dtype must be one of "auto", "fp8", "fp8_ds_mla", '
-            '"nvfp4", or valid torch.dtype string')
+            '"nvfp4", "mixed_nvfp4_<fp8|float16|bfloat16>", or valid '
+            'torch.dtype string')
+
+    @property
+    def mixed_precision_kv(self) -> Optional[MixedPrecisionKV]:
+        """Layout of a mixed-precision KV cache, else None."""
+        match = _MIXED_PRECISION_KV_DTYPE.match(self.dtype)
+        if match is None:
+            return None
+        return MixedPrecisionKV(match["low"], match["high"],
+                                self.mixed_precision_first_n,
+                                self.mixed_precision_last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5188,6 +5414,43 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             if self.use_kv_cache_manager_v2 is False:
                 raise ValueError(
                     "block_reuse_config.swa_endpoint_rewind_tokens requires "
+                    "kv_cache_config.use_kv_cache_manager_v2=True.")
+        return self
+
+    @model_validator(mode='after')
+    def migrate_mamba_branch_snapshot(self) -> 'KvCacheConfig':
+        """Copy the deprecated Mamba branch snapshot flag into block_reuse_config.
+
+        Runs before validate_branch_snapshot. The old flag had no effect
+        without block reuse, so it is not copied then rather than rejected.
+        """
+        if not self.mamba_state_config.enable_branch_snapshot:
+            return self
+        if ("enable_branch_snapshot" in self.block_reuse_config.model_fields_set
+                and not self.block_reuse_config.enable_branch_snapshot):
+            raise ValueError(
+                "Cannot set both 'kv_cache_config.mamba_state_config."
+                "enable_branch_snapshot=True' and 'kv_cache_config."
+                "block_reuse_config.enable_branch_snapshot=False'.")
+        logger.warning(
+            "'kv_cache_config.mamba_state_config.enable_branch_snapshot' is "
+            "deprecated; use 'kv_cache_config.block_reuse_config."
+            "enable_branch_snapshot' instead.")
+        if self.enable_block_reuse:
+            self.block_reuse_config = self.block_reuse_config.model_copy(
+                update={"enable_branch_snapshot": True})
+        return self
+
+    @model_validator(mode='after')
+    def validate_branch_snapshot(self) -> 'KvCacheConfig':
+        if self.block_reuse_config.enable_branch_snapshot:
+            if not self.enable_block_reuse:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
+                    "kv_cache_config.enable_block_reuse=True.")
+            if self.use_kv_cache_manager_v2 is False:
+                raise ValueError(
+                    "block_reuse_config.enable_branch_snapshot requires "
                     "kv_cache_config.use_kv_cache_manager_v2=True.")
         return self
 
@@ -5258,6 +5521,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 )
         return v
 
+    @model_validator(mode='after')
+    def validate_mixed_precision_retention(self) -> 'KvCacheConfig':
+        """A mixed-precision cache must retain at least one token per sequence."""
+        if (self.mixed_precision_kv is not None and self.mixed_precision_first_n
+                == self.mixed_precision_last_n == 0):
+            raise ValueError(
+                "Mixed-precision KV requires mixed_precision_first_n or "
+                "mixed_precision_last_n to be greater than zero.")
+        return self
+
     @field_validator('pool_ratio')
     @classmethod
     def validate_pool_ratio(cls, v: Optional[List[float]]):
@@ -5270,35 +5543,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "kv_cache_config.pool_ratio values must sum to 1.0")
         return v
-
-
-@PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
-class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
-    """Configuration for extended runtime performance knobs."""
-
-    multi_block_mode: bool = Field(
-        default=True, description="Whether to use multi-block mode.")
-
-    enable_context_fmha_fp32_acc: bool = Field(
-        default=False,
-        description="Whether to enable context FMHA FP32 accumulation.")
-
-    cuda_graph_mode: bool = Field(default=False,
-                                  description="Whether to use CUDA graph mode.")
-
-    cuda_graph_cache_size: int = Field(
-        default=0,
-        description=
-        "Number of cuda graphs to be cached in the runtime. The larger the cache, the better the perf, but more GPU memory is consumed."
-    )
-
-    def _to_pybind(self):
-        res = _ExtendedRuntimePerfKnobConfig(
-            multi_block_mode=self.multi_block_mode,
-            enable_context_fmha_fp32_acc=self.enable_context_fmha_fp32_acc)
-        res.cuda_graph_mode = self.cuda_graph_mode
-        res.cuda_graph_cache_size = self.cuda_graph_cache_size
-        return res
 
 
 # Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,
@@ -5530,7 +5774,7 @@ class DwdpConfig(StrictBaseModel):
     Each worker holds a subset of experts locally and asynchronously prefetches
     the remaining experts from peer workers via CUDA VMM + MNNVL fabric
     handles (composite virtual-address layout with zero-copy local mapping and
-    double-buffered P2P remote regions), enabling fully asynchronous execution
+    P2P remote prefetch slots), enabling fully asynchronous execution
     across ranks without synchronization barriers.
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
@@ -5552,6 +5796,14 @@ class DwdpConfig(StrictBaseModel):
         "Enable limited-contention prefetch optimization. Uses batched "
         "memcpy with round-robin slice ordering across peers and a 2 MiB "
         "slice granularity to reduce NVLink contention.")
+    num_prefetch_slots: int = Field(
+        default=2,
+        ge=2,
+        description=
+        "The number of expert prefetch buffer slots. Each slot holds the "
+        "remote experts of one MoE layer; more slots let the prefetch run "
+        "further ahead of the MoE compute, at the cost of device memory that "
+        "is then not available to the KV cache.")
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -6414,6 +6666,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Separated-routing MoE backends only.",
         status="beta")
 
+    lm_head_output_dtype: Literal["auto", "float32"] = Field(
+        default="auto",
+        description=
+        "Output dtype written by the LM head GEMM. 'auto' uses the model "
+        "dtype before logits are upcast to float32. 'float32' writes the "
+        "float32 accumulator directly, avoiding intermediate bf16/fp16 "
+        "rounding of logits before logprob computation. Weights and inputs "
+        "remain in the model dtype. Only supported for unquantized LM heads "
+        "of decoder-only models.",
+        status="prototype",
+        json_schema_extra={"type": "Literal['auto', 'float32']"})
+
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
                                   description="MoE config.",
                                   status="beta")
@@ -6991,6 +7255,38 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode="after")
+    def validate_mixed_precision_kv(self) -> 'TorchLlmArgs':
+        """Reject runtime features the mixed-precision KV cache does not support."""
+        if self.kv_cache_config.mixed_precision_kv is None:
+            return self
+        if self.kv_cache_config.use_kv_cache_manager_v2 is not True:
+            raise ValueError(
+                "Mixed-precision KV requires kv_cache_config.use_kv_cache_manager_v2=True."
+            )
+        # get_attention_backend matches the name case-insensitively.
+        if self.attn_backend.upper() not in ("TRTLLM", "FLASHINFER"):
+            raise ValueError(
+                "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
+                f"backends; got attn_backend={self.attn_backend!r}.")
+        if self.sparse_attention_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with sparse attention."
+            )
+        # The connector layout maps every cache layer to one model layer; the
+        # retained-token layers break that mapping.
+        if self.kv_connector_config is not None:
+            raise ValueError(
+                "Mixed-precision KV is not supported together with a KV connector."
+            )
+        if (self.speculative_config is not None
+                or self.kv_cache_compression_config is not None
+                or self.max_beam_width != 1):
+            raise ValueError(
+                "Mixed-precision KV currently requires single-beam execution "
+                "without speculative decoding or cold-page compression.")
+        return self
+
+    @model_validator(mode="after")
     def normalize_disabled_mm_encoder_cache(self) -> 'TorchLlmArgs':
         if (self.disable_mm_encoder
                 and self.multimodal_config.encoder_cache_max_bytes != 0):
@@ -7210,6 +7506,21 @@ class TorchLlmArgs(BaseLlmArgs):
                 raise ValueError(
                     f"Speculation type {self.speculative_config.decoding_type} does not "
                     f"support backend {self.backend}")
+
+            if isinstance(self.speculative_config, NGramDecodingConfig):
+                logger.warning_once(
+                    "NGramDecodingConfig (decoding_type 'NGram') is deprecated "
+                    "and will be removed in January 2027. Use SADecodingConfig "
+                    "(decoding_type 'SA', suffix automaton speculative "
+                    "decoding) instead.",
+                    key="deprecated_ngram_decoding_config")
+            elif isinstance(self.speculative_config,
+                            UserProvidedDecodingConfig):
+                logger.warning_once(
+                    "UserProvidedDecodingConfig (decoding_type "
+                    "'User_Provided') is deprecated and will be removed in "
+                    "January 2027.",
+                    key="deprecated_user_provided_decoding_config")
 
             # If user passed decoding_type: Eagle on pytorch, convert to Eagle3 with warning
             if type(self.speculative_config) is EagleDecodingConfig:
@@ -7633,69 +7944,40 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_gms_moe_compat(self) -> 'TorchLlmArgs':
-        """Reject ``LoadFormat.GMS`` combined with a MoE load balancer.
+        """Reject GMS when MoE load balancing owns extra device state.
 
-        The ``MoeLoadBalancer``'s ``register_weight_slots_after_to_cuda``
-        and ``finalize_model`` run AFTER the GMS RW pool is closed and
-        ``finalize_write`` has committed, so any CUDA allocations they
-        make land in non-GMS memory and are NOT part of the committed
-        layout that RO peers receive. The result is "wrong inference,
-        no error" on RO peers (broken MoE routing state). Failing at
-        config-validation time is strictly better than that silent
-        miscompute.
-
-        The fix for this gap (running the MoE finalize work INSIDE
-        ``mem_pool_scope`` and BEFORE ``finalize_write`` so MoE
-        allocations are part of the committed layout) is tracked as
-        the (MoE, GMS) follow-up; see ``model_loader.py``'s
-        ``TODO(GMS-MOE-LB)`` comment.
-
-        Returns:
-            ``self`` (Pydantic ``model_validator`` contract).
-
-        Raises:
-            ValueError: When ``load_format == LoadFormat.GMS`` and
-                ``moe_config.load_balancer`` is set.
+        Load-balancer state is currently allocated after GMS commits its
+        shared layout, so read-only peers cannot safely restore that state.
         """
         if (self.load_format == LoadFormat.GMS and self.moe_config is not None
                 and self.moe_config.load_balancer is not None):
             raise ValueError(
                 "LoadFormat.GMS is incompatible with moe_config.load_balancer "
-                "in this PR. The MoE load balancer's "
-                "register_weight_slots_after_to_cuda and finalize_model run "
-                "after the GMS pool closes and finalize_write commits, so "
-                "their allocations land outside the committed layout. RO "
-                "peers would receive a broken MoE routing state. Either "
-                "disable moe_config.load_balancer or use LoadFormat.AUTO. "
-                "Tracked as the (MoE, GMS) follow-up at "
-                "tensorrt_llm/_torch/pyexecutor/model_loader.py "
-                "(see TODO(GMS-MOE-LB)).")
+                "because load-balancer device state is not included in the "
+                "committed GMS layout. Disable moe_config.load_balancer or "
+                "use LoadFormat.AUTO.")
         return self
 
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
-        if isinstance(self.moe_config.load_balancer, str):
-            if not os.path.exists(self.moe_config.load_balancer):
-                raise FileNotFoundError(
-                    f"MoE load balancer config file not found: {self.moe_config.load_balancer}"
-                )
-            try:
-                with open(self.moe_config.load_balancer) as f:
-                    moe_load_balancer_config = yaml.safe_load(f)
-                self.moe_config.load_balancer = MoeLoadBalancerConfig(
-                    **moe_load_balancer_config)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to load MoE load balancer config file: {self.moe_config.load_balancer}"
-                ) from e
-        elif isinstance(self.moe_config.load_balancer, dict):
-            try:
-                self.moe_config.load_balancer = MoeLoadBalancerConfig(
-                    **self.moe_config.load_balancer)
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to load MoE load balancer config: {self.moe_config.load_balancer}"
-                ) from e
+        self.moe_config.load_balancer = _resolve_load_balancer_config(
+            self.moe_config.load_balancer)
+        self.moe_config.resolve_load_balancer_compatibility()
+        return self
+
+    @model_validator(mode="after")
+    def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
+        """Per-layer dynamic EPLB plans cannot be captured in CUDA graphs."""
+        if getattr(self.moe_config.load_balancer, "mode",
+                   None) != "per_layer_dynamic":
+            return self
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            raise ValueError(
+                "per-layer dynamic EPLB does not support prefill CUDA graphs")
+        if self.cuda_graph_config is not None:
+            logger.warning("per-layer dynamic EPLB does not support CUDA "
+                           "graphs; setting cuda_graph_config to None.")
+            self.cuda_graph_config = None
         return self
 
     @model_validator(mode='after')
@@ -7706,10 +7988,15 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
-        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla'):
+        elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
+                                            'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
         elif self.kv_cache_config.dtype == 'nvfp4':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
+        elif self.kv_cache_config.dtype in ('mixed_nvfp4_float16',
+                                            'mixed_nvfp4_bfloat16'):
+            # Retained tokens stay in the model dtype: no KV quantization.
+            self.quant_config.kv_cache_quant_algo = None
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "

@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
+import re
 
 ERROR_KEYWORDS = [
     "RuntimeError",
@@ -22,12 +38,20 @@ AUTOTUNER_BENIGN_TEXTS = [
     "out of memory",
 ]
 ENDPOINT_RETRY_MARKER = "is not ready, with exception:"
+PIP_TIMEOUT_RETRY = re.compile(
+    r"\s*WARNING: Retrying \(Retry\([^)]*\)\) after connection broken by "
+    r"'(?:Read|Connect)TimeoutError\(.*\)': \S+\s*"
+)
 
 
 def is_benign_line(line: str) -> bool:
     """True for lines expected during a HEALTHY run despite an error keyword."""
     if ENDPOINT_RETRY_MARKER in line:
         return True
+    # pip has scheduled another download attempt. Terminal exceptions and
+    # warning lines containing another error keyword must still fail the scan.
+    if PIP_TIMEOUT_RETRY.fullmatch(line):
+        return not any(keyword in line for keyword in ERROR_KEYWORDS if keyword != "TimeoutError")
     return AUTOTUNER_MARKER in line and any(text in line for text in AUTOTUNER_BENIGN_TEXTS)
 
 

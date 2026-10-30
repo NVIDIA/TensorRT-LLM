@@ -1597,7 +1597,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         request_ids=request_ids,
         prompt_lens=list(s.past_kv_lens),
         num_sparse_topk=num_sparse_topk,
-        num_heads_per_kv=s.q_heads_per_kv_head,
+        max_num_heads_per_kv=s.q_heads_per_kv_head,
         runtime_features=AttentionRuntimeFeatures(has_speculative_draft_tokens=s.has_draft_tokens),
         is_spec_decoding_enabled=s.has_draft_tokens,
         use_spec_decoding=s.has_draft_tokens,
@@ -1615,7 +1615,7 @@ def _create_generation_inputs(s: GenerationScenario) -> _GenerationInputs:
         metadata.spec_decoding_generation_lengths = torch.tensor(
             [s.query_len] * s.batch_size, dtype=torch.int32, device=device
         )
-        metadata.update_position_offsets_for_cpp(s.max_query_len)
+        metadata.spec_decoding_query_len = s.max_query_len
         metadata.spec_decoding_param_prepare_for_blackwell()
     metadata.prepare()
 

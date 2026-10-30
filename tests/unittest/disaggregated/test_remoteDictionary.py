@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import signal
 import socket
@@ -48,9 +51,6 @@ def stop_etcd_server(process):
 class TestEtcdDictionary(unittest.TestCase):
 
     def setUp(self):
-        # Set the protocol buffers implementation to python
-        os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-
         # Start etcd server
         self.etcd_process = start_etcd_server()
 
@@ -75,9 +75,6 @@ class TestEtcdDictionary(unittest.TestCase):
 
         # Stop etcd server
         stop_etcd_server(self.etcd_process)
-
-        # Unset the protocol buffers implementation
-        del os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]
 
     def _cleanup_test_keys(self):
         # Helper method to remove test keys

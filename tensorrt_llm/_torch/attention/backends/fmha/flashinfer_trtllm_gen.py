@@ -66,6 +66,7 @@ from .phased import FmhaParams, PhasedFmha
 from .utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
+    get_multi_ctas_kv_counter_size,
     get_multi_processor_count_for_device,
     get_trtllm_gen_context_workspace_size,
 )
@@ -217,23 +218,6 @@ if IS_FLASHINFER_AVAILABLE:
     _install_flashinfer_mla_decode_tuning_config_cache()
 
 
-_MULTI_CTAS_KV_COUNTER_ALIGNMENT = 8
-
-
-def _get_multi_ctas_kv_counter_size(
-    num_heads: int,
-    max_num_sequences: int,
-    multi_processor_count: int,
-) -> int:
-    num_counters = max(num_heads * max_num_sequences, multi_processor_count)
-    aligned_num_counters = (
-        (num_counters + _MULTI_CTAS_KV_COUNTER_ALIGNMENT - 1)
-        // _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-        * _MULTI_CTAS_KV_COUNTER_ALIGNMENT
-    )
-    return aligned_num_counters * torch.int32.itemsize
-
-
 def _get_bmm1_scale_log2(bmm1_scale: torch.Tensor) -> torch.Tensor:
     if bmm1_scale.numel() < 2:
         raise RuntimeError("trtllm-gen bmm1_scale workspace must contain raw and log2 scales.")
@@ -369,6 +353,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     MAX_HEADS_RATIO_GENERATION = 32
     MIN_TOKENS_PER_BLOCK = 8
     SUPPORTED_TOKENS_PER_BLOCK = {16, 32, 64}
+    # SMs on which this library serves only a KV cache manager's extra page
+    # sizes (``trtllm_gen_extra_tokens_per_block``); every other request there
+    # stays on the fallback FMHA.
+    EXTRA_PAGE_SIZES_ONLY_SMS = frozenset({107})
     # FlashInfer narrows key_cache.size(0) to int before constructing its TMA descriptor.
     MAX_NUM_PAGES_IN_MEM_POOL = (1 << 31) - 1
     SUPPORTED_MLA_GENERATION_HEAD_DIMS = {
@@ -407,13 +395,19 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False
 
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if sm not in (100, 103, 107):
             logger.debug(
-                f"FlashInfer TRTLLM-Gen FMHA is unavailable: requires SM100 or SM103, got SM{sm}."
+                "FlashInfer TRTLLM-Gen FMHA is unavailable: "
+                f"requires SM100, SM103 or SM107, got SM{sm}."
             )
             return False
 
         return True
+
+    @classmethod
+    def serves_only_extra_page_sizes(cls) -> bool:
+        """Whether this device uses the library only for a KV cache manager's extra page sizes."""
+        return get_sm_version() in cls.EXTRA_PAGE_SIZES_ONLY_SMS
 
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
@@ -738,7 +732,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
                     return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] unsupported attention mask: {fwd.attention_mask!r}."
             if has_alibi:
                 return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
@@ -790,12 +784,21 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if tokens_per_block & (tokens_per_block - 1) != 0:
             return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
         # A KV cache manager may allow extra page sizes, e.g. MiniMax-M3 adds 128.
-        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | set(
+        extra_tokens_per_block = frozenset(
             getattr(meta.kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ())
         )
+        supported_tokens_per_block = self.SUPPORTED_TOKENS_PER_BLOCK | extra_tokens_per_block
         if tokens_per_block not in supported_tokens_per_block:
             supported = sorted(supported_tokens_per_block)
             return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
+        # On SM107 this library serves only the extra page sizes, which the
+        # fallback thop FMHA has no paged-context kernels for. Every other SM107
+        # request stays on the fallback.
+        if self.serves_only_extra_page_sizes() and tokens_per_block not in extra_tokens_per_block:
+            return False, (
+                f"tokens_per_block ({tokens_per_block}) on SM107, which uses this library "
+                "only for the KV cache manager's extra page sizes."
+            )
 
         return True, ""
 
@@ -840,9 +843,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
 
         # One counter per head per decoder sequence; beam search expands each
         # request into ``beam_width`` sequences.
-        required_counter_size = _get_multi_ctas_kv_counter_size(
+        max_num_sequences = metadata.max_num_sequences or metadata.max_num_requests
+        required_counter_size = get_multi_ctas_kv_counter_size(
             attn.num_heads,
-            metadata.max_num_sequences or metadata.max_num_requests,
+            max_num_sequences,
             self._multi_processor_count,
         )
         counter_buffer = self._multi_ctas_kv_counter_buffer
@@ -871,8 +875,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError(f"{type(self).__name__} requires output.")
         fp8_context_fmha = self._use_fp8_context_fmha(output, attention_input_type)
 
-        workspace_max_tokens = max(num_tokens, metadata.max_context_length)
-        workspace_max_gen_tokens = max(num_gen_tokens, metadata.max_num_requests)
+        workspace_max_tokens = max(num_tokens, metadata.max_context_length, max_num_sequences)
+        workspace_max_gen_tokens = max(num_gen_tokens, max_num_sequences)
         required_workspace_size = _get_workspace_size(
             dtype=q.dtype,
             num_tokens=workspace_max_tokens,
@@ -880,7 +884,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             num_heads=attn.num_heads,
             num_kv_heads=attn.num_kv_heads,
             head_size=attn.head_dim,
-            max_num_requests=metadata.max_num_requests,
+            max_num_requests=max_num_sequences,
             rotary_embedding_dim=attn.rope_dim,
             fp8_context_fmha=fp8_context_fmha,
         )

@@ -34,7 +34,12 @@ Each SM contains 4 sub-partitions (SMSPs), each with:
 - Warp scheduler + dispatch unit
 - Register file
 - Execution units: integer (ALU), floating-point (FMA), load/store (LSU), special function (XU)
-- Shared tensor cores across the SM
+- Tensor cores
+
+Shared across the SM: the unified L1 data cache / shared memory and the texture units. On
+Blackwell, 5th-generation MMA (`tcgen05`) is issued by a single thread to the tensor-core
+pipeline (`tc`), which drives all four sub-partitions and writes the accumulator to Tensor
+Memory (TMEM) instead of registers.
 
 ### Memory Hierarchy
 
@@ -64,7 +69,7 @@ Pattern: `unit__(subunit?)_(pipestage?)_quantity_(qualifiers?)`
 | `gpc` | General Processing Cluster |
 | `tpc` | Thread Processing Cluster |
 | `gpu` | Whole GPU |
-| `ctc` | Chip-to-Chip (Grace Hopper) |
+| `ctc` | NVLink Chip-to-Chip (C2C) link to a Grace CPU |
 
 ### Pipelines (Execution Units)
 
@@ -74,9 +79,11 @@ Pattern: `unit__(subunit?)_(pipestage?)_quantity_(qualifiers?)`
 | `fma` | Fused multiply-add (FP32) |
 | `fp64` | Double precision |
 | `lsu` | Load/store |
-| `tensor` | Tensor core operations |
+| `tensor` | Tensor core operations (MMA, including Blackwell `tcgen05` MMA) |
+| `tc` | Blackwell tensor-core pipeline (`UTC*` instructions: MMA, copies, barriers) |
 | `tex` | Texture operations |
 | `tma` | Tensor memory accelerator |
+| `tmem` | Blackwell Tensor Memory loads and stores |
 | `xu` | Transcendental/conversion |
 | `cbu` | Control/branch |
 
@@ -120,8 +127,9 @@ Example: `sm__throughput.avg.pct_of_peak_sustained_elapsed` = compute throughput
 
 | Metric | Meaning | Use |
 |--------|---------|-----|
-| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | Compute throughput | SOL% classification |
-| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | Memory throughput | SOL% classification |
+| `sm__throughput.avg.pct_of_peak_sustained_elapsed` | Compute (SM) Throughput | SOL% classification |
+| `gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed` | Memory Throughput (busiest memory unit) | SOL% classification |
+| `dram__throughput.avg.pct_of_peak_sustained_elapsed` | DRAM throughput | DRAM bandwidth use |
 | `gpu__time_duration.sum` | Kernel duration (ns) | Launch overhead check |
 
 ### Occupancy
@@ -129,10 +137,11 @@ Example: `sm__throughput.avg.pct_of_peak_sustained_elapsed` = compute throughput
 | Metric | Meaning | Good Value |
 |--------|---------|------------|
 | `sm__warps_active.avg.pct_of_peak_sustained_active` | Achieved occupancy | >50% |
-| `launch__occupancy_per_sm` | Theoretical occupancy | 100% ideal |
-| `launch__occupancy_limit_registers` | Register limit | Compare to achieved |
-| `launch__occupancy_limit_shared_mem` | Shared memory limit | Compare to achieved |
-| `launch__occupancy_limit_blocks` | Block limit | Compare to achieved |
+| `sm__maximum_warps_per_active_cycle_pct` | Theoretical occupancy | 100% ideal |
+| `launch__occupancy_limit_registers` | Blocks per SM that registers allow | Lowest limit sets theoretical |
+| `launch__occupancy_limit_shared_mem` | Blocks per SM that shared memory allows | Lowest limit sets theoretical |
+| `launch__occupancy_limit_warps` | Blocks per SM that the warp count allows | Lowest limit sets theoretical |
+| `launch__occupancy_limit_blocks` | Blocks per SM the hardware allows | Lowest limit sets theoretical |
 
 ### Cache Performance
 
@@ -172,8 +181,8 @@ Example: `sm__throughput.avg.pct_of_peak_sustained_elapsed` = compute throughput
 Each hardware unit tracks:
 - `cycles_elapsed` — total cycles during measurement
 - `cycles_active` — cycles the unit was doing work
-- `cycles_stalled` — cycles waiting (active but not progressing)
-- `cycles_idle` — cycles completely idle
+- `cycles_stalled` — cycles the unit could not take new data because its output was blocked
+- `cycles_idle` — cycles the unit was idle
 
 Ratio: `active / elapsed` = utilization percentage.
 

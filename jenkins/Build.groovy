@@ -125,28 +125,28 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "single-device-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_X86_64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;107-real;120-real",
+    (WHEEL_ARCHS): "90;100;103;107;120;121",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;107-real;120-real",
+    (WHEEL_ARCHS): "90;100;103;107;120;121",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
@@ -194,6 +194,13 @@ BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
+
+// FailureClassifier catalog ids that make a failed wheel build worth retrying.
+// Add an id here to retry on that failure. Each retry halves -j (down to
+// BUILD_RETRY_MIN_JOBS), which is what helps the memory-exhaustion ids.
+BUILD_RETRY_QUERY_IDS = ["build-oom"]
+BUILD_RETRY_MAX_RETRIES = 2
+BUILD_RETRY_MIN_JOBS = 2
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
@@ -257,12 +264,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         nodeLabelPrefix = "cpu"
         break
     }
-    // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -299,7 +300,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -468,6 +468,17 @@ def prepareLLMBuild(pipeline, config, versionOverride)
 
 }
 
+// Returns the id of the BUILD_RETRY_QUERY_IDS signature the failed build attempt
+// matched in its step log, or null if it should not be retried. User aborts never
+// reach here (runLLMBuild rethrows InterruptedException first).
+def matchRetryableBuildFailure(pipeline, Throwable e)
+{
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.K8S).findAll { it.id in BUILD_RETRY_QUERY_IDS }
+    def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, queries)
+    def classified = FailureClassifier.classify(e, InfraFailure.K8S, evidence)
+    return classified instanceof InfraFailure ? evidence?.matchedQueryId : null
+}
+
 def runLLMBuild(
     pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false, artifacts=null)
 {
@@ -511,13 +522,37 @@ def runLLMBuild(
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
     }
 
-    def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
+    int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        int buildRetries = 0
+        while (true) {
+            try {
+                // cmake will download third-party sources, so we add retry.
+                trtllm_utils.llmExecStepWithRetry(
+                    pipeline,
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                )
+                break
+            } catch (InterruptedException e) {
+                // User abort / pipeline timeout (FlowInterruptedException): never retry.
+                throw e
+            } catch (Exception e) {
+                def retryReason = null
+                if (buildRetries >= BUILD_RETRY_MAX_RETRIES ||
+                    buildJobs <= BUILD_RETRY_MIN_JOBS ||
+                    (retryReason = matchRetryableBuildFailure(pipeline, e)) == null) {
+                    throw e
+                }
+                buildRetries++
+                int newJobs = Math.max(BUILD_RETRY_MIN_JOBS, (int) (buildJobs / 2))
+                echo "Wheel build failed (${retryReason}); retrying with -j ${newJobs} (was ${buildJobs}), retry ${buildRetries}/${BUILD_RETRY_MAX_RETRIES}."
+                buildJobs = newJobs
+            }
+        }
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
@@ -730,9 +765,9 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     if (extra_args == "") {
         if (triple == AARCH64_TRIPLE) {
-            extra_args = "-a '90-real;100-real;103-real;107-real;120-real'"
+            extra_args = "-a '90;100;103;107;120;121'"
         } else {
-            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real;107-real;120-real'"
+            extra_args = "-a '80;86;89;90;100;103;107;120'"
         }
     }
     if (pre_cxx11abi) {
@@ -874,7 +909,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks", true)
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })
