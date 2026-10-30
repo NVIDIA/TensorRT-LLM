@@ -5658,3 +5658,103 @@ def test_topk_indices_buffer_cuda_graph(dsa_cache_manager):
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
         "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
     )
+
+
+# --- The subclass seams of Indexer.sparse_attn_indexer ----------------------------------------
+
+
+def _seam_indexer():
+    indexer = Indexer.__new__(Indexer)
+    torch.nn.Module.__init__(indexer)
+    return indexer
+
+
+def test_reused_topk_copy_is_the_row_copy():
+    gen = torch.Generator().manual_seed(0)
+    shared = torch.randint(0, 1000, (4, 16), generator=gen, dtype=torch.int32)
+    buffer = torch.full((12, 16), -1, dtype=torch.int32)
+    expected = buffer.clone()
+    expected[2:5, :] = shared[:3, :]
+
+    _seam_indexer()._copy_reused_topk(
+        SimpleNamespace(shared_topk_indices=shared), buffer, 2, 3, 3, False, None
+    )
+
+    assert torch.equal(buffer, expected)
+
+
+def test_fill_decode_topk_leaves_the_rows_to_the_decode_branch():
+    buffer = torch.full((6, 8), -1, dtype=torch.int32)
+
+    filled = _seam_indexer()._fill_decode_topk(SimpleNamespace(), None, None, buffer, 0, 6)
+
+    assert filled is False
+    assert bool((buffer == -1).all())
+
+
+def _stored_rows_inline(
+    indexer,
+    topk_indices_buffer,
+    metadata,
+    num_contexts,
+    num_generations,
+    num_gen_tokens,
+    token_offset,
+    has_prefill,
+    has_decode,
+    is_generation,
+):
+    """The statements ``sparse_attn_indexer`` ran in place of ``_store_mtp_shared_rows``."""
+    rows = None
+    if has_decode:
+        next_n = num_gen_tokens // num_generations
+        gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+        rows = indexer._mtp_last_accepted_rows(
+            gen_topk, metadata, num_contexts, num_generations, next_n
+        )
+    if has_prefill:
+        ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+        ctx_rows = topk_indices_buffer[ctx_last]
+        rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+    if rows is not None:
+        shared_topk_indices = metadata.shared_topk_indices
+        if shared_topk_indices is None:
+            metadata.shared_topk_indices = rows.contiguous()
+        else:
+            row_start = num_contexts if is_generation else 0
+            shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(rows)
+
+
+@pytest.mark.parametrize("has_prefill, has_decode", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("is_generation", [True, False])
+@pytest.mark.parametrize("preset", [False, True], ids=["unset", "preset"])
+@pytest.mark.parametrize("accepted", [None, (0, 0, 1, 4, 2)], ids=["no_counts", "counts"])
+def test_mtp_shared_rows_are_the_inline_statements(
+    has_prefill, has_decode, is_generation, preset, accepted
+):
+    num_contexts, num_generations, next_n = 2, 3, 4
+    seq_lens = torch.tensor([5, 3] + [next_n] * num_generations, dtype=torch.int32)
+    token_offset = int(seq_lens[:num_contexts].sum())
+    num_gen_tokens = num_generations * next_n
+    gen = torch.Generator().manual_seed(1)
+    buffer = torch.randint(
+        0, 1000, (token_offset + num_gen_tokens, 6), generator=gen, dtype=torch.int32
+    )
+
+    def metadata():
+        return SimpleNamespace(
+            seq_lens_cuda=seq_lens.clone(),
+            mtp_num_accepted=None if accepted is None else torch.tensor(accepted),
+            shared_topk_indices=(torch.full((8, 8), -7, dtype=torch.int32) if preset else None),
+        )
+
+    args = (num_contexts, num_generations, num_gen_tokens, token_offset)
+    flags = (has_prefill, has_decode, is_generation)
+    expected, got = metadata(), metadata()
+    indexer = _seam_indexer()
+    _stored_rows_inline(indexer, buffer.clone(), expected, *args, *flags)
+    seam_buffer = buffer.clone()
+    indexer._store_mtp_shared_rows(seam_buffer, got, *args, *flags)
+
+    assert torch.equal(seam_buffer, buffer)
+    assert torch.equal(got.shared_topk_indices, expected.shared_topk_indices)

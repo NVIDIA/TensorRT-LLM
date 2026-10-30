@@ -211,7 +211,7 @@ or reused identities mean the original process no longer executes; a live or
 unobservable rank fails. This process observation is not GPU/RDMA fencing proof.
 The [exit-observer tests](test_transfer_lifecycle_process_exit.py) exercise all
 nine scenarios on each rank. The [startup tests](test_transfer_lifecycle_startup.py)
-check that both workers and the supervisor share one 120-second startup deadline,
+check that both workers and the supervisor share one 600-second startup deadline,
 reject readiness observed at or after expiry, and leave relative transfer waits
 unchanged; startup failures print bounded worker logs and missing readiness
 markers before cleanup.

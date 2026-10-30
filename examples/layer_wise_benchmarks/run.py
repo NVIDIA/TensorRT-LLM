@@ -168,7 +168,9 @@ if args.load_format is None:
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 if args.moe_backend_for_prefill is None:
-    args.moe_backend_for_prefill = "CUTLASS"
+    # Prefill only fills the KV cache for the GEN measurement, so it just needs a backend
+    # that can serve this checkpoint on this GPU, which AUTO resolves.
+    args.moe_backend_for_prefill = "AUTO"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:

@@ -40,7 +40,7 @@ from backend_case import (
 from model_attn_config import MODEL_CONFIGS, ModelAttnConfig
 from utils.util import getSMVersion
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 
 # Precision variants as (dtype, kv_dtype): bf16/fp16 are compute-only; fp8 is an
 # fp8 KV cache with bf16 compute.
@@ -320,7 +320,7 @@ def test_mla_context_v_token_stride_matches_both_input_layouts(kv_dtype: torch.d
     """Check separate-V layouts through BF16 FMHA and the FP8 context input quantizer."""
     case = _mla_context_v_stride_case()
     fp8_context = kv_dtype == torch.float8_e4m3fn
-    if fp8_context and get_sm_version() not in (90, 100, 103, 107, 120):
+    if fp8_context and not (get_sm_version() in (90, 100, 103, 107) or is_sm_120f()):
         pytest.skip("requires a GPU supporting FP8 context MLA")
     inputs = generate_mla_context_inputs(case)
     assert inputs["v"].stride(0) > inputs["v"].size(1)
