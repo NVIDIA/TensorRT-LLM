@@ -60,8 +60,8 @@ _SERVER_OPTIONS = [
     ("grpc.http2.max_pings_without_data", 0),
     ("grpc.http2.min_ping_interval_without_data_ms", 10000),
 ]
-# The first release that honors grpc.so_reuseport, which multiple frontends need.
-_PYGRPC_NATIVE_MIN_VERSION = "0.5.0"
+# Honors grpc.so_reuseport (0.5.0) and streams responses with far less CPU (0.6.1).
+_PYGRPC_NATIVE_MIN_VERSION = "0.6.1"
 
 
 _format_bind_address = _format_host_port

@@ -357,7 +357,7 @@ def test_serve_openengine_missing_grpc_shows_install_hint(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("installed", [None, "0.4.0"])
+@pytest.mark.parametrize("installed", [None, "0.6.0"])
 def test_openengine_pygrpc_native_is_checked_before_engine_start(
     monkeypatch: pytest.MonkeyPatch, installed: Optional[str]
 ) -> None:

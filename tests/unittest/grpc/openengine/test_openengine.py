@@ -50,7 +50,7 @@ pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 def grpc_server(request: pytest.FixtureRequest) -> str:
     """Runs the server tests on both gRPC server implementations."""
     if request.param == "pygrpc-native":
-        pytest.importorskip("pygrpc_native", minversion="0.5.0")
+        pytest.importorskip("pygrpc_native", minversion="0.6.1")
     return request.param
 
 

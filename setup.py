@@ -727,7 +727,7 @@ setup(
     extras_require={
         "devel": devel_deps + grpc_smg_deps,
         "openengine": [],
-        "openengine-native": ["pygrpc-native>=0.5.0,<1"],
+        "openengine-native": ["pygrpc-native>=0.6.1,<1"],
         "mx": mx_deps,
         "grpc-smg": grpc_smg_deps,
     },
