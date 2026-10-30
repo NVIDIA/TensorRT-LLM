@@ -171,24 +171,37 @@ def _build(spec, seed):
 
 
 def _bf16_twin(args):
-    """QSA's bf16 sparse GQA over a bf16 pool holding the dequantized values."""
-    pages = args["k_cache"].shape[0]
-    all_pages = torch.arange(pages, device=DEV)[:, None].expand(-1, args["tokens_per_block"])
-    slots = torch.arange(args["tokens_per_block"], device=DEV)[None, :].expand(pages, -1)
+    """QSA's bf16 sparse GQA over a bf16 pool holding the dequantized values.
+
+    The twin pool holds only the pages the table maps, renumbered in order, so a cell's
+    pool can reach past 2^31 bytes without the twin dequantizing all of it.
+    """
+    table = args["block_table"]
+    mapped = torch.unique(table[table >= 0]).long()
+    renumber = torch.full((args["k_cache"].shape[0],), -1, dtype=torch.int32, device=DEV)
+    renumber[mapped] = torch.arange(mapped.numel(), dtype=torch.int32, device=DEV)
+    twin_table = torch.where(table >= 0, renumber[table.clamp_min(0).long()], table)
+    tpb = args["tokens_per_block"]
+    pages = mapped[:, None].expand(-1, tpb)
+    slots = torch.arange(tpb, device=DEV)[None, :].expand(mapped.numel(), -1)
     planes = []
     for data, scales, index, grouped in (
         (args["k_cache"], args["k_scale_cache"], 1, False),
         (args["v_cache"], args["v_scale_cache"], 2, True),
     ):
         values = _entry._dequantize_tokens(
-            data, scales, all_pages, slots, args["kv_scale_quant_orig"][index], grouped
-        )  # [pages, tpb, H, D]
+            data, scales, pages, slots, args["kv_scale_quant_orig"][index], grouped
+        )  # [mapped pages, tpb, H, D]
         planes.append(values.to(args["q"].dtype).transpose(1, 2).contiguous())
     twin = {
-        name: args[name]
-        for name in ("q", "block_table", "selected_tokens", "request_indices", "tokens_per_block")
+        name: args[name] for name in ("q", "selected_tokens", "request_indices", "tokens_per_block")
     }
-    twin.update(softmax_scale=args["softmax_scale"], k_cache=planes[0], v_cache=planes[1])
+    twin.update(
+        softmax_scale=args["softmax_scale"],
+        block_table=twin_table,
+        k_cache=planes[0],
+        v_cache=planes[1],
+    )
     if "query_positions" in args:
         twin.update(query_positions=args["query_positions"], compress_ratio=args["compress_ratio"])
     return triton_qsa_paged_sparse_gqa(**twin)
@@ -198,6 +211,20 @@ def _bound(positions, spec):
     cr = spec["compress_ratio"]
     visible = positions.long() + 1
     return (visible // cr).clamp(max=spec["token_topk"] // cr) * cr + visible % cr
+
+
+def _assert_straddles(args, edge: int) -> None:
+    """The pages the cell's rows read put the scale plane's byte offsets on both sides of
+    `edge` and the data plane's past it: what the cell claims about its pool."""
+    table = args["block_table"]
+    pages = table[table >= 0].long()
+    for name, side in (("k_scale_cache", "both"), ("v_scale_cache", "both"), ("k_cache", "past")):
+        plane = args[name]
+        base = plane.data_ptr() - plane.untyped_storage().data_ptr()
+        ends = base + pages * plane.stride(0) + plane[0].numel() - 1
+        assert bool((ends >= edge).any()), f"{name}: no page the rows read lies past {edge}"
+        if side == "both":
+            assert bool((ends < edge).any()), f"{name}: every page lies past {edge}"
 
 
 def _is_prefix_packed(table):
@@ -284,6 +311,8 @@ def test_certified_cells(cell, certifying, launches) -> None:  # noqa: F811
         assert bool(_is_prefix_packed(selected).all())
         valid = (selected >= 0).sum(1)
         assert torch.equal(valid, _bound(args["query_positions"], spec))
+    if "offset_edge" in spec:
+        _assert_straddles(args, spec["offset_edge"])
 
     out = op(**args)
     assert [name for name, _ in launches] == list(spec["launches"])
