@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Apply mypy exclusions and compare diagnostics with an exact baseline."""
+"""Filter mypy diagnostics by exclusions and optional diff lines, then compare a baseline."""
 
 import argparse
 import ast
@@ -10,6 +10,8 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+from diff_line_filter import AddedLineFilter
 
 ERROR_PATTERN = re.compile(
     r"^(?P<path>.+?):(?P<line>\d+):(?P<column>\d+): error: "
@@ -344,6 +346,23 @@ def filter_imported_symbol_excludes(
     return filtered
 
 
+def filter_diff_line_diagnostics(
+    diagnostics: Counter[Diagnostic], project_root: Path, diff_base: str
+) -> tuple[Counter[Diagnostic], int]:
+    """Keep diagnostics whose line falls within added lines relative to a Git ref."""
+    if not diagnostics:
+        return Counter(), 0
+    line_filter = AddedLineFilter(project_root, diff_base)
+    filtered: Counter[Diagnostic] = Counter()
+    excluded_count = 0
+    for diagnostic, count in diagnostics.items():
+        if line_filter.contains(diagnostic.path, diagnostic.line):
+            filtered[diagnostic] = count
+        else:
+            excluded_count += count
+    return filtered, excluded_count
+
+
 def write_baseline(path: Path, diagnostics: Counter[Diagnostic]) -> None:
     """Write a deterministic snapshot of individual mypy errors."""
     with path.open("w") as output:
@@ -405,6 +424,10 @@ def main() -> int:
         "--exclusions-config", type=Path, help="JSON path and symbol exclusion config"
     )
     parser.add_argument("--project-root", type=Path)
+    parser.add_argument(
+        "--diff-base",
+        help="keep diagnostics only on added lines compared with this Git ref",
+    )
     parser.add_argument("--mypy-exit-code", required=True, type=int)
     parser.add_argument(
         "--partial", action="store_true", help="omit resolved counts for scoped scans"
@@ -412,6 +435,8 @@ def main() -> int:
     args = parser.parse_args()
 
     output = args.output.read_text(errors="replace")
+    if args.action == "record" and args.diff_base:
+        parser.error("diff-line filtering cannot be used when recording a baseline")
     if args.mypy_exit_code not in (0, 1):
         print(output, end="")
         parser.error(f"mypy failed with exit code {args.mypy_exit_code}")
@@ -426,6 +451,14 @@ def main() -> int:
         current = filter_imported_symbol_excludes(
             filter_symbol_excludes(current, symbol_patterns), symbol_patterns, project_root
         )
+        if args.diff_base:
+            current, diff_excluded_count = filter_diff_line_diagnostics(
+                current, project_root, args.diff_base
+            )
+            print(
+                f"mypy diff-line filter: {diff_excluded_count} diagnostic(s) outside added lines "
+                f"for diff base {args.diff_base}"
+            )
         if args.action == "record":
             write_baseline(args.baseline, current)
             print(f"Recorded {sum(current.values())} mypy errors in {args.baseline}")

@@ -29,7 +29,9 @@
 # Checks changed product Python files by default; explicit paths can be passed
 # by pre-commit or on the command line. Pass --full-project to scan all product
 # Python files. Pass --update-baseline with --full-project to replace the saved
-# entries with the current full scan.
+# entries with the current full scan. Pass --diff-base REF (or set
+# MYPY_DIFF_BASE=REF) to keep only diagnostics on added lines relative to REF.
+# Changed-file checks default to HEAD; pass --no-diff-filter for file-level output.
 #
 # Set MYPY_REQUIRE_BINDINGS=1 to record a failed check when the compiled
 # bindings cannot be imported.
@@ -51,6 +53,8 @@ set -euo pipefail
 
 BASELINE_ACTION="check"
 FULL_PROJECT=0
+DIFF_BASE="${MYPY_DIFF_BASE:-}"
+DIFF_FILTER=1
 while (( $# > 0 )); do
     case "$1" in
         --update-baseline)
@@ -61,11 +65,30 @@ while (( $# > 0 )); do
             FULL_PROJECT=1
             shift
             ;;
+        --diff-base)
+            if (( $# < 2 )) || [[ "$2" == --* ]]; then
+                echo "ERROR: --diff-base requires a Git ref" >&2
+                exit 2
+            fi
+            DIFF_BASE="$2"
+            shift 2
+            ;;
+        --no-diff-filter)
+            DIFF_FILTER=0
+            shift
+            ;;
         *)
             break
             ;;
     esac
 done
+if (( ! FULL_PROJECT && DIFF_FILTER )) && [[ -z "$DIFF_BASE" ]]; then
+    DIFF_BASE="HEAD"
+fi
+if (( DIFF_FILTER == 0 )) && [[ -n "$DIFF_BASE" ]]; then
+    echo "ERROR: --no-diff-filter cannot be combined with --diff-base or MYPY_DIFF_BASE" >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -107,6 +130,10 @@ EXCLUDE_REGEX="$(python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions \
 
 if (( ! FULL_PROJECT )) && [[ "$BASELINE_ACTION" == "record" ]]; then
     echo "ERROR: --update-baseline requires --full-project" >&2
+    exit 2
+fi
+if [[ -n "$DIFF_BASE" && "$BASELINE_ACTION" == "record" ]]; then
+    echo "ERROR: --update-baseline cannot be combined with diff-line filtering" >&2
     exit 2
 fi
 if (( FULL_PROJECT && $# > 0 )); then
@@ -268,6 +295,14 @@ if (( ! FULL_PROJECT )); then
     # Analyze only explicit sources; imported implementation modules become Any.
     MYPY_ARGS+=(--follow-imports=skip)
 fi
+DIFF_ARGS=()
+if [[ -n "$DIFF_BASE" ]]; then
+    DIFF_ARGS=(--diff-base "$DIFF_BASE")
+fi
+PARTIAL_ARGS=()
+if (( ! FULL_PROJECT )) || [[ -n "$DIFF_BASE" ]]; then
+    PARTIAL_ARGS=(--partial)
+fi
 
 MYPY_OUTPUT="$(mktemp)"
 MYPY_STATUS=0
@@ -277,9 +312,13 @@ mypy --config-file "$MYPY_CONFIG" "${MYPY_ARGS[@]}" \
 if (( ! FULL_PROJECT )); then
     python3 "$SCRIPT_DIR/mypy_exclusion.py" "$BASELINE_ACTION" "$MYPY_OUTPUT" \
         "$BASELINE_FILE" --mypy-exit-code "$MYPY_STATUS" \
-        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR" --partial
+        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR" \
+        "${PARTIAL_ARGS[@]+"${PARTIAL_ARGS[@]}"}" \
+        "${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}"
 else
     python3 "$SCRIPT_DIR/mypy_exclusion.py" "$BASELINE_ACTION" "$MYPY_OUTPUT" \
         "$BASELINE_FILE" --mypy-exit-code "$MYPY_STATUS" \
-        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR"
+        --exclusions-config "$EXCLUSIONS_CONFIG" --project-root "$PROJECT_DIR" \
+        "${PARTIAL_ARGS[@]+"${PARTIAL_ARGS[@]}"}" \
+        "${DIFF_ARGS[@]+"${DIFF_ARGS[@]}"}"
 fi

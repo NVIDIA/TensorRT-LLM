@@ -1614,10 +1614,11 @@ repos:
           ^(\.claude/skills/[^/]+/SKILL\.md|\.claude/agents/.*\.md|scripts/check_skill_naming_convention\.py)$
     -   id:  type-check
         name: Record advisory mypy type-check report
-        entry: scripts/run_mypy.sh
+        entry: scripts/run_mypy.sh --diff-base HEAD
         language: script
         verbose: true
         require_serial: true  # because of install_types=true
-        # Pass changed paths; the wrapper skips non-product Python inputs.
+        # Check changed paths and retain diagnostics only on added diff lines.
+        # HEAD is the pre-commit base for staged changes.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(mypy_exclusion\.json|mypy_baseline\.txt|run_mypy\.sh|mypy_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(mypy_exclusion\.json|mypy_baseline\.txt|run_mypy\.sh|mypy_exclusion\.py|diff_line_filter\.py)$|\.pre-commit-config\.yaml$)
