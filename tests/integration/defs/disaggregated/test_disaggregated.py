@@ -1516,6 +1516,11 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+# With cold JIT caches, ctx PP4 clusters took about 340s to become ready on
+# B300, past the 300s default (https://nvbugs/6728119).
+CTX_PP4_SERVER_START_TIMEOUT_S = 450
+
+
 @skip_pre_hopper
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("ctx_pp", [1, 4], ids=["ctx_pp1", "ctx_pp4"])
@@ -1544,7 +1549,9 @@ def test_disaggregated_overlap_gen_first(disaggregated_test_root,
         model_path=qwen_model_root,
         cwd=llm_venv.get_working_directory(),
         disagg_schedule_style="generation_first",
-        post_client_test=post_client_test)
+        post_client_test=post_client_test,
+        server_start_timeout=(CTX_PP4_SERVER_START_TIMEOUT_S
+                              if ctx_pp == 4 else 300))
 
 
 def test_disaggregated_overlap_transceiver_runtime_python(
@@ -1905,7 +1912,8 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                            "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            model_path=qwen_model_root,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=CTX_PP4_SERVER_START_TIMEOUT_S)
 
 
 @skip_no_hopper
