@@ -13,6 +13,6 @@ Or you can try the following commands to get a quantized model by yourself:
 
 ```bash
 git clone https://github.com/NVIDIA/Model-Optimizer.git
-cd Model-Optimizer/examples/llm_ptq
-scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8 --export_fmt hf
+cd Model-Optimizer/examples/hf_ptq
+scripts/huggingface_example.sh --model <huggingface_model_card> --quant fp8
 ```
