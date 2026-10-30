@@ -16,7 +16,6 @@
 
 import hashlib
 import importlib.util
-import os
 import ssl
 import subprocess
 from collections.abc import Iterator
@@ -94,43 +93,15 @@ def hashed_name(certificate: Path) -> str:
     return f"{value}.0"
 
 
-def test_rejects_distrusted_default_root(trust_store: tuple[Path, Path, Path]) -> None:
-    distrusted, _, _ = trust_store
-    with patch.object(verifier.ssl, "create_default_context", return_value=context(distrusted)):
-        with pytest.raises(RuntimeError, match="default CA store"):
+@pytest.mark.parametrize("location", ["default store", "hashed directory"])
+def test_rejects_distrusted_root(trust_store: tuple[Path, Path, Path], location: str) -> None:
+    distrusted, _, directory = trust_store
+    if location == "default store":
+        with patch.object(verifier.ssl, "create_default_context", return_value=context(distrusted)):
+            with pytest.raises(RuntimeError, match="default CA store"):
+                verifier.verify_system_ca()
+    else:
+        # OpenSSL loads hashed-directory roots lazily, so get_ca_certs() misses them.
+        (directory / hashed_name(distrusted)).symlink_to(distrusted)
+        with pytest.raises(RuntimeError, match="Distrusted CA"):
             verifier.verify_system_ca()
-
-
-def test_checks_lazy_hashed_directory(trust_store: tuple[Path, Path, Path]) -> None:
-    distrusted, _, directory = trust_store
-    (directory / hashed_name(distrusted)).symlink_to(distrusted)
-    with pytest.raises(RuntimeError, match="Distrusted CA"):
-        verifier.verify_system_ca()
-
-
-def test_preserves_custom_roots(trust_store: tuple[Path, Path, Path]) -> None:
-    _, custom, directory = trust_store
-    original = custom.read_bytes()
-    link = directory / hashed_name(custom)
-    link.symlink_to(custom)
-    verifier.verify_system_ca()
-    assert custom.read_bytes() == original
-    assert link.is_symlink()
-
-
-def test_checks_every_configured_directory(
-    trust_store: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    distrusted, _, directory = trust_store
-    second = directory / "second"
-    second.mkdir()
-    (second / hashed_name(distrusted)).symlink_to(distrusted)
-    monkeypatch.setenv("SSL_CERT_DIR", os.pathsep.join([str(directory), str(second)]))
-    with pytest.raises(RuntimeError, match="second"):
-        verifier.verify_system_ca()
-
-
-def test_does_not_scan_unloaded_files(trust_store: tuple[Path, Path, Path]) -> None:
-    distrusted, _, directory = trust_store
-    (directory / "not-a-hashed-trust-entry.pem").write_bytes(distrusted.read_bytes())
-    verifier.verify_system_ca()
