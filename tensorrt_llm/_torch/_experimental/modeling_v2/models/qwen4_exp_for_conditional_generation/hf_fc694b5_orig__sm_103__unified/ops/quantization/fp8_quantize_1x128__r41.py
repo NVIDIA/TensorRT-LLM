@@ -79,6 +79,18 @@ class Fp8Quantize1x128(OpWrapper):
             why="16384 rows: max_num_tokens of the tuned config",
             spec=dict(tokens=16384, **_CKPT),
         ),
+        Cell(
+            why="128 rows: the MTP drafter's decode step at max_batch_size 128",
+            spec=dict(tokens=128, **_CKPT),
+        ),
+        Cell(
+            why="1024 rows: the first draft over mtp7's verify rows, 128 requests x 8",
+            spec=dict(tokens=1024, **_CKPT),
+        ),
+        Cell(
+            why="8192 rows: the MTP layer over one max_num_tokens context chunk",
+            spec=dict(tokens=8192, **_CKPT),
+        ),
     )
 
     note = """
@@ -95,18 +107,38 @@ class Fp8Quantize1x128(OpWrapper):
 
     `data` is a leading-row view of an allocation padded to a multiple of 4
     rows -- the padded rows are uninitialized, so a raw-pointer reader must
-    stop at `T`. CUDA-graph capture and replay are certified.
+    stop at `T`. At a `T` that is a multiple of 4 (128, 1024, 8192) nothing is
+    padded and `scales` is the kernel's own buffer, not a compacting copy.
+    CUDA-graph capture and replay are certified at 64, 128 and 1024 rows.
+
+    Source: compiled-in C++, `torch.ops.trtllm.fp8_quantize_1x128` from
+    `thop/fp8Quantize.cpp` (`fp8_1x128_cs` -> `launch_scale_1x128`). The
+    launcher takes `scale_1x128_vec_kernel` when `can_vectorize_1x128` holds
+    (H % 8 == 0, 16-byte aligned input, 8-byte aligned output), as at every
+    cell; the element-wise `scale_1x128_kernel` it falls back to (an input
+    whose storage offset breaks the 16-byte alignment) is not certified. The
+    grid is persistent, `kNumDeviceSMs * 8` blocks of 8 warps quantizing 2
+    groups each: 19456 groups a sweep on GB300's 152 SMs. 128 rows (2560
+    groups) fills 13% of one sweep, 1024 rows (20480) is the first certified
+    count past one, 8192 rows (163840) takes nine.
+
+    Measured on GB300 at H 2560 (codes bit-exact; worst miss from its rounding
+    midpoint, relative): 1 row 100%; 20 rows 99.9629%, 1.122e-07; 128 rows
+    99.9451%; 1024 rows 99.9437%; 8192 rows 99.9429%; 16384 rows 99.9453%;
+    every row count above one at 1.122e-07, scales within the 4-ulp gate.
 
     Hard limits
-      T   certified at 1, 20 and 16384 at H 2560 (16384: max_num_tokens of the
-          tuned config); above that not probed
+      T   certified at 1, 20, 128, 1024, 8192 and 16384 at H 2560 (128: the
+          drafter's decode at max_batch_size 128; 1024: the first draft over
+          mtp7's 128 x 8 verify rows; 8192: a max_num_tokens context chunk;
+          16384: max_num_tokens of the tuned config); above that not probed
       H   multiple of 16 (raises otherwise); certified at 2560, the draft layer's
           width
 
     Not certified: `T == 0` (the op accepts it and returns `[0, H]` /
     `[NB, 0]`); a short tail block (`H % 128 != 0`); all-zero blocks (the
     `AMAX_FLOOR` scale), `inf` / NaN inputs and saturation; `use_ue8m0=True`;
-    the registered fake.
+    the element-wise fallback kernel; the registered fake.
     """
 
     def __call__(

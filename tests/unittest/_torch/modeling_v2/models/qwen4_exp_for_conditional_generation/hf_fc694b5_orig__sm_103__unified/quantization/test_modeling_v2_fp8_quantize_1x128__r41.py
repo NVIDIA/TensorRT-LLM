@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_quantize_1x128 catalog entry.
+"""GPU test for the fp8_quantize_1x128 entry (this target's local variant r41).
 
 The entry owns the contract. This file turns a cell into an input, holds
 every code disagreement of a cell to a rounding tie, and adds what a cell
@@ -122,15 +122,24 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
     _compare((data, scales), ref)
     rel = _assert_misses_are_ties(x, data, ref[0]) if not spec["use_ue8m0"] else 0.0
     exact = (data.view(torch.uint8) == ref[0].view(torch.uint8)).float().mean().item()
-    print(f"  {cell.why[:44]}: {100 * exact:.4f}% bit-exact, worst tie {rel:.3e}")
+    sms = torch.cuda.get_device_properties(x.device).multi_processor_count
+    print(
+        f"  {cell.why[:44]}: {100 * exact:.4f}% bit-exact, worst tie {rel:.3e}, "
+        f"{spec['tokens'] * nb} groups over a {sms * 8 * 8 * 2}-group grid sweep"
+    )
 
 
 # ── what a cell cannot carry ──────────────────────────────────────────────
 
 
-def test_cuda_graph_capture_and_replay():
-    """A replay reproduces a fresh eager call bitwise; so does a side stream."""
-    x = _input(64, 2560, seed=17, magnitude=1.0)
+@pytest.mark.parametrize("rows", (64, 128, 1024))
+def test_cuda_graph_capture_and_replay(rows):
+    """A replay reproduces a fresh eager call bitwise; so does a side stream.
+
+    128 and 1024 are the captured drafter rows at max_batch_size 128: one row
+    per request, and mtp7's 8 verify rows per request on the first draft.
+    """
+    x = _input(rows, 2560, seed=17, magnitude=1.0)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -140,7 +149,7 @@ def test_cuda_graph_capture_and_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         g_data, g_sf = op(x)
-    x.copy_(_input(64, 2560, seed=18, magnitude=1.0))
+    x.copy_(_input(rows, 2560, seed=18, magnitude=1.0))
     e_data, e_sf = op(x)
     graph.replay()
     torch.cuda.synchronize()
