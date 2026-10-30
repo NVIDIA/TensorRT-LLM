@@ -134,10 +134,11 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
 
 
 def layout_document(layout: PageLayout) -> dict:
-    """Hash canonical global layer groups, the model layer of each global layer where it is not
-    the global layer itself, slot widths, kinds and each buffer's tensors, but no addresses,
-    windows, sinks, shards, topology, total head counts, dtypes or local region numbering. Two
-    pipeline stages naming their layers alike but holding other model layers differ."""
+    """Hash canonical global layer groups, each group's model layers (aligned with its sorted
+    global layers) when any differs from its global layer, slot widths, kinds and each buffer's
+    tensors, but no addresses, windows, sinks, shards, topology, total head counts, dtypes or
+    local region numbering. Two pipeline stages naming their layers alike but holding other model
+    layers differ."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])
     groups = [None] * len(layout.layer_groups)
     for local, desc in enumerate(layout.layer_groups):

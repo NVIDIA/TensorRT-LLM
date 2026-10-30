@@ -228,13 +228,17 @@ def test_canonical_order_sorts_groups_by_smallest_layer():
 def test_layout_id_is_the_hash_of_the_documented_version_5_encoding():
     """The canonical encoding, spelled out here byte for byte so a change to it cannot pass
     unnoticed."""
-    layout = _first_group(make_layout(layers=((0,), (1,))), model_layers=(4,))
+    # A group's model layers are written whole, aligned with its sorted global layers, once any
+    # differs from its global layer.
+    layout = _first_group(make_layout(layers=((2, 0), (1,))), model_layers=(4, 0))
     expected = (
         '{"buffers":['
         '{"layer":0,"offset":0,"role":"key","size":50},'
         '{"layer":0,"offset":100,"role":"scale","size":20},'
-        '{"layer":1,"offset":0,"role":"key","size":64}],'
-        '"groups":[{"layers":[0],"model_layers":[4],"slot_bytes":[100,40]},'
+        '{"layer":1,"offset":0,"role":"key","size":64},'
+        '{"layer":2,"offset":50,"role":"key","size":50},'
+        '{"layer":2,"offset":120,"role":"scale","size":20}],'
+        '"groups":[{"layers":[0,2],"model_layers":[0,4],"slot_bytes":[100,40]},'
         '{"layers":[1],"slot_bytes":[64]}],'
         '"tokens_per_block":32,"v":5}'
     ).encode()
