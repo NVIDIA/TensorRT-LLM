@@ -67,23 +67,61 @@ class Qwen4ExpHcLowrankAct(OpWrapper):
     ARCHS = frozenset({Arch.SM_103})
 
     # spec: rows, inject (True), hc_count (4), rank (320), logits_width (384), dtype (bf16).
+    # The unified target's HC mixers run this form at every row count, on the fresh
+    # fp32 `cublas_mm` output over the first `hc_first_cols` = ceil((320 + 4) / 32) * 32
+    # = 352 columns of the first projection: hence the 352-wide cells.
     CELLS: tuple[Cell, ...] = (
         Cell(why="checkpoint rank 320 + 4, padded to 384, 128 rows", spec=dict(rows=128)),
         Cell(why="checkpoint rank 320 + 4, padded to 384, prefill 8192", spec=dict(rows=8192)),
         Cell(why="stack-final mixer: no inject, 8192 rows", spec=dict(rows=8192, inject=False)),
+        Cell(
+            why="unified decode HC mixer: one token, 352-wide logits",
+            spec=dict(rows=1, logits_width=352),
+        ),
+        Cell(
+            why="unified dep4 rank's largest captured decode batch: 32 rows",
+            spec=dict(rows=32, logits_width=352),
+        ),
+        Cell(
+            why="unified tep4 MTP-7 verify: 128 requests x 8 rows = 1024",
+            spec=dict(rows=1024, logits_width=352),
+        ),
+        Cell(
+            why="unified prefill chunk at max_num_tokens: 8192 rows, 352-wide",
+            spec=dict(rows=8192, logits_width=352),
+        ),
+        Cell(
+            why="unified stack-final mixer (no inject): one decode token",
+            spec=dict(rows=1, inject=False, logits_width=352),
+        ),
     )
 
     note = """
-    Metadata consumed: none. Call sites: the trunk's hyper-connection sites in
-    `PrefillTarget` (all 97), between the first projection and the up
-    projection. Preconditions: `logits` fp32, unit column stride, at least
-    `rank (+ hc_count)` columns; `hc_count` a power of two. Graph-capturable.
+    Metadata consumed: none. Call sites: every hyper-connection mixer, between
+    the first projection (`cublas_mm`, fp32 out, 352 columns) and the up
+    projection. HC is replicated, so the rows are this rank's tokens at every
+    member: decode 1..128 (tp4 / tep4) or 1..32 (a dep4 rank), MTP verify up to
+    128 x 8 = 1024 rows (tep4, draft 7), prefill one chunk of up to 8192 rows
+    (`max_num_tokens`). Preconditions: `logits` fp32, unit column stride, at
+    least `rank (+ hc_count)` columns; `hc_count` a power of two.
+    Graph-capturable.
 
-    Certified: bf16 outputs from 384-wide fp32 logits, with the injection at 128
-    and 8192 rows, without it at 8192 rows; graph replay.
+    Source: a Triton kernel JIT-compiled at first call for the running device;
+    the cells ran that JIT path on GB300 (sm_103). One program per row with an
+    int64 row offset: 8192 x 352 is 2.9e6 elements, and 2^31 elements is
+    2^31 / 352 = 6.1e6 rows, far past the envelope.
 
-    Not certified: zero rows, hc_count other than 4, rank other than 320,
-    float16 outputs.
+    Certified: bf16 outputs from fp32 logits 352 wide (the call site) at 1, 32,
+    1024 and 8192 rows with the injection and at 1 row without it, and 384 wide
+    at 128 and 8192 rows (without the injection at 8192); graph replay.
+    Measured against the float64 reference (logits ~ 20 * randn): bitwise at 1,
+    32 and 128 rows; at 1024 and 8192 rows at most 0.99 ulp, on 5 of 327680 and
+    52 of 2621440 `low` elements, cosine 1.0, relative L2 <= 1.6e-5.
+
+    Not certified: zero rows; rows past 8192; hc_count other than 4; rank
+    other than 320; float16 outputs. The kernel has no row-count switch, so row
+    counts between the cells take the same path, and the logits width enters
+    only as the row stride (128 rows is driven at 384 wide only).
     """
 
     def __call__(

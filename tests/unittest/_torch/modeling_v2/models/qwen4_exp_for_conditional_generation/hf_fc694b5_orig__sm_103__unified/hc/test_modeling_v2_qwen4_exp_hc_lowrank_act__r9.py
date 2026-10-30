@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for this target's qwen4_exp_hc_lowrank_act variant
 (ops/hc/qwen4_exp_hc_lowrank_act__r9): cells within one ulp of the float64
-reference, the fp32-logits guard, graph capture."""
+reference, the fp32-logits and narrow-logits guards, graph capture."""
 
 import zlib
 
@@ -61,6 +61,21 @@ def test_guard_refuses_bf16_logits() -> None:
     logits, rank, c, wi, dt = _build(dict(rows=4), seed=4)
     with validating(op), pytest.raises(AssertionError):
         op(logits.to(torch.bfloat16), rank, c, wi, dt)
+
+
+def test_guard_refuses_narrow_logits() -> None:
+    """A view narrower than `rank + hc_count` is read past its last column, into
+    the buffer it views, with no error: the injection weights then come from
+    columns the caller never handed over."""
+    wide, rank, c, wi, dt = _build(dict(rows=4, logits_width=352), seed=7)
+    narrow = wide[:, :rank]
+    _, unguarded_inject = op(narrow, rank, c, wi, dt)
+    _, wide_inject = op(wide, rank, c, wi, dt)
+    torch.cuda.synchronize()
+    assert torch.equal(unguarded_inject, wide_inject), "the hazard this guard covers is gone"
+
+    with validating(op), pytest.raises(AssertionError, match="too narrow"):
+        op(narrow, rank, c, wi, dt)
 
 
 def test_cuda_graph_capture_and_replay() -> None:
