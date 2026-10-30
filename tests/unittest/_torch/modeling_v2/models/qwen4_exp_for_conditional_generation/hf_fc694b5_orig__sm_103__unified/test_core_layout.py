@@ -1,0 +1,247 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+"""The unified target's core at tep4: each rank's forward widths and the expert window.
+
+The core is built on the meta device from the checkpoint's text and vision config values at
+every rank of a tep4 mapping, so nothing here touches a device. What is pinned is what the
+forward addresses: the fused attention row and the split the norm + rope reads it through,
+the Gated-DeltaNet projection's column split, the routed experts' window and the
+per-expert scalars cut to it, and the layouts this core does not assemble.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+import torch
+
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified import (  # noqa: E501
+    modeling as M,
+)
+from tensorrt_llm._torch.configs import Qwen4ExpTextConfig, Qwen4ExpVisionConfig
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm.llmapi import QSASparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
+
+pytestmark = pytest.mark.cpu_only
+
+NUM_LAYERS = 48
+WORLD = 4
+
+# Qwen3.8-Flash-Next's text config.
+_TEXT = dict(
+    architectures=["Qwen4ExpForCausalLM"],
+    attention_bias=False,
+    attention_dropout=0.0,
+    bos_token_id=248044,
+    dtype="bfloat16",
+    eos_token_id=248044,
+    full_attention_interval=4,
+    hc_count=4,
+    hc_lowrank=320,
+    head_dim=256,
+    heads_per_ngram=8,
+    hidden_act="silu",
+    hidden_size=2560,
+    indexer_budget=2048,
+    indexer_compress_ratio=4,
+    indexer_head_dim=128,
+    indexer_kv_heads=1,
+    indexer_n_heads=4,
+    layer_types=["full_attention" if i % 4 == 3 else "linear_attention" for i in range(NUM_LAYERS)],
+    linear_conv_kernel_dim=4,
+    linear_key_head_dim=128,
+    linear_num_key_heads=16,
+    linear_num_value_heads=48,
+    linear_value_head_dim=128,
+    make_ngram_vocab_size_divisible_by=128,
+    mamba_ssm_dtype="float32",
+    max_position_embeddings=262144,
+    moe_intermediate_size=640,
+    mtp=dict(
+        hybrid=True,
+        layer_types=["full_attention"],
+        mtp_use_hidden_state_from_layer=None,
+        num_hidden_layers=1,
+        rope_theta=10000000,
+    ),
+    mtp_num_hidden_layers=1,
+    mtp_use_dedicated_embeddings=False,
+    ngram_size=3,
+    ngram_vocab_size_base=20000000,
+    norm_topk_prob=True,
+    num_attention_heads=24,
+    num_experts=512,
+    num_experts_per_tok=10,
+    num_hidden_layers=NUM_LAYERS,
+    num_key_value_heads=2,
+    number_of_conv_states=3,
+    output_gate_type="sigmoid",
+    partial_rotary_factor=0.25,
+    ple_conv_kernel_size=4,
+    ple_embed_dim=2560,
+    ple_layer_ids=[2],
+    rms_norm_eps=1e-06,
+    rope_parameters=dict(
+        mrope_interleaved=True,
+        mrope_section=[11, 11, 10],
+        partial_rotary_factor=0.25,
+        rope_theta=10000000,
+        rope_type="default",
+    ),
+    shared_expert_intermediate_size=640,
+    split_ngram_parts=128,
+    tie_word_embeddings=False,
+    vocab_size=248320,
+)
+_VISION = dict(
+    deepstack_visual_indexes=[],
+    depth=27,
+    dtype="bfloat16",
+    hidden_act="gelu_pytorch_tanh",
+    hidden_size=1152,
+    in_channels=3,
+    intermediate_size=4304,
+    num_heads=16,
+    num_position_embeddings=2304,
+    out_hidden_size=2560,
+    patch_size=16,
+    spatial_merge_size=2,
+    temporal_patch_size=2,
+)
+
+# (attention DP, MoE TP, MoE EP) of the three members.
+_TEP4 = dict(enable_attention_dp=False, moe_tp_size=1, moe_ep_size=4)
+_DEP4 = dict(enable_attention_dp=True, moe_tp_size=1, moe_ep_size=4)
+_TP4 = dict(enable_attention_dp=False, moe_tp_size=4, moe_ep_size=1)
+
+
+def _core(rank: int, layout: dict, spec_config=None):
+    """The core of rank `rank` of a four-rank engine at `layout`, every parameter on meta."""
+    model_config = ModelConfig(
+        pretrained_config=Qwen4ExpTextConfig(**_TEXT),
+        mapping=Mapping(world_size=WORLD, tp_size=WORLD, rank=rank, **layout),
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        moe_backend="TRTLLM",
+        moe_backend_requested="TRTLLM",
+        sparse_attention_config=QSASparseAttentionConfig(),
+        spec_config=spec_config,
+    )
+    composite = SimpleNamespace(
+        vision_config=Qwen4ExpVisionConfig(**_VISION), image_token_id=248056, video_token_id=248057
+    )
+    # The core asserts the device it runs on; the weights it declares stay on meta.
+    with (
+        mock.patch.object(torch.cuda, "get_device_capability", return_value=M._SM),
+        torch.device("meta"),
+    ):
+        return M.Qwen4ExpUnifiedModelingV2(model_config, composite)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tep4_rank_runs_its_share_of_the_heads(rank) -> None:
+    """Six q heads and one of the two KV heads (repeated on rank pairs) over a 4352-wide
+    fused row: `[q 1536 | k 256 | v 256 | gate 1536 | index q 512, k 128 | v slot 128]`.
+    The main norm + rope reads it as 6 q, 1 k and 10 "v" heads of 256 (the row stride
+    alone), which is the cell `fused_qk_norm_rope__r3` certifies."""
+    core = _core(rank, _TEP4)
+    assert (core.heads_q, core.heads_kv, core.kv_head_start) == (6, 1, rank * 2 // WORLD)
+    assert (core.q_width, core.kv_width, core.qkv_width) == (1536, 256, 2048)
+    assert (core.index_width, core.index_scratch_width) == (640, 768)
+    assert core.attn_in_width == 4352
+    assert core.attn_in_tail_heads == 10
+    assert core.index_col == 3584
+    assert tuple(core.w["l3_attn_in_w"].shape) == (core.attn_in_width, 2560)
+    assert tuple(core.w["l3_o_w"].shape) == (2560, core.q_width)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tep4_rank_runs_its_share_of_the_recurrent_heads(rank) -> None:
+    """Four key and twelve value heads: the conv runs over `[q | k | v]` = 512 + 512 + 1536
+    channels, and the one input projection's output splits `[q|k|v 2560 | z 1536 | a 12 |
+    b 12]`."""
+    core = _core(rank, _TEP4)
+    assert (core.num_k_heads, core.num_v_heads) == (4, 12)
+    assert (core.key_dim, core.value_dim, core.conv_dim) == (512, 1536, 2560)
+    assert tuple(core.in_proj_split) == (2560, 1536, 12, 12)
+    assert tuple(core.w["l0_in_proj_w"].shape) == (sum(core.in_proj_split), 2560)
+    assert tuple(core.w["l0_out_w"].shape) == (2560, core.value_dim)
+    assert tuple(core.w["l0_conv_w"].shape) == (core.conv_dim, 1, 4)
+
+
+@pytest.mark.parametrize("rank", range(WORLD))
+def test_a_tep4_rank_holds_one_128_expert_window(rank) -> None:
+    """The routed experts' window is `[128r, 128r + 128)`; everything the router, the shared
+    expert and the hyper-connections read is whole on every rank."""
+    core = _core(rank, _TEP4)
+    assert (core.local_experts, core.expert_offset) == (128, 128 * rank)
+    assert core.w["l0_fc1_w"].shape[0] == 128
+    assert core.w["l0_fc2_w"].shape[0] == 128
+    assert tuple(core.w["l0_router"].shape) == (512, 2560)
+    assert tuple(core.w["embed"].shape) == (248320, 2560)
+
+
+def test_the_expert_scalars_are_cut_to_the_window() -> None:
+    """The runner takes one scalar per expert of its window: each is the whole routing
+    space's product, sliced, and the FC1 activation scale is the layer's one number."""
+    num_experts, start, count = 512, 256, 128
+    gen = torch.Generator().manual_seed(0)
+    isc1 = torch.full((num_experts,), 0.5)
+    ws2_1 = torch.rand(num_experts, generator=gen) + 0.5
+    isc2 = torch.rand(num_experts, generator=gen) + 0.5
+    ws2_2 = torch.rand(num_experts, generator=gen) + 0.5
+    w = {
+        "l0_e_isc1": isc1,
+        "l0_e_isc1_up": isc1.clone(),
+        "l0_e_ws2_1": ws2_1,
+        "l0_e_ws2_1_up": ws2_1.clone(),
+        "l0_e_isc2": isc2,
+        "l0_e_ws2_2": ws2_2,
+    }
+    s = M._moe_layer_scalars(w, 0, start, count)
+    window = slice(start, start + count)
+    gate1 = isc1 * ws2_1
+    torch.testing.assert_close(s["global_scale"], torch.tensor([2.0]), rtol=0, atol=0)
+    torch.testing.assert_close(s["output1_scale_gate_scalar"], gate1[window], rtol=0, atol=0)
+    torch.testing.assert_close(s["output1_scale_scalar"], (gate1 / isc2)[window], rtol=0, atol=0)
+    torch.testing.assert_close(s["output2_scale_scalar"], (isc2 * ws2_2)[window], rtol=0, atol=0)
+    assert all(t.shape == (count,) for k, t in s.items() if k != "global_scale")
+
+
+def test_a_spread_fc1_input_scale_is_refused() -> None:
+    """One activation quantization feeds every expert, so the layer must have one
+    `gate_proj.input_scale`."""
+    isc1 = torch.full((512,), 0.5)
+    isc1[7] = 0.25
+    ones = torch.ones(512)
+    w = {
+        "l0_e_isc1": isc1,
+        "l0_e_isc1_up": isc1.clone(),
+        "l0_e_ws2_1": ones,
+        "l0_e_ws2_1_up": ones.clone(),
+        "l0_e_isc2": ones,
+        "l0_e_ws2_2": ones,
+    }
+    with pytest.raises(AssertionError, match="one gate_proj.input_scale"):
+        M._moe_layer_scalars(w, 0, 0, 128)
+
+
+@pytest.mark.parametrize(
+    "layout, spec_config, missing",
+    [
+        (_DEP4, None, "attention DP"),
+        (_TP4, None, "split by intermediate"),
+        (_TEP4, MTPDecodingConfig(max_draft_len=3), "MTP draft layer"),
+    ],
+    ids=["dep4", "tp4", "mtp"],
+)
+def test_what_this_core_does_not_assemble_is_refused_at_construction(
+    layout, spec_config, missing
+) -> None:
+    with pytest.raises(NotImplementedError, match=missing):
+        _core(0, layout, spec_config)
