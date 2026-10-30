@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import sys
@@ -46,7 +45,7 @@ import urllib.error
 import urllib.request
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NoReturn, Optional
 
 import click
 
@@ -80,20 +79,42 @@ COVERAGE_GIT_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
 _URM = "https://urm.nvidia.com/artifactory"
 _GITHUB_COMPARE = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/compare"
 _JENKINS_BASE = "https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_PostMerge"
+
+# `build_info.txt` and the coverage archives are read with the read helper,
+# jenkins/scripts/fetch_build_artifact.sh, which looks for each file in the primary artifact
+# location (LLM_ARTIFACTS_PRIMARY) first and in the other one only when it is absent there,
+# authenticating to artifactory.nvidia.com with the ARTIFACTORY_NETRC file. Pins are read from
+# `_URM` only.
+_FETCH_BUILD_ARTIFACT = Path(__file__).resolve().parents[5] / "fetch_build_artifact.sh"
+# Exit codes of the read helper that this module acts on, by the names the helper gives them;
+# tests/unittest/scripts/test_fetch_build_artifact.py checks that they match.
+_FETCH_ABSENT = 2
+_FETCH_REJECTED = 3
+_FETCH_TRANSFER_FAILED = 4
 # Cover missing or unsuccessful recent builds.
 _MAX_PROBE = 50
 # Per-request timeout in seconds, for the small JSON/metadata calls.
 _TIMEOUT = 15
-# Socket timeout for the tarball itself, which runs to hundreds of MB.
-_DOWNLOAD_TIMEOUT = 300
 # Timeout for local Git operations and the small fetches used by the patch check.
 _GIT_TIMEOUT = 120
-# Tarball download attempts.
-_RETRIES = 3
 
 _PatchApplyStatus = Literal["clean", "conflict", "unknown"]
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 _PR_NUMBER_RE = re.compile(r"[1-9][0-9]*")
+# The line the read helper prints for --exists: "<url> <sha1>".
+_EXISTS_LINE_RE = re.compile(r"(?P<url>\S+) [0-9a-fA-F]{40}")
+
+
+class ArtifactError(Exception):
+    """An in-scope build artifact could not be read; the message is written for the job log."""
+
+
+class ArtifactAuthError(ArtifactError):
+    """The read helper exited with FETCH_REJECTED: the primary location rejected the request."""
+
+
+class ArtifactTransferError(ArtifactError):
+    """The read helper exited with FETCH_TRANSFER_FAILED: the transfer failed after its retries."""
 
 
 def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optional[bytes]]:
@@ -108,19 +129,6 @@ def _get(url: str, headers: Optional[dict] = None) -> tuple[Optional[int], Optio
         return None, None
 
 
-def _exists(url: str) -> bool:
-    """True if the artifact exists — a 1-byte ranged GET; 200/206 means present."""
-    req = urllib.request.Request(url, headers={"Range": "bytes=0-0"})
-    try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-            return resp.status in (200, 206)
-    except urllib.error.HTTPError:
-        return False
-    except OSError as e:
-        print(f"[artifact] error probing {url}: {e}", file=sys.stderr)
-        return False
-
-
 def latest_build_number(jenkins_base: str = _JENKINS_BASE) -> Optional[int]:
     """Newest build number via the Jenkins REST API (lastBuild, then lastCompletedBuild)."""
     for kind in ("lastBuild", "lastCompletedBuild"):
@@ -133,28 +141,181 @@ def latest_build_number(jenkins_base: str = _JENKINS_BASE) -> Optional[int]:
     return None
 
 
-def tarball_url(build: int, name: str, artifact_base: str = ARTIFACT_BASE) -> str:
-    return f"{_URM}/{artifact_base}/{build}/cbts-coverage/{name}"
+# Exceptions for the read helper's failure exit statuses, with what each status means.
+_HELPER_FAILURES = {
+    _FETCH_REJECTED: (ArtifactAuthError, "the location rejected the request"),
+    _FETCH_TRANSFER_FAILED: (ArtifactTransferError, "the transfer failed after retries"),
+}
 
 
-def tarball_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> list[str]:
-    return [tarball_url(build, name, artifact_base) for name in ARCH_TARBALL_NAMES]
+def _helper_failure(artifact_path: str, status: int) -> ArtifactError:
+    """The exception for a read of `artifact_path` that the read helper ended with `status`."""
+    error, reason = _HELPER_FAILURES.get(status, (ArtifactError, None))
+    detail = f": {reason}" if reason else ""
+    return error(
+        f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}{detail} "
+        f"(exit status {status}); its message above says why."
+    )
 
 
-def build_info_url(build: int, artifact_base: str = ARTIFACT_BASE) -> str:
-    return f"{_URM}/{artifact_base}/{build}/{BUILD_INFO_NAME}"
+def _fetch_build_artifact(artifact_path: str) -> Optional[bytes]:
+    """Content of a build artifact read with the read helper, or None when neither location has it.
+
+    The helper's stdout is discarded, since this command's stdout carries JSON; its stderr, which
+    names the location that served the file or says why it could not, goes to the job log.
+
+    Raises:
+        ArtifactAuthError: The helper exited with FETCH_REJECTED.
+        ArtifactTransferError: The helper exited with FETCH_TRANSFER_FAILED.
+        ArtifactError: The helper could not be run, or exited with another status.
+    """
+    with tempfile.TemporaryDirectory(prefix="cbts-artifact-") as tmp:
+        dest = Path(tmp) / Path(artifact_path).name
+        try:
+            status = subprocess.run(
+                ["bash", str(_FETCH_BUILD_ARTIFACT), artifact_path, str(dest)],
+                stdout=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            content = dest.read_bytes() if status == 0 else None
+        except OSError as e:
+            raise ArtifactError(
+                f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}: {e}"
+            ) from e
+    if status in (0, _FETCH_ABSENT):
+        return content
+    raise _helper_failure(artifact_path, status)
 
 
 def build_commit(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[str]:
-    """Revision a build ran, from its `build_info.txt`, or None when unavailable."""
-    status, data = _get(build_info_url(build, artifact_base))
-    if status != 200 or not data:
+    """Revision a build ran, from its `build_info.txt`, or None when unavailable.
+
+    A read that fails in transfer counts as unavailable, so `select_tarball` skips that build as it
+    skips one without the file. A rejection by the primary location still raises: every other
+    build's read would be rejected too. The helper reports a rejection by the secondary location as
+    a transfer failure, so that build is skipped.
+
+    While artifactory.nvidia.com is down or unreachable, each read that has to go there, of this
+    file or of a coverage archive, fails in transfer after the helper's three attempts: about 6 s
+    when it refuses connections or answers 5xx at once, about 96 s when connections time out, and
+    about 15 min when no data arrives (curl ends an attempt after 300 s below 1 byte/s). While it
+    is the primary location (the default), every read goes there, so the probe pays that once for
+    each of the last `_MAX_PROBE` builds, whose first coverage archive cannot be read, before the
+    coverage tier declines. After a rollback to urm, only files that urm does not hold are read
+    there, and the probe stops at the newest complete build that urm holds. A pre-merge
+    L0_MergeRequest run calls this command in its Setup Environment stage, before it starts any
+    build, so its builds wait for these reads.
+
+    Raises:
+        ArtifactError: As `_fetch_build_artifact` raises it, except `ArtifactTransferError`;
+            `main` reports it and exits 1.
+    """
+    try:
+        data = _fetch_build_artifact(f"{artifact_base}/{build}/{BUILD_INFO_NAME}")
+    except ArtifactTransferError as e:
+        # The helper's message above says why; the probe moves on to an older build.
+        print(f"[artifact] {e}", file=sys.stderr)
+        return None
+    if not data:
         return None
     for line in data.decode("utf-8", "replace").splitlines():
         key, _, value = line.partition("=")
         if key.strip() == "commit" and value.strip():
             return value.strip()
     return None
+
+
+def _coverage_archive_path(build: int, name: str, artifact_base: str = ARTIFACT_BASE) -> str:
+    """Legacy path of one of a build's coverage archives, which the read helper maps."""
+    return f"{artifact_base}/{build}/cbts-coverage/{name}"
+
+
+def _coverage_archive_location(
+    build: int, name: str, artifact_base: str = ARTIFACT_BASE
+) -> Optional[str]:
+    """URL of one of a build's coverage archives, or None when neither location has it.
+
+    The read helper's --exists prints "<url> <sha1>" for the location that holds the archive; its
+    stderr, which names that location or says why it could not tell, goes to the job log.
+
+    Raises:
+        ArtifactAuthError: The helper exited with FETCH_REJECTED.
+        ArtifactTransferError: The helper exited with FETCH_TRANSFER_FAILED.
+        ArtifactError: The helper could not be run, exited with another status, or printed
+            something other than "<url> <sha1>".
+    """
+    artifact_path = _coverage_archive_path(build, name, artifact_base)
+    try:
+        result = subprocess.run(
+            ["bash", str(_FETCH_BUILD_ARTIFACT), "--exists", artifact_path],
+            stdout=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as e:
+        raise ArtifactError(
+            f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}: {e}"
+        ) from e
+    if result.returncode == _FETCH_ABSENT:
+        return None
+    if result.returncode != 0:
+        raise _helper_failure(artifact_path, result.returncode)
+    line = result.stdout.decode("utf-8", "replace").strip()
+    found = _EXISTS_LINE_RE.fullmatch(line)
+    if found is None:
+        raise ArtifactError(
+            f"{_FETCH_BUILD_ARTIFACT.name} --exists printed {line!r} for {artifact_path}, "
+            "not '<url> <sha1>'."
+        )
+    return found.group("url")
+
+
+def _coverage_archive_urls(build: int, artifact_base: str = ARTIFACT_BASE) -> Optional[list[str]]:
+    """URLs of a build's coverage archives, or None when one is absent and the pair incomplete.
+
+    An archive that is absent or cannot be read ends the check, so the ones after it are not read.
+
+    Raises:
+        ArtifactError: As `_coverage_archive_location` raises it.
+    """
+    urls = []
+    for name in ARCH_TARBALL_NAMES:
+        url = _coverage_archive_location(build, name, artifact_base)
+        if url is None:
+            return None
+        urls.append(url)
+    return urls
+
+
+def _download_coverage_archive(
+    build: int, name: str, dest_dir: Path, artifact_base: str = ARTIFACT_BASE
+) -> Optional[Path]:
+    """Download one of a build's coverage archives into `dest_dir` with the read helper.
+
+    Returns the archive, `dest_dir/<name>`, or None when neither location has it. The helper's
+    stdout is discarded and its stderr goes to the job log, as `_fetch_build_artifact` does.
+
+    Raises:
+        ArtifactAuthError: The helper exited with FETCH_REJECTED.
+        ArtifactTransferError: The helper exited with FETCH_TRANSFER_FAILED.
+        ArtifactError: The helper could not be run, or exited with another status.
+    """
+    artifact_path = _coverage_archive_path(build, name, artifact_base)
+    dest = dest_dir / name
+    try:
+        status = subprocess.run(
+            ["bash", str(_FETCH_BUILD_ARTIFACT), artifact_path, str(dest)],
+            stdout=subprocess.DEVNULL,
+            check=False,
+        ).returncode
+    except OSError as e:
+        raise ArtifactError(
+            f"{_FETCH_BUILD_ARTIFACT.name} could not read {artifact_path}: {e}"
+        ) from e
+    if status == _FETCH_ABSENT:
+        return None
+    if status != 0:
+        raise _helper_failure(artifact_path, status)
+    return dest
 
 
 def _pin_decline(reason: str) -> dict:
@@ -472,19 +633,40 @@ def select_tarball(
     artifact_base: str = ARTIFACT_BASE,
     jenkins_base: str = _JENKINS_BASE,
     max_probe: int = _MAX_PROBE,
+    start_build: Optional[int] = None,
 ) -> Optional[dict]:
-    """Newest complete architecture pair with measurable PR-base topology."""
-    build = latest_build_number(jenkins_base)
-    if build is None:
+    """Newest complete architecture pair with measurable PR-base topology.
+
+    Probes the last `max_probe` builds newest first, from `start_build` when it is given. A build
+    is skipped when one of its coverage archives is absent, or when reading one fails in transfer,
+    as it is when reading its `build_info.txt` fails.
+
+    Raises:
+        ArtifactError: As `_coverage_archive_location` or `build_commit` raises it, except
+            `ArtifactTransferError`; `main` reports it and exits 1.
+    """
+    latest = latest_build_number(jenkins_base)
+    if latest is None:
         print("[artifact] could not resolve latest build number", file=sys.stderr)
         return None
-    for b in range(build, max(0, build - max_probe), -1):
-        urls = tarball_urls(b, artifact_base)
-        if not all(_exists(url) for url in urls):
+    first = latest if start_build is None else min(start_build, latest)
+    unreadable_archives = 0
+    unknown_commits = 0
+    for b in range(first, max(0, latest - max_probe), -1):
+        try:
+            urls = _coverage_archive_urls(b, artifact_base)
+        except ArtifactTransferError as e:
+            # The helper's message above says why; the probe moves on to an older build.
+            print(f"[artifact] {e}", file=sys.stderr)
+            print(f"[artifact] build {b}: coverage archive unreadable; skipped", file=sys.stderr)
+            unreadable_archives += 1
+            continue
+        if urls is None:
             continue
         commit = build_commit(b, artifact_base)
         if not commit:
             print(f"[artifact] build {b}: commit unknown; skipped", file=sys.stderr)
+            unknown_commits += 1
             continue
         distance, status = drift(commit, pr_base_commit)
         if distance is None:
@@ -503,6 +685,9 @@ def select_tarball(
         selected = {
             "url": urls[0],
             "urls": urls,
+            "paths": [
+                _coverage_archive_path(b, name, artifact_base) for name in ARCH_TARBALL_NAMES
+            ],
             "build": b,
             "commit": commit,
             "base_commit": pr_base_commit,
@@ -513,8 +698,15 @@ def select_tarball(
         if selected["lag"] is None:
             print(f"[artifact] build {b}: lag behind main unknown", file=sys.stderr)
         return selected
+    skips = []
+    if unreadable_archives:
+        skips.append(f"{unreadable_archives} skipped: coverage archive unreadable")
+    if unknown_commits:
+        skips.append(f"{unknown_commits} skipped: commit unknown")
+    skipped = f" ({'; '.join(skips)})" if skips else ""
     print(
-        f"[artifact] no complete x86/SBSA coverage pair in the last {max_probe} builds",
+        "[artifact] no complete x86/SBSA coverage pair with a known commit in the last "
+        f"{max_probe} builds{skipped}",
         file=sys.stderr,
     )
     return None
@@ -526,9 +718,22 @@ def select_build(
     expected_commit: Optional[str] = None,
     artifact_base: str = ARTIFACT_BASE,
 ) -> Optional[dict]:
-    """Resolve and validate one explicitly pinned coverage build."""
-    urls = tarball_urls(build, artifact_base)
-    if not all(_exists(url) for url in urls):
+    """Resolve and validate one explicitly pinned coverage build.
+
+    The pinned build has no older candidate, so a coverage archive whose read fails in transfer
+    declines it, as an absent one does.
+
+    Raises:
+        ArtifactError: As `_coverage_archive_location` or `build_commit` raises it, except
+            `ArtifactTransferError`; `main` reports it and exits 1.
+    """
+    try:
+        urls = _coverage_archive_urls(build, artifact_base)
+    except ArtifactTransferError as e:
+        print(f"[artifact] {e}", file=sys.stderr)
+        print(f"[artifact] pinned build {build}: coverage archive unreadable", file=sys.stderr)
+        return None
+    if urls is None:
         print(f"[artifact] pinned build {build}: coverage pair is incomplete", file=sys.stderr)
         return None
     commit = build_commit(build, artifact_base)
@@ -557,6 +762,9 @@ def select_build(
     return {
         "url": urls[0],
         "urls": urls,
+        "paths": [
+            _coverage_archive_path(build, name, artifact_base) for name in ARCH_TARBALL_NAMES
+        ],
         "build": build,
         "commit": commit,
         "base_commit": pr_base_commit,
@@ -582,25 +790,6 @@ def describe(sel: dict) -> str:
     )
 
 
-def download(url: str, dest: Path, attempts: int = _RETRIES) -> Optional[Path]:
-    """Stream the tarball into `dest`, retrying; None when every attempt fails.
-
-    Streamed, not buffered: the artifact runs to hundreds of MB.
-    """
-    out = dest / url.rsplit("/", maxsplit=1)[-1]
-    for attempt in range(1, attempts + 1):
-        try:
-            with (
-                urllib.request.urlopen(url, timeout=_DOWNLOAD_TIMEOUT) as resp,
-                out.open("wb") as f,
-            ):
-                shutil.copyfileobj(resp, f)
-            return out
-        except OSError as e:  # HTTPError/URLError are OSError subclasses
-            print(f"[artifact] download {attempt}/{attempts} failed: {e}", file=sys.stderr)
-    return None
-
-
 def extract(tarball: Path, dest: Path) -> bool:
     """Unpack the tarball into `dest`; False when it is not readable."""
     try:
@@ -616,6 +805,39 @@ def extract(tarball: Path, dest: Path) -> bool:
     return True
 
 
+def _download_and_merge(sel: dict, dest: Path) -> Optional[Path]:
+    """Download the selection's archives by their `paths`, and merge their DBs into `dest`.
+
+    Returns the merged DB, or None when an archive is absent, does not unpack, or holds no DB, or
+    when the merge fails.
+
+    Raises:
+        ArtifactError: As `_download_coverage_archive` raises it.
+    """
+    db = dest / DB_NAME
+    with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
+        temp = Path(temp_dir)
+        source_dbs = []
+        for index, path in enumerate(sel["paths"]):
+            tarball = _download_coverage_archive(sel["build"], Path(path).name, temp)
+            artifact_dir = temp / str(index)
+            artifact_dir.mkdir()
+            if tarball is None or not extract(tarball, artifact_dir):
+                return None
+            source_db = artifact_dir / DB_NAME
+            if not source_db.is_file():
+                print(f"[artifact] {DB_NAME} not in {path}", file=sys.stderr)
+                return None
+            source_dbs.append(source_db)
+        try:
+            connection = merge_databases(source_dbs, db)
+        except (OSError, sqlite3.Error, ValueError) as e:
+            print(f"[artifact] merge failed: {e}", file=sys.stderr)
+            return None
+        connection.close()
+    return db
+
+
 def prepare(
     dest_dir: str,
     pr_head: Optional[str],
@@ -627,6 +849,14 @@ def prepare(
 
     `meta` is the selection JSON on disk, which `cbts.command main --coverage-db-meta` reads.
     Paths are relative to the caller's cwd, matching the Groovy caller's `cd ${LLM_ROOT}`.
+
+    A probed build whose archive download fails in transfer is skipped as the probe skips one: the
+    probe resumes below it within the same `_MAX_PROBE` window, and the build it selects next is
+    checked and downloaded in turn. A pinned build has no older candidate, so the failure declines.
+
+    Raises:
+        ArtifactError: As `select_tarball`, `select_build`, or `_download_coverage_archive`
+            raises it, except `ArtifactTransferError`; `main` reports it and exits 1.
     """
     if not pr_head:
         print("[artifact] PR head is required to select a coverage DB", file=sys.stderr)
@@ -640,46 +870,43 @@ def prepare(
         if build is not None
         else select_tarball(pr_base_commit)
     )
-    if sel is None:
-        return None
-    compatible = _selection_accepts_pr_diff(
-        sel,
-        pr_base_commit,
-        pr_head,
-        relevant_paths,
-    )
-    print(describe(sel), file=sys.stderr)
-
     dest = Path(dest_dir)
-    dest.mkdir(parents=True, exist_ok=True)
-    meta = dest / META_NAME
-    meta.write_text(json.dumps(sel))
-    if not compatible:
-        return {"path": None, "meta": str(meta)}
+    while sel is not None:
+        compatible = _selection_accepts_pr_diff(
+            sel,
+            pr_base_commit,
+            pr_head,
+            relevant_paths,
+        )
+        print(describe(sel), file=sys.stderr)
 
-    db = dest / DB_NAME
-    with tempfile.TemporaryDirectory(prefix="cbts_artifacts_", dir=dest) as temp_dir:
-        temp = Path(temp_dir)
-        source_dbs = []
-        for index, url in enumerate(sel["urls"]):
-            tarball = download(url, temp)
-            artifact_dir = temp / str(index)
-            artifact_dir.mkdir()
-            if tarball is None or not extract(tarball, artifact_dir):
-                return None
-            source_db = artifact_dir / DB_NAME
-            if not source_db.is_file():
-                print(f"[artifact] {DB_NAME} not in {url}", file=sys.stderr)
-                return None
-            source_dbs.append(source_db)
+        dest.mkdir(parents=True, exist_ok=True)
+        meta = dest / META_NAME
+        meta.write_text(json.dumps(sel))
+        if not compatible:
+            return {"path": None, "meta": str(meta)}
+
         try:
-            connection = merge_databases(source_dbs, db)
-        except (OSError, sqlite3.Error, ValueError) as e:
-            print(f"[artifact] merge failed: {e}", file=sys.stderr)
+            db = _download_and_merge(sel, dest)
+        except ArtifactTransferError as e:
+            # The helper's message above says why.
+            print(f"[artifact] {e}", file=sys.stderr)
+            if build is not None:
+                print(
+                    f"[artifact] pinned build {build}: coverage archive unreadable",
+                    file=sys.stderr,
+                )
+                return None
+            print(
+                f"[artifact] build {sel['build']}: coverage archive unreadable; skipped",
+                file=sys.stderr,
+            )
+            sel = select_tarball(pr_base_commit, start_build=sel["build"] - 1)
+            continue
+        if db is None:
             return None
-        connection.close()
-
-    return {"path": str(db), "meta": str(meta)}
+        return {"path": str(db), "meta": str(meta)}
+    return None
 
 
 def _load_paths_json(path: Optional[str]) -> Optional[list[str]]:
@@ -715,7 +942,7 @@ def _load_paths_json(path: Optional[str]) -> Optional[list[str]]:
     "--print-selection",
     "print_selection",
     is_flag=True,
-    help="resolve and print {urls, build, commit, lag, base_commit, drift, "
+    help="resolve and print {urls, paths, build, commit, lag, base_commit, drift, "
     "drift_status, patch_apply_status} as JSON",
 )
 @click.option("--build", type=int, default=None, help="pin a build number (skip auto-resolve)")
@@ -770,7 +997,35 @@ def main(
         )
     if expected_commit is not None and build is None:
         raise click.UsageError("--expected-commit requires --build")
+    try:
+        _run_entry_point(
+            resolve_pin_file,
+            resolve_build,
+            build,
+            expected_commit,
+            prepare_dir,
+            pr_head,
+            pr_number,
+            paths_json,
+        )
+    except ArtifactError as e:
+        # Reported like the other failures: a message on stderr, no JSON, exit status 1.
+        for line in str(e).splitlines():
+            print(f"[artifact] {line}", file=sys.stderr)
+        sys.exit(1)
 
+
+def _run_entry_point(
+    resolve_pin_file: Optional[str],
+    resolve_build: bool,
+    build: Optional[int],
+    expected_commit: Optional[str],
+    prepare_dir: Optional[str],
+    pr_head: Optional[str],
+    pr_number: Optional[str],
+    paths_json: Optional[str],
+) -> NoReturn:
+    """Run the entry point `main` selected and exit with its status."""
     if prepare_dir:
         relevant_paths = _load_paths_json(paths_json)
         if relevant_paths is None:

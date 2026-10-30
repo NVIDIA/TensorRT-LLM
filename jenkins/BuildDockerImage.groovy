@@ -33,6 +33,36 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent. This job reads
+// packaged builds with jenkins/scripts/fetch_build_artifact.sh, which maps the legacy paths above.
+
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+// Credential with which the read helper reads packaged builds on artifactory.nvidia.com: the
+// publishing credential, the one the pipelines publish build artifacts with. Image pushes also
+// use it.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
+
+// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
+// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
+// that they match.
+FETCH_ABSENT = 2
+FETCH_REJECTED = 3
+FETCH_TRANSFER_FAILED = 4
+
 LLM_ROOT = "llm"
 
 LLM_BRANCH = env.gitlabBranch ?: params.branch
@@ -99,6 +129,8 @@ def MAINTENANCE_ENTRIES = "maintenance_entries"
 def BOLT_PROFILE_REF = "bolt_profile_ref"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -112,6 +144,9 @@ def globalVars = [
     // without saying so.
     (BOLT_PROFILE_REF): "",
     (BOLT_PROFILE_BRANCH): "",
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
 ]
 
 @Field
@@ -227,6 +262,24 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     ]
 
     return podConfig
+}
+
+
+// Writes a netrc for LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its owner, to netrcPath
+// for jenkins/scripts/fetch_build_artifact.sh. Callers put it under pwd(tmp: true), outside the
+// source tree and any docker build context, and remove it in a finally block.
+def writeArtifactoryNetrc(String netrcPath)
+{
+    withCredentials([usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
+    }
 }
 
 
@@ -616,59 +669,76 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 build_jobs = BUILD_JOBS_RELEASE_SBSA
             }
         }
-        stage ("make ${target}_${action} (${arch})") {
-            sh "env | sort"
-            def randomSleep = (Math.random() * 600 + 600).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            try {
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawImageTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            } catch (InterruptedException ex) {
-                throw ex
-            } catch (Exception ex) {
-                if (buildWheelArgs.trim().isEmpty()) {
-                    throw ex
-                }
-                if (!mayRetryWithoutBuildStageWheel(arch)) {
-                    echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
-                         "NOT retrying from source (that would publish an unoptimized release image)"
-                    throw ex
-                }
-                echo "Build failed with wheel arguments, retrying without them"
-                buildWheelArgs = ""
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawImageTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+        // With buildWheelArgs, the image build takes its wheel from the packaged build, which
+        // jenkins/scripts/fetch_build_artifact.sh reads with this netrc. docker/Makefile
+        // hands the netrc to `docker buildx build` as a BuildKit secret, never a build argument;
+        // it is written outside the build context (${LLM_ROOT}) and removed after the builds below.
+        def wheelNetrcPath = buildWheelArgs.trim() ? "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}" : ""
+        try {
+            if (wheelNetrcPath) {
+                def primary = llmArtifactsPrimary()
+                writeArtifactoryNetrc(wheelNetrcPath)
+                buildWheelArgs += " ARTIFACTORY_NETRC='${wheelNetrcPath}' LLM_ARTIFACTS_PRIMARY=${primary}" +
+                    " ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}"
             }
-            if (target == "ngc-release") {
-                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+            stage ("make ${target}_${action} (${arch})") {
+                sh "env | sort"
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                try {
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawImageTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                } catch (InterruptedException ex) {
+                    throw ex
+                } catch (Exception ex) {
+                    if (buildWheelArgs.trim().isEmpty()) {
+                        throw ex
+                    }
+                    if (!mayRetryWithoutBuildStageWheel(arch)) {
+                        echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
+                             "NOT retrying from source (that would publish an unoptimized release image)"
+                        throw ex
+                    }
+                    echo "Build failed with wheel arguments, retrying without them"
+                    buildWheelArgs = ""
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawImageTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                }
+                if (target == "ngc-release") {
+                    imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+                }
             }
-        }
 
-        if (customTag) {
-            stage ("Custom Tag: ${customTag} (${arch})") {
-                sh """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawCustomTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """
+            if (customTag) {
+                stage ("Custom Tag: ${customTag} (${arch})") {
+                    sh """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawCustomTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """
+                }
+            }
+        } finally {
+            if (wheelNetrcPath) {
+                sh(label: "Remove Artifactory netrc", script: "rm -f '${wheelNetrcPath}'")
             }
         }
 
@@ -962,6 +1032,10 @@ pipeline {
                     sh "env | sort"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
                 }
             }
         }
@@ -993,11 +1067,17 @@ pipeline {
                 script {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
-                            // Install wget
-                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
+                            // git for checkoutFile, curl for jenkins/scripts/fetch_build_artifact.sh
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget git curl")
+
+                            // The read helper from this run's commit looks for each file on the
+                            // primary location first; it needs a netrc for artifactory.nvidia.com.
+                            def helperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                            trtllm_utils.checkoutFile(LLM_REPO, LLM_COMMIT_OR_BRANCH, "jenkins/scripts/fetch_build_artifact.sh", helperDir)
+                            def helperPath = "${helperDir}/fetch_build_artifact.sh"
+                            def primary = llmArtifactsPrimary()
 
                             // Poll for build artifacts
-                            def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
                             def requiredFiles = [
                                 "TensorRT-LLM-GH200.tar.gz",
                                 "TensorRT-LLM.tar.gz"
@@ -1011,34 +1091,57 @@ pipeline {
                             def startTime = System.currentTimeMillis()
                             def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                            while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                                def missingFiles = []
+                            def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                            try {
+                                writeArtifactoryNetrc(netrcPath)
+                                withEnv([
+                                    "LLM_ARTIFACTS_PRIMARY=${primary}",
+                                    "ARTIFACTORY_NETRC=${netrcPath}",
+                                    "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+                                ]) {
+                                    while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                                        def missingFiles = []
 
-                                for (file in requiredFiles) {
-                                    def fileUrl = "${artifactBaseUrl}${file}"
-                                    def exitCode = sh(
-                                        script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
-                                        returnStatus: true
-                                    )
+                                        for (file in requiredFiles) {
+                                            // FETCH_ABSENT: not published yet. FETCH_TRANSFER_FAILED: the check
+                                            // failed after the helper's own retries. Both are checked again on
+                                            // the next poll.
+                                            def exitCode = sh(
+                                                script: "bash '${helperPath}' --exists '${UPLOAD_PATH}/${file}' > /dev/null",
+                                                returnStatus: true
+                                            )
 
-                                    if (exitCode != 0) {
-                                        missingFiles.add(file)
+                                            if (exitCode == FETCH_REJECTED) {
+                                                // The helper has printed which request was rejected and why.
+                                                error(primary == "aws" ?
+                                                    "Credential '${LLM_ARTIFACTS_CREDENTIALS_ID}' was rejected while checking for ${file}: its Artifactory access token needs renewal or lacks read permission on sw-tensorrt-llm-generic-local" :
+                                                    "urm rejected the anonymous request while checking for ${file}")
+                                            }
+                                            if (!(exitCode in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
+                                                error "fetch_build_artifact.sh exited with ${exitCode} while checking for ${file}"
+                                            }
+                                            if (exitCode != 0) {
+                                                missingFiles.add(file)
+                                            }
+                                        }
+
+                                        if (missingFiles.isEmpty()) {
+                                            echo "All build artifacts are ready!"
+                                            return
+                                        }
+
+                                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                        echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                                        echo "Missing files: ${missingFiles}"
+                                        sleep(pollIntervalSeconds)
                                     }
-                                }
 
-                                if (missingFiles.isEmpty()) {
-                                    echo "All build artifacts are ready!"
-                                    return
+                                    def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                    error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                                 }
-
-                                def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                                echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
-                                echo "Missing files: ${missingFiles}"
-                                sleep(pollIntervalSeconds)
+                            } finally {
+                                sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
                             }
-
-                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                         }
                     }
                 }
@@ -1054,6 +1157,7 @@ pipeline {
                 script {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                        globalVars[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         def parameters = getCommonParameters()
                         parameters += [
