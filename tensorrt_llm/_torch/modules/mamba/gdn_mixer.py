@@ -120,9 +120,7 @@ def _gdn_prefill_uses_flashinfer() -> bool:
 # Packed prefill tokens per iteration up to which the main scan pins FlashInfer's
 # plain chunked kernel (``use_cp=False``): one launch with indexed pool I/O
 # instead of the chunk-parallel kernel's four launches plus gather and scatter.
-# Measured on VR200 / flashinfer 0.6.18 (one TP8 rank of Qwen3.5-397B): the
-# plain kernel is also faster on the GPU up to 4096 tokens and ~35 us slower at
-# 8192 (results/_analysis_scratch/gdn_prefill_cp_vs_plain_bench.py). Above the
+# The plain kernel is also faster on the GPU up to this size. Above the
 # threshold the adapter's default ("auto") leaves the choice to FlashInfer. The
 # pin applies on SM90/SM100/SM103 only; FlashInfer's prefill path also runs on
 # SM120/SM121, which keep its own "auto" routing.

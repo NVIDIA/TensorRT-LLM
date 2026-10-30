@@ -354,7 +354,7 @@ class AttentionMetadata:
         """
         self._prepare_mamba_metadata()
 
-    def supports_steady_gen_step(self) -> bool:
+    def support_steady_gen_step(self) -> bool:
         """Whether ``prepare_steady_gen_step`` may advance this metadata."""
         return False
 

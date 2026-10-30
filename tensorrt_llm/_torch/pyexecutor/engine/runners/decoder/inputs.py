@@ -2605,7 +2605,7 @@ class DecoderInputPreparer:
             self._buffers.steady_gen_positions_pinned[: host.n_gen].copy_(
                 torch.as_tensor(host.num_cached_tokens_snapshot, dtype=torch.int)
             )
-            incremental = attn_metadata.supports_steady_gen_step()
+            incremental = attn_metadata.support_steady_gen_step()
             self._steady_gen_cache = {
                 "num_requests": host.n_gen,
                 "num_real": host.previous_batch_len,

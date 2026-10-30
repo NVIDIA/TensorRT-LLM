@@ -84,9 +84,17 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor._resources_released = False
     executor.worker_started = True
     executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
+    executor.dist.tp_cp_allgather_int64.side_effect = lambda v: executor.dist.tp_allgather_int64(v)
+    executor.dist.cp_allgather_int64.side_effect = lambda v: np.asarray(
+        [[int(x) for x in v]], dtype=np.int64
+    )
     executor.enable_attention_dp = True
     executor.enable_early_first_token_response = False
     executor.kv_connector_manager = None
+    executor._fetch_hint_enabled = False
+    executor._packed_sync_enabled = False
+    executor._stage_timing = False
+    executor.kv_cache_transceiver = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
     executor._kv_cache_capacity = {}
@@ -1218,7 +1226,7 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
         executor.request_broadcaster.broadcast.return_value = ([], {})
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
@@ -1278,8 +1286,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         else:
             # Only the existing routing allgather runs when no transfers exist.
             for executor in executors:
-                executor.dist.tp_allgather_int64.assert_not_called()
-                assert executor.dist.tp_allgather.call_count == 3
+                executor.dist.tp_allgather.assert_not_called()
+                assert executor.dist.tp_allgather_int64.call_count == 3
 
 
 def test_ready_owner_polls_save_during_peer_recovery() -> None:
@@ -1367,7 +1375,7 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.enable_iter_perf_stats = False
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
         executor.previous_batch = None

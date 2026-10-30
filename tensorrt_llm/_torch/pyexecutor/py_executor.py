@@ -1408,6 +1408,11 @@ class PyExecutor:
         # vector). Config-derived, so identical on every rank; see
         # _resolve_packed_sync_enabled.
         self._packed_sync_enabled = self._resolve_packed_sync_enabled()
+        self._stage_timing = os.environ.get("TLLM_EXECUTOR_STAGE_TIMING",
+                                            "0") == "1"
+        self._stage_acc: Dict[str, float] = {}
+        self._stage_n = 0
+        self._stage_busy = 0
         # Stashes produced by the packed exchanges and consumed by the legacy
         # collective sites (use if present, else gather); cleared at the end
         # of every loop pass and in _executor_loop_cleanup.
@@ -2697,20 +2702,13 @@ class PyExecutor:
     # overlap loop, logged every 500 passes on the first and last rank (dev
     # diagnostic for host-bound disaggregated loops; off unless set).
     def _stage_begin(self) -> None:
-        enabled = getattr(self, "_stage_timing", None)
-        if enabled is None:
-            enabled = self._stage_timing = (os.environ.get(
-                "TLLM_EXECUTOR_STAGE_TIMING", "0") == "1")
-            self._stage_acc = {}
-            self._stage_n = 0
-            self._stage_busy = 0
-        if not enabled:
+        if not self._stage_timing:
             return
         self._stage_pass_t0 = self._stage_t = time.perf_counter()
         self._stage_cpu0 = time.thread_time()
 
     def _stage_mark(self, name: str) -> None:
-        if not getattr(self, "_stage_timing", False):
+        if not self._stage_timing:
             return
         now = time.perf_counter()
         self._stage_acc[name] = self._stage_acc.get(name,
@@ -2718,7 +2716,7 @@ class PyExecutor:
         self._stage_t = now
 
     def _stage_end(self, busy: bool) -> None:
-        if not getattr(self, "_stage_timing", False):
+        if not self._stage_timing:
             return
         now = time.perf_counter()
         self._stage_acc["wall"] = self._stage_acc.get(
@@ -5012,7 +5010,7 @@ class PyExecutor:
                 self._handle_errors(error_msg, requests=self.active_requests)
                 return None, None
 
-        if getattr(self, "_packed_sync_enabled", False):
+        if self._packed_sync_enabled:
             # Executed on every pass that reaches this point (also
             # forward-less ones), so the collective sequence is identical on
             # every rank.
@@ -5887,7 +5885,7 @@ class PyExecutor:
                 if self._is_kv_manager_v2 and self._can_pause_for_rebalance():
                     self._maybe_rebalance_kv_pools()
 
-                if getattr(self, "_packed_sync_enabled", False):
+                if self._packed_sync_enabled:
                     # No input copy is in flight in this loop, so the voted
                     # actions follow the exchange directly.
                     flush_transfer_errors = self._adp_apply_loop_head_actions(
@@ -6137,7 +6135,7 @@ class PyExecutor:
                 # collective fires every iter regardless of future restructuring.
                 # Under enable_packed_sync the buffer is reported and drained
                 # by the next loop-head exchange instead.
-                if not getattr(self, "_packed_sync_enabled", False):
+                if not self._packed_sync_enabled:
                     self.disagg.handle_timeouts_synced()
                 # Drop any enable_packed_sync stash this pass left behind
                 # (unconsumed padding hint on a forward-less pass).
@@ -6976,7 +6974,7 @@ class PyExecutor:
 
                 loop_head = None
                 flush_transfer_errors = False
-                if getattr(self, "_packed_sync_enabled", False):
+                if self._packed_sync_enabled:
                     loop_head = self._adp_loop_head_exchange()
                 else:
                     flush_transfer_errors = self.disagg.handle_errors_synced()
@@ -7264,7 +7262,7 @@ class PyExecutor:
                 # the _enqueue_responses([]) call in the else branch. Under
                 # enable_packed_sync the timeout buffer is reported and
                 # drained by the next loop-head exchange instead.
-                if not getattr(self, "_packed_sync_enabled", False):
+                if not self._packed_sync_enabled:
                     self.disagg.handle_timeouts_synced()
                 self._flush_iter_stats_synced()
 

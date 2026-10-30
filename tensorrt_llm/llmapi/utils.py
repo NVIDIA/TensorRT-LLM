@@ -680,7 +680,11 @@ def exclude_cpus_from_affinity(cpus: List[int],
         return list(cpus), []
     kept = [c for c in cpus if c not in excluded]
     dropped = [c for c in cpus if c in excluded]
-    if not dropped or len(kept) < min_cpus:
+    if not dropped:
+        return list(cpus), []
+    if len(kept) < min_cpus:
+        logger.warning(f"Ignoring {WORKER_AFFINITY_EXCLUDE_ENV}={spec!r}: only "
+                       f"{len(kept)} CPUs would remain, fewer than {min_cpus}.")
         return list(cpus), []
     return kept, dropped
 

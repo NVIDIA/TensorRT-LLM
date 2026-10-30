@@ -53,21 +53,12 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 
 # Indexed pool I/O on the plain SM100/SM103 kernel (see the module docstring).
-# Escape hatch for A/B runs; measured on VR200 / flashinfer 0.6.18 as host
-# 20 us vs 66 us per call and GPU time <= the gather/scatter path at every
-# length (results/_analysis_scratch/gdn_prefill_cp_vs_plain_bench.py).
+# Escape hatch for A/B runs.
 _INDEXED_STATE_IO = os.environ.get("TLLM_GDN_PREFILL_INDEXED_STATE_IO", "1") == "1"
 # The kernel's indexed state loads/stores cost ~1 us per sequence on top of the
-# scan: with the one-token decode sequences that used to ride along in a mixed
-# iteration (100-250 of them) the indexed variant was up to 2x slower than the
-# wrapper's gather + scatter (192 decode + one 1024-token chunk: 330 vs 160 us;
-# results/_analysis_scratch/gdn_prefill_mixedbatch_bench.txt). Since the decode
-# rows take the recurrent kernel, the main scan carries only the context
-# segments: up to 32 of them the indexed launch is
-# cheaper than gather + scan + scatter both on the GPU (35-42 vs 52 us for 1-24
-# segments of 32-2048 tokens, fi_indexed_vs_compact_gpu_bench.py) and on the
-# host (two launches fewer per layer, the mixed iterations' critical path).
-# The limit was measured on VR200 with FlashInfer 0.6.18.
+# scan, so the indexed launch is only used up to this many context segments;
+# beyond it gather + scan + scatter is cheaper. Decode rows take the recurrent
+# kernel, so the main scan carries only the context segments.
 _INDEXED_STATE_IO_MAX_SEQS = 32
 
 
@@ -285,9 +276,7 @@ def chunk_gated_delta_rule(
     # One launch instead of gather + kernel + scatter; the pool rows never
     # leave the pool. Only with the plain kernel pinned by the caller
     # (``use_cp=False``) and a handful of sequences: the indexed variant pays
-    # ~1 us per sequence, which is what made the reverted main pick fbac78bd2a
-    # ~2-3x slower per launch in mixed iterations (their scans carry every
-    # decode request as a one-token sequence).
+    # ~1 us per sequence.
     if (
         _INDEXED_STATE_IO
         and inplace_indexed_state_update

@@ -1489,7 +1489,7 @@ class ModelEngine:
         *,
         enable_spec_decode: bool = False,
         runtime_draft_len: int = 0,
-    ) -> Tuple[ScheduledRequests, frozenset[int]]:
+    ) -> tuple[ScheduledRequests, frozenset[int]]:
         """The batch ``forward`` would hand to the CUDA-graph runner.
 
         For the executor's packed attention-DP post-schedule exchange
@@ -1504,13 +1504,15 @@ class ModelEngine:
         if make is None:
             return scheduled_requests, frozenset()
         kv_cache_manager = resource_manager.get_resource_manager(
-            ResourceManagerType.KV_CACHE_MANAGER)
-        execution_batch = runner._graphs.attention_dp_execution_batch(
-            scheduled_requests)
-        return make(execution_batch,
-                    kv_cache_manager,
-                    enable_spec_decode=enable_spec_decode,
-                    runtime_draft_len=runtime_draft_len)
+            ResourceManagerType.KV_CACHE_MANAGER
+        )
+        execution_batch = runner._graphs.attention_dp_execution_batch(scheduled_requests)
+        return make(
+            execution_batch,
+            kv_cache_manager,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+        )
 
     def _forward_scheduled(
         self,

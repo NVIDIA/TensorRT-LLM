@@ -1210,7 +1210,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:num_seqs],
         )
 
-    def supports_steady_gen_step(self) -> bool:
+    def support_steady_gen_step(self) -> bool:
         """Whether ``prepare_steady_gen_step`` may advance this metadata.
 
         True for the plain decode configuration whose per-step state is fully

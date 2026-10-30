@@ -8,11 +8,9 @@ same model inputs and attention metadata as the full ``_prepare_tp_inputs``
 walk, re-staging the KV block table only on the steps where a real request
 starts a new block."""
 
-import os
-import sys
-
 import pytest
 import torch
+from _torch.executor.engine_test_utils import DummyModelEngine, _create_request  # noqa: E402
 
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
@@ -26,9 +24,6 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.mapping import Mapping
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_pytorch_model_engine import DummyModelEngine, _create_request  # noqa: E402
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

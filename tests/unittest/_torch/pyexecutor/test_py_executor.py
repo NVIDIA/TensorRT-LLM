@@ -4086,6 +4086,8 @@ class TestPendingTransferResponseFlush:
         executor._mm_encoder_item_scheduling_enabled = False
         executor.is_benchmark_disagg = False
         executor._flush_pending_transfer_responses = Mock()
+        executor._packed_sync_enabled = False
+        executor._stage_timing = False
         return executor
 
     @staticmethod
@@ -4272,6 +4274,8 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.enable_attention_dp = False
         ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
+        ex._packed_sync_enabled = False
+        ex._stage_timing = False
         ex.waiting_queue = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
