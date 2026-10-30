@@ -30,19 +30,22 @@ from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize(
-    "checkpoint,cuda_graph,num_images,golden,steps,compile_enabled,quant_algo",
+    "checkpoint,cuda_graph,num_images,golden,steps,compile_enabled,quant_algo,quant_dynamic",
     [
-        ("FLUX.1-dev", False, 1, "flux1_lpips_golden.png", 4, False, None),
-        ("FLUX.1-dev", True, 1, "flux1_lpips_golden.png", 4, False, None),
-        ("FLUX.1-dev", False, 2, None, 4, False, None),
-        ("FLUX.2-dev", False, 1, "flux2_lpips_golden.png", 4, False, None),
-        ("qwen-image", False, 2, None, 4, False, None),
-        ("qwen-image", True, 2, None, 4, False, None),
-        ("qwen-image", False, 2, None, 50, False, None),
-        ("qwen-image", False, 2, None, 50, True, None),
-        ("qwen-image", True, 1, None, 4, True, None),
-        ("FLUX.1-dev", False, 1, None, 4, False, "NVFP4"),
-        ("FLUX.2-dev", False, 1, None, 4, False, "NVFP4"),
+        ("FLUX.1-dev", False, 1, "flux1_lpips_golden.png", 4, False, None, False),
+        ("FLUX.1-dev", True, 1, "flux1_lpips_golden.png", 4, False, None, False),
+        ("FLUX.1-dev", False, 2, None, 4, False, None, False),
+        ("FLUX.2-dev", False, 1, "flux2_lpips_golden.png", 4, False, None, False),
+        ("qwen-image", False, 2, None, 4, False, None, False),
+        ("qwen-image", True, 2, None, 4, False, None, False),
+        ("qwen-image", False, 2, None, 50, False, None, False),
+        ("qwen-image", False, 2, None, 50, True, None, False),
+        ("qwen-image", True, 1, None, 4, True, None, False),
+        ("FLUX.1-dev", False, 1, None, 4, False, "NVFP4", True),
+        ("FLUX.2-dev", False, 1, None, 4, False, "NVFP4", True),
+        ("FLUX.1-dev", False, 1, None, 4, False, "FP8", True),
+        ("FLUX.2-dev", False, 1, None, 4, False, "FP8", True),
+        ("FLUX.1-dev-modelopt-NVFP4", False, 1, None, 4, False, "NVFP4", False),
     ],
     ids=[
         "flux1",
@@ -56,6 +59,9 @@ from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
         "qwen-image-compile-cuda-graph",
         "flux1-dynamic-nvfp4",
         "flux2-dynamic-nvfp4",
+        "flux1-dynamic-fp8",
+        "flux2-dynamic-fp8",
+        "flux1-static-nvfp4",
     ],
 )
 def test_dynamic_batching_matches_singletons(
@@ -66,12 +72,14 @@ def test_dynamic_batching_matches_singletons(
     steps,
     compile_enabled,
     quant_algo,
+    quant_dynamic,
     tmp_path,
     capfd,
     monkeypatch,
 ):
     if quant_algo == "NVFP4" and torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("NVFP4 requires Blackwell or newer")
+    expect_batching = not (quant_algo == "NVFP4" or (quant_dynamic and quant_algo == "FP8"))
     monkeypatch.setenv("TLLM_LOG_LEVEL", "INFO")
     prompts = [
         "a tiny astronaut hatching from an egg on the moon",
@@ -93,7 +101,8 @@ def test_dynamic_batching_matches_singletons(
         compilation_config={"skip_warmup": True},
         torch_compile_config={"enable": compile_enabled},
         cuda_graph_config={"enable": cuda_graph},
-        quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_algo else None,
+        # Static checkpoints supply their calibrated scales and excluded layers.
+        quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_dynamic else None,
     )
     # Serial calls exercise the singleton path on the same weights/device/RNG mode.
     with VisualGen(model=get_checkpoint(checkpoint), args=args) as generator:
@@ -103,7 +112,7 @@ def test_dynamic_batching_matches_singletons(
         ]
         results = [handle.result(timeout=600) for handle in handles]
         assert [out.request_id for out in results] == [handle.request_id for handle in handles]
-        if quant_algo != "NVFP4":
+        if expect_batching:
             assert results[0].metrics.generation == results[1].metrics.generation
         for i, (baseline, result) in enumerate(zip(baselines, results)):
             assert result.image.shape == (num_images, 256, 256, 3)
@@ -118,14 +127,14 @@ def test_dynamic_batching_matches_singletons(
 
     captured = capfd.readouterr()
     log = captured.out + captured.err
-    if quant_algo == "NVFP4":
+    if not expect_batching:
         assert "Dynamic batching is inactive" in log
         assert "Dynamic batch: requests=" not in log
     else:
         assert "Dynamic batch: requests=" in log
     if quant_algo is not None:
         assert f"Quantization: {quant_algo}" in log
-        assert "Dynamic weight quant: True" in log
+        assert f"Dynamic weight quant: {quant_dynamic}" in log
     for i, prompt in enumerate(prompts):
         for j in range(num_images):
             score = _run_lpips_eval(

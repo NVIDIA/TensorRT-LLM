@@ -27,16 +27,23 @@ class BatchInfo:
     seeds: tuple[int, ...]
 
 
-def has_dynamic_nvfp4(module: torch.nn.Module) -> bool:
-    """Detect NVFP4 layers that derive an activation scale from the current input."""
-    return any(
-        getattr(getattr(layer, "quant_method", None), "quantizes_nvfp4_activations", False)
-        and (
+def has_unsupported_batch_quantization(module: torch.nn.Module) -> bool:
+    """Detect activation quantization that requires independent requests."""
+    from ..modules.linear import FP8QDQLinearMethod
+
+    for layer in module.modules():
+        method = getattr(layer, "quant_method", None)
+        if getattr(method, "quantizes_nvfp4_activations", False):
+            return True
+        quantizes_fp8 = isinstance(method, FP8QDQLinearMethod) and not getattr(
+            method, "requires_unquantized_activation", False
+        )
+        if quantizes_fp8 and (
             getattr(layer, "input_scale", None) is None
             or getattr(layer, "force_dynamic_quantization", False)
-        )
-        for layer in module.modules()
-    )
+        ):
+            return True
+    return False
 
 
 def request_sample_count(req: DiffusionRequest) -> int:

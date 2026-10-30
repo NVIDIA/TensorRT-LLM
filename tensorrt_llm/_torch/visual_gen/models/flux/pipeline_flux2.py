@@ -40,7 +40,7 @@ from transformers import (
 
 from tensorrt_llm._torch.visual_gen.batching import (
     BatchInfo,
-    has_dynamic_nvfp4,
+    has_unsupported_batch_quantization,
     randn_tensor_for_batch,
 )
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
@@ -120,7 +120,7 @@ class Flux2Pipeline(BasePipeline):
     @property
     def supports_dynamic_batching(self) -> bool:
         # Inspect loaded layers so mixed per-layer quantization is covered too.
-        return not has_dynamic_nvfp4(self.transformer)
+        return not has_unsupported_batch_quantization(self.transformer)
 
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {

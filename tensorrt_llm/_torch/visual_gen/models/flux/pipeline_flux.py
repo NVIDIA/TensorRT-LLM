@@ -13,7 +13,7 @@ from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5Tokeniz
 
 from tensorrt_llm._torch.visual_gen.batching import (
     BatchInfo,
-    has_dynamic_nvfp4,
+    has_unsupported_batch_quantization,
     randn_tensor_for_batch,
 )
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
@@ -57,8 +57,7 @@ class FluxPipeline(BasePipeline):
 
     @property
     def supports_dynamic_batching(self) -> bool:
-        # Dynamic NVFP4 scales span the input tensor, coupling requests when merged.
-        return not has_dynamic_nvfp4(self.transformer)
+        return not has_unsupported_batch_quantization(self.transformer)
 
     def __init__(self, pipeline_config):
         if (

@@ -9,6 +9,14 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.linear import (
+    FP8BlockScalesLinearMethod,
+    FP8QDQLinearMethod,
+    FP8RowwiseLinearMethod,
+    NVFP4LinearMethod,
+    W4A16NVFP4LinearMethod,
+    W8A16FP8LinearMethod,
+)
 from tensorrt_llm._torch.visual_gen.batching import BatchInfo
 from tensorrt_llm._torch.visual_gen.models.flux import Flux2Pipeline, FluxPipeline
 
@@ -17,20 +25,37 @@ pytestmark = pytest.mark.cpu_only
 
 @pytest.mark.parametrize("pipeline_cls", [FluxPipeline, Flux2Pipeline])
 @pytest.mark.parametrize(
-    "nvfp4_activations,force_dynamic,input_scale,expected",
+    "method_cls,force_dynamic,input_scale,expected",
     [
-        (True, True, torch.tensor(1.0), False),
-        (True, False, None, False),
-        (True, False, torch.tensor(1.0), True),
-        (False, True, None, True),
+        (NVFP4LinearMethod, True, torch.tensor(1.0), False),
+        (NVFP4LinearMethod, False, None, False),
+        (NVFP4LinearMethod, False, torch.tensor(1.0), False),
+        (FP8QDQLinearMethod, True, torch.tensor(1.0), False),
+        (FP8QDQLinearMethod, False, None, False),
+        (FP8QDQLinearMethod, False, torch.tensor(1.0), True),
+        (W4A16NVFP4LinearMethod, True, None, True),
+        (W8A16FP8LinearMethod, True, None, True),
+        (FP8RowwiseLinearMethod, True, None, True),
+        (FP8BlockScalesLinearMethod, True, None, True),
     ],
-    ids=["forced-dynamic", "missing-scale", "static-scale", "weight-only"],
+    ids=[
+        "nvfp4-forced-dynamic",
+        "nvfp4-missing-scale",
+        "nvfp4-static-scale",
+        "fp8-forced-dynamic",
+        "fp8-missing-scale",
+        "fp8-static-scale",
+        "nvfp4-weight-only",
+        "fp8-weight-only",
+        "fp8-rowwise",
+        "fp8-block-scales",
+    ],
 )
-def test_batching_rejects_dynamic_nvfp4_layers(
-    pipeline_cls, nvfp4_activations, force_dynamic, input_scale, expected
+def test_batching_quantization_eligibility(
+    pipeline_cls, method_cls, force_dynamic, input_scale, expected
 ):
     layer = torch.nn.Module()
-    layer.quant_method = SimpleNamespace(quantizes_nvfp4_activations=nvfp4_activations)
+    layer.quant_method = method_cls()
     layer.force_dynamic_quantization = force_dynamic
     layer.input_scale = input_scale
     pipeline = pipeline_cls.__new__(pipeline_cls)

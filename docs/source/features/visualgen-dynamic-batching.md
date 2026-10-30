@@ -59,8 +59,9 @@ prompt. A single request larger than the cap still runs independently.
 FLUX.1 and FLUX.2 text-to-image support batching. Qwen-Image supports unquantized,
 single-GPU execution with `VANILLA` attention. Unsupported configurations,
 image-edit requests and denoising-cache configurations run independently.
-FLUX requests also run independently when a transformer layer uses dynamic
-NVFP4 activation scales, which would otherwise depend on other requests in a batch.
+FLUX requests also run independently when a transformer layer uses NVFP4
+activation quantization (static or dynamic) or dynamic per-tensor FP8, to
+preserve per-request image quality.
 Each request keeps its seed and its own outputs, although batched computation
 can introduce small floating-point differences.
 
