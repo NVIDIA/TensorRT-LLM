@@ -13,6 +13,8 @@ from torch import nn
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 
+from .dsv4_triton_gate import dsv4_triton_gate
+
 # Global cache for perfect router logits shared across MoE modules
 _PERFECT_ROUTER_LOGITS_CACHE = {}
 
@@ -649,6 +651,11 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
                                   device=logits.device)
         if self.is_hashed:
             assert input_ids is not None
+            if dsv4_triton_gate(logits, None, input_ids,
+                                self.callable_tid2eid(), out_weights,
+                                out_indices, self._top_k,
+                                self.routed_scaling_factor, True):
+                return out_indices, out_weights
             # Hash mode does not consume bias (the kernel passes nullptr), but
             # the op signature requires a Tensor. Hashed gates expose a
             # None-returning bias callable, so substitute an empty tensor to
@@ -674,12 +681,18 @@ class DeepSeekV4MoeRoutingMethod(BaseMoeRoutingMethod):
                 image_mask = image_mask.contiguous()
                 vision_bias = self.callable_e_score_correction_bias_vl().to(
                     torch.float32).contiguous()
-            torch.ops.trtllm.gate_forward(
-                logits,
-                self.callable_e_score_correction_bias().to(
-                    torch.float32).contiguous(), input_ids_tensor,
-                tid2eid_tensor, out_weights, out_indices, self._top_k,
-                self.routed_scaling_factor, False, image_mask, vision_bias)
+            bias = self.callable_e_score_correction_bias().to(
+                torch.float32).contiguous()
+            if dsv4_triton_gate(logits, bias, None, None, out_weights,
+                                out_indices, self._top_k,
+                                self.routed_scaling_factor, False, image_mask,
+                                vision_bias):
+                return out_indices, out_weights
+            torch.ops.trtllm.gate_forward(logits, bias, input_ids_tensor,
+                                          tid2eid_tensor, out_weights,
+                                          out_indices, self._top_k,
+                                          self.routed_scaling_factor, False,
+                                          image_mask, vision_bias)
         return out_indices, out_weights
 
     @property

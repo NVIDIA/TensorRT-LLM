@@ -22,6 +22,8 @@ from tensorrt_llm._torch.moe.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod, SparseMixerMoeRoutingMethod,
     StaticMoeRoutingMethod, create_load_balanced_logits, create_moe)
 from tensorrt_llm._torch.moe.fused_moe import routing as moe_routing
+from tensorrt_llm._torch.moe.fused_moe.dsv4_triton_gate import \
+    TRITON_GATE_MAX_TOKENS
 from tensorrt_llm._torch.moe.fused_moe.routing import \
     get_cached_perfect_router_logits
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
@@ -443,10 +445,14 @@ def _make_v4_routing(top_k, n_group, topk_group, num_experts, is_hashed):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 @pytest.mark.parametrize("num_experts", [256, 384])
+# Up to TRITON_GATE_MAX_TOKENS tokens take the Triton gate, more take gate_forward.
+@pytest.mark.parametrize("num_tokens", [17, 300])
 def test_deepseek_v41_image_routing_native_graph(
-        num_experts: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        num_experts: int, num_tokens: int,
+        monkeypatch: pytest.MonkeyPatch) -> None:
     """Native image routing preserves FP32 weights and replay-time masks."""
-    num_tokens, top_k, route_scale = 17, 6, 2.5
+    top_k, route_scale = 6, 2.5
+    native_calls = int(num_tokens > TRITON_GATE_MAX_TOKENS)
     logits = torch.randn(num_tokens,
                          num_experts,
                          generator=torch.Generator().manual_seed(17))
@@ -499,7 +505,7 @@ def test_deepseek_v41_image_routing_native_graph(
                                    atol=1e-6)
 
     check(routing.apply_with_aux(logits, None, image_mask), image_mask)
-    native_gate.assert_called_once()
+    assert native_gate.call_count == native_calls
     check(routing.apply(logits), torch.zeros_like(image_mask))
     torch.cuda.synchronize()
 
@@ -507,12 +513,78 @@ def test_deepseek_v41_image_routing_native_graph(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         graph_outputs = routing.apply_with_aux(logits, None, image_mask)
-    native_gate.assert_called_once()
+    assert native_gate.call_count == native_calls
     for next_mask in (~image_mask, torch.zeros_like(image_mask),
                       torch.ones_like(image_mask)):
         image_mask.copy_(next_mask)
         graph.replay()
         check(graph_outputs, image_mask)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("num_experts", [256, 384])
+@pytest.mark.parametrize("mode", ["topk", "topk_image", "hash"])
+@pytest.mark.parametrize("num_tokens", [1, 6, 256, 257])
+def test_deepseek_v4_triton_gate_matches_gate_forward(
+        num_experts: int, mode: str, num_tokens: int,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """Decode-size batches use the Triton gate; it selects the same experts
+    (in the same order) as ``gate_forward``."""
+    top_k, route_scale, vocab_size = 6, 2.5, 1000
+    is_hash = mode == "hash"
+    gen = torch.Generator(device="cuda").manual_seed(num_experts + num_tokens)
+    logits = torch.randn(num_tokens, num_experts, device="cuda",
+                         generator=gen) * 3
+    logits[0, :4] = 25.0  # softplus returns its input above 20
+    bias = torch.randn(num_experts, device="cuda", generator=gen) * 0.1
+    vision_bias = torch.randn(num_experts, device="cuda", generator=gen) * 0.1
+    image_mask = (torch.rand(num_tokens, device="cuda", generator=gen) < 0.5
+                  if mode == "topk_image" else None)
+    tid2eid = torch.stack([
+        torch.randperm(num_experts, device="cuda", generator=gen)[:top_k]
+        for _ in range(vocab_size)
+    ]).to(torch.int32)
+    input_ids = torch.randint(0,
+                              vocab_size, (num_tokens, ),
+                              device="cuda",
+                              dtype=torch.int32,
+                              generator=gen)
+    empty = torch.empty(0, dtype=torch.int32, device="cuda")
+    expected_weights = torch.empty(num_tokens,
+                                   top_k,
+                                   dtype=torch.float32,
+                                   device="cuda")
+    expected_indices = torch.empty(num_tokens,
+                                   top_k,
+                                   dtype=torch.int32,
+                                   device="cuda")
+    torch.ops.trtllm.gate_forward(
+        logits,
+        torch.empty(0, device="cuda") if is_hash else bias,
+        input_ids if is_hash else empty, tid2eid if is_hash else empty,
+        expected_weights, expected_indices, top_k, route_scale, is_hash,
+        image_mask, vision_bias if image_mask is not None else None)
+
+    routing = DeepSeekV4MoeRoutingMethod(
+        top_k=top_k,
+        n_group=8,
+        topk_group=4,
+        routed_scaling_factor=route_scale,
+        callable_e_score_correction_bias=(lambda: None) if is_hash else
+        (lambda: bias),
+        callable_tid2eid=lambda: tid2eid,
+        is_hashed=is_hash,
+        callable_e_score_correction_bias_vl=lambda: vision_bias,
+    )
+    native_gate = Mock(wraps=torch.ops.trtllm.gate_forward)
+    monkeypatch.setattr(torch.ops.trtllm, "gate_forward", native_gate)
+    if image_mask is None:
+        indices, weights = routing.apply(logits, input_ids if is_hash else None)
+    else:
+        indices, weights = routing.apply_with_aux(logits, None, image_mask)
+    assert native_gate.call_count == int(num_tokens > TRITON_GATE_MAX_TOKENS)
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(weights, expected_weights, rtol=2e-6, atol=1e-6)
 
 
 # DSv4-Pro production: num_experts_per_tok=6, n_routed_experts=384, n_group=8,
