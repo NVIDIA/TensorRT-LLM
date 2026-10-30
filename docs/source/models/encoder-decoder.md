@@ -227,9 +227,6 @@ with LLM(
     backend="pytorch",
     attn_backend="TRTLLM",
     max_batch_size=4,
-    # Cross-KV pool capacity. The default (1024) is smaller than the 1500
-    # encoder positions that every Whisper request produces.
-    max_input_len=1500,
     max_num_tokens=3000,
     enable_chunked_prefill=False,
     kv_cache_config=KvCacheConfig(
@@ -247,8 +244,11 @@ with LLM(
     print(result.outputs[0].text)
 ```
 
-Set `max_input_len` to at least 1500. Every Whisper request produces 1500 encoder
-positions regardless of clip length, and the cross-KV pool is sized from `max_input_len`.
+Every Whisper request produces 1500 encoder positions (the checkpoint's
+`max_source_positions`) regardless of clip length, and the cross-KV pool is sized
+to hold them; `max_input_len` does not affect it. Leave `max_seq_len` unset, or
+set it to at least 1500, because the engine-level limit also covers the encoder
+pass.
 
 Whisper automatically disables block reuse for both the decoder self-attention
 and cross-attention KV caches, even when `KvCacheConfig.enable_block_reuse=True`.

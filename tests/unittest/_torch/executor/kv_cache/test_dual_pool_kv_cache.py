@@ -23,7 +23,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 import torch
-from transformers import PretrainedConfig
+from transformers import PretrainedConfig, WhisperConfig
 
 import tensorrt_llm
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -520,6 +520,43 @@ class TestCrossKvCacheConstruction:
         _, _, _, max_seq_len = creator._get_cross_kv_cache_layout(fallback_max_seq_len=2048)
 
         assert max_seq_len == 1536
+
+    @pytest.mark.parametrize("engine_max_seq_len", [1500, 4096])
+    @pytest.mark.parametrize("max_input_len", [512, 1024, 2048])
+    def test_cross_layout_uses_encoder_positions_for_feature_encoder(
+        self, max_input_len: int, engine_max_seq_len: int
+    ) -> None:
+        """Size a feature encoder's cross pool to its encoder output length.
+
+        Whisper's prompt is the decoder prefix, and every request emits
+        ``max_source_positions`` encoder positions, so ``max_input_len`` (1024
+        by default) must neither shrink nor grow the cross pool.
+        """
+        config = _make_kv_cache_config(
+            cross_kv_cache_fraction=0.5,
+            max_gpu_total_bytes=8 * (1 << 30),
+        )
+        # openai/whisper-large-v3 geometry; Whisper declares its encoder length
+        # only as max_source_positions.
+        model_config = ModelConfig(
+            pretrained_config=WhisperConfig(
+                architectures=["WhisperForConditionalGeneration"],
+                d_model=1280,
+                encoder_layers=32,
+                decoder_layers=32,
+                encoder_attention_heads=20,
+                decoder_attention_heads=20,
+                max_source_positions=1500,
+                max_target_positions=448,
+            )
+        )
+        creator = _make_creator(config, model_config=model_config)
+        creator._model_engine.input_processor.requires_encoder_features = True
+        creator._llm_args.max_input_len = max_input_len
+
+        layout = creator._get_cross_kv_cache_layout(fallback_max_seq_len=engine_max_seq_len)
+
+        assert layout == (32, 20, 64, 1500)
 
     def test_build_managers_cross_pool_ignores_mutated_self_max_seq_len(self):
         config = _make_kv_cache_config(
