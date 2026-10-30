@@ -679,6 +679,31 @@ def link_or_copy_file(src: Path, dst: Path, hard_link: bool = True) -> bool:
     return False
 
 
+def _install_new_file(src_file: Path, dst_file: Path, hard_link: bool,
+                      now: float) -> bool:
+    """Install ``src_file`` at ``dst_file`` in a folder `sync_tree` just made.
+
+    Gives the same result as `link_or_copy_file`, but nothing exists at
+    ``dst_file`` yet, so it skips those checks: a hard link costs one symlink
+    check and one link request to the filesystem.
+
+    Returns:
+        Whether ``dst_file`` is a hard link to ``src_file``.
+    """
+    if hard_link:
+        try:
+            # os.link does not follow a symlinked src on every platform.
+            target = (os.path.realpath(src_file)
+                      if os.path.islink(src_file) else src_file)
+            os.link(target, dst_file)
+            return True
+        except OSError:
+            pass
+    shutil.copy2(src_file, dst_file)
+    _demote_racy_mtime(dst_file, src_file.stat(), now)
+    return False
+
+
 def sync_tree(src: Path,
               dst: Path,
               exclude: Sequence[str] = (),
@@ -753,18 +778,27 @@ def sync_tree(src: Path,
         demote_racy_mtimes()
         return
 
-    # Folders the walk creates, as (source, destination) pairs in walk order.
-    new_dirs: list[tuple[Path, Path]] = []
+    # Folders the walk creates, destination to source, in walk order.
+    new_dirs: dict[Path, Path] = {}
     for root, dirs, files in os.walk(src, followlinks=True):
         rel = Path(root).relative_to(src)
         dirs[:] = [d for d in dirs if not excluded(d)]
         files = [f for f in files if not excluded(f)]
         dst_root = dst / rel
-        if dst_root.exists() and not dst_root.is_dir():
-            dst_root.unlink()
-        if not dst_root.is_dir():
+        # Inside a folder the walk just made, nothing exists yet. Skipping the
+        # checks there saves requests to the filesystem's metadata server.
+        is_new_dir = dst_root.parent in new_dirs
+        if not is_new_dir:
+            if dst_root.exists() and not dst_root.is_dir():
+                dst_root.unlink()
+            is_new_dir = not dst_root.is_dir()
+        if is_new_dir:
             dst_root.mkdir()
-            new_dirs.append((Path(root), dst_root))
+            new_dirs[dst_root] = Path(root)
+            for name in files:
+                hard_link = _install_new_file(
+                    Path(root) / name, dst_root / name, hard_link, now)
+            continue
         keep = set(dirs) | set(files)
         for stale in os.listdir(dst_root):
             if stale not in keep:
@@ -807,7 +841,7 @@ def sync_tree(src: Path,
 
     # Give each new folder its source's mode and times, as copytree does.
     # Deepest first, so a restrictive mode cannot block its own subtree.
-    for src_dir, dst_dir in reversed(new_dirs):
+    for dst_dir, src_dir in reversed(new_dirs.items()):
         shutil.copystat(src_dir, dst_dir)
 
 
