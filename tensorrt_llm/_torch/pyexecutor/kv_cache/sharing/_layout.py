@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 # A new field left out at its default keeps the version; changing the encoding or the meaning of
 # an existing field bumps it.
-LAYOUT_ID_VERSION = 4
+LAYOUT_ID_VERSION = 5
 
 
 # Enums encode as the member name, floats as "f64:" plus the 16 hex digits of their big-endian
@@ -134,9 +134,10 @@ def _buffer_document(layout: PageLayout, b: BufferDesc) -> dict:
 
 
 def layout_document(layout: PageLayout) -> dict:
-    """Hash canonical global layer groups, slot widths, kinds and each buffer's tensors, but no
-    addresses, windows, sinks, shards, topology, total head counts, dtypes or local region
-    numbering."""
+    """Hash canonical global layer groups, the model layer of each global layer where it is not
+    the global layer itself, slot widths, kinds and each buffer's tensors, but no addresses,
+    windows, sinks, shards, topology, total head counts, dtypes or local region numbering. Two
+    pipeline stages naming their layers alike but holding other model layers differ."""
     canonical = canonical_order([desc.layers for desc in layout.layer_groups])
     groups = [None] * len(layout.layer_groups)
     for local, desc in enumerate(layout.layer_groups):
@@ -146,10 +147,13 @@ def layout_document(layout: PageLayout) -> dict:
                 f"layer group {local} maps to pool group {desc.pool_group}, which is not in the "
                 "layout"
             )
+        named = sorted(zip(desc.layers, desc.model_layers or desc.layers))
         entry = {
-            "layers": sorted(int(layer) for layer in desc.layers),
+            "layers": [int(layer) for layer, _ in named],
             "slot_bytes": [int(w) for w in widths],
         }
+        if any(layer != model for layer, model in named):
+            entry["model_layers"] = [int(model) for _, model in named]
         if desc.kind != "attention":
             entry["kind"] = desc.kind
         groups[canonical[local]] = entry

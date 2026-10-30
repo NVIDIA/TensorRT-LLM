@@ -153,7 +153,9 @@ def _first_group(layout, **change):
         pytest.param(lambda: make_layout(windows=(None, 128)), id="window"),
         pytest.param(lambda: make_layout(windows=(64, 64)), id="full_to_window"),
         pytest.param(lambda: make_layout(shard=ShardDesc(2, 1)), id="shard"),
-        pytest.param(lambda: _first_group(make_layout(), model_layers=(0, 0)), id="model_layers"),
+        pytest.param(
+            lambda: _first_group(make_layout(), model_layers=(0, 2)), id="model_layers_alike"
+        ),
         pytest.param(
             lambda: dataclasses.replace(make_layout(), buffers=make_layout().buffers[::-1]),
             id="buffer_order",
@@ -163,8 +165,8 @@ def _first_group(layout, **change):
 def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
     """Local numbering and order, sinks and windows (which blocks exist, not how their bytes read),
     the shard position, which rides in the name so every rank computes the same ``layout_id``, and
-    the model layer each layer belongs to. Buffers are described by global layer, so their listing
-    order does not matter either."""
+    model layers stated equal to their global layers. Buffers are described by global layer, so
+    their listing order does not matter either."""
     assert layout_id(variant()) == layout_id(make_layout())
 
 
@@ -183,6 +185,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         lambda: _replace_buffers(make_layout(), expansion=2),
         lambda: _replace_buffers(make_layout(), role="scale2"),
         lambda: _first_group(make_layout(), kind="state"),
+        lambda: _first_group(make_layout(), model_layers=(0, 0)),
         lambda: dataclasses.replace(
             make_layout(),
             buffers=tuple(
@@ -203,6 +206,7 @@ def test_layout_id_leaves_out_what_does_not_decide_how_bytes_read(variant):
         "expansion",
         "role",
         "kind",
+        "model_layers",
         "position_in_the_transfer_bytes",
     ],
 )
@@ -221,21 +225,35 @@ def test_canonical_order_sorts_groups_by_smallest_layer():
 
 
 @pytest.mark.cpu_only
-def test_layout_id_is_the_hash_of_the_documented_version_4_encoding():
+def test_layout_id_is_the_hash_of_the_documented_version_5_encoding():
     """The canonical encoding, spelled out here byte for byte so a change to it cannot pass
     unnoticed."""
-    layout = make_layout(layers=((0,), (1,)))
+    layout = _first_group(make_layout(layers=((0,), (1,))), model_layers=(4,))
     expected = (
         '{"buffers":['
         '{"layer":0,"offset":0,"role":"key","size":50},'
         '{"layer":0,"offset":100,"role":"scale","size":20},'
         '{"layer":1,"offset":0,"role":"key","size":64}],'
-        '"groups":[{"layers":[0],"slot_bytes":[100,40]},{"layers":[1],"slot_bytes":[64]}],'
-        '"tokens_per_block":32,"v":4}'
+        '"groups":[{"layers":[0],"model_layers":[4],"slot_bytes":[100,40]},'
+        '{"layers":[1],"slot_bytes":[64]}],'
+        '"tokens_per_block":32,"v":5}'
     ).encode()
-    assert LAYOUT_ID_VERSION == 4
+    assert LAYOUT_ID_VERSION == 5
     assert canonical_bytes(layout_document(layout)) == expected
     assert layout_id(layout) == hashlib.sha256(expected).digest()
+
+
+@pytest.mark.cpu_only
+def test_stages_naming_their_layers_alike_but_holding_other_model_layers_differ_to_the_lender():
+    """Two pipeline stages of one structure whose manager names layers by local index would share
+    one lender namespace though they hold other model layers; their model layers set them apart.
+    Stages named by their model layers differ anyway."""
+    first = Manager([kv_group(lids=(0, 1))], pp_layers=[0, 1])
+    local = Manager([kv_group(lids=(0, 1))], pp_layers=[2, 3])
+    local._page_layer_ids = lambda: {0: (0, 2), 1: (1, 3)}
+    named = Manager([kv_group(lids=(0, 1))], pp_layers=[2, 3])
+    ids = [layout_id(derive_layout(m).page_layout) for m in (first, local, named)]
+    assert len(set(ids)) == 3
 
 
 @pytest.mark.cpu_only
@@ -1709,11 +1727,11 @@ def test_a_manager_whose_parts_disagree_is_refused():
                 num_kv_heads=8,
                 mappers={"index_key": "replicated"},
             ),
-            "fd26ca16e4400324b2590f51fdff89ce93369776249ffdeb08e10ecaf07c3652",
+            "7e5929bcbea6197a63fd18fcda9eb486290186a891512a591de407b62773581b",
         ),
         (
             recurrent_state,
-            "3201395d345391d3859437bfc3bf0b2a12cc2e6fe8e91638bc41607abc920d44",
+            "0090a74d69a6259baf508d5bfee005ce1fb62f9eb902590bf0e089f3ab7262d7",
         ),
     ],
     ids=["head_sharded_with_expanded_replicated_role", "recurrent_state"],
