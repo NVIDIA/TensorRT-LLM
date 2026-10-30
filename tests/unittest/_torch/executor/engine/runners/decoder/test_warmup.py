@@ -32,6 +32,7 @@ from _torch.executor.engine_test_utils import (
 
 import tensorrt_llm._torch.pyexecutor.engine.model_call as model_call_module
 import tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup as decoder_warmup_module
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8GemmRunner
 from tensorrt_llm._torch.models.modeling_utils import remove_weights
@@ -39,14 +40,20 @@ from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import warmup as warmup_module
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import DecoderMetadata
-from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
+from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import (
+    DecoderWarmup,
+    WarmupAgreement,
+)
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import ScheduledInputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import DraftTargetDecodingConfig, PrefillCudaGraphBackend
+from tensorrt_llm.mapping import Mapping
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -551,6 +558,121 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
     # Buffers cached by earlier warmup phases are released on both paths.
     clear_buffers.assert_called_once_with()
     assert engine._completed_autotuner_warmup_num_tokens == 16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("draft_tokens", [0, 3], ids=["decode", "speculative"])
+@pytest.mark.parametrize(
+    "guided,general_warmup,trtllm_backend,expected_phases",
+    [
+        (False, True, True, ("generation", "context", "mixed")),
+        (True, True, True, ("context",)),
+        (False, False, True, ("generation",)),
+        (True, False, True, ()),
+        (False, True, False, ()),
+    ],
+    ids=["all-phases", "guided", "generation-only", "no-enabled-phase", "other-backend"],
+)
+def test_attention_warmup_covers_enabled_request_phases(
+    monkeypatch: pytest.MonkeyPatch,
+    draft_tokens: int,
+    guided: bool,
+    general_warmup: bool,
+    trtllm_backend: bool,
+    expected_phases: tuple[str, ...],
+) -> None:
+    """Every enabled route must execute its JIT warmup before graph capture."""
+    resources = ResourceManager({})
+    mapping = Mapping()
+    requested: list[tuple[int, int]] = []
+    forwarded: list[tuple[int, int]] = []
+    released: list[tuple[int, int]] = []
+    batch_shapes: dict[int, tuple[int, int]] = {}
+
+    def create_request(
+        resource_manager: ResourceManager, *, num_tokens: int, num_gen_requests: int
+    ) -> ScheduledRequests:
+        assert resource_manager is resources
+        shape = (num_tokens, num_gen_requests)
+        requested.append(shape)
+        batch = ScheduledRequests()
+        batch_shapes[id(batch)] = shape
+        return batch
+
+    @contextlib.contextmanager
+    def release_batch(
+        batch: ScheduledRequests, resource_manager: ResourceManager
+    ) -> Iterator[ScheduledRequests]:
+        assert resource_manager is resources
+        try:
+            yield batch
+        finally:
+            released.append(batch_shapes[id(batch)])
+
+    # Keep the production graph and JIT-flag scopes; only allocation and the
+    # model forward are external boundaries of this host orchestration test.
+    graphs = object.__new__(DecoderCudaGraphs)
+    graphs.cuda_graph_runner = SimpleNamespace(enabled=True)
+    runner = object.__new__(DecoderRunner)
+    runner._trtllm_gen_jit_warmup = False
+
+    def forward(
+        inputs: ScheduledInputs, *, resource_manager: ResourceManager, is_dummy: bool
+    ) -> None:
+        assert resource_manager is resources
+        assert is_dummy
+        assert not graphs.cuda_graph_runner.enabled, "JIT warmup must run outside graph capture"
+        assert runner._trtllm_gen_jit_warmup, "Every attention warmup phase must request JIT"
+        assert inputs.enable_spec_decode is (draft_tokens > 0)
+        assert inputs.runtime_draft_len == draft_tokens
+        forwarded.append(batch_shapes[id(inputs.batch)])
+
+    monkeypatch.setattr(runner, "forward", forward)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    config = SimpleNamespace(
+        attention_backend=SimpleNamespace(
+            Metadata=TrtllmAttentionMetadata if trtllm_backend else AttentionMetadata
+        ),
+        max_total_draft_tokens=draft_tokens,
+        is_spec_decode=draft_tokens > 0,
+        spec_config=DraftTargetDecodingConfig(max_draft_len=draft_tokens, speculative_model="dummy")
+        if draft_tokens
+        else None,
+    )
+    warmup = DecoderWarmup(
+        config=config,
+        mapping=mapping,
+        dist=None,
+        model=torch.nn.Identity(),
+        sparse_attention_config=None,
+        warmup_timer=_WarmupTimer(rank=0),
+        metrics={},
+        agreement=WarmupAgreement(None, mapping),
+        metadata=None,
+        dummy_requests=SimpleNamespace(
+            create_warmup_request=create_request, release_batch_context=release_batch
+        ),
+        graphs=graphs,
+        inputs=SimpleNamespace(guided_decoder=object() if guided else None),
+        forward_warmup=runner._forward_warmup,
+        torch_compile_bypass=contextlib.nullcontext,
+        context_warmups_supported=general_warmup,
+        eager_workspace_reclaimable=False,
+    )
+
+    warmup._run_attention_warmup(resources, can_run_general_warmup=general_warmup)
+
+    phase_shapes = {
+        "generation": (draft_tokens + 1, 1),
+        "context": (1, 0),
+        "mixed": (draft_tokens + 2, 1),
+    }
+    expected_shapes = sorted(phase_shapes[phase] for phase in expected_phases)
+    assert sorted(requested) == expected_shapes, "Warmup must cover every enabled request phase"
+    assert sorted(forwarded) == expected_shapes, "Every warmup shape must reach execution"
+    assert sorted(released) == expected_shapes
+    assert graphs.cuda_graph_runner.enabled
+    assert not runner._trtllm_gen_jit_warmup
 
 
 @pytest.mark.parametrize("phase", ["general", "attention", "mamba", "prefill"])

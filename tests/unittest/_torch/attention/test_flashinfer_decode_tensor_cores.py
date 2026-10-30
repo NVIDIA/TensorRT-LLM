@@ -33,6 +33,8 @@ from tensorrt_llm._torch.attention.backends.flashinfer import (
 )
 from tensorrt_llm.functional import AttentionMaskType
 
+pytestmark = pytest.mark.cpu_only
+
 
 def plan(
     num_heads: int,
