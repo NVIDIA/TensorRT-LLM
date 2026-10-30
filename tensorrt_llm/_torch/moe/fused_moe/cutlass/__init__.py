@@ -33,6 +33,7 @@ from .unquantized import TrtllmCutlassUnquantizedImpl
 from .w4a8_awq import TrtllmCutlassW4a8AwqImpl
 from .w4a8_mxfp4_fp8 import TrtllmCutlassW4a8Mxfp4Fp8Impl
 from .w4a8_mxfp4_mxfp8 import TrtllmCutlassW4a8Mxfp4Mxfp8Impl
+from .w4a16 import TrtllmCutlassW4a16Impl
 from .w4a16_mxfp4 import TrtllmCutlassW4a16Mxfp4Impl
 from .w4a16_nvfp4 import TrtllmCutlassW4a16Nvfp4Impl
 from .w8a16 import TrtllmCutlassW8a16Impl
@@ -51,6 +52,7 @@ CUTLASS_LEAVES: tuple[type[CutlassFusedMoEBase], ...] = (
     TrtllmCutlassW4a8Mxfp4Mxfp8Impl,
     TrtllmCutlassW4a16Mxfp4Impl,
     TrtllmCutlassW4a8AwqImpl,
+    TrtllmCutlassW4a16Impl,
     TrtllmCutlassW8a16Impl,
     TrtllmCutlassFp8Impl,
     TrtllmCutlassUnquantizedImpl,
@@ -125,6 +127,7 @@ __all__ = [
     "TrtllmCutlassW4a8AwqImpl",
     "TrtllmCutlassW4a8Mxfp4Fp8Impl",
     "TrtllmCutlassW4a8Mxfp4Mxfp8Impl",
+    "TrtllmCutlassW4a16Impl",
     "TrtllmCutlassW4a16Mxfp4Impl",
     "TrtllmCutlassW4a16Nvfp4Impl",
     "TrtllmCutlassW8a16Impl",

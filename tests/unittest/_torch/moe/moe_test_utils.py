@@ -707,7 +707,7 @@ def should_skip_cutlass(
             "intermediate_size)"
         )
 
-    # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
+    # TP per-shard alignment: W8A16, W4A16, NVFP4, W4A8_AWQ, and MXFP8 require
     # 128-aligned per-shard intermediate_size. W8A16 fails in
     # preprocess_weights_for_mixed_gemm (num_rows % rows_per_tile != 0). NVFP4
     # pads to 128-alignment (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but
@@ -719,9 +719,13 @@ def should_skip_cutlass(
     # int32 UE8M0 SF packing, so a non-128-aligned per-shard intermediate
     # raises AssertionError.
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
+    #
+    # W4A16 (W4A16WoqPerChannelFusedMoEMethod) needs 64-row aligned shards
+    # because, unlike W8A16, its loader does not pad the intermediate size.
     if moe_tp_size > 1 and model_config is not None:
         tp_alignment_quants = {
             QuantAlgo.W8A16,
+            QuantAlgo.W4A16,
             QuantAlgo.NVFP4,
             QuantAlgo.W4A8_AWQ,
             QuantAlgo.MXFP8,
