@@ -13,6 +13,7 @@ import tensorrt_llm._torch.attention.backends.fmha.fp4_mla as fp4_mla_fmha_backe
 import tensorrt_llm._torch.attention.backends.fp4_mla as fp4_mla_backend
 import tensorrt_llm._torch.attention.backends.fp4_mla.cache_update as fp4_mla_cache_update
 import tensorrt_llm._torch.attention.backends.fp4_mla.decode as fp4_mla_decode
+import tensorrt_llm._torch.attention.backends.fp4_mla.decode_4x as fp4_mla_decode_4x
 import tensorrt_llm._torch.attention.backends.fp4_mla.metadata as fp4_mla_metadata
 import tensorrt_llm._torch.attention.backends.fp4_mla.v_cache as fp4_mla_v_cache
 import tensorrt_llm._torch.attention.backends.trtllm as trtllm_backend
@@ -2729,9 +2730,21 @@ def _assert_fp4_mla_attention_decode_accuracy(
     enable_block_reuse: bool = False,
     packed_queries: bool = False,
     split_kv: int | None = None,
+    enable_4x: bool = False,
+    env: dict[str, str] | None = None,
 ) -> None:
     _reset_triton_allocator()
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, backend)
+    monkeypatch.setenv(fp4_mla_backend.FP4_MLA_CUTEDSL_4X_ENV, str(int(enable_4x)))
+    if enable_4x:
+        # the test caches are small batches: lift the production floor on pair tasks (dispatch is tested on CPU)
+        from tensorrt_llm._torch.attention.backends.fp4_mla import (
+            fp4_mla_cutedsl_4x_host as host_4x,
+        )
+
+        monkeypatch.setenv(host_4x.MIN_PAIRS_ENV, "0")
+    for name, value in (env or {}).items():
+        monkeypatch.setenv(name, value)
     monkeypatch.setenv(
         FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
         str(int(fused_v_transpose)),
@@ -2952,6 +2965,320 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
         packed_queries=True,
         split_kv=split_kv,
     )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "query_len_per_seq,seq_lens",
+    [
+        (2, [131, 512, 2100]),
+        (4, [131, 512]),
+        (4, [131, 9000, 131, 24000]),
+        (6, [131, 2100]),
+        (8, [131, 512]),
+    ],
+    ids=["h128-q2", "h128-q4", "h128-q4-skew", "h128-q6", "h128-q8"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_matches_reference(
+    monkeypatch,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+) -> None:
+    """4x one-wave kernel (TRTLLM_FP4_MLA_CUTEDSL_4X=1) on the shapes inside its envelope."""
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=128,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+    )
+    assert calls == ["4x"], calls
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,enable_helix,enable_4x,seq_lens",
+    [
+        (128, 1, False, True, [131, 512]),  # odd q: 4x needs token pairs
+        (128, 4, False, False, [131, 512]),  # knob off
+        (96, 8, True, True, [131, 2100]),  # Helix bounds / stats
+        (128, 4, False, True, [131] * 24),  # 48 pairs > one wave of 46 with the split mode off
+        (
+            96,
+            4,
+            False,
+            True,
+            [131, 512],
+        ),  # 96 x 4 rows is not a multiple of 256 (no rows-mode pair)
+    ],
+    ids=["q1", "knob-off", "helix", "two-waves-split-off", "h96-q4"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_falls_back_to_packed(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    enable_helix: bool,
+    enable_4x: bool,
+    seq_lens: list[int],
+) -> None:
+    """Outside the 4x envelope (or with the knob off) the packed 2x path runs, untouched."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[str] = []
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    monkeypatch.setattr(
+        fp4_mla_decode_4x, "_run_cutedsl_4x_decode", lambda *a, **k: calls.append("4x")
+    )
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=41,
+        query_len_per_seq=query_len_per_seq,
+        enable_helix=enable_helix,
+        packed_queries=True,
+        split_kv=1,
+        enable_4x=enable_4x,
+        env={host_4x.SPLIT_ENV: "0"},
+    )
+    assert calls == ["2x"], calls
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+@pytest.mark.parametrize(
+    "num_heads,query_len_per_seq,seq_lens,one_wave_min_kv",
+    [
+        (128, 4, [131] * 24, None),  # 48 pairs: 23 whole + 1 split request (two waves)
+        (128, 2, [131, 512, 2100, 77] * 13, None),  # 52 pairs, skewed: the longest requests are cut
+        (
+            96,
+            8,
+            [131, 2100, 513],
+            "0",
+        ),  # rows mode (H96 x q8 = 3 pairs per request) + one-wave split
+        (128, 8, [2100] * 11, "0"),  # 44 pairs under one wave, split forced by the one-wave knob
+    ],
+    ids=["48-pairs", "52-pairs-skew", "h96-q8-onewave-split", "q8-onewave-split"],
+)
+def test_fp4_mla_attention_decode_cutedsl_4x_split_matches_reference(
+    monkeypatch,
+    num_heads: int,
+    query_len_per_seq: int,
+    seq_lens: list[int],
+    one_wave_min_kv: str | None,
+) -> None:
+    """4x split mode (device plan + FP32 partials + packed reducer) on batches above one wave, skewed KV
+    lengths and the rows-mode head count; the multi-wave KV floor is lifted so the test caches qualify."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    calls: list[str] = []
+    run_4x = fp4_mla_decode_4x._run_cutedsl_4x_decode
+    run_2x = fp4_mla_decode._run_cutedsl_packed_decode
+    split_launches: list[int] = []
+    buffers = fp4_mla_decode_4x._fp4_mla_4x_split_buffers
+
+    def spy_4x(*args, **kwargs):
+        calls.append("4x")
+        return run_4x(*args, **kwargs)
+
+    def spy_2x(*args, **kwargs):
+        calls.append("2x")
+        return run_2x(*args, **kwargs)
+
+    def spy_buffers(*args, **kwargs):
+        split = buffers(*args, **kwargs)
+        split_launches.append(int(split["task_capacity"]))
+        return split
+
+    monkeypatch.setattr(fp4_mla_decode_4x, "_run_cutedsl_4x_decode", spy_4x)
+    monkeypatch.setattr(fp4_mla_decode, "_run_cutedsl_packed_decode", spy_2x)
+    monkeypatch.setattr(fp4_mla_decode_4x, "_fp4_mla_4x_split_buffers", spy_buffers)
+    env = {host_4x.SPLIT_MIN_KV_MULTIWAVE_ENV: "0"}
+    if one_wave_min_kv is not None:
+        env[host_4x.SPLIT_MIN_KV_ONEWAVE_ENV] = one_wave_min_kv
+    _assert_fp4_mla_attention_decode_accuracy(
+        monkeypatch,
+        backend="cutedsl",
+        fused_v_transpose=False,
+        num_heads=num_heads,
+        seq_lens=seq_lens,
+        seed=43,
+        query_len_per_seq=query_len_per_seq,
+        packed_queries=True,
+        enable_4x=True,
+        env=env,
+    )
+    assert calls == ["4x"], calls
+    assert split_launches, "the split mode was not taken"
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CTM/CuTeDSL runtime",
+)
+def test_fp4_mla_cutedsl_4x_plan_kernel_matches_host_mirror() -> None:
+    """The device plan of the 4x split mode equals its host mirror (same policy, integer arithmetic, tie rules)."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_plan as plan_4x
+
+    device = torch.device("cuda")
+    cases = [
+        ([30080] * 32, 2, 512),  # B32/Q4: 23 whole + 9 x 2-way
+        ([135168] * 32, 2, 512),  # B32/Q4 long: 23 whole + 9 x 5-way
+        ([30080] * 52, 1, 256),  # B52/Q2: 46 whole + 6 x 6-way
+        ([30080] * 23, 2, 512),  # exactly one wave: nothing split
+        ([135168] * 11, 3, 768),  # H96 x q8, under-filled wave at long KV: uniform 4-way
+        ([131, 2100, 7], 3, 768),
+        ([1, 127, 128, 129, 255, 256, 257, 30079, 30080], 2, 512),
+        ([256 * (i + 1) for i in range(46)], 1, 256),
+        ([30080] * 128, 2, 512),  # B128/Q4: 115 whole + 13 x 3-way
+    ]
+    for kv_lens, pairs_per_request, rows in cases:
+        num_requests = len(kv_lens)
+        capacity = plan_4x.plan_4x_task_capacity(num_requests, pairs_per_request)
+        plan = torch.full(
+            (plan_4x.plan_4x_length(num_requests, capacity),), -1, dtype=torch.int32, device=device
+        )
+        plan_4x.launch_4x_plan(
+            torch.tensor(kv_lens, dtype=torch.int32, device=device),
+            plan,
+            num_requests=num_requests,
+            task_capacity=capacity,
+            pairs_per_request=pairs_per_request,
+            rows_per_request=rows,
+        )
+        torch.cuda.synchronize()
+        expected = plan_4x.plan_4x_tasks(
+            kv_lens,
+            task_capacity=capacity,
+            pairs_per_request=pairs_per_request,
+            rows_per_request=rows,
+        )
+        assert plan.tolist() == expected, (kv_lens[:4], pairs_per_request)
+        used = expected[1]
+        assert num_requests <= used <= capacity
+        # every request's tasks tile its KV exactly once
+        tables = 3 + num_requests
+        for request in range(num_requests):
+            tiles = max((kv_lens[request] + 255) // 256, 1)
+            chunks = sorted(
+                (expected[tables + 3 * capacity + i], expected[tables + 4 * capacity + i])
+                for i in range(used)
+                if expected[tables + i] == request
+            )
+            position = 0
+            for begin, count in chunks:
+                assert begin == position and count >= 1
+                position += count
+            assert position == tiles
+
+
+def test_fp4_mla_cutedsl_4x_envelope_reason_static() -> None:
+    """CPU-only: the static dispatch predicate behind TRTLLM_FP4_MLA_CUTEDSL_4X."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_host as host_4x
+
+    ok = dict(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080, sm_count=212)
+    assert host_4x.envelope_reason_static(**ok) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 14}) is None
+    )  # 2 x 14 x 4 m-tiles > 106 clusters: the 2x plan keeps requests whole (4x -4 %)
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 13}) is not None
+    )  # the 2x two-piece plan fits one wave (4x +29 %)
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 7, "query_len": 8}) is None
+    )  # 2 x 7 x 8 = 112 > 106
+    assert host_4x.envelope_reason_static(**{**ok, "query_len": 1}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "query_len": 3}) is not None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_heads": 96}) is not None
+    )  # 96 x 4 % 256 != 0
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_heads": 96, "query_len": 8}) is None
+    )  # rows mode
+    # one pair = 256 packed rows of one request: q2 -> 46 requests, q8 -> 11 requests fill the wave; above
+    # that the split mode takes over (plan-driven multi-wave), down to its KV floor
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 46, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 47, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 24}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 128}) is None  # 256 pairs
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 257}) is not None
+    )  # > SPLIT_MAX_PAIRS
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 24, "max_kv_len": 4096}) is not None
+    )
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "max_kv_len": 4096}) is None
+    )  # one wave: no floor
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 11, "query_len": 8}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 12, "query_len": 8}) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 6, "query_len": 8}) is not None
+    )  # 2 x 6 x 8 = 96 <= 106
+    # q2: the 2x path is latency-bound and its two-piece plan gains little -> 4x from 20 pairs on
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 20, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 26, "query_len": 2}) is None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 19, "query_len": 2}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "num_requests": 9, "query_len": 6}) is None
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 8, "query_len": 6}) is not None
+    )  # 2 x 8 x 6 = 96 <= 106
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 9, "num_heads": 96, "query_len": 8})
+        is None
+    )  # rows mode: 2 x 9 x 6 m-tiles > 106
+    assert (
+        host_4x.envelope_reason_static(**{**ok, "num_requests": 8, "num_heads": 96, "query_len": 8})
+        is not None
+    )
+    assert host_4x.envelope_reason_static(**{**ok, "max_kv_len": 163841}) is not None
+    # the static FULL-only / split-mode choice
+    assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=23, max_kv_len=30080)
+    assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=24, max_kv_len=30080)
+    assert not host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=15, max_kv_len=30080)
+    assert host_4x.use_split_mode(num_heads=128, query_len=4, num_requests=15, max_kv_len=135168)
+    assert not host_4x.use_split_mode(
+        num_heads=128, query_len=4, num_requests=23, max_kv_len=135168
+    )
+    assert host_4x.envelope_reason_static(**{**ok, "sm_count": 148}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "helix": True}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "softmax_stats": True}) is not None
+    assert host_4x.envelope_reason_static(**{**ok, "v_packed": False}) is not None
 
 
 @pytest.mark.skipif(
