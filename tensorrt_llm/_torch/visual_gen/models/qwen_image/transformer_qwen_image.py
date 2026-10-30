@@ -42,6 +42,8 @@ from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeig
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from .request_batch import QwenImageBatchLayout
+
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
     (".net.2.", ".down_proj."),
@@ -688,6 +690,7 @@ class QwenJointAttention(Attention):
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        request_batch: QwenImageBatchLayout | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         seq_txt = encoder_hidden_states.shape[1]
 
@@ -698,7 +701,16 @@ class QwenJointAttention(Attention):
             fused_rotary_emb,
         )
 
-        if attention_mask is None or self._supports_key_padding_mask:
+        if request_batch is not None:
+            out = request_batch.attention(
+                self._attn_impl,
+                joint_q,
+                joint_k,
+                joint_v,
+                attention_mask=attention_mask,
+                timestep=timestep,
+            )
+        elif attention_mask is None or self._supports_key_padding_mask:
             attn_kwargs = {}
             if attention_mask is not None:
                 attn_kwargs["key_padding_mask"] = attention_mask
@@ -836,6 +848,7 @@ class QwenImageTransformerBlock(nn.Module):
         fused_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        request_batch: QwenImageBatchLayout | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         img_mod_params = self.img_mod(temb)
         txt_mod_params = self.txt_mod(temb)
@@ -855,6 +868,7 @@ class QwenImageTransformerBlock(nn.Module):
             fused_rotary_emb=fused_rotary_emb,
             attention_mask=attention_mask,
             timestep=timestep,
+            request_batch=request_batch,
         )
 
         # Residual.
@@ -870,8 +884,13 @@ class QwenImageTransformerBlock(nn.Module):
         )
 
         txt_modulated2, txt_gate2 = self._modulate(self.txt_norm2(encoder_hidden_states), txt_mod2)
+        txt_mlp_output = (
+            self.txt_mlp(txt_modulated2)
+            if request_batch is None
+            else request_batch.apply_to_text(self.txt_mlp, txt_modulated2)
+        )
         encoder_hidden_states = self._apply_gate_residual(
-            encoder_hidden_states, txt_gate2, self.txt_mlp(txt_modulated2)
+            encoder_hidden_states, txt_gate2, txt_mlp_output
         )
 
         if encoder_hidden_states.dtype == torch.float16:
@@ -1264,6 +1283,13 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         runner.register_extra_key_fn("img_shapes", img_shapes_key)
 
+        def request_batch_key(*args: Any, **kwargs: Any) -> QwenImageBatchLayout | None:
+            return kwargs.get("request_batch")
+
+        # Prompt lengths and request boundaries can create many distinct layouts.
+        # Bound their retained graphs without evicting live CFG output tensors.
+        runner.register_extra_key_fn("request_batch", request_batch_key, max_graphs=16)
+
     def post_load_weights(self) -> None:
         for name, module in self.named_modules():
             if isinstance(module, Linear):
@@ -1294,6 +1320,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         img_shapes: Optional[list] = None,
         txt_seq_lens: Optional[list] = None,
         return_dict: bool = False,
+        request_batch: QwenImageBatchLayout | None = None,
         **kwargs,
     ):
         """Forward pass.
@@ -1354,11 +1381,16 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 fused_rotary_emb=fused_rotary_emb,
                 attention_mask=block_attention_mask,
                 timestep=timestep,
+                request_batch=request_batch,
             )
 
         hidden_states = self.sharder.gather(hidden_states, dim=1, unpad_to=image_seq_len)
         hidden_states = self.norm_out(hidden_states, temb)
-        output = self.proj_out(hidden_states)
+        output = (
+            self.proj_out(hidden_states)
+            if request_batch is None
+            else request_batch.apply_to_images(self.proj_out, hidden_states)
+        )
 
         if return_dict:
             from diffusers.models.modeling_outputs import Transformer2DModelOutput

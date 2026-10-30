@@ -31,7 +31,6 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.models.autoencoders.autoencoder_kl_flux2 import AutoencoderKLFlux2
 from diffusers.pipelines.flux2.image_processor import Flux2ImageProcessor
-from diffusers.utils.torch_utils import randn_tensor
 from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
@@ -39,6 +38,11 @@ from transformers import (
     Mistral3ForConditionalGeneration,
 )
 
+from tensorrt_llm._torch.visual_gen.batching import (
+    BatchInfo,
+    has_unsupported_batch_quantization,
+    randn_tensor_for_batch,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -112,6 +116,11 @@ class Flux2Pipeline(BasePipeline):
 
     supports_image_edit = True
     derive_output_size_from_reference = True
+
+    @property
+    def supports_dynamic_batching(self) -> bool:
+        # Inspect loaded layers so mixed per-layer quantization is covered too.
+        return not has_unsupported_batch_quantization(self.transformer)
 
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {
@@ -411,6 +420,7 @@ class Flux2Pipeline(BasePipeline):
             num_images_per_prompt=req.params.num_images_per_prompt,
             image=[r.content for r in refs] if refs else None,
             _condition_images=req.prepared_inputs.get("condition_images"),
+            _batch_info=getattr(req, "batch_info", None),
         )
 
     @torch.inference_mode()
@@ -432,6 +442,7 @@ class Flux2Pipeline(BasePipeline):
             ]
         ] = None,
         _condition_images: Optional[List[torch.Tensor]] = None,
+        _batch_info: Optional[BatchInfo] = None,
     ):
         """Generate image(s) from text and optional reference images.
 
@@ -488,7 +499,9 @@ class Flux2Pipeline(BasePipeline):
             condition_images = self._preprocess_reference_images(reference_images)
 
         height, width = self._resolve_target_dimensions(height, width, condition_images)
-        latents, latent_ids = self._prepare_latents(batch_size, height, width, generator)
+        latents, latent_ids = self._prepare_latents(
+            batch_size, height, width, generator, batch_info=_batch_info
+        )
         logger.info(f"Latents shape: {latents.shape}")
 
         image_latents = None
@@ -897,6 +910,7 @@ class Flux2Pipeline(BasePipeline):
         height: int,
         width: int,
         generator: torch.Generator,
+        batch_info: Optional[BatchInfo] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Prepare random latents in FLUX.2 packed format and position IDs.
 
@@ -916,8 +930,12 @@ class Flux2Pipeline(BasePipeline):
         in_channels = self.transformer.config.in_channels  # 128
         latent_shape = (batch_size, in_channels, latent_height // 2, latent_width // 2)
 
-        latents_4d = randn_tensor(
-            latent_shape, generator=generator, device=self.device, dtype=self.dtype
+        latents_4d = randn_tensor_for_batch(
+            latent_shape,
+            generator=generator,
+            device=self.device,
+            dtype=self.dtype,
+            batch_info=batch_info,
         )
 
         # Pack latents: [B, C, H, W] -> [B, H*W, C]

@@ -156,7 +156,7 @@ def test_reference_images_run_with_cache_acceleration(
     pipeline._preprocess_reference_images = lambda images: [
         torch.zeros(1, 3, 16, 16) for _ in images
     ]
-    pipeline._prepare_latents = lambda _batch_size, _height, _width, _generator: (
+    pipeline._prepare_latents = lambda _batch_size, _height, _width, _generator, batch_info=None: (
         torch.zeros(1, 4, 8),
         torch.zeros(4, 4),
     )
