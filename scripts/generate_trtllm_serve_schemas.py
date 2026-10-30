@@ -350,6 +350,14 @@ def generate_serve_schema() -> dict:
             mirror_moe_tactic_validators(
                 definition, "moe_backend", "moe_tactic", {"enum": ["AUTO", None]}
             )
+    # MultimodalConfig normalizes encoder backend names before Literal validation.
+    encoder_backend = schema["$defs"]["MultimodalConfig"]["properties"][
+        "encoder_attention_backend"
+    ]["anyOf"][0]["additionalProperties"]
+    alternatives = [
+        "".join(f"[{char}{char.lower()}]" for char in name) for name in encoder_backend.pop("enum")
+    ]
+    encoder_backend["pattern"] = "^(?:" + "|".join(alternatives) + r")$(?![\s\S])"
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.
     # Update these restrictions when hooks are added or gain YAML construction support.
     for name in ("batched_logits_processor", "checkpoint_loader", "_mpi_session"):

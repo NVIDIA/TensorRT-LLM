@@ -667,6 +667,7 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         self.vision_model = RADIOVisionModel(
             vision_model_config,
             disable_quantization=True,
+            vision_attn_backend=model_config.get_encoder_attention_backend("vision", "FLASHINFER"),
             encoder_cuda_graph_config=encoder_cuda_graph_config,
         )
 
@@ -2902,6 +2903,11 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     placeholder_metadata=_NEMOTRON_H_MM_PLACEHOLDER_METADATA,
 )
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
+    supported_encoder_attention_backends = {
+        "vision": frozenset({"VANILLA", "TRTLLM", "FLASHINFER"}),
+        "audio": frozenset(),
+    }
+
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
 
