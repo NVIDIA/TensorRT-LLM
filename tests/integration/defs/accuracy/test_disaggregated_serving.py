@@ -37,6 +37,7 @@ import yaml
 from datasets import load_dataset
 from defs.common import wait_for_reported_addr
 
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import (DSparkDecodingConfig,
@@ -2195,6 +2196,113 @@ class TestQwen3_8_Flash_Next(LlmapiAccuracyTestHarness):
                 llm,
                 self.MODEL_NAME, ["GSM8K"],
                 extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS})
+
+
+@pytest.mark.timeout(5400)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(145000)
+@pytest.mark.skip_less_host_memory(204800)
+class TestQwen38FlashNextNvfp4ModelingV2(LlmapiAccuracyTestHarness):
+    """Qwen3.8-Flash-Next-NVFP4 served by its modeling_v2 target on both sides of the hop.
+
+    The target is `qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified`
+    (`tensorrt_llm/_torch/_experimental/modeling_v2`), certified on sm_103 only. Both
+    engines run it at dep2 -- attention DP over two ranks, the routed experts in two
+    256-expert windows -- so each rank's K/V, QSA index, Gated-DeltaNet and PLE pools have
+    the same layout on both sides and the Python NIXL transceiver moves them between
+    identical layouts.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.8-Flash-Next-NVFP4"
+
+    # The gsm8k anchor's protocol (references/gsm8k.yaml, MIXED_PRECISION): the chat
+    # template without a reasoning block, few-shot as multi-turn, 512 output tokens.
+    GSM8K_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    # What every rank of both engines prints once it has bound the cache manager's pools.
+    TARGET_BIND_LINE = "modeling_v2 unified qwen4_exp: rank"
+
+    @pytest.mark.skipif(
+        get_sm_version() != 103,
+        reason="the modeling_v2 target is certified on sm_103 only")
+    def test_auto_dtype(self, mocker):
+        # The core configuration on both engines: the checkpoint's bf16 K/V, a bf16
+        # recurrent state, no block reuse, no chunked prefill, the trtllm-gen experts.
+        common_config = {
+            "modeling_v2": "require",
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "max_seq_len": 9216,
+            "max_batch_size": 128,
+            "max_num_tokens": 8192,
+            "enable_chunked_prefill": False,
+            "moe_config": {
+                "backend": "TRTLLM"
+            },
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "mamba_ssm_cache_dtype": "bfloat16",
+                "free_gpu_memory_fraction": 0.6,
+            },
+            # The V2 hybrid manager's pools travel over the Python transceiver.
+            "cache_transceiver_config": {
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
+            },
+        }
+        ctx_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": True,
+            "cuda_graph_config": None,
+        }
+        gen_server_config = {
+            **common_config,
+            "disable_overlap_scheduler": False,
+            "cuda_graph_config": {
+                "enable_padding": True,
+                "max_batch_size": 128,
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            },
+        }
+
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", self.GSM8K_MAX_OUTPUT_LEN)
+        with launch_disaggregated_llm(
+                disaggregated_server_config,
+                ctx_server_config,
+                gen_server_config,
+                self.MODEL_PATH,
+                max_workers=128,
+                # The target checks its step contract on its first forward.
+                extra_env={"TRTLLM_MODELING_V2_VALIDATE": "1"},
+                assert_worker_log_contains=self.TARGET_BIND_LINE,
+        ) as llm:
+            # The served quantization the reference is keyed by; the launcher reads
+            # NVFP4 off the checkpoint's name.
+            llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
+            run_accuracy_test(
+                llm,
+                self.MODEL_NAME, ["GSM8K"],
+                extra_evaluator_kwargs={GSM8K: self.GSM8K_EVALUATOR_KWARGS},
+                timeout=3000)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
