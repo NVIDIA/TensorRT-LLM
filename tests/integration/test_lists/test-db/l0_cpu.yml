@@ -209,11 +209,13 @@ l0_cpu:
   - unittest/executor/test_rpc_worker_mixin.py
   - unittest/executor/test_sleep_collective_rpc_guards.py
   - unittest/executor/test_shutdown_retry_contracts.py
+  - unittest/executor/test_rpc_proxy_submit_order.py
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
+  - unittest/executor/test_llm_result_unpickle.py
   - unittest/grpc/openengine/test_coordinator.py
   - unittest/_torch/test_shared_tensor_cpu.py
   - unittest/grpc/openengine/test_frontend_lifecycle.py

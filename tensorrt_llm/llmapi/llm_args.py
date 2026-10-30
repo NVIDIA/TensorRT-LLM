@@ -2110,6 +2110,15 @@ class AttentionDpConfig(StrictBaseModel):
     """Configuration for attention DP."""
     enable_balance: bool = Field(default=False,
                                  description="Whether to enable balance.")
+    enable_packed_sync: bool = Field(
+        default=False,
+        description="Pack the per-iteration attention-DP host collectives of "
+        "the disaggregated executor loops (error and KV-timeout votes, rank "
+        "state, can-queue and the CUDA-graph padding vector) into two "
+        "fixed-width all-gathers. Inactive, with an info log naming the "
+        "reason, in modes the packing does not cover (for example PP or CP, "
+        "speculative decoding, KV connectors, an aggregated executor). Every "
+        "rank must see the same value.")
     timeout_iters: int = Field(
         default=50, description="The number of iterations to timeout.")
     batching_wait_iters: int = Field(

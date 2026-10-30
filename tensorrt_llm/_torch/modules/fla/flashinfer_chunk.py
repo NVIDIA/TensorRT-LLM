@@ -11,13 +11,23 @@ Differences vs the Triton path are absorbed inside this wrapper:
     ``g`` in **log space** (``fla/chunk.py`` doc: "(forget) gating tensor (in
     log space!)"); FlashInfer's ``chunk_gated_delta_rule`` consumes the same
     quantity in **linear space** (default 1.0 = no decay; alpha = exp(log_g)).
-    The wrapper converts ``g_linear = exp(g_log)`` before calling FlashInfer.
+    The wrapper converts ``g_linear = exp(g_log)`` before calling FlashInfer,
+    unless the caller passes ``g_is_linear=True`` (``fused_gdn_post_conv``
+    emits alpha directly for this path, saving the torch.exp launch).
   * Pre-L2-normalize Q/K when ``use_qk_l2norm_in_kernel=True``
     (the FlashInfer prefill kernel does NOT apply L2 norm internally; the
     ``use_qk_l2norm_in_kernel`` parameter on ``flashinfer.chunk_gated_delta_rule``
     is currently a dead arg, see ``flashinfer/gdn_prefill.py:317-356``).
-  * Pre-gather and post-scatter of indexed SSM state into FlashInfer's packed
-    ``[num_seqs, H, V, K]`` layout. TRT-LLM's GDN state pool uses the same
+  * SSM-state I/O. With ``inplace_indexed_state_update``, the caller pinning
+    ``use_cp=False`` on SM100/SM103 and at most a handful of sequences, the
+    pool and the slot indices go straight to FlashInfer's plain chunked
+    kernel, which reads and writes the indexed rows itself (``state_indices``):
+    no gather, no scatter, no packed scratch. Everything else (scans with many
+    sequences -- the indexed variant costs ~1 us per sequence and a mixed
+    iteration carries every decode request as a one-token sequence -- the
+    chunk-parallel kernel, the target-verify call site with a packed state) uses a
+    pre-gather and post-scatter of the indexed SSM state into FlashInfer's
+    packed ``[num_seqs, H, V, K]`` layout. TRT-LLM's GDN state pool uses the same
     ``[N, H, V, K]`` logical layout, so the adapter gathers/scatters without
     transposing the last two dims. The SM100/SM103 kernel carries the recurrent
     state in fp32 in TMEM regardless of the initial/output-state I/O dtype, so
@@ -28,7 +38,9 @@ This module is only imported when ``TLLM_USE_FLASHINFER_GDN_PREFILL=1`` is set
 at process start; do not import it lazily inside hot paths.
 """
 
-from typing import Optional, Tuple
+import functools
+import os
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 
@@ -38,6 +50,121 @@ from tensorrt_llm._torch.modules.fla.fused_state_io import (
 )
 from tensorrt_llm._torch.modules.fla.l2norm import l2norm_fwd
 from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm.logger import logger
+
+# Indexed pool I/O on the plain SM100/SM103 kernel (see the module docstring).
+# Escape hatch for A/B runs.
+_INDEXED_STATE_IO = os.environ.get("TLLM_GDN_PREFILL_INDEXED_STATE_IO", "1") == "1"
+# The kernel's indexed state loads/stores cost ~1 us per sequence on top of the
+# scan, so the indexed launch is only used up to this many context segments;
+# beyond it gather + scan + scatter is cheaper. Decode rows take the recurrent
+# kernel, so the main scan carries only the context segments.
+_INDEXED_STATE_IO_MAX_SEQS = 32
+
+
+# The indexed single-launch path calls FlashInfer's Blackwell launcher directly
+# instead of the public ``flashinfer.chunk_gated_delta_rule``: the public wrapper
+# re-validates every argument on every call (~3 us) on top of the launcher (~8 us
+# of host time), and this adapter had already checked what the kernel needs.
+# Measured on the dev node: adapter 26 us -> ~12 us per scan. The
+# launcher is an internal FlashInfer symbol; when it is missing (other FlashInfer
+# versions) the public wrapper is used.
+
+# FlashInfer's SM100 CuTe DSL kernel takes int32 cu_seqlens while the Mamba
+# metadata hands the GDN mixer int64 ("_long") views of per-iteration buffers.
+# Casting at every direct launch cost one eager copy kernel per GDN layer per
+# prefill iteration (45 launches, ~2 ms of host time on a 397B mixed iteration).
+# The metadata rewrites those buffers exactly once per iteration, in
+# Mamba2Metadata.prepare, which invalidates this cache first; within the
+# iteration a cast keyed by (storage, length, device) is therefore valid and
+# shared by every layer. (Inference-mode tensors carry no version counter, so
+# the invalidation is explicit rather than version-keyed.)
+_INT32_CU_SEQLENS_CACHE_MAX = 8
+_int32_cu_seqlens_cache: dict = {}
+
+
+def invalidate_int32_cu_seqlens_cache() -> None:
+    """Drop the per-iteration int32 casts (called when the metadata rewrites
+    its cu_seqlens buffers)."""
+    _int32_cu_seqlens_cache.clear()
+
+
+def _int32_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
+    """``cu_seqlens`` as int32, cast at most once per iteration per buffer."""
+    if cu_seqlens.dtype == torch.int32:
+        return cu_seqlens
+    key = (cu_seqlens.data_ptr(), cu_seqlens.numel(), cu_seqlens.device.index)
+    cached = _int32_cu_seqlens_cache.get(key)
+    if cached is None:
+        if len(_int32_cu_seqlens_cache) >= _INT32_CU_SEQLENS_CACHE_MAX:
+            _int32_cu_seqlens_cache.clear()
+        # The entry keeps the source tensor alive: a freed int64 buffer could
+        # otherwise be recycled by a new tensor of the same length (same
+        # data_ptr, version 0) and the key would hand out the stale cast.
+        cached = (cu_seqlens, cu_seqlens.to(torch.int32))
+        _int32_cu_seqlens_cache[key] = cached
+    return cached[1]
+
+
+@functools.lru_cache(maxsize=1)
+def _sm100_direct_launcher():
+    """``chunk_gated_delta_rule_sm100(q, k, v, gate, beta, output, cu_seqlens,
+    initial_state, output_state, scale, ..., state_indices=)`` or None."""
+    try:
+        from flashinfer.gdn_kernels.blackwell.gdn_prefill import chunk_gated_delta_rule_sm100
+    except ImportError:
+        logger.warning("FlashInfer's direct GDN launcher is unavailable; using the public wrapper")
+        return None
+    return chunk_gated_delta_rule_sm100
+
+
+def indexed_state_io_available(num_seqs: int) -> bool:
+    """Whether a scan of ``num_seqs`` sequences pinned to the plain kernel
+    (``use_cp=False``) takes the single-launch
+    indexed pool I/O path below instead of gather + kernel + scatter."""
+    return _INDEXED_STATE_IO and num_seqs <= _INDEXED_STATE_IO_MAX_SEQS and is_sm_100f()
+
+
+def chunk_gated_delta_rule_indexed_direct(
+    q3: torch.Tensor,
+    k3: torch.Tensor,
+    v3: torch.Tensor,
+    g2: torch.Tensor,
+    beta2: torch.Tensor,
+    out3: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    pool: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: Optional[float] = None,
+) -> bool:
+    """The indexed single-launch path of ``chunk_gated_delta_rule`` for callers
+    holding FlashInfer's own layouts: packed contiguous ``[T, H, D]`` q/k/v, the
+    ``[T, HV]`` fp32 linear-space gate and fp32 beta, a ``[T, HV, V]`` output view
+    and int32/int64 pool slots (read and written in place). No layout, dtype or
+    gate-space work and no re-validation, just the launch: ~12 us of host time
+    against ~23 for the generic entry on the same call. Returns False without
+    launching when the direct launcher is unavailable or the sequence count is
+    above the indexed threshold; the caller then uses the generic entry."""
+    launcher = _sm100_direct_launcher() if _INDEXED_STATE_IO else None
+    if launcher is None or cu_seqlens.shape[0] - 1 > _INDEXED_STATE_IO_MAX_SEQS or not is_sm_100f():
+        return False
+    # FlashInfer's SM100 CuTe DSL kernel takes int32 cu_seqlens; the public
+    # wrapper casts, so the direct launch has to as well (once per iteration,
+    # see _int32_cu_seqlens).
+    launcher(
+        q3,
+        k3,
+        v3,
+        g2,
+        beta2,
+        out3,
+        _int32_cu_seqlens(cu_seqlens),
+        pool,
+        pool,
+        scale if scale else q3.shape[2] ** -0.5,
+        state_indices=state_indices,
+    )
+    return True
 
 
 # Mirror the @torch.compiler.disable on the legacy Triton wrapper
@@ -61,16 +188,24 @@ def chunk_gated_delta_rule(
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
     state_workspace: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    use_cp: Union[Literal["auto"], bool] = "auto",
+    g_is_linear: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Adapter for FlashInfer's ``chunk_gated_delta_rule``.
+    """Adapter for FlashInfer's chunk_gated_delta_rule.
 
-    Gathers the indexed SSM state into FlashInfer's packed layout, runs the
-    kernel, then scatters the final state back (or returns it). ``final_state``
-    is non-``None`` only with ``output_final_state=True`` and no in-place
-    update; an in-place update reports through ``initial_state``.
+    Uses FlashInfer's indexed pool I/O for a handful of sequences on the plain
+    SM100/SM103 kernel (Step 4a below) and otherwise gathers the indexed SSM
+    state into FlashInfer's packed layout, runs the kernel, then scatters the
+    final state back (or returns it). ``final_state`` is non-``None`` only with
+    ``output_final_state=True`` and no in-place update; an in-place update
+    reports through ``initial_state``.
     ``state_workspace`` optionally supplies an (input, output) tensor pair,
     each shaped ``[capacity, H, V, K]`` in the state I/O dtype.
     Returned states never alias this scratch.
+
+    ``g_is_linear`` declares that ``g`` already holds ``alpha = exp(g_log)``
+    (fp32), as emitted by ``fused_gdn_post_conv(g_linear=True)``; the wrapper
+    then skips its own ``torch.exp``.
     """
     # FlashInfer is imported lazily so importing this module on a non-FlashInfer
     # build does not error until the function is actually called.
@@ -103,7 +238,14 @@ def chunk_gated_delta_rule(
     # SSM state by ``g`` directly each chunk; passing log-space values produces
     # NaN. ``torch.exp`` always returns a fresh contiguous tensor, so no
     # explicit .contiguous() is needed.
-    g2 = torch.exp(g.squeeze(0))
+    if g_is_linear:
+        # Already alpha in fp32 from the producer; a [1, T, H] tensor (or a
+        # token-range slice of one) squeezes to a contiguous [T, H] view.
+        g2 = g.squeeze(0)
+        if not g2.is_contiguous():
+            g2 = g2.contiguous()
+    else:
+        g2 = torch.exp(g.squeeze(0))
     # ``.to(torch.float32)`` allocates a fresh contiguous fp32 tensor when the
     # source is bf16 (the common case), or returns the (already contiguous)
     # input view when beta is already fp32 — no .contiguous() needed.
@@ -116,6 +258,71 @@ def chunk_gated_delta_rule(
     if use_qk_l2norm_in_kernel:
         q3 = l2norm_fwd(q3)
         k3 = l2norm_fwd(k3)
+
+    # --- Output buffer (shared by both state-I/O paths) ------------------
+    # FI 0.6.10 accepts `output=`; pre-allocating skips its internal
+    # `torch.empty` per call. `num_o_heads` per FI docstring is
+    # max(num_q_heads, num_v_heads) — equivalently num_v_heads for GVA.
+    total_seq_len = q3.shape[0]
+    num_o_heads = max(q3.shape[1], v3.shape[1])
+    head_size = q3.shape[2]
+    output_buf = (
+        output.squeeze(0)
+        if output is not None
+        else q3.new_empty(total_seq_len, num_o_heads, head_size)
+    )
+
+    # --- Step 4a: indexed pool I/O on the plain SM100/SM103 kernel --------
+    # One launch instead of gather + kernel + scatter; the pool rows never
+    # leave the pool. Only with the plain kernel pinned by the caller
+    # (``use_cp=False``) and a handful of sequences: the indexed variant pays
+    # ~1 us per sequence.
+    if (
+        _INDEXED_STATE_IO
+        and inplace_indexed_state_update
+        and use_cp is False
+        and cu_seqlens.shape[0] - 1 <= _INDEXED_STATE_IO_MAX_SEQS
+        and is_sm_100f()
+    ):
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"state_indices must be int32/int64, got {initial_state_indices.dtype}"
+        )
+        launcher = _sm100_direct_launcher()
+        if launcher is not None:
+            # Same call the public wrapper makes after its checks (scale
+            # defaulting included); the pool is both the initial and the output
+            # state, indexed by ``initial_state_indices``.
+            launcher(
+                q3,
+                k3,
+                v3,
+                g2,
+                beta2,
+                output_buf,
+                _int32_cu_seqlens(cu_seqlens),
+                initial_state,
+                initial_state,
+                scale if scale else head_size**-0.5,
+                state_indices=initial_state_indices,
+            )
+            return output_buf.unsqueeze(0), None
+        flashinfer.chunk_gated_delta_rule(
+            q=q3,
+            k=k3,
+            v=v3,
+            g=g2,
+            beta=beta2,
+            scale=scale,
+            initial_state=initial_state,  # the pool [N_pool, H, V, K]
+            state_indices=initial_state_indices,  # [num_seqs]: read and write these rows
+            output_final_state=True,
+            output_state=initial_state,  # in-place update of the indexed rows
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output_buf,
+            use_cp=False,
+        )
+        return output_buf.unsqueeze(0), None
 
     # --- Step 4: gather initial state (+ cast dtype only when required) ---
     # TRT-LLM's GDN kernels and FlashInfer both use [N, H, V, K] state layout.
@@ -142,21 +349,11 @@ def chunk_gated_delta_rule(
     )
 
     # --- Step 5+6: call FlashInfer with pre-allocated output/state buffers
-    # FI 0.6.10 accepts `output=` / `output_state=`; pre-allocating skips its
-    # internal `torch.empty` per call. `num_o_heads` per FI docstring is
-    # max(num_q_heads, num_v_heads) — equivalently num_v_heads for GVA.
-    # Only allocate / request final state when a caller actually consumes it
-    # (either inplace scatter back to the SSM pool, or return to the caller);
-    # otherwise FI skips the final-state aggregation entirely.
-    total_seq_len = q3.shape[0]
-    num_o_heads = max(q3.shape[1], v3.shape[1])
-    head_size = q3.shape[2]
+    # `output_state=` likewise skips FI's internal allocation. Only allocate /
+    # request final state when a caller actually consumes it (either inplace
+    # scatter back to the SSM pool, or return to the caller); otherwise FI
+    # skips the final-state aggregation entirely.
     need_state = inplace_indexed_state_update or output_final_state
-    output_buf = (
-        output.squeeze(0)
-        if output is not None
-        else q3.new_empty(total_seq_len, num_o_heads, head_size)
-    )
     if need_state:
         num_seqs = cu_seqlens.shape[0] - 1
         # Match the initial-state dtype (native bf16/fp16 on SM100/SM103, else
@@ -178,6 +375,7 @@ def chunk_gated_delta_rule(
             output_final_state=True,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=False,  # dead param in FlashInfer; we already normalized
+            use_cp=use_cp,
             output=output_buf,
             output_state=state_buf,
         )
@@ -194,6 +392,7 @@ def chunk_gated_delta_rule(
             output_final_state=False,
             cu_seqlens=cu_seqlens,
             use_qk_l2norm_in_kernel=False,
+            use_cp=use_cp,
             output=output_buf,
         )
         out_state = None

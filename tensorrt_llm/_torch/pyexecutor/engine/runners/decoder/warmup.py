@@ -19,6 +19,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.distributed.ops import warmup_named_allreduce_topologies
 from tensorrt_llm._torch.memory_buffer_utils import clear_memory_buffers
 from tensorrt_llm._torch.models.modeling_utils import timing_metric
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
@@ -1246,6 +1247,16 @@ class DecoderWarmup:
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
+        Additionally, covers the remaining Triton int-specialization families of the GDN
+        prefill elementwise kernels (``fuse_elementwise_ops.py``): Triton
+        specializes int args (packed prefill token count and the strides equal
+        to it) into ``==1`` / ``%16==0`` / other families, and
+        ``_fused_gdn_post_conv`` forks on the ``HAS_DECODE`` constexpr. The
+        two base shapes only ever compile the (``%16==0``,
+        ``HAS_DECODE=False``) family, so the first mixed ctx+gen batch or
+        non-16-aligned context length otherwise JIT-compiles mid-serving
+        (~0.2-1.5 s, lock-stepped across ranks under SPMD).
+
         Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
         the autotuner is enabled so op-level (M,N,K) caches also get primed
         for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
@@ -1307,6 +1318,67 @@ class DecoderWarmup:
             (capped_num_tokens, 0, False, False, False),
             (capped_num_tokens, 0, False, True, True),
         ]
+
+        # Extra shapes covering the remaining GDN prefill Triton
+        # specialization families (see docstring). Context-token counts assume
+        # capped_num_tokens % 16 == 0 (WARMUP_TOKEN_CAP is 16-aligned; only a
+        # near-exhausted KV pool breaks this, degrading a missed family to
+        # lazy compilation, i.e. the pre-fix behavior). The mixed ctx+gen
+        # entries derive their context token count as
+        # num_tokens - num_gen_requests * (1 + max_total_draft_tokens); with
+        # speculative decoding the "%16!=0" entry may land on an aligned
+        # count for some draft lengths -- acceptable, since the spec-dec
+        # target-verify kernel variants are not covered here anyway. None of
+        # these needs the chunk-aligned variant (the two base shapes cover
+        # both alignments).
+        # Rank-local capacity, so the gate is agreed like the phase entry above.
+        # Only models with GDN layers run those kernels; the odd token counts
+        # would otherwise add forward passes (and padding variants of the
+        # breakable prefill graph) that no other hybrid model needs.
+        has_gdn = any(isinstance(m, Qwen3NextGatedDeltaNet) for m in self.model.modules())
+        if self._agreement.agree_flag(capped_num_tokens >= 32 and has_gdn):
+            mamba_warmup_shapes += [
+                # Prefill %16!=0 family, HAS_DECODE=False.
+                (capped_num_tokens - 4, 0, False, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16==0.
+                (capped_num_tokens, 16, False, False, False),
+                # Mixed ctx+gen (HAS_DECODE=True), ctx tokens %16!=0.
+                (capped_num_tokens - 4, 2, False, False, False),
+                # ==1 specialization (1-token context chunk remainder).
+                (1, 0, False, False, False),
+            ]
+            # The two mixed entries above sample only the (%16==0, %16==0)
+            # and (other, other) diagonal of the Triton specialization key
+            # class(ctx_tokens) x class(gen_tokens), class in {==1, %16==0,
+            # other} -- the first serving batch of each remaining combination
+            # JIT-compiles mid-serving (~230 ms, in rank lockstep). Cover the
+            # cross-terms, plus the 1-token context chunk remainder alongside
+            # gens (reachable with chunked prefill). Gen token count is
+            # num_gen_requests * t; with speculative decoding some classes
+            # shift or become unreachable -- acceptable, as above.
+            t = 1 + self._config.max_total_draft_tokens
+            gen_odd = 2 if (2 * t) % 16 else 3
+            cross_term_shapes = [
+                # ctx %16==0, single gen token (==1 specialization).
+                (capped_num_tokens - 16 + t, 1, False, False, False),
+                # ctx %16!=0, single gen token.
+                (capped_num_tokens - 5 + t, 1, False, False, False),
+                # ctx %16==0, gen tokens %16!=0.
+                (capped_num_tokens - 16 + gen_odd * t, gen_odd, False, False, False),
+                # ctx %16!=0, gen tokens %16==0.
+                (capped_num_tokens - 21 + 16 * t, 16, False, False, False),
+                # ctx==1 chunk remainder x each gen-token class.
+                (1 + t, 1, False, False, False),
+                (1 + gen_odd * t, gen_odd, False, False, False),
+                (1 + 16 * t, 16, False, False, False),
+            ]
+            # With speculative decoding a cross-term can exceed the token
+            # budget; skip it on every rank or on none.
+            mamba_warmup_shapes += [
+                shape
+                for shape in cross_term_shapes
+                if self._agreement.agree_flag(shape[0] <= capped_num_tokens)
+            ]
 
         autotuner_enabled = self._config.enable_autotuner
         cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)

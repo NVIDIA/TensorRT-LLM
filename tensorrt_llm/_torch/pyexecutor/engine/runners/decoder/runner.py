@@ -34,8 +34,13 @@ from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import (
     KeyType,
 )
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     RuntimeHooks,
@@ -537,12 +542,11 @@ class DecoderRunner(ScheduledModelRunner):
         ced_enabled = uses_private_decoder_cache(
             getattr(self._model, "model", None), kv_cache_manager
         )
-        graph_requests, promoted_context_request_ids = self._graphs.promote_final_contexts(
+        graph_requests, promoted_context_request_ids = self.make_graph_batch(
             scheduled_requests,
             kv_cache_manager,
             enable_spec_decode=enable_spec_decode,
             runtime_draft_len=runtime_draft_len,
-            ced_enabled=ced_enabled,
         )
 
         with self._graphs.pad_batch(
@@ -997,6 +1001,36 @@ class DecoderRunner(ScheduledModelRunner):
         ):
             return defer()
         return contextlib.nullcontext()
+
+    def make_graph_batch(
+        self,
+        scheduled_requests: ScheduledRequests,
+        kv_cache_manager: KVCacheManager | KVCacheManagerV2 | None,
+        *,
+        enable_spec_decode: bool,
+        runtime_draft_len: int,
+    ) -> tuple[ScheduledRequests, frozenset[int]]:
+        """The batch ``forward`` hands to the CUDA-graph runner.
+
+        Final one-token context requests are promoted into a decode-shaped
+        graph candidate when the engine configuration allows it; otherwise the
+        scheduled batch is returned as is with no promoted ids. The executor
+        evaluates it right after scheduling (enable_packed_sync packs the
+        runner's attention-DP padding vector into its post-schedule exchange,
+        see ``PyTorchModelEngine.make_graph_batch``) and obtains exactly the
+        rows the runner would gather in the forward.
+        """
+        from tensorrt_llm._torch.pyexecutor.ced_replay import uses_private_decoder_cache
+
+        return self._graphs.promote_final_contexts(
+            scheduled_requests,
+            kv_cache_manager,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+            ced_enabled=uses_private_decoder_cache(
+                getattr(self._model, "model", None), kv_cache_manager
+            ),
+        )
 
     @staticmethod
     def _restore_attention_dp_semantic_outputs(

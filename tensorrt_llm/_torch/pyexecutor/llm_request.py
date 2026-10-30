@@ -657,6 +657,13 @@ class LlmResult:
         result = object.__getattribute__(self, '_result')
         return getattr(result, item)
 
+    def __setstate__(self, state):
+        # Unpickling looks __setstate__ up on every LlmResult it rebuilds (each
+        # response on the RPC / IPC path). Without this definition the lookup
+        # falls into __getattr__ above, which raises AttributeError on the
+        # half-built object after a Python frame and a failed delegation.
+        self.__dict__.update(state)
+
     def deserialize(self):
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)

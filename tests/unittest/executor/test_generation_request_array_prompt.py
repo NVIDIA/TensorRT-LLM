@@ -66,3 +66,90 @@ def test_replacing_the_prompt_drops_the_int32_buffer():
     np.testing.assert_array_equal(
         clone.__dict__["_prompt_token_ids_i32"], np.array([6, 7, 8], dtype=np.int32)
     )
+
+
+def test_num_prompt_tokens_reads_the_int32_buffer_without_a_list():
+    ids = _ids()
+    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=1))
+    assert req.num_prompt_tokens == len(ids)
+    assert req.__dict__["_prompt_token_ids"] is None
+    clone = pickle.loads(pickle.dumps(req))
+    assert clone.num_prompt_tokens == len(ids)
+    assert clone.__dict__["_prompt_token_ids"] is None
+    listed = GenerationRequest(
+        prompt_token_ids=[3, 4, 5], sampling_params=SamplingParams(max_tokens=1)
+    )
+    assert listed.num_prompt_tokens == 3
+
+
+def test_record_stats_counts_prompt_tokens_without_building_the_list():
+    from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+    from tensorrt_llm.metrics import MetricNames, RequestEventTiming
+
+    ids = _ids()
+    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(req)
+    output = CompletionOutput(index=0, token_ids=[5, 6, 7], finish_reason="stop")
+    stats = {
+        RequestEventTiming.ARRIVAL_TIME: 1.0,
+        RequestEventTiming.FIRST_TOKEN_TIME: 1.5,
+        RequestEventTiming.LAST_TOKEN_TIME: 2.0,
+    }
+    result.record_stats(output, stats)
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == len(ids)
+    # The prompt went to the engine as an int32 buffer; counting it for the
+    # metrics must not rebuild the O(ISL) list on the response path.
+    assert req.__dict__["_prompt_token_ids"] is None
+
+
+def test_record_stats_still_reads_the_ids_for_prompt_logprobs():
+    from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+    from tensorrt_llm.metrics import MetricNames, RequestEventTiming
+
+    ids = _ids()
+    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(req)
+    output = CompletionOutput(
+        index=0, token_ids=[5, 6, 7], finish_reason="stop", prompt_logprobs=[-1.0, -2.0]
+    )
+    stats = {RequestEventTiming.ARRIVAL_TIME: 1.0, RequestEventTiming.LAST_TOKEN_TIME: 2.0}
+    result.record_stats(output, stats)
+    assert result.metrics_dict[MetricNames.PROMPT_TOKENS] == len(ids)
+    assert MetricNames.PREFILL_PERPLEXITY in result.metrics_dict
+    # Prompt logprobs need the ids themselves, so here the list is built.
+    assert req.__dict__["_prompt_token_ids"] is not None
+
+
+def test_do_tracing_reports_prompt_tokens_without_building_the_list(monkeypatch):
+    import contextlib
+
+    from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
+    from tensorrt_llm.llmapi import tracing
+    from tensorrt_llm.metrics import RequestEventTiming
+
+    class _Span:
+        def __init__(self):
+            self.attributes = {}
+
+        def set_attribute(self, key, value):
+            self.attributes[key] = value
+
+    class _Tracer:
+        def __init__(self):
+            self.span = _Span()
+
+        @contextlib.contextmanager
+        def start_as_current_span(self, *args, **kwargs):
+            yield self.span
+
+    tracer = _Tracer()
+    monkeypatch.setattr(tracing, "global_otlp_tracer", lambda: tracer)
+    ids = _ids()
+    req = GenerationRequest(prompt_token_ids=ids, sampling_params=SamplingParams(max_tokens=4))
+    result = GenerationResult(req)
+    output = CompletionOutput(index=0, token_ids=[5, 6, 7], finish_reason="stop")
+    stats = {RequestEventTiming.ARRIVAL_TIME: 1.0, RequestEventTiming.LAST_TOKEN_TIME: 2.0}
+    result.record_stats(output, stats)
+    result.do_tracing(output, stats)
+    assert tracer.span.attributes[tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] == len(ids)
+    assert req.__dict__["_prompt_token_ids"] is None

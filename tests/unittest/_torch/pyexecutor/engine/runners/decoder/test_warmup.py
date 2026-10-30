@@ -241,7 +241,7 @@ def _mamba_engine(*, world_size: int = 1, dwdp_size: int = 0) -> tuple[DecoderWa
     # The warmup resolves its chunk-alignment variant off the model's Mamba
     # metadata class; a model declaring none takes the ``Mamba2Metadata``
     # default, i.e. no alignment rewrite.
-    engine.model = SimpleNamespace()
+    engine.model = SimpleNamespace(modules=lambda: iter(()))
     batch = object()
     engine._dummy_requests = SimpleNamespace(
         release_batch_context=lambda *_a, **_kw: _released_batch(batch)

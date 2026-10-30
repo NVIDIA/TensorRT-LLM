@@ -35,7 +35,7 @@ from typing import (
 
 import aiohttp
 import msgspec
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -133,6 +133,21 @@ _GENERATION_LEG_RETRYABLE_ERRORS = (
 )
 
 
+# The disagg server is a transparent relay: worker responses come from the
+# same trusted codebase, and a deployment may attach extra top-level fields to
+# them (orchestrator-side telemetry, token transports, ...). Validate the known
+# schema but keep unknown fields -- the protocol models are extra="forbid", so
+# validating worker output with them either 500s the request or silently strips
+# whatever the deployment attached. Strictness belongs at the request boundary,
+# not on the relay of our own workers' output.
+class RelayedCompletionResponse(CompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
+class RelayedChatCompletionResponse(ChatCompletionResponse):
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+
 class OpenAIClient(ABC):
     async def send_request(
         self,
@@ -143,13 +158,13 @@ class OpenAIClient(ABC):
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks, req_id
+                "v1/completions", request, RelayedCompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
                 "v1/chat/completions",
                 request,
-                ChatCompletionResponse,
+                RelayedChatCompletionResponse,
                 server,
                 hooks,
                 req_id,
@@ -557,6 +572,24 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                # A 4xx from the worker is the request's own fault (malformed
+                # body, context length exceeded, ...) and will fail the same way
+                # every time, so retrying only burns another prefill attempt.
+                # It reaches this block only because the 4xx is re-raised above
+                # as an aiohttp.ClientResponseError -- a ClientError subclass --
+                # to carry the response body up; the retry budget here is meant
+                # for transport failures, not for server-side rejections.
+                # 408 and 429 are transient, not deterministic: keep them retryable.
+                if (
+                    isinstance(e, aiohttp.ClientResponseError)
+                    and 400 <= e.status < 500
+                    and e.status not in (408, 429)
+                ):
+                    logger.error(
+                        f"Client error to {url}: {e} - not retrying, {e.status} is deterministic",
+                        traceback.format_exc(),
+                    )
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

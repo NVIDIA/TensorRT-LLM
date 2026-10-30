@@ -653,7 +653,6 @@ class PyExecutorProfileManager:
             log_ranks = {int(r) for r in log_ranks_str.split(",")}
 
         calibrator = get_calibrator()
-
         # Local helper so the inner closure does not need to call
         # ``self._activities_from_names`` which would force a
         # method-name lookup per iteration.
@@ -682,16 +681,18 @@ class PyExecutorProfileManager:
                     )
                     executor.profile_stop_iters.discard(executor.iter_counter)
                 else:
-                    if active_enable_torch_trace and torch_profiler is not None:
-                        torch_profiler.stop()
-                        torch_profiler.export_chrome_trace(active_torch_trace_path)
-                        logger.info(
-                            f"Profiling stopped at iteration "
-                            f"{executor.iter_counter}, "
-                            f"trace saved to {active_torch_trace_path}"
-                        )
-                    torch.cuda.cudart().cudaProfilerStop()
-                    calibrator.stop()
+                    # The trace flush stalls every rank for longer than the hang timeout.
+                    with executor.hang_detector.pause():
+                        if active_enable_torch_trace and torch_profiler is not None:
+                            torch_profiler.stop()
+                            torch_profiler.export_chrome_trace(active_torch_trace_path)
+                            logger.info(
+                                f"Profiling stopped at iteration "
+                                f"{executor.iter_counter}, "
+                                f"trace saved to {active_torch_trace_path}"
+                            )
+                        torch.cuda.cudart().cudaProfilerStop()
+                        calibrator.stop()
                     enabled = False
                     # Reset lazy state so a subsequent start/stop
                     # window can pick up a fresh runtime
@@ -741,12 +742,21 @@ class PyExecutorProfileManager:
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
                     kv_util_str = "N/A"
+                    kv_reuse_str = ""
                     if executor.kv_cache_manager is not None:
                         kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = (
                                 f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
                             )
+                        # Cumulative (warmup-adjusted) block reuse counters;
+                        # kv_cache_util only shows blocks pinned by active
+                        # requests, so it says nothing about prefix reuse.
+                        kv_reuse_str = (
+                            f"kv_reused_blocks = {kv_stats.reused_blocks}, "
+                            f"kv_missed_blocks = {kv_stats.missed_blocks}, "
+                            f"kv_hit_rate = {kv_stats.cache_hit_rate:.3f}, "
+                        )
                     import datetime
 
                     formatted_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -769,6 +779,7 @@ class PyExecutorProfileManager:
                         f"adp_dummy_ctx_tokens = {executor._iter_adp_dummy_ctx_tokens}, "
                         f"adp_dummy_gen_tokens = {executor._iter_adp_dummy_gen_tokens}, "
                         f"kv_cache_util = {kv_util_str}, "
+                        f"{kv_reuse_str}"
                         f"currank_total_requests = {executor.num_fetch_requests_cur_rank}/"
                         f"{executor.num_fetch_requests}, "
                         f"host_step_time = {host_step_time}ms, "

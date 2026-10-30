@@ -392,29 +392,40 @@ class RequestBroadcaster:
         self.rank0_aux: Optional[float] = None
 
     def broadcast(
-        self, new_requests: List, prefer_cpu: bool = False
+        self,
+        new_requests: List,
+        *,
+        known_nonempty: bool = False,
+        prefer_cpu: bool = False,
     ) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks.
 
         Args:
             new_requests: Requests fetched on rank 0 (ignored on other ranks).
             prefer_cpu: Keep the request-count probe on the CPU transport.
-                Pass True from the idle fetch path, where non-root ranks park
-                in the probe while rank 0 blocks on the request queue: a
-                GPU-staged probe holds a spinning NCCL kernel on the device for
-                the whole park and puts the wait under the NCCL watchdog. Must
-                be passed with the same value on all ranks.
+                Pass True from the IDLE fetch path, where non-root ranks park
+                in the probe while rank 0 blocks on the request queue (up to
+                20 min): a GPU-staged probe holds a spinning NCCL kernel on
+                the device for the whole park and puts the wait under the
+                NCCL watchdog. Must be rank-consistent, like known_nonempty.
+            known_nonempty: All ranks already agree out-of-band (e.g. via the
+                pending-count hint piggybacked on the ADP rank-state allgather)
+                that rank 0 holds at least one request, so the request-count
+                probe broadcast is skipped and every rank enters the payload
+                broadcast directly. Must be passed with the same value on all
+                ranks.
         """
-        if self._single_round(prefer_cpu):
-            return self._broadcast_single_round(new_requests)
-        request_count = len(new_requests) if self.dist.rank == 0 else 0
-        # Idle non-root ranks can wait here while rank 0 blocks in the
-        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
-        with self.hang_detector.pause():
-            request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
+        if not known_nonempty:
+            if self._single_round(prefer_cpu):
+                return self._broadcast_single_round(new_requests)
+            request_count = len(new_requests) if self.dist.rank == 0 else 0
+            # Idle non-root ranks can wait here while rank 0 blocks in the
+            # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+            with self.hang_detector.pause():
+                request_count = self._broadcast_request_count(request_count, prefer_cpu=prefer_cpu)
 
-        if request_count == 0:
-            return [], None
+            if request_count == 0:
+                return [], None
 
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)

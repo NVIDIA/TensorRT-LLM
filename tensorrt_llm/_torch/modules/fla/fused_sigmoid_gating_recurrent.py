@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import functools
 import os
 from typing import Optional
 
@@ -27,6 +28,49 @@ try:
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = True
 except (ImportError, RuntimeError):
     _FLASHINFER_GDN_BF16_STATE_AVAILABLE = False
+
+# The two launchers behind gated_delta_rule (internal FlashInfer symbols) for
+# flashinfer_gdn_decode_t1 below; either missing only disables that shortcut.
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        _select_wide_vec_tile_v as _fi_select_wide_vec_tile_v
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state import \
+        gated_delta_rule_t1_wide_vec as _fi_gdn_decode_t1_wide_vec
+except (ImportError, RuntimeError):
+    _fi_select_wide_vec_tile_v = None
+    _fi_gdn_decode_t1_wide_vec = None
+
+# FlashInfer's compile cache of the MTP kernel and its config / key helpers, for
+# the compiled-kernel shortcut of flashinfer_gdn_tail_recurrent (internal
+# symbols; any of them missing keeps the tail on the public entry).
+try:
+    from flashinfer.gdn_kernels import \
+        gdn_decode_bf16_state as _fi_gdn_decode_mod
+    _fi_mtp_compiled = _fi_gdn_decode_mod._compiled_kernels_mtp
+    _fi_wide_vec_compiled = _fi_gdn_decode_mod._compiled_kernels_wide_vec
+    _fi_get_bf16_mtp_config = _fi_gdn_decode_mod._get_bf16_mtp_config
+    _fi_dtype_key = _fi_gdn_decode_mod._dtype_key
+    _fi_use_packed_fma = _fi_gdn_decode_mod._USE_PACKED_FMA
+    import cuda.bindings.driver as _cuda_driver
+except (ImportError, RuntimeError, AttributeError):
+    _fi_mtp_compiled = _fi_wide_vec_compiled = None
+    _fi_get_bf16_mtp_config = _fi_dtype_key = _fi_use_packed_fma = _cuda_driver = None
+
+_cu_streams: dict = {}
+
+
+def _current_cu_stream(device_index: int):
+    """The CUstream of the current torch stream, from the raw handle (the
+    torch.cuda.current_stream() Stream object costs ~2 us per call; the
+    handle lookup ~0.3 us) with the CUstream objects cached per handle."""
+    handle = torch._C._cuda_getCurrentRawStream(device_index)
+    stream = _cu_streams.get(handle)
+    if stream is None:
+        if len(_cu_streams) >= 64:
+            _cu_streams.clear()
+        stream = _cu_streams[handle] = _cuda_driver.CUstream(handle)
+    return stream
+
 
 # Max per-sequence token count served by the FlashInfer MTP verify kernel; the
 # parity test (test_flashinfer_gdn_verify.py) covers T=1..8 against the Triton
@@ -329,6 +373,150 @@ def _flashinfer_gdn_decode(
 
     # Reshape output from [N, T, HV, V] back to [1, N*T, HV, V].
     return output.reshape(1, T_total, HV, -1)
+
+
+@functools.lru_cache(maxsize=8)
+def flashinfer_gdn_bf16_state_available(pool_dtype: torch.dtype, K: int,
+                                        V: int) -> bool:
+    """Whether FlashInfer's bf16-state GDN launchers (the T=1 decode kernels) serve a state pool of this
+    dtype and head sizes on this device: the batch-independent conditions of
+    ``_can_use_flashinfer_gdn_decode`` plus the availability of the launchers,
+    evaluated once instead of per layer. Independent of the direct-launch knob,
+    which only picks how the kernels are launched."""
+    return (_FLASHINFER_GDN_BF16_STATE_AVAILABLE
+            and _fi_gdn_decode_t1_wide_vec is not None
+            and _fi_select_wide_vec_tile_v is not None
+            and os.environ.get("TRTLLM_FLA_DISABLE_FLASHINFER_GDN", "0") != "1"
+            and is_flashinfer_gdn_decode_supported_arch()
+            and pool_dtype == torch.bfloat16 and K == 128 and V == 128)
+
+
+@functools.lru_cache(maxsize=8)
+def flashinfer_gdn_decode_direct_available(pool_dtype: torch.dtype, K: int,
+                                           V: int) -> bool:
+    """Whether ``flashinfer_gdn_decode_t1`` serves one-token decode batches on a
+    state pool of this dtype and head sizes: the launchers are available."""
+    return flashinfer_gdn_bf16_state_available(pool_dtype, K, V)
+
+
+def flashinfer_gdn_decode_t1(A_log: torch.Tensor, dt_bias: torch.Tensor,
+                             q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                             a: torch.Tensor, b: torch.Tensor,
+                             pool: torch.Tensor, indices: torch.Tensor,
+                             output: torch.Tensor,
+                             scale: float) -> torch.Tensor:
+    """One-token-per-sequence GDN decode straight into FlashInfer's bf16-state
+    launchers, for callers that already hold the kernel's layouts.
+
+    ``q``/``k`` ``[N, 1, H, K]``, ``v`` ``[N, 1, HV, V]``, ``a``/``b`` ``[N, 1, HV]``
+    with 32-byte aligned base pointers, ``indices`` contiguous int32 (aligned),
+    ``output`` ``[N, 1, HV, V]`` bf16; the pool rows ``indices`` are updated in
+    place. Same dispatch as FlashInfer's ``gated_delta_rule`` (the wide-vector
+    kernel from ``N * HV >= 512``, the MTP T=1 kernel below) without its per-call
+    validation and without the two adapter layers of
+    ``fused_sigmoid_gating_delta_rule_update`` above it: ~20 us of host time per
+    GDN layer of a mixed iteration, whose host thread is the critical path.
+    Callers check ``flashinfer_gdn_decode_direct_available`` and the alignment."""
+    tile_v = _fi_select_wide_vec_tile_v(q.shape[0], v.shape[2])
+    if tile_v is not None and tile_v >= 64:
+        entry = _fi_wide_vec_compiled_entry(q.shape[2], v.shape[2], pool, A_log,
+                                            dt_bias, indices, scale, tile_v)
+        if entry is not None:
+            # FlashInfer's compiled wide-vector kernel straight from its cache
+            # (filled by the public entry on the first call for this tile):
+            # the entry's per-call Python (casts, asserts, key, defaults) goes
+            # from ~12 us to ~7 us. Same kernel, same arguments.
+            compiled, inter = entry
+            compiled(pool, inter, A_log, a, dt_bias, q, k, v, b, output,
+                     indices, indices, _current_cu_stream(q.device.index))
+            return output
+        return _fi_gdn_decode_t1_wide_vec(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=indices,
+            output_state_indices=None,
+            intermediate_states_buffer=None,
+            disable_state_update=False,
+            use_qk_l2norm_in_kernel=True,
+            scale=scale,
+            output=output,
+            tile_v=tile_v,
+        )
+    return _fi_gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=pool,
+        initial_state_indices=indices,
+        output_state_indices=None,
+        output=output,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+
+_fi_wide_vec_entries: dict = {}
+
+
+def _fi_wide_vec_compiled_entry(H: int, HV: int, pool: torch.Tensor,
+                                A_log: torch.Tensor, dt_bias: torch.Tensor,
+                                indices: torch.Tensor, scale: float,
+                                tile_v: int):
+    """``(compiled, dummy_intermediate)`` of FlashInfer's wide-vector T=1 decode
+    kernel for this pool geometry / tile, or None when FlashInfer's internals
+    are unavailable or the kernel is not compiled yet."""
+    if _fi_wide_vec_compiled is None:
+        return None
+    key = (H, HV, pool.shape[0], tuple(pool.stride()), pool.dtype, A_log.dtype,
+           dt_bias.dtype, indices.dtype, scale, tile_v)
+    entry = _fi_wide_vec_entries.get(key)
+    if entry is not None:
+        return entry
+    K = V = pool.shape[-1]
+    contiguous = pool.is_contiguous()
+    cache_key = (
+        "v3_mtp_bf16_tiled_dynB",
+        1,
+        H,
+        HV,
+        K,
+        V,
+        -1 if contiguous else pool.shape[0],
+        (-1, ) if contiguous else tuple(int(s) for s in pool.stride()),
+        tile_v,
+        False,  # effective_disable_final
+        False,  # cache_intermediate_states
+        True,  # use_qk_l2norm_in_kernel
+        scale,
+        1.0,
+        20.0,
+        _fi_use_packed_fma,
+        True,  # same_pool: read and write the same slots
+        _fi_dtype_key(A_log, dt_bias, indices),
+    )
+    cache = _fi_wide_vec_compiled.get(cache_key)
+    if cache is None:
+        return None
+    # Own storage: a view would keep the whole pool alive in this module-level cache.
+    entry = (cache["compiled"], pool[:1, :1, :1].clone())
+    if len(_fi_wide_vec_entries) >= 256:
+        _fi_wide_vec_entries.clear()
+    _fi_wide_vec_entries[key] = entry
+    return entry
 
 
 def _can_use_flashinfer_gdn_verify(

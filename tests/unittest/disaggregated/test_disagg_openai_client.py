@@ -1646,7 +1646,7 @@ class TestRemoteTailHandoffRetry:
 
         response = await openai_client.send_request(completion_request, hooks=hooks, req_id=42)
 
-        assert response == response_body
+        assert response.model_dump() == response_body.model_dump()
         assert mock_session.post.call_count == 2
         if request_type is not None:
             assert completion_request.disaggregated_params.disagg_request_id == 999
