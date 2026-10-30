@@ -15,9 +15,8 @@
 """Compilation and caching for PrimTS block-sparse attention adapters."""
 
 from collections.abc import Callable
-import functools
 
-from .._compile_cache import build_and_load_attention_kernel
+from .._compile_cache import build_and_load_attention_kernel, cache_compiled
 
 import torch
 
@@ -557,7 +556,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
         )
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_block_sparse(
     key: _BlockSparseCompileKey,
 ) -> Callable[..., object]:

@@ -25,8 +25,6 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
-from .fmha_resources import FmhaConfig
-
 
 @cute.jit
 def _load_runtime_seq_len_kv(
@@ -43,22 +41,24 @@ def _load_runtime_seq_len_kv(
 
 
 @cute.jit
-def _runtime_last_valid_page_idx(cfg: FmhaConfig, seq_len_kv: Int32) -> Int32:
-    num_pages = cute.ceil_div(seq_len_kv, cfg.num_tokens_per_page)
+def _runtime_last_valid_page_idx(
+    num_tokens_per_page: cutlass.Constexpr[int], seq_len_kv: Int32
+) -> Int32:
+    num_pages = cute.ceil_div(seq_len_kv, num_tokens_per_page)
     return cute.math.max(num_pages - Int32(1), Int32(0))
 
 
 @cute.jit
 def _load_block_table_row_bounds(
     block_table_row_stride: Int32,
-    cfg: FmhaConfig,
+    num_tokens_per_page: cutlass.Constexpr[int],
     seq_len_kv: Int32,
     batch_coord: Int32,
 ) -> tuple[Int32, Int32]:
     """Return one fixed-table row base and runtime-valid inclusive page bound."""
 
     row_begin = batch_coord * block_table_row_stride
-    return row_begin, _runtime_last_valid_page_idx(cfg, seq_len_kv)
+    return row_begin, _runtime_last_valid_page_idx(num_tokens_per_page, seq_len_kv)
 
 
 @cute.jit

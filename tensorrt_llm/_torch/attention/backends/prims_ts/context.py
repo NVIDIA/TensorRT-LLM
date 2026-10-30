@@ -36,14 +36,13 @@ register trace templates.
 """
 
 from dataclasses import dataclass
-import functools
 import itertools
 import math
 import numbers
 import struct
 from typing import TYPE_CHECKING, Callable, Literal, Optional
 
-from ._compile_cache import build_and_load_attention_kernel
+from ._compile_cache import build_and_load_attention_kernel, cache_compiled
 from ._hardware import get_max_active_clusters
 
 import torch
@@ -1729,7 +1728,7 @@ def _paged_context_compile_spec(
     )
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_context(
     compile_spec: _ContextCompileSpec,
 ):
@@ -1958,7 +1957,7 @@ def _get_compiled_context(
     return compiled, policy
 
 
-@functools.cache
+@cache_compiled
 def _get_compiled_paged_context(
     compile_spec: _PagedContextCompileSpec,
 ):
