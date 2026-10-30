@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
 import functools
 import json
@@ -63,8 +66,7 @@ def _layer_list(obj):
 
 
 def _decoder_layers(model):
-    """The decoder layer list of `model`, whatever this architecture calls it
-    and however deeply it is wrapped.
+    """Resolve decoder layers across supported model wrappers.
 
     `model.model.layers` holds for the plain causal-LM wrappers and for nothing
     else. A vision-language checkpoint serving text only exposes no `.model`:
@@ -102,7 +104,8 @@ def _decoder_layers(model):
         "name here once you have read the model definition -- guessing which "
         "attribute is the decoder stack is how a tool measures the wrong thing "
         "and still reports a number."
-        % (type(model).__name__, ", ".join(_LAYER_LIST_ATTRS), " -> ".join(seen)))
+        % (type(model).__name__, ", ".join(_LAYER_LIST_ATTRS), " -> ".join(seen))
+    )
 
 
 class Calibrator:

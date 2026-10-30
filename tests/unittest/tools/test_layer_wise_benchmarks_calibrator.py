@@ -19,7 +19,11 @@ from typing import Iterable
 import pytest
 
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import (
-    Calibrator, Mode, NoDecoderLayers, _decoder_layers)
+    Calibrator,
+    Mode,
+    NoDecoderLayers,
+    _decoder_layers,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -235,7 +239,11 @@ def test_replay_token_count_requires_replay_mode() -> None:
 class _Layer:
     """Stands in for a decoder layer: the one thing the calibrator wraps."""
 
-    def forward(self, *args, **kwargs):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def forward(self, *args, **kwargs) -> None:
+        self.calls += 1
         return None
 
 
@@ -277,8 +285,7 @@ def test_decoder_layers_descends_into_llm() -> None:
 def test_decoder_layers_descends_into_language_model() -> None:
     """The HF-style `*ForConditionalGeneration` shape, Gemma-3/4 among them."""
     layers = [_Layer()]
-    assert _decoder_layers(
-        _Holder(language_model=_Holder(model=_Holder(layers=layers)))) is layers
+    assert _decoder_layers(_Holder(language_model=_Holder(model=_Holder(layers=layers)))) is layers
 
 
 def test_decoder_layers_stops_on_a_self_referential_wrapper() -> None:
@@ -316,8 +323,7 @@ def _wrapped_chain(unwraps: int, layers) -> _Holder:
 
 @pytest.mark.parametrize("unwraps", [0, 1, 2, 3, 4])
 def test_decoder_layers_searches_the_whole_budget(unwraps: int) -> None:
-    """_MAX_UNWRAP_DEPTH counts unwraps, so the object reached by the last one
-    has to be examined.
+    """Examine the object reached by the last permitted unwrap.
 
     `range(_MAX_UNWRAP_DEPTH)` searched the root and three levels while the name
     promised four, so a four-deep layout raised instead of resolving.
@@ -344,7 +350,7 @@ def test_maybe_wrap_model_wraps_layers_behind_a_nested_wrapper() -> None:
     """
     layers = [_Layer(), _Layer(), _Layer()]
     model = _Holder(llm=_Holder(model=_Holder(layers=layers)))
-    originals = [l.forward for l in layers]
+    originals = [layer.forward for layer in layers]
 
     calibrator = Calibrator()
     calibrator.mode = Mode.MARK
@@ -358,6 +364,7 @@ def test_maybe_wrap_model_wraps_layers_behind_a_nested_wrapper() -> None:
         assert layer.forward.__wrapped__ == original
         # The wrapper has to delegate, not replace.
         assert layer.forward() is None
+        assert layer.calls == 1
 
 
 def test_decoder_layers_rejects_a_decoy_container() -> None:
