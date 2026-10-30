@@ -1248,7 +1248,7 @@ class TestRequestTimeout:
         return response
 
     @contextlib.asynccontextmanager
-    async def _worker(self, handler):
+    async def _worker(self, handler, timeout_secs=None):
         """Serve handler as a worker's /v1/completions; yield a client of it and its router."""
         app = web.Application()
         app.router.add_post("/v1/completions", handler)
@@ -1259,7 +1259,7 @@ class TestRequestTimeout:
             client = OpenAIHttpClient(
                 router=router,
                 role=ServerRole.GENERATION,
-                timeout_secs=self._TIMEOUT_SECS,
+                timeout_secs=self._TIMEOUT_SECS if timeout_secs is None else timeout_secs,
                 max_retries=0,
             )
             try:
@@ -1287,6 +1287,26 @@ class TestRequestTimeout:
 
         assert elapsed > self._TIMEOUT_SECS, "the stream must outlast the timeout to test it"
         assert received == expected
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_nonpositive_timeout_allows_delayed_headers_and_stream_data(self, timeout_secs):
+        async def generate(request):
+            await asyncio.sleep(0.05)
+            response = await self._open_response(request, "text/event-stream")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: hello\n\n")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        async with self._worker(generate, timeout_secs=timeout_secs) as (client, router):
+            response = await client.send_request(self._request(stream=True))
+            received = b"".join([chunk async for chunk in response])
+
+        assert received == b"data: hello\n\ndata: [DONE]\n\n"
         router.finish_request.assert_awaited_once()
         assert router.finish_request.await_args.kwargs["success"] is True
 

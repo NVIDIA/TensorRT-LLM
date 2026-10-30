@@ -265,11 +265,13 @@ class OpenAIHttpClient(OpenAIClient):
         # and every wait for data after that. A total bound would cut a long
         # generation that is still producing tokens.
         self._non_stream_timeout = aiohttp.ClientTimeout(total=timeout_secs)
+        # Non-positive values disable every stream bound. A negative sock_read
+        # value would otherwise schedule an immediate timeout in aiohttp.
+        stream_timeout_secs = timeout_secs if timeout_secs > 0 else None
         self._stream_timeout = aiohttp.ClientTimeout(
-            total=None, connect=timeout_secs, sock_read=timeout_secs
+            total=None, connect=stream_timeout_secs, sock_read=stream_timeout_secs
         )
-        # A timeout that is not positive disables the bound, as it does aiohttp's.
-        self._response_start_timeout_secs = timeout_secs if timeout_secs > 0 else None
+        self._response_start_timeout_secs = stream_timeout_secs
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=0,
