@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -91,7 +91,14 @@ inline AllReduceStrategyType selectStrategyLookUpTable(
 {
     auto sm_version = tensorrt_llm::common::getSMVersion();
     auto tp_index = static_cast<size_t>(std::log2(tp_size) - 1);
-    auto fusion_op_index = static_cast<size_t>(mapFusionOpToIndex.find(fusionOp)->second);
+    auto const fusion_op_entry = mapFusionOpToIndex.find(fusionOp);
+    if (fusion_op_entry == mapFusionOpToIndex.end())
+    {
+        // A fusion op the sweep never covered (e.g. RMS_NORM). NCCL runs every op via the
+        // decomposed fallback, so it is the safe answer.
+        return AllReduceStrategyType::NCCL;
+    }
+    auto fusion_op_index = static_cast<size_t>(fusion_op_entry->second);
     auto num_token_index = static_cast<size_t>(std::log2(num_tokens));
     auto hidden_size_index = static_cast<size_t>(std::log2(hidden_size) - 7);
 
