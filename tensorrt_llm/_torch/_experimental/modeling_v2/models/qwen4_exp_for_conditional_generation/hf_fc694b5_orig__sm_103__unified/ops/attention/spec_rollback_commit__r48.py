@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """`SpeculativeRollback`'s staging and commit of a verify step in one launch each.
 
-Tier 5 (Triton written for this target). A verify step runs `p` rows per generation request
+Tier 5 (Triton written for the tp1 target, `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`'s
+`ops/attention/spec_rollback_commit`, copied here as this target's local variant). Each
+`__call__` is one launch of a Triton kernel of this file, JIT-compiled on first use for the
+device it runs on. A verify step runs `p` rows per generation request
 through the trunk; the PLE pools and the QSA planes are written for every row. The staging
 launch copies what the commit rewrites from: each request's pre-step n-gram id history
 followed by its rows' ids (the `stream` whose length-`context` windows are the histories
@@ -32,6 +35,15 @@ from .qsa_rollback_planes__r47 import ROW
 
 #: Conv channels a program covers.
 _BLOCK_C = 256
+
+#: A tep4 rank (the MTP member) as the stock `Qwen4ExpHybridCacheManager` lays its pools out at
+#: core's runtime: the PLE conv state `[slots, hc_count * hidden, (ple_kernel - 1) * ngram_size]`
+#: = `[1874, 10240, 9]` bf16 and the n-gram history `[1874, 2]` int64 (replicated, 1874 the final
+#: engine's state slots), and every attention layer's index-K plane a `[pages, 32, 1, 128]` bf16
+#: view of one coalesced pool at page stride 49152 elements, 257109 attention pages, beside the
+#: `[pages, 32, 3]` int32 position plane.
+_TEP4_PLE = dict(state_slots=1874, context=2, channels=10240, state_len=9)
+_TEP4 = dict(planes=12, layout="coalesced", pool_pages=257109, **_TEP4_PLE)
 
 
 @triton.jit
@@ -191,10 +203,22 @@ class SpecRollbackStage(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request", spec=dict(n=1, p=4)),
         Cell(why="MTP3, 128 requests", spec=dict(n=128, p=4)),
+        Cell(
+            why="tep4 MTP1 verify: 128 requests x 2 rows, the 10240 x 9 PLE conv over 1874 slots",
+            spec=dict(n=128, p=2, **_TEP4_PLE),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows, the 10240 x 9 PLE conv over 1874 slots",
+            spec=dict(n=128, p=8, **_TEP4_PLE),
+        ),
     )
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.stage_ple_verify`, before
     `ple_ngram_embed` publishes the id history. Grid (requests, conv channel blocks).
+
+    The tp1 cells run a 640-channel, 3-column conv state; this target's (`_TEP4_PLE`) the
+    checkpoint's 10240 x 9 state at a tep4 rank's measured slot count, `ids` int32 and `slots`
+    int32 as the call site hands them, slots 0 and 1873 among those read.
     """
 
     def __call__(self, ngram_pool, conv_pool, slots, ids, p: int):
@@ -260,12 +284,34 @@ class SpecRollbackCommit(OpWrapper):
     CELLS: tuple[Cell, ...] = (
         Cell(why="MTP3, one request, 12 planes", spec=dict(n=1, p=4, planes=12)),
         Cell(why="MTP3, 128 requests, 12 planes", spec=dict(n=128, p=4, planes=12)),
+        Cell(
+            why="tep4 MTP1 verify: 128 requests x 2 rows (256), 12 planes of the coalesced pool",
+            spec=dict(n=128, p=2, **_TEP4),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows (1024, the largest verify step), 12 planes",
+            spec=dict(n=128, p=8, **_TEP4),
+        ),
     )
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.commit_speculative_states`,
     after the draft loop. Grid (requests, max(conv channel blocks, planes)). Slots or plane
     slots shared by two requests (CUDA-graph padding dummies) are written by both; which one
     lands is unordered, as with the indexed writes this replaces.
+
+    Two grid regimes. The tp1 cells' 640 conv channels are 3 blocks under 12 planes, so blocks
+    3..11 restore planes only. This target's 10240 channels (`_TEP4`) are 40 blocks over 12
+    planes, so blocks 12..39 write conv channels only. The tep4 cells run that layout:
+    - `accepted` and `slots` are int32, as the MTP worker hands them.
+    - The planes are the 12 trunk layers' views of the coalesced pool at the measured tep4
+      page count and stride, addressed through `plane_table`.
+    - One request's rows straddle the pool's first and last page, and its rejected row is
+      restored on the last page, 257108 x 49152 elements (1.26e10) past the plane's base.
+    - Slots 0 and 1873 are among those written.
+
+    The commit is pure data movement, held bitwise to `reference`. The test also holds that
+    nothing outside the named slots of any pool is written, and that a CUDA-graph replay at
+    1024 rows re-reads its inputs.
     """
 
     def __call__(
@@ -330,8 +376,53 @@ class SpecRollbackCommit(OpWrapper):
             num_warps=4,
         )
 
-    def reference(self, *args) -> None:
-        raise NotImplementedError("test_modeling_v2_spec_rollback drives the handler end to end")
+    def reference(
+        self,
+        accepted,
+        slots,
+        ngram_pool,
+        stream,
+        conv_pool,
+        conv_prev,
+        conv_x,
+        position,
+        position_old,
+        pages,
+        within,
+        planes,
+        index_old,
+    ):
+        """What every slot the commit names holds after it.
+
+        `(ngram [n, context], conv [n, C, state_len], position [n * p, 3], index [planes,
+        n * p, ROW])`: the n-gram and conv pool rows at `slots`, and the position plane and
+        each index-K plane at every row's `(pages, within)`. A row the request accepted keeps
+        what the plane holds now; a rejected one gets `position_old` / `index_old`.
+
+        Takes the planes themselves (`planes`, the views `plane_table` built `plane_ptrs` and
+        `plane_strides` from) in place of their address table. `slots`, `ngram_pool` and
+        `conv_pool` only say which rows those are and are not read. Data movement only: the
+        values are the inputs' own, so it is the exact answer.
+        """
+        n, p, _ = conv_x.shape
+        context, state_len = ngram_pool.shape[1], conv_pool.shape[2]
+        a = accepted.to(torch.long)
+        req = torch.arange(n, device=a.device)
+        # Window k of the unfold is the id history after k rows.
+        ngram = stream.unfold(1, context, 1)[req, a]
+        # [n, C, state_len + p]; window k of the unfold is the conv state after k tokens.
+        history = torch.cat([conv_prev, conv_x.transpose(1, 2)], 2)
+        conv = history.unfold(2, state_len, 1)[req, :, a]
+        rejected = (torch.arange(p, device=a.device)[None, :] >= a[:, None]).reshape(-1)
+        pg, tok = pages.to(torch.long), within.to(torch.long)
+        pos = torch.where(rejected[:, None], position_old, position[pg, tok])
+        index = torch.stack(
+            [
+                torch.where(rejected[:, None], index_old[k], plane[pg, tok].reshape(-1, ROW))
+                for k, plane in enumerate(planes)
+            ]
+        )
+        return ngram, conv, pos, index
 
     def is_valid(
         self,
@@ -350,18 +441,46 @@ class SpecRollbackCommit(OpWrapper):
         plane_strides,
         index_old,
     ) -> None:
+        # The kernel reads every staged tensor by raw offset in the layout its producer writes,
+        # and the pools by their strides. A wrong shape is read short or past its end, and a
+        # strided staged tensor at the wrong elements, without an error.
         n, p, channels = conv_x.shape
-        assert accepted.shape == (n,) and slots.shape == (n,)
-        assert ngram_pool.dtype == stream.dtype == torch.int64 and ngram_pool.stride(1) == 1
-        assert stream.shape == (n, ngram_pool.shape[1] + p) and stream.is_contiguous()
-        assert conv_pool.shape[1] == channels and conv_prev.is_contiguous()
-        assert conv_prev.shape == (n, channels, conv_pool.shape[2])
-        assert position.dim() == 3 and position.shape[2] == 3
-        assert position_old.shape == (n * p, 3) and position_old.is_contiguous()
-        assert pages.shape == within.shape == (n * p,)
-        assert pages.dtype == within.dtype == torch.int64
-        assert index_old.is_contiguous() and index_old.shape[1:] == (n * p, ROW)
-        assert plane_ptrs.numel() == plane_strides.numel() == index_old.shape[0]
+        assert accepted.shape == (n,) and slots.shape == (n,), (
+            f"accepted {tuple(accepted.shape)} and slots {tuple(slots.shape)} must hold one "
+            f"entry per generation request ({n})"
+        )
+        assert ngram_pool.dtype == stream.dtype == torch.int64 and ngram_pool.stride(1) == 1, (
+            "ngram_pool and stream must be int64, the n-gram history's last dim unit-strided"
+        )
+        assert stream.shape == (n, ngram_pool.shape[1] + p) and stream.is_contiguous(), (
+            f"stream must be the contiguous [n, context + p] = [{n}, {ngram_pool.shape[1] + p}] "
+            f"spec_rollback_stage wrote; got {tuple(stream.shape)}"
+        )
+        assert conv_pool.shape[1] == channels and conv_prev.is_contiguous(), (
+            "conv_prev must be contiguous (read as packed [n, C, state_len] rows), and conv_pool "
+            "as wide as conv_x"
+        )
+        assert conv_prev.shape == (n, channels, conv_pool.shape[2]), (
+            f"conv_prev is {tuple(conv_prev.shape)}, expected {(n, channels, conv_pool.shape[2])}"
+        )
+        assert position.dim() == 3 and position.shape[2] == 3, (
+            f"position must be the [pages, tokens_per_block, 3] plane; got {tuple(position.shape)}"
+        )
+        assert position_old.shape == (n * p, 3) and position_old.is_contiguous(), (
+            f"position_old must be the contiguous [n * p, 3] = [{n * p}, 3] gather"
+        )
+        assert pages.shape == within.shape == (n * p,), (
+            f"pages and within must hold one entry per verify row ({n * p})"
+        )
+        assert pages.dtype == within.dtype == torch.int64, "pages and within must be int64"
+        assert index_old.is_contiguous() and index_old.shape[1:] == (n * p, ROW), (
+            f"index_old must be the contiguous [planes, n * p, {ROW}] qsa_rollback_gather "
+            f"returns; got {tuple(index_old.shape)}, contiguous {index_old.is_contiguous()}"
+        )
+        assert plane_ptrs.numel() == plane_strides.numel() == index_old.shape[0], (
+            f"the plane table holds {plane_ptrs.numel()} planes and index_old "
+            f"{index_old.shape[0]}; the kernel restores index_old's count"
+        )
 
 
 spec_rollback_stage = SpecRollbackStage()
