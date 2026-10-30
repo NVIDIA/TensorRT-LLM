@@ -334,7 +334,7 @@ modeling_v2 iff one of its `tests:` entries matches
 - `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
   (`--ignore` of `comm/`) that collects the catalog matrix and every
   family's tests under `models/<family>`, plus `comm/` on
-  `l0_gb300_multi_gpus` for the 4-rank collectives.
+  `l0_gb300_multi_gpus` (post-merge) for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test
