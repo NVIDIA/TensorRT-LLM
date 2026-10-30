@@ -193,8 +193,7 @@ UncommittedPage::~UncommittedPage()
     // switching to monostate, so during destruction the slot still references this page.
     if (TLLM_UNLIKELY(gDebug))
     {
-        auto ssmLcId = manager->lifeCycles().ssmLifeCycleId();
-        bool isSsm = ssmLcId.has_value() && lifeCycle == *ssmLcId;
+        bool const isSsm = manager->lifeCycles().isSsm(lifeCycle);
         if (!isSsm)
         {
             bool blockRemoved = kvCache->blocks().size() <= ordinal;
@@ -474,7 +473,7 @@ void SharedPageLock::releasePageIndex()
         // entry. updateBasePageIndex deliberately returns BAD for this ordinal.
         auto const& lc = page()->manager->lifeCycles().getLifeCycle(mUser.lifeCycle);
         auto const* attention = std::get_if<AttnLifeCycle>(&lc);
-        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && attention->allowsCheckpoint()));
+        TLLM_CHECK_DEBUG(std::holds_alternative<SsmLifeCycle>(lc) || (attention && allowsCheckpoint(*attention)));
         return;
     }
     int oldBaseIndex

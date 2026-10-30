@@ -247,7 +247,12 @@ generation KV tokens, retains the most useful tokens, and physically compacts
 the cache. The prompt remains preserved, and the model's standard Attention
 implementation runs over the compacted cache.
 
-TriAttention requires an offline calibration file. A minimal configuration is:
+TriAttention requires an offline calibration file. The Blackwell TopK selector
+supports `budget` values from 1 through 16384; larger values are rejected when
+the compression manager is constructed, before calibration loading or workspace
+initialization.
+
+A minimal configuration is:
 
 ```python
 from tensorrt_llm import LLM

@@ -1623,11 +1623,17 @@ def reasoning_chat_template_kwargs(request) -> dict:
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
     reasoning = getattr(request, "reasoning", None)
-    effort = getattr(reasoning, "effort",
-                     None) if reasoning is not None else None
+    if reasoning is None:
+        return kwargs
+    effort = getattr(reasoning, "effort", None)
+    if effort == "none":
+        kwargs.setdefault("thinking", False)
+        return kwargs
     if isinstance(effort, str) and effort:
         kwargs.setdefault("reasoning_effort", effort)
-        kwargs.setdefault("thinking", True)
+    # A `reasoning` object asks a reasoning model to reason; without an
+    # effort it reasons at the model's default effort.
+    kwargs.setdefault("thinking", True)
     return kwargs
 
 

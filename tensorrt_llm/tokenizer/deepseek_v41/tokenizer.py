@@ -90,6 +90,16 @@ REASONING_EFFORT_TEMPLATE = (
 )
 REASONING_EFFORT_MAPPINGS = {"low": 50, "high": 75, "max": 100}
 DEFAULT_REASONING_EFFORT = "high"
+# OpenAI's reasoning levels, placed on the same budget: the levels the checkpoint
+# names keep their budgets, and the others fall between them in order.
+OPENAI_REASONING_EFFORTS = {
+    "minimal": 25,
+    "low": 50,
+    "medium": 62,
+    "high": 75,
+    "xhigh": 87,
+    "max": 100,
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -613,8 +623,11 @@ class DeepseekV41Tokenizer(TransformersTokenizer):
         thinking_mode = "thinking" if thinking else "chat"
         # Unlike V4, any value the checkpoint accepts is passed through: the
         # budget is numeric, so clamping to {"max", "high"} would silently
-        # discard a caller's "low" or explicit integer.
+        # discard a caller's "low" or explicit integer. OpenAI's level names
+        # are translated to the budget; anything else is left to the renderer.
         reasoning_effort = kwargs.get("reasoning_effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort in OPENAI_REASONING_EFFORTS:
+            reasoning_effort = OPENAI_REASONING_EFFORTS[reasoning_effort]
 
         conversation = kwargs.get("conversation", messages)
         # V4.1 has no developer role; a developer message is a system message.

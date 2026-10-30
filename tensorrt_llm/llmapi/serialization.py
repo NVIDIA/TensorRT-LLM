@@ -73,10 +73,10 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
     ### ending import of torch models classes
     "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
+        "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
-        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
+        "Response", "Result", "FinishReason", "KvCacheConfig",
+        "KvCacheTransferMode", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
