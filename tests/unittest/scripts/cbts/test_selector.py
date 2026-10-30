@@ -205,6 +205,144 @@ def test_selector_uses_local_caller_rows_for_no_data_import_consumer() -> None:
     assert result.caller_bounded_funcs == ["tensorrt_llm/example.py::helper"]
 
 
+def test_selector_resolves_closure_change_to_its_own_recorded_qualname() -> None:
+    """A changed line in a decorator's wrapper resolves precisely, not file-wide.
+
+    The wrapper has its own DB rows, like any other function, and the selector
+    resolves them directly rather than bounding the change to the whole file.
+    """
+    path = "tensorrt_llm/example.py"
+    before = (
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n"
+    )
+    source = (
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs) + 1\n"
+        "    return wrapper\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    db = _FakeDB()
+    db.rows["decorator.<locals>.wrapper"] = {"A10-PyTorch-1/test_caller"}
+    selector = CoverageSelector(
+        db,
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok, result.reason
+    assert result.impacted == {"A10-PyTorch": {"test_caller"}}
+    assert result.skippable == {"A10-PyTorch": {"test_unrelated"}}
+    assert result.no_data_funcs == []
+
+
+def test_selector_falls_back_to_file_level_for_closure_with_no_db_rows() -> None:
+    """A closure change with no recorded rows yet uses the ordinary no-data policy.
+
+    Same file-level fallback any other never-recorded function gets.
+    """
+    path = "tensorrt_llm/example.py"
+    before = (
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs)\n"
+        "    return wrapper\n"
+    )
+    source = (
+        "def decorator(func):\n"
+        "    def wrapper(*args, **kwargs):\n"
+        "        return func(*args, **kwargs) + 1\n"
+        "    return wrapper\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    selector = CoverageSelector(
+        _FakeDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok, result.reason
+    assert result.impacted == {"A10-PyTorch": {"test_caller", "test_unrelated"}}
+    assert result.skippable == {"A10-PyTorch": set()}
+    assert result.no_data_funcs == ["tensorrt_llm/example.py::decorator.<locals>.wrapper"]
+    assert result.caller_bounded_funcs == []
+
+
+class _ClosureConsumerDB:
+    """A DB where a closure's own body, not its enclosing def, touches a test."""
+
+    def __init__(self) -> None:
+        self.rows = {
+            "outer": {"A10-PyTorch-1/test_constructs_only"},
+            "outer.<locals>.inner": {"A10-PyTorch-1/test_invokes_cached_closure"},
+        }
+
+    def file_has_touch_rows(self, _path: str) -> bool:
+        return True
+
+    def tests_touching_func(self, _path: str, qualname: str) -> set[str]:
+        return set(self.rows.get(qualname, set()))
+
+    def tests_touching_file(self, _path: str) -> set[str]:
+        return {
+            "A10-PyTorch-1/test_constructs_only",
+            "A10-PyTorch-1/test_invokes_cached_closure",
+            "A10-PyTorch-1/test_unrelated",
+        }
+
+    def known_by_family(self) -> dict[str, set[str]]:
+        return {
+            "A10-PyTorch": {
+                "test_constructs_only",
+                "test_invokes_cached_closure",
+                "test_unrelated",
+            }
+        }
+
+    def untrusted_tests(self, *_args) -> set[str]:
+        return set()
+
+
+def test_selector_resolves_changed_literal_to_its_closures_own_consumer() -> None:
+    """A changed top-level literal a closure's body reads resolves to the closure.
+
+    The test that constructs the closure (calling the outer def) and the test
+    that later invokes it can differ -- a cached decorator or a session-scoped
+    fixture built this way, say. Resolving the consumer to the outer def would
+    find only the constructing test; resolving it to the closure that actually
+    reads the binding finds the test that actually depends on it.
+    """
+    path = "tensorrt_llm/example.py"
+    before = (
+        "_VALUE = 521\n\ndef outer():\n    def inner():\n        return _VALUE\n    return inner\n"
+    )
+    source = (
+        "_VALUE = 522\n\ndef outer():\n    def inner():\n        return _VALUE\n    return inner\n"
+    )
+    diff = "".join(difflib.unified_diff(before.splitlines(True), source.splitlines(True)))
+    selector = CoverageSelector(
+        _ClosureConsumerDB(),
+        REPO_ROOT,
+        read_source=lambda _path: source,
+        external_references=lambda _path, _names: set(),
+    )
+
+    result = selector.decide([path], {path: diff})
+
+    assert result.ok, result.reason
+    assert result.impacted == {"A10-PyTorch": {"test_invokes_cached_closure"}}
+    assert result.skippable == {"A10-PyTorch": {"test_constructs_only", "test_unrelated"}}
+
+
 @pytest.mark.parametrize("covered_caller", (True, False))
 def test_selector_bounds_new_dataclass_methods_by_existing_binding_consumers(
     covered_caller: bool,

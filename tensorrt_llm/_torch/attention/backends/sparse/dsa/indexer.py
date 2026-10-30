@@ -1993,9 +1993,24 @@ class Indexer(nn.Module):
         )
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
-            topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
-                metadata.shared_topk_indices[:num_generations, :]
+            self._copy_reused_topk(
+                metadata,
+                topk_indices_buffer,
+                token_offset,
+                num_gen_tokens,
+                num_generations,
+                has_prefill,
+                gvr_prior_indices,
             )
+        elif (
+            has_decode
+            and not metadata.skip_indexer_for_gen_reqs
+            and self._fill_decode_topk(
+                metadata, q_fp8, weights, topk_indices_buffer, token_offset, num_gen_tokens
+            )
+        ):
+            # A subclass filled the generation rows.
+            pass
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
@@ -2274,29 +2289,82 @@ class Indexer(nn.Module):
                 prev_topk_dst.copy_(last_mtp_topk)
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
-            rows = None
-            if has_decode:
-                next_n = num_gen_tokens // num_generations
-                gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-                rows = self._mtp_last_accepted_rows(
-                    gen_topk, metadata, num_contexts, num_generations, next_n
-                )
-            if has_prefill:
-                ctx_last = (
-                    torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
-                )
-                ctx_rows = topk_indices_buffer[ctx_last]
-                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
-            if rows is not None:
-                shared_topk_indices = metadata.shared_topk_indices
-                if shared_topk_indices is None:
-                    metadata.shared_topk_indices = rows.contiguous()
-                else:
-                    row_start = num_contexts if is_generation else 0
-                    shared_topk_indices[
-                        row_start : row_start + rows.shape[0], : rows.shape[1]
-                    ].copy_(rows)
+            self._store_mtp_shared_rows(
+                topk_indices_buffer,
+                metadata,
+                num_contexts,
+                num_generations,
+                num_gen_tokens,
+                token_offset,
+                has_prefill,
+                has_decode,
+                is_generation,
+            )
         return topk_indices_buffer
+
+    def _copy_reused_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+        num_generations: int,
+        has_prefill: bool,
+        gvr_prior_indices: Optional[torch.Tensor],
+    ) -> None:
+        """Copy the shared TopK rows an MTP draft step reuses into its generation rows."""
+        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
+            metadata.shared_topk_indices[:num_generations, :]
+        )
+
+    def _fill_decode_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+    ) -> bool:
+        """Fill the generation TopK rows ahead of the decode branch; True if it filled them.
+
+        This class leaves them to the decode branch of ``sparse_attn_indexer``.
+        """
+        return False
+
+    def _store_mtp_shared_rows(
+        self,
+        topk_indices_buffer: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        num_contexts: int,
+        num_generations: int,
+        num_gen_tokens: int,
+        token_offset: int,
+        has_prefill: bool,
+        has_decode: bool,
+        is_generation: Optional[bool],
+    ) -> None:
+        """Store each request's last accepted TopK row for the next MTP draft step to reuse."""
+        rows = None
+        if has_decode:
+            next_n = num_gen_tokens // num_generations
+            gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+            rows = self._mtp_last_accepted_rows(
+                gen_topk, metadata, num_contexts, num_generations, next_n
+            )
+        if has_prefill:
+            ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+            ctx_rows = topk_indices_buffer[ctx_last]
+            rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+        if rows is not None:
+            shared_topk_indices = metadata.shared_topk_indices
+            if shared_topk_indices is None:
+                metadata.shared_topk_indices = rows.contiguous()
+            else:
+                row_start = num_contexts if is_generation else 0
+                shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(
+                    rows
+                )
 
     def _mtp_last_accepted_rows(
         self,

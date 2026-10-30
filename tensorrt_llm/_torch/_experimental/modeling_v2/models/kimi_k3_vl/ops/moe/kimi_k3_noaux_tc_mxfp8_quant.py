@@ -16,7 +16,7 @@ class KimiK3NoauxTcMxfp8Quant(OpWrapper):
     to noaux_tc_op), linear UE8M0 scales, one per 32 elements.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(

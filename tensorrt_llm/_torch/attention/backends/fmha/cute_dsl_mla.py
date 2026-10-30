@@ -28,6 +28,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.logger import logger
 
 from .interface import FmhaPhase
@@ -56,6 +57,9 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# ``assumed_align`` the decode runner compiles the page table and the KV
+# lengths with; their runtime pointers must keep it.
+_KERNEL_INPUT_ALIGN_BYTES = 16
 
 
 @triton.jit(
@@ -261,6 +265,33 @@ class CuteDslMlaFmha(PhasedFmha):
         return True
 
     @staticmethod
+    def _page_size_exclusive_to_cute_dsl(meta: "TrtllmAttentionMetadata") -> bool:
+        """Whether this layer's FP4 MLA 128-token KV pages are read by no other MLA generation library.
+
+        Only ``FP4_MLA_TOKENS_PER_BLOCK`` can count as exclusive; every other
+        page size keeps the default routing. The fallback thop op has
+        TRTLLM-Gen MLA generation kernels for 32-token pages only. FlashInfer
+        TRTLLM-Gen reads 128-token pages only when the KV cache manager lists
+        them in ``trtllm_gen_extra_tokens_per_block``. PrimTS reads them on its
+        SMs from an FP8 or BF16 KV cache manager; it is opt-in, but it counts
+        whether or not it is enabled.
+        """
+        from ..fp4_mla.config import FP4_MLA_TOKENS_PER_BLOCK
+        from .prims_ts import PrimsTSFmha
+
+        tokens_per_block = meta.tokens_per_block
+        if tokens_per_block != FP4_MLA_TOKENS_PER_BLOCK:
+            return False
+        kv_cache_manager = meta.kv_cache_manager
+        if tokens_per_block in getattr(kv_cache_manager, "trtllm_gen_extra_tokens_per_block", ()):
+            return False
+        return not (
+            get_sm_version() in PrimsTSFmha.SUPPORTED_SMS
+            and tokens_per_block in PrimsTSFmha.SUPPORTED_PAGE_SIZES
+            and getattr(kv_cache_manager, "dtype", None) in (DataType.FP8, DataType.BF16)
+        )
+
+    @staticmethod
     def _get_kernel_dtype(attn: "TrtllmAttention", q: torch.Tensor) -> Optional[torch.dtype]:
         if getattr(attn, "has_fp8_kv_cache", False):
             return torch.float8_e4m3fn
@@ -446,8 +477,12 @@ class CuteDslMlaFmha(PhasedFmha):
         if fwd.attention_input_type != AttentionInputType.generation_only:
             return False, "CuTe DSL MLA FMHA only supports generation-only attention."
         # Disable mixed context/generation batches until the CuTe DSL host
-        # overhead is reduced.
-        if meta.num_contexts != 0 or meta.num_generations <= 0:
+        # overhead is reduced, except when no other library reads this
+        # layer's FP4 MLA 128-token KV pages (for example an NVFP4 manager's
+        # FP8 fallback layer); this path slices the generation inputs and
+        # page tables past num_contexts.
+        exclusive_page_size = self._page_size_exclusive_to_cute_dsl(meta)
+        if meta.num_generations <= 0 or (meta.num_contexts != 0 and not exclusive_page_size):
             return False, "CuTe DSL MLA FMHA only supports decode-only batches."
         if meta.beam_width != 1:
             return False, f"Beam search is not supported, got beam_width={meta.beam_width}."
@@ -516,7 +551,7 @@ class CuteDslMlaFmha(PhasedFmha):
             and self._get_kernel_dtype(attn, q) == torch.float8_e4m3fn
             and get_sm_version() in (100, 103)
         )
-        if not (helix_h96_verify_group or fp8_wide_head_verify_group):
+        if not (helix_h96_verify_group or fp8_wide_head_verify_group or exclusive_page_size):
             # Perf gate (NOT a correctness limit).
             favorable, reason = self._is_perf_favorable(
                 attn.num_heads,
@@ -640,15 +675,11 @@ class CuteDslMlaFmha(PhasedFmha):
         local_layer_idx = attn.get_local_layer_idx(meta)
         pool_idx = int(pool_mapping[local_layer_idx, 0])
         page_table_layer = block_offsets[pool_idx, :, 0, :]
-        cache_seqs_base = params.sequence_lengths.to(torch.int32)
+        cache_seqs_base = self._decode_kv_lengths(meta, params.sequence_lengths)
         # The page-table batch dimension determines the kernel launch batch.
-        page_table = (
-            page_table_layer[meta.num_contexts : meta.num_contexts + batch_size]
-            .transpose(0, 1)
-            .to(torch.int32)
+        page_table = self._generation_page_table(
+            page_table_layer, meta.num_contexts, batch_size, layer_in_pool
         )
-        if layers_in_pool > 1:
-            page_table = page_table + layer_in_pool
 
         # KVCacheManager exposes NHD pages as [num_pages, 1, page_size, 1, head_dim].
         # The CuTe DSL kernel consumes a paged [page_size, dim, num_pages] view
@@ -708,6 +739,71 @@ class CuteDslMlaFmha(PhasedFmha):
             ),
             block_split_kvs,
         )
+
+    @staticmethod
+    def _aligned_kernel_input(tensor: torch.Tensor) -> torch.Tensor:
+        """Return ``tensor``, or a contiguous copy when its pointer breaks ``assumed_align``.
+
+        The decode runner compiles the page table and the KV lengths with a
+        16-byte ``assumed_align``, which the runtime pointer itself must keep.
+        Slicing past the context requests of a mixed batch, or into a
+        non-first pool of ``kv_cache_block_offsets``, can leave a 4- or 8-byte
+        aligned view of an aligned buffer. Aligned views (every decode-only
+        batch whose pool offset is aligned) pass through without a copy; the
+        copy otherwise comes from the caching allocator and, under CUDA graph
+        capture, replays with the graph.
+        """
+        if tensor.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return tensor
+        return tensor.clone(memory_format=torch.contiguous_format)
+
+    @classmethod
+    def _decode_kv_lengths(
+        cls,
+        meta: "TrtllmAttentionMetadata",
+        sequence_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """This step's int32 KV lengths with the kernel's pointer alignment.
+
+        A misaligned view (the generation rows of a mixed batch) is copied
+        into a staging buffer kept on ``meta``, so every layer of the step
+        passes the same pointer and ``_split_kv_plan`` plans once per step
+        instead of once per layer. Under CUDA graph capture without that
+        buffer it falls back to ``_aligned_kernel_input``.
+        """
+        lengths = sequence_lengths.to(torch.int32)
+        if lengths.data_ptr() % _KERNEL_INPUT_ALIGN_BYTES == 0:
+            return lengths
+        num_lengths = lengths.numel()
+        staging = getattr(meta, "_cute_dsl_mla_kv_lens_staging", None)
+        if staging is None or staging.numel() < num_lengths or staging.device != lengths.device:
+            if lengths.is_cuda and torch.cuda.is_current_stream_capturing():
+                return cls._aligned_kernel_input(lengths)
+            capacity = max(int(getattr(meta, "max_num_requests", 0) or 0), num_lengths)
+            staging = torch.empty(capacity, dtype=torch.int32, device=lengths.device)
+            meta._cute_dsl_mla_kv_lens_staging = staging
+        staged = staging[:num_lengths].view(lengths.shape)
+        staged.copy_(lengths)
+        return staged
+
+    @classmethod
+    def _generation_page_table(
+        cls,
+        page_table_layer: torch.Tensor,
+        num_contexts: int,
+        batch_size: int,
+        layer_in_pool: int,
+    ) -> torch.Tensor:
+        """This step's ``[max_blocks, batch]`` int32 page table for the generation requests.
+
+        ``page_table_layer`` is one pool's ``[num_seqs, max_blocks]`` view of
+        ``kv_cache_block_offsets``; ``layer_in_pool`` folds a KVCacheManagerV1
+        layer slot into the page indices.
+        """
+        rows = page_table_layer[num_contexts : num_contexts + batch_size].to(torch.int32)
+        if layer_in_pool:
+            rows = rows + layer_in_pool
+        return cls._aligned_kernel_input(rows).transpose(0, 1)
 
     @staticmethod
     def _split_kv_plan(
