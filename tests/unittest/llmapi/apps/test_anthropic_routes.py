@@ -569,23 +569,46 @@ def test_over_length_prompt_is_answered_as_anthropic_answers_it(monkeypatch, whe
     assert json.loads(body) == _PROMPT_TOO_LONG
 
 
-def test_stream_starts_without_waiting_for_a_slow_first_token(monkeypatch, short_admission_wait):
-    """The wait for a rejection is bounded; a long prefill does not hold the stream back."""
+@pytest.mark.parametrize("immediate", [True, False], ids=["immediate", "delayed"])
+def test_stream_starts_without_waiting_for_a_slow_first_token(
+    monkeypatch, short_admission_wait, immediate
+):
+    """Resume the stream exactly once, whether its first frame is ready or still pending."""
 
     async def run():
         gate = asyncio.Event()
+        if immediate:
+            gate.set()
         server = _chat_server(monkeypatch, _GatedGeneration(_reply_steps(), gate))
         response = await _messages_response(server, stream=True)
-        # Started while the first token is still pending.
+        # The delayed case starts while the first token is still pending.
         assert isinstance(response, StreamingResponse)
         gate.set()
         return await _read(response)
 
     body = asyncio.run(run())
 
-    assert body.startswith("event: message_start\n")
-    assert '"text":"hello"' in body
-    assert body.rstrip().endswith('data: {"type":"message_stop"}')
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in body.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [event["type"] for event in events] == [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ]
+    text = "".join(
+        event["content_block"]["text"]
+        if event["type"] == "content_block_start"
+        else event["delta"]["text"]
+        for event in events
+        if event["type"] in ("content_block_start", "content_block_delta")
+    )
+    assert text == "hello"
 
 
 def test_rejection_after_the_wait_ends_the_stream_in_the_same_wording(
