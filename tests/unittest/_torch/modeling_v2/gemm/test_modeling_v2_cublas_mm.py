@@ -408,6 +408,14 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
 CELLS = certified_cells(op, TARGET_CELLS)
 
 
+def test_the_entry_cells_are_all_driven() -> None:
+    """`test_certified_cells` drives every cell the entry itself declares (`op.CELLS`),
+    not only the targets' `TARGET_CELLS`: `certified_cells` keeps one cell per distinct spec."""
+    driven = {repr(sorted(c.spec.items())) for c in CELLS}
+    undriven = [c.why for c in op.CELLS if repr(sorted(c.spec.items())) not in driven]
+    assert not undriven, f"entry cells test_certified_cells does not drive: {undriven}"
+
+
 @pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
