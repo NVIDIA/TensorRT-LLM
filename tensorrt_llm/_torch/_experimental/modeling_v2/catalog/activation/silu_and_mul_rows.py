@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's shared expert: intermediate 640, the fused GEMM output row 2 * 640 + 8.
 _INTER = 640

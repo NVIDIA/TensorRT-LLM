@@ -12,11 +12,11 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.activation.silu_and_mul_rows__r35 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul_rows import (  # noqa: E501
     silu_and_mul_rows as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "silu_and_mul_rows requires a CUDA device"

@@ -122,6 +122,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_tanh import gelu_tanh
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul_rows import (
+    silu_and_mul_rows,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -152,7 +155,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
-from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_expand_block_indices import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk import qsa_mtp_reuse_topk
