@@ -131,12 +131,16 @@ def test_setup_aliases_does_not_read_meta_weights() -> None:
 
     assert model.model.layers[0].next_layer_layernorm is model.model.layers[1].input_layernorm
     assert model.model.layers[1].next_layer_layernorm is model.model.norm
-    assert not hasattr(model.model.norm, "_fused_norm_weight")
+    assert model.model.norm._fused_norm_weight is None
 
 
 @torch.no_grad()
 def test_cache_derived_state_refreshes_gemma_norm_weight() -> None:
     model = _new_causal_lm()
+    # No decoder layers: only the norm weight precompute runs.
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList()
+    model.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=0))
     model.gemma_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16, use_gemma=True)
     model.standard_norm = RMSNorm(hidden_size=4, eps=1e-6, dtype=torch.bfloat16)
     model.gemma_norm.weight.copy_(torch.tensor([-0.5, 0.0, 0.5, 1.0], dtype=torch.bfloat16))
@@ -147,7 +151,7 @@ def test_cache_derived_state_refreshes_gemma_norm_weight() -> None:
     # Exact: cache_derived_state bakes (1+weight) with the same fp32-add-then-
     # cast recomputed here, so the result must be bitwise-identical.
     torch.testing.assert_close(model.gemma_norm._fused_norm_weight, expected, atol=0.0, rtol=0.0)
-    assert not hasattr(model.standard_norm, "_fused_norm_weight")
+    assert model.standard_norm._fused_norm_weight is None
 
     model.gemma_norm.weight.add_(1.0)
     model.cache_derived_state()

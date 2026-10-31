@@ -5133,18 +5133,19 @@ def is_static_nvfp4_input_eligible(linear) -> bool:
     eligible to have its input-quantize folded into a producing RMSNorm.
 
     Eligible iff the Linear quantizes activations to NVFP4, has a calibrated
-    (static) `input_scale`, has no AWQ `pre_quant_scale`, and is not forced to
-    dynamic quantization. This is the single canonical definition shared by
-    every NVFP4-fold site (the layer-boundary / dense folds in
-    modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold in
-    attention.py's MLA) so the gate cannot drift between them.
+    (static) `input_scale`, has no AWQ `pre_quant_scale`, is not forced to
+    dynamic quantization, and accepts a pre-quantized input. This is the single
+    canonical definition shared by every NVFP4-fold site (the layer-boundary /
+    dense folds in modeling_deepseekv3.py and the q_a_layernorm -> q_b_proj fold
+    in attention.py's MLA) so the gate cannot drift between them.
     """
     if linear is None:
         return False
     return (getattr(linear, "has_nvfp4_activation_quantization", False)
             and not getattr(linear, "force_dynamic_quantization", False)
             and getattr(linear, "input_scale", None) is not None
-            and getattr(linear, "pre_quant_scale", None) is None)
+            and getattr(linear, "pre_quant_scale", None) is None
+            and not getattr(linear, "requires_unquantized_activation", False))
 
 
 def is_dynamic_nvfp4_input_eligible(linear) -> bool:
@@ -5161,6 +5162,7 @@ def is_dynamic_nvfp4_input_eligible(linear) -> bool:
 class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
+    requires_unquantized_activation: ClassVar[bool] = True
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
