@@ -10,9 +10,9 @@ Wraps the in-tree module callable
 Triton kernel ``_cached_replay_kernel`` -- plain ``triton.jit``, no autotuner;
 the Python body picks the launch configuration from the shapes.
 
-This target's local variant (r46) of the tp1 target's entry of the same name: tp1's
-cells, plus a tp4/tep4 rank's 4 key / 12 value heads over the stock tep4 engine's bf16
-state page.
+Shared by the qwen4_exp tp1 target and the unified target (promoted from their copies):
+the tp1 target's cells, plus a tp4/tep4 rank's 4 key / 12 value heads over the stock tep4
+engine's bf16 state page.
 """
 
 from __future__ import annotations
@@ -22,10 +22,11 @@ from typing import Optional
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     fused_recurrent_gated_delta_rule_cached_replay_update as _cached_replay_update,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's GDN geometry at tp1.
 NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 16, 48, 128, 128
@@ -249,7 +250,7 @@ class FusedRecurrentGatedDeltaRuleCachedReplayUpdate(OpWrapper):
     when it does commit twice -- both silent at the op and far off the exact
     recurrence one step later.
 
-    This target at tp4/tep4 (`DecodeTarget._gdn_verify -> _replay_verify`): a rank's
+    The unified target at tp4/tep4 (`DecodeTarget._gdn_verify -> _replay_verify`): a rank's
     4 key / 12 value heads, q/k/v the `[N, T, 4|12, 128]` views of the post-conv
     `[N*T, 2560]` rows, `g`/`beta` `[N, T, 12]`, and `ssm_states` the layer's view of the
     stock manager's bf16 state page, `[slots, 12, 128, 128]` at a slot stride of 36

@@ -17,8 +17,11 @@ import tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_fl
 
 _spec = importlib.util.spec_from_file_location(
     "trep",
+    # The Triton entry's test, in the catalog tree (tests/unittest/_torch/modeling_v2/ssm).
     os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
+        *[os.pardir] * 4,
+        "ssm",
         "test_modeling_v2_fused_recurrent_gated_delta_rule_cached_replay_update.py",
     ),
 )

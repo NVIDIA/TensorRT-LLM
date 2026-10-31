@@ -242,6 +242,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.cu_seqlens_from_s
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (
     flashinfer_chunk_gated_delta_rule,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
     MAX_ROWS as _GDN_DECODE_FUSED_MAX_ROWS,
 )
@@ -340,9 +343,6 @@ from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
 from .ops.ssm.fused_gdn_gating import fused_gdn_gating
-from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (
-    fused_recurrent_gated_delta_rule_cached_replay_update,
-)
 from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gated_delta_rule_update
 from .ops.ssm.gdn_cached_replay_cute import gdn_cached_replay_cute
 from .ops.ssm.gdn_in_proj_conv1d_pdl import MAX_ROWS as _GDN_CONV_FUSED_MAX_ROWS

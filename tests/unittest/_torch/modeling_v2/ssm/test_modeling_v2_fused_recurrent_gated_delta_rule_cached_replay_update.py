@@ -36,7 +36,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update__r46 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     ALL_LAYER_COMMIT_MIN_BATCH,
     HEAD_K_DIM,
     HEAD_V_DIM,
@@ -46,7 +46,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     PACKED_QKV_WIDTH,
     RANK_V_HEADS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update__r46 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update as op,
 )
 from tensorrt_llm._torch.modules.fla.cache_manager import (
@@ -59,7 +59,7 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_triton
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import ULP, certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), (

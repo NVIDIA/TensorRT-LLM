@@ -239,6 +239,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.cu_seqlens_from_s
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.flashinfer_chunk_gated_delta_rule import (
     flashinfer_chunk_gated_delta_rule,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
+    fused_recurrent_gated_delta_rule_cached_replay_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_rows_gated_norm import (
     gdn_decode_rows,
     gdn_decode_rows_gated_norm,
@@ -274,9 +277,6 @@ from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
-from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update__r46 import (
-    fused_recurrent_gated_delta_rule_cached_replay_update,
-)
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
