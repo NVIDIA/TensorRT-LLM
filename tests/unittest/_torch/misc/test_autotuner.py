@@ -1791,6 +1791,23 @@ def test_parallel_tactics_split_skips_non_helix_cp_ranks():
         tactics, DistributedTuningStrategy.PARALLEL) == tactics
 
 
+def test_parallel_tactics_short_list_not_split_across_helix_cp_ranks():
+    """A tactic list shorter than the Helix TP*CP group is not sharded."""
+    from tensorrt_llm.mapping import CpType
+
+    tactics = list(range(3))
+    for rank in range(4):
+        tuner = autotuner.AutoTuner()
+        mapping = Mapping(world_size=4,
+                          rank=rank,
+                          tp_size=1,
+                          cp_size=4,
+                          cp_config={"cp_type": CpType.HELIX})
+        tuner.setup_distributed_state(mapping, dist=object())
+        assert tuner._maybe_parallelize_tactics(
+            tactics, DistributedTuningStrategy.PARALLEL) == tactics
+
+
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
     # ast.literal_eval-parsable, so the cache serializes tactic.value instead.

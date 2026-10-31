@@ -106,6 +106,55 @@ def test_merge_matches_the_non_causal_oracle(block_size, window, heads):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("causal", [False, True])
+def test_windowed_decode_and_merge_use_cache_precision(cache_dtype, causal):
+    """Check the decode boundary and future-block merge against rounded cache values."""
+    torch.manual_seed(17)
+    batch, block_size, num_heads, num_kv_heads, head_dim = 2, 3, 4, 2, 8
+    query = torch.randn(batch, block_size, num_heads, head_dim, dtype=torch.bfloat16)
+    block_key = torch.randn(batch, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
+    block_value = torch.randn_like(block_key)
+    rounded_query = query.to(cache_dtype)
+    keys = block_key.to(cache_dtype).float().unbind()
+    values = block_value.to(cache_dtype).float().unbind()
+    context_lengths = [0] * batch
+    causal_out, causal_lse = _oracle(
+        rounded_query, keys, values, context_lengths, 1, 0, causal=True
+    )
+    expected, _ = _oracle(rounded_query, keys, values, context_lengths, 1, 1, causal=causal)
+    cache = torch.empty(1, 2, num_kv_heads, 4, head_dim, dtype=cache_dtype)
+    out = torch.empty_like(causal_out)
+
+    def decode(**kwargs):
+        assert kwargs["query"].dtype == kwargs["kv_cache"][0].dtype == cache_dtype
+        torch.testing.assert_close(
+            kwargs["query"].float(), rounded_query.float().reshape_as(kwargs["query"])
+        )
+        kwargs["out"].copy_(causal_out)
+        if kwargs["return_lse"]:
+            return kwargs["out"], causal_lse / math.log(2.0)
+        return kwargs["out"]
+
+    dflash_trtllm_windowed_block_attention(
+        SimpleNamespace(batch_decode_with_kv_cache=decode),
+        query,
+        block_key,
+        block_value,
+        cache,
+        torch.zeros(batch, 1, dtype=torch.int32),
+        torch.full((batch,), block_size, dtype=torch.int32),
+        4,
+        causal,
+        (1, 0 if causal else 1),
+        torch.empty(0),
+        torch.empty(0),
+        out,
+    )
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
 def _wrapper(cls, config, layer_windows=(), backend="TRTLLM"):
     wrapper = cls.__new__(cls)
     torch.nn.Module.__init__(wrapper)

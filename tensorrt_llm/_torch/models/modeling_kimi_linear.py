@@ -143,6 +143,11 @@ from ..utils import AuxStreamType
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
+# Helix MLA generation applies the V up-projection of all heads before the CP
+# all-to-all (see ``MLA._helix_project_v_partials``), which needs every head's
+# BF16 V weight on each rank.
+_K3_HELIX_V_UP_BEFORE_A2A = os.environ.get("TRTLLM_HELIX_V_UP_BEFORE_A2A", "0") == "1"
+
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
 _K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
@@ -3032,6 +3037,11 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         )
         attention.k_b_proj_trans.data.copy_(key_weight.transpose(1, 2))
         attention.k_b_proj_trans_scale.data.copy_(key_scale.transpose(1, 2))
+        if _K3_HELIX_V_UP_BEFORE_A2A and attention.mapping.has_cp_helix():
+            expanded = value_scale.repeat_interleave(_FP8_BLOCK, -2).repeat_interleave(
+                _FP8_BLOCK, -1
+            )
+            attention._bind_helix_v_up_weight((value_weight.float() * expanded).to(torch.bfloat16))
         value_weight = _helix_cp_v_b_shard(
             value_weight,
             num_heads_tp_cp=attention.num_heads_tp_cp,
@@ -3349,6 +3359,8 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
                     cp_rank=mla_mixer.mapping.cp_rank,
                 )
                 mla_mixer.v_b_proj = nn.Parameter(v_weight, requires_grad=False)
+                if _K3_HELIX_V_UP_BEFORE_A2A and mla_mixer.mapping.has_cp_helix():
+                    mla_mixer._bind_helix_v_up_weight(param[h * n :].view(h, v, kv))
                 return
             if name.endswith(".A_log") and src.numel() != param.numel():
                 # The checkpoint pads A_log from [num_heads] to [head_dim]

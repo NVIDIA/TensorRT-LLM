@@ -2185,6 +2185,7 @@ MnnvlFusionPattern getMnnvlFusionPattern(AllReduceFusionOp fusionOp)
     {
     case AllReduceFusionOp::NONE: return MnnvlFusionPattern::kAllReduce;
     case AllReduceFusionOp::RMS_NORM: return MnnvlFusionPattern::kARRMSNorm;
+    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE: return MnnvlFusionPattern::kARRMSNormFP8BlockScale;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return MnnvlFusionPattern::kARResidualRMSNorm;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return MnnvlFusionPattern::kARResidualRMSNormFP8Quant;
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return MnnvlFusionPattern::kARResidualRMSNormFP4Quant;
@@ -2259,7 +2260,8 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
         // kARRMSNorm has no residual operand (kHasResidual/kHasResidualOut
         // are both false), so residual_in is optional for it alone.
-        bool const needsResidual = fusionOp != AllReduceFusionOp::RMS_NORM;
+        bool const needsResidual
+            = fusionOp != AllReduceFusionOp::RMS_NORM && fusionOp != AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE;
         TORCH_CHECK(gamma.has_value() && epsilon.has_value(),
             "[mnnvlFusionAllReduce] gamma and epsilon must be provided for RMSNorm fusion");
         TORCH_CHECK(!needsResidual || residual_in.has_value(),
@@ -2317,6 +2319,25 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         }
     }
 
+    // FP8 1x128 block-scale quant: shapes replicate fp8_quantize_1x128_packed_ue8m0
+    // (value buffer padded to 4 rows, scale buffer a [num_packed_sf_k,
+    // scaleLeadingDim] int32 block viewed MN-major), so the consumer GEMM cannot
+    // tell this from a standalone-quantized activation.
+    int64_t scaleLeadingDim = 0;
+    int64_t numPackedSfK = 0;
+    at::Tensor sfBuf;
+    if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE)
+    {
+        TORCH_CHECK(hiddenDim % 128 == 0, "[mnnvlFusionAllReduce] FP8 block-scale quant needs hidden % 128 == 0, got ",
+            hiddenDim);
+        numPackedSfK = ((hiddenDim / 128) + 3) / 4;
+        int64_t const tPadded = (numTokens + 3) / 4 * 4;
+        constexpr int64_t kTmaAlignedUint32Elems = 4;
+        scaleLeadingDim = (tPadded + kTmaAlignedUint32Elems - 1) / kTmaAlignedUint32Elems * kTmaAlignedUint32Elems;
+        quantOut = at::detail::empty_cuda({tPadded, hiddenDim}, torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+        sfBuf = at::detail::empty_cuda({numPackedSfK, scaleLeadingDim}, torch::kInt32, input.device(), std::nullopt);
+    }
+
     auto allreduce_params = tensorrt_llm::kernels::mnnvl::AllReduceFusionParams();
     allreduce_params.nRanks = mcast_mem->getWorldSize();
     allreduce_params.rank = mcast_mem->getRank();
@@ -2352,6 +2373,12 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
         allreduce_params.quantOut = quantOut.mutable_data_ptr();
         allreduce_params.scaleOut = scaleOut.defined() ? scaleOut.mutable_data_ptr() : nullptr;
         allreduce_params.scaleFactor = scale.value().data_ptr<float>();
+    }
+    else if (fusionOp == AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE)
+    {
+        allreduce_params.quantOut = quantOut.mutable_data_ptr();
+        allreduce_params.scaleOut = sfBuf.mutable_data_ptr();
+        allreduce_params.sfLeadingDim = static_cast<int>(scaleLeadingDim);
     }
 
     allreduce_params.rmsNormFusion = hasRmsNormFusion;
@@ -2392,6 +2419,13 @@ std::vector<torch::Tensor> mnnvlFusionAllReduce(torch::Tensor& input, torch::opt
     {
     case AllReduceFusionOp::NONE: return {reduceOut};
     case AllReduceFusionOp::RMS_NORM: return {normOut};
+    case AllReduceFusionOp::RMS_NORM_QUANT_FP8_BLOCKSCALE:
+        // Scales go back MN-major -- [T, num_packed_sf_k] with stride
+        // (1, scaleLeadingDim) -- which is the layout the deep_gemm runner wants.
+        return {quantOut.slice(0, 0, numTokens),
+            at::from_blob(
+                sfBuf.mutable_data_ptr(), {numTokens, numPackedSfK}, {1, scaleLeadingDim},
+                [keep = sfBuf](void*) mutable {}, sfBuf.options())};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {normOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quantOut, residualOut};
     case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {normOut, quantOut, residualOut};

@@ -2140,6 +2140,18 @@ class AutoTuner:
             # Each rank of the tuning group only tunes its share of tactics;
             # _merge_cache_data then keeps the fastest across the group.
             group_size, group_index = self._tuning_group()
+            # Sharding a candidate list shorter than the group size by
+            # idx % group_size leaves the ranks with
+            # group_index >= len(all_valid_tactics) with an EMPTY shard. Those
+            # ranks then find no valid (runner, tactic) pair and emit a
+            # spurious "No valid runner/tactic was found" warning, while also
+            # diverging in tuning wall-time from the ranks that did get work
+            # (a per-rank desync hazard for the following collective).
+            # Parallelizing such a short list saves almost nothing, so have
+            # every rank profile the full list instead; the subsequent
+            # _merge_cache_data allgather still keeps the min-time winner.
+            if len(all_valid_tactics) < group_size:
+                return all_valid_tactics
             return [
                 tactic for idx, tactic in enumerate(all_valid_tactics)
                 if idx % group_size == group_index

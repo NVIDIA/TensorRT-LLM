@@ -6076,6 +6076,69 @@ def test_cutedsl_fc12_outer_runner_unique_id_includes_epilogue():
     assert situ(inputs, tactic=-1, do_preparation=True) is inputs[4]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_tokens", [0, 4])
+@pytest.mark.parametrize("with_event", [False, True])
+@pytest.mark.parametrize("provided_output", [False, True])
+def test_cutedsl_fc12_input_ready_event(monkeypatch, num_tokens, with_event, provided_output):
+    """Each forward joins once before input consumption, including empty batches."""
+    backend = CuteDslFc12FusedMoE.__new__(CuteDslFc12FusedMoE)
+    torch.nn.Module.__init__(backend)
+    backend._weights_created = True
+    backend.quant_config = SimpleNamespace(layer_quant_mode=SimpleNamespace(has_nvfp4=lambda: True))
+    backend.hidden_size = 16
+    backend.num_slots = 8
+    backend.use_fused_finalize = True
+    backend.activation_type = ActivationType.Swiglu
+    backend.act_clamp = float("inf")
+    backend.fc2_input_scale = torch.ones(1)
+    backend.mapping = SimpleNamespace(moe_ep_size=1)
+    weights = MagicMock(expert_size_per_partition=8, slot_start=0)
+    calls = []
+
+    def fused_op(**kwargs):
+        calls.append("kernel")
+
+    monkeypatch.setattr(torch.ops.trtllm, "moe_sort", lambda **kwargs: (None,) * 6, raising=False)
+    monkeypatch.setattr(
+        torch.ops.trtllm, "cute_dsl_nvfp4_fc12_fused_rubin", fused_op, raising=False
+    )
+    monkeypatch.setattr(CuteDslFc12FusedMoENvfp4Runner, "get_tuning_config", lambda self: None)
+
+    def choose_one(name, runners, config, inputs):
+        assert num_tokens > 0, "Empty batches must not enter autotuning"
+        # Exercise repeated dispatch within one forward, as during autotuning.
+        runners[0](inputs, tactic=128)
+        return runners[0], 128
+
+    tuner = SimpleNamespace(choose_one=Mock(side_effect=choose_one))
+    monkeypatch.setattr(AutoTuner, "get", staticmethod(lambda: tuner))
+    output = torch.empty((num_tokens, backend.hidden_size), dtype=torch.bfloat16)
+    for _ in range(2):
+        calls.clear()
+        event = Mock() if with_event else None
+        if event is not None:
+            event.wait.side_effect = lambda: calls.append("wait")
+        result = backend.run_moe_nvfp4(
+            x=torch.zeros((num_tokens, backend.hidden_size // 2), dtype=torch.uint8),
+            token_selected_experts=torch.zeros((num_tokens, 2), dtype=torch.int32),
+            token_final_scales=torch.ones((num_tokens, 2), dtype=torch.float32),
+            x_sf=torch.ones(1, dtype=torch.uint8),
+            moe_output=output if provided_output else None,
+            weight_view=weights,
+            x_ready_event=event,
+        )
+        assert calls == (["wait"] if with_event else []) + (["kernel"] * 2 if num_tokens else [])
+        if event is not None:
+            event.wait.assert_called_once_with()
+        assert getattr(backend, "_pending_x_ready_event", None) is None
+        assert result.shape == output.shape
+        assert result.dtype == torch.bfloat16
+        if provided_output:
+            assert result is output
+    assert tuner.choose_one.call_count == (2 if num_tokens else 0)
+
+
 def test_unresolvable_layer_error_carries_rejection_details():
     """describe() prints reason codes only, so impl_class_for has to add the
     details -- without them a shape rejection reaches the operator as a bare

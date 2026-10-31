@@ -265,7 +265,7 @@ def test_embedded_checkpoint_load_preserves_optional_confidence_bias(monkeypatch
     draft.mtp_layers = nn.ModuleList([stage])
     draft.num_stages = 1
     draft.post_load_weights = Mock()
-    draft.cache_attn_weights_from_state_dict = Mock()
+    draft._use_bf16_linear = False
     wrapper = modeling_dspark.DSv4DSparkForCausalLM.__new__(modeling_dspark.DSv4DSparkForCausalLM)
     nn.Module.__init__(wrapper)
     wrapper.dspark_model = draft
