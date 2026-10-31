@@ -9,7 +9,8 @@ cell.
 
 The matrix is ``_allreduce_op_matrix.py`` beside this file. Its cells are
 keyed by world size, so it runs once per size the gpt-oss and deepseek default
-targets are certified at; world 8 in one node needs a B200/B300. The world-8
+targets are certified at; the qwen4 unified target's plain-sum (``op=NONE``)
+cells are world 4 only. World 8 in one node needs a B200/B300. The world-8
 MNNVL entry is not collected here: it runs as one srun task per rank (see
 ``_mnnvl_allreduce_op_matrix.py``).
 """

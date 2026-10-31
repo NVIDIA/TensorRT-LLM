@@ -200,6 +200,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allgather import allgather
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import NONE as _SUM_ONLY
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm.allreduce import (
+    allreduce,
+    allreduce_group_args,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
     cublas_mm as mtp_cublas_mm,
@@ -290,8 +295,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
-from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
-from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
 from .ops.comm.reducescatter__r7 import reducescatter
 
 # The GPU architecture this target is certified for; a direct instantiation could

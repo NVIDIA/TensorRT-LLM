@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Sum across ranks, then add the residual and RMS-normalize, via the trtllm allreduce op."""
+"""Sum across ranks, then add the residual and RMS-normalize, via the trtllm allreduce op.
+
+Also the plain sum (`op=NONE`): the qwen4 unified target's cells, at hidden
+2560, are merged into the gpt-oss and deepseek default targets' fused ones.
+"""
 
 from __future__ import annotations
 
@@ -13,9 +17,14 @@ from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 
 from .._op import Arch, Cell, OpWrapper
 
-#: The fusion this entry certifies: `residual_out = sum(input) + residual`,
-#: `norm_out = rmsnorm(residual_out) * norm_weight`.
+#: The fusion the gpt-oss and deepseek targets call: `residual_out = sum(input)
+#: + residual`, `norm_out = rmsnorm(residual_out) * norm_weight`.
 RESIDUAL_RMS_NORM = int(AllReduceFusionOp.RESIDUAL_RMS_NORM)
+
+#: No fusion: the sum alone, one fresh tensor out. What the qwen4 unified
+#: target calls, because its hyper-connection inject (replicated on every
+#: rank) consumes the reduced block output rather than a normed residual.
+NONE = int(AllReduceFusionOp.NONE)
 
 #: The strategy the default targets pass. The op picks a kernel by message
 #: size and topology: one-shot or two-shot over the IPC workspace inside one
@@ -81,6 +90,8 @@ class Allreduce(OpWrapper):
     and across trays this op falls back to NCCL with an unfused norm.
     """
 
+    # The RESIDUAL_RMS_NORM cells are certified on both; the qwen4 `NONE` cells
+    # were driven on sm_103 (GB300) only -- see `note`.
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
     # The gpt-oss default target at attention TP2, TP4 and TP8, inside one
@@ -95,6 +106,11 @@ class Allreduce(OpWrapper):
     _DEEPSEEK = dict(
         hidden=7168, dtype=torch.bfloat16, eps=1e-6, op=RESIDUAL_RMS_NORM, strategy=AUTO
     )
+    # The qwen4 unified target (Qwen3.8-Flash-Next) at tp4 and tep4: the plain
+    # sum of the attention / GDN out-projection partials and of the MoE
+    # partials, twice per layer, on the full token set every rank holds.
+    # `eps` is not read under NONE, so it is no axis here.
+    _QWEN4 = dict(hidden=2560, dtype=torch.bfloat16, op=NONE, strategy=AUTO)
 
     CELLS: tuple[Cell, ...] = (
         Cell(why="decode, one token, tp4", spec=dict(world=4, rows=1, **_GPT_OSS)),
@@ -152,20 +168,84 @@ class Allreduce(OpWrapper):
             why="deepseek, a full 8192-token prefill chunk, tp8 in one node",
             spec=dict(world=8, rows=8192, **_DEEPSEEK),
         ),
+        # Qwen3.8-Flash-Next at tp4 / tep4. AUTO takes the one-shot IPC kernel
+        # below 2048 rows and NCCL from 2048 (see `note`).
+        Cell(
+            why="qwen4 plain sum, decode, one token, tp4: the one-shot kernel",
+            spec=dict(world=4, rows=1, **_QWEN4),
+        ),
+        Cell(
+            why="qwen4 plain sum, the 128-request decode batch, tp4",
+            spec=dict(world=4, rows=128, **_QWEN4),
+        ),
+        Cell(
+            why="qwen4 plain sum, 1024 rows (128 x MTP-7 verify), tp4: the widest one-shot call",
+            spec=dict(world=4, rows=1024, **_QWEN4),
+        ),
+        Cell(
+            why="qwen4 plain sum, an 8192-token prefill chunk, tp4: the NCCL path",
+            spec=dict(world=4, rows=8192, **_QWEN4),
+        ),
     )
 
     note = """
-    Only `RESIDUAL_RMS_NORM` is certified: it is the one fusion the targets
-    call. `reference` also computes `NONE`; the quantizing fusions (FP8, NVFP4
-    outputs) are not modelled.
+    Two fusions are certified: `RESIDUAL_RMS_NORM` (gpt-oss, deepseek) and
+    `NONE` (qwen4 unified). `NONE` is certified at world 4, hidden 2560 only,
+    and on sm_103 only: its cells were measured on GB300, never on sm_100.
+    The quantizing fusions (FP8, NVFP4 outputs) are not modelled.
+
+    `torch.ops.trtllm.allreduce` / `allreduce_pg` are compiled-in C++
+    (`cpp/tensorrt_llm/thop/allreduceOp.cpp`, `allreduce_raw`), not JIT; the
+    data type is taken from `input`.
+
+    Which kernel answers under AUTO is the C++ op's choice per call
+    (`AllreduceOp::selectImplementation`). It goes to NCCL when the message
+    outgrows the IPC workspace (64 MiB, `getMaxRequiredWorkspaceSize`, and
+    `max_workspace_size_auto` on the Python side). Otherwise it reads
+    `selectStrategyLookUpTable`, keyed by `log2(hidden)` and `log2(rows)`,
+    both truncated, so hidden 2560 reads the 2048 row. At world 4 with `NONE`
+    on sm_10x that row picks ONESHOT for every row bucket below 2048 (1 to
+    2047 rows) and NCCL from 2048 rows. So the 1, 128 and 1024-row cells run
+    the one-shot IPC kernel, and the 8192-row cell (40 MiB, inside the
+    workspace) runs NCCL. 1025 to 2047 rows share the 1024 cell's bucket.
+
+    `NONE` returns the sum alone; `residual`, `norm_weight` and `eps` are
+    not read, and the caller adds its own residual.
+
+    `NONE` measured on GB300 at world 4, hidden 2560 (`_allreduce_op_matrix.py`,
+    one seed per cell):
+    - 1, 128 and 1024 rows (one-shot): bitwise the reference, an fp32 sum of
+      the four bf16 partials rounded once.
+    - 8192 rows (NCCL): 2.59 ulp per element against the row scale, 0.76 ulp
+      relative RMS, cosine 0.9999956.
+    - Every rank gets the same bits back, at 1, 128, 1024 and 8192 rows. Under
+      tep4 each rank routes the sum to its own expert window, so a rank whose
+      copy differed could break a top-k tie differently with no error.
+    - CUDA-graph replay at 1, 8, 13, 128, 512 and 1024 rows (decode, and
+      128-request MTP-3 / MTP-7 verifies), twice per graph, stays in the band.
+    - A sum missing one rank reads 189 / 148 ulp (one-shot) and 230 / 148 ulp
+      (NCCL) against the test's 5 / 1.25 band.
 
     The cells run the `_pg` symbol, because the certification matrix starts its
     ranks without MPI. A served engine under `mpirun` or
     `trtllm-llmapi-launch` runs the MPI symbol. Both dispatch to the same
     `AllreduceOp` in C++; only the communicator differs.
 
+    So the 8192-row `NONE` cell runs c10d `ProcessGroup::allreduce`, while a
+    served engine's MPI symbol runs `ncclAllReduce` on the TP communicator.
+    The one-shot cells run the same IPC kernel under either symbol.
+
     `trigger_completion_at_end` only changes when the next kernel may launch
     under PDL. It is not a cell axis.
+
+    Not certified for `NONE`:
+    - sm_100 (B200, GB200): the cells were driven on sm_103 only;
+    - world 2 (a tep2 context engine) and world 8;
+    - hidden other than 2560;
+    - fp16 and fp32 inputs;
+    - the MPI symbol's NCCL path;
+    - CUDA-graph capture of the NCCL path (a breakable prefill segment at
+      2048 rows or more).
     """
 
     def __call__(
