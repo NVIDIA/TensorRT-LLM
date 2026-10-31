@@ -13,15 +13,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    ACTION_ASPECT_RATIO_LABELS,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
-    VIDEO_RES_SIZE_INFO,
     action_reference_frame_step,
     action_reference_size,
     crop_action_latent,
-    find_closest_target_size,
-    normalize_action_resolution,
     prepare_action_latents,
     resize_and_pad_action_image,
     resolve_action_content_size,
@@ -36,6 +32,14 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_POLICY_SAMPLING_PARAMS,
     get_domain_preset,
     resolve_checkpoint_policy_defaults,
+)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
+    COSMOS3_ASPECT_RATIO_BUCKETS,
+    VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
+    normalize_action_resolution,
+)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
     resolve_domain_action_config,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
@@ -68,14 +72,14 @@ class TestFindClosestTargetSize:
         )
 
     def test_unknown_resolution_raises(self):
-        with pytest.raises(ValueError, match="Unknown Cosmos3 action resolution"):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 resolution"):
             find_closest_target_size(480, 832, 1080)
 
     @pytest.mark.parametrize("action_resolution", sorted(VIDEO_RES_SIZE_INFO))
     def test_all_buckets_have_aspect_entries(self, action_resolution):
         # find_closest_target_size picks from whatever entries exist, so a bucket
         # that lost "9,16" would silently land portrait sources on another canvas.
-        assert set(VIDEO_RES_SIZE_INFO[action_resolution]) == set(ACTION_ASPECT_RATIO_LABELS)
+        assert set(VIDEO_RES_SIZE_INFO[action_resolution]) == set(COSMOS3_ASPECT_RATIO_BUCKETS)
 
 
 class TestResolveActionSize:

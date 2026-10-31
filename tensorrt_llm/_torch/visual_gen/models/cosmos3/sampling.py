@@ -113,15 +113,21 @@ class Cosmos3SamplingPolicy:
 
     @classmethod
     def from_scheduler(
-        cls, scheduler: Any, native_flow_schedule: bool = False
+        cls,
+        scheduler: Any,
+        native_flow_schedule: bool = False,
+        fixed_sigmas: "tuple[float, ...] | None" = None,
     ) -> "Cosmos3SamplingPolicy":
         """Derive the policy from a loaded scheduler's config.
 
         Valid recipes: UniPC without fixed sigmas (base) and stochastic
         FlowMatchEuler with a nonempty ``fixed_step_sampler_config.t_list``
-        (distilled); anything else fails here, at load time.
+        (distilled); anything else fails here, at load time. ``fixed_sigmas`` is the
+        schedule as the checkpoint resolver read it; when omitted it is read from the
+        scheduler's own config.
         """
-        fixed_sigmas = _resolve_distilled_sigmas(scheduler.config)
+        if fixed_sigmas is None:
+            fixed_sigmas = _resolve_distilled_sigmas(scheduler.config)
         is_unipc = isinstance(scheduler, UniPCMultistepScheduler)
         is_flow_match = isinstance(scheduler, FlowMatchEulerDiscreteScheduler)
 
@@ -174,20 +180,6 @@ class Cosmos3SamplingPolicy:
     @property
     def is_distilled(self) -> bool:
         return self.fixed_sigmas is not None
-
-    def generation_default_overrides(self) -> dict:
-        """Checkpoint-mandated overrides of the table generation defaults.
-
-        Merged over the checkpoint family's video table by the pipeline's
-        ``default_generation_params``, so executor-merged requests arrive
-        carrying the checkpoint's true defaults.
-        """
-        if not self.is_distilled:
-            return {}
-        return {
-            "num_inference_steps": len(self.fixed_sigmas),
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
 
     def num_steps(self, default: int) -> int:
         """The only step count this policy can run: fixed for distilled, else ``default``."""

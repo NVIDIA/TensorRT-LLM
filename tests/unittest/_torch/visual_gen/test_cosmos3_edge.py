@@ -381,7 +381,6 @@ class TestEdgeTransformerStructure:
         assert model.audio_gen is False
         assert model.has_action_weights is True
         assert model.temporal_compression_factor == 4
-        assert model.temporal_compression_factor_declared is True
 
     def test_und_attention_norms(self, model):
         attn = model.language_model.layers[0].self_attn
@@ -855,11 +854,6 @@ class TestEdgeDefaults:
             }
         )
 
-        policy = pipeline._mode_params("video", action_mode=ACTION_MODE_POLICY)
-
-        assert policy["num_inference_steps"] == 4
-        assert policy["guidance_scale"] == 3.0
-        assert policy["guidance_interval"] == COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"]
         resolved_policy = pipeline._resolve_generation_params(
             "video",
             action_mode=ACTION_MODE_POLICY,
@@ -872,14 +866,8 @@ class TestEdgeDefaults:
             "guidance_scale": 3.0,
             "guidance_interval": COSMOS3_POLICY_SAMPLING_PARAMS["guidance_interval"],
         }
-        assert (
-            pipeline._mode_params("video", action_mode=ACTION_MODE_FORWARD_DYNAMICS)
-            is COSMOS3_ACTION_PARAMS
-        )
-        assert (
-            pipeline._mode_params("video", action_mode=ACTION_MODE_INVERSE_DYNAMICS)
-            is COSMOS3_ACTION_PARAMS
-        )
+        assert pipeline._mode_table("video", ACTION_MODE_FORWARD_DYNAMICS) is COSMOS3_ACTION_PARAMS
+        assert pipeline._mode_table("video", ACTION_MODE_INVERSE_DYNAMICS) is COSMOS3_ACTION_PARAMS
         for action_mode in (ACTION_MODE_FORWARD_DYNAMICS, ACTION_MODE_INVERSE_DYNAMICS):
             resolved = pipeline._resolve_generation_params(
                 "video",
@@ -893,7 +881,7 @@ class TestEdgeDefaults:
                 "guidance_scale": 1.0,
                 "guidance_interval": None,
             }
-        assert pipeline._mode_params("video") is COSMOS3_EDGE_VIDEO_PARAMS
+        assert pipeline._mode_table("video") is COSMOS3_EDGE_VIDEO_PARAMS
 
     @pytest.mark.parametrize(
         "action_mode",
@@ -1056,23 +1044,6 @@ class TestEdgeDefaults:
         assert captured["guidance_scale"] == 5.0
         assert captured["max_sequence_length"] == 4096
 
-    def test_declared_temporal_factor_must_match_vae(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-            _validate_temporal_compression,
-        )
-
-        declared = SimpleNamespace(
-            temporal_compression_factor=4, temporal_compression_factor_declared=True
-        )
-        _validate_temporal_compression(declared, 4)
-        with pytest.raises(ValueError, match="temporal_compression_factor"):
-            _validate_temporal_compression(declared, 8)
-        # Nano-style configs don't declare it; the VAE value simply wins.
-        undeclared = SimpleNamespace(
-            temporal_compression_factor=4, temporal_compression_factor_declared=False
-        )
-        _validate_temporal_compression(undeclared, 8)
-
 
 class TestSamplingRecipeMatrix:
     """Family + model_index schedule flag + scheduler recipe must be validated
@@ -1128,6 +1099,13 @@ class TestSamplingRecipeMatrix:
         )
         (tmp_path / "model_index.json").write_text(
             json.dumps({"_class_name": "Cosmos3OmniPipeline"})
+        )
+        (tmp_path / "config.json").write_text(
+            json.dumps({"model": {"config": {"vlm_config": {"use_system_prompt": False}}}})
+        )
+        (tmp_path / "vae").mkdir()
+        (tmp_path / "vae" / "config.json").write_text(
+            json.dumps({"scale_factor_temporal": 4, "scale_factor_spatial": 16})
         )
 
         def fresh_pipeline():
@@ -1802,7 +1780,7 @@ class TestEdgeCheckpoint:
     def test_tokenization_matches_diffusers_golden(self):
         from transformers import AutoTokenizer
 
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
             COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
             COSMOS3_DURATION_TEMPLATE,
         )
@@ -1877,7 +1855,7 @@ class TestEdgeCheckpoint:
         # the two modes resolve to the same (shift, karras) pair and share one
         # cached scheduler rather than building two identical ones.
         schedulers = {
-            mode: edge_pipeline._scheduler_for(edge_pipeline._mode_params(mode)["flow_shift"])
+            mode: edge_pipeline._scheduler_for(edge_pipeline._mode_table(mode)["flow_shift"])
             for mode in ("video", "image")
         }
         for scheduler in schedulers.values():

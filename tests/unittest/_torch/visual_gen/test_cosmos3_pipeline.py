@@ -41,15 +41,15 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DURATION_TEMPLATE,
     COSMOS3_EXTRA_SPECS,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     COSMOS3_T2I_PARAMS,
     _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
-    COSMOS3_DEFAULT_SYSTEM_PROMPT,
-    COSMOS3_DURATION_TEMPLATE,
-    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
     _load_reference_image,
@@ -928,9 +928,6 @@ class TestCosmos3V2V:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((target, use_karras_sigmas))
                 return scheduler
@@ -989,9 +986,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
@@ -1054,9 +1048,6 @@ class TestCosmos3V2V:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 return scheduler
 
@@ -1111,9 +1102,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((scheduler.name, target, use_karras_sigmas))
@@ -1219,9 +1207,6 @@ class TestCosmos3TransferRouting:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
         pipeline.sampling = FakeSampling()
         pipeline._forward_transfer = lambda **kwargs: None
         # A precomputed control and no video: an existing guard already rejects
@@ -1273,9 +1258,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         captured = {}

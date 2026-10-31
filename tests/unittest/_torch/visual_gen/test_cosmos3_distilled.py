@@ -69,6 +69,17 @@ def _write_scheduler_config(checkpoint_dir: Path, config: dict) -> None:
     scheduler_dir.mkdir(parents=True, exist_ok=True)
     with open(scheduler_dir / "scheduler_config.json", "w") as f:
         json.dump(config, f)
+    vae_dir = checkpoint_dir / "vae"
+    vae_dir.mkdir(parents=True, exist_ok=True)
+    with open(vae_dir / "config.json", "w") as f:
+        json.dump({"scale_factor_temporal": 4, "scale_factor_spatial": 16}, f)
+
+
+def _write_trained_config(checkpoint_dir: Path, use_system_prompt) -> None:
+    """The training config's prompt flag; ``None`` writes a config without it."""
+    vlm_config = {} if use_system_prompt is None else {"use_system_prompt": use_system_prompt}
+    with open(checkpoint_dir / "config.json", "w") as f:
+        json.dump({"model": {"config": {"vlm_config": vlm_config}}}, f)
 
 
 def _distilled_policy() -> Cosmos3SamplingPolicy:
@@ -181,13 +192,6 @@ class TestPolicyFacts:
         }
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
         assert Cosmos3SamplingPolicy.from_scheduler(scheduler).fixed_sigmas == (1.0, 0.5)
-
-    def test_generation_default_overrides(self):
-        assert _distilled_policy().generation_default_overrides() == {
-            "num_inference_steps": 4,
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
-        assert _base_policy().generation_default_overrides() == {}
 
     def test_num_steps(self):
         assert _distilled_policy().num_steps(2) == 4
@@ -599,6 +603,7 @@ class TestDefaultMarksThroughRealPath:
 class TestPipelineSchedulerLoading:
     def test_distilled_checkpoint_loads_flow_match(self, tmp_path):
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
         pipeline.load_standard_components(
@@ -611,6 +616,7 @@ class TestPipelineSchedulerLoading:
 
     def test_base_checkpoint_loads_unipc(self, tmp_path):
         _write_scheduler_config(tmp_path, UNIPC_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline()
 
         pipeline.load_standard_components(
@@ -623,6 +629,7 @@ class TestPipelineSchedulerLoading:
 
     def test_audio_scheduler_is_separate_same_class_instance(self, tmp_path):
         _write_scheduler_config(tmp_path, DISTILLED_SCHEDULER_CONFIG)
+        _write_trained_config(tmp_path, False)
         pipeline = _bare_pipeline(audio_gen=True)
 
         pipeline.load_standard_components(
@@ -1042,7 +1049,7 @@ class TestForwardConditioningWiring:
 
 
 class TestSystemPromptDefault:
-    """use_system_prompt defaults are checkpoint-declared via model_index.json."""
+    """use_system_prompt default: config.json's vlm_config, else model_index.json."""
 
     def _write_model_index(self, checkpoint_dir: Path, content: dict) -> None:
         with open(checkpoint_dir / "model_index.json", "w") as f:
@@ -1071,15 +1078,26 @@ class TestSystemPromptDefault:
 
         assert COSMOS3_EXTRA_SPECS["use_system_prompt"].default is None
 
-    def test_missing_model_index_keeps_false(self, tmp_path):
-        pipeline = self._loaded_pipeline(tmp_path)
-        assert pipeline.default_use_system_prompt is False
-        assert pipeline.extra_param_specs["use_system_prompt"].default is None
-
-    def test_model_index_without_field_keeps_false(self, tmp_path):
+    def test_undeclared_system_prompt_is_a_load_error(self, tmp_path):
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            self._loaded_pipeline(tmp_path)
         self._write_model_index(tmp_path, {"_class_name": "Cosmos3OmniPipeline"})
+        _write_trained_config(tmp_path, None)
+        with pytest.raises(ValueError, match="cannot resolve prompt.use_system_prompt"):
+            self._loaded_pipeline(tmp_path)
+
+    @pytest.mark.parametrize("trained", [False, True])
+    def test_trained_config_wins_over_model_index(self, tmp_path, trained):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": not trained})
+        _write_trained_config(tmp_path, trained)
         pipeline = self._loaded_pipeline(tmp_path)
-        assert pipeline.default_use_system_prompt is False
+        assert pipeline.default_use_system_prompt is trained
+
+    def test_trained_config_without_key_keeps_model_index(self, tmp_path):
+        self._write_model_index(tmp_path, {"default_use_system_prompt": True})
+        _write_trained_config(tmp_path, None)
+        pipeline = self._loaded_pipeline(tmp_path)
+        assert pipeline.default_use_system_prompt is True
 
     def _captured_use_system_prompt(self, pipeline, extra_params):
         captured = {}
@@ -1384,8 +1402,8 @@ class TestDistilledForwardDefaults:
         assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" not in dims
 
     def test_base_checkpoint_still_uses_the_mode_table(self, monkeypatch):
-        """The checkpoint-first step must be a no-op for a base checkpoint:
-        ``generation_default_overrides()`` is empty, so the mode tables win."""
+        """The checkpoint-first step must be a no-op for a base checkpoint: there is no
+        fixed schedule, so the mode tables win."""
         import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
 
         pipeline = _bare_pipeline()

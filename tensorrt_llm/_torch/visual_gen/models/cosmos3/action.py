@@ -13,6 +13,8 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
+from .geometry import find_closest_target_size
+
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
 ACTION_MODE_INVERSE_DYNAMICS = "inverse_dynamics"
@@ -93,62 +95,6 @@ def resolve_raw_action_dim(
         if mapped_id == int(domain_id) and name in EMBODIMENT_TO_RAW_ACTION_DIM
     }
     return widths.pop() if len(widths) == 1 else None
-
-
-# Canonical ``W,H`` labels; every action canvas is one of these bucket shapes.
-ACTION_ASPECT_RATIO_LABELS = ("1,1", "4,3", "3,4", "16,9", "9,16")
-
-
-VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
-    "256": {
-        "1,1": (256, 256),
-        "4,3": (320, 256),
-        "3,4": (256, 320),
-        "16,9": (320, 192),
-        "9,16": (192, 320),
-    },
-    "480": {
-        "1,1": (640, 640),
-        "4,3": (736, 544),
-        "3,4": (544, 736),
-        "16,9": (832, 480),
-        "9,16": (480, 832),
-    },
-    "704": {
-        "1,1": (960, 960),
-        "4,3": (1088, 832),
-        "3,4": (832, 1088),
-        "16,9": (1280, 704),
-        "9,16": (704, 1280),
-    },
-    "720": {
-        "1,1": (960, 960),
-        "4,3": (1104, 832),
-        "3,4": (832, 1104),
-        "16,9": (1280, 720),
-        "9,16": (720, 1280),
-    },
-}
-
-
-COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
-
-
-def normalize_action_resolution(resolution: Any) -> int:
-    if resolution is None:
-        raise ValueError("Cosmos3 action_resolution is required for action generation.")
-    try:
-        bucket = int(resolution)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
-        ) from exc
-    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
-        raise ValueError(
-            f"Unknown Cosmos3 action_resolution={bucket}; "
-            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
-        )
-    return bucket
 
 
 def normalize_action_mode(mode: Any) -> str | None:
@@ -319,25 +265,6 @@ def load_action_state(action: Any = None) -> torch.Tensor:
             f"got {tuple(tensor.shape)}."
         )
     return tensor
-
-
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
-    key = str(resolution)
-    if key not in VIDEO_RES_SIZE_INFO:
-        raise ValueError(
-            f"Unknown Cosmos3 action resolution={resolution!r}; "
-            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
-        )
-    input_ratio = h / w
-    best_size = None
-    best_diff = float("inf")
-    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
-        diff = abs(input_ratio - cand_h / cand_w)
-        if diff < best_diff:
-            best_diff = diff
-            best_size = (cand_w, cand_h)
-    assert best_size is not None
-    return best_size
 
 
 ACTION_IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})

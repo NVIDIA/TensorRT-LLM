@@ -25,11 +25,10 @@ from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.models.cosmos3.config_resolver import fill_pretrained_config
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
-    PRETRAINED_CONFIG_COMPAT_DEFAULTS,
     Cosmos3VFMTransformer,
     Qwen3VLTextRotaryEmbedding,
-    apply_pretrained_config_compat_defaults,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
@@ -773,9 +772,11 @@ class TestConfigCompatDefaults:
 
     def test_new_schema_gets_defaults(self):
         config = SimpleNamespace(hidden_size=64, rope_axes_dim=[4, 2, 2])
-        apply_pretrained_config_compat_defaults(config)
-        for key, value in PRETRAINED_CONFIG_COMPAT_DEFAULTS.items():
-            assert getattr(config, key) == value
+        fill_pretrained_config(config)
+        assert config.position_embedding_type == "unified_3d_mrope"
+        assert config.max_position_embeddings == 262144
+        assert config.temporal_compression_factor == 4
+        assert config.temporal_compression_factor_sound == 1
 
     def test_old_schema_untouched(self):
         # Every field deliberately differs from its compat default, so an
@@ -785,16 +786,16 @@ class TestConfigCompatDefaults:
             max_position_embeddings=12345,
             temporal_compression_factor_sound=7,
         )
-        apply_pretrained_config_compat_defaults(config)
+        fill_pretrained_config(config)
         assert config.position_embedding_type == "rope_3d"
         assert config.max_position_embeddings == 12345
         assert config.temporal_compression_factor_sound == 7
 
     def test_idempotent(self):
         config = SimpleNamespace(hidden_size=64)
-        apply_pretrained_config_compat_defaults(config)
+        fill_pretrained_config(config)
         snapshot = vars(config).copy()
-        apply_pretrained_config_compat_defaults(config)
+        fill_pretrained_config(config)
         assert vars(config) == snapshot
 
     @pytest.mark.parametrize("rope_scaling", [_OMITTED, None, {}], ids=["omitted", "none", "empty"])
@@ -818,7 +819,7 @@ class TestConfigCompatDefaults:
         if rope_scaling is not _OMITTED:
             config.rope_scaling = rope_scaling
         assert hasattr(config, "rope_scaling") is (rope_scaling is not _OMITTED)
-        apply_pretrained_config_compat_defaults(config)
+        fill_pretrained_config(config)
         # Construct for real: the point is that __init__ reaches the resolver
         # instead of raising AttributeError on the missing block.
         embedding = tf.Qwen3VLTextRotaryEmbedding(SimpleNamespace(pretrained_config=config))

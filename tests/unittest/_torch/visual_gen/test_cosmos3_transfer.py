@@ -30,17 +30,18 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
+)
+from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
     VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BILATERAL_D,
     BILATERAL_SIGMA_COLOR,
     BILATERAL_SIGMA_SPACE,
     _scaled_bilateral_params,
     decode_media_to_uint8_cthw,
-    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
@@ -229,16 +230,6 @@ class StubSamplingPolicy:
     def scheduler_step_kwargs(self, generator):
         self.step_kwargs_calls += 1
         return {"generator": generator} if self.is_distilled else {}
-
-    def generation_default_overrides(self):
-        # Mirrors the real policy rather than returning {}, so a distilled stub
-        # still overrides the table the way the checkpoint would.
-        if not self.is_distilled:
-            return {}
-        return {
-            "num_inference_steps": len(self.fixed_sigmas),
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
 
     def num_steps(self, default):
         return len(self.fixed_sigmas) if self.is_distilled else default
@@ -1310,5 +1301,5 @@ class TestFindClosestTargetSize:
         )
 
     def test_unknown_resolution_raises(self):
-        with pytest.raises(ValueError, match="Unknown Cosmos3 transfer resolution"):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 resolution"):
             find_closest_target_size(720, 1280, 1080)

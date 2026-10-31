@@ -57,3 +57,15 @@ ffmpeg -y -framerate 24 -i frame_%02d.png \
   -x264-params b_adapt=0:scenecut=0 \
   cosmos3_v2v_ref_9f_bframes.avi
 ```
+
+## `cosmos3_checkpoint_configs.json`
+
+The settings `config_resolver.RULES` reads, extracted from the
+published Cosmos3 checkpoints on Hugging Face (`main`, Fri 23 Oct 2026): for each
+repo, file and key path a rule names, the value at that path, nested back into its
+file. Nothing else from the checkpoints is kept. `test_cosmos3_config_resolver.py`
+resolves every entry, so a new export whose files disagree in a way the precedence
+table does not expect fails the test.
+
+Regenerate by fetching `https://huggingface.co/<repo>/raw/main/<file>` for every
+`Key` in the table and keeping only those paths.
