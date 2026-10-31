@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fused_qk_norm_rope catalog entry."""
+"""GPU test for the fused_qk_norm_rope catalog entry.
+
+Every cell of the entry and of its targets -- gpt-oss, the qwen4_exp tp1 target
+and the unified tp4 / tep4 / dep4 target's per-rank trunk and MTP shapes --
+against the entry's reference; the mRoPE section wiring at each qwen4_exp
+geometry; the MTP site's CUDA-graph replay; and the guard's refusals.
+"""
 
 import zlib
 
@@ -62,6 +68,16 @@ def _compare(out: torch.Tensor, ref: torch.Tensor, *, element_atol: float | None
     ceiling) gates each element at `GEMMA_PREFILL_ATOL + 1.6e-2 |ref|` instead
     and keeps the RMS gate (0.13 measured). Every wrong mRoPE wiring lands
     11-19 away, ~100x outside it.
+
+    The unified target's cells, 12 seeds each, positions below 32768. The
+    trunk's fused row at attention TP4 / dep4: worst element 1.86 ulp of the
+    row scale (max abs 0.0625) at 1024 tokens, on the 2-ulp gate, and 1.98 at
+    8192 tokens, under GEMMA_PREFILL_ATOL; relative RMS at most 0.09 ulp. The
+    MTP layer's 6 q / 1 k / 1 v scratch: 1.84 ulp at 1024 tokens on the 2-ulp
+    gate, 1.98 at 8192 tokens under GEMMA_PREFILL_ATOL; relative RMS at most
+    0.15 ulp. Against a float64 evaluation the kernel and the reference sit
+    equally far at both sites (RMS 0.42-0.44 ulp each, the bf16 rounding
+    floor), so what separates them is the two roundings.
     """
     if element_atol is None:
         assert_within_ulp(out, ref, element_ulp=2.0, rms_ulp=1.0)
@@ -162,6 +178,23 @@ _QWEN_MAIN = dict(num_heads_q=24, num_heads_k=2, num_heads_v=2, head_dim=256, **
 _QWEN_INDEX_HEADS = dict(num_heads_q=4, num_heads_k=1, num_heads_v=1, head_dim=128)
 _QWEN_INDEX_MROPE = dict(**_QWEN_INDEX_HEADS, **_QWEN_MROPE)
 _QWEN_INDEX_PLAIN = dict(**_QWEN_INDEX_HEADS, **_QWEN_ROPE)
+# The unified target's main rope at attention TP4 (tp4, tep4): one rank holds
+# 24 / 4 = 6 query heads and one of the 2 kv heads, and its fused input
+# projection row is [q | k | v | gate | index | pad] = 17 heads of 256 = 4352,
+# so everything after k (10 heads) is passed as v and only sets the row stride.
+_QWEN_TP4_FUSED_ROW = dict(**{**_QWEN_MAIN, "num_heads_q": 6, "num_heads_k": 1, "num_heads_v": 10})
+# dep4 keeps tp1's full geometry (24 / 2, row 14080 = 55 heads) on at most 32
+# local requests per rank.
+_QWEN_DEP4_FUSED_ROW = dict(**{**_QWEN_MAIN, "num_heads_v": 29})
+# The unified target's MTP layer at attention TP4 (tp4, tep4): its q, k and v
+# projections land in a scratch of their own, [q | k | v] with no gate or index
+# heads after them, and one rank holds 24 / 4 = 6 query heads and one of the 2
+# kv heads -- the tp1 MTP layer's 24 / 2 / 2 form at the per-rank head counts.
+# The MTP module's own rope_theta is the trunk's 1e7.
+_QWEN_MTP_TP4 = dict(**{**_QWEN_MAIN, "num_heads_q": 6, "num_heads_k": 1, "num_heads_v": 1})
+
+#: The unified target's key in `TARGET_CELLS`.
+_UNIFIED = "qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified"
 
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
@@ -260,6 +293,57 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_INDEX_PLAIN),
         ),
     ),
+    "qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified": (
+        # The trunk's main rope on the fused input-projection row.
+        Cell(
+            why="unified tp4/tep4 fused-row main rope, 1 token: 6q/1k heads, 10 v heads "
+            "on the 4352-wide row",
+            spec=dict(tokens=1, **_QWEN_TP4_FUSED_ROW),
+        ),
+        Cell(
+            why="unified tp4/tep4 fused-row main rope, 128 tokens: decode at max concurrency",
+            spec=dict(tokens=128, **_QWEN_TP4_FUSED_ROW),
+        ),
+        Cell(
+            why="unified tp4/tep4 fused-row main rope, 1024 tokens: the MTP7 verify step "
+            "of 128 requests",
+            spec=dict(tokens=1024, **_QWEN_TP4_FUSED_ROW),
+        ),
+        Cell(
+            why="unified tp4/tep4 fused-row main rope, 8192 tokens: a prefill chunk at "
+            "max_num_tokens, under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_TP4_FUSED_ROW),
+        ),
+        Cell(
+            why="unified dep4 fused-row main rope, 32 tokens: 24q/2k on the 14080-wide row, "
+            "one rank's 32 requests",
+            spec=dict(tokens=32, **_QWEN_DEP4_FUSED_ROW),
+        ),
+        # The MTP layer's rope on its own q/k/v scratch.
+        Cell(
+            why="unified MTP layer rope at TP4, 1 token: 6q/1k/1v heads of 256 on its own "
+            "scratch, a tep4 draft step of one request",
+            spec=dict(tokens=1, **_QWEN_MTP_TP4),
+        ),
+        Cell(
+            why="unified MTP layer rope at TP4, 128 tokens: a draft step at the 128-request "
+            "capture cap",
+            spec=dict(tokens=128, **_QWEN_MTP_TP4),
+        ),
+        Cell(
+            why="unified MTP layer rope at TP4, 512 tokens: the depth-3 verify of 128 requests",
+            spec=dict(tokens=512, **_QWEN_MTP_TP4),
+        ),
+        Cell(
+            why="unified MTP layer rope at TP4, 1024 tokens: the depth-7 verify of 128 requests",
+            spec=dict(tokens=1024, **_QWEN_MTP_TP4),
+        ),
+        Cell(
+            why="unified MTP layer rope at TP4, 8192 tokens: a prefill chunk at max_num_tokens, "
+            "under GEMMA_PREFILL_ATOL",
+            spec=dict(tokens=8192, gemma_prefill_band=True, **_QWEN_MTP_TP4),
+        ),
+    ),
 }
 
 CELLS = certified_cells(op, TARGET_CELLS)
@@ -297,27 +381,36 @@ def test_the_v_heads_are_left_alone() -> None:
     assert not torch.equal(qkv[:, :v_start], before[:, :v_start]), "q and k were not touched"
 
 
-def _qwen_spec(num_heads_q: int, tokens: int) -> dict:
+def _qwen_spec(num_heads_q: int, num_heads_v: int, tokens: int) -> dict:
     """The certified qwen4_exp mRoPE cell at this geometry, at `tokens` rows."""
     matches = [
         c.spec
         for c in CELLS
-        if c.spec["num_heads_q"] == num_heads_q and c.spec.get("use_mrope", False)
+        if c.spec["num_heads_q"] == num_heads_q
+        and c.spec["num_heads_v"] == num_heads_v
+        and c.spec.get("use_mrope", False)
     ]
-    assert matches, f"no certified mRoPE cell with {num_heads_q} query heads"
+    assert matches, f"no certified mRoPE cell with {num_heads_q} query / {num_heads_v} v heads"
     spec = dict(matches[0])
     spec.pop("gemma_prefill_band", None)
     spec["tokens"] = tokens
     return spec
 
 
-# The two geometries qwen4_exp runs the mRoPE form at: the main attention rope
-# (24 query heads over 256) and the QSA index plane's query rope (4 over 128).
-_QWEN_GEOMETRIES = pytest.mark.parametrize("num_heads_q", [24, 4], ids=["main", "index"])
+# The geometries qwen4_exp runs the mRoPE form at, by (query heads, v heads):
+# the main attention rope (24 over 256), the QSA index plane's query rope (4 over
+# 128), and the unified target's two attention TP4 forms -- the trunk's main
+# rope on the 4352 row (6 / 1 / 10 over 256) and the MTP layer's rope on its own
+# scratch (6 / 1 / 1 over 256).
+_QWEN_GEOMETRIES = pytest.mark.parametrize(
+    ("num_heads_q", "num_heads_v"),
+    [(24, 2), (4, 1), (6, 10), (6, 1)],
+    ids=["main", "index", "tp4_main", "mtp_tp4"],
+)
 
 
 @_QWEN_GEOMETRIES
-def test_mrope_section_split_is_11_11_10(num_heads_q: int) -> None:
+def test_mrope_section_split_is_11_11_10(num_heads_q: int, num_heads_v: int) -> None:
     """The [11, 11, 10] split, measured against the wrong wirings as well as the right one.
 
     At rotary_dim 64 there are 32 frequency pairs and the checkpoint's
@@ -328,7 +421,7 @@ def test_mrope_section_split_is_11_11_10(num_heads_q: int) -> None:
     is independent of head_dim and the head counts; running it at both
     geometries makes that a measurement rather than an argument.
     """
-    qkv0, kwargs, _ = _build(_qwen_spec(num_heads_q, 19), seed=10 + num_heads_q)
+    qkv0, kwargs, _ = _build(_qwen_spec(num_heads_q, num_heads_v, 19), seed=10 + num_heads_q)
     pos = kwargs["position_ids"]
 
     def call(**over):
@@ -368,13 +461,13 @@ def test_mrope_section_split_is_11_11_10(num_heads_q: int) -> None:
 
 
 @_QWEN_GEOMETRIES
-def test_mrope_reduces_to_plain_rope_when_rows_agree(num_heads_q: int) -> None:
+def test_mrope_reduces_to_plain_rope_when_rows_agree(num_heads_q: int, num_heads_v: int) -> None:
     """Text tokens put the same position in all three rows; that must be the plain path.
 
     Bitwise, which is what lets the index plane run row 0 alone on the plain
     form and lets a text batch stay where its accuracy gates measured it.
     """
-    qkv0, kwargs, _ = _build(_qwen_spec(num_heads_q, 5), seed=16 + num_heads_q)
+    qkv0, kwargs, _ = _build(_qwen_spec(num_heads_q, num_heads_v, 5), seed=16 + num_heads_q)
     flat = kwargs["position_ids"][0].contiguous()
 
     def call(**over):
@@ -387,6 +480,70 @@ def test_mrope_reduces_to_plain_rope_when_rows_agree(num_heads_q: int) -> None:
         call(position_ids=three_equal_rows),
         call(position_ids=flat, use_mrope=False, mrope_section1=0, mrope_section2=0),
     )
+
+
+#: The MTP rope's row counts a captured step replays here: one request's draft
+#: step and the 128-request capture cap.
+_GRAPH_TOKENS = (1, 128)
+
+
+def _is_mtp_tp4(spec) -> bool:
+    """Whether a cell is the unified MTP layer's 6 / 1 / 1 scratch form."""
+    return all(spec.get(k) == v for k, v in _QWEN_MTP_TP4.items())
+
+
+def test_mtp_rope_replays_under_a_cuda_graph() -> None:
+    """The MTP site runs inside DecodeTarget's captured graph: the draft steps and
+    `mtp_forward` at tep4 launch it from a capture, then refill its buffers and replay.
+
+    One graph per row count, sharing one memory pool as the engine's batch
+    sizes do, each replayed twice in reverse capture order after its scratch
+    and its `[3, T]` position rows are refilled in place. Every replay must
+    match the entry's reference on the new input under the cell's band, be
+    bitwise the eager call on that input, and leave the v head as written --
+    so the graph reads the refilled buffers rather than anything frozen at
+    capture.
+    """
+    cells = [
+        c
+        for c in TARGET_CELLS[_UNIFIED]
+        if _is_mtp_tp4(c.spec) and c.spec["tokens"] in _GRAPH_TOKENS
+    ]
+    assert sorted(c.spec["tokens"] for c in cells) == sorted(_GRAPH_TOKENS)
+    pool = None
+    graphs = {}
+    for cell in cells:
+        qkv, kwargs, compare_kwargs = _build(cell.spec, seed=_seed(cell.why))
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                op(qkv, **kwargs)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            out = op(qkv, **kwargs)
+        assert out is qkv, "the op writes in place"
+        if pool is None:
+            pool = graph.pool()
+        graphs[cell.spec["tokens"]] = (cell, graph, qkv, kwargs, compare_kwargs)
+
+    for step in range(2):
+        for tokens in reversed(_GRAPH_TOKENS):
+            cell, graph, qkv, kwargs, compare_kwargs = graphs[tokens]
+            fresh, fresh_kwargs, _ = _build(cell.spec, seed=_seed(f"{cell.why} replay {step}"))
+            qkv.copy_(fresh)
+            kwargs["position_ids"].copy_(fresh_kwargs["position_ids"])
+            ref = op.reference(fresh, **kwargs)
+            eager = op(fresh.clone(), **kwargs)
+            graph.replay()
+            torch.cuda.synchronize()
+            print(f"\n  replay {step}, {tokens} tokens: {_deviation(qkv, ref)}")
+            _compare(qkv, ref, **compare_kwargs)
+            assert torch.equal(qkv, eager), f"replay at {tokens} tokens differs from the eager call"
+            v_start = (kwargs["num_heads_q"] + kwargs["num_heads_k"]) * kwargs["head_dim"]
+            assert torch.equal(qkv[:, v_start:], fresh[:, v_start:]), "the v head was written"
 
 
 def _ok(**over):

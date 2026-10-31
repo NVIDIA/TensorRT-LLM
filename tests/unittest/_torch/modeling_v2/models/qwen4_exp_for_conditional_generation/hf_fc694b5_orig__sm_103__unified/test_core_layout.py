@@ -152,7 +152,7 @@ def test_a_tep4_rank_runs_its_share_of_the_heads(rank) -> None:
     """Six q heads and one of the two KV heads (repeated on rank pairs) over a 4352-wide
     fused row: `[q 1536 | k 256 | v 256 | gate 1536 | index q 512, k 128 | v slot 128]`.
     The main norm + rope reads it as 6 q, 1 k and 10 "v" heads of 256 (the row stride
-    alone), which is the cell `fused_qk_norm_rope__r3` certifies."""
+    alone), which is the cell `fused_qk_norm_rope` certifies."""
     core = _core(rank, _TEP4)
     assert (core.heads_q, core.heads_kv, core.kv_head_start) == (6, 1, rank * 2 // WORLD)
     assert (core.q_width, core.kv_width, core.qkv_width) == (1536, 256, 2048)

@@ -1,6 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Per-head QK RMS norm followed by RoPE, in place on a packed qkv buffer."""
+"""Per-head QK RMS norm followed by RoPE, in place on a packed qkv buffer.
+
+Called by gpt-oss, the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified tp4 / tep4 / dep4
+target (`hf_fc694b5_orig__sm_103__unified`), whose per-rank cells -- the trunk's
+main rope on the fused input-projection row and the MTP layer's rope on its own
+q/k/v scratch -- were promoted from that target's copies.
+"""
 
 from __future__ import annotations
 
@@ -63,7 +70,8 @@ class FusedQkNormRope(OpWrapper):
 
     note = """
     Certified by caller: gpt-oss runs `is_qk_norm=False` with YaRN; qwen4_exp
-    runs `is_qk_norm=True, use_gemma=True`, unscaled, with and without
+    (the tp1 target, and the unified target at its per-rank head counts) runs
+    `is_qk_norm=True, use_gemma=True`, unscaled, with and without
     interleaved mRoPE. Uncertified because no shipped target reaches them:
     `is_qk_norm=True` with `use_gemma=False` (the plain-weight norm the op's
     name advertises), `is_neox=False`, YaRN together with the norm or with
@@ -84,6 +92,58 @@ class FusedQkNormRope(OpWrapper):
     split; an image span is where one shows.
 
     Metadata consumed: none.
+
+    Source: `torch.ops.trtllm.fused_qk_norm_rope`, registered in
+    `cpp/tensorrt_llm/thop/fusedQKNormRopeOp.cpp` over `launchFusedQKNormRope`
+    (`cpp/tensorrt_llm/kernels/fusedQKNormRopeKernel.cu`): a compiled-in C++
+    kernel shipped in the wheel, no JIT path. The angle is `pos * freq` in fp32
+    (`freq` from `exp2f`), turned into sin/cos by the fast `__sincosf`.
+
+    The unified target's cells are in the test's `TARGET_CELLS` under
+    `qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified`, all
+    with the qwen4_exp rope (Gemma norm, interleaved mRoPE [11, 11, 10], rotary
+    64, base 1e7, positions below 32768), and were measured on sm_103 only:
+    `ARCHS`' sm_100 does not extend to them.
+      - The trunk's main rope in place on the fused input-projection row at
+        attention TP4 (tp4, tep4): 6 q / 1 k heads of 256 with 10 more heads of
+        row stride, 4352 wide, at 1, 128, 1024 (the MTP7 verify of 128
+        requests) and 8192 tokens; and dep4's full 24 / 2 row (14080 wide) at
+        one rank's 32 requests. Over 12 seeds per cell: worst element 1.86 bf16
+        ulp of the row scale at 1024 tokens (max abs 0.0625, one bf16 spacing
+        at magnitude 8-16) and 1.98 at 8192 tokens, relative RMS at most 0.09
+        ulp.
+      - The MTP layer's rope on its separate `[q | k | v]` scratch at attention
+        TP4 (tp4, tep4): 6 q / 1 k / 1 v heads of 256 (2048 wide) -- the tp1
+        MTP layer's 24 / 2 / 2 at the per-rank head counts, at the MTP module's
+        `rope_theta`, which is the trunk's 1e7 -- at 1 and 128 tokens (draft
+        steps), 512 and 1024 (the depth-3 and depth-7 verify of 128 requests)
+        and 8192 (a prefill chunk at max_num_tokens). Over 12 seeds per cell:
+        worst element 1.84 ulp at 1024 tokens on the 2-ulp gate and 1.98 at
+        8192 tokens under the test's GEMMA_PREFILL_ATOL; relative RMS at most
+        0.15 ulp, cosine at least 0.9999998. The 1- and 128-token cells are
+        also captured as two CUDA graphs sharing one pool and replayed with
+        their buffers refilled in place; each replay is bitwise the eager call.
+    Against a float64 evaluation (4 seeds per cell) the kernel (<= 1.34 ulp,
+    RMS 0.42-0.44) and `reference` (<= 0.99 ulp, RMS 0.42-0.44) sit equally far
+    at both sites, so what separates them is the two bf16 roundings.
+
+    Positions past 32768 are uncertified. At positions drawn below 262144 (the
+    qwen4_exp checkpoint's `max_position_embeddings`, and its tune's longest
+    prompts) the fast sincos loses range-reduction accuracy: against float64
+    the kernel's worst element at 8192 tokens is 0.354 abs / 8.8 ulp of the row
+    scale (RMS 0.61 ulp, cosine 0.999997) on the fused-row geometries and 0.258
+    / 8.7 ulp on the MTP scratch, where `reference` stays at 0.068 / 2.4 ulp;
+    128 tokens reach 0.17 / 6.4 ulp (fused row) and 0.19 / 7.4 ulp (MTP). The
+    stock Qwen4Exp attention (`_torch/attention/qk_norm_attention.py`) takes its
+    cos/sin from a precomputed fp32 table instead
+    (`fused_qkv_gemma_rmsnorm_rope_gate`), so past that range this entry and
+    the stock path differ by more than bf16 rounding.
+
+    Not certified at the unified target: the unified cells on sm_100; CUDA-graph
+    replay of the trunk's fused-row form and of the MTP form at its 512- and
+    1024-row verify widths (only the MTP's 1- and 128-token cells are
+    replayed); the dep4 MTP layer's 24 / 2 / 2 scratch at its 32..256 rows
+    (the tp1 geometry, a cell only at 1, 19 and 8192 tokens).
     """
 
     def __call__(

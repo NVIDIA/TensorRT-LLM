@@ -141,6 +141,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_m
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flashinfer_top_k_ragged_transform import (
     flashinfer_top_k_ragged_transform,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
+    fused_qk_norm_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
+    fused_qk_norm_rope as mtp_fused_qk_norm_rope,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
@@ -279,8 +285,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
-from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
-from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
 from .ops.comm.allgather__r6 import allgather
 from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
 from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
