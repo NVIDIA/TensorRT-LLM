@@ -2,13 +2,27 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU certification matrix for the allgather catalog entry.
 
+The cells are filtered by the world size the job runs at (a cell without
+`world` runs at every size), the CUDA-graph batch sizes are the union of the
+default capture list and the qwen4_exp unified target's, a decode graph holds
+one gather per MoE layer of the qwen4_exp checkpoint (48, more than the 29 of a
+30-layer deepseek-shaped graph), and the served path's checks run a second time
+through the MPI-session symbol.
+
 A collective cannot be exercised in one process, so this script is its own
-launcher: run it plainly and it spawns one worker process per device, with one
-rank per device named in CUDA_VISIBLE_DEVICES, under a deadline the parent
-enforces by killing the whole process group. A wedged collective hangs
-rather than raising — and this op wedges rather than raising for every
-rank-argument-disagreement case probed — so the deadline is what keeps a
-broken kernel from taking the calling run down with it.
+launcher, with one rank per device named in CUDA_VISIBLE_DEVICES and two
+transports, run one after the other, each under its own deadline:
+
+  pg   it spawns one worker process per device; the ranks rendezvous through
+       torch.distributed and call `allgather_pg`. Every check runs here.
+  mpi  it re-executes itself under `mpirun -n <devices>` (the in-tree
+       `_lockstep.spawn` launch, plus the scrub below); the ranks are an MPI
+       world and call `allgather`, the symbol a served engine calls. The checks
+       a served dep4 / dep2 forward exercises run here (`MPI_CHECKS`).
+
+A wedged collective hangs rather than raising — and this op wedges rather than
+raising for every rank-argument-disagreement case probed — so the deadline is
+what keeps a broken kernel from taking the calling run down with it.
 
 Beyond the lockstep surface (uniform / ragged / dtypes / CUDA graphs) the
 file covers what a serving engine adds: the engine's own attention-DP
@@ -16,21 +30,22 @@ synchronisation interleaved with the op, the engine's stream switching, and
 what disagreeing on call order actually does.
 
     CUDA_VISIBLE_DEVICES=0,1,2,3 python _allgather_op_matrix.py
+    CUDA_VISIBLE_DEVICES=0,1 python _allgather_op_matrix.py --transport mpi
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed
-sequence inside a single 4-rank job rather than independent cases: each reads
-module-global rank state that only `_run_one_rank` binds, and several assert
+sequence inside a single job rather than independent cases: each reads
+module-global rank state that only the rank bodies bind, and several assert
 on communicator state the previous one left behind. Collected as tests they
 would run at world size 1 against unbound globals — so neither this file's
 name nor its function names match pytest's collection patterns, which is what
 keeps it uncollectable however pytest is pointed at this tree.
 
-The collected entry point is
-`tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py`:
-it starts this job and turns its exit code into an assertion. Both halves are
-started by file path: the launcher must not import `tensorrt_llm` (that calls
-CUDA nor torch.distributed state of its own), and the
-ranks reach the catalog by absolute import, so neither needs a package.
+The collected entry point is `test_modeling_v2_allgather_op_matrix.py`
+beside this file: it starts this job at world 2 and 4 and turns its exit code
+into an assertion. Both halves are started by file path: the launcher must not
+import `tensorrt_llm` (that calls MPI_Init, and the launcher must carry no
+CUDA nor torch.distributed state of its own), and the ranks reach the catalog by
+absolute import, so neither needs a package.
 """
 
 import functools
@@ -50,27 +65,41 @@ import torch.distributed as dist
 assert torch.cuda.is_available(), "allgather requires CUDA devices"
 
 _WORKER_FLAG = "--rank-worker"
-DEADLINE_S = 1200
+_MPI_WORKER_FLAG = "--mpi-rank-worker"
 
-HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
+#: Each transport's own budget, enforced by this launcher.
+PG_DEADLINE_S = 1200
+MPI_DEADLINE_S = 900
+#: The whole job's budget: both transports, one after the other. `_rank_job`
+#: reads it to set its own timeout above this one.
+DEADLINE_S = PG_DEADLINE_S + MPI_DEADLINE_S
+
+HIDDEN = 2560  # DeepSeek-V3-Lite's and the qwen4_exp checkpoint's MoE input width
 
 # The row counts one engine's decode graphs are captured at. trtllm's graph
 # runner instantiates one graph per configured batch size, and under attention
-# data parallelism a decode call's per-rank row count *is* that batch size:
-# with `cuda_graph_config.max_batch_size = 256` and the default list that is 35
-# graphs at [1..32, 64, 128, 256], all alive at once in one memory pool and
-# replayed interleaved as the served batch size moves. So the surface a
-# captured gather has to be correct over is the whole set plus the transitions
-# between its members, not one representative row count.
-GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(range(1, 33)) + (64, 128, 256)
+# data parallelism a decode call's per-rank row count *is* that batch size,
+# all alive at once in one memory pool and replayed interleaved as the served
+# batch size moves. So the surface a captured gather has to be correct over is
+# the whole set plus the transitions between its members, not one
+# representative row count. The default list at `max_batch_size = 256` is 35
+# graphs (1..32, 64, 128, 256); the qwen4_exp deployment captures 19 at
+# `max_batch_size = 128` (1, 2, 4, 8, 16, 24, ..., 120, 128). Both: 45 sizes.
+_QWEN4_CAPTURE_SIZES = (1, 2, 4, 8, 16) + tuple(range(24, 129, 8))
+GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(
+    sorted(set(range(1, 33)) | {64, 128, 256} | set(_QWEN4_CAPTURE_SIZES))
+)
 
-# Gathers inside one decode graph for this checkpoint: 30 layers with
-# `first_k_dense_replace = 1`, so 29 expert-parallel MoE calls, each preceded
-# by one gather of the rank's own rows into the full token set.
-SITES_PER_DECODE_GRAPH = 29
+# Gathers inside one decode graph, each preceding one expert-parallel MoE call
+# with a gather of the rank's own rows into the full token set. The qwen4_exp
+# checkpoint has 48, all its layers being MoE; a 30-layer deepseek-shaped
+# checkpoint with `first_k_dense_replace = 1` has 29. One graph holding the
+# larger count covers the smaller.
+SITES_PER_DECODE_GRAPH = 48
 
 # Bound inside the rank body, never in the launcher: importing the entry
 # pulls in tensorrt_llm, which calls MPI_Init at import, and an
+# MPI-initialized launcher could not start the mpi transport's mpirun.
 allgather: Any = None
 entry: Any = None
 RANK = 0
@@ -82,17 +111,32 @@ GROUP: List[int] = [0]
 HOST_GROUP: Any = None
 SUBGROUPS: Dict[Tuple[int, ...], Any] = {}
 PG_BOXED: Any = None
+# The MPI world, on the mpi transport only; None on the pg transport.
+MPI_COMM: Any = None
+
+
+def _barrier() -> None:
+    """Align the ranks: torch.distributed's barrier on the pg transport, the MPI
+    world's on the mpi transport (after the device work this rank queued)."""
+    if MPI_COMM is None:
+        dist.barrier()
+    else:
+        torch.cuda.synchronize()
+        MPI_COMM.Barrier()
 
 
 def _host_allgather(obj: Any) -> List[Any]:
     """One host-side cross-rank step, the shape of the engine's per-step sync.
 
     A serving engine agrees the per-rank token counts once per step with a
-    host-side collective (`Distributed.tp_allgather`; TorchDist rides this same
-    torch.distributed machinery). A dedicated gloo group stands in for the
-    engine object here: constructing the engine's own `TorchDist` needs ray
+    host-side collective (`Distributed.tp_allgather`: MPI's allgather under
+    mpirun, which is what the mpi transport calls; TorchDist rides
+    torch.distributed). On the pg transport a dedicated gloo group stands in
+    for the engine object: constructing the engine's own `TorchDist` needs ray
     importable, which a plain development machine does not owe this test.
     """
+    if MPI_COMM is not None:
+        return list(MPI_COMM.allgather(obj))
     gathered: List[Any] = [None] * WORLD
     dist.all_gather_object(gathered, obj, group=HOST_GROUP)
     return gathered
@@ -224,7 +268,7 @@ def _warm_up_off_capture_stream(body, reps: int = 2) -> None:
             body()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
-    dist.barrier()
+    _barrier()
 
 
 def _capture_per_batch_size(
@@ -276,7 +320,7 @@ def _capture_per_batch_size(
         if pool is None:
             pool = graph.pool()
         inputs[rows], graphs[rows] = xs, graph
-        dist.barrier()
+        _barrier()
     return inputs, graphs, outputs
 
 
@@ -328,7 +372,7 @@ def check_cuda_graph_captures_a_cold_first_call() -> None:
     rows = 16
     seed = 100
     x = _payload(RANK, rows, seed)
-    dist.barrier()
+    _barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -342,12 +386,12 @@ def check_cuda_graph_captures_a_cold_first_call() -> None:
     # A second replay after a refilled input reflects that input, not the first.
     x.copy_(_payload(RANK, rows, seed + 500))
     torch.cuda.synchronize()
-    dist.barrier()
+    _barrier()
     graph.replay()
     torch.cuda.synchronize()
     _assert_bitwise(captured, _gather_ref([rows] * WORLD, seed + 500), "replay after refill")
     del graph
-    dist.barrier()
+    _barrier()
 
 
 def check_certified_cells() -> None:
@@ -358,8 +402,20 @@ def check_certified_cells() -> None:
     says the plain thing: for every configuration the entry claims to be
     certified over, the gather is the concatenation, and the guard admits the
     input a shipped target passes.
+
+    A cell with a `world` runs at that world size only; one without runs at
+    every world size the job is started at. The seed is the cell's position in
+    `CELLS`, so a cell draws the same payload at every world and transport.
     """
-    for i, cell in enumerate(entry.allgather.CELLS):
+    cells = [
+        (i, cell)
+        for i, cell in enumerate(entry.allgather.CELLS)
+        if cell.spec.get("world", WORLD) == WORLD
+    ]
+    assert any("world" in cell.spec for _, cell in cells), (
+        f"no cell names world size {WORLD}; no target calls this op at the size this job runs"
+    )
+    for i, cell in cells:
         spec = cell.spec
         rows, trailing, dtype = spec["rows"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -368,7 +424,10 @@ def check_certified_cells() -> None:
             out = allgather(x, spec["sizes"], GROUP)
         assert out.shape == (rows * WORLD, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed, dtype, trailing), cell.why)
-        dist.barrier()
+        _barrier()
+    if RANK == 0:
+        driven = [(cell.spec["rows"], cell.spec["trailing"][-1]) for _, cell in cells]
+        print(f"[rank 0] world {WORLD}: {len(cells)} cells bitwise, (rows, hidden) {driven}")
 
 
 def check_uniform_gather() -> None:
@@ -385,7 +444,7 @@ def check_uniform_gather() -> None:
         assert out.dtype is x.dtype and out.device == x.device
         assert out.is_contiguous()
         _assert_bitwise(out, _gather_ref([rows] * WORLD, seed), f"uniform rows={rows}")
-        dist.barrier()
+        _barrier()
 
 
 def check_ragged_gather() -> None:
@@ -402,7 +461,7 @@ def check_ragged_gather() -> None:
         assert out.shape == (sum(sizes), HIDDEN), (sizes, out.shape)
         assert out.dtype is x.dtype and out.is_contiguous()
         _assert_bitwise(out, _gather_ref(sizes, seed), f"ragged sizes={sizes}")
-        dist.barrier()
+        _barrier()
 
 
 def check_output_is_fresh_and_input_is_untouched() -> None:
@@ -419,7 +478,7 @@ def check_output_is_fresh_and_input_is_untouched() -> None:
     x.fill_(-7.0)
     torch.cuda.synchronize()
     _assert_bitwise(out, _gather_ref([rows] * WORLD, seed), "output after input clobber")
-    dist.barrier()
+    _barrier()
 
 
 def check_trailing_dims_are_preserved() -> None:
@@ -442,7 +501,7 @@ def check_trailing_dims_are_preserved() -> None:
             _gather_ref([rows] * WORLD if sizes is None else sizes, seed, trailing=trailing),
             f"trailing={trailing} sizes={sizes}",
         )
-        dist.barrier()
+        _barrier()
 
 
 def check_dtypes_move_bitwise() -> None:
@@ -467,13 +526,13 @@ def check_dtypes_move_bitwise() -> None:
         out = allgather(x, None, GROUP)
         assert out.dtype is dtype and out.shape == (16 * WORLD, HIDDEN)
         _assert_bitwise(out, _gather_ref([16] * WORLD, seed, dtype), f"uniform {dtype}")
-        dist.barrier()
+        _barrier()
 
         xr = _payload(RANK, sizes[RANK], seed, dtype)
         outr = allgather(xr, sizes, GROUP)
         assert outr.dtype is dtype and outr.shape == (sum(sizes), HIDDEN)
         _assert_bitwise(outr, _gather_ref(sizes, seed, dtype), f"ragged {dtype}")
-        dist.barrier()
+        _barrier()
 
 
 def check_group_selects_a_rank_subset() -> None:
@@ -487,7 +546,7 @@ def check_group_selects_a_rank_subset() -> None:
         out = allgather(_payload(RANK, rows, seed), None, subset, process_group=pg)
         assert out.shape == (rows * len(subset), HIDDEN), out.shape
         _assert_bitwise(out, _gather_ref([rows] * len(subset), seed, ranks=subset), "subset gather")
-    dist.barrier()
+    _barrier()
 
 
 def check_group_order_does_not_change_the_output_order() -> None:
@@ -496,11 +555,11 @@ def check_group_order_does_not_change_the_output_order() -> None:
     x = _payload(RANK, rows, seed)
     out = allgather(x, None, list(reversed(GROUP)))
     _assert_bitwise(out, _gather_ref([rows] * WORLD, seed), "reversed group list")
-    dist.barrier()
+    _barrier()
 
 
 def check_cuda_graph_at_every_engine_batch_size() -> None:
-    """Captured at all 35 engine batch sizes, then replayed interleaved.
+    """Captured at all 45 engine batch sizes, then replayed interleaved.
 
     Capturing one row count proves nothing about an engine, which holds every
     graph in GRAPH_BATCH_SIZES alive at once and replays them in whatever order
@@ -510,12 +569,12 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
 
     Two passes per order: one replay at a time with a synchronize and a full
     check before the next graph runs, then the whole order issued back to back
-    with no synchronization in between — 35 differently sized collectives
+    with no synchronization in between — 45 differently sized collectives
     queued as one run of work, which is the only pass that can catch a hazard
     that needs the next call to already be in flight.
     """
     inputs, graphs, outputs = _capture_per_batch_size()
-    assert len(graphs) == len(GRAPH_BATCH_SIZES) == 35
+    assert len(graphs) == len(GRAPH_BATCH_SIZES) == 45
     seed = 110000
     for name, order in _replay_orders():
         for pos, rows in enumerate(order):
@@ -524,7 +583,7 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
             graphs[rows].replay()
             torch.cuda.synchronize()
             _verify_replay(outputs, rows, seed, f"{name}/checked@{pos} rows={rows}")
-        dist.barrier()
+        _barrier()
         staged: Dict[int, int] = {}
         for rows in order:
             seed += 1000
@@ -535,7 +594,7 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
         torch.cuda.synchronize()
         for pos, rows in enumerate(order):
             _verify_replay(outputs, rows, staged[rows], f"{name}/burst@{pos} rows={rows}")
-        dist.barrier()
+        _barrier()
     # Discrimination for a gate of exactly 0: what a replay that did not happen
     # leaves behind is the previous payload's gather. Measured by mutating this
     # file to skip one row count's refresh — the checked pass then failed on all
@@ -547,17 +606,17 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
     margin = (last.float() - prev.float()).abs().max().item()
     assert margin > 8.0, f"stale-replay margin {margin}"
     del graphs, outputs, inputs
-    dist.barrier()
+    _barrier()
 
 
 def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
-    """The decode graph this checkpoint captures, at all 35 batch sizes.
+    """The decode graph this checkpoint captures, at all 45 batch sizes.
 
-    1015 captured gathers, one memory pool. The sites are independent — each
-    reads its own buffer and every one gets a distinct payload, so a site that
-    returned a neighbour's data would fail the bitwise gate. Two replay orders
-    rather than four: the per-order cost is 29x the single-site test's and the
-    axis this one adds is site count, not order.
+    2160 captured gathers (45 graphs x 48 MoE layers), one memory pool. The
+    sites are independent — each reads its own buffer and every one gets a
+    distinct payload, so a site that returned a neighbour's data would fail the
+    bitwise gate. Two replay orders rather than four: the per-order cost is 48x
+    the single-site test's and the axis this one adds is site count, not order.
     """
     inputs, graphs, outputs = _capture_per_batch_size(sites=SITES_PER_DECODE_GRAPH, seed=21000)
     seed = 310000
@@ -568,7 +627,7 @@ def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
             graphs[rows].replay()
             torch.cuda.synchronize()
             _verify_replay(outputs, rows, seed, f"{name}/checked@{pos} rows={rows}")
-        dist.barrier()
+        _barrier()
         staged: Dict[int, int] = {}
         for rows in order:
             seed += 1000
@@ -579,9 +638,9 @@ def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
         torch.cuda.synchronize()
         for pos, rows in enumerate(order):
             _verify_replay(outputs, rows, staged[rows], f"{name}/burst@{pos} rows={rows}")
-        dist.barrier()
+        _barrier()
     del graphs, outputs, inputs
-    dist.barrier()
+    _barrier()
 
 
 def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
@@ -611,9 +670,9 @@ def check_cuda_graph_replays_survive_eager_calls_of_other_shapes() -> None:
         graphs[rows].replay()
         torch.cuda.synchronize()
         _verify_replay(outputs, rows, seed, f"after-eager@{i} rows={rows}")
-        dist.barrier()
+        _barrier()
     del graphs, outputs, inputs
-    dist.barrier()
+    _barrier()
 
 
 def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
@@ -639,7 +698,7 @@ def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
         pool = graph.pool() if pool is None else pool
         buffers[tag], graphs[tag] = x, graph
         assert captured[tag].shape == (sum(sizes), HIDDEN), captured[tag].shape
-        dist.barrier()
+        _barrier()
 
     for round_seed in (82000, 83000):
         for tag, sizes in (("second", second), ("first", first)):
@@ -651,9 +710,9 @@ def check_cuda_graph_holds_the_sizes_vector_it_captured() -> None:
                 _gather_ref(sizes, round_seed),
                 f"ragged replay {tag} sizes={sizes}",
             )
-            dist.barrier()
+            _barrier()
     del graphs, captured, buffers
-    dist.barrier()
+    _barrier()
 
 
 def check_the_gate_discriminates_a_wrong_gather() -> None:
@@ -674,6 +733,13 @@ def check_the_gate_discriminates_a_wrong_gather() -> None:
     two 0.2489 figures sit just under the arithmetic ceiling of 1/WORLD: a
     variant that corrupts one rank's block cannot move more than a quarter of
     a 4-rank gather, which is why the floors below are per variant.
+
+    The rotated split's floor follows the world size too. Its first row is
+    rank 0's first row drawn from the same generator stream at another height,
+    which comes out identical (0.9602 at world 4 is 27 of 28 rows differing),
+    so the most it can move is 1 - 1/sum(sizes): 5 of 6 rows at world 2. From
+    world 4 up that ceiling leaves room for the flat 0.9 floor, which is kept
+    there; below it the floor is 0.9 of the ceiling.
     """
     rows, seed = 8, 91000
     uniform = allgather(_payload(RANK, rows, seed), None, GROUP)
@@ -704,7 +770,7 @@ def check_the_gate_discriminates_a_wrong_gather() -> None:
             "ragged split rotated",
             ragged,
             torch.cat([_payload(r, rotated_split[r], seed) for r in range(WORLD)], 0),
-            0.9,
+            0.9 if WORLD >= 4 else 0.9 * (1 - 1 / sum(sizes)),
         ),
     ]
     for name, got, variant, floor in wrong:
@@ -713,7 +779,7 @@ def check_the_gate_discriminates_a_wrong_gather() -> None:
         fraction = (diff != 0).float().mean().item()
         assert fraction > floor, f"{name}: only {fraction:.4f} of elements differ"
         assert diff.max().item() > 8.0, f"{name}: max difference {diff.max().item()}"
-    dist.barrier()
+    _barrier()
 
 
 def check_the_engines_own_cross_rank_step_is_not_on_this_communicator() -> None:
@@ -726,7 +792,7 @@ def check_the_engines_own_cross_rank_step_is_not_on_this_communicator() -> None:
     """
     counts = [3 + 2 * r for r in range(WORLD)]
     assert list(_host_allgather(counts[RANK])) == counts
-    dist.barrier()
+    _barrier()
 
 
 def check_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
@@ -740,7 +806,7 @@ def check_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
 
     Nothing synchronises here. Every step's payloads and gathers, and the host
     collective between steps, are issued back to back for all 8 steps before a
-    single result is read — 232 gathers per rank in flight, which is what makes
+    single result is read — 384 gathers per rank in flight, which is what makes
     the launch queue saturate the way it does in a served forward rather than
     in a lockstep test loop. All of them are checked afterwards, bitwise.
     """
@@ -764,7 +830,7 @@ def check_interleaved_with_the_engines_attention_dp_synchronisation() -> None:
             _gather_ref([rows] * WORLD, seed),
             f"adp step={step} layer={layer} rows={rows}",
         )
-    dist.barrier()
+    _barrier()
 
 
 def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
@@ -792,7 +858,7 @@ def check_the_stream_the_call_lands_on_is_not_part_of_the_match() -> None:
             x = _payload(RANK, rows, seed)
             out = _gather_on_a_side_stream(x, side) if use_side(i) else allgather(x, None, GROUP)
             _assert_bitwise(out, _gather_ref([rows] * WORLD, seed), f"{name} i={i}")
-        dist.barrier()
+        _barrier()
 
 
 def check_wrapper_guards_a_non_contiguous_input() -> None:
@@ -812,7 +878,7 @@ def check_wrapper_guards_a_non_contiguous_input() -> None:
         pass
     else:
         raise AssertionError("wrapper accepted a non-contiguous input")
-    dist.barrier()
+    _barrier()
 
 
 def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
@@ -828,7 +894,7 @@ def check_wrapper_guards_a_sizes_list_of_the_wrong_length() -> None:
             pass
         else:
             raise AssertionError(f"wrapper accepted sizes of length {len(sizes)}")
-    dist.barrier()
+    _barrier()
 
 
 def check_wrapper_guards_a_zero_dim_input() -> None:
@@ -844,7 +910,7 @@ def check_wrapper_guards_a_zero_dim_input() -> None:
         pass
     else:
         raise AssertionError("wrapper accepted a 0-d input")
-    dist.barrier()
+    _barrier()
 
 
 def check_call_order_disagreement_corrupts_silently() -> None:
@@ -874,7 +940,7 @@ def check_call_order_disagreement_corrupts_silently() -> None:
     first, second = _payload(RANK, rows, seed), _payload(RANK, rows, seed + 500)
     ref_first = _gather_ref([rows] * WORLD, seed)
     ref_second = _gather_ref([rows] * WORLD, seed + 500)
-    dist.barrier()
+    _barrier()
 
     if RANK == 0:
         got_second = allgather(second, None, GROUP)
@@ -894,7 +960,7 @@ def check_call_order_disagreement_corrupts_silently() -> None:
         assert got.shape == ref.shape, (name, got.shape, ref.shape)
         wrong = (got != ref).float().mean().item()
         assert wrong > floor, f"{name}: only {wrong:.4f} of elements differ"
-    dist.barrier()
+    _barrier()
 
     x = _payload(RANK, rows, seed + 900)
     _assert_bitwise(
@@ -902,7 +968,7 @@ def check_call_order_disagreement_corrupts_silently() -> None:
         _gather_ref([rows] * WORLD, seed + 900),
         "gather after an order disagreement",
     )
-    dist.barrier()
+    _barrier()
 
 
 CHECKS = (
@@ -934,11 +1000,96 @@ CHECKS = (
     check_call_order_disagreement_corrupts_silently,
 )
 
+# What a served dep4 / dep2 forward does with the MPI-session symbol: the
+# cells, uniform and ragged gathers, a fresh output, CUDA graphs at every
+# engine batch size with one gather per MoE layer, eager calls between
+# replays, the engine's host step between gathers, and the stream moving
+# under the call. The rest of `CHECKS` concern the wrapper's guards, the
+# reference's discrimination or the pg symbol's sub-groups, none of which
+# depends on the symbol a served engine reaches.
+MPI_CHECKS = (
+    # Stays first: the MPI symbol builds its group's communicator on the
+    # group's first call, which cannot happen inside a capture, so the first
+    # call is an eager one.
+    check_certified_cells,
+    check_uniform_gather,
+    check_ragged_gather,
+    check_output_is_fresh_and_input_is_untouched,
+    check_cuda_graph_at_every_engine_batch_size,
+    check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph,
+    check_cuda_graph_replays_survive_eager_calls_of_other_shapes,
+    check_interleaved_with_the_engines_attention_dp_synchronisation,
+    check_the_stream_the_call_lands_on_is_not_part_of_the_match,
+)
+
+
+def _bind_entry(rank: int, world: int, process_group: Optional[object]) -> None:
+    """Bind the rank state every check reads: the entry, its call surface and
+    the guard harness."""
+    global RANK, WORLD, GROUP, allgather, validating, entry
+    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
+
+    # One partial instead of a per-call argument: every check's call site keeps
+    # the certified shape, and the wrapper hands `process_group` to the symbol
+    # it selects -- the same routing the product does in
+    # _torch/distributed/ops.py: a boxed group runs the _pg symbol, None the
+    # MPI-session one. The partial is only the call surface: the guard is
+    # armed on the entry itself, and `reference` and `CELLS` are read off
+    # `entry.allgather` directly.
+    allgather = functools.partial(entry.allgather, process_group=process_group)
+
+    # This file is run as a spawned worker process, not collected by pytest,
+    # so the repo's `__extra_import_path__` mechanism is not in play and the
+    # sibling helper has to be reached the plain way. The mutation is confined
+    # to these rank processes; the pytest process that launched them never sees
+    # it, which is what its own sys.path check is there to protect.
+    # comm -> modeling_v2, where _validating is.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from _validating import validating as _validating_cm
+
+    validating = _validating_cm
+    RANK = rank
+    WORLD = world
+    GROUP = list(range(WORLD))
+    assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
+
+
+def _run_checks(checks: Sequence[Any], transport: str, fail) -> None:
+    """Run `checks` in order; rank 0 reports each one's wall time. A failing
+    rank calls `fail`, which must not return: a rank that leaves a collective
+    early wedges every sibling in it."""
+    start = time.monotonic()
+    for check in checks:
+        t0 = time.monotonic()
+        try:
+            check()
+        except BaseException:
+            import traceback
+
+            print(f"[rank {RANK}] FAILED {check.__name__} ({transport})", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            fail()
+        if RANK == 0:
+            print(
+                f"[rank 0] {transport} world {WORLD}: passed {check.__name__} "
+                f"in {time.monotonic() - t0:.1f}s",
+                flush=True,
+            )
+    _barrier()
+    torch.cuda.synchronize()
+    print(
+        f"[rank {RANK}] {transport} world {WORLD}: {len(checks)} checks passed "
+        f"in {time.monotonic() - start:.1f}s",
+        flush=True,
+    )
+
 
 def _run_one_rank(device: Optional[int] = None) -> int:
-    """Body of one spawned rank: run every test; a failing rank exits nonzero
-    and the launcher kills its siblings."""
-    global RANK, WORLD, GROUP, HOST_GROUP, SUBGROUPS, PG_BOXED, allgather, validating, entry
+    """Body of one spawned rank (pg transport): run every check; a failing rank
+    exits nonzero and the launcher kills its siblings."""
+    global HOST_GROUP, SUBGROUPS, PG_BOXED
     os.environ.setdefault("TLLM_DISABLE_MPI", "1")
     rank = int(os.environ["RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -953,30 +1104,8 @@ def _run_one_rank(device: Optional[int] = None) -> int:
     # that measurably wedges a watchdog at exit.
     dist.init_process_group("nccl", init_method="env://", device_id=torch.device("cuda", device))
 
-    from tensorrt_llm._torch._experimental.modeling_v2.catalog.comm import allgather as entry
-
-    # One partial instead of a per-call argument: every check's call site keeps
-    # the certified shape, and the wrapper hands the boxed group to the _pg
-    # symbol -- the same routing the product's non-MPI mode does in
-    # _torch/distributed/ops.py. The partial is only the call surface: the
-    # guard is armed on the entry itself, and `reference` and
-    # `CELLS` are read off `entry.allgather` directly.
     PG_BOXED = dist.distributed_c10d._get_default_group().boxed()
-    allgather = functools.partial(entry.allgather, process_group=PG_BOXED)
-
-    # This file is run as a spawned worker process, not collected by pytest,
-    # so the repo's `__extra_import_path__` mechanism is not in play and the
-    # sibling helper has to be reached the plain way. The mutation is confined
-    # to these rank processes; the pytest process that launched them never sees
-    # it, which is what its own sys.path check is there to protect.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from _validating import validating as _validating_cm
-
-    validating = _validating_cm
-    RANK = rank
-    WORLD = world
-    GROUP = list(range(WORLD))
-    assert WORLD >= 2, f"a collective needs at least 2 ranks, got {WORLD}"
+    _bind_entry(rank, world, PG_BOXED)
     HOST_GROUP = dist.new_group(backend="gloo")
     # A rank subset is a real sub-ProcessGroup on this path, not just a shorter
     # `group` list: the _pg op gathers on the communicator it is handed, so a
@@ -987,23 +1116,9 @@ def _run_one_rank(device: Optional[int] = None) -> int:
         if key not in SUBGROUPS:
             SUBGROUPS[key] = dist.new_group(list(key))
 
-    for check in CHECKS:
-        try:
-            check()
-        except BaseException:
-            import traceback
-
-            print(f"[rank {RANK}] FAILED {check.__name__}", flush=True)
-            traceback.print_exc()
-            sys.stdout.flush()
-            sys.stderr.flush()
-            # Exit hard rather than return: a rank that leaves a collective
-            # early wedges every sibling in it, and the launcher kills the
-            # rest the moment it sees this nonzero exit.
-            os._exit(13)
-    dist.barrier()
-    torch.cuda.synchronize()
-    print(f"[rank {RANK}] {len(CHECKS)} checks passed", flush=True)
+    # Exit hard rather than return: the launcher kills the rest the moment it
+    # sees this nonzero exit.
+    _run_checks(CHECKS, "pg", lambda: os._exit(13))
     # Exit without tearing the process group down: destroying a communicator
     # that captured collectives into CUDA graphs measurably wedges NCCL's
     # watchdog, and these are throwaway processes the launcher owns anyway.
@@ -1011,14 +1126,28 @@ def _run_one_rank(device: Optional[int] = None) -> int:
     os._exit(0)
 
 
-def _spawn_ranks() -> None:
-    """Start one worker process per claimed device; no external launcher.
+def _run_one_mpi_rank() -> int:
+    """Body of one mpirun rank (mpi transport): the MPI world is the group, and
+    the entry runs the MPI-session symbol a served engine calls."""
+    global MPI_COMM
+    from mpi4py import MPI
 
-    The ranks rendezvous through torch.distributed's env:// method, so the only
-    thing this needs is a free port. Each child gets its own session; on the
-    first nonzero exit or on the deadline, every session is killed, which is
-    what keeps one wedged collective from outliving the run.
-    """
+    comm = MPI.COMM_WORLD
+    rank, world = comm.Get_rank(), comm.Get_size()
+    # The launcher started one rank per device it names, in order.
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    _bind_entry(rank, world, None)
+    MPI_COMM = comm
+    # A failing rank aborts the MPI world, which ends every rank and mpirun.
+    _run_checks(MPI_CHECKS, "mpi", lambda: comm.Abort(13))
+    # Finalize MPI, so mpirun reads a clean exit, then leave without running the
+    # NCCL communicators' destructors, for the reason the pg ranks give.
+    sys.stdout.flush()
+    MPI.Finalize()
+    os._exit(0)
+
+
+def _visible_world() -> int:
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     assert visible, (
         "set CUDA_VISIBLE_DEVICES to the devices this run owns, "
@@ -1028,6 +1157,18 @@ def _spawn_ranks() -> None:
     assert world_size >= 2, (
         f"CUDA_VISIBLE_DEVICES names {world_size} device(s); a collective test needs at least 2"
     )
+    return world_size
+
+
+def _spawn_ranks(world_size: int, deadline_s: int) -> None:
+    """pg transport: start one worker process per claimed device; no external
+    launcher.
+
+    The ranks rendezvous through torch.distributed's env:// method, so the only
+    thing this needs is a free port. Each child gets its own session; on the
+    first nonzero exit or on the deadline, every session is killed, which is
+    what keeps one wedged collective from outliving the run.
+    """
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
@@ -1046,7 +1187,7 @@ def _spawn_ranks() -> None:
     # it -- before anything is reported. These ranks rendezvous through
     # torch.distributed's own env://, not pmix.
     env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
-    print(f"[launcher] spawning {world_size} ranks, rendezvous on :{port}", flush=True)
+    print(f"[launcher] pg: spawning {world_size} ranks, rendezvous on :{port}", flush=True)
     children = [
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
@@ -1065,12 +1206,12 @@ def _spawn_ranks() -> None:
         for p in children:
             p.wait()
 
-    deadline = time.monotonic() + DEADLINE_S
+    deadline = time.monotonic() + deadline_s
     live = set(range(world_size))
     failure = None
     while live and failure is None:
         if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
+            failure = f"did not finish in {deadline_s}s (wedged)"
             break
         for r in sorted(live):
             code = children[r].poll()
@@ -1083,15 +1224,86 @@ def _spawn_ranks() -> None:
         time.sleep(0.5)
     if failure is not None:
         _kill_all()
-        raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+        raise AssertionError(f"the {world_size}-rank pg run failed: {failure}")
+
+
+def _inherited_from_a_launch(key: str) -> bool:
+    """An environment variable that places this process inside some launch.
+
+    mpirun reads them as the allocation it runs in: inside a one-task Slurm
+    allocation the SLURM_ ones make it refuse to start more ranks than the one
+    task (or start ranks that each believe they are rank 0 of a world of 1),
+    and an enclosing PMIx/OMPI namespace would register its ranks with that
+    launch. The MCA settings and the run-as-root consent are configuration,
+    not placement, and are kept.
+    """
+    if key.startswith("SLURM_"):
+        return True
+    if key.startswith(("PMIX_MCA_", "OMPI_MCA_", "OMPI_ALLOW_RUN_AS_ROOT")):
+        return False
+    return key.startswith(("PMIX_", "PMI_", "OMPI_"))
+
+
+def _spawn_mpi_ranks(world_size: int, deadline_s: int) -> None:
+    """mpi transport: re-execute this file under mpirun, one rank per device,
+    killed with its process group at the deadline.
+
+    `_lockstep.spawn`'s launch, with `--oversubscribe` and the environment
+    scrubbed of any enclosing launch (see `_inherited_from_a_launch`), so it
+    also starts inside a scheduler allocation that granted this process one
+    task.
+    """
+    env = {k: v for k, v in os.environ.items() if not _inherited_from_a_launch(k)}
+    env.pop("TLLM_DISABLE_MPI", None)
+    command = [
+        "mpirun",
+        "--allow-run-as-root",
+        "--oversubscribe",
+        "-n",
+        str(world_size),
+        sys.executable,
+        str(Path(__file__).resolve()),
+        _MPI_WORKER_FLAG,
+    ]
+    print(f"[launcher] mpi: {' '.join(command)}", flush=True)
+    process = subprocess.Popen(command, env=env, start_new_session=True)
+    try:
+        code = process.wait(timeout=deadline_s)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        raise AssertionError(
+            f"the {world_size}-rank mpi run did not finish in {deadline_s}s (wedged)"
+        ) from None
+    assert code == 0, f"the {world_size}-rank mpi run exited {code}"
+
+
+def _argument(name: str, default: str) -> str:
+    if name in sys.argv:
+        return sys.argv[sys.argv.index(name) + 1]
+    return default
 
 
 if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
+    if _MPI_WORKER_FLAG in sys.argv:
+        sys.exit(_run_one_mpi_rank())
     if "--srun" in sys.argv:
+        # _rank_job is beside this file, in comm/.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
         import _rank_job
 
         sys.exit(_run_one_rank(device=_rank_job.adopt_srun_env()))
-    _spawn_ranks()
+    WORLD_SIZE = _visible_world()
+    requested = _argument("--world-size", str(WORLD_SIZE))
+    assert int(requested) == WORLD_SIZE, (
+        f"--world-size {requested}, but CUDA_VISIBLE_DEVICES names {WORLD_SIZE} devices"
+    )
+    TRANSPORT = _argument("--transport", "both")
+    assert TRANSPORT in ("both", "pg", "mpi"), f"--transport {TRANSPORT}: both, pg or mpi"
+    if TRANSPORT in ("both", "pg"):
+        _spawn_ranks(WORLD_SIZE, PG_DEADLINE_S)
+    if TRANSPORT in ("both", "mpi"):
+        _spawn_mpi_ranks(WORLD_SIZE, MPI_DEADLINE_S)
     print("OK")
