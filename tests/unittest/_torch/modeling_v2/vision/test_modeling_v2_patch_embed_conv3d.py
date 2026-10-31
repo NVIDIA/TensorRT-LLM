@@ -17,11 +17,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.vision.patch_embed_conv3d__r49 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.vision.patch_embed_conv3d import (  # noqa: E501
     patch_embed_conv3d as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "patch_embed_conv3d requires a CUDA device"

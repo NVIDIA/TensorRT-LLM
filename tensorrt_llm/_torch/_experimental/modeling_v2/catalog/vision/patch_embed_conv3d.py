@@ -16,12 +16,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 #: This checkpoint: in_channels 3, kernel (temporal_patch_size 2, patch_size
 #: 16, 16), out_channels 1152 -- weight [1152, 3, 2, 16, 16], a 1536-pixel row.

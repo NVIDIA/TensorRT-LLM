@@ -28,11 +28,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.vision_rope
     vision_rope_2d_packed_qk,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.vision.patch_embed_conv3d import (
+    patch_embed_conv3d,
+)
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
 from .ops.attention.thop_attention__r2 import thop_attention
 from .ops.gemm.cublas_mm__vision import cublas_mm
-from .ops.vision.patch_embed_conv3d__r49 import patch_embed_conv3d
 from .ops.vision.triton_pos_embed_interpolate__tower import triton_pos_embed_interpolate
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
