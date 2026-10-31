@@ -458,7 +458,7 @@ def test_trtllm_attention_rejects_unvalidated_gpu(
         MiniMaxH3Pipeline(config)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7)])
 def test_trtllm_attention_accepts_supported_gpu(
     monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
 ) -> None:
