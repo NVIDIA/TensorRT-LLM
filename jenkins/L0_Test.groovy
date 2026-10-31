@@ -1170,6 +1170,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = SlurmConfig.withGpuBudget(pipeline, partition.clusterName, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -1630,6 +1631,10 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // GB200 stages run on gcp-iad, which needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200")) {
+        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
+    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
@@ -2393,9 +2398,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
+                        # Silence xtrace around the capture and prints: it would re-echo the
+                        # multi-line sbatch output in every traced command. Restore it only
+                        # if it was on, so a caller that turned it off stays off.
+                        case \$- in
+                            *x*) xtrace_was_on=1 ;;
+                            *)   xtrace_was_on=0 ;;
+                        esac
+                        { set +x; } 2>/dev/null
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
-                        printf '%s\\n' "\${sbatch_output}"
+                        sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
+                        printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${xtrace_was_on}" -eq 1 ]; then
+                            set -x
+                        fi
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
