@@ -40,7 +40,7 @@ from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.async_llm import AsyncLLM
 from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
-from tensorrt_llm.executor import CppExecutorError
+from tensorrt_llm.executor import CppExecutorError, RequestError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
@@ -129,14 +129,16 @@ from tensorrt_llm.serve.render import (HarmonyConversionError, RenderResources,
                                        prepare_chat_request, render_chat,
                                        render_chat_for_length,
                                        render_conversation)
-from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
-                                                ConversationHistoryStore,
-                                                ResponsesStreamingProcessor,
-                                                ServerArrivalTimeMiddleware)
+from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, ClosingStreamingResponse,
+    ConversationHistoryStore, ResponsesStreamingProcessor,
+    ServerArrivalTimeMiddleware, classify_stream_termination)
 from tensorrt_llm.serve.responses_utils import \
     create_response as responses_api_create_response
-from tensorrt_llm.serve.responses_utils import (guard_responses_stream,
-                                                keep_responses_stream_alive)
+from tensorrt_llm.serve.responses_utils import (describe_stream_termination,
+                                                guard_responses_stream,
+                                                keep_responses_stream_alive,
+                                                rejected_responses_stream)
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
 from tensorrt_llm.serve.responses_web_search import web_search_rejection_reason
@@ -3519,15 +3521,30 @@ class OpenAIServer(_VideoRoutesMixin):
                 request.disaggregated_params)
             conversation_params = to_llm_conversation_params(
                 request.conversation_params)
-            promise = self.generator.generate_async(
-                inputs=input_tokens,
-                sampling_params=sampling_params,
-                streaming=request.stream,
-                disaggregated_params=disaggregated_params,
-                conversation_params=conversation_params,
-                _postproc_params=postproc_params
-                if self.postproc_worker_enabled else None,
-            )
+            try:
+                promise = self.generator.generate_async(
+                    inputs=input_tokens,
+                    sampling_params=sampling_params,
+                    streaming=request.stream,
+                    disaggregated_params=disaggregated_params,
+                    conversation_params=conversation_params,
+                    _postproc_params=postproc_params
+                    if self.postproc_worker_enabled else None,
+                )
+            except RequestError as error:
+                # An executor that runs in this process rejects an over-length
+                # prompt here; one in a worker process rejects it while the
+                # stream runs (guard_responses_stream). A streamed request
+                # fails in-stream either way.
+                cause = classify_stream_termination(error)
+                if (streaming_processor is None
+                        or cause != STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED):
+                    raise
+                detail = describe_stream_termination(error, cause)
+                logger.error(f"Responses request rejected ({cause}): {detail}")
+                return StreamingResponse(content=rejected_responses_stream(
+                    streaming_processor, cause, detail),
+                                         media_type="text/event-stream")
             if not self.postproc_worker_enabled:
                 # Set by the executor only for postprocessing it runs itself.
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)

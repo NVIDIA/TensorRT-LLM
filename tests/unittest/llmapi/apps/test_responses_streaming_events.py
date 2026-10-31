@@ -31,23 +31,27 @@ from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
+from openai.types.responses import ResponseFailedEvent
 from openai.types.responses.tool import FunctionTool
 from starlette.requests import ClientDisconnect
 
 import tensorrt_llm.serve.responses_utils as responses_utils
 from tensorrt_llm.executor import EngineDeadError, RequestError
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.serve.openai_protocol import ResponsesRequest
 from tensorrt_llm.serve.responses_utils import (
     ClosingStreamingResponse,
     ResponsesStreamingEventsHelper,
     ResponsesStreamingProcessor,
     _create_output_content,
+    _format_sse_event,
     _generate_streaming_event,
     _stamp_sequence_number,
     classify_stream_termination,
     describe_stream_termination,
     guard_responses_stream,
     keep_responses_stream_alive,
+    rejected_responses_stream,
     stream_error_event,
 )
 
@@ -303,12 +307,14 @@ def _event_data(frame):
     return json.loads(frame.split("data: ", 1)[1])
 
 
-def _processor():
-    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+def _processor(request=None, create_time=None):
+    if request is None:
+        request = ResponsesRequest(model="test-model", input="hi", stream=True)
     return ResponsesStreamingProcessor(
         request=request,
         sampling_params=request.to_sampling_params(),
         model_name="test-model",
+        create_time=create_time,
         use_harmony=False,
     )
 
@@ -403,12 +409,17 @@ async def test_a_broken_reporter_does_not_replace_the_original_fault():
     assert isinstance(raised, ValueError)
 
 
+_OVER_LENGTH = context_length_exceeded_message(max_context_length=8, num_prompt_tokens=9)
+
+
 @pytest.mark.parametrize(
     "exc, cause, detail",
     [
         (RequestError("request failed"), "engine_error", "RequestError: request failed"),
+        (RequestError(_OVER_LENGTH), "context_length_exceeded", _OVER_LENGTH),
         (EngineDeadError(), "engine_error", "EngineDeadError: Engine has died"),
         (ValueError("at 10.0.0.7:8001"), "internal_error", "ValueError"),
+        (ValueError(_OVER_LENGTH), "internal_error", "ValueError"),
         (aiohttp.ClientPayloadError("from 10.0.0.7:8001"), "upstream_error", "ClientPayloadError"),
     ],
 )
@@ -438,6 +449,107 @@ def test_the_failed_snapshot_says_failed_and_carries_no_content():
     )
     assert response["output"] == []
     assert response["id"] == processor.request.request_id
+
+
+@pytest.mark.parametrize(
+    "cause, code",
+    [
+        ("context_length_exceeded", "context_length_exceeded"),
+        ("engine_error", "server_error"),
+        ("upstream_error", "server_error"),
+        ("internal_error", "server_error"),
+    ],
+)
+def test_only_an_over_length_rejection_fails_with_its_own_code(cause, code):
+    """Clients act on the code of response.failed.
+
+    The Codex CLI reads context_length_exceeded as a full context window and
+    compacts its history before the next turn; it retries a server_error.
+    """
+    processor = _processor()
+    error, failed = processor.get_stream_failed_events(cause, "the detail", 2)
+
+    assert (_event_data(error)["code"], _event_data(error)["message"]) == (cause, "the detail")
+    response = _event_data(failed)["response"]
+    assert (response["status"], response["error"]["code"], response["error"]["message"]) == (
+        "failed",
+        code,
+        "the detail",
+    )
+
+
+@pytest.mark.parametrize(
+    "detail", ["ValueError", 'RequestError: a "quoted"\nline', "RequestError: ünïcødé ✓"]
+)
+def test_other_failures_are_serialized_as_any_other_frame(detail):
+    _, failed = _processor().get_stream_failed_events("engine_error", detail, 2)
+
+    event = ResponseFailedEvent.model_validate(_event_data(failed))
+    assert failed == _format_sse_event(event)
+
+
+@pytest.mark.asyncio
+async def test_an_over_length_rejection_fails_the_stream_and_ends_it_normally():
+    """The stream ends after response.failed rather than re-raising.
+
+    Re-raising aborts the connection, which a client reads as a transport
+    error. The Codex CLI settles on response.failed only once the stream has
+    ended, so it would never see the code.
+    """
+    processor = _processor()
+
+    seen, raised = await _drive(
+        processor.get_initial_responses(),
+        processor.get_stream_failed_events,
+        RequestError(_OVER_LENGTH),
+    )
+
+    assert [_event_type(frame) for frame in seen] == [
+        "response.created",
+        "response.in_progress",
+        "error",
+        "response.failed",
+    ]
+    assert [_event_data(frame)["sequence_number"] for frame in seen] == [0, 1, 2, 3]
+    error = _event_data(seen[-1])["response"]["error"]
+    assert (error["code"], error["message"]) == ("context_length_exceeded", _OVER_LENGTH)
+    assert raised is None
+
+
+@pytest.mark.asyncio
+async def test_other_engine_failures_still_fail_with_server_error_and_re_raise():
+    processor = _processor()
+
+    seen, raised = await _drive(
+        processor.get_initial_responses(),
+        processor.get_stream_failed_events,
+        RequestError("Insufficient KV cache"),
+    )
+
+    assert _event_data(seen[-1])["response"]["error"]["code"] == "server_error"
+    assert isinstance(raised, RequestError)
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_before_generation_streams_what_one_during_it_does():
+    """An executor in this process rejects in generate_async, one in a worker mid-stream."""
+    request = ResponsesRequest(model="test-model", input="hi", stream=True)
+
+    before = [
+        frame
+        async for frame in rejected_responses_stream(
+            _processor(request, create_time=1), "context_length_exceeded", _OVER_LENGTH
+        )
+    ]
+    processor = _processor(request, create_time=1)
+    during, raised = await _drive(
+        processor.get_initial_responses(),
+        processor.get_stream_failed_events,
+        RequestError(_OVER_LENGTH),
+    )
+
+    assert raised is None
+    assert before == during
 
 
 @pytest.mark.asyncio

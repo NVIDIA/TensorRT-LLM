@@ -67,10 +67,10 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, ResponsesStreamingProcessor,
+    ServerArrivalTimeMiddleware, get_steady_clock_now_in_seconds,
+    guard_responses_stream, rejected_responses_stream, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -456,7 +456,7 @@ class OpenAIDisaggServer:
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
-                return self._handle_exception(e)
+                return self._handle_exception(e, req)
         return wrapper
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
@@ -545,7 +545,8 @@ class OpenAIDisaggServer:
             return anthropic_error_response(str(error), "api_error", 503)
         return JSONResponse(content=response.model_dump())
 
-    def _handle_exception(self, exception):
+    def _handle_exception(self, exception: Exception,
+                          request: Optional[UCompletionRequest] = None) -> Response:
         if isinstance(exception, CppExecutorError):
             logger.error("CppExecutorError: ", traceback.format_exc())
             record_termination_observation(
@@ -570,6 +571,21 @@ class OpenAIDisaggServer:
             # /v1/chat/completions, so those get the same treatment.
             message = _upstream_error_message(exception)
             if is_context_length_exceeded_message(message):
+                if isinstance(request, ResponsesRequest) and request.stream:
+                    # The context phase never streams, so its worker rejected
+                    # the request with a 400. A streamed Responses request
+                    # fails in-stream instead, as on an aggregated server.
+                    processor = ResponsesStreamingProcessor(
+                        request=request,
+                        sampling_params=request.to_sampling_params(),
+                        model_name=request.model,
+                        use_harmony=False)
+                    return StreamingResponse(
+                        content=rejected_responses_stream(
+                            processor,
+                            STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED,
+                            message),
+                        media_type="text/event-stream")
                 # The worker tagged this rejection with the machine-readable
                 # code "context_length_exceeded" (openai_server.py,
                 # create_error_response). HTTPException would flatten it to
