@@ -963,8 +963,8 @@ class MarlinNVFP4RefGatedMLPFusedMoE(nn.Module):
             batch_idx, nth_expert = torch.where(selected_experts == expert_id)
             expert_inputs = hidden_states[batch_idx].float()
             ew = self._expert_weights[expert_id]
-            gate = expert_inputs @ ew["w3"].T
-            up = expert_inputs @ ew["w1"].T
+            gate = expert_inputs @ ew["w1"].T
+            up = expert_inputs @ ew["w3"].T
             if self.bias:
                 if "w1_bias" in ew:
                     gate = gate + ew["w1_bias"]
