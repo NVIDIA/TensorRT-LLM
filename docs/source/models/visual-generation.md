@@ -187,6 +187,11 @@ are not supported. See the
   for input limits, ordering, and media dependencies.
 - MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. This is a
   model-specific restriction, not a general VisualGen backend requirement.
+- Pre-quantized ModelOpt NVFP4 and per-tensor FP8 checkpoints load as exported:
+  quantized weights, scales, calibrated activation scales and the ModelOpt ignore
+  list are taken from the checkpoint's `quantization_config` when `quant_config`
+  is not set. Passing `quant_config: {quant_algo: NVFP4}` instead keeps the packed
+  weights but quantizes activations dynamically and ignores the exclusion list.
 - The published [MiniMax-H3 checkpoint license](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/LICENSE)
   restricts use by territory. Obtain legal approval before downloading or running the weights.
 
