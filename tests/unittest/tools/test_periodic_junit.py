@@ -23,13 +23,18 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 ``scripts/``.
 """
 
+import copy
 import faulthandler
 import os
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
+from _pytest.junitxml import LogXML
+from _pytest.reports import TestReport as PytestReport
 
 __extra_import_path__ = ["~/tests/integration/defs/utils"]
 from periodic_junit import PeriodicJUnitXML
@@ -212,3 +217,82 @@ def test_hang_traceback_off_by_default(make_reporter: ReporterFactory) -> None:
     assert reporter._hang_timer is None
     assert reporter._hang_file is None
     assert not os.path.exists(reporter._hang_traceback_path())
+
+
+@pytest.mark.parametrize("scenario", ["interleaved", "double_failure", "rerun", "skipped"])
+def test_periodic_snapshots_match_pytest_junit(tmp_path: Path, scenario: str) -> None:
+    reporter = PeriodicJUnitXML(str(tmp_path / "results.xml"), batch_size=1)
+    reporter.config = SimpleNamespace()
+    reference = LogXML(str(tmp_path / "reference.xml"), None, "pytest", "out-err")
+
+    def report(case: str, phase: str, outcome: str = "passed") -> PytestReport:
+        longrepr = None
+        if outcome in {"failed", "rerun"}:
+            longrepr = "failure <details> & context"
+        elif outcome == "skipped":
+            longrepr = ("test_sample.py", 1, "Skipped: unavailable <device> & runtime")
+        result = PytestReport(
+            nodeid=f"test_sample.py::test_{case}[<value>&]",
+            location=("test_sample.py", 1, f"test_{case}"),
+            keywords={},
+            outcome=outcome,
+            longrepr=longrepr,
+            when=phase,
+            duration=0.125,
+            sections=[("Captured stdout call", f"{case}: {phase} <output> & text")],
+            user_properties=[("property <name>", "property & value")],
+        )
+        result.node = case
+        return result
+
+    if scenario == "interleaved":
+        reports = [
+            report("slow", "setup"),
+            report("fast", "setup"),
+            report("slow", "call"),
+            report("fast", "call"),
+            report("fast", "teardown"),
+            report("slow", "teardown"),
+        ]
+    elif scenario == "double_failure":
+        reports = [
+            report("broken", "setup"),
+            report("broken", "call", "failed"),
+            report("broken", "teardown", "failed"),
+        ]
+    elif scenario == "rerun":
+        reports = [
+            report("retry", "setup"),
+            report("retry", "call", "rerun"),
+            report("retry", "teardown"),
+            report("retry", "setup"),
+            report("retry", "call"),
+            report("retry", "teardown"),
+        ]
+    else:
+        reports = [report("skip", "setup", "skipped"), report("skip", "teardown")]
+
+    def assert_snapshot() -> None:
+        suite = ET.parse(reporter.xmlpath).find("testsuite")
+        assert suite is not None
+        assert [ET.tostring(case) for case in suite] == [
+            ET.tostring(case.to_xml()) for case in reference.node_reporters_ordered
+        ]
+        assert {key: suite.get(key) for key in ("errors", "failures", "skipped", "tests")} == {
+            "errors": str(reference.stats["error"]),
+            "failures": str(reference.stats["failure"]),
+            "skipped": str(reference.stats["skipped"]),
+            "tests": str(sum(reference.stats.values()) - reference.cnt_double_fail_tests),
+        }
+
+    for current in reports:
+        reference_report = copy.copy(current)
+        if reference_report.outcome == "rerun":
+            reference_report.outcome = "failed"
+        reference.pytest_runtest_logreport(reference_report)
+        reporter.pytest_runtest_logreport(current)
+        reporter._generate_report()
+        assert_snapshot()
+
+    reporter.pytest_sessionfinish()
+    assert_snapshot()
