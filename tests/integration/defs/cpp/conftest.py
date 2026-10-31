@@ -153,18 +153,8 @@ def build_google_tests(request, build_type):
     )
 
 
-@pytest.fixture(scope="session")
-def build_kv_cache_compression_tests(request, build_type):
-    """Build only the standalone NVFP4 cold-page kernel gtest.
-
-    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
-    build that build_google_tests pays for.
-    """
-    if _cpp.prepare_test_bundle(build_type):
-        return
-
-    cuda_arch = f"{request.param}"
-
+def _build_standalone_gtest(cuda_arch, build_type, target):
+    """Configure for one CUDA arch and build only the given gtest target."""
     _logger.info(f"Using CUDA arch: {cuda_arch}")
 
     build_trt_llm(
@@ -192,12 +182,36 @@ def build_kv_cache_compression_tests(request, build_type):
             "--parallel",
             "12",
             "--target",
-            "nvfp4ColdPageKernelsTest",
+            target,
         ],
         cwd=build_dir,
         env=_os.environ,
         timeout=1800,
     )
+
+
+@pytest.fixture(scope="session")
+def build_kv_cache_compression_tests(request, build_type):
+    """Build only the standalone NVFP4 cold-page kernel gtest.
+
+    The binary uses NO_TLLM_LINKAGE, so this skips the full-library
+    build that build_google_tests pays for.
+    """
+    if _cpp.prepare_test_bundle(build_type):
+        return
+
+    _build_standalone_gtest(f"{request.param}", build_type,
+                            "nvfp4ColdPageKernelsTest")
+
+
+@pytest.fixture(scope="session")
+def build_haloq_planner_tests(request, build_type):
+    """Build only the HALO-Q planner gtest, which links just the CUDA runtime."""
+    if _cpp.prepare_test_bundle(build_type):
+        return
+
+    _build_standalone_gtest(f"{request.param}", build_type,
+                            "moeRebalanceHaloQTest")
 
 
 @pytest.fixture(scope="session")
