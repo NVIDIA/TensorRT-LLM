@@ -19,7 +19,8 @@ import json
 import os
 import traceback
 from abc import ABC, abstractmethod
-from contextlib import aclosing
+from contextlib import AbstractAsyncContextManager, aclosing
+from types import TracebackType
 from typing import (
     Any,
     AsyncGenerator,
@@ -225,6 +226,34 @@ class OpenAIClient(ABC):
         ...
 
 
+class _ResponseStartBound:
+    """Wrap a worker request so that its response must start within a time limit.
+
+    Entering the request covers connecting, sending the request and receiving
+    the response headers, and only entering is bounded; exiting is delegated
+    unchanged.
+    """
+
+    def __init__(
+        self,
+        request: AbstractAsyncContextManager[aiohttp.ClientResponse],
+        timeout_secs: Optional[float],
+    ) -> None:
+        self._request = request
+        self._timeout_secs = timeout_secs
+
+    async def __aenter__(self) -> aiohttp.ClientResponse:
+        return await asyncio.wait_for(self._request.__aenter__(), self._timeout_secs)
+
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc: Optional[BaseException],
+        tb: Optional[TracebackType],
+    ) -> Optional[bool]:
+        return await self._request.__aexit__(exc_type, exc, tb)
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -242,6 +271,20 @@ class OpenAIHttpClient(OpenAIClient):
         self._router = router
         self._role = role
         self._metrics_collector = ClientMetricsCollector(role)
+        # A non-streamed response arrives whole, so timeout_secs bounds the whole
+        # request. A streamed response lasts as long as the worker keeps
+        # generating, so timeout_secs bounds its silence instead: the wait for the
+        # response to start, which includes connecting and sending the request,
+        # and every wait for data after that. A total bound would cut a long
+        # generation that is still producing tokens.
+        self._non_stream_timeout = aiohttp.ClientTimeout(total=timeout_secs)
+        # Non-positive values disable every stream bound. A negative sock_read
+        # value would otherwise schedule an immediate timeout in aiohttp.
+        stream_timeout_secs = timeout_secs if timeout_secs > 0 else None
+        self._stream_timeout = aiohttp.ClientTimeout(
+            total=None, connect=stream_timeout_secs, sock_read=stream_timeout_secs
+        )
+        self._response_start_timeout_secs = stream_timeout_secs
         self._session = session or aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(
                 limit=0,
@@ -323,6 +366,24 @@ class OpenAIHttpClient(OpenAIClient):
                     headers=response.headers,
                 )
             return response_type(**await response.json())
+
+    def _post(
+        self,
+        url: str,
+        data: bytes,
+        headers: dict[str, str],
+        timeout: aiohttp.ClientTimeout,
+    ) -> _ResponseStartBound:
+        """POST to a worker, failing if its response has not started within timeout_secs.
+
+        aiohttp starts its sock_read bound only once the request is fully written,
+        so for a streamed response, which has no total bound, this is the bound
+        on a worker that stops reading a large request.
+        """
+        return _ResponseStartBound(
+            self._session.post(url, data=data, headers=headers, timeout=timeout),
+            self._response_start_timeout_secs,
+        )
 
     async def _send_request(
         self,
@@ -484,10 +545,11 @@ class OpenAIHttpClient(OpenAIClient):
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
-                async with self._session.post(
+                async with self._post(
                     url,
                     data=body,
                     headers=headers,
+                    timeout=self._stream_timeout if is_stream else self._non_stream_timeout,
                 ) as http_response:
                     response_started = True
                     response_clock = AdjustedSteadyClock()

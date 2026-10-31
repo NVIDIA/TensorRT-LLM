@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import errno
 import json
 import socket
@@ -24,6 +25,8 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 import aiohttp
 import msgspec
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
@@ -1339,6 +1342,233 @@ class TestSelectiveTransientTcpRetry:
 
         # 1 original + 5 retries
         assert session.post.call_count == 6
+
+
+class TestRequestTimeout:
+    """What timeout_secs (--request_timeout) bounds on a worker's response.
+
+    A streamed response is bounded by silence, so a long generation completes
+    while data keeps arriving. A non-streamed response is bounded by its total
+    time. The bounds are enforced by aiohttp's transport, so these tests run a
+    real worker server and a client that builds its own session, as the
+    disaggregated server does.
+    """
+
+    _TIMEOUT_SECS = 1
+    # Eight chunks a quarter of the timeout apart: twice the timeout in total,
+    # never silent for more than a quarter of it.
+    _CHUNKS = 8
+    _INTERVAL_SECS = 0.25
+
+    @staticmethod
+    def _request(stream: bool, prompt: str = "hi") -> CompletionRequest:
+        return CompletionRequest(
+            model="m",
+            prompt=prompt,
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="generation_only", first_gen_tokens=[7], ctx_request_id=1
+            ),
+        )
+
+    @staticmethod
+    async def _open_response(request: web.Request, content_type: str) -> web.StreamResponse:
+        response = web.StreamResponse(headers={"Content-Type": content_type})
+        await response.prepare(request)
+        return response
+
+    @contextlib.asynccontextmanager
+    async def _worker(self, handler, timeout_secs=None):
+        """Serve handler as a worker's /v1/completions; yield a client of it and its router."""
+        app = web.Application()
+        app.router.add_post("/v1/completions", handler)
+        async with TestServer(app) as server:
+            _reset_prometheus_registry()
+            router = AsyncMock(spec=Router)
+            router.get_next_server = AsyncMock(return_value=(f"{server.host}:{server.port}", None))
+            client = OpenAIHttpClient(
+                router=router,
+                role=ServerRole.GENERATION,
+                timeout_secs=self._TIMEOUT_SECS if timeout_secs is None else timeout_secs,
+                max_retries=0,
+            )
+            try:
+                yield client, router
+            finally:
+                await client.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_a_stream_longer_than_the_timeout_completes_while_data_keeps_arriving(self):
+        expected = b"".join(f"data: {index}\n\n".encode() for index in range(self._CHUNKS))
+
+        async def generate(request):
+            response = await self._open_response(request, "text/event-stream")
+            for index in range(self._CHUNKS):
+                await asyncio.sleep(self._INTERVAL_SECS)
+                await response.write(f"data: {index}\n\n".encode())
+            return response
+
+        loop = asyncio.get_running_loop()
+        async with self._worker(generate) as (client, router):
+            started = loop.time()
+            response = await client.send_request(self._request(stream=True))
+            received = b"".join([chunk async for chunk in response])
+            elapsed = loop.time() - started
+
+        assert elapsed > self._TIMEOUT_SECS, "the stream must outlast the timeout to test it"
+        assert received == expected
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_nonpositive_timeout_allows_delayed_headers_and_stream_data(self, timeout_secs):
+        async def generate(request):
+            await asyncio.sleep(0.05)
+            response = await self._open_response(request, "text/event-stream")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: hello\n\n")
+            await asyncio.sleep(0.05)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        async with self._worker(generate, timeout_secs=timeout_secs) as (client, router):
+            with patch.object(client._session, "post", wraps=client._session.post) as post:
+                response = await client.send_request(self._request(stream=True))
+                received = b"".join([chunk async for chunk in response])
+
+            post.assert_called_once()
+            timeout = post.call_args.kwargs["timeout"]
+            assert timeout.total is None
+            assert timeout.connect is None
+            assert timeout.sock_read is None
+
+        assert received == b"data: hello\n\ndata: [DONE]\n\n"
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_stream_silent_for_longer_than_the_timeout_fails(self):
+        async def stall(request):
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b'data: "first"\n\n')
+            # Far longer than the timeout; the stream would end cleanly here if
+            # nothing bounded the silence.
+            await asyncio.sleep(self._TIMEOUT_SECS * 10)
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        received = []
+        async with self._worker(stall) as (client, router):
+            response = await client.send_request(self._request(stream=True))
+            with pytest.raises(asyncio.TimeoutError):
+                async for chunk in response:
+                    received.append(chunk)
+
+        assert b"".join(received) == b'data: "first"\n\n'
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_stream_whose_request_the_worker_does_not_read_fails(self):
+        client_gave_up = asyncio.Event()
+
+        async def stall_before_reading(request):
+            # Far longer than the timeout unless the client gives up first; the
+            # stream would end cleanly here if nothing bounded sending the request.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(client_gave_up.wait(), self._TIMEOUT_SECS * 10)
+            response = await self._open_response(request, "text/event-stream")
+            await response.write(b"data: [DONE]\n\n")
+            return response
+
+        # Far more than the socket buffers between client and worker hold, so
+        # sending it waits for the worker to read it.
+        request = self._request(stream=True, prompt="x" * (32 << 20))
+        async with self._worker(stall_before_reading) as (client, router):
+            response = await client.send_request(request)
+            with pytest.raises(asyncio.TimeoutError):
+                _ = [chunk async for chunk in response]
+            # A worker that is not reading cannot see the client leave, so
+            # release it rather than have the server's shutdown wait out the stall.
+            client_gave_up.set()
+
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_non_streamed_response_is_bounded_by_its_total_time(self):
+        body = json.dumps(TestOpenAIHttpClient().dummy_response().model_dump()).encode()
+        piece = -(-len(body) // self._CHUNKS)
+
+        async def trickle(request):
+            response = await self._open_response(request, "application/json")
+            for start in range(0, len(body), piece):
+                await asyncio.sleep(self._INTERVAL_SECS)
+                await response.write(body[start : start + piece])
+            return response
+
+        async with self._worker(trickle) as (client, router):
+            with pytest.raises(asyncio.TimeoutError):
+                await client.send_request(self._request(stream=False))
+
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_request_still_bounds_connecting(
+        self, openai_client, streaming_completion_request, mock_session
+    ):
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "text/event-stream"}
+
+        async def chunks():
+            yield b"data: [DONE]\n\n"
+
+        http_response.content.iter_any = chunks
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        response = await openai_client.send_request(streaming_completion_request)
+        _ = [chunk async for chunk in response]
+
+        timeout = mock_session.post.call_args.kwargs["timeout"]
+        assert (timeout.total, timeout.connect, timeout.sock_read) == (None, 180, 180)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timeout_secs", [0, -1])
+    async def test_a_timeout_that_is_not_positive_does_not_bound_the_response_start(
+        self, mock_router, mock_session, completion_request, monkeypatch, timeout_secs
+    ):
+        bounds = []
+        wait_for = asyncio.wait_for
+
+        async def recording_wait_for(awaitable, timeout):
+            bounds.append(timeout)
+            return await wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(asyncio, "wait_for", recording_wait_for)
+        _reset_prometheus_registry()
+        client = OpenAIHttpClient(
+            router=mock_router,
+            role=ServerRole.GENERATION,
+            timeout_secs=timeout_secs,
+            session=mock_session,
+        )
+        http_response = AsyncMock()
+        http_response.status = 200
+        http_response.headers = {"Content-Type": "application/json"}
+        http_response.json.return_value = TestOpenAIHttpClient().dummy_response().model_dump()
+        http_response.__aenter__.return_value = http_response
+        http_response.__aexit__.return_value = False
+        mock_session.post.return_value = http_response
+
+        response = await client.send_request(completion_request)
+
+        assert isinstance(response, CompletionResponse)
+        assert bounds == [None]
 
 
 def test_a_forwarded_request_keeps_the_field_names_it_arrived_with():
