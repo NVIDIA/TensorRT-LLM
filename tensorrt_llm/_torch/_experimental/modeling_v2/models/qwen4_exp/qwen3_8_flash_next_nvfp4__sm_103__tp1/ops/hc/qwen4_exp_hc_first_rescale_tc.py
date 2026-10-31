@@ -39,11 +39,16 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_inject_norm import (
+    _bf16_hi,
+    _bf16_lo,
+    _bf16x2,
+    _ldg_v4,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
-from .qwen4_exp_hc_inject_norm import _bf16_hi, _bf16_lo, _bf16x2, _ldg_v4
 from .qwen4_exp_hc_up_gate_mean import _asm, _st_global_v4
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0.

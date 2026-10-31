@@ -36,9 +36,11 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_inject_norm import (
+    _asm,
+    _mapa,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-
-from .qwen4_exp_hc_inject_norm import _asm, _mapa
 
 #: This checkpoint's hyper-connection bottleneck width.
 RANK = 320

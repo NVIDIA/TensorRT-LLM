@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_hc_inject_norm entry (this target's local variant r8).
+"""GPU test for the qwen4_exp_hc_inject_norm entry (the unified target's local variant r8).
 
 Cells are gated at one ulp of the activation dtype against the float64
 reference; the MoE-combine cells widen the residual's band by the combine's own
@@ -15,11 +15,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.hc.qwen4_exp_hc_inject_norm__r8 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_inject_norm import (  # noqa: E501
     qwen4_exp_hc_inject_norm as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_hc_inject_norm requires a CUDA device"

@@ -190,6 +190,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_gated_residual import (
     qwen4_exp_gated_residual,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_inject_norm import (
+    qwen4_exp_hc_inject_norm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -258,7 +261,6 @@ from .ops.hc.qwen4_exp_hc_decode_rows_tc import (
 from .ops.hc.qwen4_exp_hc_decode_tc_first import precompile as hc_tc_first_precompile
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_first_rescale_tc import qwen4_exp_hc_first_rescale_tc
-from .ops.hc.qwen4_exp_hc_inject_norm import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_inject_rstd import qwen4_exp_hc_inject_rstd
 from .ops.hc.qwen4_exp_hc_lowrank_act import qwen4_exp_hc_lowrank_act
 from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean

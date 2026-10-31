@@ -188,6 +188,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_gated_residual import (
     qwen4_exp_gated_residual,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_inject_norm import (
+    qwen4_exp_hc_inject_norm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -217,7 +220,6 @@ from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
 from .ops.comm.reducescatter__r7 import reducescatter
 from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
-from .ops.hc.qwen4_exp_hc_inject_norm__r8 import qwen4_exp_hc_inject_norm
 from .ops.hc.qwen4_exp_hc_lowrank_act__r9 import qwen4_exp_hc_lowrank_act
 from .ops.hc.qwen4_exp_hc_up_gate_mean__r10 import qwen4_exp_hc_up_gate_mean
 from .ops.hc.qwen4_exp_post_inject__r11 import qwen4_exp_post_inject

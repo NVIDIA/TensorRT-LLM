@@ -6,7 +6,7 @@ and its normalized copy in the same pass. After a MoE block it also forms the
 block output itself, from the routed experts' output, the shared expert's
 output and its gate logit (the shared-expert combine).
 
-Tier 5 (Triton written for this target). No ``torch.ops.trtllm.*`` op or
+Tier 5 (Triton written for the unified target). No ``torch.ops.trtllm.*`` op or
 FlashInfer callable accumulates a block output into ``hc_count`` streams with
 per-stream gates and normalizes each stream with its own RMS in one launch; the
 two-launch composition (``qwen4_exp_post_inject`` + four
@@ -16,7 +16,7 @@ launch before it -- and with ``topk_weights`` / ``topk_rows`` the MoE runner's
 finalize launch as well.
 
 The decode MoE sites (the finalize fold below `_FEW_WARPS_MIN_ROWS` rows) run a
-CuTe DSL kernel instead (Tier 6, written for this target), bitwise the Triton
+CuTe DSL kernel instead (Tier 6, written for the unified target), bitwise the Triton
 kernel's outputs there.
 """
 
@@ -34,9 +34,10 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Trigger dependents at kernel start (`griddepcontrol.launch_dependents`); a no-op
 #: unless the next kernel is launched with programmatic dependent launch.
