@@ -47,6 +47,9 @@ public:
 
     //! Protocols that expose retention metadata receive native page priority changes.
     virtual void addPriorityUpdated(Digest const&, Priority, Priority, LifeCycleId) {}
+
+    //! Notify streaming consumers after the complete reuse tree has been cleared.
+    virtual void addAllBlocksCleared() {}
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

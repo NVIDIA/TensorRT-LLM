@@ -1680,10 +1680,6 @@ def executor_request_to_llm_request(
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
-        prompt_embedding_table=None if executor_request.prompt_tuning_config
-        is None else executor_request.prompt_tuning_config.embedding_table,
-        prompt_vocab_size=None if executor_request.prompt_tuning_config is None
-        else executor_request.prompt_tuning_config.embedding_table.shape[0],
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,

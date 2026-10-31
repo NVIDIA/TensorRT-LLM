@@ -198,7 +198,7 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
 }
 
 void LlmRequest::validate(
-    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool enableKVCacheReuse)
+    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool /*enableKVCacheReuse*/)
 {
     if (mPromptLen > maxInputLen)
     {
@@ -244,27 +244,17 @@ void LlmRequest::validate(
             mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
         mMaxNewTokens = maxNewTokens;
     }
-
-    // validate extra ids when enabling kv cache reuse with prompt table
-    if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
-    {
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
-            "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-            "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
-            mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
-    }
 }
 
 LlmRequest::LlmRequest(LlmRequest const& parent, RequestIdType requestId)
     : LlmRequest(requestId, parent.mMaxNewTokens, parent.mTokens.at(0), parent.mSamplingConfig, parent.mIsStreaming,
-        parent.mPromptEmbeddingTable, parent.mPromptVocabSize, copyOptionalInput(parent.mMultimodalHashes),
-        copyOptionalInput(parent.mMultimodalPositions), copyOptionalInput(parent.mMultimodalLengths),
-        copyOptionalInput(parent.mMultimodalUuids), parent.mLoraTaskId, parent.mLoraWeights, parent.mLoraConfig,
-        parent.mKvCacheRetentionConfig, parent.mDraftTokens ? *parent.mDraftTokens : VecTokens{},
-        parent.mExcludeInputFromOutput, copyOptionalInput(parent.mEncoderTokens), parent.mPriority,
-        parent.mEncoderInputLength, parent.mEncoderOutputLength, parent.mLlmRequestType,
-        copyOptionalInput(parent.mInputTokenExtraIds), parent.mReturnPerfMetrics, parent.mContextPhaseParams,
+        copyOptionalInput(parent.mMultimodalHashes), copyOptionalInput(parent.mMultimodalPositions),
+        copyOptionalInput(parent.mMultimodalLengths), copyOptionalInput(parent.mMultimodalUuids), parent.mLoraTaskId,
+        parent.mLoraWeights, parent.mLoraConfig, parent.mKvCacheRetentionConfig,
+        parent.mDraftTokens ? *parent.mDraftTokens : VecTokens{}, parent.mExcludeInputFromOutput,
+        copyOptionalInput(parent.mEncoderTokens), parent.mPriority, parent.mEncoderInputLength,
+        parent.mEncoderOutputLength, parent.mLlmRequestType, copyOptionalInput(parent.mInputTokenExtraIds),
+        parent.mReturnPerfMetrics, parent.mContextPhaseParams,
         parent.mReturnPerfMetrics ? std::make_optional(parent.mPerfMetrics.timingMetrics.arrivalTime) : std::nullopt,
         parent.mAgentHierarchy, copyOptionalInput(parent.mMultimodalItemRunCuOffsets),
         copyOptionalInput(parent.mMultimodalRunPositions), copyOptionalInput(parent.mMultimodalRunLengths),
