@@ -17,6 +17,7 @@ all available backends (FMA, DeepGEMM split-K, DeepGEMM no-split) at warmup.
 Falls back to FMA when DeepGEMM is unavailable or autotuner cache misses.
 """
 
+import os
 from functools import lru_cache, partial
 from typing import Any, List
 
@@ -1150,16 +1151,30 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_fused_hc",
-        [runner],
-        MhcFusedHcRunner.tuning_config,
-        [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-        pre_mix_ext=pre_mix_ext,
-    )
+    if os.getenv("FORCE_DETERMINISTIC", "0") == "1":
+        # This fixed FMA tactic has no cross-CTA floating-point atomics and
+        # uses the same reduction order for context and generation shapes.
+        # Bypass tuning so an existing cache cannot reintroduce atomic split-K.
+        best_tactic = _FUSED_HC_FALLBACK_TACTIC_FMA
+    else:
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::mhc_fused_hc",
+            [runner],
+            MhcFusedHcRunner.tuning_config,
+            [
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                w_t_cur,
+                hc_scale_cur,
+                hc_base_cur,
+            ],
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+            pre_mix_ext=pre_mix_ext,
+        )
 
     return runner(
         inputs=[

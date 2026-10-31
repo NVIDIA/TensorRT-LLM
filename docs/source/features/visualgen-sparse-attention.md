@@ -278,6 +278,7 @@ attention_config:
     disabled_until_timestep: 0.6  # dense while the normalized timestep >= cutoff
     dense_layers: [0, 2, 3, 4]    # optional: layer indices forced dense
     thresh_type: diag             # block threshold policy: "diag" or "exact"
+    token_order: native           # or "morton" / "hilbert" (Wan): 3D-local token blocks
 ```
 
 - `tau` is the routing threshold in standard deviations above the mean block
@@ -292,6 +293,21 @@ attention_config:
   `diag` treats every key channel independently, `exact` uses the full key
   covariance. Both backends implement both policies from the same per-block
   statistics.
+- `token_order: morton` permutes the video tokens (and their RoPE tables) into
+  Morton / Z-order once before the transformer blocks and restores the raster
+  order after them, so each 64-token routing block covers a compact 3D
+  neighborhood instead of a run along width; `hilbert` does the same along a
+  Hilbert curve, which has no octant jumps. Dense attention is
+  permutation-equivariant in exact arithmetic, so only the block routing
+  changes the math; in BF16 the permutation also changes the reduction order
+  inside every kernel. The Wan transformer honors this knob; models that do
+  not wire the reorder reject it at construction. It is opt-in and not recommended for
+  Wan2.2-T2V-A14B at the recipe above: with torch.compile and CUDA graphs on
+  it is about 3 % slower than the native order at every `tau` from 0.5 to
+  1.0, and the BF16 reduction-order change alone (every layer dense, Morton
+  order) already moves the worst-prompt LPIPS against the native-order dense
+  output over the 0.25 gate, so it does not move the speed-vs-quality
+  frontier as the gate measures it.
 
 The TRTLLM envelope is full-mask BF16 self-attention on SM100 or SM103 with 4-D
 BSHD Q/K/V tensors, equal Q/K/V shapes and head dimension 128. The predictor is

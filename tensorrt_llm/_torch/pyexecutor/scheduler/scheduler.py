@@ -810,6 +810,7 @@ class MultimodalScheduler(RequestScheduler):
     ) -> bool:
         """Check whether unclaimed pending entries can fit beside protected cache entries."""
         state = request.py_mm_encoder_state
+        embedding_lengths = state.embedding_lengths
         stable_keys = self.get_item_cache_keys(request)
         item_cache_keys = (
             stable_keys
@@ -823,7 +824,7 @@ class MultimodalScheduler(RequestScheduler):
         # entries without live references are evictable and do not claim space.
         additional_entries = {
             item_cache_keys[item_idx]: (
-                state.embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
+                embedding_lengths[item_idx] * self.bytes_per_encoder_embedding
             )
             for item_idx in get_mm_pending_items(request)
             if item_cache_keys[item_idx] not in held_keys

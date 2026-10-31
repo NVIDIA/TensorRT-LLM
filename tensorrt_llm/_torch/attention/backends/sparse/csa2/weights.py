@@ -5,6 +5,9 @@
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.quantization.utils import fp8_utils
+
 _NATIVE_LINEARS = frozenset(("wq_a", "wq_b", "wkv", "index_wq_b", "o_b_proj"))
 
 
@@ -188,5 +191,19 @@ def load_attention_weights(
         for name, scales in native_scales.items():
             module.get_submodule(name).weight_scale.copy_(scales)
         if native:
+            if grouped_block128 and get_sm_version() == 120:
+                # The SM120 FP8 block-scaling BMM reads packed UE8M0 scales.
+                weight, grouped_scales = fp8_utils.resmooth_to_fp8_e8m0(
+                    module.o_a_proj, grouped_scales
+                )
+                module.o_a_proj.copy_(weight)
+                grouped_scales = fp8_utils.transform_sf_into_required_layout(
+                    grouped_scales,
+                    mn=weight.shape[1],
+                    k=weight.shape[2],
+                    recipe=(1, 128, 128),
+                    num_groups=weight.shape[0],
+                    is_sfa=False,
+                )
             module.o_a_proj_scale = grouped_scales
             module._o_a_fp8_block128 = grouped_block128

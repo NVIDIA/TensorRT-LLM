@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
+from tensorrt_llm._torch.visual_gen.token_order import TokenReorder
 
 pytestmark = pytest.mark.cpu_only
 
@@ -37,6 +38,7 @@ def _routing_model(expand_timesteps: bool, token_sharded_tp: bool = False):
     model.sharder.gather.side_effect = lambda tensor, **_kwargs: tensor
     model.sharder.shard_per_sample.side_effect = lambda tensor: tensor
     model.sharder.token_sharded_tp = token_sharded_tp
+    model._token_reorder = TokenReorder("native")
 
     def condition_embedder(
         timestep: torch.Tensor,

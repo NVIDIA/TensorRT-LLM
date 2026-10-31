@@ -22,6 +22,7 @@ import re
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -32,7 +33,7 @@ from typing import Dict, List, NamedTuple, Optional
 
 import pytest
 from defs.trt_test_alternative import (Popen, cleanup_process_tree, print_error,
-                                       print_info)
+                                       print_info, print_warning)
 
 from ..common import get_trt_llm_lib_dir
 from ..local_venv import PythonVenvRunnerImpl
@@ -41,6 +42,7 @@ from .data_export import (GPU_MONITORING_FORMAT_KEYS, write_csv,
                           write_gpu_monitoring_no_test_results, write_yaml)
 from .gpu_clock_lock import GPUClockLock, InvalidGPUMonitoringResultError
 from .session_data_writer import SessionDataWriter
+from .warmup_pass import WarmupPass, send_warmup_pass
 
 
 def clean_myelin_time(log: str):
@@ -371,18 +373,28 @@ def _wait_for_server_ready(url: str,
 class PerfServeScriptTestCmds:
     """Commands for serve runtime perf tests (server-client model)."""
 
-    def __init__(self, server_cmd: List[str], client_cmds: List[List[str]],
-                 data_cmds: List[List[str]], server_env: Dict[str, str],
-                 server_timeout: int):
+    def __init__(self,
+                 server_cmd: List[str],
+                 client_cmds: List[List[str]],
+                 data_cmds: List[List[str]],
+                 server_env: Dict[str, str],
+                 server_timeout: int,
+                 warmup_passes: Optional[List[Optional[WarmupPass]]] = None,
+                 server_log_dir: str | None = None):
         self.server_cmd = server_cmd
         self.client_cmds = client_cmds
         self.data_cmds = data_cmds
         self.server_env = server_env
         self.server_timeout = server_timeout
+        self._server_log_dir = server_log_dir
+        # Per client, the warmup pass to send before it, or None.
+        self.warmup_passes = warmup_passes or [None] * len(client_cmds)
         self._server_proc = None
         self._server_log_path = None
+        self._server_log_file = None
 
     def start_server(self) -> None:
+        """Start the server, capture stdout/stderr, and wait for readiness."""
         if self._server_proc is not None:
             return
         from tensorrt_llm._utils import get_free_port
@@ -393,13 +405,15 @@ class PerfServeScriptTestCmds:
             str(self._port)
         ]
         print_info(f"Starting trtllm-serve: {' '.join(cmd)}")
-        # Cluster jobs can share a working directory. Create a unique log for
-        # each launch so another server cannot truncate its startup metrics.
+        log_dir = os.path.abspath(self._server_log_dir or os.getcwd())
+        os.makedirs(log_dir, exist_ok=True)
+        # Write directly to the results directory so failed startups survive
+        # workspace cleanup. Concurrent launches must not truncate each other.
         self._server_log_file = tempfile.NamedTemporaryFile(
             mode="w",
             prefix="trtllm-serve-perf-",
             suffix=".log",
-            dir=os.getcwd(),
+            dir=log_dir,
             delete=False)
         self._server_log_path = self._server_log_file.name
         print_info(f"trtllm-serve log: {self._server_log_path}")
@@ -435,6 +449,27 @@ class PerfServeScriptTestCmds:
                   errors='replace') as f:
             return f.read()
 
+    def print_server_log_tail(self) -> None:
+        """Include bounded server diagnostics in captured pytest failure output."""
+        if not self._server_log_path:
+            return
+        try:
+            with open(self._server_log_path, "rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 64 * 1024))
+                tail = stream.read(64 * 1024).decode("utf-8", errors="replace")
+        except OSError as error:
+            # Diagnostic failures must not replace the original test error.
+            print_error(
+                f"Cannot read server log {self._server_log_path}: {error}")
+            return
+        print_error(f"--- trtllm-serve stdout/stderr (last up to 200 lines, "
+                    f"64 KiB); full log: {self._server_log_path} ---")
+        tail = "\n".join(tail.splitlines()[-200:]) or "<empty>"
+        encoding = sys.stdout.encoding or "utf-8"
+        print(tail.encode(encoding, errors="backslashreplace").decode(encoding))
+        print_error("--- end trtllm-serve log ---")
+
     def run_cmd(self, cmd_idx: int, venv) -> str:
         output = ""
         if cmd_idx <= len(self.data_cmds) - 1:
@@ -462,17 +497,50 @@ class PerfServeScriptTestCmds:
             # instead of an empty string.
             output = self.get_server_log_content()
         else:
-            client_cmd = self.client_cmds[cmd_idx - 1 - len(self.data_cmds)]
-            client_cmd_with_port = client_cmd + [
-                "--host", self._host, "--port",
-                str(self._port)
-            ]
+            client_idx = cmd_idx - 1 - len(self.data_cmds)
+            host_port = ["--host", self._host, "--port", str(self._port)]
+            warmup_pass = self.warmup_passes[client_idx]
+            if warmup_pass is not None:
+                self._send_warmup_pass(warmup_pass, host_port)
+            client_cmd_with_port = self.client_cmds[client_idx] + host_port
             print_info(
                 f"Running benchmark client: {' '.join(client_cmd_with_port)}")
             output = _run_command_with_captured_output(client_cmd_with_port,
                                                        env=copy.deepcopy(
                                                            os.environ))
         return output
+
+    @staticmethod
+    def _send_warmup_pass(warmup_pass: WarmupPass,
+                          host_port: List[str]) -> None:
+        """Send a client's warmup pass; its output goes to a log of its own."""
+        # Unique per pass: cluster jobs can share a working directory.
+        with tempfile.NamedTemporaryFile(mode="w",
+                                         prefix="benchmark-warmup-pass-",
+                                         suffix=".log",
+                                         dir=os.getcwd(),
+                                         delete=False) as log_file:
+            log_path = log_file.name
+
+        def run_benchmark(cmd: List[str]) -> str:
+            try:
+                output = _run_command_with_captured_output(cmd,
+                                                           env=copy.deepcopy(
+                                                               os.environ))
+            except subprocess.CalledProcessError as e:
+                with open(log_path, "wb") as log:
+                    log.write(e.stdout or b"")
+                raise
+            with open(log_path, "w", encoding="utf-8") as log:
+                log.write(output)
+            return output
+
+        send_warmup_pass(warmup_pass.cmd + host_port,
+                         warmup_pass.num_requests,
+                         run_benchmark,
+                         log_path=log_path,
+                         log_info=print_info,
+                         log_warning=print_warning)
 
     def get_cmd_str(self, cmd_idx) -> str:
         if cmd_idx <= len(self.data_cmds) - 1:
@@ -650,6 +718,12 @@ class AbstractPerfScriptTestClass(abc.ABC):
             else:
                 print_info(f"Reusing cached logs for command index {cmd_idx}.")
 
+        except pytest.fail.Exception:
+            # pytest-timeout raises this BaseException during server startup.
+            if isinstance(commands, PerfServeScriptTestCmds):
+                commands.print_server_log_tail()
+            raise
+
         except InvalidGPUMonitoringResultError as e:
             # Mark result state as invalid when GPU monitoring result is invalid.
             self._result_state = "invalid"
@@ -686,6 +760,11 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 print(partial_output)
                 print(f"{'=' * 60}\n")
 
+        # Include both command exceptions and failed requests reported by clients.
+        if self._result_state == "failed" and isinstance(
+                commands, PerfServeScriptTestCmds):
+            commands.print_server_log_tail()
+
         if self._result_state == "valid":
             if is_setup_cmd:
                 print_info(
@@ -693,7 +772,13 @@ class AbstractPerfScriptTestClass(abc.ABC):
                 )
                 outputs.pop(cmd_idx, None)
             else:
-                self._perf_result = self.get_perf_result(outputs)
+                try:
+                    self._perf_result = self.get_perf_result(outputs)
+                except Exception:
+                    # Add diagnostics without changing the parsing exception.
+                    if isinstance(commands, PerfServeScriptTestCmds):
+                        commands.print_server_log_tail()
+                    raise
 
                 # Stop the timer
                 self._end_timestamp = datetime.utcnow()

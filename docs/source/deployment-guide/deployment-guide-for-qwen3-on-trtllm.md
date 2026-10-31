@@ -104,7 +104,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 * **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens. We won't specifically set it. It will be inferred from model config.
 
 #### `trust_remote_code`
-* **Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows loading and executing custom Python code provided by the model repository, such as custom configuration or tokenizer implementations. This option is passed to the Hugging Face loading APIs.
 
 #### `cuda_graph_config`
 

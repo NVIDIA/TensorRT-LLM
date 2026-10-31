@@ -18,20 +18,14 @@ l0_dgx_b300:
       stage: post_merge
       backend: pytorch
   tests:
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
-  # The sparse/dsa/test_cute_dsl_* files ignored below keep their own entries (pre-existing).
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
-  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
-  - unittest/_torch/executor
+  # Single-GPU coverage of tests/unittest/_torch/attention/ on B300 comes from l0_b300
+  # (pre_merge, same GPU), with two exceptions. cpu_only cases run only on CPU (l0_cpu,
+  # pre_merge). The GPU cases of kernels/parallel_hw_agnostic/, which do not depend on the
+  # GPU architecture, run on H100 (pre_merge) and GB300 (post_merge). So of attention/,
+  # this 4-GPU stage runs only multi_gpu/, whose cases need >= 2 GPUs;
+  # test_helix_zero_kv.py runs in this list's pre_merge block instead.
+  - unittest/_torch/attention/multi_gpu --ignore=unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
@@ -76,6 +70,9 @@ l0_dgx_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp4] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_pp4_mtp] TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=TRTLLM-mtp_nextn=0-tp4-fp8kv=False-attention_dp=True-cuda_graph=False-overlap_scheduler=False-low_precision_combine=True-torch_compile=False]
+  # modeling_v2 GLM-5.2-NVFP4 sm_103 tep4 target: identity and MTP1 GSM8K paired in one test,
+  # with the MTP1 acceptance gate on the second leg.
+  - accuracy/modeling_v2/test_glm_moe_dsa.py::TestModelingV2Glm52Nvfp4Sm103Tep4::test_gsm8k_identity_vs_mtp1_and_acceptance TIMEOUT (45)
 - condition:
     ranges:
       system_gpu_count:
@@ -97,8 +94,11 @@ l0_dgx_b300:
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]
-  # Helix zero-local-KV coverage needs two Blackwell GPUs and must run before merge.
+  # Helix zero-local-KV coverage needs two GPUs, Blackwell for most cases, and must run
+  # before merge.
   - unittest/_torch/attention/multi_gpu/test_helix_zero_kv.py TIMEOUT (30)
+  # modeling_v2 GLM-5.2-NVFP4 sm_103 tep4 target: its all-reduce entries, one 4-rank matrix.
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4/comm
   # ------------- MoE components tests (multi-GPU) ---------------
   # ------------- MoE: multi-GPU module tests (DEP parallel, per backend per quant) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16

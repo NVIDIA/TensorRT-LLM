@@ -27,19 +27,21 @@ zoo's static index never has to know these classes exist.
 """
 
 from ._router_index import (
-    MODELING_V2_ROUTERS,
     MODELING_V2_VALIDATE_ENV,
     ModelingV2Mode,
     NoTarget,
     modeling_v2_resolve,
+    modeling_v2_resolve_on_all_ranks,
+    resolved_mode,
     step_contract_enabled,
 )
 
 __all__ = [
-    "MODELING_V2_ROUTERS",
     "MODELING_V2_VALIDATE_ENV",
     "ModelingV2Mode",
     "NoTarget",
     "modeling_v2_resolve",
+    "resolved_mode",
+    "modeling_v2_resolve_on_all_ranks",
     "step_contract_enabled",
 ]

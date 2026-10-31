@@ -17,10 +17,16 @@ decode QKV packing, the dense in_proj row permutation, and the multi-row
 gated RMSNorm."""
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers import Qwen3NextConfig
+
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+from tensorrt_llm._torch.utils import torch_compiling
 
 skip_no_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -562,6 +568,49 @@ def test_recurrent_state_reset_supports_gdn_pool_views():
         torch.testing.assert_close(state_pool[state_idx], state_pool_before[state_idx])
 
 
+@skip_no_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_tokens,num_heads,head_dim", [(1, 2, 4), (5, 3, 8)])
+def test_gdn_eager_forward_supplies_output_buffer(
+    dtype: torch.dtype, num_tokens: int, num_heads: int, head_dim: int
+) -> None:
+    config = Qwen3NextConfig(
+        architectures=["Qwen3NextForCausalLM"],
+        hidden_size=16,
+        linear_num_key_heads=1,
+        linear_num_value_heads=num_heads,
+        linear_key_head_dim=head_dim,
+        linear_value_head_dim=head_dim,
+        linear_conv_kernel_dim=4,
+        torch_dtype=dtype,
+    )
+    layer = Qwen3NextGatedDeltaNet(
+        ModelConfig(pretrained_config=config), aux_stream=None, layer_idx=0
+    )
+    mixed_qkv = torch.empty(num_tokens, layer.conv_dim_per_tp, dtype=dtype, device="cuda")
+    layer._compute_tokenwise_inputs = Mock(return_value=(mixed_qkv, None, None, None))
+    # This test checks the wrapper's output-buffer allocation and forwarding.
+    # Existing mixed-decode tests cover the core's numerical and state behavior, so the core can be
+    # mocked without repeating those kernel checks here.
+    layer.forward_core = Mock()
+    layer._postprocess_gdn_output = Mock()
+
+    with torch_compiling(False):
+        layer.forward(
+            hidden_states=torch.empty(num_tokens, config.hidden_size, dtype=dtype, device="cuda"),
+            attn_metadata=None,
+            mamba_metadata=None,
+        )
+
+    layer.forward_core.assert_called_once()
+    # Check that we pass one buffer to the core call.
+    output = layer.forward_core.call_args.kwargs.get("output")
+    assert output is not None
+    assert output.shape == (1, num_tokens, num_heads, head_dim)
+    assert output.dtype == mixed_qkv.dtype
+    assert output.device == mixed_qkv.device
+
+
 def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
     """The compile boundary consumes split inputs and mutates its output."""
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
@@ -608,7 +657,6 @@ def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
 
 def test_gdn_attaches_only_static_fp8_scale():
     from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
-    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
     from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
 
     layer = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
@@ -631,6 +679,72 @@ def test_gdn_attaches_only_static_fp8_scale():
     layer.out_proj.force_dynamic_quantization = True
     layer.cache_derived_state()
     assert layer.norm.fp8_scale is None
+
+
+@pytest.mark.parametrize("ring_mode", [False, True], ids=["triton", "flashinfer_ring"])
+def test_gdn_replay_verify_dispatches_by_history_layout(monkeypatch, ring_mode):
+    from tensorrt_llm._torch.modules.fla.cache_manager import ReplayStateUpdateMetadata
+    from tensorrt_llm._torch.modules.mamba import gdn_mixer
+
+    layer = gdn_mixer.Qwen3NextGatedDeltaNet.__new__(gdn_mixer.Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.A_log = torch.zeros(4)
+    layer.dt_bias = torch.zeros(4)
+    calls = {}
+    monkeypatch.setattr(
+        gdn_mixer,
+        "flashinfer_cached_replay_update",
+        lambda **kwargs: calls.setdefault("flashinfer", kwargs),
+    )
+    monkeypatch.setattr(
+        gdn_mixer,
+        "fused_recurrent_gated_delta_rule_cached_replay_update",
+        lambda **kwargs: calls.setdefault("triton", kwargs),
+    )
+
+    prev_num_accepted_tokens = torch.tensor([0, 3, 9, 13, 5, 7], dtype=torch.int32)
+    cache_buf_idx = torch.zeros(6, dtype=torch.int32)
+    layer_cache = SimpleNamespace(
+        prev_num_accepted_tokens=prev_num_accepted_tokens,
+        cache_buf_idx=cache_buf_idx,
+        cache_base=torch.tensor([0, 1, 2, 30, 4, 5], dtype=torch.int32) if ring_mode else None,
+        k_ring="k_ring",
+        u_ring="u_ring",
+        g_ring="g_ring",
+        old_x="old_x",
+        old_B="old_B",
+        old_dt="old_dt",
+        old_dA_cumsum="old_dA_cumsum",
+    )
+
+    layer._replay_verify_recurrent(
+        "q",
+        "k",
+        "v",
+        "a",
+        "b",
+        "pool",
+        state_indices_d=torch.tensor([3, 1, 5, 0], dtype=torch.int32),
+        num_decodes=3,
+        draft_token_num=4,
+        replay_metadata=ReplayStateUpdateMetadata(prev_num_accepted_tokens, cache_buf_idx, 4, 16),
+        layer_cache=layer_cache,
+        replay_work_items=None,
+        replay_n_writes=None,
+    )
+
+    if ring_mode:
+        assert set(calls) == {"flashinfer"}
+        kwargs = calls["flashinfer"]
+        assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["hist_len"].tolist() == [13, 3, 7]  # gathered per row
+        assert kwargs["cache_base"].tolist() == [30, 1, 5]
+        assert kwargs["k_ring"] == "k_ring" and kwargs["history_size"] == 16
+    else:
+        assert set(calls) == {"triton"}
+        kwargs = calls["triton"]
+        assert kwargs["state_indices"].tolist() == [3, 1, 5]
+        assert kwargs["old_u"] == "old_x"
 
 
 def test_verify_intermediate_state_indices_reuses_buffers():

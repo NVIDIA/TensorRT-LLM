@@ -16,7 +16,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import PrefillCompiledModel
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import ModelEngine
 from tensorrt_llm.llmapi import CudaGraphConfig, PrefillCudaGraphBackend, TorchCompileConfig
 
 
@@ -35,7 +35,7 @@ def _create_compile_restricted_runner(
 ) -> DecoderRunner:
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
-    runner.model = SimpleNamespace(model=model)
+    runner._model = SimpleNamespace(model=model)
     return runner
 
 
@@ -43,13 +43,11 @@ def _create_compile_restricted_runner(
 @pytest.mark.parametrize("enabled", [False, True])
 def test_engine_passes_compile_policy_to_decoder_runner(enabled: bool) -> None:
     engine = Mock()
-    engine._compile_only_piecewise_graphs = enabled
-    config = PyTorchModelEngine._decoder_runner_config(engine)
+    engine.llm_args.torch_compile_config = SimpleNamespace(compile_only_piecewise_graphs=enabled)
+    config = ModelEngine._decoder_runner_config(engine)
     runner_type = Mock()
 
-    result = PyTorchModelEngine._initialize_decoder_runner(
-        engine, runner_type, runner_config=config
-    )
+    result = ModelEngine._initialize_decoder_runner(engine, runner_type, runner_config=config)
 
     assert config.compile_only_piecewise_graphs is enabled
     assert result is runner_type.return_value
@@ -155,7 +153,7 @@ def test_decoder_runner_bypass_requires_compile_only_option() -> None:
 def test_decoder_runner_without_compile_restriction() -> None:
     runner = object.__new__(DecoderRunner)
     runner._config = SimpleNamespace(compile_only_piecewise_graphs=False)
-    runner.model = torch.nn.Identity()
+    runner._model = torch.nn.Identity()
     with runner._maybe_bypass_torch_compile(bypass=True):
         pass
 
@@ -170,7 +168,9 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     torch.nn.Module.__init__(model)
     wrapper, _, _ = _create_prefill_compiled_model()
     model.model = wrapper if has_wrapper else torch.nn.Identity()
-    config = SimpleNamespace(compile_only_piecewise_graphs=enabled, max_beam_width=1)
+    config = SimpleNamespace(
+        compile_only_piecewise_graphs=enabled, max_beam_width=1, is_spec_decode=False
+    )
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
 
     for component in ("DecoderInputBuffers", "DecoderMetadata", "DecoderWarmup"):
@@ -192,20 +192,18 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
         runner = DecoderRunner(
             model,
             config,
-            input_processor=Mock(),
             model_caller=Mock(),
             mapping=Mock(),
             dist=None,
             moe_load_balancer=None,
             sparse_attention_config=None,
-            torch_compile_backend=None,
+            attention_runtime_features=Mock(),
             get_runtime_tokens_per_gen_step=Mock(),
             warmup_timer=Mock(),
             iter_states={},
             metrics={},
-            kv_cache_manager_key=Mock(),
         )
-        assert runner.model.model is model.model
+        assert runner._model.model is model.model
 
 
 def test_decoder_runner_nested_bypass_restores_after_exception() -> None:
@@ -235,15 +233,18 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         enabled=False,
         is_warmup_only=False,
         padding_dummy_requests={},
+        reset_padding_dummies=Mock(),
     )
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
+    warmup._config = SimpleNamespace(max_beam_width=1)
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
+    warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
     warmup._context_warmups_supported = True
     warmup._torch_compile_bypass = runner._bypass_torch_compile
     warmup._get_full_general_warmup_requests = Mock(return_value=[(4, 0)])

@@ -18,6 +18,11 @@ The current C++ headers and tests are the source of truth. Historical Python
 behavior remains useful for compatibility testing, but migration-era proposed
 layouts or ownership models must not override the implementation.
 
+`SPARSE_ATTENTION_DESIGN.md` covers how a sparse buffer's pages are held in host
+memory and read through a per-request GPU cache, and `INDEX_CONVERSION_DESIGN.md`
+how page indices become the compact arena indices attention kernels take. Read
+them before changing `batch.*`, `sparseCache.*` or the index conversion.
+
 ## Layout
 
 - `common.h`, `config.h`, `tokenIdExt.h`, and `exceptions.h`: shared types,
@@ -25,7 +30,12 @@ layouts or ownership models must not override the implementation.
 - `blockRadixTree.*`: the shared prefix-reuse tree and SHA-256 block keys.
 - `page.*`, `kvCache.*`, and `kvCacheManager.*`: page lifecycle, per-request
   cache state, and the top-level manager.
-- `batch.*`: stable request rows, dirty tracking, and raw GPU metadata publication.
+- `batch.*`: the caches stepped together and their device-side mirror — row
+  ownership, the per-layer-group page tables a sparse fetch reads, and the
+  per-row watermarks a step derives its counts from.
+- `sparseCache.*`, `sparseCacheKernels.*`, and `indexConversionKernels.*`: the
+  per-request GPU cache over host-backed sparse pages, and the conversion from
+  page indices to the compact arena indices attention kernels take.
 - `storage/`, `storageManager.*`, `evictionController.*`, and `copyEngine.*`:
   pools, eviction ownership, migration, and data movement.
 - `lifeCycleRegistry.*`: layer-group/lifecycle mapping, including attention and
@@ -39,13 +49,30 @@ layouts or ownership models must not override the implementation.
 - Prefer composition when it expresses ownership or containment. Use
   inheritance only for a real IS-A relationship or required virtual dispatch,
   such as `CommittedPage : Page` and `EventManager : EventSink`.
-- Preserve strongly typed indices. `LayerGroupId` is a public lifecycle
+- Preserve strongly typed indices. `CacheGroupId` (and legacy `LayerGroupId`) is a public lifecycle
   semantic, `PoolGroupIndex` is a storage-layout index, `BlockOrdinal` is a
   sequence position, and `SlotId`/page indices address storage. Do not convert
   or compare them implicitly.
 - Keep hot-path checks under `TLLM_CHECK_DEBUG*` or `gDebug` when they are too
   expensive for release builds. Do not remove debug invariants simply because
   production does not execute them.
+- Check with `TLLM_CHECK*` rather than a hand-rolled `if (bad) { throw ...; }`.
+  It is the convention across the project, and it keeps a condition and the
+  message explaining it in one place that reads as a check.
+  The exception is a failure whose *type* is the contract. The bindings make a
+  Python class of each one in `exceptions.h`, so callers -- and the poison latch
+  -- act on which class they caught; throw those directly:
+  `OutOfMemoryError` and its `Host`/`Disk`/`Cu` forms, `LogicError`,
+  `AssertionError`, `CuError`, `CorruptedError`, `ResourceBusyError`,
+  `OutOfPagesError`.
+  Validation at the binding boundary that throws `std::invalid_argument` or
+  `std::out_of_range` is legacy and should migrate to `TLLM_CHECK*` as it is
+  touched, so that KVCM2 ends up on the same footing as the rest of the repo.
+  Migrate deliberately rather than in passing: nanobind maps those to
+  `ValueError` and `IndexError` where `TLLM_CHECK*` raises `RuntimeError`, and
+  the suites assert the first two in well over a hundred places, so each
+  conversion carries its own test updates and is a Python API change under the
+  nanobind rule on preserving exception types.
 - Keep the core independent of Python. C++ storage, copying, CUDA, hashing, and
   lifecycle operations call C++ APIs directly; Python adaptation belongs in
   nanobind.
@@ -59,34 +86,86 @@ must eventually be `close()`d. Its normal flow is:
 
 1. Match the input `TokenSpan` against `BlockRadixTree` within a `ReuseScope`.
 2. Allocate request-local pages for unmatched blocks through `StorageManager`.
-3. Lock or restore required pages before model execution: GPU for writable and
-   dense pages, level-1 host memory for cold sparse history.
+3. Lock or restore required pages before model execution. Every page locks at the
+   hot level; a sparse pool's hot allocation is host memory, which is a property
+   of that pool rather than of the level or of the group holding it.
 4. Commit completed blocks to the tree, making their immutable pages available
    for later requests; `stopCommitting()` finalizes this process.
 5. Suspend or close the request, returning pages to holding/eviction ownership.
 
-`LifeCycleRegistry` maps model layers to lifecycle groups. Attention lifecycles
+`LifeCycleRegistry` maps layer buffers to lifecycle groups. Attention lifecycles
 may have sliding-window and sink-token rules; SSM lifecycles represent a
-recurrent-state checkpoint. A pool-group index is a storage-layout index and is
+recurrent-state checkpoint. Both layer configs expose `reusePolicy`: `REQUIRED`
+constrains the prefix match, `OPTIONAL` offers state at the required endpoint for
+explicit selection on first resume, and `PRIVATE` never publishes reusable pages.
+A buffer may override its layer's default through `BufferConfig::reusePolicy`.
+This applies to attention and SSM buffers, so one model layer may span several
+lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
+(`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
+These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
+`LayerGroupId` remains a lifecycle alias for legacy APIs.
+The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
+documentation only: uniform layers retain their results, while a split layer
+fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,
+respectively), exposed as `RuntimeError` in Python. No deprecation warnings are emitted.
+
+Page conversion reads `BufferAttr::scratchPagesPerBlock`, counting only the
+layer's buffers in that coalesced slot. Scratch capacity uses the maximum exact
+layer share across pools within each lifecycle. Layer counts are temporary
+layout calculations, not persistent `(layer, lifecycle)` attributes.
+
+Execution backends that share a page or state index across coupled buffers must
+validate that they use the same policy; independent policies require independent
+index tables. In particular, the default attention view couples K/V and scales,
+and Mamba kernels couple recurrent, convolution, PLE, and replay state. Native
+KVCM supports independent policies for callers that provide those indices.
+The sparse fetch path configured by `sparseCache` still uses one group per layer;
+its setup uses the checked layer lookup and rejects split layers.
+
+SSM lifecycles are deduplicated by policy, so a manager can have up to three SSM
+groups; iterate `ssmLifeCycleIds()` for working state and use
+`requiredSsmLifeCycleId()` only for prefix pruning.
+Optional SSM checkpoints require an exact endpoint match, including partial
+blocks. Fresh or unselected recurrent state must be initialized or reconstructed
+by the caller before inference. A pool-group index is a storage-layout index and is
 not interchangeable with a layer ID or lifecycle ID.
 
-Attention lifecycle identity also includes `isSparse`. All buffers in one
-attention layer must agree on this flag. Sparse buffers require `HOST_MEM` at
-level 1 and are invalid for SSM layers. Sparse and dense GPU pools stay separate
-even when their slot sizes match; compatible sparse buffers still coalesce.
+Sparsity is a property of a pool, not of a lifecycle: a layer's buffers may be
+partly sparse, and the pool each lands in carries the flag. Sparse buffers are
+invalid for SSM layers. Sparse and dense pools stay separate even when their slot
+sizes match, which is what lets a sparse pool be backed by host memory while a
+dense pool of the same group and level is device memory; the group reports
+GPU_MEM either way. Compatible sparse buffers still coalesce. Sparse buffers place no requirement on the cold tiers.
 
 `StorageManager` coordinates GPU, host, and disk cache levels. It allocates
 slots, schedules pages for eviction, migrates pages between levels, and resizes
 pools. `CopyEngine` performs the actual batched transfers; C++ code calls it
 directly and must not round-trip through Python bindings.
 
-`Batch` groups requests from one manager across all layer groups. Request changes
-invalidate their stable rows; `publish()` uploads final raw indices and eligible
-history counts, including post-rollback state. Device addresses remain fixed.
-Publish and wait for readiness outside graph capture; after submitting readers
-or replaying a graph, call `recordRead()` before mutating requests or membership.
-Publication waits for offload and prior readers, and retains each staging buffer
-until its upload completes. DLPack views keep the allocation alive, not KV pages.
+`Batch` groups the `KvCache`s stepped together and owns their row order. Rows are
+slots rather than positions in a compacted list, so removing a member leaves a
+hole instead of shifting later rows and the shapes and addresses a captured graph
+baked in stay valid. Membership is exclusive and carries the sparse arena lease,
+so a request joins only once it is ready to be stepped; `move()` relocates a
+member between rows without ending membership, which `removeKvCache()` followed
+by `addKvCache()` would. A member may not be resumed, suspended or closed while
+seated, because those write page indices through the Batch's staged row.
+
+`publish()` uploads a step's page tables and watermarks from pinned staging and
+returns with the copy still in flight, so every later host write to a member's
+page indices — a `KvCache::resize()`, a commit, a beam fork, an SWA recycle,
+anything that locks or unlocks a page — must be separated from it by
+`waitPublished()`, or it races the copy and publishes a torn table. The Batch's
+own mutators are exempt: `resize()`, `move()`, `addKvCache()` and
+`removeKvCache()` each wait for themselves. `publish()` throws rather than waits
+when the previous publish has not been waited on, because waiting there would
+cover only its own write and hide a member already mutated into the hazard; the
+lock and unlock paths carry a debug check for the member side of the same rule.
+
+A sparse member writes back the units its history passes through
+`flushSparseUnits()`, and must have done so for the history it is giving up
+before it leaves, since removal returns the arena lease and discards whatever the
+GPU cache held.
 
 The dependency direction is broadly:
 
@@ -96,6 +175,7 @@ types/config/exceptions
   -> storage pools + eviction + copy engine + radix tree
   -> pages + storage manager
   -> per-request KvCache
+  -> Batch + sparse cache
   -> KvCacheManager
   -> nanobind API
 ```
@@ -121,8 +201,9 @@ pages and performs final commit-state bookkeeping.
 ### Page status
 
 - `LOCKED`: pinned at the current storage level; neither eviction nor dropping
-  is permitted. GPU locks support every lifecycle. Level-1 `HOST_MEM` locks
-  support sparse attention only; disk pages cannot be locked.
+  is permitted. Every lifecycle locks at the hot level, sparse or not. A sparse
+  lifecycle's hot pool group is host memory, but that is a property of the
+  allocation rather than of the level, so locking does not distinguish them.
 - `HELD`: eviction is allowed, but dropping is not.
 - `DROPPABLE`: both eviction and dropping are allowed.
 
@@ -132,21 +213,13 @@ they establish write completion, migration ordering, and safe reuse across
 streams. A stream change for an active cache intentionally synchronizes the
 new stream with the old one.
 
-`batchedLockPages()` takes an explicit destination per page and restores cold
-pages before locking, deduplicating pages shared by multiple owners. Resume,
-prefetch, and prefix rebasing preserve host-resident sparse history. A partial
-prefix copies from the source's actual tier into a private GPU page without
-moving a shared host source. Rollback records the original lock level, and
-`ScratchSlotLock` remains GPU-only. This does not itself demote GPU history;
-offload requires a separate transfer and GPU-slot ownership handoff.
-
-Prefill admission, prefetch, and rebasing promote a host-locked sparse page into
-one shared GPU slot. Promotion waits for all owners' prior work and finished
-readers, updates every owner's page indices and metadata version, and releases
-the source host slot with a copy-completion fence. Allocation or copy failure
-preserves host ownership. Decoding owners retain deferred-offload work so that
-`Batch.publish()` retries demotion after the prefill owner enters decode,
-suspends, or closes, even without history growth.
+`batchedLockPages()` restores cold pages to the hot level before locking them,
+deduplicating pages shared by multiple owners. The destination is always the hot
+level: an earlier revision carried one per page, for sparse lifecycles that
+resided at level 1, and that is gone along with the residency split. A partial
+prefix copies from the source's actual tier into a private hot page without
+moving a shared source. `ScratchSlotLock` remains GPU-only. This does not itself
+demote history; offload requires a separate transfer and slot ownership handoff.
 
 ## Ownership and lifetime
 
@@ -162,11 +235,6 @@ KvCacheManager
 KvCache
 |- KvCacheManager (shared; cache keeps manager alive)
 `- per-beam/per-block page holders and locks
-
-Batch
-|- KvCacheManager (shared)
-|- request rows (non-owning; exclusive membership, driven by one owning thread)
-`- fixed device metadata and event-protected staging buffers
 
 BlockRadixTree
 `- roots -> child Blocks (strong ownership through next maps)
@@ -188,10 +256,6 @@ Eviction controller
   strong ones merely to simplify access.
 - `KvCache` keeps its `KvCacheManager` alive. The manager's registry of living
   caches must not create the reverse strong-reference cycle.
-- Closing a request removes its `Batch` row; closing a batch detaches its live
-  requests without closing them. Removed rows stay dirty until publication clears
-  them. Batch destruction waits for uploads and recorded readers before freeing
-  memory; exported arrays can extend the allocation lifetime beyond `close()`.
 - A committed page is referenced by the radix tree without making the tree its
   permanent owner. Eviction queues may be the only strong owner of a droppable
   page, so never store a raw pointer past the operation that obtained it.
@@ -294,6 +358,23 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - CUDA virtual memory and copy operations use the driver/runtime APIs directly.
   Keep allocation granularity, stream ordering, and source/destination lifetime
   valid through asynchronous copies.
+
+## Testing a change here
+
+The Python suite (`tests/unittest/kv_cache_manager_v2_tests/`) does **not** build this
+package's C++ tests, so a green Python run says nothing about whether they still compile:
+it loads a prebuilt `.so` and never sees the headers. Removing a symbol the C++ tests use
+therefore breaks them silently. Build and run them too:
+
+```bash
+cd cpp/build
+for t in kvCacheManagerV2ConfigTest kvCacheManagerV2ColdPageTest \
+         kvCacheManagerV2ColdPageCopyTest kvCacheManagerV2TypedIndexTest \
+         kvCacheManagerV2HostMemTest kvCacheManagerV2StatsTest \
+         kvCacheManagerV2ConcurrencyTest kvCacheManagerV2DigestPoolTest; do
+  cmake --build . --target "$t" -j"$(nproc)" || echo "$t: BUILD FAIL"
+done
+```
 
 ## Interfaces, bindings, and build
 
