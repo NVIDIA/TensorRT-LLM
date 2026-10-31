@@ -304,6 +304,40 @@ def _get_workspace_size(
     return max(context_size, generation_size)
 
 
+@lru_cache(maxsize=64)
+def _fallback_has_paged_context_kernel(
+    head_size: int, kv_cache_dtype: DataType, tokens_per_block: int
+) -> bool:
+    kernel_exists = getattr(thop, "fused_context_fmha_kernel_exists", None)
+    if kernel_exists is None:
+        return True
+    return bool(
+        kernel_exists(
+            head_size=head_size,
+            kv_cache_dtype=kv_cache_dtype,
+            tokens_per_block=tokens_per_block,
+            output_dtype=kv_cache_dtype,
+        )
+    )
+
+
+def _fallback_serves_paged_context(
+    head_size: int, meta: "TrtllmAttentionMetadata", kv_cache_dtype: Optional[DataType]
+) -> bool:
+    """Whether the fallback (thop) FMHA can run this 16-bit context phase.
+
+    With ``use_paged_context_fmha`` (chunked prefill, KV block reuse or draft tokens)
+    the context attends to cached KV, which needs a fused paged-context kernel. A build
+    can lack it for a head size and page size, and the thop op then refuses the request,
+    so such a context is not a candidate for the fallback. Builds whose bindings predate
+    the ``fused_context_fmha_kernel_exists`` lookup keep the previous selection.
+    """
+    if not meta.use_paged_context_fmha or meta.tokens_per_block is None:
+        return True
+    dtype = kv_cache_dtype if kv_cache_dtype is not None else DataType.BF16
+    return _fallback_has_paged_context_kernel(head_size, dtype, meta.tokens_per_block)
+
+
 class FlashInferTrtllmGenFmha(PhasedFmha):
     """
     An attention backend using pure trtllm-gen kernels from flashinfer.
@@ -620,6 +654,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 meta.use_paged_context_fmha
                 and meta.tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK
             )
+            and _fallback_serves_paged_context(attn.head_dim, meta, kv_cache_dtype)
         ):
             # NVBug 6579626: the per-layer host overhead of the FlashInfer
             # TRTLLM-Gen context path regresses TTFT for small BF16 batches.
