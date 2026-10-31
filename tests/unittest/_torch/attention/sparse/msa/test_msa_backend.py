@@ -795,6 +795,67 @@ def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
     assert result is expected
 
 
+@pytest.mark.parametrize(
+    "gen_token_first, expected",
+    [(None, [True]), (0, [False]), (3, [False, True])],
+    ids=["prefill", "decode", "mixed"],
+)
+def test_msa_indexer_sends_only_context_rows_to_the_context_selector(
+    monkeypatch, gen_token_first, expected
+):
+    import tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer as indexer_module
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+        MiniMaxM3SparseConfig,
+    )
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    num_tokens = 4
+    flags = []
+
+    def fake_select(max_score_kv, *, n_valid_blocks, context_rows, **kwargs):
+        del max_score_kv, kwargs
+        flags.append(context_rows)
+        return torch.zeros(n_valid_blocks.shape[0], 1, 16, dtype=torch.int32)
+
+    monkeypatch.setattr(indexer_module, "select_blocks_from_maxscore", fake_select)
+    monkeypatch.setattr(indexer_module, "_cutedsl_score", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        indexer_module,
+        "_proxy_max_score",
+        lambda idx_q, *args, **kwargs: torch.zeros(4, 2, idx_q.shape[0]),
+    )
+    scorer = {}
+    if gen_token_first is not None:
+        scorer = dict(
+            max_score=torch.zeros(4, 2, num_tokens - gen_token_first),
+            block_table=torch.zeros(1, 2, dtype=torch.int32),
+            seq_lens_cuda=torch.ones(1, dtype=torch.int32),
+            decode_query_len=1,
+            gen_token_first=gen_token_first,
+            ctx_rows=1 if gen_token_first else 0,
+        )
+    indexer_module.MsaIndexer(config).select_blocks(
+        torch.zeros(num_tokens, 4, 128, dtype=torch.bfloat16),
+        torch.zeros(2, 1, 128, 128, dtype=torch.bfloat16),
+        idx_sm_scale=1.0,
+        kv_indices=torch.arange(2, dtype=torch.int32),
+        qo_lens_cpu=torch.tensor([3, 1], dtype=torch.int32),
+        kv_lens_cpu=torch.tensor([200, 256], dtype=torch.int32),
+        qo_offset_cpu=torch.tensor([197, 255], dtype=torch.int32),
+        n_valid_blocks=torch.ones(num_tokens, dtype=torch.int32),
+        **scorer,
+    )
+    assert flags == expected
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
     """Only producer states reachable from the FP8 and BF16 model paths pass."""

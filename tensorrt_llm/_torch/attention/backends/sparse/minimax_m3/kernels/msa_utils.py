@@ -269,6 +269,7 @@ def select_blocks_from_maxscore(
     init_blocks: int,
     local_blocks: int,
     head_major_output: bool = False,
+    context_rows: bool = False,
 ) -> torch.Tensor:
     """Select per-query top-k blocks from per-KV-head block scores.
 
@@ -278,8 +279,22 @@ def select_blocks_from_maxscore(
     padding. When ``head_major_output`` is set, the logical result uses a
     head-major backing so ``result.permute(1, 0, 2)`` is contiguous without a
     copy.
+
+    ``context_rows`` marks rows that no CUDA graph captures. With topk 16 and
+    a head-major output they go to minimax_m3_select_context_blocks, a CuTe
+    DSL kernel that is faster on context batches but compiles on first use;
+    its docstring lists the rare rows where it differs from the C++ op.
     """
     nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    if context_rows and head_major_output and topk == MSA_REQUIRED_TOPK:
+        # Deferred so that importing this module does not load the CuTe DSL.
+        from tensorrt_llm._torch.attention.kernels.blackwell.minimax_m3_select_context_blocks import (
+            minimax_m3_select_context_blocks,
+        )
+
+        return minimax_m3_select_context_blocks(
+            max_score_kv, nvb, init_blocks=init_blocks, local_blocks=local_blocks
+        )
     return torch.ops.trtllm.minimax_m3_select_blocks(
         max_score_kv,
         nvb,

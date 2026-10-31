@@ -459,7 +459,9 @@ class MsaIndexer:
                 block_size=page_size,
             )
 
-        gen_table = self._select(max_score, n_valid_blocks[gen_first:])
+        # The backend scores every generation span (require_cutedsl), so an
+        # unscored batch is a pure-prefill step's: context rows only.
+        gen_table = self._select(max_score, n_valid_blocks[gen_first:], context_rows=not scored)
         if gen_first == 0:
             return gen_table
         # The proxy scores the context prefix into its own buffer, under the
@@ -478,6 +480,7 @@ class MsaIndexer:
                 idx_sm_scale=idx_sm_scale,
             ),
             n_valid_blocks[:gen_first],
+            context_rows=True,
         )
         return _combined_topk_table(ctx_table, gen_table, head_major=True)
 
@@ -528,12 +531,17 @@ class MsaIndexer:
         self,
         max_score: torch.Tensor,
         n_valid_blocks: torch.Tensor,
+        *,
+        context_rows: bool,
     ) -> torch.Tensor:
         """Reduce scores to KV-head granularity and take the top-k blocks.
 
         Always into a head-major backing, whatever the step: the Triton sparse
         decode kernel reads the table head-major and takes every generation
         row, while fmha_sm100 reads whatever strides it is handed.
+
+        Context rows, which no CUDA graph captures, take the CuTe DSL context
+        selector; generation rows keep the C++ op that pure-decode graphs capture.
         """
         return select_blocks_from_maxscore(
             _group_max_reduce(max_score, self.config),
@@ -542,6 +550,7 @@ class MsaIndexer:
             init_blocks=self.config.init_blocks,
             local_blocks=self.config.local_blocks,
             head_major_output=True,
+            context_rows=context_rows,
         )
 
 
