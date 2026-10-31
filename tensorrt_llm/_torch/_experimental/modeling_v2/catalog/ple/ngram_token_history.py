@@ -4,8 +4,11 @@
 per token, its out-of-slice predecessors read from -- and its tail published
 back to -- the per-slot n-gram context pool.
 
-Tier-3 composed from native torch integer ops (~20 small launches); exact, so
-gated bitwise. Nothing registered under ``torch.ops.trtllm`` assembles an
+A macro entry, composed from native torch integer ops (~20 small launches;
+the sourcing ladder's native-torch rung); exact, so gated bitwise. Shared by
+the qwen4_exp tp1 target and the unified target (promoted from their copies), with
+the unified target's per-rank slot pools among the cells.
+Nothing registered under ``torch.ops.trtllm`` assembles an
 n-gram id window, and the one kernel-plane callable in the family
 (``EngramHashProvider.compute_hashes`` / ``NgramHashMapping._get_ngram_hashes``
 in ``tensorrt_llm/_torch/modules/engram/engram.py``) has no cross-step state:
@@ -18,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's PLE constants: `ngram_size` 3, so a 2-id context row
 #: (`Qwen4ExpPLECacheParams.ngram_context_len`).
@@ -30,12 +33,32 @@ CKPT_VOCAB_SIZE = 248320
 #: bf16 recurrent pool holds more slots in the same memory) takes the same path. The target
 #: hands the whole pool over unsliced.
 ENGINE_SLOTS = 461
+#: The per-rank `ple_ngram` slot counts of the unified target's members: the stock engine's
+#: `Qwen4ExpHybridCacheManager` at core's config (bf16 KV and recurrent state, KV fraction
+#: 0.6, `max_batch_size` 128, `max_seq_len` 9216, `max_num_tokens` 8192, TRTLLM MoE, the
+#: padded 19-batch CUDA-graph list) with the n-gram table host-resident
+#: (`TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD=1`), read off its "PLE state views bound" log line,
+#: the same count on all four ranks. The pool shares the GDN recurrent pools' slot space,
+#: which the V2 manager sizes from the rank's memory budget, not from `max_batch_size`:
+#: tep4 holds 1784 with the table device-resident, and a dep4 rank, which keeps every GDN
+#: head, fewer than a tep4 rank.
+TEP4_SLOTS = 1874
+DEP4_SLOTS = 850
 
 
 def _scattered(num_seqs: int) -> tuple[int, ...]:
     """`num_seqs` distinct slots over the whole engine pool, both ends in."""
     slots = ((0, ENGINE_SLOTS - 1) + tuple(i * 13 + 4 for i in range(num_seqs)))[:num_seqs]
     assert len(set(slots)) == num_seqs and max(slots) < ENGINE_SLOTS
+    return slots
+
+
+def _spread(num_seqs: int, pool_slots: int) -> tuple[int, ...]:
+    """`num_seqs` distinct slots evenly over a `pool_slots` pool, both ends in, out of
+    order: batch row `s` is never slot `s`, as the scheduler's slot vector allows."""
+    even = sorted({round(i * (pool_slots - 1) / (num_seqs - 1)) for i in range(num_seqs)})
+    slots = tuple(even[1::2][::-1]) + tuple(even[0::2])
+    assert len(set(slots)) == num_seqs and {0, pool_slots - 1} <= set(slots)
     return slots
 
 
@@ -119,6 +142,42 @@ class NgramTokenHistory(OpWrapper):
             (True, True, False),
             3,
         ),
+        _cell(
+            f"tep4 decode: 128 x 1 row at the rank's {TEP4_SLOTS}-slot pool",
+            (1,) * 128,
+            _spread(128, TEP4_SLOTS),
+            (True,) * 128,
+            TEP4_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
+        _cell(
+            f"dep4 decode: a rank's 32 x 1 row at its {DEP4_SLOTS}-slot pool",
+            (1,) * 32,
+            _spread(32, DEP4_SLOTS),
+            (True,) * 32,
+            DEP4_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
+        _cell(
+            f"tep4 MTP7 verify: 128 x 8 rows at the {TEP4_SLOTS}-slot pool",
+            (8,) * 128,
+            _spread(128, TEP4_SLOTS),
+            (True,) * 128,
+            TEP4_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
+        _cell(
+            "tep4 prefill: one fresh 8192-token context, max_num_tokens",
+            (8192,),
+            (TEP4_SLOTS - 1,),
+            (False,),
+            TEP4_SLOTS,
+            qsl_from="seq_lens",
+            **_CALL_SITE,
+        ),
     )
 
     note = """
@@ -155,19 +214,38 @@ class NgramTokenHistory(OpWrapper):
     pool. At 461 slots the result is bitwise identical to an 11-slot pool
     with the same slot content.
 
-    Certified at the forward's two verify-step shapes, both on the
+    Certified at the tp1 forward's two verify-step shapes, both on the
     `cu_seqlens_from_seq_lens` rebuild at the 461-slot pool (32 x 8 rows; a
     37-token fresh context with in-stream EOS beside 8 x 3 rows), and at
-    zero-token rows. Not certified: a plain decode (one row per sequence) or
-    a context-only batch -- outside a verify step the forward takes the
-    fused `ple_ngram_embed`, not this op.
+    zero-token rows. At the unified target's per-rank pools (`TEP4_SLOTS` 1874,
+    `DEP4_SLOTS` 850; every cell on the rebuild, with slots spread over the
+    whole pool, both ends in): a plain decode of 128 x 1 rows at tep4 and of
+    a dep4 rank's 32 x 1 rows, the MTP7 verify's 128 x 8 rows at tep4, and
+    one fresh 8192-token context at tep4 (`max_num_tokens`, the envelope's
+    largest row).
+
+    The pool the manager hands over is a contiguous `[slots, 2]` int64
+    (stride (2, 1), offset 0) at tp4, tep4 and dep4, ranks 0 and 3, with
+    the GDN pools' slot count (probed on the stock manager). The call site
+    is `ple_ngram_embed`, whose `reference` composes this entry's
+    `reference`; the tp1 forward launches the fused entry, not this op.
+
+    Not certified: tp4's pool (stock does not serve pure tp4 -- its NVFP4
+    MoE weight shuffle refuses 160 rows per rank -- so it was not booted), the
+    MTP and multimodal members' pools, and the dep4 variants' pools
+    (kv_fp8, kv_nvfp4, chunked, reuse with its recurrent-state snapshots).
+    The op addresses a slot by index alone, so these differ from the cells
+    in pool length only.
 
     CUDA-graph capture certified (no `repeat_interleave` on device lengths,
     so no data-dependent shape). Cost, not gated: ~0.30 ms for a 4096-token
     prefill, a 32-row decode or a mixed 2 x 1024 + 30 x 1 batch alike --
     launch-bound.
 
-    Hard limits: not probed (`num_tokens` measured to 4096 in timing).
+    Hard limits: none reached. `num_tokens` is certified to 8192; every index
+    is int64 and the largest tensor is the `[num_tokens, ngram_size]` window,
+    far from 2^31 elements. Pure torch: no JIT path and no compiled kernel of
+    its own, so nothing in it is architecture-specific.
     """
 
     def __call__(

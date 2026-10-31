@@ -20,7 +20,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash 
     CKPT_MULTIPLIERS,
     ngram_hash,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ngram_token_history import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ple_ngram_embed import (  # noqa: E501

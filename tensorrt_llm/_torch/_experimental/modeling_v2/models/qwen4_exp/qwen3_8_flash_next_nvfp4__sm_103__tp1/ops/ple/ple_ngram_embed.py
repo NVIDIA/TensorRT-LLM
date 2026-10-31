@@ -31,8 +31,9 @@ import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import ngram_hash
-
-from .ngram_token_history import ngram_token_history
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (
+    ngram_token_history,
+)
 
 #: This checkpoint's PLE geometry: 3-gram, 16 heads of 160 fp8 columns.
 CKPT_NGRAM_SIZE = 3

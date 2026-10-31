@@ -6,10 +6,9 @@ depthwise short conv against the paged conv state (published back), the
 residual add into the hyper-connection stream, and the next site's grouped
 norm -- three Triton launches behind one call.
 
-This target's local variant of
-``qwen3_8_flash_next_nvfp4__sm_103__tp1/ops/ple/ple_gate_conv_inject_norm``:
-the Triton kernels written for that target, copied unchanged, reading the
-row-to-sequence search of this target's own ``ple_ngram_embed__r15``. It
+Shared by the qwen4_exp tp1 target and the unified target (promoted from their
+copies): the Triton kernels written for the tp1 target, reading the
+row-to-sequence search of ``ple_ngram_embed``. It
 replaces, on the decode path, three `_grouped_norm` calls (12
 ``flashinfer_gemma_rmsnorm`` + 3 cats), ``gated_ngram_injection`` (~10
 launches), ``dilated_short_conv_paged`` (~15 launches around ``F.conv1d``),
@@ -37,8 +36,11 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (
+    DEP4_SLOTS,
+    TEP4_SLOTS,
+)
 
-from .ngram_token_history__r14 import DEP4_SLOTS, TEP4_SLOTS
 from .ple_ngram_embed__r15 import PER_SEQ_MAX_ROWS, _seq_of_rows
 
 

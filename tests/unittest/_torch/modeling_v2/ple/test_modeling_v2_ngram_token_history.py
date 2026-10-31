@@ -15,17 +15,17 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ngram_token_history import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (  # noqa: E501
     CKPT_EOS_TOKEN_ID,
     CKPT_NGRAM_SIZE,
     CKPT_VOCAB_SIZE,
     ENGINE_SLOTS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ngram_token_history import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "ngram_token_history requires a CUDA device"

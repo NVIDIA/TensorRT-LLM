@@ -27,11 +27,11 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_store import (  # noqa: E501
     qsa_paged_index_store,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (  # noqa: E501
+    ngram_token_history,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.modeling import (  # noqa: E501
     SpeculativeRollback,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ngram_token_history__r14 import (  # noqa: E501
-    ngram_token_history,
 )
 
 assert torch.cuda.is_available(), "the rollback handler test requires a CUDA device"
