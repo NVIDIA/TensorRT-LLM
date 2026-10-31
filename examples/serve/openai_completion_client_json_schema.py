@@ -1,5 +1,20 @@
 ### :title OpenAI Completion Client with JSON Schema
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This example requires to specify `guided_decoding_backend` as
 # `xgrammar` or `llguidance` in the config.yaml file.
 import json
@@ -36,11 +51,13 @@ response = client.chat.completions.create(
                 },
             },
             "required": ["name", "population"],
-            "chat_template_kwargs": {
-                "enable_thinking": False
-            }
         }
     },
+    # The OpenAI client has no chat_template_kwargs argument; send it in the
+    # request body so the chat template actually receives it.
+    extra_body={"chat_template_kwargs": {
+        "enable_thinking": False
+    }},
 )
 
 content = response.choices[0].message.content
@@ -48,5 +65,5 @@ try:
     response_json = json.loads(content)
     assert "name" in response_json and "population" in response_json
     print(content)
-except json.JSONDecodeError:
-    print("Failed to decode JSON response")
+except json.JSONDecodeError as e:
+    raise RuntimeError(f"Failed to decode JSON response: {content!r}") from e
