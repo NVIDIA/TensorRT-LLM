@@ -195,6 +195,13 @@ BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
 
+// FailureClassifier catalog ids that make a failed wheel build worth retrying.
+// Add an id here to retry on that failure. Each retry halves -j (down to
+// BUILD_RETRY_MIN_JOBS), which is what helps the memory-exhaustion ids.
+BUILD_RETRY_QUERY_IDS = ["build-oom"]
+BUILD_RETRY_MAX_RETRIES = 2
+BUILD_RETRY_MIN_JOBS = 2
+
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
 
@@ -461,6 +468,17 @@ def prepareLLMBuild(pipeline, config, versionOverride)
 
 }
 
+// Returns the id of the BUILD_RETRY_QUERY_IDS signature the failed build attempt
+// matched in its step log, or null if it should not be retried. User aborts never
+// reach here (runLLMBuild rethrows InterruptedException first).
+def matchRetryableBuildFailure(pipeline, Throwable e)
+{
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.K8S).findAll { it.id in BUILD_RETRY_QUERY_IDS }
+    def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, queries)
+    def classified = FailureClassifier.classify(e, InfraFailure.K8S, evidence)
+    return classified instanceof InfraFailure ? evidence?.matchedQueryId : null
+}
+
 def runLLMBuild(
     pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false, artifacts=null)
 {
@@ -504,17 +522,37 @@ def runLLMBuild(
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
     }
 
-    def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
+    int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        // cmake will download third-party sources, so we add retry
-        trtllm_utils.llmExecStepWithRetry(
-            pipeline,
-            script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
-        )
+        int buildRetries = 0
+        while (true) {
+            try {
+                // cmake will download third-party sources, so we add retry.
+                trtllm_utils.llmExecStepWithRetry(
+                    pipeline,
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                )
+                break
+            } catch (InterruptedException e) {
+                // User abort / pipeline timeout (FlowInterruptedException): never retry.
+                throw e
+            } catch (Exception e) {
+                def retryReason = null
+                if (buildRetries >= BUILD_RETRY_MAX_RETRIES ||
+                    buildJobs <= BUILD_RETRY_MIN_JOBS ||
+                    (retryReason = matchRetryableBuildFailure(pipeline, e)) == null) {
+                    throw e
+                }
+                buildRetries++
+                int newJobs = Math.max(BUILD_RETRY_MIN_JOBS, (int) (buildJobs / 2))
+                echo "Wheel build failed (${retryReason}); retrying with -j ${newJobs} (was ${buildJobs}), retry ${buildRetries}/${BUILD_RETRY_MAX_RETRIES}."
+                buildJobs = newJobs
+            }
+        }
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in

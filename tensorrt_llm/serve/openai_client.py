@@ -480,6 +480,7 @@ class OpenAIHttpClient(OpenAIClient):
                 headers[RETURN_METRICS_HEADER] = "1"
             headers.update(self._get_request_headers(request))
             response_started = False
+            streaming_status_rejected = False
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
@@ -518,6 +519,28 @@ class OpenAIHttpClient(OpenAIClient):
                                 role,
                                 response_metrics,
                             )
+                    if http_response.status >= 400:
+                        if is_stream:
+                            # Preserve no-replay semantics even if reading the
+                            # rejected response's diagnostics fails.
+                            streaming_status_rejected = True
+                            # Error diagnostics must not buffer an unbounded worker response.
+                            error_prefix = bytearray()
+                            while len(error_prefix) < 2048:
+                                chunk = await http_response.content.read(2048 - len(error_prefix))
+                                if not chunk:
+                                    break
+                                error_prefix.extend(chunk)
+                            error_body = error_prefix.decode("utf-8", errors="replace")
+                        else:
+                            error_body = await http_response.text()
+                        raise aiohttp.ClientResponseError(
+                            http_response.request_info,
+                            http_response.history,
+                            status=http_response.status,
+                            message=f"{http_response.reason}: {error_body[:2048]}",
+                            headers=http_response.headers,
+                        )
                     if not is_stream and "text/event-stream" in content_type:
                         raise ValueError(
                             "Received an event-stream although request stream was False"
@@ -540,15 +563,6 @@ class OpenAIHttpClient(OpenAIClient):
                                 lines_yielded += 1
                                 yield line
                     else:
-                        if http_response.status >= 400:
-                            error_body = await http_response.text()
-                            raise aiohttp.ClientResponseError(
-                                http_response.request_info,
-                                http_response.history,
-                                status=http_response.status,
-                                message=f"{http_response.reason}: {error_body[:2048]}",
-                                headers=http_response.headers,
-                            )
                         response_dict = await http_response.json()
                         # yield here since python forbids return statements in async generators
                         yield response_dict
@@ -557,6 +571,8 @@ class OpenAIHttpClient(OpenAIClient):
                         )
                 break  # break and skip retries if the whole response is processed without exception
             except (aiohttp.ClientError, OSError) as e:
+                if streaming_status_rejected:
+                    raise
                 if lines_yielded > 0:
                     logger.error(
                         f"Client error to {url}: {e} - cannot retry since {lines_yielded} lines were yielded",

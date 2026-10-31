@@ -1642,7 +1642,10 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
                                   or module.disable_deep_gemm)) or is_sm_120f()
         use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
             module, "use_indexer_q_cutedsl_fusion", False))
-        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
+        # Consumers that read UE8M0 scales from the FP32 K128 layout (e.g. the
+        # fused shared FC12 kernel) ask for the rounding alone.
+        round_to_ue8m0 = getattr(module, "round_block_scales_to_ue8m0", False)
+        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout or round_to_ue8m0:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
 
@@ -1688,6 +1691,15 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             if get_sm_version() != 107:
                 module.fp8_low_m_gemm = Fp8BlockScaleLowMGemmRange.for_weight(
                     *weight.shape)
+        elif round_to_ue8m0:
+            # Same FP32 K128 layout; the rounded tensors may live on another device.
+            replace_parameter_and_save_metadata(
+                module, "weight", nn.Parameter(weight, requires_grad=False),
+                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(
+                module, "weight_scale",
+                nn.Parameter(weight_scale, requires_grad=False),
+                module.rebuild_tensor_metadata)
 
 
 class NVFP4LinearMethod(LinearMethodBase):
@@ -3462,21 +3474,58 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 
 
 def _mxfp8_cutlass_op_available() -> bool:
-    """Cached check for whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in.
+    """Check whether the CUTLASS MXFP8xMXFP8 GEMM op is compiled in and runs on this GPU.
 
     Pre-M2-build the op is absent and we fall back to the dequant reference
     path; post-build the op is registered under torch.ops.trtllm and we route
     Linear.apply through it.
     """
-    return hasattr(torch.ops.trtllm,
-                   "mxfp8_mxfp8_gemm") and torch.cuda.is_available(
-                   ) and torch.cuda.get_device_capability()[0] >= 10
+    return hasattr(
+        torch.ops.trtllm,
+        "mxfp8_mxfp8_gemm") and torch.cuda.is_available() and is_sm_100f()
+
+
+def _mxfp8_flashinfer_only() -> bool:
+    """Blackwell GPUs outside the SM100 family run MXFP8 GEMMs through FlashInfer only."""
+    return (not _mxfp8_cutlass_op_available()
+            and hasattr(torch.ops.trtllm, "mxfp8_quantize")
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] >= 10
+            and not is_sm_100f())
+
+
+def mxfp8_gemm_backend_override() -> Optional[str]:
+    """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
+
+    ``TRTLLM_MXFP8_GEMM_BACKEND`` takes precedence on SM100-family GPUs.
+    Elsewhere the native GEMM is not compiled, so FlashInfer is the only
+    backend and other explicit choices are rejected.
+    """
+    backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND")
+    if _mxfp8_flashinfer_only():
+        if backend not in (None, "flashinfer"):
+            raise ValueError(
+                f"TRTLLM_MXFP8_GEMM_BACKEND={backend!r} is not supported on "
+                "this GPU: the native MXFP8 GEMM runs on SM100-family GPUs "
+                "only, so use 'flashinfer' or leave it unset")
+        backend = "flashinfer"
+    return backend
 
 
 _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_autotune_active", default=False)
 _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE = ContextVar(
     "flashinfer_mxfp8_decode_graph_capture_active", default=False)
+
+
+def flashinfer_mxfp8_autotune_active() -> bool:
+    """Whether the current forward runs inside ``flashinfer_mxfp8_autotune``."""
+    return _FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get()
+
+
+def flashinfer_mxfp8_decode_graph_capture_active() -> bool:
+    """Whether the current forward is a decode CUDA-graph warmup or capture."""
+    return _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()
 
 
 @contextmanager
@@ -3532,8 +3581,9 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def __init__(self) -> None:
         super().__init__()
-        self.use_cutlass = _mxfp8_cutlass_op_available()
-        self.backend = os.environ.get("TRTLLM_MXFP8_GEMM_BACKEND", "trtllm")
+        self.use_cutlass = _mxfp8_cutlass_op_available(
+        ) or _mxfp8_flashinfer_only()
+        self.backend = mxfp8_gemm_backend_override() or "trtllm"
         # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
         # Helix CP) on the direct native op instead of leaving Python
@@ -3596,7 +3646,7 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     def enable_flashinfer_auto(self) -> bool:
         """Enable graph-only FlashInfer dispatch unless the user overrode it."""
-        if "TRTLLM_MXFP8_GEMM_BACKEND" in os.environ:
+        if mxfp8_gemm_backend_override() is not None:
             return self.backend == "auto"
         if not self._load_flashinfer(required=False):
             return False

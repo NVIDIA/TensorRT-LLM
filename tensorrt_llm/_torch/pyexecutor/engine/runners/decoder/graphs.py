@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -46,11 +47,7 @@ from tensorrt_llm._torch.speculative import (
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    PrefillCudaGraphBackend,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -720,6 +717,13 @@ class DecoderCudaGraphs:
                     )
                     with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
                         self._capture_generation_cuda_graphs(resource_manager)
+                    if (
+                        is_warmup_only
+                        and runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks
+                    ):
+                        # Tactics tuned while warming the decode graphs agree across
+                        # ranks before the capture pass reads them.
+                        AutoTuner.get().post_tune_merge_tactics()
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
@@ -751,11 +755,8 @@ class DecoderCudaGraphs:
         if self.mapping.has_cp_helix():
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
-        sparse_config = self.sparse_attention_config
-        if (
-            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-            and sparse_config.needs_separate_short_long_cuda_graphs()
-        ):
+        short_long_seq_len_threshold = self.cuda_graph_runner.short_long_seq_len_threshold
+        if short_long_seq_len_threshold is not None:
             # For short sequences, subtract the maximum runtime tokens consumed
             # by a generation step so all current-step tokens stay within the
             # sequence length threshold. PARD uses 2K tokens here, not K+1.
@@ -763,7 +764,7 @@ class DecoderCudaGraphs:
                 self._config.max_draft_len
             )
             # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - max_runtime_tokens_per_gen_step
+            max_seq_len = short_long_seq_len_threshold - max_runtime_tokens_per_gen_step
             if max_seq_len < effective_max_seq_len:
                 max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:

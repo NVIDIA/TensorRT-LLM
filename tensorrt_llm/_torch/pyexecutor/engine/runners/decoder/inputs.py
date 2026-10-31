@@ -17,6 +17,7 @@ from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.kernels.spec_step_copies import op as spec_step_copies
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import _build_request_multimodal_input
+from tensorrt_llm._torch.pyexecutor import step_inputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import get_mrope_dummy_seq_slot
 from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -30,7 +31,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
-from tensorrt_llm._torch.pyexecutor.runtime_hooks import DecodePrologue
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
+    DEFAULT_RUNTIME_HOOKS,
+    DecodePrologue,
+    RuntimeHooks,
+    runtime_hooks_of,
+)
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import RemoteTailPhase
@@ -325,6 +331,8 @@ class DecoderInputPreparer:
     path overrides ``_new_extra_inputs`` and ``_prepare_inputs_fast_path``.
     """
 
+    # Step-loop behaviour the model opted into (RuntimeHooks); all off unless it declares otherwise.
+    runtime_hooks: RuntimeHooks = DEFAULT_RUNTIME_HOOKS
     # The model's decode prologue (RuntimeHooks.decode_prologue), set by the runner.
     decode_prologue: DecodePrologue | None = None
 
@@ -351,6 +359,7 @@ class DecoderInputPreparer:
         self.mapping = mapping
         self.dist = dist
         self.model = model
+        self.runtime_hooks = runtime_hooks_of(model)
         self.get_runtime_tokens_per_gen_step = get_runtime_tokens_per_gen_step
         self.iter_states = iter_states
         self._lora = lora
@@ -1894,6 +1903,16 @@ class DecoderInputPreparer:
                 self._staged_previous_batch_indices = list(previous_batch_indices)
             return previous_slots
 
+        def previous_pos_indices_device(previous_batch_tokens: int) -> None:
+            if previous_pos_indices != self._staged_previous_pos_indices:
+                previous_pos_indices_host = torch.tensor(
+                    previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
+                )
+                self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                    previous_pos_indices_host, non_blocking=True
+                )
+                self._staged_previous_pos_indices = list(previous_pos_indices)
+
         if scheduled_requests.is_attention_dp_phase_idle:
             # Graph padding normally reuses an existing input buffer. An idle
             # rank has no real row to initialize that buffer on its first step.
@@ -1915,16 +1934,60 @@ class DecoderInputPreparer:
             self._buffers.draft_tokens_cuda[: len(draft_tokens)].copy_(
                 draft_tokens, non_blocking=True
             )
+        step_fold = (
+            self.runtime_hooks.spec_step_fold
+            if self._config.is_spec_decode and not self._dspark_trims_submitted_tokens
+            else None
+        )
+        fold_rows = None
+        fold_staged = False
+        if step_fold is not None:
+            # A decode-only step's generation rows; the model's forward may stage the next
+            # step's inputs for exactly these rows (see SpecStepFold).
+            fold_rows = (
+                [request.py_seq_slot for request in extend_requests]
+                if scheduled_requests.num_context_requests == 0
+                else None
+            )
+            if fold_rows is not None and any(slot is None for slot in fold_rows):
+                fold_rows = None
+            fold_staged = step_fold.begin_step(fold_rows, len(extend_requests))
         if next_draft_tokens_device is not None:
             runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(runtime_draft_len)
             runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
             num_extend_reqeust_wo_dummy = len(extend_requests) - len(extend_dummy_requests)
+            # The previous forward already staged this step's inputs when it ran for exactly
+            # these rows and this step adds nothing of its own.
+            inputs_staged = (
+                fold_staged
+                and len(extend_dummy_requests) == 0
+                and num_tokens == 0
+                and num_draft_tokens == 0
+                and previous_batch_len == len(extend_requests)
+                and previous_batch_indices == fold_rows
+            )
+            if not inputs_staged and step_fold is not None and previous_batch_len > 0:
+                previous_slots = previous_seq_slots_device()
+                previous_pos_indices_device(previous_batch_len * runtime_tokens_per_gen_step)
+                inputs_staged = step_fold.gather(
+                    new_tokens_device,
+                    next_draft_tokens_device,
+                    new_tokens_lens_device,
+                    previous_slots,
+                    self._buffers.previous_pos_indices_cuda,
+                    previous_batch_len,
+                    runtime_tokens_per_gen_step,
+                    runtime_draft_token_buffer_width,
+                    num_tokens,
+                    num_draft_tokens,
+                    num_extend_reqeust_wo_dummy - previous_batch_len,
+                )
             # The offsets of requests without a previous batch and of dummy
             # requests must read 0. On a CUDA graph step (no token padding)
             # where every row is a request with a previous batch, the gathers
             # below overwrite all rows _preprocess_inputs reads, so the buffers
             # need no zeroing first.
-            if not (
+            if not inputs_staged and not (
                 not self._dspark_trims_submitted_tokens
                 and attn_metadata.is_cuda_graph
                 and previous_batch_len == num_extend_reqeust_wo_dummy
@@ -1935,21 +1998,14 @@ class DecoderInputPreparer:
                 self._buffers.previous_pos_id_offsets_cuda.zero_()
                 self._buffers.previous_kv_lens_offsets_cuda.zero_()
 
-            if previous_batch_len > 0:
+            if previous_batch_len > 0 and not inputs_staged:
                 previous_slots = previous_seq_slots_device()
                 is_ragged_gen = host.previous_batch_tokens_per_request is not None and any(
                     tokens != runtime_tokens_per_gen_step
                     for tokens in host.previous_batch_tokens_per_request
                 )
                 previous_batch_tokens = len(previous_pos_indices)
-                if previous_pos_indices != self._staged_previous_pos_indices:
-                    previous_pos_indices_host = torch.tensor(
-                        previous_pos_indices, dtype=torch.int, pin_memory=prefer_pinned()
-                    )
-                    self._buffers.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
-                        previous_pos_indices_host, non_blocking=True
-                    )
-                    self._staged_previous_pos_indices = list(previous_pos_indices)
+                previous_pos_indices_device(previous_batch_tokens)
 
                 # The order of requests in a batch: [context requests, generation requests]
                 # generation requests: ['requests that do not have previous batch', 'requests that
@@ -2157,9 +2213,7 @@ class DecoderInputPreparer:
                     generation_positions.view(1, 1, -1).expand(3, 1, -1),
                 )
         else:
-            self._buffers.position_ids_cuda[:total_num_tokens].copy_(
-                host_position_ids, non_blocking=True
-            )
+            step_inputs.copy_(self._buffers.position_ids_cuda[:total_num_tokens], host_position_ids)
 
         host.host_position_ids = host_position_ids
 

@@ -36,6 +36,7 @@ from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     server_pb2,
 )
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session  # noqa: E402
 
 # grpc.aio starts a `_poll_wrapper` daemon thread on server start and tears it
 # down only once its internal state is released, which happens after the event
@@ -55,7 +56,8 @@ def test_format_bind_address_brackets_ipv6() -> None:
 
 
 @pytest.mark.parametrize("fail_stop", [False, True])
-def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> None:
+@pytest.mark.parametrize("fail_metrics", [False, True])
+def test_stop_drains_both_media_pools_even_if_shutdown_fails(fail_stop, fail_metrics) -> None:
     async def exercise_stop():
         server = OpenEngineServer.__new__(OpenEngineServer)
         server._server = SimpleNamespace(
@@ -63,17 +65,22 @@ def test_stop_drains_both_media_pools_even_if_grpc_shutdown_fails(fail_stop) -> 
         )
         server._health = SimpleNamespace(enter_graceful_shutdown=AsyncMock())
         server._health_task = None
-        server._metrics = SimpleNamespace(stop=AsyncMock())
+        server._metrics = SimpleNamespace(
+            stop=AsyncMock(side_effect=RuntimeError("metrics failed") if fail_metrics else None)
+        )
         server._input_executor = ThreadPoolExecutor(max_workers=1)
         server._media_executor = ThreadPoolExecutor(max_workers=1)
         futures = [
             pool.submit(lambda: True) for pool in (server._input_executor, server._media_executor)
         ]
-        if fail_stop:
-            with pytest.raises(RuntimeError, match="stop failed"):
+        media_session = await _get_aiohttp_session()
+        if fail_stop or fail_metrics:
+            message = "metrics failed" if fail_metrics else "stop failed"
+            with pytest.raises(RuntimeError, match=message):
                 await server.stop(grace=0)
         else:
             await server.stop(grace=0)
+        assert media_session.closed
         assert server._stopping
         server._metrics.stop.assert_awaited_once()
         server._health.enter_graceful_shutdown.assert_awaited_once()

@@ -730,7 +730,7 @@ def test_overlap_offsets_follow_the_packed_prefix(
 def test_graph_overlap_offset_zeroing_preserves_ragged_bucket_padding(trims: bool) -> None:
     decoder = object.__new__(DecoderInputPreparer)
     decoder._config = SimpleNamespace(
-        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False
+        max_num_tokens=16, max_beam_width=1, disable_overlap_scheduler=False, is_spec_decode=True
     )
     decoder._dspark_trims_submitted_tokens = trims
     decoder._staged_previous_batch_indices = None
