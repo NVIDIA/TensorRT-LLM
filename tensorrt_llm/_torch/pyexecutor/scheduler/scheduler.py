@@ -551,6 +551,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
 
         ctx_chunk_config_cpp = None
         if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config[0], ctx_chunk_config[1], max_num_tokens
+            )
             ctx_chunk_config_cpp = tb_internal.batch_manager.ContextChunkingConfig(
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
@@ -1307,6 +1310,47 @@ class ContextChunkingConfig:
     chunk_unit_size: int
 
 
+def _to_chunking_policy(policy: Any) -> ChunkingPolicy:
+    """Return the ``ChunkingPolicy`` for a policy given in any of its representations.
+
+    The executor hands the schedulers a ``ContextChunkingPolicy`` (llmapi StrEnum);
+    callers may also pass a ``ChunkingPolicy``, the C++ binding enum or a string,
+    so the name is matched rather than the object. Unknown names fall back to
+    FIRST_COME_FIRST_SERVED.
+    """
+    if isinstance(policy, ChunkingPolicy):
+        return policy
+    name = str(policy)
+    if "EQUAL_PROGRESS" in name:
+        return ChunkingPolicy.EQUAL_PROGRESS
+    if "FORCE_CHUNK" in name:
+        return ChunkingPolicy.FORCE_CHUNK
+    return ChunkingPolicy.FIRST_COME_FIRST_SERVED
+
+
+def _check_forced_chunk_context_limit(
+    policy: Any, chunk_unit_size: int, max_num_tokens: Optional[int]
+) -> None:
+    """Reject a ``max_num_tokens`` below one FORCE_CHUNK unit.
+
+    ``max_num_tokens`` is the schedulers' context-length limit. They reject such
+    a limit on every context request (see ``_chunk_forced`` and
+    ``microBatchScheduler.cpp``), so the configuration is rejected when the
+    scheduler is created instead.
+    """
+    if _to_chunking_policy(policy) != ChunkingPolicy.FORCE_CHUNK or max_num_tokens is None:
+        return
+    if max_num_tokens < chunk_unit_size:
+        raise ValueError(
+            f"max_num_tokens ({max_num_tokens}) must be at least the "
+            f"FORCE_CHUNK context chunk unit ({chunk_unit_size}). Increase "
+            "max_num_tokens. FORCE_CHUNK is selected for a hybrid linear-attention "
+            "model with kv_cache_config.enable_block_reuse, with the KV cache block "
+            "size as the unit; otherwise it comes from "
+            "scheduler_config.context_chunking_policy."
+        )
+
+
 class MicroBatchScheduler:
     """Base class to match structure."""
 
@@ -1340,6 +1384,10 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         self.max_num_tokens = max_num_tokens
         self.ctx_chunk_config = ctx_chunk_config
         self.max_context_length = max_num_tokens
+        if ctx_chunk_config is not None:
+            _check_forced_chunk_context_limit(
+                ctx_chunk_config.chunking_policy, ctx_chunk_config.chunk_unit_size, max_num_tokens
+            )
         # Match C++ MicroBatchScheduler defaults (see algorithms.cpp line 68-70)
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
@@ -2798,19 +2846,9 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None
         if ctx_chunk_config:
-            # Fix: Use string comparison to identify the policy.
-            # This works regardless of whether the input is a Python Enum, C++ Binding Enum, or String.
-            input_policy = ctx_chunk_config[0]
-
-            if "EQUAL_PROGRESS" in str(input_policy):
-                policy_enum = ChunkingPolicy.EQUAL_PROGRESS
-            elif "FORCE_CHUNK" in str(input_policy):
-                policy_enum = ChunkingPolicy.FORCE_CHUNK
-            else:
-                # Default to FCFS for FIRST_COME_FIRST_SERVED or others
-                policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
-
-            py_chunk_config = ContextChunkingConfig(policy_enum, ctx_chunk_config[1])
+            py_chunk_config = ContextChunkingConfig(
+                _to_chunking_policy(ctx_chunk_config[0]), ctx_chunk_config[1]
+            )
 
         self.micro_batch_scheduler = PyMicroBatchScheduler(
             max_batch_size=max_batch_size,
