@@ -155,6 +155,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_s
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4_decode import (
     qsa_paged_sparse_gqa_nvfp4_decode,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_prefill_compress import (
+    qsa_prefill_compress,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -195,7 +198,6 @@ from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_deco
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import qsa_paged_sparse_gqa_nvfp4_verify
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import takes_grouped as _verify_takes_grouped
-from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
 from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile

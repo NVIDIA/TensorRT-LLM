@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""QSA block compression of the paged index-key side cache: completed groups to anchors."""
+"""QSA block compression of the paged index-key side cache: completed groups to anchors.
+
+Shared by the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified tp4/tep4/dep4 target
+(`hf_fc694b5_orig__sm_103__unified`);
+promoted from their copies.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +14,11 @@ from typing import Optional, Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+
+from .._op import Arch, Cell, OpWrapper
 
 #: The mRoPE sections the checkpoint declares; the target passes `None` today
 #: (`_QSA_MROPE_SECTION`) and these are certified, on the NVFP4 trunk-plane cell,
@@ -40,6 +46,26 @@ _CKPT = dict(
 _MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
 
 
+#: The unified target's index pool at bf16 KV, as the stock `Qwen4ExpHybridCacheManager` lays it out on
+#: every member and rank: KV cache manager V2 coalesces the 12 sparse layers' same-size index
+#: pages into one pool, so a layer's `get_index_k_buffer` view is `[pages, 32, 1, 128]` with page
+#: stride 12 x 4096 elements, starting `ordinal x 4096` into each slot. The position plane is its
+#: own contiguous `[pages, 32, 3]` int32 pool.
+INDEX_ROLES = 12
+
+#: A rank's attention pool, in pages: the stock engine's `maxNumBlocks` at core config (bf16 KV,
+#: fraction 0.6, host-resident n-gram table), measured per member. The manager's index view holds
+#: slightly fewer pages than its primary block count, so these bound it from above.
+TEP4_PAGES = 258983
+DEP4_PAGES = 120530
+
+#: `qsa_block_table` is `[max_num_sequences, max_blocks_per_seq]`: 128 seats (`max_batch_size`, per
+#: rank under attention DP), 292 pages a sequence at max_seq_len 9216 and 516 at the MTP member's 16384.
+SEATS = 128
+CORE_WIDTH = 292
+MTP_WIDTH = 516
+
+
 def _spec(segments, pages, **overrides) -> dict:
     """`segments` is `(first position, rows)` per request, in row order."""
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
@@ -48,6 +74,39 @@ def _spec(segments, pages, **overrides) -> dict:
 def _mrope(segments, pages, **overrides) -> dict:
     """Prefill from 0 under mRoPE (11, 11, 10)."""
     return _spec(segments, pages, mrope_section=MROPE_SECTION, **overrides)
+
+
+def _pool(segments, pages, width, ordinal, **overrides) -> dict:
+    """The unified target's call over a rank's coalesced index pool: layer `ordinal`'s plane, 128 seats,
+    and request 0's last page the pool's last (`top_page`)."""
+    return _spec(
+        segments,
+        pages,
+        slots=SEATS,
+        width=width,
+        layout="coalesced",
+        roles=INDEX_ROLES,
+        ordinal=ordinal,
+        top_page=True,
+        **overrides,
+    )
+
+
+def _decode(requests: int, last: int) -> tuple:
+    """`requests` decode rows spread over positions 3..`last`; every other one an anchor
+    (`4k + 3`), the others at `4k + 0..2`, the last request an anchor at `last`."""
+    span = (last - 3) // 4
+    segments = []
+    for r in range(requests):
+        k = r * span // (requests - 1)
+        offset = 3 if r % 2 == 0 or r == requests - 1 else r % 3
+        segments.append((4 * k + offset, 1))
+    return tuple(segments)
+
+
+#: 128 MTP7 verify blocks (8 rows, two anchors each) at starts spread to the MTP member's last
+#: position, 16383: some blocks inside one page, some across a page edge.
+_MTP7_128 = tuple((r * (16384 - 8) // 127, 8) for r in range(128))
 
 
 class QsaPrefillCompress(OpWrapper):
@@ -99,6 +158,24 @@ class QsaPrefillCompress(OpWrapper):
             why="NVFP4 trunk planes: 12 index roles and the position page share each page",
             spec=_mrope(((0, 64),) * 2, pages=4, layout="shared_page", roles=12),
         ),
+        # The unified target's calls over a rank's measured pool, every page reachable: the last
+        # page's plane sits past 2^31 elements of the pool's base.
+        Cell(
+            why="tep4 decode: 128 requests x 1 row, the 258983-page coalesced pool, ordinal 11",
+            spec=_pool(_decode(128, 9215), TEP4_PAGES, CORE_WIDTH, 11),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows = 1024, positions to 16383",
+            spec=_pool(_MTP7_128, TEP4_PAGES, MTP_WIDTH, 5),
+        ),
+        Cell(
+            why="tep4 prefill at max_num_tokens: 8192 rows (6144 + 2047 + 1, all from 0)",
+            spec=_pool(((0, 6144), (0, 2047), (0, 1)), TEP4_PAGES, CORE_WIDTH, 0, rounding_flips=5),
+        ),
+        Cell(
+            why="dep4 decode: 32 requests x 1 row over a rank's 120530-page pool, 128 seats",
+            spec=_pool(_decode(32, 9215), DEP4_PAGES, CORE_WIDTH, 11),
+        ),
     )
 
     note = """
@@ -132,31 +209,65 @@ class QsaPrefillCompress(OpWrapper):
     `cos_sin`'s dtype is the rotation's precision: bf16 is accepted and was
     measured 1.4% of elements off by up to 1.56e-2 -- not certified. Text
     rows reduce mRoPE to plain RoPE bit for bit (measured, not pinned by a
-    test). Plain `@triton.jit`, no
-    autotune; CUDA-graph capturable at a fixed row count (captured at 256
-    rows, 32 MTP7 verify blocks).
+    test). Plain `@triton.jit`, no autotune, JIT-compiled at first call; the
+    cells drove that JIT path on sm_103 (GB300). Every stride is a
+    `tl.constexpr`, so each pool layout (contiguous, the NVFP4 shared page,
+    the unified target's coalesced bf16 pool) is its own compiled specialization, and
+    each is driven by a cell. CUDA-graph capturable at a fixed row count
+    (captured at 256 rows, 32 MTP7 verify blocks, and at 128 decode rows over
+    the unified target's tep4 pool).
 
     Under an NVFP4 KV pool both caches are strided views of one per-slot
     allocation (each physical page holds the index roles, then the position
     page); the trunk-plane cell checks the other index roles and the position
     page untouched.
 
-    The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
-    reference's: every cell is bitwise the reference but the 32-block MTP7 one, where
-    1 of 8192 anchor elements rounds one bf16 step away.
+    The unified target's pools (`coalesced` cells), on every member and rank at bf16
+    KV: KV cache manager V2 coalesces the 12 sparse layers' index pages into
+    one pool, so `get_index_k_buffer(i)` is `[pages, 32, 1, 128]` with page
+    stride 49152 elements, starting 4096 x (the layer's ordinal) into each slot;
+    the position plane is a contiguous `[pages, 32, 3]` (read off the stock
+    manager at tep4 and dep4 rank 0, max_seq_len 9216 and 16384). The cells hold
+    a rank's measured pool -- tep4 258983 pages, dep4 120530: the stock
+    engine's `maxNumBlocks` at core config, host-resident n-gram table, an
+    upper bound on the index view, which the same manager builds slightly
+    smaller (1706 index pages for 1842 primary blocks) -- with request 0's last
+    page the pool's last, written at 258982 x 49152 elements from the base,
+    past 2^31; the table is the engine's `[128, 292]` (core) or `[128, 516]`
+    (MTP, max_seq_len 16384), 128 seats at 128 and at 32 requests. The other
+    11 layers' planes are checked untouched.
 
-    Hard limits (read from the kernel, not probed): positions, requests and
-    page ids are widened to int64 before any address arithmetic, so no int32
-    boundary inside the call. Certified extent: positions to 1928 through a
-    [40, 260] table over 1100 pages.
+    The kernel's `tl.rsqrt` is the hardware approximation, an fp32 ulp from the
+    reference's: every cell is bitwise the reference but two. In the 32-block
+    MTP7 one, 1 of 8192 anchor elements rounds one bf16 step away. In the 8192-row
+    tep4 prefill, 5 of 262016 do, every one an exact bf16 tie in the reference's
+    fp32 value (low 16 bits 0x8000). Measured against the kernel on that cell,
+    the nearest wrong variants are far outside that budget: sequential bf16
+    pooling 94580 elements (up to 0.03125), coordinates from the group's last
+    member 61418, the norm weight without its `+1` 261994.
+
+    Hard limits (read from the kernel; the page offset also driven): positions,
+    requests and page ids are widened to int64 before any address arithmetic,
+    so no int32 boundary inside the call -- the coalesced cells address pages
+    past 2^31 elements of the pool's base. Certified extent: positions to 16383
+    through a [128, 516] table over 258983 pages; 8192 rows in one launch.
+
+    Each rank's call is local to its device (the indexer is replicated, no
+    collective), so a one-device cell stands for any rank's call at its pool.
 
     Not certified: `compress_ratio` other than 4, `D` other than 128, a bf16
-    or fp16 `cos_sin`, positions past 1928 or the table's rows, mRoPE outside
-    the NVFP4 trunk-plane cell, the NVFP4 draft planes (one index role a page), multiple devices,
+    or fp16 `cos_sin`, positions past 16383 or the table's rows (the tune's
+    max_seq_len 262144 and ~220k-token prompts), mRoPE outside the NVFP4
+    trunk-plane cell, the NVFP4 draft planes (one index role a page),
     `tokens_per_block` other than 32 (no group straddles a page), eps other
     than 1e-6, int32 positions or int64 request indices, a strided view of the
     index cache, position plane or table other than the NVFP4 pool's shared
-    page, two rows naming one anchor in a launch, and `rows == 0`.
+    page and the unified target's coalesced bf16 pool, the kv_fp8 / kv_nvfp4 dep4
+    pools at their measured page count (their packed `QSA_SIDE_PLANES` layout
+    is the shared-page cell's, at 4 pages), the MTP member's own pool count and
+    its separate draft cache (the 1024-row cell runs on the core tep4 pool), a
+    tp4 pool (never booted; the indexer is replicated, so tep4's stands in), two
+    rows naming one anchor in a launch, and `rows == 0`.
     """
 
     def __call__(

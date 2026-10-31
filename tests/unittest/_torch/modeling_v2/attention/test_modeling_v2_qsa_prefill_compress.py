@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's qsa_prefill_compress__r19 variant.
+"""GPU test for the unified target's qsa_prefill_compress variant.
 
 A copy of the tp1 target's test for `ops/attention/qsa_prefill_compress`, pointed at the variant.
 
@@ -12,7 +12,7 @@ rows past the batch holding a previous step's plausible page ids. The cos|sin
 table is built the way the target builds it at load, `max_position_embeddings`
 rows tall.
 
-The `coalesced` cells hold this target's pool: one rank's measured page count,
+The `coalesced` cells hold the unified target's pool: one rank's measured page count,
 the 12 sparse layers' index pages sharing each slot as KV cache manager V2 lays
 them out at bf16, the other 11 layers' planes holding a sentinel that must
 survive. Those pools are drawn on the device.
@@ -26,11 +26,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_prefill_compress__r19 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_prefill_compress import (  # noqa: E501
     qsa_prefill_compress as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_prefill_compress requires a CUDA device"
@@ -234,14 +234,14 @@ _MTP7_32 = next(c.spec for c in op.CELLS if c.why.startswith("decode MTP7: 32 re
 _MTP7_BATCH = {key: _MTP7_32[key] for key in ("segments", "pages", "slots", "rounding_flips")}
 
 
-#: The 128-request decode over this target's tep4 pool, at its cell's seed.
+#: The 128-request decode over the unified target's tep4 pool, at its cell's seed.
 _DECODE_128 = next(c for c in op.CELLS if c.why.startswith("tep4 decode: 128 requests"))
 
 
 @pytest.mark.parametrize("batch", ["mtp7_32", "tep4_decode_128"])
 def test_cuda_graph_capture_and_replay(batch) -> None:
     """The launch grid is fixed by the row count, so it captures and replays: 32 MTP7
-    verify blocks, and 128 decode rows over this target's coalesced tep4 pool, the
+    verify blocks, and 128 decode rows over the unified target's coalesced tep4 pool, the
     decode target's captured batches."""
     if batch == "mtp7_32":
         args, flips = _scene(seed=16, **_MTP7_BATCH), _MTP7_BATCH["rounding_flips"]
