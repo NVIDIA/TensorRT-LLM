@@ -28,17 +28,17 @@ import cuda.bindings.driver as cuda_drv
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm import (  # noqa: E501
-    gdn_decode_rows_gated_norm__r32 as rows_mod,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.gdn_decode_rows_gated_norm__r32 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows as rows_op,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm.gdn_decode_rows_gated_norm__r32 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_rows_gated_norm import (  # noqa: E501
     gdn_decode_rows_gated_norm as op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ssm import (  # noqa: E501
+    gdn_decode_rows_gated_norm as rows_mod,
+)
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdn_decode_rows_gated_norm requires a CUDA device"

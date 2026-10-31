@@ -4,8 +4,10 @@
 over the fp32 or bf16 state pool: the decode step at batch sizes past the cluster kernel's
 over an fp32 pool, and at every batch size over a bf16 pool.
 
-Tier 6 (CuTe DSL written for this target; the recurrence is the gated delta rule of
-FlashInfer's `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here). At a
+A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target, shared with the unified
+target (promoted from their copies, the kernel unchanged); the
+recurrence is the gated delta rule of FlashInfer's
+`gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here. At a
 decode batch the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32 or
 32 KB bf16, read and written once -- so a CTA owns one whole state and streams it: warp w
 the value rows [w * RPW, (w + 1) * RPW), lane l the key columns [4l, 4l + 4) of each, so
@@ -37,7 +39,6 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
     _recurrence_reference,
 )
@@ -47,6 +48,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
+from .._op import Arch, Cell, OpWrapper
+
 #: Key columns a lane (one 16-byte fp32 or 8-byte bf16 vector of a state row).
 _PL = 4
 #: Warps a CTA; a warp owns `V // _WARPS` value rows of the head's state.
@@ -54,6 +57,35 @@ _WARPS = 8
 #: Largest recurrent-pool slot count the cache manager was seen to allocate for this
 #: checkpoint; the kernel addresses a slot by its index alone, any pool size alike.
 ENGINE_SLOTS = 461
+#: Recurrent-state slots one rank's stock engine allocates for this checkpoint at the core
+#: configuration (bf16 state cache, `max_batch_size` 128), as the engines bound them: tep4
+#: and dep4 counted. No engine has served tp4; a tp4 rank's GDN state has tep4's per-slot
+#: shape (4 k / 12 v heads), so tp4 takes tep4's count.
+TEP4_SLOTS = 1874
+DEP4_SLOTS = 850
+TP4_SLOTS = TEP4_SLOTS
+
+#: The rank geometries the engine cells take: a tp4/tep4 rank's 4 k / 12 v heads on its
+#: 4120-wide projection, a dep4 rank's whole 16 / 48 on 16480, each over its member's bf16
+#: engine page.
+_TEP4 = dict(
+    k_heads=4,
+    v_heads=12,
+    proj_width=4120,
+    state="bf16",
+    pool="coalesced",
+    pool_slots=TEP4_SLOTS,
+    member="tep4",
+)
+_DEP4 = dict(
+    k_heads=16,
+    v_heads=48,
+    proj_width=16480,
+    state="bf16",
+    pool="coalesced",
+    pool_slots=DEP4_SLOTS,
+    member="dep4",
+)
 
 
 def _iv(x, loc, ip):
@@ -782,9 +814,11 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows; pool (default a contiguous 461-slot pool | "coalesced": the
-    # cache manager's pool, slot stride 36 layers' states, slots 100 and 101);
-    # pad (row 1 given slot -1).
+    # spec: rows; k_heads / v_heads (default 16 / 48) and proj_width (their projection's);
+    # state (default fp32 | "bf16"); pool (default a contiguous 461-slot pool |
+    # "coalesced": the cache manager's page, slot stride 36 layers' states -- 102 slots
+    # (slots 100 and 101), or with pool_slots an engine's slot count, the view the last
+    # layer's sub-page); pad (row 1 given slot -1); member (the layout the counts are from).
     CELLS: tuple[Cell, ...] = (
         Cell(why="qwen3.8 decode, 128 rows (con 128), 461-slot pool", spec=dict(rows=128)),
         Cell(why="qwen3.8 decode, 3 rows (past the conv-fused path)", spec=dict(rows=3)),
@@ -801,6 +835,38 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
             why="bf16 pool, 2 rows, coalesced: slot stride 36 layers, slot 100",
             spec=dict(rows=2, pool="coalesced", state="bf16"),
         ),
+        Cell(
+            why="tep4 decode, 1 row (con 1) at 4 k / 12 v heads, slot 1873 of the 1874-slot "
+            "bf16 engine page",
+            spec=dict(_TEP4, rows=1),
+        ),
+        Cell(
+            why="tep4, 2 rows at 4 / 12 heads: slots 1873 and 0 of the 1874-slot bf16 page",
+            spec=dict(_TEP4, rows=2),
+        ),
+        Cell(
+            why="tep4, 3 rows at 4 / 12 heads over the 1874-slot bf16 engine page",
+            spec=dict(_TEP4, rows=3),
+        ),
+        Cell(
+            why="tep4, 128 rows (con 128; the bulk-copy variant) at 4 / 12 heads over the "
+            "1874-slot bf16 page",
+            spec=dict(_TEP4, rows=128),
+        ),
+        Cell(
+            why="tp4, 128 rows at 4 / 12 heads over its 1874-slot bf16 page (tep4's count), "
+            "row 1 a pad slot (-1)",
+            spec=dict(_TEP4, rows=128, pad=True, pool_slots=TP4_SLOTS, member="tp4"),
+        ),
+        Cell(
+            why="dep4 decode, 32 rows at 16 / 48 heads (proj 16480) over the 850-slot bf16 "
+            "engine page",
+            spec=dict(_DEP4, rows=32),
+        ),
+        Cell(
+            why="dep4, 128 rows (max_batch_size) at 16 / 48 heads over the 850-slot bf16 page",
+            spec=dict(_DEP4, rows=128),
+        ),
     )
 
     note = """
@@ -812,15 +878,16 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     `V / 8` in {4, 8, 16, 32}; `A_log`, `dt_bias` fp32 `[HV]`; `norm_weight` bf16
     `[V]`; int32 `slots` `[rows]`. **The pool rows and `slots` must not be written by
     any kernel of the same step queued ahead of this one**: both are read before
-    `griddepcontrol.wait` -- as `gdn_decode_gated_norm_pdl` states, this target's decode
+    `griddepcontrol.wait` -- as `gdn_decode_gated_norm_pdl` states, the unified target's decode
     steps keep that (a layer's pool is written only by its own recurrence, `slots` is
     filled before the step's graph launches), and verify and prefill steps do not use
     the entry.
 
     Launch: one CTA of 8 warps a (v-head, row), `HV * rows` CTAs, PDL (off with
     TRTLLM_ENABLE_PDL=0); a bf16 pool's state by bulk copy into shared memory from
-    `rows * HV > 2 * SMs` (7 rows here; an fp32 pool, or a layout the copy cannot take,
-    stays on registers), both variants compiled on the first call. GB300, bf16 pool, a CUDA
+    `rows * HV > 2 * SMs` (GB300's 152 SMs: 7 rows at 48 v heads, 26 at a tp4/tep4 rank's
+    12; an fp32 pool, or a layout the copy cannot take, stays on registers), both variants
+    compiled on the first call. GB300, bf16 pool, a CUDA
     graph of 36 layers each streaming its own pool from HBM, PDL on / off, us a layer
     (register-only kernel -> this): 256 rows 152.4 / 141.6 -> 118.8 / 119.4 (6.8 TB/s read +
     write), 128 rows 77.7 / 72.6 -> 61.1 / 61.7, 32 rows 21.7 / 20.7 -> 17.9 / 18.5, 8 rows
@@ -833,14 +900,53 @@ class GdnDecodeRowsGatedNorm(OpWrapper):
     the pool's dtype of the composition's float64 reference, not bitwise FlashInfer's
     kernel. Batch-invariant: a row's output and state do not depend on the other rows.
 
-    Certified: 128 and 3 rows (the fewest a decode step sends here once the conv-fused
-    path stops) over a contiguous 461-slot pool, and 2 rows over the cache manager's
-    coalesced pool (slot stride 36 layers' states, slot 100 ~2.8G elements past the
-    base) with the second row a pad slot (-1); the same over a bf16 pool. Under graph
-    replay the op reads the projection after `griddepcontrol.wait` (16 rows). The bulk-copy
-    and register variants bitwise equal (outputs and state) at 1-33 rows over contiguous bf16
-    and fp32 pools and the coalesced pool (slot 100 by the bulk copy), pad rows included. Not
-    certified: `pdl=False`.
+    Source: the CuTe DSL kernel in this file, JIT-compiled (`cute.compile`) for the running
+    device at the first call per geometry; the cells ran that path on sm_103 (GB300).
+
+    The unified target: its routing admits a bf16 recurrent-state cache only, so its decode step
+    runs this entry over the bf16 pool at every batch size (the fp32-only one-launch kernel,
+    `gdn_decode_gated_norm_pdl`, is never launched here; its references are this entry's).
+    A tp4/tep4 rank holds 4 k / 12 v heads, its projection `[rows, 4120]`; a dep4 rank all
+    16 / 48, `[rows, 16480]`. The pool is the stock manager's coalesced page: every GDN
+    layer's state of a slot in one page, slot stride 36 layers' states (7077888 elements at
+    12 v heads, 28311552 at 48), a layer's view its sub-page.
+
+    Certified, sm_103:
+    - tp1's 16 / 48 heads. fp32 pool: 128 and 3 rows (the fewest a decode step sends here
+      once the conv-fused path stops) over a contiguous 461-slot pool, and 2 rows over a
+      102-slot coalesced page (slot 100 ~2.8G elements past the base) with the second row a
+      pad slot (-1). bf16 pool: 128, 1 and 33 rows (one pad slot) over the contiguous pool,
+      and 2 rows over the coalesced page.
+    - A tp4/tep4 rank's 4 / 12 heads over tep4's bf16 engine page (1874 slots, the view the
+      last GDN layer's sub-page; slot 1873 sits ~1.3e10 elements past the base): 1, 2, 3
+      rows (register variant) and 128 rows (bulk copy); tp4 128 rows with a pad slot over
+      the same 1874 slots.
+    - dep4's 16 / 48 heads over its bf16 engine page (850 slots; slot 849 ~2.4e10 elements
+      past the base): 32 rows and 128 rows (`max_batch_size`), both by the bulk copy.
+    - Every other byte of a touched slot's page stays unchanged; a pad row's output is zero.
+    - Under graph replay the op reads the projection after `griddepcontrol.wait`: 16 rows at
+      16 / 48, 3 rows (register) and 128 rows (bulk copy) at 4 / 12.
+    - Batch-invariant over a bf16 pool, bitwise, at 1-256 rows across the variant switch, at
+      16 / 48 and 4 / 12.
+    - The bulk-copy and register variants bitwise equal (outputs and state), with and without
+      the norm, at 1-33 rows over contiguous bf16 and fp32 pools and the tp1 coalesced page,
+      and at 4 / 12 heads over a contiguous bf16 pool (3 and 128 rows) and tep4's engine page
+      (3 rows at slots 1873, 0, 5).
+    Against the fp64 reference, torch's default bands: at 4 / 12 heads at most 27 of 196608
+    output elements differ in value from the bf16-rounded reference (max 3.9e-3; relative
+    L2 <= 2.7e-5 at 128 rows, 5.2e-5 at 3 rows, where one element of 4608 differs by
+    2.0e-3), state relative L2 <= 2.4e-5 (max 2.0e-3); dep4 at most
+    93 of 786432 (max 7.8e-3, relative L2 3.1e-5), state relative L2 <= 1.7e-5.
+
+    The engine slot counts are the stock engines' at the core configuration (bf16 state
+    cache, `max_batch_size` 128, `kv_cache_free_gpu_memory_fraction` 0.6); a tp4 rank's GDN
+    pools have tep4's per-slot shape and no engine has run tp4, so its cell takes tep4's
+    count. The kernel addresses a slot as `Int64(slot) * s_slot`: any slot count an int32
+    index can name.
+
+    Not certified: `pdl=False`; the slot counts of the members' variants (kv_fp8, kv_nvfp4,
+    chunked, reuse at dep4; MTP at tep4, `max_seq_len` 16384) and of tp4's own engine; this
+    target's own call, which its modeling does not make yet.
     """
 
     def __call__(
@@ -944,6 +1050,20 @@ class GdnDecodeRows(OpWrapper):
             why="bf16 pool: 3 rows, one pad slot (-1)",
             spec=dict(rows=3, pad=True, out="row_range", state="bf16"),
         ),
+        Cell(
+            why="tp4/tep4 mixed step: 3 generation rows at 4 k / 12 v heads (proj 4120), bf16 "
+            "pool, into a row range",
+            spec=dict(
+                rows=3, k_heads=4, v_heads=12, proj_width=4120, state="bf16", out="row_range"
+            ),
+        ),
+        Cell(
+            why="tp4/tep4 mixed step: 127 generation rows (max_batch_size with one context "
+            "row) at 4 / 12 heads",
+            spec=dict(
+                rows=127, k_heads=4, v_heads=12, proj_width=4120, state="bf16", out="row_range"
+            ),
+        ),
     )
 
     note = """
@@ -953,8 +1073,17 @@ class GdnDecodeRows(OpWrapper):
     writes the generation rows' slots (the context rows' reset and chunked recurrence touch
     only theirs). Numerics: the recurrence of `GdnDecodeRowsGatedNorm` (the same kernel).
 
-    Certified: a mixed step's 121 generation rows, 3 rows with a pad slot (-1), and 2 rows
-    over the cache manager's coalesced pool, each into a row range of the step output.
+    Certified, sm_103: at tp1's 16 / 48 heads a mixed step's 121 generation rows, 3 rows with
+    a pad slot (-1), and 2 rows over the cache manager's coalesced pool, each into a row range
+    of the step output (fp32 and bf16 pools). At a tp4/tep4 rank's 4 / 12 heads (proj 4120)
+    over a contiguous bf16 pool, 3 rows and 127 (`max_batch_size` with one context row), into
+    a row range: output at most 12 of 195072 elements off the bf16-rounded fp64 reference
+    (max 3.1e-5), state relative L2 <= 9.8e-6. The bitwise bulk / register agreement with
+    `norm` off covers this entry's launch at 4 / 12 over tep4's engine page.
+
+    Not certified: this entry's own call over an engine's page (a mixed step's eager path at
+    tp4/tep4 or dep4), `pdl=False`; at dep4 a mixed step runs the 16 / 48 cells above, over
+    tp1's pools.
     """
 
     def __call__(
