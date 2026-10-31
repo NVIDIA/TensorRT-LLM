@@ -36,6 +36,7 @@
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include "tensorrt_llm/thop/allreduceTacticCache.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -74,6 +75,7 @@
 #include <shared_mutex>
 #include <tuple>
 #include <unordered_set>
+#include <vector>
 
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
@@ -1702,88 +1704,10 @@ void endNCCLWindowTensorScope(
 namespace
 {
 
-constexpr std::array<int64_t, 14> kAllReduceTuningBuckets
-    = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192};
-constexpr size_t kAllReduceNumTuningBuckets = kAllReduceTuningBuckets.size();
-constexpr size_t kAllReduceNumInputs = 6;
-
-using AllReduceInputShape = c10::SmallVector<int64_t, 8>;
-using AllReduceInputShapes = std::array<AllReduceInputShape, kAllReduceNumInputs>;
-
-struct AllReduceTacticCacheKey
-{
-    std::vector<int64_t> group;
-    AllReduceFusionOp fusionOp;
-    bool inputUsesNcclWindow;
-    c10::ScalarType dtype;
-    AllReduceInputShapes staticInputShapes;
-
-    bool operator<(AllReduceTacticCacheKey const& other) const
-    {
-        return std::tie(group, fusionOp, inputUsesNcclWindow, dtype, staticInputShapes)
-            < std::tie(other.group, other.fusionOp, other.inputUsesNcclWindow, other.dtype, other.staticInputShapes);
-    }
-};
-
-using AllReduceTacticBuckets = std::array<std::optional<int64_t>, kAllReduceNumTuningBuckets>;
-
-struct AllReduceTacticCache
-{
-    mutable std::shared_mutex mutex;
-    std::map<AllReduceTacticCacheKey, AllReduceTacticBuckets> tactics;
-};
-
-std::optional<size_t> getAllReduceBucketIndex(int64_t bucket)
-{
-    auto const iterator = std::lower_bound(kAllReduceTuningBuckets.begin(), kAllReduceTuningBuckets.end(), bucket);
-    if (iterator == kAllReduceTuningBuckets.end() || *iterator != bucket)
-    {
-        return std::nullopt;
-    }
-    return static_cast<size_t>(iterator - kAllReduceTuningBuckets.begin());
-}
-
-std::optional<size_t> getAllReduceBucketIndexForTokens(int64_t numTokens)
-{
-    // Match Python's last_positive_power_of_2: the largest bucket also
-    // represents token counts through the value immediately before its next
-    // power of two.
-    if (numTokens < kAllReduceTuningBuckets.front() || numTokens >= 2 * kAllReduceTuningBuckets.back())
-    {
-        return std::nullopt;
-    }
-
-    // Use the largest tuned bucket that does not exceed the token count.
-    auto const firstLargerBucket
-        = std::upper_bound(kAllReduceTuningBuckets.begin(), kAllReduceTuningBuckets.end(), numTokens);
-    return static_cast<size_t>(firstLargerBucket - kAllReduceTuningBuckets.begin() - 1);
-}
-
 AllReduceTacticCache& getAllReduceTacticCache()
 {
     static AllReduceTacticCache cache;
     return cache;
-}
-
-void insertAllReduceTactic(AllReduceTacticCacheKey key, size_t bucketIndex, int64_t tactic)
-{
-    TORCH_INTERNAL_ASSERT(bucketIndex < kAllReduceNumTuningBuckets);
-    auto& cache = getAllReduceTacticCache();
-    std::unique_lock lock(cache.mutex);
-    cache.tactics[std::move(key)][bucketIndex] = tactic;
-}
-
-std::optional<int64_t> findAllReduceTactic(AllReduceTacticCacheKey const& key, std::optional<size_t> bucketIndex)
-{
-    if (!bucketIndex.has_value())
-    {
-        return std::nullopt;
-    }
-
-    auto const& cache = getAllReduceTacticCache();
-    std::shared_lock lock(cache.mutex);
-    auto const iterator = cache.tactics.find(key);
-    return iterator == cache.tactics.end() ? std::nullopt : iterator->second[*bucketIndex];
 }
 
 AllReduceInputShapes getAllReduceStaticInputShapes(torch::Tensor const& input,
@@ -1845,31 +1769,30 @@ void registerAllReduceTactic(torch::Tensor const& input, torch::optional<torch::
     torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
     torch::List<int64_t> const& group, int64_t fusionOp, int64_t bucket, int64_t tactic)
 {
-    auto const bucketIndex = getAllReduceBucketIndex(bucket);
-    TORCH_CHECK(bucketIndex.has_value(), "Invalid AllReduce autotuner bucket: ", bucket);
-    insertAllReduceTactic(getAllReduceTacticCacheKey(input, residual, normWeight, scale, bias, workspace, group,
-                              static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
-        *bucketIndex, tactic);
+    getAllReduceTacticCache().insert(
+        getAllReduceTacticCacheKey(input, residual, normWeight, scale, bias, workspace, group,
+            static_cast<AllReduceFusionOp>(fusionOp), isNCCLWindowBuffer(input, group)),
+        bucket, tactic);
 }
 
-void validateAllReduceTuningBuckets(torch::List<int64_t> const& buckets)
+std::vector<int64_t> configureAllReduceTuningBuckets(int64_t maxNumTokens)
 {
-    TORCH_CHECK(buckets.size() == kAllReduceNumTuningBuckets, "AllReduce autotuner bucket mismatch: Python provided ",
-        buckets.size(), " buckets, but C++ expects ", kAllReduceNumTuningBuckets,
-        ". Rebuild TensorRT-LLM so the Python and C++ sources match.");
-    for (size_t index = 0; index < kAllReduceNumTuningBuckets; ++index)
-    {
-        TORCH_CHECK(buckets[index] == kAllReduceTuningBuckets[index], "AllReduce autotuner bucket mismatch at index ",
-            index, ": Python provided ", buckets[index], ", but C++ expects ", kAllReduceTuningBuckets[index],
-            ". Rebuild TensorRT-LLM so the Python and C++ sources match.");
-    }
+    return getAllReduceTacticCache().configure(maxNumTokens);
+}
+
+std::vector<int64_t> getAllReduceTuningBuckets()
+{
+    return getAllReduceTacticCache().getBuckets();
+}
+
+int64_t mapToAllReduceTuningBucket(int64_t numTokens)
+{
+    return getAllReduceTacticCache().mapToBucket(numTokens);
 }
 
 void clearAllReduceTacticCache()
 {
-    auto& cache = getAllReduceTacticCache();
-    std::unique_lock lock(cache.mutex);
-    cache.tactics.clear();
+    getAllReduceTacticCache().clear();
 }
 
 std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
@@ -1904,10 +1827,10 @@ std::vector<torch::Tensor> autotunedAllreduce(torch::Tensor const& input,
 {
     auto key = getAllReduceTacticCacheKey(
         input, residual, normWeight, scale, bias, workspace, group, static_cast<AllReduceFusionOp>(fusionOp), false);
-    auto const bucketIndex = getAllReduceBucketIndexForTokens(input.size(0));
-    auto const defaultTactic = findAllReduceTactic(key, bucketIndex);
+    auto const numTokens = input.size(0);
+    auto const defaultTactic = getAllReduceTacticCache().find(key, numTokens);
     key.inputUsesNcclWindow = true;
-    auto const windowTactic = findAllReduceTactic(key, bucketIndex);
+    auto const windowTactic = getAllReduceTacticCache().find(key, numTokens);
 
     int64_t tactic;
     if (!defaultTactic.has_value() && !windowTactic.has_value())
@@ -2539,7 +2462,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "register_allreduce_tactic(Tensor input, Tensor? residual, Tensor? norm_weight, Tensor? scale, Tensor? bias, "
         "Tensor? workspace, int[] group, int op, int bucket, int tactic) -> ()");
-    m.def("validate_allreduce_tuning_buckets(int[] buckets) -> ()");
+    m.def("configure_allreduce_tuning_buckets(int max_num_tokens) -> int[]");
+    m.def("get_allreduce_tuning_buckets() -> int[]");
+    m.def("map_to_allreduce_tuning_bucket(int num_tokens) -> int");
     m.def("clear_allreduce_tactic_cache() -> ()");
     m.def(
         "allreduce_pg("
@@ -2656,7 +2581,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
-    m.impl("validate_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::validateAllReduceTuningBuckets);
+    m.impl("configure_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::configureAllReduceTuningBuckets);
+    m.impl("get_allreduce_tuning_buckets", &tensorrt_llm::torch_ext::getAllReduceTuningBuckets);
+    m.impl("map_to_allreduce_tuning_bucket", &tensorrt_llm::torch_ext::mapToAllReduceTuningBucket);
     m.impl("clear_allreduce_tactic_cache", &tensorrt_llm::torch_ext::clearAllReduceTacticCache);
 }
 

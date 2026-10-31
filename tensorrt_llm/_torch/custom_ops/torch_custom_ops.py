@@ -2636,15 +2636,27 @@ class AllReduceRunner(TunableRunner):
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
     _prealloc_dtype: ClassVar[Optional[torch.dtype]] = None
-    # Keep these buckets synchronized with kAllReduceTuningBuckets in
-    # cpp/tensorrt_llm/thop/allreduceOp.cpp.
+    # Populate buckets at engine configuration or first standalone use, not import.
     tuning_config = TuningConfig(
-        dynamic_tensor_specs=(DynamicTensorSpec(
-            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-            last_positive_power_of_2), ),
         constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
     )
+
+    @classmethod
+    def configure_tuning_buckets(cls, max_num_tokens: int) -> None:
+        """Set the process-wide profiling range before warmup and graph capture."""
+        cls._set_tuning_buckets(
+            torch.ops.trtllm.configure_allreduce_tuning_buckets(max_num_tokens))
+
+    @classmethod
+    def _set_tuning_buckets(cls, buckets: List[int]) -> None:
+        cls.tuning_config = replace(
+            cls.tuning_config,
+            dynamic_tensor_specs=(DynamicTensorSpec(
+                0, 0, tuple(buckets),
+                torch.ops.trtllm.map_to_allreduce_tuning_bucket.default), ),
+            tune_max_num_tokens=buckets[-1],
+        )
 
     def __init__(
         self,
@@ -2656,6 +2668,9 @@ class AllReduceRunner(TunableRunner):
         trigger_completion_at_end: bool,
         input_uses_nccl_window: bool = False,
     ):
+        if not self.tuning_config.dynamic_tensor_specs:
+            self._set_tuning_buckets(
+                torch.ops.trtllm.get_allreduce_tuning_buckets())
         self.tp_size = tp_size
         self.op = op
         self.group = group
@@ -2664,7 +2679,9 @@ class AllReduceRunner(TunableRunner):
         self.trigger_completion_at_end = trigger_completion_at_end
         self.input_uses_nccl_window = input_uses_nccl_window
 
-    def unique_id(self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool]:
+    def unique_id(
+        self
+    ) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool, Tuple[int, ...]]:
         return (
             self.tp_size,
             # Keep Python cache entries aligned with the native tactic cache:
@@ -2673,6 +2690,9 @@ class AllReduceRunner(TunableRunner):
             self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
+            # A hit from a shorter profiling range must not skip the new buckets.
+            tuple(self.tuning_config.dynamic_tensor_specs[0].gen_tuning_buckets
+                  ),
         )
 
     @classmethod
@@ -2761,25 +2781,10 @@ class AllReduceRunner(TunableRunner):
         custom_op = "trtllm::tunable_allreduce::allreduce"
         tuning_buckets = self.tuning_config.dynamic_tensor_specs[
             0].gen_tuning_buckets
-        # Avoid a module-import cycle during custom-op registration.
-        from tensorrt_llm._torch.distributed.ops import \
-            disable_native_allreduce_autotuner
-
-        if not hasattr(torch.ops.trtllm, "validate_allreduce_tuning_buckets"):
-            disable_native_allreduce_autotuner(
-                "native extension does not expose bucket validation")
-            return
-        try:
-            torch.ops.trtllm.validate_allreduce_tuning_buckets(tuning_buckets)
-        except RuntimeError as error:
-            if "AllReduce autotuner bucket mismatch" not in str(error):
-                raise
-            disable_native_allreduce_autotuner(str(error))
-            return
         tuner = AutoTuner.get()
         cache = tuner.profiling_cache
         input_shapes = tuple(tuner._get_input_sizes(inputs))
-        # Look up the fixed set of allreduce buckets directly instead of
+        # Look up the configured allreduce buckets directly instead of
         # scanning unrelated custom-op and profile entries in the full cache.
         for bucket in tuning_buckets:
             bucket_input_shapes = list(input_shapes)
@@ -2945,26 +2950,23 @@ def tunable_allreduce(
         new_inputs[0] = nccl_symmetric_memory_window_tensor
         return new_inputs
 
-    tuning_config = AllReduceRunner.tuning_config
+    tuning_config = allreduce_runner.tuning_config
     if input_uses_nccl_window:
         tuning_config = replace(
-            AllReduceRunner.tuning_config,
+            allreduce_runner.tuning_config,
             inputs_pre_hook=
             _inputs_pre_hook_register_nccl_symmetric_memory_window)
 
+    inputs = [input, residual, norm_weight, scale, bias, workspace]
     _, best_tactic = tuner.choose_one(
         "trtllm::tunable_allreduce::allreduce",
         [allreduce_runner],
         tuning_config,
-        [input, residual, norm_weight, scale, bias, workspace],
+        inputs,
     )
-    allreduce_runner._register_native_tactics(
-        [input, residual, norm_weight, scale, bias, workspace])
+    allreduce_runner._register_native_tactics(inputs)
 
-    return allreduce_runner(
-        [input, residual, norm_weight, scale, bias, workspace],
-        tactic=best_tactic,
-    )
+    return allreduce_runner(inputs, tactic=best_tactic)
 
 
 @tunable_allreduce.register_fake

@@ -72,6 +72,9 @@ class DynamicTensorSpec:
         dim_idx: The index of the dimension to tune.
         gen_tuning_buckets: A tuple of values to try or a function generating values.
         map_to_tuning_buckets: A function to map dimensions to tuning buckets during inference.
+            A negative result indicates the input is outside the supported tuning range.
+            Such inputs miss the cache. In skip-sweep mode, a negative mapping
+            for any required dimension suppresses profiling of the entire operation.
     """
     input_idx: int
     dim_idx: int
@@ -288,9 +291,11 @@ def autotune(tune_mode: bool = True,
         tune_mode: Whether to enable tuning mode
         cache_path: Path to save/load cache files
         skip_dynamic_tuning_buckets: When True, suppress bucket generation in
-            _optimization_profiles() so only actual input shapes from warmup
-            are profiled. Useful for workloads (e.g. diffusion) where the
-            LLM-oriented M-bucket sweep is unnecessary.
+            _optimization_profiles() and profile the encountered shapes and
+            their mapped buckets, subject to tune_max_num_tokens. Inputs with
+            no mapped bucket use the fallback without profiling. Useful for
+            workloads (e.g. diffusion) where the LLM-oriented M-bucket sweep
+            is unnecessary.
         post_tune_merge_dist: Optional ``Distributed``. When set, tactics are
             tuned per-rank independently and merged across ranks in one
             collective at context exit (before the cache is saved) — for
@@ -1740,7 +1745,12 @@ class AutoTuner:
                     # used during inference (bucketed via map_to_tuning_buckets).
                     actual_val = base_profile.shapes[spec.input_idx][
                         spec.dim_idx].val
-                    opt_shapes = (spec.map_to_tuning_buckets(actual_val), )
+                    mapped_val = spec.map_to_tuning_buckets(actual_val)
+                    if mapped_val < 0:
+                        # Lookup cannot use a measured winner for this input.
+                        # Leave it as a cache miss so choose_one uses fallback.
+                        return []
+                    opt_shapes = (mapped_val, )
                 else:
                     opt_shapes = ()
             elif callable(spec.gen_tuning_buckets):
