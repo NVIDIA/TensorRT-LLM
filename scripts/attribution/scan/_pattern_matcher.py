@@ -442,5 +442,5 @@ class PatternMatcher:
         # Only return URL if version matches (or no version specified)
         if version and tag != version:
             return ""
-        repo = repo.replace("${github_base_url}", "https://github.com").rstrip(".git")
+        repo = repo.replace("${github_base_url}", "https://github.com").removesuffix(".git")
         return f"{repo}/tree/{tag}"
