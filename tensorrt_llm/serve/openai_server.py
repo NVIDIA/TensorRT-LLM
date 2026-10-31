@@ -63,7 +63,8 @@ from tensorrt_llm.llmapi.thinking_budget import \
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
-from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.metrics.collector import (MetricsCollector,
+                                            speculative_config_info)
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
@@ -1796,7 +1797,12 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=ver)
 
     async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
+        args = getattr(self.generator, "args", None)
+        metadata = None
+        if args is not None:
+            metadata = {"speculative_config": speculative_config_info(args)}
+        model_list = ModelList(
+            data=[ModelCard(id=self.model, metadata=metadata)])
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:

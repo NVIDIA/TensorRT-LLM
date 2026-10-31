@@ -36,7 +36,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (ALL_SUPPORTED_BACKENDS,
                                                         get_settings)
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
-    generate_warmup_dataset, update_sampler_args_with_extra_options)
+    generate_warmup_dataset, resolve_end_id,
+    update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -149,10 +150,12 @@ from tensorrt_llm.sampling_params import SamplingParams
 @optgroup.option(
     "--eos_id",
     type=int,
-    default=-1,
+    default=None,
     required=False,
     help=
-    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS.",
+    "Set the end-of-sequence token for the benchmark. Set to -1 to disable EOS. "
+    "If unset, EOS is honored (the tokenizer's EOS token) when speculative "
+    "decoding is configured and disabled otherwise.",
 )
 @optgroup.option(
     "--modality",
@@ -455,9 +458,11 @@ def throughput_command(
         llm = get_llm(runtime_config, kwargs)
         startup_metrics = llm.startup_metrics
 
+        eos_id = resolve_end_id(llm.args, tokenizer.eos_token_id,
+                                options.eos_id)
         sampler_args = {
-            "end_id": options.eos_id,
-            "pad_id": options.eos_id,
+            "end_id": eos_id,
+            "pad_id": eos_id,
             "n": options.beam_width,
             "use_beam_search": options.beam_width > 1
         }

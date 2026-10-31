@@ -737,6 +737,37 @@ async def fetch_energy_metrics(base_url: str) -> Optional[dict]:
             return None
 
 
+async def server_uses_speculative_decoding(base_url: str) -> Optional[bool]:
+    """Ask the server's ``/v1/models`` whether it runs speculative decoding.
+
+    Returns True or False when the first model card carries the TensorRT-LLM
+    ``metadata.speculative_config`` entry, and None when the server does not
+    report it (another server, an older TensorRT-LLM, or no answer).
+    """
+    models_url = f"{base_url}/v1/models"
+    async with aiohttp.ClientSession(trust_env=True,
+                                     timeout=AIOHTTP_TIMEOUT) as session:
+        try:
+            async with session.get(models_url) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+    return speculative_decoding_from_models(payload)
+
+
+def speculative_decoding_from_models(payload: Any) -> Optional[bool]:
+    """Read speculative decoding from a ``/v1/models`` response body."""
+    try:
+        metadata = payload["data"][0]["metadata"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(metadata, dict) or "speculative_config" not in metadata:
+        return None
+    return metadata["speculative_config"] is not None
+
+
 def _snapshot_perf_metrics(output_dir: str) -> dict[Path, int]:
     directory = Path(output_dir)
     if not directory.exists():
@@ -990,6 +1021,15 @@ def main(args: argparse.Namespace):
 
     if "temperature" not in sampling_params:
         sampling_params["temperature"] = 0.0  # Default to greedy decoding.
+
+    if args.ignore_eos is None:
+        # Mirrors trtllm-bench: honor EOS with speculative decoding so the
+        # acceptance rate is measured on natural sequences, ignore it otherwise.
+        uses_spec_dec = asyncio.run(server_uses_speculative_decoding(base_url))
+        args.ignore_eos = (not uses_spec_dec
+                           if uses_spec_dec is not None else False)
+        print(f"--ignore-eos not given: ignore_eos={args.ignore_eos} "
+              f"(server speculative decoding: {uses_spec_dec})")
 
     # Avoid GC - reduce pause times.
     gc.disable()
@@ -1335,9 +1375,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--ignore-eos",
-        action="store_true",
-        help="Set ignore_eos flag when sending the benchmark request."
-        "Warning: ignore_eos is not supported in deepspeed_mii and tgi.")
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Set ignore_eos flag when sending the benchmark request. "
+        "If neither --ignore-eos nor --no-ignore-eos is given, EOS is ignored "
+        "when the server's /v1/models reports no speculative decoding, honored "
+        "when it reports speculative decoding, and honored when it reports "
+        "neither. Warning: ignore_eos is not supported in deepspeed_mii and "
+        "tgi.")
     parser.add_argument(
         "--percentile-metrics",
         type=str,

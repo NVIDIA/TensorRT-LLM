@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from random import choices, shuffle
-from typing import Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -166,6 +166,23 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "pytorch_config": pyt_options,
         }
     }
+
+
+def resolve_end_id(llm_args: Any,
+                   eos_token_id: Optional[int],
+                   end_id: Optional[int] = None) -> int:
+    """Return the end-of-sequence id a benchmark should sample with.
+
+    An explicit ``end_id`` is returned unchanged. Otherwise EOS is honored
+    (``eos_token_id``) when ``llm_args`` configures speculative decoding, so
+    acceptance rates are measured on natural sequences, and disabled (-1)
+    otherwise, so every request generates its full output length.
+    """
+    if end_id is not None:
+        return end_id
+    if getattr(llm_args, "speculative_config", None) is not None:
+        return eos_token_id
+    return -1
 
 
 def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:
