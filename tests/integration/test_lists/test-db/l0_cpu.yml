@@ -215,6 +215,7 @@ l0_cpu:
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
+  - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
   - unittest/grpc/openengine/test_coordinator.py
