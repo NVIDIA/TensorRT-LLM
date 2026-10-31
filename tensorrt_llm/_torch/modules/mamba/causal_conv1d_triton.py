@@ -382,6 +382,9 @@ def causal_conv1d_fn(
     activation: Optional[str] = "silu",
     pad_slot_id: int = PAD_SLOT_ID,
     validate_data=False,
+    _block_n: int | None = None,
+    _num_warps: int | None = None,
+    _num_stages: int | None = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -541,8 +544,9 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=8,
-        BLOCK_N=256,
-        num_stages=2,
+        BLOCK_N=_block_n if _block_n is not None else 256,
+        num_warps=_num_warps if _num_warps is not None else 4,
+        num_stages=_num_stages if _num_stages is not None else 2,
     )
     return out
 
