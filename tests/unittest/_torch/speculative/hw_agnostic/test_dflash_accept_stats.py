@@ -257,12 +257,6 @@ def test_mocked_calibration_end_to_end(tmp_path):
     assert p1["ece"] == pytest.approx((0.375 + 0.375 + 2 * 0.125) / 4)
 
 
-def test_default_provider_absent_in_core_tree():
-    # The optional dspark_confidence module ships in a separate MR; on this
-    # tree the default provider must resolve to None (not raise).
-    assert accept_stats._resolve_default_confidence_provider() is None
-
-
 def test_conf_bin_edges():
     assert accept_stats._conf_bin(-0.1, 20) == 0
     assert accept_stats._conf_bin(0.0, 20) == 0

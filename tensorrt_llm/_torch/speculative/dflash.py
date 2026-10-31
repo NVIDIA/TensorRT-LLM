@@ -1992,10 +1992,9 @@ class DFlashWorker(SpecWorkerBase):
 
                 # Opt-in confidence-calibration recording (env-gated). The
                 # confidence values come from an optional provider on the
-                # recorder (None here -> no calibration rows collected; the
-                # DSpark confidence-scheduled verification MR supplies the
-                # real provider, see accept_stats.py). Guarded off for
-                # CUDA-graph batches and d2t vocab-mapped drafters.
+                # recorder (None by default -> no calibration rows collected;
+                # see accept_stats.py). Guarded off for CUDA-graph batches
+                # and d2t vocab-mapped drafters.
                 if (
                     self._accept_stats is not None
                     and self._accept_stats.confidence_provider is not None
