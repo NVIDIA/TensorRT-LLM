@@ -486,7 +486,9 @@ def launch_server(
             instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
-                longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
+                longest_name = max(
+                    "coordinator-abort", f"frontend-{mode.num_frontends - 1}", key=len
+                )
                 socket_path = os.path.join(directory.name, longest_name)
                 if len(os.fsencode(socket_path)) >= 108:
                     raise ValueError(
@@ -549,7 +551,12 @@ def launch_server(
                 raise RuntimeError("An OpenEngine frontend exited during startup")
             _signal_frontend_ready(mode)
             if coordinator is not None:
-                await coordinator.set_ready()
+                try:
+                    await coordinator.set_ready()
+                except CoordinationError as error:
+                    if failure is not None:
+                        raise RuntimeError(failure) from error
+                    raise
                 await server._refresh_inference_health()
             await stop_event.wait()
         finally:

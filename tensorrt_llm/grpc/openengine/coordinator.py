@@ -9,12 +9,14 @@ The Unix sockets live in the launcher's mode-0700 temporary directory.
 """
 
 import asyncio
+import concurrent.futures
 import json
+import queue
 import threading
 import uuid
-from _thread import RLock
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -26,6 +28,8 @@ from tensorrt_llm.logger import logger
 _RPC_TIMEOUT = 5.0
 _ABORT_TIMEOUT = 30.0
 _HEARTBEAT_TIMEOUT = 10.0
+_CONTROL_THREADS = 4
+_ABORT_THREADS = 4
 _MAX_REQUEST_ID_BYTES = 1024
 # At most six JSON bytes per UTF-8 byte, plus the fixed UUID and framing:
 # 128 accepted entries occupy less than 1 MiB, well below the 64 MiB limit.
@@ -38,7 +42,7 @@ _OPTIONS = [
 
 
 class CoordinationError(RuntimeError):
-    """The serving group can no longer guarantee request ownership."""
+    """A private coordination operation could not be completed."""
 
 
 class DuplicateRequestError(ValueError):
@@ -103,8 +107,28 @@ class _Connection:
         await self.channel.close()
 
 
+class _SyncConnection:
+    """A synchronous private channel used only by coordinator handlers."""
+
+    def __init__(self, address: str) -> None:
+        self.channel = grpc.insecure_channel(address, options=_OPTIONS)
+        self.call = self.channel.unary_unary(
+            f"/{_SERVICE}/Call", request_serializer=_encode, response_deserializer=json.loads
+        )
+
+    def request(self, message: dict, timeout: float) -> grpc.Future:
+        return self.call.future(message, timeout=timeout)
+
+    def close(self) -> None:
+        self.channel.close()
+
+
 class Coordinator:
-    """Serialize ownership changes and route fenced control operations."""
+    """Own request state and serve private control without another aio loop.
+
+    Slow aborts use their own endpoint and pool so they cannot occupy the
+    heartbeat and reservation handlers. All state changes hold one lock.
+    """
 
     def __init__(
         self,
@@ -113,7 +137,7 @@ class Coordinator:
         instance_id: str,
         healthy: Callable[[], bool],
         fail: Callable[[str], None],
-        admission_lock: RLock | None = None,
+        admission_lock: AbstractContextManager[Any] | None = None,
     ) -> None:
         self.instance_id = instance_id
         self.ready = False
@@ -124,29 +148,67 @@ class Coordinator:
         self._admission_lock = admission_lock if admission_lock is not None else threading.RLock()
         self._requests: dict[str, tuple[str, int]] = {}
         self._directory = directory
-        self._peers: list[_Connection] = []
-        self._server: grpc.aio.Server | None = None
+        self._peers: list[_SyncConnection] = []
+        self._servers: list[grpc.Server] = []
+        self._pools: list[concurrent.futures.ThreadPoolExecutor] = []
 
-    async def start(self) -> None:
+    def start(self) -> None:
         try:
-            self._server = grpc.aio.server(options=_OPTIONS)
             for frontend in range(len(self._heartbeats)):
-                self._peers.append(_Connection(_address(self._directory, f"frontend-{frontend}")))
-            _server(_address(self._directory, "coordinator"), self._dispatch, self._server)
-            await self._server.start()
+                self._peers.append(
+                    _SyncConnection(_address(self._directory, f"frontend-{frontend}"))
+                )
+            for name, handler, workers, limit in (
+                ("coordinator", self._dispatch, _CONTROL_THREADS, None),
+                ("coordinator-abort", self._abort, _ABORT_THREADS, _ABORT_THREADS),
+            ):
+                pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix=f"openengine-{name}"
+                )
+                self._pools.append(pool)
+                server = grpc.server(pool, options=_OPTIONS, maximum_concurrent_rpcs=limit)
+                self._servers.append(server)
+                server.add_generic_rpc_handlers(
+                    (
+                        grpc.method_handlers_generic_handler(
+                            _SERVICE,
+                            {
+                                "Call": grpc.unary_unary_rpc_method_handler(
+                                    handler,
+                                    request_deserializer=json.loads,
+                                    response_serializer=_encode,
+                                )
+                            },
+                        ),
+                    )
+                )
+                address = _address(self._directory, name)
+                if not server.add_insecure_port(address):
+                    raise RuntimeError(f"Failed to bind OpenEngine private endpoint {address}")
+                server.start()
         except BaseException:
-            await self.close()
+            self.close()
             raise
 
-    async def close(self) -> None:
-        self.ready = False
+    def close(self) -> None:
+        with self._admission_lock:
+            self.ready = False
+            self.stopping = True
         try:
-            if self._server is not None:
-                await self._server.stop(0)
+            stopped = [server.stop(0) for server in self._servers]
+            for peer in self._peers:
+                peer.close()
+            for event in stopped:
+                event.wait()
         finally:
-            await asyncio.gather(*(peer.close() for peer in self._peers))
+            for pool in self._pools:
+                pool.shutdown(wait=True)
+            self._servers.clear()
+            self._peers.clear()
+            self._pools.clear()
 
     def _group_ready(self) -> bool:
+        """Check group readiness while holding the admission lock."""
         if not self.ready or self.stopping:
             return False
         now = monotonic()
@@ -157,58 +219,28 @@ class Coordinator:
                 return False
         return self._healthy()
 
-    async def _abort_frontend(self, frontend: int, requests: list, deadline: float) -> dict:
-        aborted = failed = 0
-        # One outstanding batch per frontend bounds fan-out independently of
-        # the snapshot size. Each batch retains the original generation tokens.
-        for start in range(0, len(requests), _ABORT_BATCH_SIZE):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                return {"aborted": aborted, "failed": failed + len(requests) - start}
-            try:
-                reply = await asyncio.wait_for(
-                    self._peers[frontend].request(
-                        {"requests": requests[start : start + _ABORT_BATCH_SIZE]}
-                    ),
-                    timeout=remaining,
-                )
-            except asyncio.TimeoutError:
-                # The current batch has no confirmed outcome. Include it and
-                # unsent batches as failures without invalidating the group.
-                return {"aborted": aborted, "failed": failed + len(requests) - start}
-            except grpc.aio.AioRpcError as error:
-                if error.code() != grpc.StatusCode.DEADLINE_EXCEEDED:
-                    raise
-                return {"aborted": aborted, "failed": failed + len(requests) - start}
-            aborted += reply["aborted"]
-            failed += reply["failed"]
-        return {"aborted": aborted, "failed": failed}
-
-    async def _dispatch(self, message: dict, context: grpc.aio.ServicerContext) -> dict:
+    def _dispatch(self, message: dict, context: grpc.ServicerContext) -> dict:
         operation = message["operation"]
-        if operation == "heartbeat":
-            # Check expiry before refreshing: a late heartbeat cannot resurrect
-            # a group that has already lost a frontend's responsiveness guarantee.
-            self._group_ready()
-            self._heartbeats[message["frontend"]] = monotonic()
-            operation = "status"
-        if operation == "status":
-            return {
-                "ready": self._group_ready(),
-                "instance_id": self.instance_id,
-                "count": len(self._requests),
-                "stopping": self.stopping,
-            }
-        if operation == "withdraw":
-            self.ready = False
-            if not self.stopping:
-                self.stopping = True
-                self._fail(f"OpenEngine frontend {message['frontend']} is stopping")
-            return {}
-        if operation == "reserve":
-            # Terminal owner failure and reservation commit share one ordering.
-            # This section performs no asynchronous work or engine operations.
-            with self._admission_lock:
+        with self._admission_lock:
+            if operation == "heartbeat":
+                # A late heartbeat cannot resurrect an expired group.
+                self._group_ready()
+                self._heartbeats[message["frontend"]] = monotonic()
+                operation = "status"
+            if operation == "status":
+                return {
+                    "ready": self._group_ready(),
+                    "instance_id": self.instance_id,
+                    "count": len(self._requests),
+                    "stopping": self.stopping,
+                }
+            if operation == "withdraw":
+                self.ready = False
+                if not self.stopping:
+                    self.stopping = True
+                    self._fail(f"OpenEngine frontend {message['frontend']} is stopping")
+                return {}
+            if operation == "reserve":
                 if not self._group_ready():
                     return {"ready": False, "reserved": False}
                 request_id = message["request_id"]
@@ -218,51 +250,92 @@ class Coordinator:
                     return {"reserved": False}
                 self._requests[request_id] = owner
                 return {"reserved": True}
-        if operation == "release":
-            request_id = message["request_id"]
-            if self._requests.get(request_id) == (message["token"], message["frontend"]):
-                del self._requests[request_id]
-            return {}
-        if operation == "abort":
-            # Snapshot before awaiting peer RPCs. Every dispatched item carries
-            # its generation token, including entries in abort-all snapshots.
-            # Reserve one control-RPC interval to deliver partial outcomes
-            # before the caller's overall abort deadline expires.
-            deadline = monotonic() + _ABORT_TIMEOUT - _RPC_TIMEOUT
+            if operation == "release":
+                request_id = message["request_id"]
+                if self._requests.get(request_id) == (message["token"], message["frontend"]):
+                    del self._requests[request_id]
+                return {}
+        context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown private operation")
+
+    def _abort(self, message: dict, context: grpc.ServicerContext) -> dict:
+        if message.get("operation") != "abort":
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown private operation")
+        # Keep generation tokens in the snapshot, then release the state lock
+        # before any RPC; a slow frontend must not block normal control traffic.
+        with self._admission_lock:
             request_id = message.get("request_id")
             if request_id is None:
                 snapshot = list(self._requests.items())
             else:
                 owner = self._requests.get(request_id)
                 snapshot = [(request_id, owner)] if owner is not None else []
-            by_frontend: dict[int, list] = defaultdict(list)
-            for key, (token, frontend) in snapshot:
-                by_frontend[frontend].append([key, token])
-            tasks = [
-                asyncio.create_task(self._abort_frontend(frontend, requests, deadline))
-                for frontend, requests in by_frontend.items()
-            ]
-            try:
-                if tasks:
-                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
-                    for task in done:
-                        if (error := task.exception()) is not None:
-                            raise error
-                replies = [task.result() for task in tasks]
-                return {
-                    "aborted": sum(reply["aborted"] for reply in replies),
-                    "failed": sum(reply["failed"] for reply in replies),
-                }
-            except grpc.aio.AioRpcError as error:
-                self.ready = False
-                self._fail(f"Frontend control connection failed: {error}")
-                await context.abort(grpc.StatusCode.UNAVAILABLE, "Frontend control failed")
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown private operation")
+        by_frontend: dict[int, list] = defaultdict(list)
+        for key, (token, frontend) in snapshot:
+            by_frontend[frontend].append([key, token])
+
+        deadline = monotonic() + _ABORT_TIMEOUT - _RPC_TIMEOUT
+        completed: queue.Queue[tuple[int | None, grpc.Future | None]] = queue.Queue()
+        if not context.add_callback(lambda: completed.put((None, None))):
+            context.abort(grpc.StatusCode.CANCELLED, "Abort request cancelled")
+        active: dict[int, grpc.Future] = {}
+        offsets = dict.fromkeys(by_frontend, 0)
+        aborted = failed = 0
+
+        def submit(frontend: int) -> bool:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return False
+            offset = offsets[frontend]
+            batch = by_frontend[frontend][offset : offset + _ABORT_BATCH_SIZE]
+            future = self._peers[frontend].request(
+                {"requests": batch}, min(_RPC_TIMEOUT, remaining)
+            )
+            active[frontend] = future
+            future.add_done_callback(lambda result: completed.put((frontend, result)))
+            return True
+
+        try:
+            for frontend in by_frontend:
+                if not submit(frontend):
+                    failed += len(by_frontend[frontend])
+            while active:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    failed += sum(len(by_frontend[i]) - offsets[i] for i in active)
+                    break
+                try:
+                    frontend, future = completed.get(timeout=remaining)
+                except queue.Empty:
+                    failed += sum(len(by_frontend[i]) - offsets[i] for i in active)
+                    break
+                if frontend is None:
+                    context.abort(grpc.StatusCode.CANCELLED, "Abort request cancelled")
+                if active.get(frontend) is not future:
+                    continue
+                del active[frontend]
+                try:
+                    reply = future.result()
+                except grpc.RpcError as error:
+                    if error.code() != grpc.StatusCode.DEADLINE_EXCEEDED:
+                        with self._admission_lock:
+                            if self.stopping or not context.is_active():
+                                context.abort(grpc.StatusCode.CANCELLED, "Abort request cancelled")
+                            self.ready = False
+                            self._fail(f"Frontend control connection failed: {error}")
+                        context.abort(grpc.StatusCode.UNAVAILABLE, "Frontend control failed")
+                    failed += len(by_frontend[frontend]) - offsets[frontend]
+                    continue
+                aborted += reply["aborted"]
+                failed += reply["failed"]
+                offsets[frontend] += min(
+                    _ABORT_BATCH_SIZE, len(by_frontend[frontend]) - offsets[frontend]
+                )
+                if offsets[frontend] < len(by_frontend[frontend]) and not submit(frontend):
+                    failed += len(by_frontend[frontend]) - offsets[frontend]
+            return {"aborted": aborted, "failed": failed}
+        finally:
+            for future in active.values():
+                future.cancel()
 
 
 class Reservation:
@@ -328,6 +401,7 @@ class FrontendClient:
         self._fail = fail
         self._cleanup: set[asyncio.Task] = set()
         self._connection = _Connection(_address(directory, "coordinator"))
+        self._abort_connection = _Connection(_address(directory, "coordinator-abort"))
         self._server = _server(_address(directory, f"frontend-{frontend_id}"), self._abort)
 
     async def start(self) -> None:
@@ -338,8 +412,13 @@ class FrontendClient:
         if operation == "abort" and "request_id" in fields:
             _validate_request_id(fields["request_id"])
         try:
-            return await self._connection.request({"operation": operation, **fields})
+            connection = self._abort_connection if operation == "abort" else self._connection
+            return await connection.request({"operation": operation, **fields})
         except grpc.aio.AioRpcError as error:
+            if operation == "abort" and error.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
+                # The bounded abort pool is busy; ownership remains intact and
+                # a caller may retry without invalidating the serving group.
+                raise CoordinationError("OpenEngine abort capacity exhausted") from error
             # A reserve reply may have been lost after committing. Fail the
             # entire group rather than retry with ambiguous ownership.
             self._fail(f"OpenEngine coordinator unavailable: {error}")
@@ -393,3 +472,4 @@ class FrontendClient:
             await asyncio.gather(*self._cleanup, return_exceptions=True)
         await self._server.stop(0)
         await self._connection.close()
+        await self._abort_connection.close()
