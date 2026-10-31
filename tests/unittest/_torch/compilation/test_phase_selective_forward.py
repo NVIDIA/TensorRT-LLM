@@ -168,7 +168,9 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     torch.nn.Module.__init__(model)
     wrapper, _, _ = _create_prefill_compiled_model()
     model.model = wrapper if has_wrapper else torch.nn.Identity()
-    config = SimpleNamespace(compile_only_piecewise_graphs=enabled, max_beam_width=1)
+    config = SimpleNamespace(
+        compile_only_piecewise_graphs=enabled, max_beam_width=1, is_spec_decode=False
+    )
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
 
     for component in ("DecoderInputBuffers", "DecoderMetadata", "DecoderWarmup"):
@@ -238,6 +240,7 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
+    warmup._config = SimpleNamespace(max_beam_width=1)
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
