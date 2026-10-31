@@ -560,6 +560,20 @@ class GatherGroupedGemmInputsHelper(GroupedGemmInputsHelper):
     IDX_PERMUTED_IDX_TO_EXPANDED_IDX = 7
     IDX_SHAPE_INFER = IDX_PERMUTED_IDX_TO_EXPANDED_IDX
 
+    def infer_shape_locality_domain_output_sf_numel(
+            self,
+            input_shapes: List[torch.Size],
+            scaling_vector_size: int = 16) -> int:
+        """Element count of the shared FC1 output scale-factor buffer.
+
+        Both locality-domain partitions write ``m * full_interm //
+        scaling_vector_size`` scales; each partition's weight width ``n``
+        (input 1) equals ``full_interm``.
+        """
+        n = input_shapes[1][1]
+        return (self.infer_shape_max_num_permuted_tokens(input_shapes) * n //
+                scaling_vector_size)
+
     @staticmethod
     def _resize_locality_domain_outputs(
         m: int,
@@ -15957,6 +15971,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     helper = GatherGroupedGemmInputsHelper(
                         self.num_experts, self.top_k, self.num_local_experts,
                         self.local_expert_offset, self.tile_size)
+                    infer_shape_output_sf_numel = functools.partial(
+                        helper.infer_shape_locality_domain_output_sf_numel,
+                        scaling_vector_size=self.scaling_vector_size)
                     self.__class__.tuning_config_cache[key] = TuningConfig(
                         # Use permuted_idx_to_expanded_idx (IDX_SHAPE_INFER) for tuning
                         dynamic_tensor_specs=(DynamicTensorSpec(
@@ -15970,6 +15987,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                            helper.infer_shape_max_num_tiles),
                             ConstraintSpec(6, 0,
                                            helper.infer_shape_max_num_tiles),
+                            # Inplace outputs of the locality-domain half-GEMM
+                            # (10: output, 11: output_sf) follow input 7's bucket;
+                            # the autotuner skips these specs when they are None.
+                            ConstraintSpec(
+                                10, 0,
+                                helper.infer_shape_max_num_permuted_tokens),
+                            ConstraintSpec(11, 0, infer_shape_output_sf_numel),
                         ),
                         inputs_pre_hook=helper.inputs_pre_hook,
                     )
