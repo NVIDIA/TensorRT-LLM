@@ -3002,13 +3002,27 @@ def _(
         scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
         residual_out = torch.empty_like(input)
         return [quant_fp4, scale_fp4, residual_out]
-    elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4):
-        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(input.shape, 16)
+    elif op in (
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4),
+            int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)):
+        swizzled = op == int(
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+        fp4_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, 16, swizzled)
         quant_fp4 = input.new_empty(fp4_shape, dtype=torch.uint8)
         scale_fp4 = input.new_empty(scale_shape, dtype=torch.uint8)
         norm_out = torch.empty_like(input)
         residual_out = torch.empty_like(input)
         return [norm_out, quant_fp4, scale_fp4, residual_out]
+    elif op in (int(AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_MXFP8),
+                int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)):
+        quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        scale_out = input.new_empty(fp4_utils.get_fp4_shape(input.shape, 32)[1],
+                                    dtype=torch.uint8)
+        outputs = [quant_out, scale_out, torch.empty_like(input)]
+        if op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8):
+            outputs.insert(0, torch.empty_like(input))
+        return outputs
     else:
         return [torch.empty_like(input)]
 
