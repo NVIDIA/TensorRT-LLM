@@ -526,6 +526,10 @@ def extract_disagg_cluster_config(
         DisaggClusterConfig(cluster_uri or cluster_config_dict["cluster_uri"]),
         cluster_config_dict,
     )
+    if cluster_uri:
+        # update_dataclass() above copied the uri from the dict over the
+        # constructor argument, so apply the override last.
+        cluster_config.cluster_uri = cluster_uri
     return cluster_config
 
 
