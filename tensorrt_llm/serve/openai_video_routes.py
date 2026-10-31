@@ -146,7 +146,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files (``{video_id}_{i}``).
@@ -307,10 +307,35 @@ class _VideoRoutesMixin:
             form = await raw_request.form()
             data = {}
             for key in form:
+                if key in _REFERENCE_FIELDS:
+                    # Preserve repeated uploads and JSON objects/lists in their
+                    # per-slot wire order. FormData[key] keeps only the last part.
+                    references = []
+                    for value in form.getlist(key):
+                        if hasattr(value, "file"):
+                            references.append(value)
+                            continue
+                        if value == "":
+                            continue
+                        try:
+                            reference = json.loads(value)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"'{key}' must be an uploaded file or a JSON object/list string "
+                                f'like {{"content": ..., "format": "url"}}; {exc}'
+                            ) from exc
+                        references.append(reference)
+                    if len(references) == 1:
+                        data[key] = references[0]
+                    elif references:
+                        data[key] = [
+                            item
+                            for reference in references
+                            for item in (reference if isinstance(reference, list) else [reference])
+                        ]
+                    continue
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded reference file (image_reference / video_reference)
-                    # — pass through so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -321,19 +346,6 @@ class _VideoRoutesMixin:
                     except json.JSONDecodeError as exc:
                         raise ValueError(
                             f"'extra_params' must be a JSON object string; {exc}"
-                        ) from exc
-                    continue
-                if key in _REFERENCE_FIELDS:
-                    # A reference sent as a text part is the object form; a file
-                    # part was already routed above and carries its own format.
-                    if value == "":
-                        continue
-                    try:
-                        data[key] = json.loads(value)
-                    except json.JSONDecodeError as exc:
-                        raise ValueError(
-                            f"'{key}' must be an uploaded file or a JSON object string "
-                            f'like {{"content": ..., "format": "url"}}; {exc}'
                         ) from exc
                     continue
                 if value == "":
@@ -386,7 +398,7 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional image_reference / video_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
         request_received = raw_request.state.server_arrival_time
         # Prefixes this request's output files and keys its VIDEO_STORE entry.

@@ -2400,34 +2400,37 @@ class VideoGenerationRequest(OpenAIBaseModel):
     seed: Optional[int] = Field(default=None,
                                 ge=0,
                                 description="Random seed for reproducibility.")
-    image_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    image_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Image reference(s) conditioning generation (e.g. image-to-video "
              "first frame). Send a ``{content, format, role}`` object or a list "
              "of them, where ``format`` is ``path`` / ``url`` / ``base64``; or "
-             "upload a single image file via multipart, whose form is implied. "
+             "upload image files via repeated multipart fields, whose format "
+             "is implied. "
              "PNG or JPEG only — HEIF/AVIF are not supported."),
         )
-    video_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    video_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Video reference(s) conditioning generation (video-to-video). Send "
              "a ``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single video file "
-             "via multipart, whose form is implied. MP4 or AVI, with H.264 the "
+             "is ``path`` / ``url`` / ``base64``; or upload video files "
+             "via repeated multipart fields, whose format is implied. MP4 or AVI, "
+             "with H.264 the "
              "tested codec and others best-effort."),
         )
-    audio_reference: Optional[Union[
-        UploadFile, MediaReferenceItem, List[MediaReferenceItem]]] = Field(
+    audio_reference: Optional[Union[UploadFile, MediaReferenceItem, List[Union[
+        UploadFile, MediaReferenceItem]]]] = Field(
             default=None,
             description=
             ("Audio reference(s) conditioning generation. Send a "
              "``{content, format}`` object or a list of them, where ``format`` "
-             "is ``path`` / ``url`` / ``base64``; or upload a single audio "
-             "file via multipart, whose form is implied. Accepted only by "
+             "is ``path`` / ``url`` / ``base64``; or upload audio "
+             "files via repeated multipart fields, whose format is implied. "
+             "Accepted only by "
              "models that declare an audio reference slot."),
         )
     input_reference: Optional[Union[str, UploadFile]] = Field(
