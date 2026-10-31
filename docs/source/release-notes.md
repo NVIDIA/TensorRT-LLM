@@ -36,6 +36,8 @@ All published functionality in the Release Notes has been fully tested and verif
   in `get_dummy_mm_data()` results used for startup profiling. See the
   [multimodal developer guide](developer-guide/multimodal.md).
 
+- A request body that fails validation is now answered with OpenAI's error object by `trtllm-serve` and the disaggregated server: HTTP 400 with `{"error": {"message", "type": "invalid_request_error", "param", "code": null}}`. The `message` names each rejected parameter by its place in the body (for example `Unknown parameter: 'stores'.`) and never quotes the rejected value, and `param` holds the place of the first one. The `error` field was a string before, pydantic's rendering of the failure, which repeated every rejected value; clients that read it as a string should read `error.message` instead. `/v1/messages` keeps the Anthropic error envelope, now with the same message, and visual generation keeps its HTTP 422 envelope.
+
 ### Fixed Issues
 
 ### Known Issues

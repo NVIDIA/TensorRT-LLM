@@ -223,7 +223,8 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     the adapter's dispatch on `type`, and raise AttributeError on an attribute
     the block never had -- a 500 for a plain client error.
 
-    Errors carry `loc` as a tuple, so the tag and field appear adjacent.
+    The error names the block's location in the body, so the tag and then
+    the field appear in it as path segments.
     """
     client, backend = _make_route_client("standard", _json_chat_response())
 
@@ -235,9 +236,9 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
     message = response.json()["error"]["message"]
-    assert f"'{tag}', '{field}'" in message
+    assert f".{tag}.{field}'" in message
     # The catch-all must not have absorbed it; that is the regression itself.
-    assert "'unknown'," not in message
+    assert ".unknown." not in message
     backend.assert_not_awaited()
 
 
@@ -841,7 +842,7 @@ class _FakeTokenizer:
 
 
 def _anthropic_validation_handler(app):
-    """Mirror the server's handler so boundary rejections keep the envelope.
+    """Install the server's own handler so boundary rejections keep the envelope.
 
     Model-level validation fails before the route function runs, so without
     this a bare test app answers with FastAPI's 422 shape while the real
@@ -850,13 +851,10 @@ def _anthropic_validation_handler(app):
     """
     from fastapi.exceptions import RequestValidationError
 
-    from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
-
-    @app.exception_handler(RequestValidationError)
-    async def _handler(request, exc):  # noqa: ANN001
-        if request.url.path.startswith("/v1/messages"):
-            return anthropic_error_response(str(exc), "invalid_request_error", 400)
-        raise exc
+    server = object.__new__(OpenAIServer)
+    server.metrics_collector = None
+    server.server_role = None
+    app.add_exception_handler(RequestValidationError, server._request_validation_error)
 
 
 def _count_tokens_client():
