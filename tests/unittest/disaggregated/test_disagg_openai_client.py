@@ -825,7 +825,7 @@ class TestHttpErrorBodyPreservation:
         assert exc_info.value.headers == http_response.headers
         # Streaming rejections never replay. Non-streaming CTX retains its retry
         # budget, but an accepted GEN leg cannot acquire a new pairing identity.
-        retried = not stream and role == ServerRole.CONTEXT
+        retried = not stream and role == ServerRole.CONTEXT and status >= 500
         assert session.post.call_count == (2 if retried else 1)
         assert next_id.await_count == int(retried)
         assert req.disaggregated_params.disagg_request_id == (2 if retried else 1)
@@ -863,13 +863,14 @@ class TestHttpErrorBodyPreservation:
             ),
         )
 
-        with pytest.raises(type(error)) as exc_info:
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
             response = await client.send_request(req)
             async with aclosing(response):
                 async for _ in response:
                     pytest.fail("A rejected stream must not yield output")
 
-        assert exc_info.value is error
+        assert exc_info.value.status == 500
+        assert exc_info.value.__cause__ is error
         session.post.assert_called_once()
         next_id.assert_not_awaited()
         assert req.disaggregated_params.disagg_request_id == 1
@@ -929,6 +930,172 @@ class TestHttpErrorBodyPreservation:
         session.post.assert_called_once()
         http_response.__aexit__.assert_awaited_once()
         client._router.finish_request.assert_awaited_once_with(req, session, success=False)
+
+
+class TestWorkerErrorStatus:
+    """A worker's error status reaches the caller with the worker's message.
+
+    A 4xx other than 408 and 429 rejects the request itself, so it is sent once;
+    non-streamed context requests keep retries for 408, 429 and 5xx. Streamed
+    HTTP errors never replay. The status is preserved regardless of the
+    response's content type and whether its body can be read.
+    """
+
+    _BODY = '{"object": "error", "message": "bad field X", "type": "BadRequestError"}'
+
+    @classmethod
+    def _response(cls, status: int, content_type: str = "application/json") -> AsyncMock:
+        response = AsyncMock()
+        response.status = status
+        response.reason = "Reason"
+        response.headers = {"Content-Type": content_type}
+        response.text = AsyncMock(return_value=cls._BODY)
+        body_stream = BytesIO(cls._BODY.encode())
+        response.content.read = AsyncMock(side_effect=body_stream.read)
+        response.request_info = MagicMock()
+        response.history = ()
+        response.__aenter__ = AsyncMock(return_value=response)
+        response.__aexit__ = AsyncMock(return_value=False)
+        return response
+
+    @staticmethod
+    def _make_client(session) -> tuple[OpenAIHttpClient, AsyncMock]:
+        _reset_prometheus_registry()
+        router = AsyncMock(spec=Router)
+        router.get_next_server = AsyncMock(return_value=("localhost:8000", None))
+        # One retry, the disaggregated server's default.
+        client = OpenAIHttpClient(
+            router=router,
+            role=ServerRole.CONTEXT,
+            timeout_secs=10,
+            max_retries=1,
+            retry_interval_sec=0,
+            session=session,
+        )
+        return client, router
+
+    @staticmethod
+    async def _send(client: OpenAIHttpClient, stream: bool) -> list[bytes]:
+        """Send a request; return the chunks relayed for a streamed one."""
+        request = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=1
+            ),
+        )
+        response = await client.send_request(request)
+        return [chunk async for chunk in response] if stream else []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/json", "text/event-stream"])
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
+    @pytest.mark.parametrize("status", [400, 403, 404, 413, 422])
+    async def test_a_rejection_reaches_the_caller_once_with_its_status_and_message(
+        self, status, stream, content_type
+    ):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(status, content_type)
+        client, router = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream)
+
+        assert exc_info.value.status == status
+        assert "bad field X" in exc_info.value.message
+        assert session.post.call_count == 1, "a worker's rejection must not be retried"
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content_type", ["application/json", "text/event-stream"])
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
+    @pytest.mark.parametrize("status", [408, 429, 500, 502, 503])
+    async def test_retryable_status_retries_only_non_streamed_context(
+        self, status, stream, content_type
+    ):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(status, content_type)
+        client, router = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream)
+
+        assert exc_info.value.status == status
+        assert session.post.call_count == (1 if stream else 2)
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_server_error_does_not_replay(self):
+        failed = self._response(500)
+        succeeded = self._response(200, "text/event-stream")
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.side_effect = [failed, succeeded]
+        client, router = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream=True)
+
+        assert exc_info.value.status == 500
+        assert session.post.call_count == 1
+        failed.__aexit__.assert_awaited_once()
+        succeeded.__aenter__.assert_not_awaited()
+        router.renew_request.assert_not_awaited()
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_stream", "stream"])
+    @pytest.mark.parametrize("status, attempts", [(400, 1), (503, 2)])
+    async def test_an_unreadable_error_body_keeps_its_status(self, status, attempts, stream):
+        read_error = aiohttp.ClientPayloadError("Response payload is not completed")
+        response = self._response(status)
+        response.text = AsyncMock(side_effect=read_error)
+        response.content.read = AsyncMock(side_effect=read_error)
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = response
+        client, _ = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream)
+
+        assert exc_info.value.status == status
+        assert exc_info.value.__cause__ is read_error
+        assert session.post.call_count == (1 if stream else attempts)
+
+    @pytest.mark.asyncio
+    async def test_an_error_body_that_is_not_utf8_keeps_its_status_and_message(self):
+        # Decodes the way aiohttp's ClientResponse.text does.
+        async def text(encoding: str = "utf-8", errors: str = "strict") -> str:
+            return b'{"message": "bad field X \xff"}'.decode(encoding, errors)
+
+        response = self._response(400)
+        response.text = text
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = response
+        client, _ = self._make_client(session)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            await self._send(client, stream=False)
+
+        assert exc_info.value.status == 400
+        assert "bad field X" in exc_info.value.message
+        assert session.post.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_a_streamed_2xx_that_is_not_an_event_stream_is_a_protocol_error(self):
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(200)
+        client, router = self._make_client(session)
+
+        with pytest.raises(ValueError, match="'application/json' although request stream was True"):
+            await self._send(client, stream=True)
+
+        assert session.post.call_count == 1
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
 
 
 class TestDisaggIdRegenOnRetry:
