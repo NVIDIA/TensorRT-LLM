@@ -658,7 +658,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     wrapper.plan(
         device=device,
         batch_size=batch_size,
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=max_seq_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -676,12 +676,12 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
     assert len(compile_records) == 3
     assert [
-        (args[0].max_seq_len_q, args[0].max_kv_len, policy["scheduler"])
+        (args[0].max_q_len, args[0].max_kv_len, args[0].runtime_lengths, policy["scheduler"])
         for args, policy, _compiled in compile_records
     ] == [
-        (96, 96, "clc_dynamic_persistent"),
-        (128, 128, "nonpersistent"),
-        (3, 64, "clc_dynamic_persistent"),
+        (None, None, True, "clc_dynamic_persistent"),
+        (None, None, True, "nonpersistent"),
+        (None, None, True, "clc_dynamic_persistent"),
     ]
     assert compile_records[0][0] != compile_records[2][0]
     assert len({id(recorded) for _args, _policy, recorded in compile_records}) == 3
@@ -801,11 +801,11 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -916,7 +916,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         q_dtype=dtype,
         kv_dtype=dtype,
         out_dtype=dtype,
@@ -937,11 +937,11 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -957,7 +957,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_cache,
         block_tables,
         seq_lens,
-        bmm1_scale=bmm1_scale,
+        softmax_scale=bmm1_scale,
         out=output,
     )
     graph = torch.cuda.CUDAGraph()
@@ -967,7 +967,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
             kv_cache,
             block_tables,
             seq_lens,
-            bmm1_scale=bmm1_scale,
+            softmax_scale=bmm1_scale,
             out=output,
             validate=False,
         )
@@ -985,8 +985,8 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         max_kv_len=max_seq_len,
-        max_seq_len_q=1,
-        bmm1_scale=bmm1_scale,
+        max_q_len=1,
+        softmax_scale=bmm1_scale,
         out_dtype=dtype,
         out=torch.empty_like(output),
         mask_type="causal",
@@ -1068,11 +1068,11 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1227,11 +1227,11 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )

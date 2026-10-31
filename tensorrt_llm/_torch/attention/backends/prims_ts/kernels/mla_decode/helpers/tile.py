@@ -20,7 +20,7 @@ from cutlass import Int32
 
 from cutlass.experimental.task_scheduling.resources import StageInfo
 
-from .layout import _TASK_CACHE_SEQ_LEN_KV
+from .layout import _TASK_CACHE_SEQ_LEN_KV, _TASK_CACHE_LOCAL_KV_TILES
 from .mask import MaskType, mask_visible_k_length
 from .query import (
     flat_query_row_state,
@@ -32,6 +32,14 @@ from ..throughput_latency_1cta.config import MlaConfig
 
 
 @cute.jit
+def runtime_split_count(requested_splits):
+    """Read the scalar count from optional host-prepared division metadata."""
+    return Int32(
+        requested_splits[0] if isinstance(requested_splits, tuple) else requested_splits
+    )
+
+
+@cute.jit
 def local_kv_tile_idx(
     cfg: MlaConfig,
     stage_info: StageInfo,
@@ -39,6 +47,7 @@ def local_kv_tile_idx(
     is_v: int,
     *,
     section: cutlass.Constexpr[MlaStage],
+    requested_splits=None,
 ):
     """Return the local K/V tile id for one staged pipeline instance."""
     if cutlass.const_expr(section == MlaStage.Head):
@@ -48,7 +57,11 @@ def local_kv_tile_idx(
         if cutlass.const_expr(is_v or (cfg.serial_swap_reuse and inst_id == 1)):
             return base + Int32(inst_id)
         return base + Int32(cfg.num_insts_kv + inst_id)
-    if cutlass.const_expr(cfg.total_kv_tiles <= cfg.num_insts_kv):
+    if cutlass.const_expr(
+        requested_splits is None
+        and cfg.seq_len_kv is not None
+        and cfg.total_kv_tiles <= cfg.num_insts_kv
+    ):
         return Int32(inst_id)
     return stage_info.loop_end * Int32(cfg.num_insts_kv) + Int32(inst_id)
 
@@ -106,20 +119,36 @@ def runtime_split_pruning_is_profitable(configured_splits_kv: int) -> bool:
 
 
 @cute.jit
-def _runtime_configured_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
+def _runtime_configured_local_kv_tiles(
+    cfg: MlaConfig,
+    seq_len_kv,
+    requested_splits=None,
+):
     """Return the instruction-aligned local span for configured split capacity."""
 
     if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
         return Int32(cfg.fixed_sparse_kv_tiles)
     total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
     num_insts_kv = Int32(cfg.num_insts_kv)
-    tiles_per_group = Int32(cfg.num_ctas_per_seq_kv) * num_insts_kv
-    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // tiles_per_group
+    split_count = (
+        Int32(cfg.num_ctas_per_seq_kv)
+        if requested_splits is None
+        else runtime_split_count(requested_splits)
+    )
+    tiles_per_group = split_count * num_insts_kv
+    divisor = (
+        requested_splits[1] if isinstance(requested_splits, tuple) else tiles_per_group
+    )
+    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // divisor
     return cute.math.max(num_groups * num_insts_kv, num_insts_kv)
 
 
 @cute.jit
-def runtime_num_ctas_kv(cfg: MlaConfig, seq_len_kv):
+def runtime_num_ctas_kv(
+    cfg: MlaConfig,
+    seq_len_kv,
+    requested_splits=None,
+):
     """Return the active prefix of configured split-KV CTAs.
 
     One CTA's minimum useful K unit is ``tile_size_kv * num_insts_kv``.
@@ -129,17 +158,26 @@ def runtime_num_ctas_kv(cfg: MlaConfig, seq_len_kv):
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return Int32(1)
     total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
-    local_kv_tiles = _runtime_configured_local_kv_tiles(cfg, seq_len_kv)
+    local_kv_tiles = _runtime_configured_local_kv_tiles(
+        cfg, seq_len_kv, requested_splits=requested_splits
+    )
     return (total_kv_tiles + local_kv_tiles - Int32(1)) // local_kv_tiles
 
 
 @cute.jit
-def runtime_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
+def runtime_local_kv_tiles(
+    cfg: MlaConfig,
+    seq_len_kv,
+    requested_splits=None,
+):
     """Return the padded local KV tile count assigned to each KV CTA group."""
     if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
         return Int32(cfg.fixed_sparse_kv_tiles)
     if cutlass.const_expr(
-        cfg.sparse_direct and cfg.seq_len_kv <= 256 and cfg.num_ctas_per_seq_kv == 1
+        cfg.seq_len_kv is not None
+        and cfg.sparse_direct
+        and cfg.seq_len_kv <= 256
+        and cfg.num_ctas_per_seq_kv == 1
     ):
         # The short direct schedule executes its planned padded tiles. Every
         # consumer must use that same domain: using the smaller live length
@@ -148,7 +186,9 @@ def runtime_local_kv_tiles(cfg: MlaConfig, seq_len_kv):
         return Int32(cfg.local_kv_tiles(cfg.total_kv_tiles))
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return runtime_total_kv_tiles(cfg, seq_len_kv)
-    return _runtime_configured_local_kv_tiles(cfg, seq_len_kv)
+    return _runtime_configured_local_kv_tiles(
+        cfg, seq_len_kv, requested_splits=requested_splits
+    )
 
 
 @cute.jit
@@ -157,6 +197,19 @@ def runtime_base_seq_len_kv(cfg: MlaConfig, cache_seqs, batch_idx):
     if cutlass.const_expr(cache_seqs is None):
         return Int32(cfg.seq_len_kv)
     return Int32(cache_seqs[batch_idx])
+
+
+@cute.jit
+def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
+    """Return whether a batch row publishes O / LSE (and split scratch).
+
+    An empty request (zero KV length) publishes nothing, which preserves its
+    output. D576 sparse rows keep their contract instead: a token whose
+    top-k length is zero still writes O = 0 and LSE = -inf.
+    """
+    if cutlass.const_expr(cfg.sparse_d576_reload):
+        return cutlass.Boolean(True)
+    return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
 
 
 @cute.jit
@@ -249,9 +302,12 @@ def runtime_split_tile_is_active(
     batch_idx,
     cta_idx_q,
     cta_idx_kv,
+    requested_splits=None,
 ):
     """Return whether a configured split rank owns runtime KV work."""
 
+    if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
+        return Int32(cta_idx_kv) < Int32(1)
     seq_len_kv = runtime_seq_len_kv_for_q(
         cfg,
         cache_seqs,
@@ -259,7 +315,16 @@ def runtime_split_tile_is_active(
         cta_idx_q,
         cu_seqlens_q,
     )
-    return Int32(cta_idx_kv) < runtime_num_ctas_kv(cfg, seq_len_kv)
+    total_kv_tiles = runtime_total_kv_tiles(cfg, seq_len_kv)
+    local_kv_tiles = runtime_local_kv_tiles(
+        cfg, seq_len_kv, requested_splits=requested_splits
+    )
+    # A split owns work exactly when its first tile intersects the valid K
+    # prefix. Avoid dividing by the local span just to compare with its ceil.
+    # The physical suffix can be much larger than the requested count.
+    return cutlass.Int64(cta_idx_kv) * cutlass.Int64(local_kv_tiles) < cutlass.Int64(
+        total_kv_tiles
+    )
 
 
 @cute.jit
@@ -270,6 +335,7 @@ def runtime_work_tile_activity(
     batch_idx,
     cta_idx_q,
     cta_idx_kv,
+    requested_splits=None,
 ):
     """Return the independent runtime Q and split-KV activity predicates."""
 
@@ -286,6 +352,10 @@ def runtime_work_tile_activity(
         batch_idx,
         cta_idx_q,
         cta_idx_kv,
+        requested_splits=requested_splits,
+    )
+    query_is_active = query_is_active & (
+        runtime_request_publishes(cfg, cache_seqs, batch_idx)
     )
     return query_is_active, split_is_active
 
@@ -298,6 +368,7 @@ def runtime_work_tile_is_active(
     batch_idx,
     cta_idx_q,
     cta_idx_kv,
+    requested_splits=None,
 ):
     """Return whether a Q/split work tile owns any runtime data."""
 
@@ -308,6 +379,7 @@ def runtime_work_tile_is_active(
         batch_idx,
         cta_idx_q,
         cta_idx_kv,
+        requested_splits=requested_splits,
     )
     return query_is_active and split_is_active
 
@@ -380,11 +452,22 @@ def global_kv_tile_idx(
     local_tile_idx,
     seq_len_kv,
     cta_idx_kv,
+    requested_splits=None,
+    task_cache=None,
 ):
     """Map a local KV tile id to the global KV tile id for split-KV mode."""
     if cutlass.const_expr(cfg.use_multi_ctas_kv != 1):
         return local_tile_idx
-    return Int32(cta_idx_kv) * runtime_local_kv_tiles(cfg, seq_len_kv) + local_tile_idx
+    if cutlass.const_expr(requested_splits is not None and task_cache is not None):
+        return (
+            Int32(cta_idx_kv) * Int32(task_cache[_TASK_CACHE_LOCAL_KV_TILES])
+            + local_tile_idx
+        )
+    return (
+        Int32(cta_idx_kv)
+        * runtime_local_kv_tiles(cfg, seq_len_kv, requested_splits=requested_splits)
+        + local_tile_idx
+    )
 
 
 @cute.jit

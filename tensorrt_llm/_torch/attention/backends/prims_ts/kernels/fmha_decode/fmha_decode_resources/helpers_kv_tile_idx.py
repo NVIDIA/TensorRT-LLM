@@ -82,6 +82,7 @@ def _runtime_configured_local_kv_tiles(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return the instruction-aligned local span for configured split capacity."""
     total_kv_tiles = _runtime_total_kv_tiles(
@@ -91,9 +92,20 @@ def _runtime_configured_local_kv_tiles(
         q_token_base,
     )
     num_insts_kv = Int32(cfg.num_insts_kv)
-    configured_splits = Int32(cfg.splits_kv if cfg.use_split_kv else 1)
+    configured_splits = (
+        Int32(cfg.splits_kv if cfg.use_split_kv else 1)
+        if requested_splits is None
+        else Int32(
+            requested_splits[0]
+            if isinstance(requested_splits, tuple)
+            else requested_splits
+        )
+    )
     tiles_per_group = configured_splits * num_insts_kv
-    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // tiles_per_group
+    divisor = (
+        requested_splits[1] if isinstance(requested_splits, tuple) else tiles_per_group
+    )
+    num_groups = (total_kv_tiles + tiles_per_group - Int32(1)) // divisor
     return cute.math.max(num_groups * num_insts_kv, num_insts_kv)
 
 
@@ -219,6 +231,7 @@ def _runtime_active_splits_kv(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return the useful split prefix for one runtime Q/KV work item."""
     if cutlass.const_expr(not cfg.use_split_kv):
@@ -230,14 +243,31 @@ def _runtime_active_splits_kv(
         q_token_base,
     )
     local_kv_tiles = _runtime_configured_local_kv_tiles(
-        cfg,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
+        cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
     )
     # Split ranges are instruction-group aligned. Only ranges intersecting the
     # valid K domain participate; remaining configured grid slots are padding.
+    if cutlass.const_expr(cfg.splits_kv == 2):
+        # The configured span covers at most two nonempty ranges. Comparisons
+        # recover their count without a divide by the runtime local span.
+        return Int32(total_kv_tiles > Int32(0)) + Int32(total_kv_tiles > local_kv_tiles)
     return (total_kv_tiles + local_kv_tiles - Int32(1)) // local_kv_tiles
+
+
+@cute.jit
+def runtime_split_kv_is_active(
+    cfg: FmhaDecodeConfig,
+    seq_len_kv: Int32,
+    seq_len_q: Int32,
+    q_token_base: Int32,
+    split_idx: Int32,
+) -> cutlass.Boolean:
+    """Test a split's first tile without dividing by its runtime local span."""
+    total_kv_tiles = _runtime_total_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+    local_kv_tiles = _runtime_configured_local_kv_tiles(
+        cfg, seq_len_kv, seq_len_q, q_token_base
+    )
+    return split_idx * local_kv_tiles < total_kv_tiles
 
 
 @cute.jit
@@ -246,10 +276,13 @@ def _runtime_execution_splits_kv(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return a nonzero producer/reduction fanout for a runtime-valid Q tile."""
     return cute.math.max(
-        _runtime_active_splits_kv(cfg, seq_len_kv, seq_len_q, q_token_base),
+        _runtime_active_splits_kv(
+            cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
+        ),
         Int32(1),
     )
 
@@ -306,6 +339,8 @@ def _static_split_kv_global_tile_idx(
 @cute.jit
 def _logical_cta_kv_idx(cfg: FmhaDecodeConfig, stage_info: StageInfo) -> Int32:
     """Resolve the split index from the Q-group-major launch coordinate."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[0])
     if cutlass.const_expr(stage_info.work_tile is not None):
         q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
     else:
@@ -321,13 +356,11 @@ def _runtime_local_kv_tiles(
     seq_len_kv: Int32,
     seq_len_q: Int32,
     q_token_base: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Return local KV tiles assigned to one split CTA at runtime."""
     return _runtime_configured_local_kv_tiles(
-        cfg,
-        seq_len_kv,
-        seq_len_q,
-        q_token_base,
+        cfg, seq_len_kv, seq_len_q, q_token_base, requested_splits=requested_splits
     )
 
 
@@ -343,9 +376,23 @@ def _runtime_split_kv_global_tile_idx(
     """Map a runtime local tile index to a global split-KV tile index."""
     if cutlass.const_expr(not cfg.use_split_kv):
         return local_tile_idx
+    if cutlass.const_expr(cfg.runtime_split_kv):
+        # get_domain has already resolved the split's absolute window origin.
+        # Consumers need only add their local tile, without dividing by the
+        # launch count again for every K/V or score tile.
+        return (
+            Int32(_decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE])
+            - _num_skipped_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+            + local_tile_idx
+        )
     return (
         _logical_cta_kv_idx(cfg, stage_info)
-        * _runtime_local_kv_tiles(cfg, seq_len_kv, seq_len_q, q_token_base)
+        * _runtime_local_kv_tiles(
+            cfg,
+            seq_len_kv,
+            seq_len_q,
+            q_token_base,
+        )
         + local_tile_idx
     )
 
@@ -417,7 +464,9 @@ def resolve_keeps_tile_context(
     if cutlass.const_expr(cfg.uses_uniform_causal_mask):
         element_mask_end_idx = seq_len_kv - seq_len_q + q_token_base + Int32(1)
 
-    use_runtime_kv_domain = seqlens_kv is not None or cfg.uses_runtime_q_kv_union
+    use_runtime_kv_domain = seqlens_kv is not None or (
+        not cfg.fixed_seqlen or cfg.uses_runtime_q_kv_union
+    )
     if cutlass.const_expr(local_tile_idx is None):
         local_tile_idx = _softmax_tile_idx(cfg, stage_info, inst_id)
     if cutlass.const_expr(not use_runtime_kv_domain):

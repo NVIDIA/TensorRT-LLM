@@ -28,8 +28,9 @@ from ..decode import (
     _validate_exact_compact_strides,
     _validate_scale,
 )
-from ..sage import SageAttentionParams, sage_adapter_slots, validate_sage_params
+from ..sage.config import SageAttentionParams, validate_sage_params
 from .common import (
+    sage_adapter_slots,
     _SIGNED_INT32_MAX,
     _num_sparse_pattern_heads,
     _validate_dense_contiguous_plan_inputs,
