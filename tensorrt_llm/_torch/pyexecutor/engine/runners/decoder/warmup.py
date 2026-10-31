@@ -23,7 +23,10 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
-from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import warmup_sampling_module
+from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
+    warmup_sampling_module,
+    warmup_topk_module,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.trace_log_utils import log_mem_snapshot
 from tensorrt_llm._torch.pyexecutor.workspace import EagerWorkspaceReclaimer
@@ -353,6 +356,8 @@ class DecoderWarmup:
             "sampling_module_prewarm", metrics=self._metrics, metric_name="sampling_warmup_seconds"
         ):
             warmup_sampling_module()
+            if self._config.max_beam_width > 1:
+                warmup_topk_module()
             self._prewarm_engram_kernels(kv_cache_manager)
             self._prewarm_csa2_sparse_indexer(kv_cache_manager)
             self._prewarm_minimax_m3_msa_indexer(kv_cache_manager)
