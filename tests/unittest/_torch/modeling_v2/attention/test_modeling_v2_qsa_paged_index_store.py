@@ -24,11 +24,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_paged_index_store__r18 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_store import (  # noqa: E501
     qsa_paged_index_store as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_index_store requires a CUDA device"
@@ -309,8 +309,12 @@ def _pool_layout():
     engine builds on a rank of a member (core cache config, bf16 KV), and `ATTN_LAYERS` names the
     sparse layers. Loaded rather than restated so the two cannot disagree on what the stock pool
     is."""
-    path = Path(__file__).resolve().parents[1] / "test_pool_layout.py"
-    spec = importlib.util.spec_from_file_location("_r18_pool_layout", path)
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "models/qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified"
+        / "test_pool_layout.py"
+    )
+    spec = importlib.util.spec_from_file_location("_qsa_index_store_pool_layout", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

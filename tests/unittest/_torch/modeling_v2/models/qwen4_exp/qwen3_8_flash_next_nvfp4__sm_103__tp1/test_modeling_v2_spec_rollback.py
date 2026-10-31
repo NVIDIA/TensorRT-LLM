@@ -19,11 +19,11 @@ batched plane gather / restore, and the fused one-launch staging and commit.
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_store import (  # noqa: E501
+    qsa_paged_index_store,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.modeling import (  # noqa: E501
     SpeculativeRollback,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_index_store import (  # noqa: E501
-    qsa_paged_index_store,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history,

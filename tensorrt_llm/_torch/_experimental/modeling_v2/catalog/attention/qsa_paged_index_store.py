@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 _INTEGER_DTYPES = (torch.int32, torch.int64)
 
@@ -151,6 +151,40 @@ def _spec(segments, pages, **overrides) -> dict:
     return {**_CKPT, "segments": segments, "pages": pages, **overrides}
 
 
+#: The unified target (tp4 / tep4 / dep4) at one rank. Its fused input projection row
+#: `[q | k | v | gate | index q, k | pad of one index head]` is 4352 wide under attention TP (6 q
+#: and 1 KV heads of 256: 34 heads of 128, the raw index key head 32) and 14080 under attention DP
+#: (110 heads, key head 108). Its bf16 index pool is the stock manager's at every member: the 12
+#: sparse layers' INDEX_KEY buffers coalesce into one pool, so a layer's plane is `[pages, 32, 1,
+#: 128]` at page stride 12 x 4096 = 49152 elements, layer `j` at `j` x 8192 bytes into the slot,
+#: and the position plane is its own contiguous `[pages, 32, 3]` int32 pool (`cache_layout`
+#: "coalesced", the last layer's plane). `pages` is the measured tep4 pool: the stock tep4
+#: engine's (core config, bf16 KV) `kv_max_tokens` 7866720 a rank, 245835 pages of 32. The table
+#: is `qsa_block_table`, `[max_batch_size, max_blocks_per_seq]`: 128 x 292 (`max_seq_len` 9216) or
+#: 128 x 516 under MTP (16384). `straddle` puts the batch's last row on the pool's last page, past
+#: 2^31 elements of the index plane.
+_UNIFIED = dict(
+    _CKPT,
+    key_layout="fused_row",
+    cache_layout="coalesced",
+    layers=12,
+    layer=11,
+    page_stride=49152,
+    slots=128,
+    width=292,
+    pages=245835,
+    straddle=True,
+)
+
+#: 128 decode requests, one row each, at positions on both sides of page edges; the last at
+#: 9215 (`max_seq_len` - 1, table column 287).
+_DECODE_128 = tuple((31 + 72 * i, 1) for i in range(127)) + ((9215, 1),)
+#: 32 decode requests (one dep4 rank's share of 128), the last at 9215.
+_DECODE_32 = tuple((31 + 287 * i, 1) for i in range(31)) + ((9215, 1),)
+#: 128 MTP7 verify blocks of 8 rows, some across a page edge, up to position 16165.
+_MTP7_128 = tuple((29 + 127 * i, 8) for i in range(128))
+
+
 class QsaPagedIndexStore(OpWrapper):
     """Write each row's raw index key and position coordinates into its paged slot.
 
@@ -168,8 +202,8 @@ class QsaPagedIndexStore(OpWrapper):
     rotation itself. Returns `(index_cache, position_cache)`, both written in
     place.
 
-    Sourcing tier 5: one Triton launch written for this target
-    (`_qsa_paged_index_store_kernel`). Nothing in the engine performs this
+    Sourcing: one Triton launch (`_qsa_paged_index_store_kernel`), written for
+    the tp1 target and carried here unchanged. Nothing in the engine performs this
     store for a packed, ragged batch: the registered index-cache ops write fp8
     planes or norm and rotate on the way in, `triton_qsa_decode_pre_indexer`
     is one row per request, and `QSAIndexer.update_cache_and_compress` bundles
@@ -208,6 +242,31 @@ class QsaPagedIndexStore(OpWrapper):
                 hole="unallocated_page",
             ),
         ),
+        Cell(
+            why="unified tep4 decode: one row at position 9215 on the pool's last page, token_k "
+            "off the 4352-wide fused row, the coalesced bf16 index plane",
+            spec=dict(_UNIFIED, member="tep4", segments=((9215, 1),), row_width=4352),
+        ),
+        Cell(
+            why="unified tep4 decode: 128 requests one row each (the largest captured batch), "
+            "4352-wide row",
+            spec=dict(_UNIFIED, member="tep4", segments=_DECODE_128, row_width=4352),
+        ),
+        Cell(
+            why="unified tep4 MTP7 verify: 128 requests x 8 rows (1024), 16 rows per program, "
+            "a 516-column table",
+            spec=dict(_UNIFIED, member="tep4", segments=_MTP7_128, row_width=4352, width=516),
+        ),
+        Cell(
+            why="unified tp4 step of 8192 rows (max_num_tokens): a context from 0 and a decode "
+            "row at 9215, 4352-wide row",
+            spec=dict(_UNIFIED, member="tp4", segments=((0, 8191), (9215, 1)), row_width=4352),
+        ),
+        Cell(
+            why="unified dep4 decode: 32 requests one row each on a 128-row table, token_k off "
+            "the 14080-wide row",
+            spec=dict(_UNIFIED, member="dep4", segments=_DECODE_32, row_width=14080),
+        ),
     )
 
     note = """
@@ -227,6 +286,20 @@ class QsaPagedIndexStore(OpWrapper):
     at page stride 49344 (12 x 4096 + 192) with the position plane
     `[pages, 32, 3]` at (24672, 3, 1); the cell checks that the other index-K
     roles of each page survive the call.
+
+    The unified target (`_UNIFIED` cells) under bf16 KV, read off the stock
+    manager at tp4, tep4 and dep4 (the test re-reads it): each sparse layer's
+    `get_index_k_buffer(i)` is `[pages, 32, 1, 128]` at strides (49152, 128,
+    128, 1), the 12 layers' planes 8192 bytes apart in one coalesced pool, and
+    `get_qsa_position_buffer()` a contiguous `[pages, 32, 3]` int32 pool. Under
+    fp8 and NVFP4 KV both are the shared-page layout above (49344 / 24672) at
+    every member. The cells drive the last layer's plane of a 245835-page pool
+    (the stock tep4 engine's measured `kv_max_tokens` 7866720 a rank, core
+    config), its other 11 planes checked untouched, with the batch's last row on
+    the pool's last page: index-plane offsets past 2^31 elements (1.2e10).
+    `token_k` is the index-K head off the fused input projection row, 4352 wide
+    under attention TP (head 32) and 14080 under attention DP (head 108); the
+    table is `[128, 292]` (core) or `[128, 516]` (MTP's `max_seq_len` 16384).
 
     Preconditions:
       - destination slots are unique across the batch: two rows naming one
@@ -264,10 +337,13 @@ class QsaPagedIndexStore(OpWrapper):
     them) share that mask and have no cell.
 
     Not certified: an fp8 index plane, keys other than bf16, any index geometry
-    other than 1 head x 128 at 32-token pages, decode batches other than 32 MTP7
-    verify blocks, strided metadata or tables,
-    stride-0 coordinates, multiple devices, concurrent streams onto one pool,
-    duplicate destinations.
+    other than 1 head x 128 at 32-token pages, decode batches other than 1, 32
+    and 128 requests and verify batches other than 32 and 128 MTP7 blocks,
+    strided metadata or tables, stride-0 coordinates, multiple devices,
+    concurrent streams onto one pool, duplicate destinations. The tp4 and dep4
+    pools are driven at tep4's measured page count, not their own: stock serves
+    neither member, and both hold at most that many pages a rank (the same or
+    larger weights a rank, the same or larger KV page).
     """
 
     def __call__(
