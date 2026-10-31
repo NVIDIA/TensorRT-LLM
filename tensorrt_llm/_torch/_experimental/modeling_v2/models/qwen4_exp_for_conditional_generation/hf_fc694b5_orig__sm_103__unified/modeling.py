@@ -182,6 +182,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.spec_rollba
     spec_rollback_commit,
     spec_rollback_stage,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    QM_FP8_KV_CACHE,
+    QM_NVFP4_KV_CACHE,
+    thop_attention,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
@@ -268,7 +273,6 @@ from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
-from .ops.attention.thop_attention__r2 import QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE, thop_attention
 from .ops.comm.allgather__r6 import allgather
 from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
 from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args

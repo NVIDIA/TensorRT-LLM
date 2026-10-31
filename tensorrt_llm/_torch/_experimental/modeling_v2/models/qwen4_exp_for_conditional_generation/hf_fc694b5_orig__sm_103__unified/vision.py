@@ -24,6 +24,9 @@ import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_tanh import gelu_tanh
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
+    thop_attention,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.vision_rope_2d_packed_qk import (
     vision_rope_2d_packed_qk,
 )
@@ -36,7 +39,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.vision.triton_pos_emb
 )
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
-from .ops.attention.thop_attention__r2 import thop_attention
 from .ops.gemm.cublas_mm__vision import cublas_mm
 
 #: Tower rope base (`vision_config` has no rope field); unrelated to the text 1e7.
