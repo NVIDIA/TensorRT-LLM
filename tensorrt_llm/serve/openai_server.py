@@ -1146,12 +1146,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
 
-    @property
-    def _vocab_size(self) -> Optional[int]:
-        if self.tokenizer is not None and self.tokenizer.tokenizer is not None:
-            return self.tokenizer.tokenizer.vocab_size
-        return None
-
     @staticmethod
     def create_error_response(
             message: str,
