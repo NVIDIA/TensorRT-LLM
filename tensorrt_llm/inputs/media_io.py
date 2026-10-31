@@ -176,6 +176,17 @@ _RESPONSE_CHUNK_BYTES = 1024 * 1024
 # Maximum number of redirects allowed for remote fetches.
 _MAX_REDIRECTS = 5
 
+# Maximum number of decoded audio samples (frames x channels) per audio input.
+# Compressed formats such as FLAC can expand a few hundred kilobytes into
+# gigabytes of samples, so decoded audio needs its own limit. The value is the
+# sample count of _MAX_RESPONSE_BYTES of 16-bit PCM, about 100 Mi samples, or
+# 800 MiB as float64.
+_MAX_AUDIO_SAMPLES = _MAX_RESPONSE_BYTES // 2
+
+# Frame count that libsndfile reports when a file does not state its length,
+# such as a FLAC stream whose STREAMINFO total is 0.
+_SF_UNKNOWN_FRAMES = 2**63 - 1
+
 _REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
 # Opt-in switch relaxing the requirement that media URLs resolve to global
@@ -1092,6 +1103,38 @@ def _decode_base64_with_limit(data: str) -> bytes:
     return decoded
 
 
+class _BoundedAudioSoundFile(soundfile.SoundFile):
+    def seekable(self) -> bool:
+        # libsndfile reports unknown-length FLAC as a huge sentinel. soundfile
+        # seeks after each read on seekable files, including a short final read;
+        # that seek fails when the header has no frame count. Read sequentially.
+        return self.frames != _SF_UNKNOWN_FRAMES and super().seekable()
+
+
+def _read_audio_with_limit(source: Any) -> Tuple[np.ndarray, int]:
+    """Decode audio like ``soundfile.read`` with a cap on decoded samples.
+
+    A file whose header reports more than ``_MAX_AUDIO_SAMPLES`` samples is
+    rejected before any samples are read. For a file of unknown length, the
+    read stops at one frame beyond the limit, so an oversized payload is
+    rejected before it is fully decoded.
+    """
+    too_many_samples = (
+        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+        f"(frames x channels), the maximum allowed."
+    )
+    with _BoundedAudioSoundFile(source) as audio_file:
+        # libsndfile refuses to open a file with fewer than one channel.
+        max_frames = _MAX_AUDIO_SAMPLES // audio_file.channels
+        if audio_file.frames != _SF_UNKNOWN_FRAMES and audio_file.frames > max_frames:
+            raise ValueError(too_many_samples)
+        data = audio_file.read(frames=max_frames + 1)
+        samplerate = audio_file.samplerate
+    if len(data) > max_frames:
+        raise ValueError(too_many_samples)
+    return data, samplerate
+
+
 def _safe_read_local_file(location: str, *, max_bytes: int | None = None) -> bytes:
     """Read a local file, refusing anything that has no end.
 
@@ -1339,7 +1382,7 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return self.load_bytes(base64.b64decode(data))
+        return self.load_bytes(_decode_base64_with_limit(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
@@ -1350,16 +1393,23 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
         if self._decoded_memory_reserver is None:
-            return soundfile.read(source)
+            return _read_audio_with_limit(source)
 
         reservation = None
         try:
             # Read metadata and samples from the same handle. Reserve the float64
             # output before allocation; libsndfile's internal buffers are excluded.
-            with soundfile.SoundFile(source) as audio:
+            with _BoundedAudioSoundFile(source) as audio:
                 frames, channels = audio.frames, audio.channels
                 if frames < 0 or channels < 1:
                     raise ValueError("invalid audio frame or channel count")
+                if frames == _SF_UNKNOWN_FRAMES:
+                    return self._read_unknown_length(audio, channels)
+                if frames * channels > _MAX_AUDIO_SAMPLES:
+                    raise ValueError(
+                        f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+                        f"(frames x channels), the maximum allowed."
+                    )
                 decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
                 reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
                 shape = (frames,) if channels == 1 else (frames, channels)
@@ -1377,6 +1427,64 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
         finally:
             samples = decoded = None
             if reservation is not None:
+                reservation.release()
+
+    def _read_unknown_length(
+        self, audio: soundfile.SoundFile, channels: int
+    ) -> Tuple[np.ndarray, int]:
+        """Read an unknown-length stream in bounded, budgeted chunks."""
+        reserver = self._decoded_memory_reserver
+        assert reserver is not None
+        max_frames = _MAX_AUDIO_SAMPLES // channels
+        too_many_samples = (
+            f"Audio input decodes to more than {_MAX_AUDIO_SAMPLES} samples "
+            f"(frames x channels), the maximum allowed."
+        )
+        chunks: List[np.ndarray] = []
+        reservations: List[Tuple[_DecodedMemoryReservation, int]] = []
+        concatenation_reservation: Optional[_DecodedMemoryReservation] = None
+        total_frames = 0
+        try:
+            while True:
+                chunk_frames = min(16384, max_frames + 1 - total_frames)
+                chunk_bytes = chunk_frames * channels * np.dtype(np.float64).itemsize
+                reservation = reserver(chunk_bytes, chunk_bytes)
+                reservations.append((reservation, 0))
+                shape = (chunk_frames,) if channels == 1 else (chunk_frames, channels)
+                samples = np.empty(shape, dtype=np.float64)
+                decoded = audio.read(frames=chunk_frames, out=samples)
+                read_frames = len(decoded)
+                if total_frames + read_frames > max_frames:
+                    raise ValueError(too_many_samples)
+                if read_frames != chunk_frames:
+                    decoded = None
+                    samples.resize((read_frames,) if channels == 1 else (read_frames, channels))
+                    reservation.shrink(samples.nbytes)
+                if read_frames:
+                    chunks.append(samples)
+                    reservations[-1] = (reservation, samples.nbytes)
+                total_frames += read_frames
+                if read_frames < chunk_frames:
+                    break
+
+            if chunks:
+                total_bytes = sum(size for _, size in reservations)
+                concatenation_reservation = reserver(total_bytes, 0)
+                result = np.concatenate(chunks)
+                chunks.clear()
+                concatenation_reservation.release()
+                concatenation_reservation = None
+            else:
+                shape = (0,) if channels == 1 else (0, channels)
+                result = np.empty(shape, dtype=np.float64)
+            for reservation, size in reservations:
+                reservation.commit(size)
+            return result, audio.samplerate
+        finally:
+            chunks.clear()
+            if concatenation_reservation is not None:
+                concatenation_reservation.release()
+            for reservation, _ in reservations:
                 reservation.release()
 
 
