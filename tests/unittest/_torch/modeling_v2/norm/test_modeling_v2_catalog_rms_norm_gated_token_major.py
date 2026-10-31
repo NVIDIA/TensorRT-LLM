@@ -7,18 +7,27 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.norm.rms_norm_gated_token_major import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (  # noqa: E501
     rms_norm_gated_token_major as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "rms_norm_gated_token_major requires a CUDA device"
 
 
-#: The target's concatenated GDN input projection: [q k v | z | a | b] = 10240 | 6144 | 48 | 48.
-_IN_PROJ_WIDTH, _Z_OFFSET = 16480, 10240
+#: The width of the concatenated GDN input projection `[q k v | z | a | b]` a cell names no
+#: `z_row_stride` for: all 48 heads, 10240 | 6144 | 48 | 48. A tp4/tep4 rank's is 4120:
+#: 2560 | 1536 | 12 | 12.
+_IN_PROJ_WIDTH = 16480
+
+
+def _z_offset(row_stride: int, heads: int, n: int) -> int:
+    """First column of `z` in a `[q k v | z | a | b]` row: `a` and `b` are one column a head."""
+    offset = row_stride - heads * (n + 2)
+    assert offset > 0, (row_stride, heads, n)
+    return offset
 
 
 #: The checkpoint's GDN epilogue geometry over a packed `z`, for the guard test.
@@ -41,7 +50,9 @@ def _build(spec, seed):
 
     layout = spec.get("z", "packed")
     if layout == "in_proj":
-        z = randn(t, _IN_PROJ_WIDTH)[:, _Z_OFFSET : _Z_OFFSET + heads * n].view(t, heads, n)
+        width = spec.get("z_row_stride", _IN_PROJ_WIDTH)
+        offset = _z_offset(width, heads, n)
+        z = randn(t, width)[:, offset : offset + heads * n].view(t, heads, n)
     else:
         assert layout == "packed", layout
         z = randn(t, heads, n)
@@ -55,7 +66,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     certifying(op)
     args = _build(cell.spec, seed=_seed(cell.why))
     x, z, weight = args[:3]
-    assert z.stride() == (_IN_PROJ_WIDTH, cell.spec["width"], 1) and not z.is_contiguous()
+    assert z.stride()[1:] == (cell.spec["width"], 1)
+    if cell.spec["tokens"] > 1:
+        # A one-token view reports the dense stride for its size-1 token dim (and is then
+        # contiguous); the kernel never reads past token 0 there.
+        row_stride = cell.spec.get("z_row_stride", _IN_PROJ_WIDTH)
+        assert z.stride(0) == row_stride and not z.is_contiguous()
     before = [x.clone(), z.clone(), weight.clone()]
 
     out = op(*args)

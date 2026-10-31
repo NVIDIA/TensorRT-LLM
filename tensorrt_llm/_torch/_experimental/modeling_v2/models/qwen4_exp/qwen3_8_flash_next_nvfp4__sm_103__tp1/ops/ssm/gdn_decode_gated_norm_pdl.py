@@ -35,9 +35,10 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
+    rms_norm_gated_token_major as _gated_norm,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-
-from ..norm.rms_norm_gated_token_major import rms_norm_gated_token_major as _gated_norm
 
 #: Decode rows per launch this entry is certified for.
 MAX_ROWS = 4

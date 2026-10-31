@@ -3,8 +3,8 @@
 """One Gated-DeltaNet decode step per row, and the gated RMS norm on its output, in
 one PDL launch.
 
-A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target and copied unchanged, with
-this file, from its `ops/ssm/gdn_decode_gated_norm_pdl.py` (this target's variant r31); the
+A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target, shared with the unified
+target (promoted from their copies, the kernel unchanged); the
 recurrence is the gated delta rule of FlashInfer's
 `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here. At one
 decode row the step reads and writes each v-head's 64 KB fp32 state once and
@@ -37,9 +37,10 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
+    rms_norm_gated_token_major as _gated_norm,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-
-from ..norm.rms_norm_gated_token_major__r30 import rms_norm_gated_token_major as _gated_norm
 
 #: Decode rows per launch this entry is certified for.
 MAX_ROWS = 4

@@ -14,7 +14,8 @@ import triton
 # `import tensorrt_llm._torch.custom_ops` alone does not make
 # torch.ops.trtllm.rms_norm_gated_token_major resolve.
 import tensorrt_llm._torch.modules.mamba.layernorm_gated as _layernorm_gated
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: The checkpoint's GDN epilogue: 48 value heads of 128, `output_gate_type: sigmoid`.
 _CKPT = dict(heads=48, width=128, dtype=torch.bfloat16, eps=1e-6, gate_activation="sigmoid")
