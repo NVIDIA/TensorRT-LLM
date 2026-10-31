@@ -129,6 +129,12 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (
+    fused_sigmoid_mul_inplace,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (
+    fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul_rows import (
     silu_and_mul_rows,
 )
@@ -273,10 +279,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from . import pool as _pool
 from . import vision as _vision
 from . import weights as _weights
-from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
-    fused_sigmoid_mul_inplace as mtp_fused_sigmoid_mul_inplace,
-)
-from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
 from .ops.comm.allgather__r6 import allgather

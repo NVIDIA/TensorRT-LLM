@@ -120,6 +120,9 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (
+    fused_sigmoid_mul_inplace,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_tanh import gelu_tanh
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_mul_rows import (
@@ -275,7 +278,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
-from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
 from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECODE_MAX_ROWS

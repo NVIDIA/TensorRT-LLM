@@ -1,21 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's fused_sigmoid_mul_inplace variant
-(ops/activation/fused_sigmoid_mul_inplace__mtp): every cell against the entry's
-reference with nothing written past `attention_output`'s last row, the MTP
-layer's 3-D gate under graph capture, the band refusing a wrong gate read, and
-the loud layout refusal."""
+"""GPU test for the fused_sigmoid_mul_inplace catalog entry: every cell against
+the entry's reference with nothing written past `attention_output`'s last row,
+graph capture of the unified target's fused-row and MTP forms, the band refusing
+a wrong gate read, and the loud layout refusal."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.activation.fused_sigmoid_mul_inplace__mtp import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.fused_sigmoid_mul_inplace import (  # noqa: E501
     fused_sigmoid_mul_inplace as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "fused_sigmoid_mul_inplace requires a CUDA device"
@@ -34,8 +33,10 @@ def _build(spec, seed):
 
     `out` is the compact `[T, hidden]` head of `out_buffer`, which runs `_TAIL`
     elements past its last row. `gate` is a view of `gate_buffer`: the second
-    half of each `[T, heads, 2 * D]` q_proj head, or the 2-D gate window of the
-    target's fused projection row.
+    half of each `[T, heads, 2 * D]` q_proj head (`gate="interleaved"`), or the
+    2-D gate window of the target's fused projection row (`gate="fused_row"`:
+    `row_stride` columns, the gate at `gate_col`; tp1's 14080 / 7168 where the
+    spec names neither).
     """
     g = torch.Generator(device="cuda").manual_seed(seed)
     t, heads, d, dtype = spec["tokens"], spec["heads"], spec["head_dim"], spec["dtype"]
@@ -51,10 +52,11 @@ def _build(spec, seed):
         gate = gate_buffer[:, :, d:]
     else:
         assert spec["gate"] == "fused_row", spec["gate"]
-        # The target's fused input projection row [q | k | v | gate | index | pad]:
-        # 14080 columns, the gate a 2-D [T, hidden] window at column 7168.
-        gate_buffer = randn(t, 14080)
-        gate = gate_buffer[:, 7168 : 7168 + hidden]
+        # The target's fused input projection row [q | k | v | gate | index scratch]:
+        # the gate a 2-D [T, hidden] window at column qkv_width.
+        row_stride, gate_col = spec.get("row_stride", 14080), spec.get("gate_col", 7168)
+        gate_buffer = randn(t, row_stride)
+        gate = gate_buffer[:, gate_col : gate_col + hidden]
     return out, out_buffer, gate_buffer, gate
 
 
@@ -67,7 +69,7 @@ def _mtp_spec(tokens: int) -> dict:
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
+def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     out, out_buffer, gate_buffer, gate = _build(cell.spec, seed=_seed(cell.why))
     gate_before = gate_buffer.clone()
@@ -80,6 +82,31 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     torch.testing.assert_close(result, expected)
     assert torch.equal(gate_buffer, gate_before)
     assert torch.equal(out_buffer[out.numel() :], tail_before), "a masked lane stored"
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    """The decode call sites run captured: the tp4 / tep4 form (6 heads off the
+    4352-wide row, two 1024-wide blocks a row) replays on refilled inputs."""
+    spec = next(c.spec for c in op.CELLS if c.spec.get("row_stride") == 4352)
+    spec = dict(spec, tokens=8)
+    out, _, gate_buffer, gate = _build(spec, seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(out, gate)  # JIT compile outside capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op(out, gate)
+
+    for seed in (11, 12):
+        fresh_out, _, fresh_gate_buffer, _ = _build(spec, seed=seed)
+        out.copy_(fresh_out)
+        gate_buffer.copy_(fresh_gate_buffer)
+        expected = op.reference(out, gate)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected)
 
 
 @pytest.mark.parametrize("tokens", [1, 128, 1024])
