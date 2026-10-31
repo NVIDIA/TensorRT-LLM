@@ -61,6 +61,14 @@ Ownership and reuse (cuFlow):
   records, after its own dependency wait. A poll that has seen no arrival for
   ``guard_ns`` sets a guard word in host memory (and keeps polling).
 
+Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
+requests (16..32 rows, ``wide_prologue``) run the wide tagged kernel's statements, in
+which each CTA routes only its own two rows (no placement, no early ids). A record is
+then the source rank's ``[32, C]`` pool slot followed by one ``[32, L]`` FP32 logit
+block, the router's output as it is (``router_shard_rows`` with the block as its
+output): CTA ``c`` polls and resets rows ``2c`` and ``2c + 1`` of each sender's block.
+A separate workspace with its own buffer sequence; the 8-row layout is unchanged.
+
 PDL memory order: before ``griddepcontrol.wait`` the routing warps read the
 expert bias (a parameter), as in ``pool_gather_route``; nothing else, in
 particular nothing of the transport. After it: the transport (ordered by the
@@ -84,7 +92,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -92,7 +100,7 @@ from tensorrt_llm.mapping import Mapping
 from . import pool_gather_route as _route
 from . import unpool_direct_boundary as _direct
 from .pool_gather_fp4quant import _VECTOR_SPAN_WORDS, _VECTORS, BLOCK, HIDDEN, local_columns
-from .projection_inbox import MAX_ROWS
+from .projection_inbox import MAX_ROWS, WIDE_MAX_ROWS
 
 #: The TP sizes this transport is laid out for: TP8 over two trays and TP4 on one.
 WORLDS = (4, 8)
@@ -118,6 +126,11 @@ _SENTINEL_I32 = DIRECT_SENTINEL - (1 << 32)
 #: CTAs of the routed kernel at ``MAX_ROWS`` rows (two rows each): one logit box each.
 CTAS = MAX_ROWS // 2
 CHUNKS = _route.CHUNKS
+#: The wide layout's half-window census (``PLACE_HALF``), per buffer in rank-local device
+#: memory: ``CHUNKS`` presence words, the CTAs' arrival count and their read count.
+CENSUS_WORDS = 2 * CHUNKS
+CENSUS_ARRIVED = CHUNKS
+CENSUS_READ = CHUNKS + 1
 
 
 def pool_row_words(world: int) -> int:
@@ -125,24 +138,39 @@ def pool_row_words(world: int) -> int:
     return local_columns(world) // 2
 
 
-def pool_slot_words(world: int) -> int:
-    """32-bit words of a pool slot: ``MAX_ROWS`` rows."""
-    return MAX_ROWS * pool_row_words(world)
+def check_layout(world: int, max_rows: int) -> None:
+    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP8 or TP4, 32 rows at TP4."""
+    if world not in WORLDS or max_rows not in (MAX_ROWS, WIDE_MAX_ROWS):
+        raise ValueError(f"no direct pool layout for TP{world} and {max_rows} rows")
+    if max_rows == WIDE_MAX_ROWS and world != 4:
+        raise ValueError("the wide direct pool layout is TP4 only")
+
+
+def pool_slot_words(world: int, max_rows: int = MAX_ROWS) -> int:
+    """32-bit words of a pool slot: ``max_rows`` rows."""
+    return max_rows * pool_row_words(world)
 
 
 def box_words(world: int) -> int:
-    """32-bit words of a logit box: ``[MAX_ROWS, local_experts(world)]`` FP32."""
+    """32-bit words of a logit box of the 8-row layout: ``[MAX_ROWS, local_experts(world)]`` FP32."""
     return MAX_ROWS * _route.local_experts(world)
 
 
-def record_words(world: int) -> int:
-    """32-bit words of a record: the pool slot, then ``CTAS`` logit boxes."""
-    return pool_slot_words(world) + CTAS * box_words(world)
+def logit_words(world: int, max_rows: int = MAX_ROWS) -> int:
+    """32-bit words of a record's logits: ``CTAS`` boxes (8 rows), or one ``[max_rows, L]`` block (wide)."""
+    if max_rows == MAX_ROWS:
+        return CTAS * box_words(world)
+    return max_rows * _route.local_experts(world)
 
 
-def workspace_bytes(world: int) -> int:
+def record_words(world: int, max_rows: int = MAX_ROWS) -> int:
+    """32-bit words of a record: the pool slot, then the logits (``logit_words``)."""
+    return pool_slot_words(world, max_rows) + logit_words(world, max_rows)
+
+
+def workspace_bytes(world: int, max_rows: int = MAX_ROWS) -> int:
     """Bytes of one rank's copy of the transport: ``BUFFERS x world`` records."""
-    return BUFFERS * world * record_words(world) * 4
+    return BUFFERS * world * record_words(world, max_rows) * 4
 
 
 #: 32-bit words of one row of a pool slot, of a pool slot, of a logit box, of a record
@@ -213,8 +241,70 @@ if _AVAILABLE:
         _stamp_timer,
         _top8_by_redux,
     )
-    from .projection_inbox import _asm, _u32
+    from .projection_inbox import _asm, _i64, _u32
     from .unpool_direct_boundary import _globaltimer, _pending, _poll_x4, _reset_x4, _set_guard_word
+
+    @dsl_user_op
+    def _red_global_or(address, value, *, loc=None, ip=None):
+        """A relaxed GPU-scope OR into a rank-local global word (the wide census)."""
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(value, loc, ip)],
+            "red.relaxed.gpu.global.or.b32 [$0], $1;",
+            "l,r",
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def _red_release_gpu_add(address, value, *, loc=None, ip=None):
+        """A release GPU-scope add (a CTA's arrival at the wide census)."""
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(value, loc, ip)],
+            "red.release.gpu.global.add.u32 [$0], $1;",
+            "l,r",
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def _atom_acq_rel_gpu_add(address, value, *, loc=None, ip=None):
+        """An acquire-release GPU-scope add returning the old value."""
+        return Uint32(
+            _asm(
+                T.i32(),
+                [_i64(address, loc, ip), _u32(value, loc, ip)],
+                "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+                "=r,l,r",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
+    def _ld_acquire_gpu_b32(address, *, loc=None, ip=None):
+        return Uint32(
+            _asm(
+                T.i32(),
+                [_i64(address, loc, ip)],
+                "ld.acquire.gpu.global.b32 $0, [$1];",
+                "=r,l",
+                loc,
+                ip,
+            )
+        )
+
+    @dsl_user_op
+    def _st_relaxed_gpu_b32(address, value, *, loc=None, ip=None):
+        _asm(
+            None,
+            [_i64(address, loc, ip), _u32(value, loc, ip)],
+            "st.relaxed.gpu.global.b32 [$0], $1;",
+            "l,r",
+            loc,
+            ip,
+        )
 
     @dsl_user_op
     def _pending_words(w0, w1, w2, w3, *, loc=None, ip=None):
@@ -256,10 +346,24 @@ if _AVAILABLE:
             guard_ns: int,
             guard_break: bool,
             world: int = WORLD,
+            max_rows: int = MAX_ROWS,
+            census: int = 0,
         ):
+            check_layout(world, max_rows)
+            wide = max_rows > MAX_ROWS
+            if wide and (
+                place not in (PLACE_NONE, PLACE_HALF) or (place == PLACE_HALF) != bool(census)
+            ):
+                raise ValueError(
+                    "the wide layout routes only, or places the half window with its census words"
+                )
+            # A wide layout compiles the tagged kernel's wide statements (``self.wide``):
+            # each CTA routes its own rows, without early ids; the tagged kernel has no
+            # wide placement, so it is built routing-only and the half window's placement,
+            # over the grid's census (``census``), is this kernel's.
             super().__init__(
                 peer_rank,
-                place,
+                PLACE_NONE if wide else place,
                 static_from,
                 True,
                 False,
@@ -268,13 +372,16 @@ if _AVAILABLE:
                 trigger,
                 stamps,
                 world,
+                max_rows,
             )
+            self.place = place
+            self.census = int(census)
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
             self.pool_row_words = pool_row_words(world)
-            self.pool_slot_words = pool_slot_words(world)
+            self.pool_slot_words = pool_slot_words(world, max_rows)
             self.box_words = box_words(world)
-            self.record_words = record_words(world)
+            self.record_words = record_words(world, max_rows)
 
         @cute.jit
         def __call__(
@@ -586,11 +693,22 @@ if _AVAILABLE:
                     if cutlass.const_expr(self.place != PLACE_NONE):
                         if rt < CHUNKS:
                             _st_shared_b32(sCensus.iterator + rt, Uint32(0))
-                    if rt * 4 < M * local_count:
+                    if cutlass.const_expr(self.wide):
+                        # The CTA's own rows of each sender's block: words 4 rt of its
+                        # [rows_per_block, L] rows (fewer when its last row is past M).
+                        word_limit = _min_u32(
+                            Uint32(rows_per_block * local_count),
+                            Uint32((M - bidx * rows_per_block) * local_count),
+                        )
+                        logits_start = Int64(self.pool_slot_words) + Int64(
+                            bidx * rows_per_block * local_count
+                        )
+                    else:
+                        word_limit = M * local_count
+                        logits_start = Int64(self.pool_slot_words) + Int64(bidx * self.box_words)
+                    if rt * 4 < word_limit:
                         word = Int64(rt * 4)
-                        piece = (
-                            Int64(self.pool_slot_words) + Int64(bidx * self.box_words) + word
-                        ) * 4
+                        piece = (logits_start + word) * 4
                         received = cute.make_rmem_tensor(cute.make_layout((4 * world,)), Uint32)
                         start = Int64(0)
                         if cutlass.const_expr(self.guard_ns > 0):
@@ -641,13 +759,20 @@ if _AVAILABLE:
                     full_row = bidx * rows_per_block + rt // 64
                     if full_row < M:
                         lr = full_row * EXPERTS + (rt % 64) * 4
-                        f0, f1, f2, f3 = _load_shared_words(sLogits.iterator + lr)
+                        if cutlass.const_expr(self.wide):
+                            slr = (rt // 64) * EXPERTS + (rt % 64) * 4
+                        else:
+                            slr = lr
+                        f0, f1, f2, f3 = _load_shared_words(sLogits.iterator + slr)
                         _store_global_words(logits_full + Int64(lr) * 4, f0, f1, f2, f3)
                     eps_bits = _f32_bits(renorm_eps)
                     # Each lane's keys of the warp's two rows, sorted; then the warp's
-                    # top 8 of each row (key s in lane s).
+                    # top 8 of each row (key s in lane s). Wide: one row per routing warp,
+                    # the CTA's own (warps 0 and 1; warps 2 and 3 route unread shared rows
+                    # and store nothing).
+                    halves = 1 if self.wide else 2
                     lists = []
-                    for half in cutlass.range_constexpr(2):
+                    for half in cutlass.range_constexpr(halves):
                         row = rwarp + 4 * half
                         keys = []
                         for k in cutlass.range_constexpr(CHUNKS):
@@ -658,12 +783,22 @@ if _AVAILABLE:
                             )
                         lists.append(_sort8(keys))
                     picks, winners = _top8_by_redux(lists, lane)
-                    for half in cutlass.range_constexpr(2):
+                    for half in cutlass.range_constexpr(halves):
                         row = rwarp + 4 * half
                         if cutlass.const_expr(self.place != PLACE_NONE):
                             # The census, from the rounds' winners (warp-uniform): one
-                            # lane sets each selected expert's bit.
-                            counts = _eq(Uint32(lane), Uint32(0)) & _lt_u(Uint32(row), Uint32(M))
+                            # lane sets each selected expert's bit (wide: of the CTA's own
+                            # rows only; the grid's census is merged below).
+                            if cutlass.const_expr(self.wide):
+                                counts = (
+                                    _eq(Uint32(lane), Uint32(0))
+                                    & _lt_u(Uint32(row), Uint32(rows_per_block))
+                                    & _lt_u(Uint32(bidx * rows_per_block + row), Uint32(M))
+                                )
+                            else:
+                                counts = _eq(Uint32(lane), Uint32(0)) & _lt_u(
+                                    Uint32(row), Uint32(M)
+                                )
                             if counts != Uint32(0):
                                 for s in cutlass.range_constexpr(TOP_K):
                                     chosen = Uint32(255) - winners[half][s]
@@ -671,7 +806,7 @@ if _AVAILABLE:
                                         sCensus.iterator + (chosen >> 5),
                                         Uint32(1) << (chosen & Uint32(31)),
                                     )
-                    for half in cutlass.range_constexpr(2):
+                    for half in cutlass.range_constexpr(halves):
                         row = rwarp + 4 * half
                         mine = picks[half]
                         # Masked so that the unused rows' (unwritten) keys stay in bounds.
@@ -683,19 +818,81 @@ if _AVAILABLE:
                         quad = _add_rn(pair, _shfl_xor_b32(pair, 4))
                         total = _add_rn(quad, _shfl_xor_b32(quad, 2))
                         weight = _div_rn(score, _add_rn(eps_bits, total))
-                        keep = _lt_u(Uint32(row), Uint32(M)) & _lt_u(Uint32(lane), Uint32(TOP_K))
-                        if keep != Uint32(0):
-                            _st_shared_b32(sSelected.iterator + row * TOP_K + lane, expert_id)
-                            _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
-                            if row // rows_per_block == bidx:
-                                out = Int64(row * TOP_K + lane) * 4
+                        if cutlass.const_expr(self.wide):
+                            global_row = bidx * rows_per_block + row
+                            keep = (
+                                _lt_u(Uint32(row), Uint32(rows_per_block))
+                                & _lt_u(Uint32(global_row), Uint32(M))
+                                & _lt_u(Uint32(lane), Uint32(TOP_K))
+                            )
+                            if keep != Uint32(0):
+                                if cutlass.const_expr(self.place != PLACE_NONE):
+                                    # The CTA's own rows, at their CTA-relative rows.
+                                    _st_shared_b32(
+                                        sSelected.iterator + row * TOP_K + lane, expert_id
+                                    )
+                                    _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
+                                out = Int64(global_row * TOP_K + lane) * 4
                                 _st_global_b32(selected + out, expert_id)
                                 _st_global_b32(weights + out, weight)
+                        else:
+                            keep = _lt_u(Uint32(row), Uint32(M)) & _lt_u(
+                                Uint32(lane), Uint32(TOP_K)
+                            )
+                            if keep != Uint32(0):
+                                _st_shared_b32(sSelected.iterator + row * TOP_K + lane, expert_id)
+                                _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
+                                if row // rows_per_block == bidx:
+                                    out = Int64(row * TOP_K + lane) * 4
+                                    _st_global_b32(selected + out, expert_id)
+                                    _st_global_b32(weights + out, weight)
 
                     # Placement (replicated experts) from all M rows' selections, in every
                     # routing warp.
                     if cutlass.const_expr(self.place != PLACE_NONE):
                         _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
+                        if cutlass.const_expr(self.wide):
+                            # The grid's census: every CTA ORs its rows' bits into this
+                            # rank's census words of the buffer, arrives, and waits for
+                            # every CTA's arrival (all of the grid's CTAs are resident:
+                            # at most 16); then each CTA reads the merged words. The
+                            # last CTA to have read them clears them for the next call.
+                            census = Int64(self.census) + Int64(buffer) * Int64(CENSUS_WORDS * 4)
+                            if rt < CHUNKS:
+                                bits = _ld_shared_b32(sCensus.iterator + rt)
+                                if bits != Uint32(0):
+                                    _red_global_or(census + Int64(rt * 4), bits)
+                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
+                            ctas = Uint32((M + rows_per_block - 1) // rows_per_block)
+                            if rt == 0:
+                                _red_release_gpu_add(census + Int64(CENSUS_ARRIVED * 4), Uint32(1))
+                                start = Int64(0)
+                                if cutlass.const_expr(self.guard_ns > 0):
+                                    start = _globaltimer()
+                                arrived = _ld_acquire_gpu_b32(census + Int64(CENSUS_ARRIVED * 4))
+                                while _lt_u(arrived, ctas) != Uint32(0):
+                                    arrived = _ld_acquire_gpu_b32(
+                                        census + Int64(CENSUS_ARRIVED * 4)
+                                    )
+                                    if cutlass.const_expr(self.guard_ns > 0):
+                                        if _globaltimer() - start > Int64(self.guard_ns):
+                                            _set_guard_word(control + Int64(GUARD_WORD * 4))
+                                            if cutlass.const_expr(self.guard_break):
+                                                arrived = ctas
+                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
+                            if rt < CHUNKS:
+                                _st_shared_b32(
+                                    sCensus.iterator + rt,
+                                    _ld_relaxed_gpu_b32(census + Int64(rt * 4)),
+                                )
+                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
+                            if rt == 0:
+                                read = _atom_acq_rel_gpu_add(
+                                    census + Int64(CENSUS_READ * 4), Uint32(1)
+                                )
+                                if _eq(read + Uint32(1), ctas) != Uint32(0):
+                                    for word in cutlass.range_constexpr(CENSUS_WORDS):
+                                        _st_relaxed_gpu_b32(census + Int64(word * 4), Uint32(0))
                         w0, w1, w2, w3 = _load_shared_words(sCensus.iterator)
                         w4, w5, w6, w7 = _load_shared_words(sCensus.iterator + 4)
                         words = [w0, w1, w2, w3, w4, w5, w6, w7]
@@ -848,12 +1045,14 @@ if _AVAILABLE:
                         )
                         if writes != Uint32(0):
                             slot_index = own_row * TOP_K + lane
-                            g = _ld_shared_b32(sSelected.iterator + slot_index)
+                            # Wide: the CTA's rows sit at their CTA-relative rows.
+                            shared_index = rwarp * TOP_K + lane if self.wide else slot_index
+                            g = _ld_shared_b32(sSelected.iterator + shared_index)
                             placed = _placed_expert(
                                 g, words, xs, self.peer_rank, x2s, world, place_half
                             )
                             _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
-                            w_bits = _ld_shared_b32(sWeights.iterator + slot_index)
+                            w_bits = _ld_shared_b32(sWeights.iterator + shared_index)
                             _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
                         held_load = loads[0]
                         for b in cutlass.range_constexpr(1, world):
@@ -889,6 +1088,8 @@ if _AVAILABLE:
         guard_ns: int,
         guard_break: bool,
         world: int = WORLD,
+        max_rows: int = MAX_ROWS,
+        census: int = 0,
     ):
         kernel = _PoolDirectRouteKernel(
             peer_rank,
@@ -901,6 +1102,8 @@ if _AVAILABLE:
             guard_ns,
             guard_break,
             world,
+            max_rows,
+            census,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
@@ -980,9 +1183,10 @@ class PoolDirectWorkspace:
 
     ``slot(buffer, rows)`` is this rank's ``[rows, local_columns(world)]`` BF16 pool
     slot of ``buffer`` (512 columns at TP8, 1024 at TP4) and ``boxes(buffer, rows)``
-    its ``[publish_copies(rows), box_words(world)]`` FP32 logit boxes, both on the
-    multicast address: a producer given them as its output
-    publishes into every rank's copy. ``kernel(variant)`` is the compiled routed
+    its ``[publish_copies(rows), box_words(world)]`` FP32 logit boxes (the 8-row
+    layout) or ``block(buffer, rows)`` its ``[rows, L]`` FP32 logit block (the wide
+    layout, ``max_rows=WIDE_MAX_ROWS``, TP4), all on the multicast address: a producer
+    given them as its output publishes into every rank's copy. ``kernel(variant)`` is the compiled routed
     kernel for a call's settings. Construction is collective over the group (fabric
     allocation and sentinel fill), and so is ``build_variants``; both succeed on
     every rank or raise on every rank. Nothing compiles inside a CUDA graph
@@ -999,6 +1203,7 @@ class PoolDirectWorkspace:
         *,
         guard_ns: int = DIRECT_GUARD_NS,
         guard_break: bool = False,
+        max_rows: int = MAX_ROWS,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -1011,10 +1216,13 @@ class PoolDirectWorkspace:
             raise ValueError(
                 "the direct pool transport needs TP8 or TP4 without attention DP or CP"
             )
+        check_layout(int(mapping.tp_size), int(max_rows))
         self.rank = mapping.tp_rank
-        #: The group size, which fixes the layout (``record_words(world)``).
+        #: The group size and the row capacity, which fix the layout (``record_words``).
         self.world = int(mapping.tp_size)
-        self.record_words = record_words(self.world)
+        self.max_rows = int(max_rows)
+        self.wide = self.max_rows > MAX_ROWS
+        self.record_words = record_words(self.world, self.max_rows)
         self.guard_ns = int(guard_ns)
         self.guard_break = bool(guard_break)
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -1040,7 +1248,7 @@ class PoolDirectWorkspace:
         error: Optional[BaseException] = None
         try:
             use_fabric = mapping.is_multi_node()
-            nbytes = workspace_bytes(self.world)
+            nbytes = workspace_bytes(self.world, self.max_rows)
             self._handle = _make_mnnvl_mcast_buffer(self._comm, nbytes, mapping, use_fabric)
             words = nbytes // 4
             self._receive = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
@@ -1048,6 +1256,12 @@ class PoolDirectWorkspace:
             self._records = self._mc.view(BUFFERS, self.world, self.record_words)
             with torch.cuda.device(self.device):
                 self._receive.fill_(_SENTINEL_I32)
+                # The wide layout's half-window census words (rank-local, zero between calls).
+                self._census = (
+                    torch.zeros(BUFFERS * CENSUS_WORDS, dtype=torch.int32, device=self.device)
+                    if self.wide
+                    else None
+                )
                 self.control = torch.zeros(
                     CONTROL_WORDS, dtype=torch.int32, pin_memory=prefer_pinned()
                 )
@@ -1074,7 +1288,7 @@ class PoolDirectWorkspace:
 
         Write-only: a store through it reaches every rank's copy; nothing may read it.
         """
-        if not 1 <= rows <= MAX_ROWS:
+        if not 1 <= rows <= self.max_rows:
             raise ValueError(f"no slot for {rows} rows")
         record = self._record(buffer)
         return (
@@ -1088,12 +1302,21 @@ class PoolDirectWorkspace:
 
         Multicast and write-only.
         """
-        if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(f"no boxes for {rows} rows")
+        if self.wide or not 1 <= rows <= MAX_ROWS:
+            raise ValueError(f"no boxes for {rows} rows on a {self.max_rows}-row layout")
         copies = (rows + 1) // 2
         record = self._record(buffer)
         start, box = pool_slot_words(self.world), box_words(self.world)
         return record[start : start + copies * box].view(torch.float32).view(copies, box)
+
+    def block(self, buffer: int, rows: int) -> torch.Tensor:
+        """This rank's ``[rows, L]`` FP32 logit block of ``buffer`` on the wide layout (multicast; write-only)."""
+        if not self.wide or not 1 <= rows <= self.max_rows:
+            raise ValueError(f"no logit block for {rows} rows on a {self.max_rows}-row layout")
+        local = _route.local_experts(self.world)
+        record = self._record(buffer)
+        start = pool_slot_words(self.world, self.max_rows)
+        return record[start : start + rows * local].view(torch.float32).view(rows, local)
 
     def receive(self) -> torch.Tensor:
         """This rank's copy of the whole transport, ``int32 [3 * world * record_words(world)]`` (tests)."""
@@ -1104,14 +1327,20 @@ class PoolDirectWorkspace:
         return self._control_ptr
 
     def is_clean(self) -> bool:
-        """Whether every word of this rank's copy holds the sentinel (synchronizes; tests)."""
+        """Whether every word of this rank's copy holds the sentinel and every census word
+        is zero (synchronizes; tests)."""
         torch.cuda.synchronize(self.device)
-        return bool((self._receive == _SENTINEL_I32).all().item())
+        clean = bool((self._receive == _SENTINEL_I32).all().item())
+        if self._census is not None:
+            clean = clean and not bool(self._census.any().item())
+        return clean
 
     def reset(self) -> None:
         """Every word of this rank's copy back to the sentinel (tests; nothing may be in flight)."""
         torch.cuda.synchronize(self.device)
         self._receive.fill_(_SENTINEL_I32)
+        if self._census is not None:
+            self._census.zero_()
         torch.cuda.synchronize(self.device)
 
     def guard_fired(self, sync: bool = True) -> bool:
@@ -1207,6 +1436,8 @@ class PoolDirectWorkspace:
             self.guard_ns,
             self.guard_break,
             self.world,
+            self.max_rows,
+            self._census.data_ptr() if self.wide and place != PLACE_NONE else 0,
         )
         # A dry launch loads the module now, not inside a capture.
         with torch.cuda.device(self.device):
@@ -1278,12 +1509,13 @@ def _launch(
 _SHARED: dict = {}
 
 
-def shared_workspace(mapping: Mapping) -> PoolDirectWorkspace:
-    """The one direct pool workspace of this group, built on first use (collective)."""
-    workspace = _SHARED.get(mapping)
+def shared_workspace(mapping: Mapping, max_rows: int = MAX_ROWS) -> PoolDirectWorkspace:
+    """The direct pool workspace of this group and row capacity, built on first use (collective)."""
+    key = (mapping, int(max_rows))
+    workspace = _SHARED.get(key)
     if workspace is None:
-        workspace = PoolDirectWorkspace(mapping)
-        _SHARED[mapping] = workspace
+        workspace = PoolDirectWorkspace(mapping, max_rows=max_rows)
+        _SHARED[key] = workspace
     return workspace
 
 
@@ -1304,6 +1536,68 @@ class PoolDirectRoute(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="DFlash2 K=7 verify: 8 rows, balanced placement, buffer 0",
+            spec=dict(rows=8, place=_route.PLACE_BALANCE, buffer=0),
+        ),
+        Cell(
+            why="8 rows over three ring windows, the second buffer",
+            spec=dict(rows=8, place=_route.PLACE_BALANCE3, buffer=1),
+        ),
+        Cell(
+            why="the third buffer (the last call of an odd count)",
+            spec=dict(rows=8, place=_route.PLACE_BALANCE, buffer=2),
+        ),
+        Cell(
+            why="8 rows, routing only (no placement)", spec=dict(rows=8, place=PLACE_NONE, buffer=0)
+        ),
+        Cell(
+            why="1 row: one CTA, its second row idle, one logit box",
+            spec=dict(rows=1, place=_route.PLACE_BALANCE, buffer=1),
+        ),
+        Cell(
+            why="3 rows: the second CTA carries one row",
+            spec=dict(rows=3, place=_route.PLACE_BALANCE, buffer=0),
+        ),
+        Cell(
+            why="8 rows, owner-only placement",
+            spec=dict(rows=8, place=_route.PLACE_OWNER, buffer=1),
+        ),
+        Cell(
+            why="8 rows, static placement",
+            spec=dict(rows=8, place=_route.PLACE_STATIC, buffer=0),
+        ),
+        Cell(
+            why="tep4 wide layout: two requests' K=7 verify (16 rows), routing only",
+            spec=dict(rows=16, place=PLACE_NONE, buffer=0, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: three requests (24 rows), the second buffer",
+            spec=dict(rows=24, place=PLACE_NONE, buffer=1, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: four requests (32 rows), the third buffer",
+            spec=dict(rows=32, place=PLACE_NONE, buffer=2, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: an odd row count (19 rows), the last CTA one row",
+            spec=dict(rows=19, place=PLACE_NONE, buffer=0, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: 16 rows on the half window, the grid's census",
+            spec=dict(rows=16, place=PLACE_HALF, buffer=1, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: 32 rows on the half window (16 CTAs at the census)",
+            spec=dict(rows=32, place=PLACE_HALF, buffer=0, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: 19 rows on the half window, the last CTA one row",
+            spec=dict(rows=19, place=PLACE_HALF, buffer=2, wide=True),
+        ),
+    )
 
     note = """
     Certified against `pool_gather_route` on the same slices and logits bit for bit
@@ -1421,9 +1715,15 @@ class PoolDirectRoute(OpWrapper):
         stamps: Optional[torch.Tensor] = None,
     ) -> None:
         """Raw vector accesses at fixed strides on the operands' device; the transport's
-        buffer and row count must be the ones the producers published into."""
-        if not 1 <= rows <= MAX_ROWS:
-            raise ValueError(f"rows must be in 1..{MAX_ROWS}, got {rows}")
+        buffer and row count must be the ones the producers published into. The wide
+        layout routes only (``PLACE_NONE``, no early ids)."""
+        if not 1 <= rows <= workspace.max_rows:
+            raise ValueError(f"rows must be in 1..{workspace.max_rows}, got {rows}")
+        if workspace.wide and (place not in (PLACE_NONE, PLACE_HALF) or early is not None):
+            raise ValueError(
+                "the wide layout routes only or places the half window (PLACE_NONE or PLACE_HALF), "
+                "without early ids"
+            )
         if buffer not in range(BUFFERS):
             raise ValueError(f"buffer must be in 0..{BUFFERS - 1}, got {buffer}")
         if not enable_pdl and early is not None:

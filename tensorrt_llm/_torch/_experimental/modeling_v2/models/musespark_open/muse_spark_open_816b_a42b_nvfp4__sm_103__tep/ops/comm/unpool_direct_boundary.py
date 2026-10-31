@@ -56,6 +56,12 @@ Ownership and reuse (cuFlow):
   keeps polling): a call sequence that differs between ranks, or a peer that
   stopped, shows up there, and ``start_guard_watch`` logs it from the host.
 
+Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
+requests (16..32 rows, ``wide_prologue``) take a separate workspace whose slots hold 32
+rows (``3 buffers x 4 source ranks x 32 rows x 2048``), with its own buffer sequence;
+the kernel is the gather boundary's at those row counts (a cluster of 4 CTAs, one per
+peer slice) with the slot stride of 32 rows. The 8-row layout is unchanged.
+
 PDL memory order: before ``griddepcontrol.wait`` the kernel touches shared
 memory and the cluster barrier only (and, with ``trigger="entry"``, releases
 its dependents first). After it: the coefficients and weights (immutable),
@@ -79,13 +85,13 @@ from typing import Optional, Sequence, Tuple
 import torch
 from cuda.bindings import runtime as _cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from . import unpool_gather_boundary as _f1
-from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WORLDS
+from .projection_inbox import HAS_CUTE_DSL, MAX_ROWS, WIDE_MAX_ROWS, WORLDS
 
 #: Width of the residual stream; one rank's unpool slice is ``local_columns(TP)`` of it.
 HIDDEN = _f1.HIDDEN
@@ -101,6 +107,21 @@ _SENTINEL_I32 = DIRECT_SENTINEL - (1 << 32)
 #: Bytes of the whole transport: ``BUFFERS`` x TP slots of ``MAX_ROWS`` rows of a rank's
 #: ``HIDDEN / TP`` columns, the same at every TP size.
 WORKSPACE_BYTES = BUFFERS * MAX_ROWS * HIDDEN * 2
+
+
+def workspace_bytes(max_rows: int = MAX_ROWS) -> int:
+    """Bytes of the whole transport for slots of ``max_rows`` rows (``WORKSPACE_BYTES`` at 8)."""
+    return BUFFERS * max_rows * HIDDEN * 2
+
+
+def check_layout(world: int, max_rows: int) -> None:
+    """Raise unless ``(world, max_rows)`` is a served layout: 8 rows at TP4 or TP8, 32 rows at TP4."""
+    if world not in WORLDS or max_rows not in (MAX_ROWS, WIDE_MAX_ROWS):
+        raise ValueError(f"no direct unpool layout for TP{world} and {max_rows} rows")
+    if max_rows == WIDE_MAX_ROWS and world != 4:
+        raise ValueError("the wide direct unpool layout is TP4 only")
+
+
 #: Per-rank control words, in pinned host memory the kernel stores to at system scope:
 #: ``GUARD_WORD`` is set by a poll that outlived the guard.
 CONTROL_WORDS = 4
@@ -212,8 +233,14 @@ if _AVAILABLE:
             guard_ns: int,
             guard_break: bool,
             world: int = 8,
+            max_rows: int = MAX_ROWS,
         ):
-            super().__init__(m, gain, post_eps, pre_eps, norm_fp32, 0, trigger, world)
+            check_layout(world, max_rows)
+            super().__init__(m, gain, post_eps, pre_eps, norm_fp32, 0, trigger, world, max_rows)
+            if not 1 <= m <= max_rows:
+                raise ValueError(f"{m} rows on a {max_rows}-row layout")
+            # The slot stride in rows: the workspace's layout.
+            self.max_rows = int(max_rows)
             self.capture = bool(capture)
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
@@ -325,7 +352,7 @@ if _AVAILABLE:
                 box = (
                     receive.toint()
                     + (
-                        ((Int64(parity) * self.world + Int64(peer)) * MAX_ROWS + Int64(row))
+                        ((Int64(parity) * self.world + Int64(peer)) * self.max_rows + Int64(row))
                         * self.row_words
                         + Int64(word)
                     )
@@ -459,6 +486,7 @@ if _AVAILABLE:
         guard_ns: int,
         guard_break: bool,
         world: int = 8,
+        max_rows: int = MAX_ROWS,
     ):
         kernel = _UnpoolDirectBoundaryKernel(
             rows,
@@ -471,6 +499,7 @@ if _AVAILABLE:
             guard_ns,
             guard_break,
             world,
+            max_rows,
         )
         pointers = [
             make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
@@ -560,7 +589,8 @@ class UnpoolDirectWorkspace:
 
     ``slot(buffer, rows)`` is this rank's ``[rows, 8192 / TP]`` BF16 slot of buffer
     ``buffer`` on the multicast address: a GEMM given it as its output publishes
-    into every rank's copy. ``kernel(variant)`` is the compiled boundary for a
+    into every rank's copy. ``max_rows`` is the slots' row capacity: 8, or
+    ``WIDE_MAX_ROWS`` for the wide layout (TP4). ``kernel(variant)`` is the compiled boundary for a
     call's settings. Construction is collective over the group (fabric
     allocation and sentinel fill), and so is ``build_variants``; both succeed on
     every rank or raise on every rank. Nothing compiles inside a CUDA graph
@@ -579,6 +609,7 @@ class UnpoolDirectWorkspace:
         *,
         guard_ns: int = DIRECT_GUARD_NS,
         guard_break: bool = False,
+        max_rows: int = MAX_ROWS,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -591,8 +622,11 @@ class UnpoolDirectWorkspace:
             raise ValueError(
                 "the direct unpool transport needs TP4 or TP8 without attention DP or CP"
             )
+        check_layout(int(mapping.tp_size), int(max_rows))
         self.rank = mapping.tp_rank
         self.world = mapping.tp_size
+        self.max_rows = int(max_rows)
+        self.wide = self.max_rows > MAX_ROWS
         self.guard_ns = int(guard_ns)
         self.guard_break = bool(guard_break)
         self.device = torch.device("cuda", _mnnvl_device_index(mapping))
@@ -616,14 +650,13 @@ class UnpoolDirectWorkspace:
         error: Optional[BaseException] = None
         try:
             use_fabric = mapping.is_multi_node()
-            self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, WORKSPACE_BYTES, mapping, use_fabric
-            )
-            words = WORKSPACE_BYTES // 4
+            nbytes = workspace_bytes(self.max_rows)
+            self._handle = _make_mnnvl_mcast_buffer(self._comm, nbytes, mapping, use_fabric)
+            words = nbytes // 4
             self._receive = self._handle.get_uc_buffer(self.rank, (words,), torch.int32, 0)
             self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
             self._slots = self._mc.view(torch.bfloat16).view(
-                BUFFERS, self.world, MAX_ROWS, local_columns(self.world)
+                BUFFERS, self.world, self.max_rows, local_columns(self.world)
             )
             with torch.cuda.device(self.device):
                 self._receive.fill_(_SENTINEL_I32)
@@ -653,7 +686,7 @@ class UnpoolDirectWorkspace:
 
         Write-only: a store through it reaches every rank's copy; nothing may read it.
         """
-        if buffer not in range(BUFFERS) or not 1 <= rows <= MAX_ROWS:
+        if buffer not in range(BUFFERS) or not 1 <= rows <= self.max_rows:
             raise ValueError(f"no slot for buffer {buffer}, {rows} rows")
         return self._slots[buffer, self.rank, :rows]
 
@@ -774,6 +807,7 @@ class UnpoolDirectWorkspace:
             self.guard_ns,
             self.guard_break,
             self.world,
+            self.max_rows,
         )
         # A dry launch loads the module now, not inside a capture.
         dummy = self._dry.data_ptr()
@@ -797,12 +831,13 @@ def publish_copy(slot: torch.Tensor, partial: torch.Tensor) -> None:
 _SHARED: dict = {}
 
 
-def shared_workspace(mapping: Mapping) -> UnpoolDirectWorkspace:
-    """The one direct workspace of this group, built on first use (collective, like the constructor)."""
-    workspace = _SHARED.get(mapping)
+def shared_workspace(mapping: Mapping, max_rows: int = MAX_ROWS) -> UnpoolDirectWorkspace:
+    """The direct workspace of this group and row capacity, built on first use (collective, like the constructor)."""
+    key = (mapping, int(max_rows))
+    workspace = _SHARED.get(key)
     if workspace is None:
-        workspace = UnpoolDirectWorkspace(mapping)
-        _SHARED[mapping] = workspace
+        workspace = UnpoolDirectWorkspace(mapping, max_rows=max_rows)
+        _SHARED[key] = workspace
     return workspace
 
 
@@ -823,6 +858,71 @@ class UnpoolDirectBoundary(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
+
+    CELLS: tuple[Cell, ...] = (
+        Cell(
+            why="DFlash2 K=7 verify: 8 rows, the one row count the target publishes at",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False),
+        ),
+        Cell(
+            why="the second buffer: odd layers publish into buffer 1",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=1),
+        ),
+        Cell(
+            why="the third buffer: the last fused layer of an odd count (61 in the model)",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, parity=2),
+        ),
+        Cell(
+            why="early release: dependents launched at entry, the next QKV streams its weight meanwhile",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry"),
+        ),
+        Cell(
+            why="capture with early release: the DFlash capture from a boundary releasing the next QKV at entry",
+            spec=dict(
+                rows=8, with_gain=True, norm_fp32_residual=False, trigger="entry", capture=True
+            ),
+        ),
+        Cell(
+            why="the FP32-residual pre-QKV norm ordering switch",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=True),
+        ),
+        Cell(
+            why="a weightless first norm (the boundary's other arm)",
+            spec=dict(rows=8, with_gain=False, norm_fp32_residual=False),
+        ),
+        Cell(
+            why="dependents launched right after the wait",
+            spec=dict(rows=8, with_gain=True, norm_fp32_residual=False, trigger="after_wait"),
+        ),
+        Cell(
+            why="1 row: the cluster of 16 CTAs, two CTAs per peer slice",
+            spec=dict(rows=1, with_gain=True, norm_fp32_residual=False),
+        ),
+        Cell(
+            why="3 rows, a short draft between the two cluster shapes",
+            spec=dict(rows=3, with_gain=True, norm_fp32_residual=False, parity=1),
+        ),
+        Cell(
+            why="tep4 wide layout: two requests' K=7 verify (16 rows), cluster of 4 CTAs",
+            spec=dict(rows=16, with_gain=True, norm_fp32_residual=False, wide=True),
+        ),
+        Cell(
+            why="tep4 wide layout: 24 rows with the capture and the early release, buffer 1",
+            spec=dict(
+                rows=24,
+                with_gain=True,
+                norm_fp32_residual=False,
+                trigger="entry",
+                capture=True,
+                parity=1,
+                wide=True,
+            ),
+        ),
+        Cell(
+            why="tep4 wide layout: 32 rows (four requests), the third buffer",
+            spec=dict(rows=32, with_gain=True, norm_fp32_residual=False, parity=2, wide=True),
+        ),
+    )
 
     note = """
     Certified against ``unpool_gather_boundary`` on the same slices bit for bit (the test publishes with
@@ -941,9 +1041,9 @@ class UnpoolDirectBoundary(OpWrapper):
         """
         rows = published.shape[0] if published.dim() == 2 else -1
         columns = local_columns(workspace.world)
-        if not 1 <= rows <= MAX_ROWS or tuple(published.shape) != (rows, columns):
+        if not 1 <= rows <= workspace.max_rows or tuple(published.shape) != (rows, columns):
             raise ValueError(
-                f"published must be [1..{MAX_ROWS}, {columns}], got {tuple(published.shape)}"
+                f"published must be [1..{workspace.max_rows}, {columns}], got {tuple(published.shape)}"
             )
         if (
             parity not in range(BUFFERS)
@@ -988,10 +1088,13 @@ def available() -> bool:
     return _AVAILABLE
 
 
-def log_once_enabled(layers: int, kernels: str, buffers: Sequence[int] = ()) -> None:
+def log_once_enabled(
+    layers: int, kernels: str, buffers: Sequence[int] = (), wide_rows: Sequence[int] = ()
+) -> None:
     last = f", the last on buffer {buffers[-1]}" if buffers else ""
+    wide = f", and {'/'.join(map(str, wide_rows))}-row ones on the wide layout" if wide_rows else ""
     logger.info(
         f"[musespark_open] unpool_direct: the unpool GEMM publishes into the post-FFN boundary's direct transport on "
-        f"{layers} layers (8-row decode graphs; buffers alternate per layer{last}; unpool kernel "
+        f"{layers} layers (8-row decode graphs{wide}; buffers alternate per layer{last}; unpool kernel "
         f"{kernels}); eager and other row counts keep the gather boundary's tagged inbox"
     )
