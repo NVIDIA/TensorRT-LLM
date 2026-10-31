@@ -189,6 +189,9 @@ public:
 
 private:
     void scrubEvents();
+    // allocate() after its scrub: the next ready recycled slot, else a never-used slot, else the
+    // oldest recycled slot (its readyEvent still pending). Precondition: numFreeSlots() > 0.
+    Slot takeFreeSlot();
     [[nodiscard]] bool check() const noexcept;
 
     SlotCount mCapacity;

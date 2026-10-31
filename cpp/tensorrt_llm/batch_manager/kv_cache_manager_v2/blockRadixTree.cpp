@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
@@ -696,7 +697,125 @@ BlockRadixTree::BlockRadixTree(
     : mLifeCycles(lifeCycles)
     , mTokensPerBlock(tokensPerBlock)
     , mEventSink(std::move(eventSink))
+    , mKeyChainMemo(tokensPerBlock)
 {
+}
+
+// ---------------------------------------------------------------------------
+// BlockKeyChainMemo
+// ---------------------------------------------------------------------------
+
+bool keyChainMemoEnabled() noexcept
+{
+    static bool const enabled = []()
+    {
+        char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_KEY_CHAIN_MEMO");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+BlockKeyChainMemo::BlockKeyChainMemo(int tokensPerBlock, size_t capacity)
+    : mTokensPerBlock(static_cast<size_t>(tokensPerBlock))
+    , mCapacity(capacity)
+{
+    TLLM_CHECK(tokensPerBlock > 0 && capacity > 0);
+}
+
+namespace
+{
+//! Number of leading full blocks on which `a` and `b` (both at least `numBlocks` blocks long) agree.
+size_t commonFullBlocks(uint32_t const* a, uint32_t const* b, size_t numBlocks, size_t tokensPerBlock)
+{
+    // Compare in large chunks first (memcmp is vectorised), then find the first differing block.
+    constexpr size_t kBlocksPerChunk = 64;
+    size_t block = 0;
+    while (block < numBlocks)
+    {
+        size_t const n = std::min(kBlocksPerChunk, numBlocks - block);
+        size_t const offset = block * tokensPerBlock;
+        if (std::memcmp(a + offset, b + offset, n * tokensPerBlock * sizeof(uint32_t)) == 0)
+        {
+            block += n;
+            continue;
+        }
+        for (size_t i = 0; i < n; ++i)
+        {
+            size_t const o = (block + i) * tokensPerBlock;
+            if (std::memcmp(a + o, b + o, tokensPerBlock * sizeof(uint32_t)) != 0)
+            {
+                return block + i;
+            }
+        }
+        TLLM_CHECK_DEBUG_WITH_INFO(false, "chunk differs but no block does");
+        return block;
+    }
+    return numBlocks;
+}
+} // namespace
+
+BlockKeyChainMemo::Hit BlockKeyChainMemo::find(
+    BlockKey const& rootKey, TokenIdExt const* tokens, size_t numFullBlocks) const
+{
+    static_assert(sizeof(TokenIdExt) == sizeof(uint32_t));
+    std::vector<std::shared_ptr<Entry const>> entries;
+    {
+        std::lock_guard<std::mutex> const lock(mMutex);
+        entries = mEntries;
+    }
+    auto const* bits = reinterpret_cast<uint32_t const*>(tokens);
+    Hit best;
+    for (auto it = entries.rbegin(); it != entries.rend(); ++it)
+    {
+        Entry const& entry = **it;
+        if (entry.rootKey != rootKey)
+        {
+            continue;
+        }
+        size_t const limit = std::min(numFullBlocks, entry.keys.size());
+        if (limit <= best.numBlocks)
+        {
+            continue;
+        }
+        size_t const n = commonFullBlocks(bits, entry.tokenBits.data(), limit, mTokensPerBlock);
+        if (n > best.numBlocks)
+        {
+            best = Hit{*it, n};
+        }
+    }
+    return best;
+}
+
+void BlockKeyChainMemo::remember(
+    BlockKey const& rootKey, TokenIdExt const* tokens, Hit const& hit, std::vector<BlockKey> newKeys)
+{
+    if (newKeys.empty())
+    {
+        return;
+    }
+    auto entry = std::make_shared<Entry>();
+    entry->rootKey = rootKey;
+    size_t const numBlocks = hit.numBlocks + newKeys.size();
+    entry->keys.reserve(numBlocks);
+    if (hit.numBlocks > 0)
+    {
+        entry->keys.assign(hit.entry->keys.begin(), hit.entry->keys.begin() + static_cast<ptrdiff_t>(hit.numBlocks));
+    }
+    entry->keys.insert(entry->keys.end(), newKeys.begin(), newKeys.end());
+    auto const* bits = reinterpret_cast<uint32_t const*>(tokens);
+    entry->tokenBits.assign(bits, bits + numBlocks * mTokensPerBlock);
+
+    std::lock_guard<std::mutex> const lock(mMutex);
+    // The new chain extends the hit entry when it covered all of that entry: replace it.
+    if (hit.entry && hit.numBlocks == hit.entry->keys.size())
+    {
+        std::erase(mEntries, hit.entry);
+    }
+    if (mEntries.size() >= mCapacity)
+    {
+        mEntries.erase(mEntries.begin());
+    }
+    mEntries.push_back(std::move(entry));
 }
 
 BlockRadixTree::~BlockRadixTree()
@@ -790,6 +909,12 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
 {
     // Read-only: probeReuse() runs this under a shared lock, so probes may overlap. A root still
     // awaiting erasure is childless, so it yields no match.
+    if (keyChainMemoEnabled()
+        && (knownNoDigest
+            || std::none_of(tokens.begin(), tokens.end(), [](TokenIdExt const& t) { return t.isDigest(); })))
+    {
+        return matchTokenPathMemo(reuseScope, tokens, enablePartialMatch);
+    }
     std::vector<MatchResult> results;
 
     // Lazily compute one key per iteration — no wasted hashing on early miss.
@@ -834,6 +959,68 @@ std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPath(
             results.push_back({best, bestMatch});
     }
 
+    return results;
+}
+
+std::vector<BlockRadixTree::MatchResult> BlockRadixTree::matchTokenPathMemo(
+    ReuseScope const& reuseScope, TokenSpan tokens, bool enablePartialMatch) const
+{
+    // The same walk as matchTokenPath; only where each block key comes from differs. Keys of the
+    // memoised prefix are read from the memo, the rest are hashed exactly as the generator does
+    // (Hasher over the previous key and the block's tokens) and recorded afterwards.
+    std::vector<MatchResult> results;
+    BlockKey const rootKey = RootBlock::makeKey(reuseScope);
+    auto rootIt = mRoots.find(rootKey);
+    if (rootIt == mRoots.end())
+        return results;
+
+    size_t const tokensPerBlock = static_cast<size_t>(mTokensPerBlock);
+    size_t const numTokens = static_cast<size_t>(tokens.size());
+    auto const hit = mKeyChainMemo.find(rootKey, tokens.begin(), numTokens / tokensPerBlock);
+    std::vector<BlockKey> newKeys;
+
+    std::unordered_map<BlockKey, SharedPtr<Block>> const* currentNext = &rootIt->second->next;
+    HalfOpenRange<size_t> missedRange;
+    bool missed = false;
+    BlockKey digest = rootKey;
+    for (size_t ordinal = 0, beg = 0; beg < numTokens; ++ordinal, beg += tokensPerBlock)
+    {
+        size_t const end = std::min(beg + tokensPerBlock, numTokens);
+        if (ordinal < hit.numBlocks)
+        {
+            digest = hit.entry->keys[ordinal];
+        }
+        else
+        {
+            Hasher h;
+            h.update(digest);
+            h.update(tokens.begin() + beg, end - beg, /*knownNoDigest=*/true);
+            digest = h.digest();
+            if (end - beg == tokensPerBlock)
+            {
+                newKeys.push_back(digest);
+            }
+        }
+        auto blockIt = currentNext->find(digest);
+        if (blockIt == currentNext->end())
+        {
+            missedRange = {beg, end};
+            missed = true;
+            break;
+        }
+        Block* block = blockIt->second.get();
+        results.push_back({block, static_cast<int>(end - beg)});
+        currentNext = &block->next;
+    }
+    mKeyChainMemo.remember(rootKey, tokens.begin(), hit, std::move(newKeys));
+
+    if (missed && enablePartialMatch)
+    {
+        auto [best, bestMatch]
+            = findBestPartialMatchInNextNodes(*currentNext, tokens.begin() + missedRange.beg, missedRange.length());
+        if (best)
+            results.push_back({best, bestMatch});
+    }
     return results;
 }
 

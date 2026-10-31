@@ -2131,6 +2131,37 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
               .def("close", &kv::CachedCudaEvent::close)
               .def("is_closed", &kv::CachedCudaEvent::isClosed);
     cachedCudaEvent.attr("NULL") = kv::CachedCudaEvent::makeNull();
+    mIntrospection.def("stream_ordered_events_enabled", &kv::streamOrderedEventsEnabled,
+        "Whether TLLM_KV_CACHE_MANAGER_V2_STREAM_ORDERED_EVENTS=1 was set when the process first used it.");
+    mIntrospection.def(
+        "stream_ordered_event_counters",
+        []()
+        {
+            auto const c = kv::streamOrderedEventCounters();
+            nb::dict d;
+            d["waits_issued"] = nb::cast(c.waitsIssued);
+            d["waits_elided"] = nb::cast(c.waitsElided);
+            d["merges_without_stream"] = nb::cast(c.mergesWithoutStream);
+            d["merges_with_stream"] = nb::cast(c.mergesWithStream);
+            return d;
+        },
+        "Process-wide counters of the stream-ordered event paths (counted only while enabled).");
+    mIntrospection.def(
+        "stream_wait_events",
+        [](kv::CudaStream stream, std::vector<kv::CachedCudaEvent> const& events)
+        {
+            std::vector<CUevent> handles;
+            handles.reserve(events.size());
+            for (auto const& ev : events)
+            {
+                handles.push_back(ev.handle());
+            }
+            kv::streamWaitEvents(stream, std::move(handles));
+        },
+        nb::arg("stream"), nb::arg("events"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "merge_events", [](std::vector<kv::CachedCudaEvent> events) { return kv::mergeEvents(events); },
+        nb::arg("events"), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
         "make_test_block",
         [](kv::KvCacheManager& manager, nb::object tokenObject, std::vector<int> coveragePerLc, nb::object parentObject,

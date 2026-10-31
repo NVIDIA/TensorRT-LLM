@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
@@ -86,6 +87,24 @@ SlotCount SlotAllocator::numOccupiedSlots() const noexcept
     return slotCountValueFromSize(mOccupiedMask.numSetBits());
 }
 
+namespace
+{
+//! TLLM_KV_CACHE_MANAGER_V2_LAZY_SLOT_SCRUB=1 (read once): scrub recycled-slot events once per
+//! allocateMultiple() instead of once per slot, and not on release(). Scrubbing only decides which
+//! free slot is handed out first (ready ones are preferred); every user of a slot still waits for
+//! its readyEvent, so this changes neither correctness nor contents, only how many cuEventQuery
+//! calls a migration of N pages issues (about 2 instead of 2N).
+bool lazySlotScrubEnabled() noexcept
+{
+    static bool const enabled = []()
+    {
+        char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_LAZY_SLOT_SCRUB");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+} // namespace
+
 Slot SlotAllocator::allocate()
 {
     if (numFreeSlots() == 0)
@@ -93,7 +112,11 @@ Slot SlotAllocator::allocate()
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
     scrubEvents();
+    return takeFreeSlot();
+}
 
+Slot SlotAllocator::takeFreeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -130,6 +153,16 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
+    if (lazySlotScrubEnabled())
+    {
+        // numFreeSlots() >= numSlots was checked above, and each take consumes exactly one.
+        scrubEvents();
+        for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
+        {
+            result.push_back(takeFreeSlot());
+        }
+        return result;
+    }
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
         result.push_back(allocate());
@@ -160,7 +193,10 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    if (!lazySlotScrubEnabled())
+    {
+        scrubEvents();
+    }
     TLLM_CHECK_DEBUG(check());
 }
 
