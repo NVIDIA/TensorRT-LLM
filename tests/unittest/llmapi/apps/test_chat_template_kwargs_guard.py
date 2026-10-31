@@ -591,6 +591,7 @@ def test_router_and_server_tool_call_tokenization_match(
     # raw body. The router must tokenize each to the same ids the server does.
     from tensorrt_llm.inputs.utils import MultimodalDataTracker
     from tensorrt_llm.serve.chat_utils import parse_chat_message_content
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 
     template = "{{ messages[0].tool_calls[0].function.arguments.city }}"
     synthetic_tokenizer.chat_template = template
@@ -609,9 +610,11 @@ def test_router_and_server_tool_call_tokenization_match(
     ]
     original = deepcopy(messages)
     request = _chat_request_as_the_server_sees_it({"model": "test-model", "messages": messages})
-    # The strict model keeps `tool_calls` as a lazy pydantic iterator; the raw
-    # fallback hands the plain list through. Pin which path each shape took.
-    assert isinstance(dict(request.messages[0])["tool_calls"], list) is served_via_fallback
+    # The strict model hands the tool calls it validates through as a list and
+    # leaves the ones it rejects lazy, so the server re-reads those from the raw
+    # body. Pin which path each shape took.
+    strict = ChatCompletionRequest(model="test-model", messages=deepcopy(original))
+    assert isinstance(dict(strict.messages[0])["tool_calls"], list) is not served_via_fallback
     router_tokens = render_chat(
         request, RenderResources.from_tokenizer(synthetic_tokenizer), tokenize=True
     ).token_ids

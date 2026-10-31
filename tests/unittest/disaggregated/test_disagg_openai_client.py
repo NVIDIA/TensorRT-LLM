@@ -37,6 +37,10 @@ from tensorrt_llm.serve.disagg_auth import (
 )
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient, _encode_request_body
 from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionResponseChoice,
+    ChatMessage,
     CompletionRequest,
     CompletionResponse,
     CompletionResponseChoice,
@@ -1140,6 +1144,53 @@ class TestDisaggIdRegenOnRetry:
         )
         assert client._router.finish_request.await_count == 1
         assert client._router.finish_request.await_args.kwargs["req_id"] == 42
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("streamed_index", [False, True], ids=["no_index", "streamed_index"])
+    async def test_retry_resends_the_tool_calls_of_a_replayed_turn(self, streamed_index):
+        # A client sends an earlier assistant turn back with its tool calls; one that rebuilt
+        # the turn from a stream keeps the streaming-only `index` on each call.
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+        replayed = {**call, "index": 0} if streamed_index else dict(call)
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        client = self._make_client(session)
+        ok = ChatCompletionResponse(
+            model="m",
+            usage=UsageInfo(prompt_tokens=1, completion_tokens=1),
+            choices=[
+                ChatCompletionResponseChoice(
+                    index=0, message=ChatMessage(role="assistant", content="ok")
+                )
+            ],
+        )
+        session.post.side_effect = [
+            aiohttp.ClientError("transient"),
+            self._mock_http_ok(ok.model_dump()),
+        ]
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [replayed]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ],
+            stream=False,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only", disagg_request_id=42
+            ),
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            response = await client.send_request(request)
+
+        assert isinstance(response, ChatCompletionResponse)
+        bodies = [msgspec.msgpack.decode(c.kwargs["data"]) for c in session.post.call_args_list]
+        assert len(bodies) == 2
+        for attempt, body in enumerate(bodies):
+            assert body["messages"][1]["tool_calls"] == [call], (
+                f"attempt {attempt} must forward the replayed tool call, without the "
+                "streaming-only index; the first serialization must not use it up"
+            )
 
 
 class TestSelectiveTransientTcpRetry:
