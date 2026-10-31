@@ -135,6 +135,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.silu_and_m
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flashinfer_top_k_ragged_transform import (
     flashinfer_top_k_ragged_transform,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
+    qsa_expand_block_indices,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
@@ -160,7 +163,6 @@ from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
-from .ops.attention.qsa_expand_block_indices__r21 import qsa_expand_block_indices
 from .ops.attention.qsa_mtp_reuse_topk__r43 import qsa_mtp_reuse_topk
 from .ops.attention.qsa_paged_index_scores__r20 import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store__r18 import qsa_paged_index_store

@@ -28,10 +28,11 @@ from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
+    qsa_expand_block_indices as _expand,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .qsa_expand_block_indices__r21 import qsa_expand_block_indices as _expand
 
 #: Consecutive scores a thread holds (one 16-byte load).
 KPT = 4

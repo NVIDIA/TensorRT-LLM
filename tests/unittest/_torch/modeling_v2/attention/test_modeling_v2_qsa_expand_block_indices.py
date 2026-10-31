@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qsa_expand_block_indices catalog entry.
+"""GPU test for the unified target's qsa_expand_block_indices variant.
 
 Selections are built the way `qsa_topk_select` emits them: a random subset of
 the complete visible groups, prefix-packed, then `-1`. Every gate is bitwise.
@@ -11,11 +11,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_expand_block_indices import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (  # noqa: E501
     qsa_expand_block_indices as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_expand_block_indices requires a CUDA device"
@@ -31,7 +31,10 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 DEV = "cuda"
 CR, TOPK = 4, 2048
+# The tp1 engine's max_seq_len: where `_serving_rows` places its continuation chunks.
 ENGINE_MAX_SEQ_LEN = 8192
+# The unified target's longest sequence (the tune's perf configs): every cell's bound.
+ENVELOPE_MAX_SEQ_LEN = 262144
 
 
 def _serving_rows(requests: int, context_lens: tuple) -> tuple[list[int], list[int]]:
@@ -55,18 +58,34 @@ def _serving_rows(requests: int, context_lens: tuple) -> tuple[list[int], list[i
     return positions, lengths
 
 
+def _decode_positions(rows: int, top: int) -> list[int]:
+    """One decode row per request, spread over [1, top): the first row sees one group,
+    the last is near `top`, and `i % 4` cycles the tail width through 0..3."""
+    step = (top - 4) // (rows - 1) // CR * CR
+    positions = [1 + i * step + i % CR for i in range(rows)]
+    assert positions[-1] < top
+    return positions
+
+
 def _rows(batch) -> tuple[list[int], list[int]]:
     kind = batch[0]
     if kind == "sweep":
         positions = [4096 + 13 * i for i in range(batch[1])]
+    elif kind == "decode":
+        positions = _decode_positions(batch[1], batch[2])
+        assert max(positions) + 1 <= ENVELOPE_MAX_SEQ_LEN
     elif kind == "serving":
         return _serving_rows(batch[1], batch[2])
+    elif kind == "chunk":
+        start, rows = batch[1], batch[2]
+        assert start + rows <= ENVELOPE_MAX_SEQ_LEN
+        return list(range(start, start + rows)), [start + rows] * rows
     else:
         assert kind == "verify", kind
         starts, per_request = batch[1], batch[2]
         positions = [s + i for s in starts for i in range(per_request)]
         lengths = [s + per_request for s in starts for _ in range(per_request)]
-        assert max(lengths) <= ENGINE_MAX_SEQ_LEN
+        assert max(lengths) <= ENVELOPE_MAX_SEQ_LEN
         return positions, lengths
     return positions, [p + 1 for p in positions]
 
@@ -108,17 +127,19 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert out.dtype == torch.int32 and out.is_cuda and out.is_contiguous()
     assert tuple(out.shape) == (rows, final)
     _compare(out, op.reference(*args, **geometry))
-    if cell.spec["batch"][0] == "serving":
+    if cell.spec["batch"][0] in ("serving", "chunk"):
         positions, lengths = args[1], args[2]
         assert bool((lengths.long() > positions.long() + 1).any()), (
-            "a serving cell must drive sequence_lengths past position + 1"
+            "a context cell must drive sequence_lengths past position + 1"
         )
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    """Capturable, and a replay recomputes from whatever the buffers now hold: the 256 rows
-    a verify step of 32 requests carries at max_draft_len 7."""
-    rows = 256
+@pytest.mark.parametrize("rows", [1, 128, 256, 1024])
+def test_cuda_graph_capture_and_replay(rows: int) -> None:
+    """Capturable, and a replay recomputes from whatever the buffers now hold, at both
+    launch shapes: one decode row (columns split across programs), the 128-request decode
+    batch (the first whole-row launch), and the verify steps of 32 and 128 requests at
+    max_draft_len 7 (256 and 1024 rows)."""
     positions = torch.tensor([4096 + 7 * i for i in range(rows)], device=DEV)
     lengths = (positions + 1).to(torch.int32)
     blocks = _packed_selection(positions, CR, TOPK, seed=31)
