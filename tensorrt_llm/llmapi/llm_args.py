@@ -7268,22 +7268,28 @@ class TorchLlmArgs(BaseLlmArgs):
             raise ValueError(
                 "Mixed-precision KV supports the TRTLLM and FLASHINFER attention "
                 f"backends; got attn_backend={self.attn_backend!r}.")
-        if self.sparse_attention_config is not None:
-            raise ValueError(
-                "Mixed-precision KV is not supported together with sparse attention."
-            )
         # The connector layout maps every cache layer to one model layer; the
         # retained-token layers break that mapping.
         if self.kv_connector_config is not None:
             raise ValueError(
                 "Mixed-precision KV is not supported together with a KV connector."
             )
-        if (self.speculative_config is not None
-                or self.kv_cache_compression_config is not None
+        sparse = self.sparse_attention_config
+        if sparse is not None and sparse.algorithm not in ("dsa",
+                                                           "deepseek_v4"):
+            raise ValueError(
+                "Mixed-precision KV supports the dsa and deepseek_v4 sparse "
+                f"attention algorithms; got {sparse.algorithm!r}.")
+        if (self.kv_cache_compression_config is not None
                 or self.max_beam_width != 1):
             raise ValueError(
                 "Mixed-precision KV currently requires single-beam execution "
-                "without speculative decoding or cold-page compression.")
+                "without cold-page compression.")
+        if getattr(self.speculative_config, "use_dynamic_tree", False):
+            raise NotImplementedError(
+                "Mixed-precision KV does not support dynamic-tree speculative "
+                "decoding, which moves accepted KV rows inside the cache pools."
+            )
         return self
 
     @model_validator(mode="after")

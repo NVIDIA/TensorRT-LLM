@@ -33,6 +33,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
+from ..mixed_precision_retained_rows import overlay_retained_rows
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -479,6 +480,16 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                         max_compressed_kv_tokens,
                         num_pool_tokens,
                     )
+            if metadata.has_mixed_precision_retained_rows:
+                overlay_retained_rows(
+                    self,
+                    metadata,
+                    compressed_local_indices,
+                    req_id,
+                    compressed_indices,
+                    scratch,
+                    shared_rows=attention_input_type != AttentionInputType.generation_only,
+                )
             metadata.nvfp4_compress_fp8_scratch = scratch
             global_indices[:, -num_compressed_indices:] = compressed_indices
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()

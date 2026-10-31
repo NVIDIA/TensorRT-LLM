@@ -1063,6 +1063,30 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return float("inf")
         return self._max_num_tokens + (quota - context_limit_quota) / generation_size_per_token
 
+    # One high-precision twin per compressed layer.
+    _supports_mixed_precision_kv = True
+    _mixed_precision_native_pool = True
+
+    def _is_mixed_precision_layer(self, local_layer_idx: int) -> bool:
+        return super()._is_mixed_precision_layer(local_layer_idx) and compress_ratio_has_attention(
+            self._compress_ratios[self.pp_layers[local_layer_idx]], DeepseekV4AttentionType.COMPRESS
+        )
+
+    def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
+        # A compressed page holds tokens_per_block // ratio rows.
+        return self.compressed_block_sizes[self.pp_layers[local_layer_idx]]
+
+    def _add_mixed_precision_layers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        config = super()._add_mixed_precision_layers(config)
+        if self.high_layers:
+            self._num_manager_layers = len(config.layers)
+            # Disaggregated transfer names every layer through this map.
+            for local, twin in self.high_layers.items():
+                self._layer_attn_to_layer_id[
+                    self.pp_layers[local], DeepseekV4AttentionType.RETAINED
+                ] = LayerId(twin)
+        return config
+
     def _build_cache_config(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """
         Add DeepSeek-V4 layers and warmup constraints to the cache config.
@@ -2078,6 +2102,9 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         """
         buffers_handled = set()
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            if attn == DeepseekV4AttentionType.RETAINED:
+                # The base manager owns the twins' buffers.
+                continue
             buffer_key = (layer_id, attn.role)
             if buffer_key in buffers_handled:
                 continue
@@ -2117,6 +2144,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # buffers -- the clobber case the per-buffer key exists to avoid.
         buffers_per_layer: Dict[int, set] = defaultdict(set)
         for layer, attn in self._layer_attn_to_layer_id:
+            if attn == DeepseekV4AttentionType.RETAINED:
+                continue
             buffers_per_layer[layer].add((self._layer_attn_to_layer_id[(layer, attn)], attn.role))
         multi = sum(1 for bufs in buffers_per_layer.values() if len(bufs) > 1)
         return (
@@ -2136,6 +2165,8 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # Handle each attention buffer from start to end to traverse the whole
         # KV cache. Multiple attention buffers can now share one cache layer.
         for (layer, attn), layer_id in self._layer_attn_to_layer_id.items():
+            if attn == DeepseekV4AttentionType.RETAINED:
+                continue
             buffers = [((layer_id, attn.role), self.get_buffers(layer, attn))]
             if self._use_nvfp4_compress and attn == DeepseekV4AttentionType.COMPRESS:
                 buffers.append(

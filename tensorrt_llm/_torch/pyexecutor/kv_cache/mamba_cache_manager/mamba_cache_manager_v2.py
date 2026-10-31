@@ -130,6 +130,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # re-prefill (see _has_recurrent_state on the attention-only base classes).
     _has_recurrent_state = True
 
+    # Twins are appended like any attention layer group.
+    _supports_mixed_precision_kv = True
     # Set per instance when the MLA latent cache uses the FP4 MLA layout.
     _attention_cache_layout_policy = None
     # Set per instance once the FP4 MLA layout has logged a snapshot move.
@@ -490,13 +492,21 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         layer. With it, the MLA latent and HP-ring layers use the policy's
         ``2 * L`` / ``2 * L + 1`` encoding, and recurrent layers use ``2 * L``
         so that the IDs stay collision-free across all of the manager's
-        layers and identical under any pipeline split.
+        layers and identical under any pipeline split. Mixed-precision twins
+        use the same encoding: ``2 * L`` for the model's layers, ``2 * L + 1``
+        for the twin of layer ``L``.
         """
         layout_policy = self._attention_cache_layout_policy
+        twin_owner = {twin: local for local, twin in self.high_layers.items()}
         result = []
         for layer_id in self.impl.layer_grouping[layer_group_id]:
             internal_layer = int(layer_id)
-            if layout_policy is None:
+            if layout_policy is None and twin_owner:
+                if internal_layer in twin_owner:
+                    global_layer_id = 2 * int(self.pp_layers[twin_owner[internal_layer]]) + 1
+                else:
+                    global_layer_id = 2 * int(self.pp_layers[internal_layer])
+            elif layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
@@ -571,8 +581,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _is_local_mamba_layer(self, local_layer_idx: int) -> bool:
         if local_layer_idx >= len(self.pp_layers):
-            # Virtual layers past the model's own (the FP4 MLA HP ring) are
-            # attention layers.
+            # Virtual layers past the model's own (the FP4 MLA HP ring or the
+            # mixed-precision twins) are attention layers.
             return False
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
@@ -580,13 +590,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
         if layer_id >= self.num_local_layers:
-            # Virtual layers past the model's own exist only for the FP4 MLA
-            # HP ring.
+            # Virtual layers past the model's own are the FP4 MLA HP ring or
+            # the mixed-precision twins.
             if (
                 self._attention_cache_layout_policy is not None
                 and LayerId(layer_id) in self._hp_manager_layer_ids
             ):
                 return Role.MLA_HP_TAIL, None
+            if layer_id in self.high_layers.values():
+                return super()._get_pool_roles(pool_id)
             raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
         if self._is_local_mamba_layer(layer_id):
             return MambaRole.SSM_STATE, None
@@ -1037,11 +1049,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return 0
 
     @override
-    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
+    def get_buffers(
+        self, layer_idx: int, kv_layout: str = "NHD", **kwargs
+    ) -> Optional[torch.Tensor]:
         local_layer_idx = self.layer_offsets[layer_idx]
         if self._is_local_mamba_layer(local_layer_idx):
             return None
-        return super().get_buffers(layer_idx, kv_layout)
+        return super().get_buffers(layer_idx, kv_layout, **kwargs)
 
     @override
     def _create_kv_cache(

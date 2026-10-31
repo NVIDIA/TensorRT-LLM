@@ -59,6 +59,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     """
 
     kda_context_only = False
+    # Its sparse MLA backend has no retained-row hooks.
+    _supports_mixed_precision_kv = False
 
     @override
     def __init__(

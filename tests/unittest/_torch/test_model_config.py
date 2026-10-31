@@ -425,3 +425,21 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
         model_config,
         _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
     )
+
+
+@pytest.mark.parametrize(
+    "dtype,draft_algo",
+    [("mixed_nvfp4_fp8", QuantAlgo.FP8.value), ("mixed_nvfp4_bfloat16", QuantAlgo.NO_QUANT)],
+)
+def test_validate_and_set_kv_cache_quant_sparse_mixed_keeps_drafter_plain(dtype, draft_algo):
+    """dsa keeps its history in NVFP4; a separate drafter's cache stays in the retained dtype."""
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    model_config = ModelConfig(
+        pretrained_config=types.SimpleNamespace(torch_dtype=torch.bfloat16),
+        quant_config=QuantConfig(),
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+    )
+    validate_and_set_kv_cache_quant(model_config, dtype)
+    assert model_config.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4.value
+    assert model_config.extra_attrs.get("mixed_precision_draft_kv_cache_quant_algo") == draft_algo

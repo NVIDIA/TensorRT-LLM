@@ -307,6 +307,25 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
+        # One twin page table per compression ratio; -1 = not retained.
+        manager = self.kv_cache_manager
+        if getattr(manager, "high_layers", None):
+            self._retained_table_layers = {}
+            for local in manager.high_layers:
+                layer_idx = manager.pp_layers[local]
+                self._retained_table_layers.setdefault(
+                    manager._compress_ratios[layer_idx], layer_idx
+                )
+            self.retained_block_table = {
+                compress_ratio: self.get_empty(
+                    self.cuda_graph_buffers,
+                    compress_block_table_shape,
+                    cache_name=f"retained_block_table_{compress_ratio}",
+                    dtype=torch.int32,
+                    capture_graph=capture_graph,
+                )
+                for compress_ratio in self._retained_table_layers
+            }
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -518,6 +537,19 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
+        if self.retained_block_table is not None:
+            manager = self.kv_cache_manager
+            for compress_ratio, high_table in self.retained_block_table.items():
+                # Any twin of this ratio shares the pool.
+                layer_idx = self._retained_table_layers[compress_ratio]
+                table = torch.full(
+                    (self.num_seqs, high_table.shape[1]),
+                    -1,
+                    dtype=torch.int32,
+                    pin_memory=prefer_pinned(),
+                )
+                manager.fill_high_precision_page_table(self.request_ids, layer_idx, table.numpy())
+                high_table[: self.num_seqs].copy_(table, non_blocking=True)
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -698,6 +730,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Repoint sparse fields to the draft buffers for a draft forward."""
+        # Draft layers keep a plain cache: no retained rows while the draft manager is swapped in.
+        self.swap_for_draft("retained_block_table", None)
         if self.draft_sliding_block_tables is None:
             return None
         saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}

@@ -3640,9 +3640,11 @@ def _build_v2_hybrid_with_mamba_layer(
     max_batch_size=4,
     num_mamba_layers=1,
     num_attention_layers=1,
+    num_draft_layers=0,
     num_kv_heads=4,
     mapping=None,
     spec_config=None,
+    pretrained_config=None,
     use_replay_state_update=False,
     enable_block_reuse=False,
     enable_partial_reuse=True,
@@ -3677,8 +3679,9 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_tokens: int = 8192,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
-    mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
-    attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
+    # Draft layers of a combined speculative manager follow the model's layers in both masks.
+    mamba_mask = [True] * num_mamba_layers + [False] * (num_attention_layers + num_draft_layers)
+    attn_mask = [False] * num_mamba_layers + [True] * (num_attention_layers + num_draft_layers)
     if mapping is None:
         mapping = Mapping(
             world_size=1,
@@ -3752,7 +3755,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_attention_layers,
+        num_layers=num_attention_layers + num_draft_layers,
         num_kv_heads=num_kv_heads,
         head_dim=64,
         tokens_per_block=32,
@@ -3762,6 +3765,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -3896,6 +3900,94 @@ def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) 
 
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[ssm_pool_id, :, 1]) == 0
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[attention_pool_id, :, 1]) > 0
+    finally:
+        mgr.shutdown()
+
+
+def _mixed_precision_kv_cache_config() -> KvCacheConfig:
+    """A small mixed-precision NVFP4 cache whose leading and trailing 32 tokens keep FP16."""
+    return KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=False,
+        dtype="mixed_nvfp4_float16",
+        mixed_precision_first_n=32,
+        mixed_precision_last_n=32,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_appends_retained_group():
+    """The retained-token twin of the attention layer sits behind the SSM and attention layers."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        # Layer 0 is recurrent state, layer 1 the attention layer, layer 2 its twin.
+        assert mgr.high_layers == {1: 2}
+        assert not mgr._is_local_mamba_layer(2)
+        assert mgr.get_buffers(0) is None
+        low = mgr.get_buffers(1, mixed_precision_pool="low")
+        high = mgr.get_buffers(1, mixed_precision_pool="high")
+        assert low.dtype == torch.uint8
+        assert high.dtype == torch.float16
+        assert high.shape[1:] == (2, 32, 4, 64)
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=False)
+        low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
+        assert len(low_pages[0]) == len(high_pages[0]) == 4
+        assert min(low_pages[0]) >= 0
+        # The leading (sink) and trailing (window) pages are always retained.
+        assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_mixes_appended_mtp_layer():
+    """An MTP layer appended to the hybrid manager's mask goes mixed like the target layers."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        spec_config=MTPDecodingConfig(max_draft_len=1),
+        num_draft_layers=1,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        # Layers 0 (recurrent), 1 (attention), 2 (MTP): both attention layers get a twin.
+        assert mgr._first_spec_layer_id is None
+        assert mgr.high_layers == {1: 3, 2: 4}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_names_twins():
+    """Disaggregated transfer gives a hybrid manager's twins collision-free layer ids."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        assert mgr.high_layers == {1: 2}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        # Model layers L -> 2L, the twin of layer L -> 2L + 1.
+        assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()
 

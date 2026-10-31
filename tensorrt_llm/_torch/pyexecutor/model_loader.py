@@ -188,6 +188,16 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    unquantized_retained_dtype = mapped_pyt_quant is None
+    if (pyt_kv_cache_dtype.startswith("mixed_")
+            and getattr(model_config.sparse_attention_config, "algorithm",
+                        None) in ("dsa", "deepseek_v4")):
+        # These backends keep the history in their own pool, in the low-precision format.
+        # A drafter with its own architecture keeps a plain cache in the retained dtype.
+        model_config.extra_attrs[
+            "mixed_precision_draft_kv_cache_quant_algo"] = (mapped_pyt_quant or
+                                                            QuantAlgo.NO_QUANT)
+        mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
@@ -226,7 +236,7 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
 
     # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
     # would otherwise reject it after the weights are loaded.
-    if mapped_pyt_quant is None:
+    if unquantized_retained_dtype:
         retained_dtype = str_dtype_to_torch(
             pyt_kv_cache_dtype.rsplit("_", 1)[1])
         if model_config.torch_dtype != retained_dtype:

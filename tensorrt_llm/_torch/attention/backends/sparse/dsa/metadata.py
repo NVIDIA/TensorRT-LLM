@@ -94,6 +94,10 @@ class TokenMajorGenView:
 class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     """Attention metadata for DSA (Dense Sparse Attention) with indexer state."""
 
+    # Twin page table (-1 = not retained) and context positions.
+    retained_block_table = None
+    draft_retained_block_table = None
+    retained_context_positions = None
     sparse_metadata_params: Optional[DSAMetadataParams] = None
     use_fp8_ds_mla: bool = field(default=False, init=False)
     # Store reference to indexer for preparation stage
@@ -377,6 +381,40 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_indexer(capture_graph=capture_graph)
         self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
 
+    def _has_mixed_precision_staging(self) -> bool:
+        # No staging: attention reads the gather's FP8 scratch.
+        return False
+
+    @property
+    def has_mixed_precision_retained_rows(self) -> bool:
+        """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
+        return self.retained_block_table is not None
+
+    def _fill_retained_block_tables(self) -> None:
+        """Refresh the twin page tables over their full width.
+
+        The MTP draft loop writes past this step's kv lengths, so every column a request
+        has allocated must be current; the rest stay -1.
+        """
+        for manager, high_table in (
+            (self.kv_cache_manager, self.retained_block_table),
+            (self.draft_kv_cache_manager, self.draft_retained_block_table),
+        ):
+            if high_table is None:
+                continue
+            table = torch.full(
+                (self.num_seqs, high_table.shape[1]),
+                -1,
+                dtype=torch.int32,
+                pin_memory=prefer_pinned(),
+            )
+            # Every twin shares one pool and page scale, so one table serves all layers.
+            local = next(iter(manager.high_layers))
+            manager.fill_high_precision_page_table(
+                self.request_ids, manager.pp_layers[local], table.numpy()
+            )
+            high_table[: self.num_seqs].copy_(table, non_blocking=True)
+
     def prepare(self):
         self._validate_ragged_verification()
         super().prepare()
@@ -430,6 +468,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Select native DSA indexer metadata for a draft forward."""
+        # MTP layers on the draft manager use its twin table; other drafters have none.
+        self.swap_for_draft("retained_block_table", self.draft_retained_block_table)
         # DeepSeek-V4 metadata inherits DSA metadata, but its cache manager uses a
         # different dual-pool layout. Only native DSA cache managers use the DSA
         # draft-replay buffers below.
@@ -1106,6 +1146,23 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int32,
             capture_graph=capture_graph,
         )
+        # Twin page table; -1 = not retained.
+        if getattr(self.kv_cache_manager, "high_layers", None):
+            self.retained_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [self.max_num_sequences, self.kv_cache_manager.max_blocks_per_seq],
+                cache_name="retained_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+        if getattr(self.draft_kv_cache_manager, "high_layers", None):
+            self.draft_retained_block_table = self.get_empty(
+                self.cuda_graph_buffers,
+                [self.max_num_sequences, self.draft_kv_cache_manager.max_blocks_per_seq],
+                cache_name="draft_retained_block_table",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
         if is_dsa_cache_manager(self.draft_kv_cache_manager):
             self.draft_block_table = self.get_empty(
                 self.cuda_graph_buffers,
@@ -2079,6 +2136,26 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
+        self._fill_retained_block_tables()
+        high_table = self.retained_block_table
+        if high_table is not None:
+            # Absolute position of every context token, for the retained-row write.
+            self.retained_context_positions = None
+            if self.num_ctx_tokens > 0:
+                positions = torch.empty(
+                    self.num_ctx_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+                )
+                torch.cat(
+                    [
+                        torch.arange(int(cached), int(cached) + int(length), dtype=torch.int32)
+                        for cached, length in zip(
+                            cached_token_lens[: self.num_contexts].tolist(),
+                            self.seq_lens[: self.num_contexts].tolist(),
+                        )
+                    ],
+                    out=positions,
+                )
+                self.retained_context_positions = positions.to(high_table.device, non_blocking=True)
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens

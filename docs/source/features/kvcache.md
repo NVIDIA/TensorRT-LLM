@@ -167,9 +167,12 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
-The prototype requires the TRTLLM or FlashInfer attention backend with
-`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.
+The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
+FlashInfer attention backend. It supports the standard V2 manager (dense
+models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
+backends (DSA, DeepSeek-V4), and speculative decoding except dynamic-tree
+drafting. Beam search, cold-page compression, KV connectors and context
+parallelism are not supported.
 
 ### SWA Endpoint Retention
 

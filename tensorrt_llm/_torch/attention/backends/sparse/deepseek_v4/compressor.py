@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..mixed_precision_retained_rows import store_retained_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -352,6 +353,19 @@ class Compressor(nn.Module):
             scale_output,
         )
 
+        # Write the twin with the same scatter.
+        if not self.is_indexer and metadata.has_mixed_precision_retained_rows:
+            store_retained_compressed_rows(
+                self,
+                metadata,
+                kv_comp,
+                position_ids,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                compressed_mask,
+                bsz,
+            )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
                 return quant_output.view(torch.float4_e2m1fn_x2), scale_output
