@@ -110,13 +110,18 @@ public:
     static std::pair<std::vector<int32_t>, std::vector<int32_t>> batchWatermarks(Batch const& batch);
 
     // Run the sparse resolve kernel over caller-supplied state, so the
-    // probe index, victim choice and recency rebuild can be exercised without a request.
+    // probe index and victim choice can be exercised without a request.
     // Synchronises. Inputs are [layer][entry] and [layer][selectionWidth] row-major.
     struct SparseResolveProbe
     {
         std::vector<int32_t> residentOrdinal; //!< [layer][entry] after the resolve
-        std::vector<int32_t> lruOrder;        //!< [layer][entry] after the resolve
-        std::vector<int32_t> outSlot;         //!< [layer][width] entry per selection
+        //! [layer][entry] steps since each entry's last use, and whether that use found it
+        //! already resident. Together they are the eviction order: an entry is given away
+        //! before an entry of the same age that was hit, and before any younger one. -1 and
+        //! false where the entry is free.
+        std::vector<int32_t> entryAge;
+        std::vector<int32_t> entryHit;
+        std::vector<int32_t> outSlot; //!< [layer][width] entry per selection
         //! The compacted work list, one per layer: [layer][rows * width], of which the
         //! first missTotal[layer] are valid, in whatever order the CTAs raced to.
         std::vector<int32_t> missRow;
@@ -127,8 +132,11 @@ public:
         std::vector<int32_t> inFlightSlot; //!< [layer][maxInFlightUnits]
     };
 
+    //! @param entryAge [layer][entry] steps since each entry's last use, as the state the
+    //! resolve starts from. Empty leaves every entry at zero, which makes the eviction order
+    //! among them arbitrary.
     static SparseResolveProbe sparseResolve(std::vector<int32_t> const& residentOrdinal,
-        std::vector<int32_t> const& lruOrder, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
+        std::vector<int32_t> const& entryAge, int numLayers, int entriesPerLayer, std::vector<int32_t> const& selected,
         int selectionWidth, std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits,
         int maxInFlightUnits, std::vector<int32_t> const& inactiveRows);
 

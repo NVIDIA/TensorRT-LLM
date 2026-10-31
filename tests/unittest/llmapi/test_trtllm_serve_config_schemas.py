@@ -353,6 +353,48 @@ def test_llm_model_fields_have_schema(schemas: dict[str, dict]) -> None:
         _assert_model_fields_in_schema(TorchLlmArgs, schema["properties"])
 
 
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("config_name", "algorithm"),
+    [("DeepSeekSparseAttentionConfig", "dsa"), ("DeepSeekV4SparseAttentionConfig", "deepseek_v4")],
+)
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_sparse_offload_indexer_default(
+    schemas: dict[str, dict], filename: str, config_name: str, algorithm: str, enabled: bool | None
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import (
+        DeepSeekSparseAttentionConfig,
+        DeepSeekV4SparseAttentionConfig,
+    )
+
+    config_cls = {
+        "dsa": DeepSeekSparseAttentionConfig,
+        "deepseek_v4": DeepSeekV4SparseAttentionConfig,
+    }[algorithm]
+    sparse_config: dict[str, str | bool] = {"algorithm": algorithm}
+    if enabled is not None:
+        sparse_config["enable_kv_cache_offload"] = enabled
+    schema = schemas[filename]
+    definition = schema["$defs"][config_name]
+    field = "use_cute_dsl_paged_mqa_logits"
+    assert "default" not in definition["properties"][field]
+    condition = definition["allOf"][0]
+    branch = "then" if Draft202012Validator(condition["if"]).is_valid(sparse_config) else "else"
+    expected = enabled is not True
+    assert condition[branch]["properties"][field]["default"] is expected
+    assert config_cls.model_validate(sparse_config).use_cute_dsl_paged_mqa_logits is expected
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"sparse_attention_config": sparse_config})
+    for value in (False, True):
+        explicit = {**sparse_config, field: value}
+        assert validator.is_valid({"sparse_attention_config": explicit})
+        assert config_cls.model_validate(explicit).use_cute_dsl_paged_mqa_logits is value
+    for invalid in (None, "invalid", 2):
+        assert not validator.is_valid(
+            {"sparse_attention_config": {**sparse_config, field: invalid}}
+        )
+
+
 def test_model_field_guard_detects_missing_fields_and_aliases() -> None:
     class Config(BaseModel):
         plain: int

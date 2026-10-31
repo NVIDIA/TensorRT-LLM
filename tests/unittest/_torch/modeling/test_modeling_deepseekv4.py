@@ -1265,6 +1265,37 @@ def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch)
     assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
 
 
+@pytest.mark.parametrize("enable_offload", [False, True])
+def test_deepseek_v4_model_config_preserves_sparse_offload(tmp_path, monkeypatch, enable_offload):
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        num_hidden_layers=8,
+        compress_ratios=[0, 0, 4, 128, 4, 128, 4, 128],
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
+    )
+    offload_options = (
+        {"gpu_cache_factor": 3.0, "host_history_size": 2 * 1024**3} if enable_offload else {}
+    )
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=enable_offload,
+        kv_cache_offload_config=offload_options,
+    )
+
+    resolved = ModelConfig.from_pretrained(
+        str(tmp_path),
+        sparse_attention_config=sparse_config,
+        attn_backend="TRTLLM",
+        moe_backend="TRTLLM",
+    ).sparse_attention_config
+
+    assert resolved.enable_kv_cache_offload is enable_offload
+    assert resolved.kv_cache_offload_config == sparse_config.kv_cache_offload_config
+    assert resolved.compress_ratios == [1, 1, 4, 128, 4, 128, 4, 128]
+    assert sparse_config.compress_ratios == [1, 1, 4, 128, 4, 128, 4]
+
+
 def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):
     checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
     config = DeepseekV4Config(

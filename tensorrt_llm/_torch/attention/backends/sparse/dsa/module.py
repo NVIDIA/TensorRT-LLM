@@ -177,6 +177,7 @@ def forward_sparse_attn(
             standard output at index zero.
     """
     output = attn_output[0]
+    self.mqa.prepare_sparse_write(attn_metadata)
     proj_outputs = forward_dsa_proj(self, position_ids, hidden_states, attn_metadata)
     q, compressed_kv, k_pe, latent_cache = proj_outputs[:4]
     indexer_intermediates = proj_outputs[4:]
@@ -203,6 +204,11 @@ def forward_sparse_attn_custom_op(
     """Run DSA's two-stage custom ops for piecewise CUDA graph capture."""
     del latent_cache_gen
     from . import custom_ops  # noqa: F401
+
+    # Metadata-dependent cache work stays outside the projection custom op.
+    if not torch.compiler.is_compiling():
+        attn_metadata, _ = custom_ops._extract_extra_attrs(self.layer_idx_str)
+        self.mqa.prepare_sparse_write(attn_metadata)
 
     if isinstance(hidden_states, Fp4QuantizedTensor):
         proj_outputs = torch.ops.trtllm.mla_dsa_proj(
@@ -325,6 +331,7 @@ def _forward_dsa_attn(
     num_tokens comes from batch-specific metadata and must not be
     baked into CUDA graph capture.
     """
+    self.mqa.prepare_sparse_write(attn_metadata)
     num_contexts = attn_metadata.num_contexts
     num_generations = attn_metadata.num_generations
     num_ctx_tokens = attn_metadata.num_ctx_tokens
@@ -411,6 +418,7 @@ def _forward_dsa_attn(
     # capture requires the join within the same layer's forward.
     if self.mqa.indexer is not None:
         self.mqa.indexer.maybe_join_prev_topk_copy()
+    self.mqa.prefetch_next_sparse_history(attn_metadata)
 
 
 def should_use_short_mha(

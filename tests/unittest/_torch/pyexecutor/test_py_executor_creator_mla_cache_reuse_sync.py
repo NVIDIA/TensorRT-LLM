@@ -851,6 +851,37 @@ def test_startup_allocation_phases(monkeypatch, estimate):
     assert timers[0].depth == 0
 
 
+@pytest.mark.parametrize("decode_only", [False, True], ids=["default", "decode_only"])
+def test_decode_only_worker_skips_kv_cache_estimation(monkeypatch, decode_only):
+    """A decode-only worker cannot run the dummy-prompt profiling forward."""
+    skip_est_args = []
+
+    class RecordingCacheCreator(_DummyKvCacheCreator):
+        """Record whether estimation was disabled at construction."""
+
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            skip_est_args.append(kwargs["skip_est"])
+
+    monkeypatch.delenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", raising=False)
+    monkeypatch.setattr(py_executor_creator, "is_decode_only", lambda config: decode_only)
+    _run_create_py_executor(
+        monkeypatch,
+        sm_version=100,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        kv_cache_creator_cls=RecordingCacheCreator,
+        # A decode-only worker is a disaggregated generation server; creation refuses
+        # one without a cache transceiver.
+        cache_transceiver_config=(
+            CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
+            if decode_only
+            else None
+        ),
+    )
+
+    assert skip_est_args == [decode_only]
+
+
 @pytest.mark.parametrize("failure_stage", ["profiling", "allocation", "rebind"])
 def test_failed_resource_transition_closes_executor(monkeypatch, failure_stage):
     executors = []

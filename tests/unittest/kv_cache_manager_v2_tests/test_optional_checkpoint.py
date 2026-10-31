@@ -385,12 +385,12 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
         assert cache.resume(stream.cuda_stream)
         assert cache.resize(64)
         required = manager.get_buffer_group_id(0, "key")
-        scratch = cache.get_scratch_desc(required)
-        assert scratch is not None
-        blocks = scratch.range.end - scratch.range.beg
+        scratch_range = cache.get_swa_scratch_range(required)
+        assert scratch_range
+        blocks = scratch_range.end - scratch_range.beg
         # The side pool has one buffer for each of two layers and needs half
         # a slot per logical block, more than K/V's two-fifths share.
-        assert len(scratch.slot_ids) == (blocks + 1) // 2
+        assert len(cache.get_scratch_slots(required)) == (blocks + 1) // 2
         for layer in layers:
             spans = []
             for buffer in layer.buffers:
@@ -399,7 +399,8 @@ def test_scratch_addresses_with_unequal_buffer_membership(split):
                 indices = converter(
                     cache.get_base_page_indices(group),
                     kv.PageIndexMode.PER_LAYER,
-                    cache.get_scratch_desc(group),
+                    cache.get_swa_scratch_range(group),
+                    cache.get_scratch_slots(group),
                 )
                 base = manager.get_mem_pool_base_address(
                     layer.layer_id, buffer.role, kv.PageIndexMode.PER_LAYER

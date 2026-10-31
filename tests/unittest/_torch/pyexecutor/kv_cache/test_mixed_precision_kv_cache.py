@@ -238,7 +238,7 @@ def test_native_common_reuse_and_window_retention(make_manager, policy, reused_t
         assert source.resume(stream) and source.resize(len(tokens))
         source.commit(tokens)
         source.suspend()
-        assert source.resume(stream, is_decoding=True)
+        assert source.resume(stream)
         pages = list(source.get_base_page_indices(high_group))
         assert pages[0] >= 0 and pages[4] >= 0
         assert pages[1:4] == [kv.BAD_PAGE_INDEX] * 3

@@ -263,6 +263,34 @@ CudaUniqPtr<> deviceCopy(std::vector<int32_t> const& values)
     return owned;
 }
 
+CudaUniqPtr<> deviceCopyWords(std::vector<uint32_t> const& values)
+{
+    CUstream const stream = nullptr;
+    auto owned = allocateDeviceMemory(sizeof(uint32_t) * values.size());
+    if (values.empty())
+    {
+        return owned;
+    }
+    cuCheck(cuMemcpyHtoDAsync(
+        reinterpret_cast<CUdeviceptr>(owned.get()), values.data(), sizeof(uint32_t) * values.size(), stream));
+    cuCheck(cuStreamSynchronize(stream));
+    return owned;
+}
+
+std::vector<uint32_t> readBackWords(CudaUniqPtr<> const& buffer, size_t count)
+{
+    CUstream const stream = nullptr;
+    std::vector<uint32_t> out(count);
+    if (count == 0)
+    {
+        return out;
+    }
+    cuCheck(
+        cuMemcpyDtoHAsync(out.data(), reinterpret_cast<CUdeviceptr>(buffer.get()), sizeof(uint32_t) * count, stream));
+    cuCheck(cuStreamSynchronize(stream));
+    return out;
+}
+
 std::vector<int32_t> readBack(CudaUniqPtr<> const& buffer, size_t count)
 {
     CUstream const stream = nullptr;
@@ -280,12 +308,15 @@ std::vector<int32_t> readBack(CudaUniqPtr<> const& buffer, size_t count)
 } // namespace
 
 KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
-    std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& lruOrder, int numLayers,
+    std::vector<int32_t> const& residentOrdinal, std::vector<int32_t> const& entryAge, int numLayers,
     int entriesPerLayer, std::vector<int32_t> const& selected, int selectionWidth,
     std::vector<int32_t> const& historyUnits, std::vector<int32_t> const& capacityUnits, int maxInFlightUnits,
     std::vector<int32_t> const& inactiveRows)
 {
     CUstream const stream = nullptr;
+    // Far enough into the clock that every age the probe accepts has a timestamp of its own
+    // below it, so the state it builds needs no wrap.
+    auto const stepAge = SparseEntry::kMaxAge;
     auto const numRows = static_cast<int>(historyUnits.size());
     auto const perRowEntries = static_cast<size_t>(numLayers) * entriesPerLayer;
     auto const entryCount = perRowEntries * static_cast<size_t>(numRows);
@@ -293,9 +324,14 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto const selectionCount = perRowSelection * static_cast<size_t>(numRows);
     TLLM_CHECK_WITH_INFO(maxInFlightUnits >= 0, "sparseResolve: maxInFlightUnits counts units and cannot be negative");
     TLLM_CHECK_WITH_INFO(numRows != 0 && capacityUnits.size() == historyUnits.size()
-            && residentOrdinal.size() == entryCount && lruOrder.size() == entryCount
+            && residentOrdinal.size() == entryCount && (entryAge.empty() || entryAge.size() == entryCount)
             && selected.size() == selectionCount,
         "sparseResolve: input sizes must match the declared shape");
+    for (auto const age : entryAge)
+    {
+        TLLM_CHECK_WITH_INFO(age >= 0 && static_cast<uint32_t>(age) <= SparseEntry::kMaxAge,
+            "sparseResolve: an entry age must be within the range the eviction clock keeps distinguishable");
+    }
 
     auto selection = deviceCopy(selected);
     auto outSlot = deviceCopy(std::vector<int32_t>(selectionCount, 0));
@@ -310,19 +346,19 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
     auto const inFlightCount = countCount * static_cast<size_t>(maxInFlightUnits);
     auto inFlight = deviceCopy(std::vector<int32_t>(inFlightCount, kNoSparseSlot));
 
-    // One metadata block per lease, its resident ordinals then its recency order, which is
-    // how the arena lays a lease out. The probe takes and returns each array whole, so they
-    // are interleaved on the way in and separated on the way out.
-    auto const leaseInts = 2 * perRowEntries;
-    std::vector<int32_t> metadataHost(leaseInts * static_cast<size_t>(numRows));
-    for (int row = 0; row < numRows; ++row)
+    // One metadata block per lease: the two caller arrays packed into the entry words the
+    // arena actually holds. The probe takes and returns them separately, since an ordinal
+    // and an age are what a test states.
+    std::vector<uint32_t> metadataHost(entryCount);
+    for (size_t i = 0; i < entryCount; ++i)
     {
-        auto const from = perRowEntries * static_cast<size_t>(row);
-        auto const to = leaseInts * static_cast<size_t>(row);
-        std::copy_n(residentOrdinal.begin() + from, perRowEntries, metadataHost.begin() + to);
-        std::copy_n(lruOrder.begin() + from, perRowEntries, metadataHost.begin() + to + perRowEntries);
+        auto const ordinal = residentOrdinal[i];
+        auto const age = entryAge.empty() ? 0U : static_cast<uint32_t>(entryAge[i]);
+        metadataHost[i] = ordinal < 0
+            ? SparseEntry::kFreeWord
+            : SparseEntry::pack(SparseEntry::usedByte(stepAge - age, false), static_cast<uint32_t>(ordinal));
     }
-    auto metadata = deviceCopy(metadataHost);
+    auto metadata = deviceCopyWords(metadataHost);
 
     // Row r takes lease r, except an inactive row, which holds none for the kernel to skip.
     std::vector<int32_t> leaseHost(static_cast<size_t>(numRows));
@@ -333,11 +369,13 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
                                                                                              : row;
     }
     auto leases = deviceCopy(leaseHost);
+    // Device-resident, as the Batch publishes it: the resolve reads the clock rather than
+    // taking it by value.
+    auto stepAgeBuffer = deviceCopy(std::vector<int32_t>(1, static_cast<int32_t>(stepAge)));
 
     SparseArenaView arena;
     arena.metadataBase = metadata.get();
-    arena.leaseStride = sizeof(int32_t) * leaseInts;
-    arena.lruOffset = static_cast<int32_t>(perRowEntries);
+    arena.leaseStride = sizeof(uint32_t) * perRowEntries;
     arena.numLayers = numLayers;
     // One metadata row per layer: this probe drives a model where every layer selects for
     // itself, which is what a resolve sees whenever no selection_id is shared.
@@ -380,21 +418,24 @@ KvCacheIntrospection::SparseResolveProbe KvCacheIntrospection::sparseResolve(
         args.work.capacity = numRows * selectionWidth;
         args.work.numLists = 1;
         args.missCount = reinterpret_cast<int32_t*>(missCount.get()) + countOffset;
+        args.stepAge = reinterpret_cast<int32_t const*>(stepAgeBuffer.get());
 
         launchSparseResolve(args, stream);
     }
     cuCheck(cuStreamSynchronize(stream));
 
     SparseResolveProbe result;
-    auto const metadataOut = readBack(metadata, leaseInts * static_cast<size_t>(numRows));
+    auto const metadataOut = readBackWords(metadata, entryCount);
     result.residentOrdinal.resize(entryCount);
-    result.lruOrder.resize(entryCount);
-    for (int row = 0; row < numRows; ++row)
+    result.entryAge.resize(entryCount);
+    result.entryHit.resize(entryCount);
+    for (size_t i = 0; i < entryCount; ++i)
     {
-        auto const from = leaseInts * static_cast<size_t>(row);
-        auto const to = perRowEntries * static_cast<size_t>(row);
-        std::copy_n(metadataOut.begin() + from, perRowEntries, result.residentOrdinal.begin() + to);
-        std::copy_n(metadataOut.begin() + from + perRowEntries, perRowEntries, result.lruOrder.begin() + to);
+        auto const word = metadataOut[i];
+        auto const ordinal = SparseEntry::ordinal(word);
+        result.residentOrdinal[i] = ordinal;
+        result.entryAge[i] = ordinal < 0 ? -1 : static_cast<int32_t>(SparseEntry::age(word, stepAge));
+        result.entryHit[i] = ordinal < 0 ? 0 : static_cast<int32_t>(SparseEntry::wasHit(word));
     }
     result.outSlot = readBack(outSlot, selectionCount);
     result.missRow = readBack(missRow, selectionCount);
@@ -475,7 +516,6 @@ std::vector<uint8_t> KvCacheIntrospection::sparseUnitCopy(std::vector<uint8_t> c
     // This probe drives the addressing, not the metadata.
     arena.metadataBase = nullptr;
     arena.leaseStride = 0;
-    arena.lruOffset = 0;
     arena.numLayers = 0;
     arena.numSelections = 0;
     arena.entriesPerSelection = 0;
@@ -552,11 +592,13 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
     auto outCount = deviceCopy(std::vector<int32_t>(static_cast<size_t>(numLayers), 0));
 
     // The scan spans the batch, so the hook stands one row in for a single request, holding
-    // one lease laid out as the arena lays one: its resident ordinals, then its recency
-    // order, which the scan does not read.
-    std::vector<int32_t> metadataHost(2 * entryCount, 0);
-    std::copy(residentOrdinal.begin(), residentOrdinal.end(), metadataHost.begin());
-    auto metadata = deviceCopy(metadataHost);
+    // one lease laid out as the arena lays one. The scan reads only the ordinals, so the
+    // age each word carries is left at zero.
+    std::vector<uint32_t> metadataHost(entryCount);
+    std::transform(residentOrdinal.begin(), residentOrdinal.end(), metadataHost.begin(),
+        [](int32_t ordinal)
+        { return ordinal < 0 ? SparseEntry::kFreeWord : SparseEntry::pack(0, static_cast<uint32_t>(ordinal)); });
+    auto metadata = deviceCopyWords(metadataHost);
     auto leases = deviceCopy(std::vector<int32_t>(1, 0));
 
     // A layer per metadata row, in order: the probe drives unshared selections.
@@ -566,8 +608,7 @@ KvCacheIntrospection::SparseFlushList KvCacheIntrospection::sparseFlushList(std:
 
     SparseArenaView arena;
     arena.metadataBase = metadata.get();
-    arena.leaseStride = sizeof(int32_t) * 2 * entryCount;
-    arena.lruOffset = static_cast<int32_t>(entryCount);
+    arena.leaseStride = sizeof(uint32_t) * entryCount;
     arena.numLayers = numLayers;
     arena.numSelections = numLayers;
     arena.entriesPerSelection = entriesPerLayer;

@@ -27,8 +27,12 @@
 #include <cub/cub.cuh>
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -47,32 +51,38 @@ namespace
         }                                                                                                              \
     } while (0)
 
+//! Threads a copy, out-index or flush-list CTA takes. The resolve is templated on its own
+//! width instead; see resolveThreads().
 constexpr int kThreads = 256;
+//! The two widths the resolve is instantiated at. Nothing wider was ever faster at any
+//! shape measured, and the narrow one must still cover the eviction histogram.
+constexpr int kResolveThreadsNarrow = 256;
+constexpr int kResolveThreadsWide = 512;
 constexpr uint32_t kWarpSize = 32;
 constexpr int32_t kWarpsPerCopyCta = kThreads / static_cast<int>(kWarpSize);
-constexpr int32_t kEmptyKey = -1;
 //! kBadPageIndex as a plain int32, since device code cannot use the strong typedef.
 constexpr int32_t kBadPageIndexValue = kBadPageIndex.value();
-constexpr int32_t kFreeOrdinal = kBadBlockOrdinal.value();
 
-//! A lease's metadata block: its resident ordinals, with its recency order at `lruOffset`.
+//! A lease's metadata block: one SparseEntry word per entry.
 //!
 //! Every lease of a life cycle is the same size, so the block is arithmetic from the
 //! arena's base -- the same addressing cells already use, which is why a row publishes an
 //! index rather than the pointers it would imply.
-__device__ inline int32_t* leaseMetadata(SparseArenaView const& arena, SparseLeaseIndex lease)
+__device__ inline uint32_t* leaseMetadata(SparseArenaView const& arena, SparseLeaseIndex lease)
 {
-    return reinterpret_cast<int32_t*>(arena.metadataBase + static_cast<uint64_t>(lease.value()) * arena.leaseStride);
+    return reinterpret_cast<uint32_t*>(arena.metadataBase + static_cast<uint64_t>(lease.value()) * arena.leaseStride);
 }
 
-//! Recency classes, ordered: a hit outranks a unit fetched this step, which outranks an
-//! entry the step did not touch. This is what makes a repeatedly selected unit survive a
-//! one-off selection.
-constexpr uint8_t kClassHit = 0;
-constexpr uint8_t kClassFetched = 1;
-constexpr uint8_t kClassUntouched = 2;
-// Untouched in-flight entries are pinned; a hit is protected by its recency class.
-constexpr uint8_t kPinned = 4;
+//! What the resolve knows about an entry while it is choosing victims.
+constexpr uint8_t kFlagEvictable = 0; //!< Not selected this step and holding no in-flight unit.
+constexpr uint8_t kFlagMatched = 1;   //!< Selected this step, so its unit stays and its age resets.
+constexpr uint8_t kFlagHeld = 2;      //!< Holding in-flight data, which only this entry has.
+
+//! Buckets the eviction histogram takes, which is the whole range of SparseEntry::staleness.
+constexpr int32_t kAgeBuckets = 256;
+//! The bucket a free entry falls in. No resident entry reaches it, so the free ones are
+//! always given away before any unit is evicted.
+constexpr int32_t kStalest = kAgeBuckets - 1;
 
 using BlockScan = cub::BlockScan<int32_t, kThreads>;
 
@@ -81,19 +91,17 @@ __host__ __device__ inline size_t alignUp16(size_t bytes) noexcept
     return (bytes + 15U) & ~static_cast<size_t>(15U);
 }
 
-//! Byte offsets of the shared-memory regions one CTA carves. Computed identically on the
-//! host, which sizes the launch, and in the kernel, which carves it. Every region is
-//! 16-byte aligned: cls is a byte array, so an unaligned int32 region after it faults.
+//! Byte offsets of the shared-memory regions one resolve CTA carves. Computed identically
+//! on the host, which sizes the launch, and in the kernel, which carves it. Every region is
+//! 16-byte aligned: flag is a byte array, so an unaligned int32 region after it faults.
 struct SmemLayout
 {
-    size_t keys = 0;
-    size_t vals = 0;
-    size_t cls = 0;
-    size_t scratch = 0;
-    size_t order = 0;
-    size_t lru = 0;
+    size_t table = 0;
+    size_t entry = 0;
+    size_t flag = 0;
     size_t missIdx = 0;
     size_t missOrd = 0;
+    size_t hist = 0;
     size_t total = 0;
 };
 
@@ -103,22 +111,18 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
 {
     SmemLayout layout;
     size_t offset = 0;
-    layout.keys = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(tableSize));
-    layout.vals = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(tableSize));
-    layout.cls = offset;
+    layout.table = offset;
+    offset = alignUp16(offset + sizeof(uint32_t) * static_cast<size_t>(tableSize));
+    layout.entry = offset;
+    offset = alignUp16(offset + sizeof(uint32_t) * static_cast<size_t>(entries));
+    layout.flag = offset;
     offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(entries));
-    layout.scratch = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
-    layout.order = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
-    layout.lru = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(entries));
     layout.missIdx = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
     layout.missOrd = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    layout.hist = offset;
+    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(kAgeBuckets));
     layout.total = offset;
     return layout;
 }
@@ -161,54 +165,100 @@ __device__ inline uint32_t slotOf(int32_t key, uint32_t mask) noexcept
     return (static_cast<uint32_t>(key) * 0x9E3779B1U) & mask;
 }
 
-//! Exclusive sum of zero-or-one flags over [0, n), single CTA, result in `flags`.
-//! Each warp scans a contiguous range before the ranges exchange their totals.
-//! Returns the total. `flags` is shared memory; the scan is in place.
-__device__ int32_t blockExclusiveSum(int32_t* flags, int32_t n)
-{
-    constexpr int32_t kWarps = kThreads / kWarpSize;
-    __shared__ int32_t warpTotals[kWarps];
-    int32_t const lane = static_cast<int32_t>(threadIdx.x % kWarpSize);
-    int32_t const warp = static_cast<int32_t>(threadIdx.x / kWarpSize);
-    int32_t const tiles = (n + kThreads - 1) / kThreads;
-    int32_t const begin = warp * tiles * kWarpSize;
-    uint32_t const precedingLanes = (1U << lane) - 1U;
-    int32_t carry = 0;
-    for (int32_t tile = 0; tile < tiles; ++tile)
-    {
-        int32_t const idx = begin + tile * kWarpSize + lane;
-        uint32_t const votes = __ballot_sync(0xffffffffU, idx < n && flags[idx] != 0);
-        if (idx < n)
-        {
-            flags[idx] = carry + __popc(votes & precedingLanes);
-        }
-        carry += __popc(votes);
-    }
-    if (lane == 0)
-    {
-        warpTotals[warp] = carry;
-    }
-    __syncthreads();
+//! Bits of a probe-index position given to the entry holding the keyed ordinal, leaving the
+//! rest for the ordinal itself. An ordinal of every one bit would be indistinguishable from
+//! an empty position, and a slot of every one bit is what "keyed, but not resident" is, so
+//! neither field reaches its own maximum.
+constexpr uint32_t kTableSlotBits = 14;
+constexpr uint32_t kTableSlotMask = (1U << kTableSlotBits) - 1U;
+constexpr uint32_t kTableEmpty = 0xFFFFFFFFU;
+constexpr int32_t kMaxTableOrdinal = static_cast<int32_t>((1U << (32 - kTableSlotBits)) - 2U);
+constexpr int32_t kMaxTableSlot = static_cast<int32_t>(kTableSlotMask) - 1;
 
-    int32_t offset = 0;
-    int32_t total = 0;
-#pragma unroll
-    for (int32_t w = 0; w < kWarps; ++w)
+//! The resolve's open-addressed probe index, one word per position.
+//!
+//! Packed rather than two arrays because every pass over it is a shared-memory round trip
+//! per probe step, and the publish pass walks the whole resident set: halving the bytes a
+//! position takes halves the traffic and leaves twice the index in one cache line.
+//!
+//! Insert races; publish and lookup do not, because they run between syncs that separate
+//! them from the inserts. A position is written once by insert and at most once by publish,
+//! each by the single thread owning the ordinal.
+struct QueryTable
+{
+    uint32_t* word;
+
+    __device__ explicit QueryTable(unsigned char* base)
+        : word(reinterpret_cast<uint32_t*>(base))
     {
-        int32_t const count = warpTotals[w];
-        offset += w < warp ? count : 0;
-        total += count;
     }
-    for (int32_t tile = 0; tile < tiles; ++tile)
+
+    __device__ void clear(int32_t position) const
     {
-        int32_t const idx = begin + tile * kWarpSize + lane;
-        if (idx < n)
+        word[position] = kTableEmpty;
+    }
+
+    __device__ uint32_t find(int32_t ordinal, uint32_t mask, uint32_t& position) const
+    {
+        position = slotOf(ordinal, mask);
+        uint32_t current = word[position];
+        while (current != kTableEmpty && (current >> kTableSlotBits) != static_cast<uint32_t>(ordinal))
         {
-            flags[idx] += offset;
+            position = (position + 1U) & mask;
+            current = word[position];
+        }
+        return current;
+    }
+
+    //! Key `ordinal`, with no entry named yet.
+    __device__ void insert(int32_t ordinal, uint32_t mask) const
+    {
+        uint32_t const want = (static_cast<uint32_t>(ordinal) << kTableSlotBits) | kTableSlotMask;
+        uint32_t position = slotOf(ordinal, mask);
+        uint32_t previous = atomicCAS(&word[position], kTableEmpty, want);
+        while (previous != kTableEmpty && (previous >> kTableSlotBits) != static_cast<uint32_t>(ordinal))
+        {
+            position = (position + 1U) & mask;
+            previous = atomicCAS(&word[position], kTableEmpty, want);
         }
     }
-    __syncthreads();
-    return total;
+
+    //! Name `slot` as the entry holding `ordinal`, if the ordinal was keyed. Returns whether
+    //! it was, which is what says the entry is selected this step.
+    __device__ bool publish(int32_t ordinal, int32_t slot, uint32_t mask) const
+    {
+        uint32_t position = 0;
+        if (find(ordinal, mask, position) == kTableEmpty)
+        {
+            return false;
+        }
+        word[position] = (static_cast<uint32_t>(ordinal) << kTableSlotBits) | static_cast<uint32_t>(slot);
+        return true;
+    }
+
+    //! The entry holding `ordinal`, or kNoSparseSlot when nothing does.
+    __device__ int32_t lookup(int32_t ordinal, uint32_t mask) const
+    {
+        uint32_t position = 0;
+        uint32_t const current = find(ordinal, mask, position);
+        if (current == kTableEmpty)
+        {
+            return kNoSparseSlot;
+        }
+        uint32_t const slot = current & kTableSlotMask;
+        return slot == kTableSlotMask ? kNoSparseSlot : static_cast<int32_t>(slot);
+    }
+};
+
+//! Bits of the prepare-write reduction key given to the entry index, the rest to the
+//! staleness plus one -- so that zero is a key no candidate produces and can stand for a
+//! block that found none.
+constexpr uint32_t kVictimSlotBits = 23;
+constexpr uint32_t kVictimSlotMask = (1U << kVictimSlotBits) - 1U;
+
+__device__ inline uint32_t victimKey(uint32_t staleness, int32_t slot) noexcept
+{
+    return ((staleness + 1U) << kVictimSlotBits) | static_cast<uint32_t>(slot);
 }
 
 //! Reserve one in-flight unit without building a selection probe index.
@@ -225,6 +275,9 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
     int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= 1);
+    // The same bound the resolve's probe index imposes, since this ordinal is resolved
+    // through it on every later step.
+    KVCM2_SPARSE_REQUIRE(historyUnits <= kMaxTableOrdinal);
     if (threadIdx.x == 0)
     {
         args.missCount[row] = 0;
@@ -236,57 +289,52 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
     }
 
     int32_t const entries = args.arena.entriesPerSelection;
-    auto* const metadata = leaseMetadata(args.arena, lease);
-    auto* resident = metadata + static_cast<ptrdiff_t>(args.selectionSlot) * entries;
-    auto* order = metadata + args.arena.lruOffset + static_cast<ptrdiff_t>(args.selectionSlot) * entries;
-    extern __shared__ int32_t previousOrder[];
-    using Reduce = cub::BlockReduce<int32_t, kThreads>;
+    auto const stepAge = static_cast<uint32_t>(*args.stepAge);
+    bool const rebase = SparseEntry::rebaseDue(stepAge);
+    auto* entry = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(args.selectionSlot) * entries;
+    using Reduce = cub::BlockReduce<uint32_t, kThreads>;
     __shared__ typename Reduce::TempStorage temp;
-    __shared__ int32_t matchPosition;
-    __shared__ int32_t chosenPosition;
-    __shared__ int32_t chosenSlot;
 
-    int32_t match = -1;
-    int32_t victim = -1;
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+    // The entry already holding the in-flight unit, if one does, and the stalest of those
+    // that could be given to it otherwise -- free entries first, then history by age. An
+    // entry above the watermark is another unit's only copy and is never a candidate.
+    //
+    // Both reductions take a key that is zero where a thread saw no candidate, which is
+    // below every key one did produce.
+    uint32_t match = 0;
+    uint32_t stalest = 0;
+    for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
     {
-        int32_t const slot = order[p];
-        int32_t const ordinal = resident[slot];
-        previousOrder[p] = slot;
+        uint32_t word = entry[s];
+        if (rebase)
+        {
+            word = SparseEntry::rebase(word, stepAge);
+            entry[s] = word;
+        }
+        int32_t const ordinal = SparseEntry::ordinal(word);
         if (ordinal == historyUnits)
         {
-            match = p;
+            match = static_cast<uint32_t>(s) + 1U;
         }
-        if (ordinal == kFreeOrdinal || ordinal < historyUnits)
+        else if (ordinal < historyUnits)
         {
-            victim = p;
+            auto const staleness
+                = ordinal < 0 ? static_cast<uint32_t>(kStalest) : SparseEntry::staleness(word, stepAge);
+            stalest = max(stalest, victimKey(staleness, s));
         }
     }
-    int32_t const matched = Reduce(temp).Reduce(match, cuda::maximum<>{});
-    if (threadIdx.x == 0)
-    {
-        matchPosition = matched;
-    }
+    uint32_t const victim = Reduce(temp).Reduce(stalest, cuda::maximum<>{});
     __syncthreads();
-    int32_t const lastVictim = Reduce(temp).Reduce(victim, cuda::maximum<>{});
+    uint32_t const matched = Reduce(temp).Reduce(match, cuda::maximum<>{});
     if (threadIdx.x == 0)
     {
-        chosenPosition = matchPosition >= 0 ? matchPosition : lastVictim;
-        KVCM2_SPARSE_REQUIRE(chosenPosition >= 0);
-        chosenSlot = previousOrder[chosenPosition];
-        resident[chosenSlot] = historyUnits;
-        args.inFlightSlot[row] = chosenSlot;
-    }
-    __syncthreads();
-
-    // Move the touched entry to the front, retaining every other entry's order.
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < chosenPosition; p += kThreads)
-    {
-        order[p + 1] = previousOrder[p];
-    }
-    if (threadIdx.x == 0)
-    {
-        order[0] = chosenSlot;
+        // The reservation covers a full selection plus every in-flight unit, so a candidate
+        // exists whenever the unit is not already held.
+        KVCM2_SPARSE_REQUIRE(matched != 0 || victim != 0);
+        auto const slot = static_cast<int32_t>(matched != 0 ? matched - 1U : (victim & kVictimSlotMask));
+        entry[slot]
+            = SparseEntry::pack(SparseEntry::usedByte(stepAge, matched != 0), static_cast<uint32_t>(historyUnits));
+        args.inFlightSlot[row] = slot;
     }
 }
 
@@ -294,8 +342,16 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
 //!
 //! Shared memory is carved by hand because the probe index is sized at launch; see
 //! SmemLayout for the regions and their alignment.
-__global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArgs args, int32_t tableSize)
+//!
+//! `kResolveThreads` is chosen per shape by resolveThreads(): every pass but the probe is a
+//! stride loop over the resident set, so a wider CTA shortens the kernel wherever a
+//! multiprocessor has the room to hold more warps of it.
+template <int kResolveThreads>
+__global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseResolveArgs args, int32_t tableSize)
 {
+    // The threshold search below gives one thread to each histogram bucket.
+    static_assert(kResolveThreads >= kAgeBuckets, "A resolve CTA must cover the eviction histogram");
+    using Scan = cub::BlockScan<int32_t, kResolveThreads>;
     extern __shared__ unsigned char smem[];
     int32_t const selection = args.selectionSlot;
     int32_t const row = static_cast<int32_t>(blockIdx.x);
@@ -309,6 +365,9 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t const entries = args.arena.entriesPerSelection;
     int32_t const width = args.selectionWidth;
     uint32_t const mask = static_cast<uint32_t>(tableSize) - 1U;
+    int32_t const tid = static_cast<int32_t>(threadIdx.x);
+    auto const stepAge = static_cast<uint32_t>(*args.stepAge);
+    bool const rebase = SparseEntry::rebaseDue(stepAge);
 
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
     int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
@@ -319,25 +378,28 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t const required = inFlight + width;
 
     SmemLayout const layout = smemLayout(tableSize, entries, args.maxInFlightUnits + width);
-    auto* keys = reinterpret_cast<int32_t*>(smem + layout.keys);
-    auto* vals = reinterpret_cast<int32_t*>(smem + layout.vals);
-    auto* cls = reinterpret_cast<uint8_t*>(smem + layout.cls);
-    auto* scratch = reinterpret_cast<int32_t*>(smem + layout.scratch);
-    auto* order = reinterpret_cast<int32_t*>(smem + layout.order);
-    auto* previousLru = reinterpret_cast<int32_t*>(smem + layout.lru);
+    QueryTable const table(smem + layout.table);
+    auto* entryCache = reinterpret_cast<uint32_t*>(smem + layout.entry);
+    auto* flag = reinterpret_cast<uint8_t*>(smem + layout.flag);
     auto* missIdx = reinterpret_cast<int32_t*>(smem + layout.missIdx);
     auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
+    auto* hist = reinterpret_cast<int32_t*>(smem + layout.hist);
 
-    __shared__ typename BlockScan::TempStorage temp;
+    __shared__ typename Scan::TempStorage temp;
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
+    __shared__ int32_t copyBase;
+    // The staleness at which the misses run out, and how many of the entries holding
+    // exactly that staleness are wanted. A threshold past the histogram evicts nothing.
+    __shared__ int32_t thresholdStaleness;
+    __shared__ int32_t neededAtThreshold;
+    __shared__ int32_t takenAtThreshold;
+    __shared__ int32_t victimCounter;
 
-    // The view's own arrays belong to this row's allocation, so only the selection indexes
+    // The lease's own words belong to this row's allocation, so only the selection indexes
     // them.
-    auto* const metadata = leaseMetadata(args.arena, lease);
-    int32_t* residentOrdinal = metadata + static_cast<ptrdiff_t>(selection) * entries;
-    int32_t* lruOrder = metadata + args.arena.lruOffset + static_cast<ptrdiff_t>(selection) * entries;
+    uint32_t* entry = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(selection) * entries;
     // The batch-wide arrays are indexed by row alone: the call is one selection, and every
     // buffer resolving within it shares the single result.
     auto const selectionBase = static_cast<ptrdiff_t>(row) * width;
@@ -346,16 +408,23 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     int32_t* outSlot = args.outSlot + selectionBase;
     int32_t* inFlightSlot = args.inFlightSlot + inFlightBase;
 
-    if (threadIdx.x == 0)
+    if (tid == 0)
     {
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
+        thresholdStaleness = kAgeBuckets;
+        neededAtThreshold = 0;
+        takenAtThreshold = 0;
+        victimCounter = 0;
     }
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < tableSize; i += kThreads)
+    for (int32_t i = tid; i < tableSize; i += kResolveThreads)
     {
-        keys[i] = kEmptyKey;
-        vals[i] = kNoSparseSlot;
+        table.clear(i);
+    }
+    for (int32_t b = tid; b < kAgeBuckets; b += kResolveThreads)
+    {
+        hist[b] = 0;
     }
     __syncthreads();
 
@@ -365,57 +434,57 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
 
     // Index the required ordinals, then match the resident set against that index.
     // The index size follows the selection width rather than the cache capacity.
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
+    for (int32_t i = tid; i < required; i += kResolveThreads)
     {
         int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
         if (ord < 0)
         {
             continue;
         }
-        uint32_t pos = slotOf(ord, mask);
-        int32_t key = atomicCAS(&keys[pos], kEmptyKey, ord);
-        while (key != kEmptyKey && key != ord)
-        {
-            pos = (pos + 1U) & mask;
-            key = atomicCAS(&keys[pos], kEmptyKey, ord);
-        }
-    }
-    __syncthreads();
-
-    for (int32_t s = static_cast<int32_t>(threadIdx.x); s < entries; s += kThreads)
-    {
-        int32_t const ord = residentOrdinal[s];
-        cls[s] = kClassUntouched | (ord >= historyUnits ? kPinned : 0);
-        previousLru[s] = lruOrder[s];
-        if (ord == kFreeOrdinal)
-        {
-            continue;
-        }
-        uint32_t pos = slotOf(ord, mask);
-        int32_t key = keys[pos];
-        while (key != kEmptyKey && key != ord)
-        {
-            pos = (pos + 1U) & mask;
-            key = keys[pos];
-        }
-        if (key == ord)
-        {
-            vals[pos] = s;
-        }
+        // A position of the index holds the ordinal beside the entry naming it, so an
+        // ordinal past this would be truncated into a different one.
+        KVCM2_SPARSE_REQUIRE(ord <= kMaxTableOrdinal);
+        table.insert(ord, mask);
     }
 
     // Slots past the in-flight span say "no unit in flight", so a consumer can read this
     // array without also being told how many units there are.
-    for (int32_t i = static_cast<int32_t>(threadIdx.x) + inFlight; i < args.maxInFlightUnits; i += kThreads)
+    for (int32_t i = tid + inFlight; i < args.maxInFlightUnits; i += kResolveThreads)
     {
         inFlightSlot[i] = kNoSparseSlot;
+    }
+    __syncthreads();
+
+    // Classify the resident set against the index, and build the eviction histogram over
+    // what the step may give away. The words land in shared memory on the way past: two
+    // passes below read them again, and each read would otherwise cross to global memory.
+    for (int32_t s = tid; s < entries; s += kResolveThreads)
+    {
+        uint32_t word = entry[s];
+        if (rebase)
+        {
+            word = SparseEntry::rebase(word, stepAge);
+            entry[s] = word;
+        }
+        entryCache[s] = word;
+        int32_t const ordinal = SparseEntry::ordinal(word);
+        bool const matched = ordinal >= 0 && table.publish(ordinal, s, mask);
+        bool const held = ordinal >= historyUnits;
+        uint8_t const cls = matched ? kFlagMatched : (held ? kFlagHeld : kFlagEvictable);
+        flag[s] = cls;
+        if (cls == kFlagEvictable)
+        {
+            auto const staleness
+                = ordinal < 0 ? static_cast<uint32_t>(kStalest) : SparseEntry::staleness(word, stepAge);
+            atomicAdd(&hist[staleness], 1);
+        }
     }
     __syncthreads();
 
     // Probe once per required unit. A hit resolves immediately; a miss is recorded against
     // its position in the virtual list and resolved once a victim is chosen.
     int32_t resolvedMine = 0;
-    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < required; i += kThreads)
+    for (int32_t i = tid; i < required; i += kResolveThreads)
     {
         int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
         if (ord < 0)
@@ -424,18 +493,10 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
             continue;
         }
         resolvedMine += i < inFlight ? 0 : 1;
-        uint32_t pos = slotOf(ord, mask);
-        int32_t key = keys[pos];
-        while (key != kEmptyKey && key != ord)
+        int32_t const slot = table.lookup(ord, mask);
+        if (slot != kNoSparseSlot)
         {
-            pos = (pos + 1U) & mask;
-            key = keys[pos];
-        }
-        if (key == ord && vals[pos] != kNoSparseSlot)
-        {
-            int32_t const slot = vals[pos];
             (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
-            cls[slot] = kClassHit;
         }
         else
         {
@@ -454,17 +515,16 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     // eviction loop below can write straight into it. Only a miss below the watermark is
     // copied, which is the same test the loop applies, so counting it here costs one pass
     // over a list already in shared memory and saves staging the entries anywhere.
-    __shared__ int32_t copyBase;
     {
         int32_t mine = 0;
-        for (int32_t j = static_cast<int32_t>(threadIdx.x); j < numMiss; j += kThreads)
+        for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
             mine += missOrd[j] < historyUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
-        BlockScan(temp).ExclusiveSum(mine, scanned, claimed);
-        if (threadIdx.x == 0)
+        Scan(temp).ExclusiveSum(mine, scanned, claimed);
+        if (tid == 0)
         {
             copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
             // The list is sized for every row missing its whole selection, so a claim can
@@ -479,130 +539,72 @@ __global__ __launch_bounds__(kThreads) void sparseResolveKernel(SparseResolveArg
     }
     __syncthreads();
 
-    // Entries that may be given away: free ones, and resident ones this step did not select
-    // that are not holding in-flight data.
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+    // Where the misses run out, walking the histogram down from its stalest bucket. One
+    // thread per bucket, so the scan that totals them is the whole search.
     {
-        int32_t const slot = previousLru[p];
-        scratch[p] = cls[slot] == kClassUntouched ? 1 : 0;
+        int32_t const bucket = tid < kAgeBuckets ? hist[kStalest - tid] : 0;
+        int32_t inclusive = 0;
+        Scan(temp).InclusiveSum(bucket, inclusive);
+        int32_t const before = inclusive - bucket;
+        if (tid < kAgeBuckets && numMiss > 0 && before < numMiss && inclusive >= numMiss)
+        {
+            thresholdStaleness = kStalest - tid;
+            neededAtThreshold = numMiss - before;
+        }
     }
     __syncthreads();
-
-    // Victims come from the tail, least recently used first, so rank from the tail.
-    int32_t const totalEvictable = blockExclusiveSum(scratch, entries);
     // The reservation covers a full selection plus every in-flight unit, and the in-flight
     // ones are resolved first, so there is always a cell for each remaining miss.
-    KVCM2_SPARSE_REQUIRE(totalEvictable >= numMiss);
-    __syncthreads();
+    KVCM2_SPARSE_REQUIRE(numMiss == 0 || thresholdStaleness < kAgeBuckets);
 
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
+    // Give the misses the stalest entries. Everything staler than the threshold goes; the
+    // bucket at it holds more entries than are left to fill, so those race for the places.
+    for (int32_t s = tid; s < entries; s += kResolveThreads)
     {
-        int32_t const slot = previousLru[p];
-        bool const evictable = cls[slot] == kClassUntouched;
-        if (!evictable)
+        uint32_t const word = entryCache[s];
+        uint8_t const cls = flag[s];
+        if (cls == kFlagMatched)
+        {
+            entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, true), word);
+            continue;
+        }
+        if (cls != kFlagEvictable)
         {
             continue;
         }
-        // scratch[p] is the count of evictable entries before p, so this is its rank from
-        // the tail. The numMiss least recently used take the misses, in selection order.
-        int32_t const rankFromTail = totalEvictable - 1 - scratch[p];
-        if (rankFromTail < numMiss)
+        auto const staleness = static_cast<int32_t>(
+            SparseEntry::ordinal(word) < 0 ? static_cast<uint32_t>(kStalest) : SparseEntry::staleness(word, stepAge));
+        bool victim = staleness > thresholdStaleness;
+        if (!victim && staleness == thresholdStaleness)
         {
-            int32_t const j = numMiss - 1 - rankFromTail;
-            int32_t const ordinal = missOrd[j];
-            int32_t const position = missIdx[j];
-            residentOrdinal[slot] = ordinal;
-            (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = slot;
-            cls[slot] = kClassFetched;
-            // Only history has anything to fetch. An in-flight unit's host page is not
-            // written until the watermark passes it, so copying from it would read stale
-            // bytes over the data the model is about to write.
-            if (ordinal < historyUnits)
-            {
-                auto const c = copyBase + atomicAdd(&numCopy, 1);
-                args.work.row[c] = row;
-                args.work.ordinal[c] = ordinal;
-                args.work.slot[c] = slot;
-            }
+            victim = atomicAdd(&takenAtThreshold, 1) < neededAtThreshold;
+        }
+        if (!victim)
+        {
+            continue;
+        }
+        int32_t const j = atomicAdd(&victimCounter, 1);
+        int32_t const ordinal = missOrd[j];
+        int32_t const position = missIdx[j];
+        entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
+        (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
+        // Only history has anything to fetch. An in-flight unit's host page is not
+        // written until the watermark passes it, so copying from it would read stale
+        // bytes over the data the model is about to write.
+        if (ordinal < historyUnits)
+        {
+            auto const c = copyBase + atomicAdd(&numCopy, 1);
+            args.work.row[c] = row;
+            args.work.ordinal[c] = ordinal;
+            args.work.slot[c] = s;
         }
     }
     __syncthreads();
 
-    // The work list and slots are final. The copy can perform its independent setup
-    // while this block rebuilds recency, then wait before consuming the work list.
+    // The work list and the entry indices are final, so a copy may start.
     gridDependencyRelease();
 
-    // Rebuild recency: hits, then units fetched this step, then everything untouched, each
-    // group keeping its previous relative order. Each warp ranks all three classes
-    // within a contiguous range; class totals give the offsets between ranges.
-    constexpr int32_t kWarps = kThreads / kWarpSize;
-    __shared__ int32_t classTotals[3][kWarps];
-    int32_t const lane = static_cast<int32_t>(threadIdx.x % kWarpSize);
-    int32_t const warp = static_cast<int32_t>(threadIdx.x / kWarpSize);
-    int32_t const tiles = (entries + kThreads - 1) / kThreads;
-    int32_t const begin = warp * tiles * kWarpSize;
-    uint32_t const precedingLanes = (1U << lane) - 1U;
-    int32_t carry[3] = {};
-    for (int32_t tile = 0; tile < tiles; ++tile)
-    {
-        int32_t const p = begin + tile * kWarpSize + lane;
-        uint8_t const c = p < entries ? cls[previousLru[p]] & ~kPinned : 3;
-#pragma unroll
-        for (uint8_t group = 0; group < 3; ++group)
-        {
-            uint32_t const votes = __ballot_sync(0xffffffffU, c == group);
-            if (c == group)
-            {
-                order[p] = carry[group] + __popc(votes & precedingLanes);
-            }
-            carry[group] += __popc(votes);
-        }
-    }
-    if (lane == 0)
-    {
-#pragma unroll
-        for (uint8_t c = 0; c < 3; ++c)
-        {
-            classTotals[c][warp] = carry[c];
-        }
-    }
-    __syncthreads();
-
-    int32_t offsets[3] = {};
-    int32_t base = 0;
-#pragma unroll
-    for (uint8_t c = 0; c < 3; ++c)
-    {
-        int32_t count = 0;
-        int32_t before = 0;
-#pragma unroll
-        for (int32_t w = 0; w < kWarps; ++w)
-        {
-            int32_t const total = classTotals[c][w];
-            before += w < warp ? total : 0;
-            count += total;
-        }
-        offsets[c] = base + before;
-        base += count;
-    }
-    for (int32_t tile = 0; tile < tiles; ++tile)
-    {
-        int32_t const p = begin + tile * kWarpSize + lane;
-        if (p < entries)
-        {
-            int32_t const slot = previousLru[p];
-            uint8_t const c = cls[slot] & ~kPinned;
-            int32_t const offset = c == kClassHit ? offsets[0] : (c == kClassFetched ? offsets[1] : offsets[2]);
-            scratch[offset + order[p]] = slot;
-        }
-    }
-    __syncthreads();
-
-    for (int32_t p = static_cast<int32_t>(threadIdx.x); p < entries; p += kThreads)
-    {
-        lruOrder[p] = scratch[p];
-    }
-    if (threadIdx.x == 0)
+    if (tid == 0)
     {
         args.missCount[row] = numCopy;
     }
@@ -801,11 +803,12 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     // The entries scanned are the layer's selection's, which several layers may share; the
     // list claimed below is the layer's own, because the copy that consumes it walks the
     // layer's buffers and each holds its own mirror of a shared entry.
-    int32_t const* residentOrdinal
+    uint32_t const* entry
         = leaseMetadata(args.arena, lease) + static_cast<ptrdiff_t>(args.arena.layerSelection[layer]) * entries;
+    auto const ordinalAt = [&](int32_t slot) { return SparseEntry::ordinal(entry[slot]); };
     auto const crossed = [&](int32_t slot)
     {
-        int32_t const ord = residentOrdinal[slot];
+        int32_t const ord = ordinalAt(slot);
         return ord >= from && ord < to;
     };
 
@@ -851,7 +854,7 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
         }
         auto const j = listBase + atomicAdd(&count, 1);
         args.work.row[j] = row;
-        args.work.ordinal[j] = residentOrdinal[s];
+        args.work.ordinal[j] = ordinalAt(s);
         args.work.slot[j] = s;
     }
 
@@ -992,9 +995,12 @@ namespace
 
 //! Dynamic shared memory a block of the resolve kernel may take, which it is opted in to.
 //!
-//! The device is asked once and the kernel opted in at that maximum once: the opt-in is a
-//! ceiling, and a block's occupancy follows the bytes its launch asks for rather than the
-//! ceiling, so granting the most the device allows costs nothing.
+//! The device is asked once and each instantiation opted in at that maximum once: the
+//! opt-in is a ceiling, and a block's occupancy follows the bytes its launch asks for
+//! rather than the ceiling, so granting the most the device allows costs nothing.
+//!
+//! The narrower allowance of the two is what a caller is told, since the shape is sized
+//! before the width that will run it is chosen.
 int32_t sparseResolveSharedLimit()
 {
     static int32_t const limit = []
@@ -1003,16 +1009,72 @@ int32_t sparseResolveSharedLimit()
         cuCheck(cuCtxGetDevice(&device));
         int deviceMax = 0;
         cuCheck(cuDeviceGetAttribute(&deviceMax, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device));
-        // The opt-in names dynamic bytes, and what the kernel declares statically is spent
-        // from the same per-block budget, so only the rest of it can be asked for.
-        cudaFuncAttributes attr{};
-        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, reinterpret_cast<void const*>(&sparseResolveKernel)));
-        int const value = deviceMax - static_cast<int>(attr.sharedSizeBytes);
-        TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-            reinterpret_cast<void const*>(&sparseResolveKernel), cudaFuncAttributeMaxDynamicSharedMemorySize, value));
-        return static_cast<int32_t>(value);
+        int allowed = deviceMax;
+        for (void const* function : {reinterpret_cast<void const*>(&sparseResolveKernel<kResolveThreadsNarrow>),
+                 reinterpret_cast<void const*>(&sparseResolveKernel<kResolveThreadsWide>)})
+        {
+            // The opt-in names dynamic bytes, and what an instantiation declares statically
+            // is spent from the same per-block budget, so only the rest of it can be asked
+            // for. The two differ: cub's scan storage follows the thread count.
+            cudaFuncAttributes attr{};
+            TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, function));
+            int const value = deviceMax - static_cast<int>(attr.sharedSizeBytes);
+            TLLM_CUDA_CHECK(cudaFuncSetAttribute(function, cudaFuncAttributeMaxDynamicSharedMemorySize, value));
+            allowed = std::min(allowed, value);
+        }
+        return static_cast<int32_t>(allowed);
     }();
     return limit;
+}
+
+//! Threads a resolve CTA of this shape takes.
+//!
+//! Every pass but the probe is a stride loop over the resident set, so doubling the CTA
+//! halves the entries a thread walks. A CTA's work is one row and does not grow with its
+//! width, so that only pays where the wider block raises the warps a multiprocessor holds;
+//! where it does not, the wider CTA costs residency and the kernel loses more to waves than
+//! the shorter loops win. The device's own occupancy answer for each instantiation -- at
+//! the dynamic shared memory this shape asks for, which is what drives the count -- is
+//! therefore the whole decision, and a tie goes to the narrow one, whose smaller blocks
+//! leave a smaller tail on a grid that does not fill the device.
+//!
+//! The three extents are the life cycle's, so the answer never changes within one; it is
+//! held rather than asked per launch.
+int resolveThreads(int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits, size_t shared)
+{
+    using Shape = std::tuple<int32_t, int32_t, int32_t>;
+    static std::mutex mutex;
+    static std::map<Shape, int> decided;
+
+    Shape const shape{entriesPerSelection, selectionWidth, maxInFlightUnits};
+    std::lock_guard<std::mutex> const guard(mutex);
+    auto const found = decided.find(shape);
+    if (found != decided.end())
+    {
+        return found->second;
+    }
+    // The query adds the instantiation's own static shared memory to what is passed here,
+    // so the figure it works from is the block's whole footprint.
+    auto residentBlocks = [shared](void const* kernel, int threads)
+    {
+        int blocksPerSm = 0;
+        TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocksPerSm, kernel, threads, shared));
+        return blocksPerSm;
+    };
+    int const narrowWarps = residentBlocks(reinterpret_cast<void const*>(&sparseResolveKernel<kResolveThreadsNarrow>),
+                                kResolveThreadsNarrow)
+        * (kResolveThreadsNarrow / static_cast<int>(kWarpSize));
+    int const wideWarps
+        = residentBlocks(reinterpret_cast<void const*>(&sparseResolveKernel<kResolveThreadsWide>), kResolveThreadsWide)
+        * (kResolveThreadsWide / static_cast<int>(kWarpSize));
+
+    // A CTA's work is one row and does not grow with its width, so a wider one is worth
+    // taking only where it raises the warps a multiprocessor holds. Where both widths reach
+    // the same occupancy the narrow one wins on grid quantisation, since a row count that
+    // does not fill the device leaves a smaller tail.
+    int const threads = wideWarps > narrowWarps ? kResolveThreadsWide : kResolveThreadsNarrow;
+    decided.emplace(shape, threads);
+    return threads;
 }
 
 } // namespace
@@ -1045,6 +1107,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
             && (args.maxInFlightUnits <= 0 || args.inFlightSlot != nullptr),
         "launchSparseResolve: every device array must be provided");
     TLLM_CHECK_WITH_INFO(args.maxInFlightUnits >= 0, "launchSparseResolve: maxInFlightUnits must not be negative");
+    TLLM_CHECK_WITH_INFO(args.stepAge != nullptr,
+        "launchSparseResolve: the eviction clock is device-resident, so a captured graph reads the step's own value");
     if (args.selectionWidth > 0)
     {
         checkWorkList(args.work, "launchSparseResolve");
@@ -1052,14 +1116,18 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
             args.work.numLists == 1, "launchSparseResolve: a fetch resolves one selection, so it fills one list");
     }
     TLLM_CHECK_WITH_INFO(args.unitTokens > 0, "launchSparseResolve: unitTokens must be positive");
+    // A position of the probe index holds an entry index beside the ordinal keyed there, so
+    // a cache wider than the field would resolve two entries onto one position.
+    TLLM_CHECK_WITH_INFO(args.arena.entriesPerSelection <= kMaxTableSlot,
+        "Sparse resolve: the cache holds " + std::to_string(args.arena.entriesPerSelection)
+            + " entries per selection, above the " + std::to_string(kMaxTableSlot)
+            + " its probe index can name; reduce max_cached_units");
 
-    if (args.selectionWidth == 0 && args.maxInFlightUnits == 1
-        && sizeof(int32_t) * static_cast<size_t>(args.arena.entriesPerSelection) <= 32U * 1024U)
+    dim3 const grid(static_cast<unsigned>(args.numRows));
+    if (args.selectionWidth == 0 && args.maxInFlightUnits == 1)
     {
-        size_t const shared = sizeof(int32_t) * static_cast<size_t>(args.arena.entriesPerSelection);
-        tensorrt_llm::common::launchWithPdlWhenEnabled("sparsePrepareWrite", sparsePrepareWriteKernel,
-            dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream),
-            args);
+        tensorrt_llm::common::launchWithPdlWhenEnabled("sparsePrepareWrite", sparsePrepareWriteKernel, grid,
+            dim3(kThreads), 0, reinterpret_cast<cudaStream_t>(stream), args);
         return;
     }
 
@@ -1067,9 +1135,15 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     int32_t const tableSize = nextPow2(2 * (args.maxInFlightUnits + args.selectionWidth));
     size_t const shared
         = checkedSparseResolveSharedBytes(args.arena.entriesPerSelection, args.selectionWidth, args.maxInFlightUnits);
-    tensorrt_llm::common::launchWithPdlWhenEnabled("sparseResolve", sparseResolveKernel,
-        dim3(static_cast<unsigned>(args.numRows)), dim3(kThreads), shared, reinterpret_cast<cudaStream_t>(stream), args,
-        tableSize);
+    if (resolveThreads(args.arena.entriesPerSelection, args.selectionWidth, args.maxInFlightUnits, shared)
+        == kResolveThreadsWide)
+    {
+        tensorrt_llm::common::launchWithPdlWhenEnabled("sparseResolve", sparseResolveKernel<kResolveThreadsWide>, grid,
+            dim3(kResolveThreadsWide), shared, reinterpret_cast<cudaStream_t>(stream), args, tableSize);
+        return;
+    }
+    tensorrt_llm::common::launchWithPdlWhenEnabled("sparseResolve", sparseResolveKernel<kResolveThreadsNarrow>, grid,
+        dim3(kResolveThreadsNarrow), shared, reinterpret_cast<cudaStream_t>(stream), args, tableSize);
 }
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -106,8 +106,9 @@ Batch::Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpe
     // A row that no member occupies must still read as "no such block" rather than as slot
     // zero, since the fetch has no other way to tell them apart.
     std::ranges::fill(_buf<int32_t>(BufName::kPageTables), kBadPageIndex.value());
-    // Watermarks of a free row are zero: a request with nothing eligible.
-    for (auto const name : {BufName::kHistory, BufName::kCapacity})
+    // Watermarks of a free row are zero: a request with nothing eligible. The eviction
+    // clock starts there too, which publish() advances off before any resolve reads it.
+    for (auto const name : {BufName::kHistory, BufName::kCapacity, BufName::kSparseClock})
     {
         std::ranges::fill(_buf<int32_t>(name), 0);
     }
@@ -1096,6 +1097,7 @@ void Batch::_layoutBufs(size_t scratchElements) noexcept
         {BufName::kPageTables, sizeof(int32_t) * _rowElements() * groups, alignof(int32_t)},
         {BufName::kHistory, sizeof(int32_t) * rows, alignof(int32_t)},
         {BufName::kCapacity, sizeof(int32_t) * rows, alignof(int32_t)},
+        {BufName::kSparseClock, sizeof(int32_t), alignof(int32_t)},
         {BufName::kLeases, sizeof(SparseLeaseIndex) * rows, alignof(SparseLeaseIndex)},
         {BufName::kScratch, sizeof(int32_t) * scratchElements, alignof(int32_t)},
     }};
@@ -1113,6 +1115,11 @@ void Batch::_layoutBufs(size_t scratchElements) noexcept
 SparseLeaseIndex const* Batch::_leaseMirror() const noexcept
 {
     return reinterpret_cast<SparseLeaseIndex const*>(sparseLeases());
+}
+
+int32_t const* Batch::_sparseStepAgeMirror() const noexcept
+{
+    return reinterpret_cast<int32_t const*>(_mirrorAt(BufName::kSparseClock));
 }
 
 size_t Batch::_mirrorBytes() const noexcept
@@ -1220,8 +1227,7 @@ BatchRow Batch::addKvCache(KvCache& kvCache, std::optional<BatchRow> requestedRo
     else
     {
         row = *requestedRow;
-        TLLM_CHECK_WITH_INFO(
-            row != kNoBatchRow && row < mMaxBatchSize, "Batch::addKvCache: row is beyond max_batch_size");
+        TLLM_CHECK_WITH_INFO(row >= 0 && row < mMaxBatchSize, "Batch::addKvCache: row is beyond max_batch_size");
         if (mRows[row] != nullptr)
         {
             throw LogicError("Batch::addKvCache: row is already occupied");
@@ -1471,6 +1477,16 @@ void Batch::publish()
     }
     mFlushCountersDirty = false;
 
+    // The sparse eviction clock, which the resolves of this step then read. It wraps into
+    // SparseEntry's timestamp field, and a rebase every kRebaseStep steps is what keeps a
+    // timestamp from falling far enough behind the wrap to read as a recent one.
+    //
+    // Staged rather than passed by value, with the watermarks and for the same reason: a
+    // captured resolve replays against whatever the device holds, not against what the host
+    // held when the graph was recorded.
+    mSparseStepAge = (mSparseStepAge + 1) & SparseEntry::kTimestampMask;
+    _buf<int32_t>(BufName::kSparseClock).front() = static_cast<int32_t>(mSparseStepAge);
+
     // Refusing rather than waiting, because by this point a wait would be too late to help.
     // Everything that writes the staged rows has to be separated from the copy reading them:
     // the members' own mutations, which happened before this call, and the watermarks and
@@ -1677,6 +1693,7 @@ void Batch::prepareSparseWriteIndices(
     resolve.inFlightSlot = scratch.inFlightSlot;
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.missCount = scratch.missCount;
+    resolve.stepAge = _sparseStepAgeMirror();
     // No selection on this path, so there is nothing to resolve into a slot.
     resolve.selected = nullptr;
     resolve.outSlot = nullptr;
@@ -1865,6 +1882,7 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.maxInFlightUnits = scratch.maxInFlightUnits;
     resolve.work = _sparseFetchWork(scratch, span.selectionSlot);
     resolve.missCount = scratch.missCount;
+    resolve.stepAge = _sparseStepAgeMirror();
     // Every row adds its own hits and misses as it resolves them.
     resolve.hitMiss = scratch.hitMiss;
     launchSparseResolve(resolve, stream);

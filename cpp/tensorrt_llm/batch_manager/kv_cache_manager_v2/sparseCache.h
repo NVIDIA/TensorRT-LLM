@@ -42,10 +42,109 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //
 // The metadata is laid out [selection][entry]. It is per SELECTION, not per buffer or even
 // per layer: everything selecting the same units resolves to the same residency, so one
-// resident set and one recency order serve them all, and the entry index the resolve
-// produces addresses each buffer's own cell. A layer selecting for itself is the singleton
-// case of that; layers sharing a selection_id share the row.
+// resident set serves them all, and the entry index the resolve produces addresses each
+// buffer's own cell. A layer selecting for itself is the singleton case of that; layers
+// sharing a selection_id share the row.
 // ---------------------------------------------------------------------------
+
+//! One cache entry's whole persistent state, packed into a single word:
+//!
+//!     bits 31..25   timestamp, the step clock value at the entry's last use
+//!     bit  24       history, set when that use found the entry already resident
+//!     bits 23..0    ordinal, the unit held; kFreeOrdinal means the entry is free
+//!
+//! The top byte is addressed together as the "age byte", `(timestamp << 1) | history`.
+//!
+//! The history flag says the entry was already resident at its last use, so eviction by
+//! highest `staleness()` -- which is `2 * age - history` -- orders by age first and, within
+//! one age, gives away what was fetched before what was hit.
+//!
+//! The step clock wraps, so a timestamp more than `kMaxAge + kRebaseStep` behind it would
+//! read as a recent one. `rebase()` is what keeps it from getting that far: it snaps a
+//! timestamp forward to `kMaxAge` and is idempotent, so the kernels that stream a row may
+//! each apply it without having to agree on which of them does.
+struct SparseEntry
+{
+    static constexpr uint32_t kOrdinalBits = 24;
+    static constexpr uint32_t kOrdinalMask = (1U << kOrdinalBits) - 1U;
+    //! The ordinal field of an entry holding no unit.
+    static constexpr uint32_t kFreeOrdinal = kOrdinalMask;
+    //! An entry holding no unit, which is the state initialiseLease() leaves a lease in.
+    static constexpr uint32_t kFreeWord = kFreeOrdinal;
+
+    //! Values the timestamp field holds, and the mask that wraps a step count into it.
+    static constexpr uint32_t kTimestampValues = 128;
+    static constexpr uint32_t kTimestampMask = kTimestampValues - 1;
+
+    //! Steps between rebases, and the age a rebase leaves an older entry at. Their sum is
+    //! the oldest age still distinguishable from a recent one, so it must not exceed the
+    //! timestamp's own range.
+    static constexpr uint32_t kRebaseStep = 32;
+    static constexpr uint32_t kMaxAge = kTimestampValues - 1 - kRebaseStep;
+
+    //! Whether the resolves of `stepAge` rebase the timestamps they pass. Derived from the
+    //! clock rather than published beside it, so the two cannot disagree.
+    [[nodiscard]] static constexpr bool rebaseDue(uint32_t stepAge) noexcept
+    {
+        return stepAge % kRebaseStep == 0;
+    }
+
+    //! `ordinal`'s high bits are dropped, so a word may be passed where one is wanted.
+    [[nodiscard]] static constexpr uint32_t pack(uint32_t ageByte, uint32_t ordinal) noexcept
+    {
+        return (ageByte << kOrdinalBits) | (ordinal & kOrdinalMask);
+    }
+
+    [[nodiscard]] static constexpr uint32_t ageByte(uint32_t word) noexcept
+    {
+        return word >> kOrdinalBits;
+    }
+
+    //! The unit held, or -1 -- kBadBlockOrdinal's value -- when the entry is free.
+    [[nodiscard]] static constexpr int32_t ordinal(uint32_t word) noexcept
+    {
+        return (word & kOrdinalMask) == kFreeOrdinal ? -1 : static_cast<int32_t>(word & kOrdinalMask);
+    }
+
+    //! Steps since the entry's last use. Exact while that is at most kTimestampMask, which
+    //! is what the rebase maintains.
+    [[nodiscard]] static constexpr uint32_t age(uint32_t word, uint32_t stepAge) noexcept
+    {
+        return (stepAge - (ageByte(word) >> 1)) & kTimestampMask;
+    }
+
+    [[nodiscard]] static constexpr bool wasHit(uint32_t word) noexcept
+    {
+        return (ageByte(word) & 1U) != 0U;
+    }
+
+    //! Eviction key, highest first. Stays below the free entry's own key for every age the
+    //! rebase leaves representable, so a free entry is always given away first.
+    [[nodiscard]] static constexpr uint32_t staleness(uint32_t word, uint32_t stepAge) noexcept
+    {
+        return static_cast<uint8_t>((stepAge << 1) - ageByte(word));
+    }
+
+    //! The age byte of an entry used at `stepAge`. `hit` is set when the entry already held
+    //! the unit and clear when the unit was fetched into it.
+    [[nodiscard]] static constexpr uint32_t usedByte(uint32_t stepAge, bool hit) noexcept
+    {
+        return ((stepAge & kTimestampMask) << 1) | (hit ? 1U : 0U);
+    }
+
+    //! The word with its age pulled up to kMaxAge if it had fallen further behind. Applying
+    //! this twice at one `stepAge` changes nothing the second time.
+    [[nodiscard]] static constexpr uint32_t rebase(uint32_t word, uint32_t stepAge) noexcept
+    {
+        return age(word, stepAge) <= kMaxAge
+            ? word
+            : pack((((stepAge - kMaxAge) & kTimestampMask) << 1) | (ageByte(word) & 1U), word);
+    }
+};
+
+static_assert(SparseEntry::kMaxAge + SparseEntry::kRebaseStep < SparseEntry::kTimestampValues,
+    "A timestamp must stay distinguishable for a whole rebase period past the oldest age the rebase leaves");
+
 //! The arena slot a row's member holds, or kNoSparseLease when the row carries none.
 //!
 //! This is the whole of a row's published cache state: everything else a kernel needs is
@@ -60,15 +159,13 @@ inline constexpr SparseLeaseIndex kNoSparseLease{};
 //! launch takes it by value and no row carries a copy.
 struct SparseArenaView
 {
-    //! Lease i's metadata begins at `metadataBase + i * leaseStride`: first its resident
-    //! unit ordinal per entry, kBadBlockOrdinal where the entry is free, then at
-    //! `lruOffset` its entry indices in recency order, most-recently-used first.
+    //! Lease i's metadata begins at `metadataBase + i * leaseStride`: one SparseEntry word
+    //! per entry, holding the unit resident there and when it was last used.
     //!
-    //! The ordinals are dense rather than keyed: a fetch builds a hash over them in shared
-    //! memory to answer "is this ordinal resident, and where".
+    //! The words are dense rather than keyed: a fetch builds a hash over their ordinals in
+    //! shared memory to answer "is this ordinal resident, and where".
     std::byte* metadataBase;
     uint64_t leaseStride;
-    int32_t lruOffset;
 
     //! [numBuffers] each buffer's index among those sharing its pool: where its cells sit
     //! inside that pool's arena region.
@@ -184,9 +281,9 @@ public:
         return mNumBytes;
     }
 
-    //! Clear `slot`'s metadata on `stream`, which is what taking it means here: every
-    //! ordinal becomes kBadBlockOrdinal and the recency order the identity permutation.
-    //! The slot is the Batch row's own, and one row's slot serves every life cycle.
+    //! Clear `slot`'s metadata on `stream`, which is what taking it means here: every entry
+    //! becomes free. The slot is the Batch row's own, and one row's slot serves every life
+    //! cycle.
     void initialiseLease(SparseLeaseIndex slot, CUstream stream);
 
     //! Copy a slot's resident ordinals back to the host, for debugging and introspection
@@ -218,7 +315,6 @@ private:
     int32_t* mSharedLayer = nullptr;
     int32_t* mSharedSlotInPool = nullptr;
     int32_t* mSharedLayerSelection = nullptr;
-    int32_t* mIdentity = nullptr;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

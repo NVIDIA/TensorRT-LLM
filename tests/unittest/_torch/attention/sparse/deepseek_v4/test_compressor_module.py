@@ -90,6 +90,8 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 class DummyAttentionMetadata:
     """Dummy attention metadata for testing Compressor.forward."""
 
+    sparse_offload_state = None
+
     def __init__(
         self,
         num_contexts: int,
@@ -1947,10 +1949,66 @@ def test_compressor_wkv_gate_uses_checkpoint_dtype():
     assert compressor.wkv_gate.weight.dtype == DTYPE
 
 
-def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_indexer: bool):
+def _run_compressor_with_fake_postprocess(
+    monkeypatch, kv_cache_dtype: str, is_indexer: bool, sparse=False, sparse_write_index=7
+):
     compressor = _create_small_compressor(kv_cache_dtype, is_indexer)
     metadata = _create_minimal_metadata(compressor)
     seen = {}
+    if sparse:
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        metadata.num_contexts = 0
+        metadata.num_generations = 1
+        metadata.num_ctx_tokens = 0
+        metadata.num_tokens = 1
+        metadata.num_gen_tokens_per_seq = 1
+        metadata.cu_seq_lens_cuda = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        # Write rows by Batch row: the one request sits in row 2, not at its input position.
+        writes = torch.full((4, 2), -1, device=DEVICE, dtype=torch.int32)
+        writes[2] = sparse_write_index
+        is_nvfp4 = kv_cache_dtype == "nvfp4"
+        descriptor = SimpleNamespace(
+            data_buffer_index=1,
+            scale_buffer_index=0 if is_nvfp4 else None,
+        )
+        metadata.sparse_offload_state = SimpleNamespace(
+            layers={0: descriptor},
+            # Neither buffer shares a slice here, so each reads at its own index.
+            out_slots={0: (0, 1)},
+            batch_rows=torch.tensor([2, -1, -1, -1], device=DEVICE, dtype=torch.int32),
+            scatter_start_positions=torch.zeros(4, device=DEVICE, dtype=torch.int32),
+        )
+        data = torch.empty(
+            (
+                12,
+                1,
+                (compressor.head_dim + compressor.nvfp4_residual_dim) // 2
+                if is_nvfp4
+                else compressor.head_dim,
+            ),
+            device=DEVICE,
+            dtype=torch.uint8
+            if is_nvfp4
+            else (torch.float8_e4m3fn if kv_cache_dtype == "fp8_pertensor" else DTYPE),
+        )
+        scales = (
+            torch.empty(
+                (12, 1, (compressor.head_dim + compressor.nvfp4_residual_dim) // 16),
+                device=DEVICE,
+                dtype=torch.float8_e4m3fn,
+            )
+            if is_nvfp4
+            else None
+        )
+        metadata.kv_cache_manager.get_sparse_compress_buffers = Mock(return_value=(data, scales))
+        seen["arena"] = (data, scales)
+        seen["zero_positions"] = metadata.sparse_offload_state.scatter_start_positions
+        metadata.kv_cache_manager.prepare_sparse_compressor_write_indices = Mock(
+            return_value=writes
+        )
+        seen["prepare"] = metadata.kv_cache_manager.prepare_sparse_compressor_write_indices
 
     def fake_prefill_reduction(*args):
         seen["kv_score_dtype"] = args[0].dtype
@@ -1958,7 +2016,8 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         kv_comp.fill_(0.25)
 
     def fake_paged_kv_compress(*args):
-        raise AssertionError("generation compression path should not run")
+        assert sparse
+        args[6].fill_(0.25)
 
     def fake_postprocess_scatter(
         kv_comp,
@@ -1991,6 +2050,11 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         seen["kv_cache_scale"] = kv_cache_scale
         seen["nvfp4_global_scale"] = nvfp4_global_scale
         seen["nvfp4_residual_dim"] = nvfp4_residual_dim
+        seen["kv_cache"] = kv_cache
+        seen["block_table"] = block_table
+        seen["tokens_per_block"] = tokens_per_block
+        seen["start_pos"] = start_pos
+        seen["num_outputs"] = num_comp_tokens
         if kv_out is not None:
             kv_out.fill_(0.5)
         if quant_output is not None:
@@ -2019,10 +2083,44 @@ def _run_compressor_with_fake_postprocess(monkeypatch, kv_cache_dtype: str, is_i
         raising=False,
     )
 
-    x = torch.randn(compressor.compress_ratio, 16, device=DEVICE, dtype=DTYPE)
+    x = torch.randn(metadata.num_tokens, 16, device=DEVICE, dtype=DTYPE)
     with torch.no_grad():
         output = compressor(x, metadata)
     return output, seen
+
+
+@pytest.mark.parametrize(
+    "kv_cache_dtype,is_indexer",
+    [
+        ("default", False),
+        ("fp8_pertensor", False),
+        ("nvfp4", False),
+        ("default", True),
+        ("fp8_blockwise", True),
+        ("mxfp4", True),
+    ],
+)
+@pytest.mark.parametrize("write_index", [7, -1])
+def test_compressor_routes_only_main_writes_to_arena(
+    monkeypatch, kv_cache_dtype, is_indexer, write_index
+):
+    _, seen = _run_compressor_with_fake_postprocess(
+        monkeypatch, kv_cache_dtype, is_indexer, sparse=True, sparse_write_index=write_index
+    )
+    if is_indexer:
+        seen["prepare"].assert_not_called()
+        assert seen["kv_cache"] is not None
+        assert seen["block_table"] is not None
+        return
+    seen["prepare"].assert_called_once()
+    assert seen["kv_cache"] is seen["arena"][0]
+    assert seen["kv_cache_scale"] is seen["arena"][1]
+    assert seen["tokens_per_block"] == 1
+    assert seen["block_table"].shape == (1, 1) and seen["block_table"].is_contiguous()
+    assert seen["block_table"].tolist() == [[write_index]]
+    assert seen["start_pos"].data_ptr() == seen["zero_positions"].data_ptr()
+    assert (seen["start_pos"] == 0).all()
+    assert (seen["num_outputs"] == int(write_index >= 0)).all()
 
 
 def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):

@@ -828,7 +828,6 @@ class _KVCache:
     def resume(
         self,
         cuda_stream: CudaStream | None = None,
-        is_decoding: bool | None = None,
         optional_reuse_groups: Sequence[LayerGroupId] | None = None,
     ) -> bool:
         """Lock this cache's pages at their required levels.
@@ -839,10 +838,6 @@ class _KVCache:
 
         Takes no sparse cache arena lease: that follows membership, so a request receiving
         its history costs the GPU cache nothing until it is seated.
-
-        ``is_decoding`` is accepted and ignored. Resuming no longer distinguishes a decoding
-        request; the parameter is kept so callers that still pass it keep working, and goes
-        with the full sparse attention support.
         """
     def prefetch(self, target: CacheLevel) -> bool: ...
     def get_swa_scratch_range(self, layer_group_id: LayerGroupId) -> HalfOpenRange:
@@ -957,11 +952,6 @@ class HalfOpenRange:
     def __len__(self) -> int: ...
     def __eq__(self, other: object) -> bool: ...
 
-class ScratchDesc:
-    range: HalfOpenRange
-    slot_ids: Sequence[int]
-    def __bool__(self) -> bool: ...
-
 @dataclass(slots=True, frozen=True)
 class PageIndexConverter:
     scale: int
@@ -973,7 +963,7 @@ class PageIndexConverter:
         self,
         base_indices: Sequence[int],
         index_mode: PageIndexMode | None = None,
-        scratch_range: HalfOpenRange | ScratchDesc | None = None,
+        scratch_range: HalfOpenRange | None = None,
         scratch_slots: Sequence[int] = (),
     ) -> list[int]: ...
 
@@ -1319,10 +1309,17 @@ class Batch:
         after**: a block must be in its host page before it can be selected, and
         :meth:`_KVCache.resize` refuses a history this has not covered.
 
-        Bounded by the capacity each row started from, not by how far history travels, so
-        a resumed request moving history across a whole prompt writes back nothing -- its
-        units reached their host pages directly rather than through a cell. A move wider
-        than the in-flight headroom is refused.
+        Only flush a history that is final -- one the row is going to take up. A history
+        past the row's capacity is refused: those units were never written, so they have
+        no cell to write back from.
+
+        Bounded by what was in flight, not by how far history travels, so a resumed request
+        moving history across a whole prompt writes back nothing -- its units reached their
+        host pages directly rather than through a cell. The bound is aggregate: the units
+        crossed, summed over rows, must fit the per-layer write-back list, which is sized
+        from ``max_total_input_tokens``. One prefilling row may therefore use the budget
+        several decoding rows leave unspent, and a batch that exceeds it is refused before
+        any work is issued.
 
         Reads the index table as of the last :meth:`publish`, which covers the blocks in
         range because they were allocated by an earlier step.
@@ -1538,10 +1535,12 @@ class Batch:
         which member is passed makes no difference -- but it must still be a whole
         layer's sparse buffers, as :meth:`fetch_sparse_pages` requires.
 
-        The miss list this leaves behind is read by every :meth:`fetch_resolved_pages`
-        that follows and is overwritten by the next resolve of the same selection, so
-        fetch each member layer before resolving the selection again. Both run on
-        ``stream``, so that ordering is the caller's only across streams.
+        The miss list and per-slot cell mapping this leaves behind are read by every
+        :meth:`fetch_resolved_pages` that follows, and they belong to the life cycle rather
+        than to the selection: the next resolve of *any* selection in the same life cycle
+        overwrites them. Fetch every member layer before resolving another selection there,
+        or those fetches copy the later selection's units. Both run on ``stream``, so that
+        ordering is the caller's only across streams.
         """
 
     def fetch_resolved_pages(

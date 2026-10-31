@@ -347,7 +347,11 @@ class SparseResolveResult(NamedTuple):
     """State and outputs of one sparse resolve launch."""
 
     resident_ordinal: list[int]
-    lru_order: list[int]
+    #: Steps since each entry's last use, and whether that use found the entry already
+    #: resident. Eviction takes the oldest first and, within one age, what was fetched
+    #: before what was hit. ``-1`` and ``0`` where the entry is free.
+    entry_age: list[int]
+    entry_hit: list[int]
     out_slot: list[int]
     #: The compacted work list, one run per layer, of which the first ``miss_total[layer]``
     #: are valid. Entry order is whatever the CTAs raced to, so compare as a set.
@@ -460,7 +464,7 @@ def sparse_flush_list(
 
 def sparse_resolve(
     resident_ordinal: list[int],
-    lru_order: list[int],
+    entry_age: list[int],
     num_layers: int,
     entries_per_layer: int,
     selected: list[int],
@@ -477,6 +481,9 @@ def sparse_resolve(
     the view each row owns, while the selection and every output are [layer][row][width]
     so that each launch sees a contiguous slice of its own.
 
+    ``entry_age`` is the age in steps each entry starts at, or an empty list to leave every
+    entry at zero -- which leaves the eviction order among them arbitrary.
+
     A negative selection entry is padding. ``inactive_rows`` get a default view, standing
     in for a row holding no reservation. Ordinals in ``[history_units, capacity_units)`` are in
     flight: they are made resident before the selection takes any victim, are never
@@ -492,7 +499,8 @@ def sparse_resolve(
 
     (
         resident,
-        lru,
+        ages,
+        hits,
         out,
         miss_row,
         miss_ord,
@@ -502,7 +510,7 @@ def sparse_resolve(
         in_flight,
     ) = _cpp().sparse_resolve(
         resident_ordinal,
-        lru_order,
+        entry_age,
         num_layers,
         entries_per_layer,
         selected,
@@ -514,7 +522,8 @@ def sparse_resolve(
     )
     return SparseResolveResult(
         list(resident),
-        list(lru),
+        list(ages),
+        list(hits),
         list(out),
         list(miss_row),
         list(miss_ord),

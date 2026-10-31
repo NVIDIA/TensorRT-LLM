@@ -1561,6 +1561,16 @@
       "path": "sparse_attention_config.kt_cache_dtype"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.gpu_cache_factor"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "sparse_attention_config.kv_cache_offload_config.host_history_size"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "sparse_attention_config.num_attention_heads"

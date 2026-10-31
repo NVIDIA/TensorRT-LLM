@@ -20,7 +20,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
-#include <numeric>
+#include <algorithm>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -40,26 +40,12 @@ size_t alignedBytes(size_t bytes) noexcept
 namespace
 {
 
-//! Per-lease metadata, in carve order. Arrays shared by every lease of a life cycle live
+//! Bytes one lease's entry words take. Arrays shared by every lease of a life cycle live
 //! on the arena instead.
-struct LeaseLayout
-{
-    size_t ordinal = 0;
-    size_t lru = 0;
-
-    [[nodiscard]] size_t total() const noexcept
-    {
-        return ordinal + lru;
-    }
-};
-
-LeaseLayout leaseLayout(SparseCacheInit const& shape)
+size_t leaseBytes(SparseCacheInit const& shape)
 {
     auto const entries = static_cast<size_t>(shape.numSelections) * shape.entriesPerSelection;
-    LeaseLayout out;
-    out.ordinal = alignedBytes(sizeof(int32_t) * entries);
-    out.lru = alignedBytes(sizeof(int32_t) * entries);
-    return out;
+    return alignedBytes(sizeof(uint32_t) * entries);
 }
 
 } // namespace
@@ -107,9 +93,8 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         TLLM_CHECK_WITH_INFO(buffers >= 0, "SparseCellArena: a pool cannot have a negative buffer count");
     }
 
-    auto const layout = leaseLayout(mShape);
     mMaxLeases = maxLeases;
-    mMetadataBytes = layout.total();
+    mMetadataBytes = leaseBytes(mShape);
 
     // One region per pool, each aligned so that a buffer's cell indices stay relative to its own
     // pool's base.
@@ -121,12 +106,10 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
         cellBytes += alignedBytes(static_cast<size_t>(maxLeases) * buffers * mShape.cellsPerBuffer * bytes);
     }
 
-    auto const entries = static_cast<size_t>(mShape.numSelections) * mShape.entriesPerSelection;
     size_t const layerBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const slotBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numBuffers));
     size_t const selectionBytes = alignedBytes(sizeof(int32_t) * static_cast<size_t>(mShape.numLayers));
-    size_t const identityBytes = alignedBytes(sizeof(int32_t) * entries);
-    size_t const sharedBytes = layerBytes + slotBytes + selectionBytes + identityBytes;
+    size_t const sharedBytes = layerBytes + slotBytes + selectionBytes;
 
     mNumBytes = cellBytes + sharedBytes + static_cast<size_t>(maxLeases) * mMetadataBytes;
 
@@ -142,7 +125,6 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     mSharedLayer = reinterpret_cast<int32_t*>(shared);
     mSharedSlotInPool = reinterpret_cast<int32_t*>(shared + layerBytes);
     mSharedLayerSelection = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes);
-    mIdentity = reinterpret_cast<int32_t*>(shared + layerBytes + slotBytes + selectionBytes);
     mMetadataBase = shared + sharedBytes;
 
     cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedLayer), mShape.bufferLayer.data(),
@@ -152,25 +134,15 @@ SparseCellArena::SparseCellArena(SparseCacheInit const& shape, int maxLeases)
     cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mSharedLayerSelection), mShape.layerSelection.data(),
         sizeof(int32_t) * mShape.layerSelection.size(), stream));
 
-    // The recency order every lease starts from: a per-selection identity permutation.
-    std::vector<int32_t> identity(entries);
-    for (int32_t selection = 0; selection < mShape.numSelections; ++selection)
-    {
-        auto const begin = identity.begin() + static_cast<ptrdiff_t>(selection) * mShape.entriesPerSelection;
-        std::iota(begin, begin + mShape.entriesPerSelection, 0);
-    }
-    cuCheck(cuMemcpyHtoDAsync(
-        reinterpret_cast<CUdeviceptr>(mIdentity), identity.data(), sizeof(int32_t) * identity.size(), stream));
-
     // An unused cell is a clean one, so the arena is born that way and a row hands its
-    // lease back clean. Ordered after the identity staged above, which this copies from.
+    // lease back clean.
     for (int slot = 0; slot < mMaxLeases; ++slot)
     {
         initialiseLease(SparseLeaseIndex{slot}, stream);
     }
 
     // The arena has no stream of its own, so the staging above is ordered on the null
-    // stream only. `identity` also dies with this scope. Both want it landed here.
+    // stream only, and the host vectors it reads die with this scope.
     cuCheck(cuStreamSynchronize(stream));
 }
 
@@ -184,24 +156,9 @@ void SparseCellArena::initialiseLease(SparseLeaseIndex slot, CUstream stream)
         "SparseCellArena::initialiseLease: slot %d is outside [0, %d)", slot.value(), mMaxLeases);
     int const index = slot.value();
 
-    auto const layout = leaseLayout(mShape);
-    auto* bytes = mMetadataBase + static_cast<size_t>(index) * mMetadataBytes;
-    size_t carved = 0;
-    auto carve = [&](size_t size)
-    {
-        auto* ptr = reinterpret_cast<int32_t*>(bytes + carved);
-        carved += size;
-        return ptr;
-    };
-
-    auto* const residentOrdinal = carve(layout.ordinal);
-    auto* const lruOrder = carve(layout.lru);
-
     auto const entries = static_cast<size_t>(mShape.numSelections) * static_cast<size_t>(mShape.entriesPerSelection);
-    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(residentOrdinal),
-        static_cast<unsigned int>(kBadBlockOrdinal.value()), entries, stream));
-    cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(lruOrder), reinterpret_cast<CUdeviceptr>(mIdentity),
-        sizeof(int32_t) * entries, stream));
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mMetadataBase + static_cast<size_t>(index) * mMetadataBytes),
+        SparseEntry::kFreeWord, entries, stream));
 }
 
 SparseArenaView SparseCellArena::view() const noexcept
@@ -209,8 +166,6 @@ SparseArenaView SparseCellArena::view() const noexcept
     SparseArenaView out;
     out.metadataBase = mMetadataBase;
     out.leaseStride = mMetadataBytes;
-    // Both regions are carved from one lease block, the ordinals first; see leaseLayout().
-    out.lruOffset = static_cast<int32_t>(leaseLayout(mShape).ordinal / sizeof(int32_t));
     out.bufferSlotInPool = mSharedSlotInPool;
     out.bufferLayer = mSharedLayer;
     out.layerSelection = mSharedLayerSelection;
@@ -232,11 +187,13 @@ std::vector<int32_t> SparseCellArena::peekResidentOrdinals(SparseLeaseIndex slot
     // knows which stream last touched the slot.
     cuCheck(cuCtxSynchronize());
     auto const arena = view();
-    std::vector<int32_t> out(arena.numEntries());
-    cuCheck(cuMemcpyDtoHAsync(out.data(),
+    std::vector<uint32_t> words(arena.numEntries());
+    cuCheck(cuMemcpyDtoHAsync(words.data(),
         reinterpret_cast<CUdeviceptr>(arena.metadataBase + static_cast<uint64_t>(slot.value()) * arena.leaseStride),
-        sizeof(int32_t) * out.size(), stream));
+        sizeof(uint32_t) * words.size(), stream));
     cuCheck(cuStreamSynchronize(stream));
+    std::vector<int32_t> out(words.size());
+    std::transform(words.begin(), words.end(), out.begin(), [](uint32_t word) { return SparseEntry::ordinal(word); });
     return out;
 }
 
