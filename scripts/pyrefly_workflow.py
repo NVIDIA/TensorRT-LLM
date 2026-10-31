@@ -4,9 +4,39 @@
 
 import argparse
 import json
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
+
+
+def copy_untracked_product_files(source_root: Path, worktree: Path) -> None:
+    """Copy new product Python files and include them in the worktree's diff."""
+    paths = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "tensorrt_llm/"],
+        cwd=source_root,
+        capture_output=True,
+        check=True,
+    ).stdout.split(b"\0")
+    for raw_path in paths:
+        if not raw_path:
+            continue
+        relative = Path(os.fsdecode(raw_path))
+        if relative.suffix not in (".py", ".pyi"):
+            continue
+        target = worktree / relative
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"Untracked source file conflicts with rebased path: {relative}")
+        if not target.parent.resolve().is_relative_to(worktree.resolve()):
+            raise ValueError(f"Untracked file destination escapes the worktree: {relative}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative, target, follow_symlinks=False)
+        subprocess.run(
+            ["git", "add", "--intent-to-add", "--force", "--", str(relative)],
+            cwd=worktree,
+            check=True,
+        )
 
 
 def print_summary(report_path: Path) -> None:
@@ -221,6 +251,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    copy_parser = subparsers.add_parser("copy-untracked-product-files")
+    copy_parser.add_argument("source_root", type=Path)
+    copy_parser.add_argument("worktree", type=Path)
+
     summary_parser = subparsers.add_parser("print-summary")
     summary_parser.add_argument("report", type=Path)
 
@@ -258,7 +292,9 @@ def main() -> int:
     failure_parser.add_argument("failed_command")
 
     args = parser.parse_args()
-    if args.command == "print-summary":
+    if args.command == "copy-untracked-product-files":
+        copy_untracked_product_files(args.source_root, args.worktree)
+    elif args.command == "print-summary":
         print_summary(args.report)
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
