@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the hang-traceback dumping in PeriodicJUnitXML.
+"""CPU-only tests for PeriodicJUnitXML reporting and hang tracebacks.
 
 These exercise the pure-Python wiring only (timeout resolution and the watchdog
 that writes output-dir/hang_traceback.txt); they need no GPU or model access.
@@ -26,10 +26,12 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 import faulthandler
 import os
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Callable
 
 import pytest
+from _pytest.reports import TestReport
 
 __extra_import_path__ = ["~/tests/integration/defs/utils"]
 from periodic_junit import PeriodicJUnitXML
@@ -212,3 +214,149 @@ def test_hang_traceback_off_by_default(make_reporter: ReporterFactory) -> None:
     assert reporter._hang_timer is None
     assert reporter._hang_file is None
     assert not os.path.exists(reporter._hang_traceback_path())
+
+
+@pytest.fixture
+def unfinished_reporter(
+    make_reporter: ReporterFactory, request: pytest.FixtureRequest
+) -> PeriodicJUnitXML:
+    reporter = make_reporter(dump_hang_traceback=False, save_unfinished_test=True)
+    # Use pytest's real XML reporter without installing process signal handlers.
+    reporter.config = request.config
+    return reporter
+
+
+def _complete_test(reporter: PeriodicJUnitXML, nodeid: str) -> None:
+    for when in ("setup", "call", "teardown"):
+        reporter.pytest_runtest_logreport(
+            TestReport(
+                nodeid=nodeid,
+                location=("test_example.py", 0, "test_example"),
+                keywords={},
+                outcome="passed",
+                longrepr=None,
+                when=when,
+                sections=[],
+                duration=0.01,
+            )
+        )
+
+
+def test_logstart_records_test_before_reports(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path
+) -> None:
+    reporter = unfinished_reporter
+    reporter.pytest_runtest_logstart("test_example.py::test_setup", None)
+
+    assert (tmp_path / "unfinished_test.txt").read_text() == "test_example.py::test_setup\n"
+    assert reporter.pending_reports == []
+    assert not Path(reporter.xmlpath).exists()
+
+
+def test_publication_clears_completed_but_preserves_active(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path
+) -> None:
+    reporter = unfinished_reporter
+    completed = "test_example.py::test_completed"
+    active = "test_example.py::test_active"
+    reporter.pytest_runtest_logstart(completed, None)
+    _complete_test(reporter, completed)
+    reporter.pytest_runtest_logstart(active, None)
+    unfinished = tmp_path / "unfinished_test.txt"
+    assert unfinished.read_text().splitlines() == [completed, active]
+
+    reporter._generate_report()
+
+    assert unfinished.read_text().splitlines() == [active]
+    assert ET.parse(reporter.xmlpath).find(".//testcase") is not None
+    assert not reporter._completed_unfinished_tests
+
+
+def test_failed_xml_publication_retains_unfinished_test(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reporter = unfinished_reporter
+    nodeid = "test_example.py::test_completed"
+    reporter.pytest_runtest_logstart(nodeid, None)
+    _complete_test(reporter, nodeid)
+
+    def fail_replace(src: str, dst: str) -> None:
+        raise OSError("publication failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", fail_replace)
+        with pytest.raises(OSError, match="publication failed"):
+            reporter._generate_report()
+
+    assert (tmp_path / "unfinished_test.txt").read_text().splitlines() == [nodeid]
+    assert reporter._completed_unfinished_tests == {nodeid}
+    assert not Path(reporter.xmlpath).exists()
+    reporter._generate_report()
+    assert (tmp_path / "unfinished_test.txt").read_text() == ""
+
+
+def test_failed_cleanup_retries_after_successful_publication(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reporter = unfinished_reporter
+    nodeid = "test_example.py::test_completed"
+    reporter.pytest_runtest_logstart(nodeid, None)
+    _complete_test(reporter, nodeid)
+    unfinished = tmp_path / "unfinished_test.txt"
+    replace = os.replace
+
+    def fail_cleanup(src: str, dst: str) -> None:
+        if Path(dst) == unfinished:
+            raise OSError("cleanup failed")
+        replace(src, dst)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "replace", fail_cleanup)
+        reporter._generate_report()
+
+    assert ET.parse(reporter.xmlpath).find(".//testcase") is not None
+    assert unfinished.read_text().splitlines() == [nodeid]
+    assert reporter._completed_unfinished_tests == {nodeid}
+    assert not Path(str(unfinished) + ".tmp").exists()
+    reporter._generate_report()
+    assert unfinished.read_text() == ""
+    assert not reporter._completed_unfinished_tests
+
+
+def test_invalid_utf8_cleanup_keeps_published_xml(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    reporter = unfinished_reporter
+    nodeid = "test_example.py::test_completed"
+    reporter.pytest_runtest_logstart(nodeid, None)
+    _complete_test(reporter, nodeid)
+    unfinished = tmp_path / "unfinished_test.txt"
+    damaged = unfinished.read_bytes() + b"\xe4\xb8"
+    unfinished.write_bytes(damaged)
+
+    reporter._generate_report()
+
+    assert ET.parse(reporter.xmlpath).find(".//testcase") is not None
+    assert unfinished.read_bytes() == damaged
+    assert reporter._completed_unfinished_tests == {nodeid}
+    output = capsys.readouterr().out
+    assert "Error clearing saved tests" in output
+    assert "Error in report generation" not in output
+
+
+def test_restarted_nodeid_stays_tracked_until_second_publication(
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path
+) -> None:
+    reporter = unfinished_reporter
+    nodeid = "test_example.py::test_retry"
+    reporter.pytest_runtest_logstart(nodeid, None)
+    _complete_test(reporter, nodeid)
+    reporter.pytest_runtest_logstart(nodeid, None)
+
+    reporter._generate_report()
+
+    unfinished = tmp_path / "unfinished_test.txt"
+    assert nodeid in unfinished.read_text().splitlines()
+    _complete_test(reporter, nodeid)
+    reporter._generate_report()
+    assert unfinished.read_text() == ""
