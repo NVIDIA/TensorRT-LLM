@@ -40,6 +40,7 @@ from ..._utils import get_sm_version, is_sm_100f, is_sm_120f
 from ...models.modeling_utils import QuantConfig
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
+from ..kernels.fused_ops.fp8_static_quant import fp8_static_quant
 from ..locality_domain.layout import (make_bf16_linear_output_layout,
                                       make_nvfp4_linear_output_layout)
 from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
@@ -129,6 +130,23 @@ def _fp8_per_tensor_uses_cute_dsl_sm107() -> bool:
     # Opt-in until an LLM API option exists; SM107 only.
     return (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE
             and os.environ.get("USE_CUTE_DSL_FP8_PER_TENSOR_MM", "0") == "1")
+
+
+# Below this size the C++ quantize kernel is as fast on the GPU and cheaper to
+# launch; above it the Triton kernel sustains more HBM bandwidth.
+_TRITON_STATIC_FP8_QUANT_MIN_NUMEL = 1 << 23
+
+
+def _static_quantize_e4m3_per_tensor(input: torch.Tensor,
+                                     scale: torch.Tensor) -> torch.Tensor:
+    """FP8 per-tensor quantization of ``input`` with the static ``scale``."""
+    if (not is_torch_compiling() and input.dtype == torch.bfloat16
+            and input.is_contiguous()
+            and input.numel() >= _TRITON_STATIC_FP8_QUANT_MIN_NUMEL):
+        return fp8_static_quant(input, scale)
+    qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+        input, scale)
+    return qinput
 
 
 def _fp8_block_scales_uses_cute_dsl_sm107(module) -> bool:
@@ -868,7 +886,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if input.dtype != torch.float8_e4m3fn:
             if static_input_scale is not None:
                 # Static quantization
-                qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                qinput = _static_quantize_e4m3_per_tensor(
                     input, static_input_scale)
             else:
                 # Dynamic quantization
