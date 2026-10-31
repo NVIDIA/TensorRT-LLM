@@ -986,6 +986,13 @@ class WinoVaeCausalConv3d(WanCausalConv3d):
         return self._forward_spatial_taps(taps, 2 - history, x.shape[3], x.shape[4], bias)
 
 
+def _video_to_frames_2d(x: torch.Tensor) -> torch.Tensor:
+    """Video ``[B, C, T, H, W]`` as the frames ``[B*T, C, H, W]`` channels-last."""
+    batch_size, channels, frames, height, width = x.shape
+    x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
+    return _channels_last_2d_if_needed(x_4d)
+
+
 class WinoVaeResample(WanResample):
     """``WanResample`` with the fused upsample (2x2 conv on the low-res grid plus a phase
     gather), the deferred downsample bias and sharding."""
@@ -1011,14 +1018,48 @@ class WinoVaeResample(WanResample):
             self._packed = (key[0], key[1], packed, packed_bias)
         return self._packed[2], self._packed[3]
 
-    def _fused_upsample(
+    def forward(
         self,
-        x_4d: torch.Tensor,
-        batch_size: int,
-        frames: int,
-        shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
+        *,
+        prepadded: bool = False,
     ) -> torch.Tensor:
-        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut)."""
+        """Resample ``x`` ``[B, C, T, H, W]``: upsampling runs the time step, then the space
+        step; downsampling runs the space step, then the time step. The time steps run only in
+        the 3d modes under a causal cache.
+
+        ``shortcut`` = (residual, DupUp3D module, first_chunk), upsample modes only: the space
+        step adds the expanded shortcut while writing and the caller skips its add.
+        ``prepadded``, downsample modes only: ``x`` already carries the zero row and column of
+        the downsample pad, as ``[T, C, H+1, W+1]`` channels-last frames of batch 1."""
+        if feat_cache is not None and feat_idx is None:
+            raise ValueError("feat_idx is required when feat_cache is provided")
+        upsample = self.mode.startswith("upsample")
+        if shortcut is not None and not upsample:
+            raise ValueError("shortcut is only consumed by the upsample modes")
+        if prepadded and upsample:
+            raise ValueError("prepadded input is only taken by the downsample modes")
+
+        if upsample:
+            return self._upsample_space(self._upsample_time(x, feat_cache, feat_idx), shortcut)
+        if prepadded:
+            batch_size, frames = 1, x.shape[0]
+            y = self._downsample_space(x, batch_size, prepadded=True)
+        else:
+            batch_size, frames = x.shape[0], x.shape[2]
+            y = self._downsample_space(_video_to_frames_2d(x), batch_size)
+        return self._downsample_time(y, batch_size, frames, feat_cache, feat_idx)
+
+    def _upsample_space(
+        self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
+    ) -> torch.Tensor:
+        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut):
+        ``[B, C, T, H, W] -> [B, Cout, T, 2H, 2W]``."""
+        batch_size, frames = x.shape[0], x.shape[2]
+        x_4d = _video_to_frames_2d(x)
         packed, packed_bias = self._packed_weights()
         cout = packed.shape[0] // 4
         factor_t, repeats = (
@@ -1052,44 +1093,21 @@ class WinoVaeResample(WanResample):
             temp, residual, batch_size, frames, dup.factor_t, dup.repeats, crop, bias=gather_bias
         )
 
-    def forward(
+    def _upsample_time(
         self,
         x: torch.Tensor,
-        feat_cache: list[CacheEntry] | None = None,
-        feat_idx: list[int] | None = None,
-        shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
+        feat_cache: list[CacheEntry] | None,
+        feat_idx: list[int] | None,
     ) -> torch.Tensor:
-        """Resample ``x`` ``[B, C, T, H, W]``: the upsample3d time step with its causal cache,
-        then the spatial step (upsampling as a 2x2 conv on the low-res grid plus a phase
-        gather), then (downsample3d) the temporal downsample continuation. ``shortcut`` =
-        (residual, DupUp3D module, first_chunk): when given, the upsample adds the expanded
-        shortcut while writing and the caller skips its add."""
-        batch_size, channels, _, height, width = x.size()
-        if feat_cache is not None and feat_idx is None:
-            raise ValueError("feat_idx is required when feat_cache is provided")
-        if shortcut is not None and not self.mode.startswith("upsample"):
-            raise ValueError("shortcut is only consumed by the upsample modes")
-
-        if self.mode == "upsample3d" and feat_cache is not None and feat_idx is not None:
-            x = self._temporal_upsample(x, feat_cache, feat_idx)
-
-        frames = x.shape[2]
-        x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
-        x_4d = _channels_last_2d_if_needed(x_4d)
-        if self.mode.startswith("upsample"):
-            return self._fused_upsample(x_4d, batch_size, frames, shortcut)
-        y = self._downsample(x_4d, batch_size)
-        return self._after_resample(y, batch_size, frames, feat_cache, feat_idx)
-
-    def _temporal_upsample(
-        self, x: torch.Tensor, feat_cache: list[CacheEntry], feat_idx: list[int]
-    ) -> torch.Tensor:
-        """The upsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one).
-        First chunk: records the ``"Rep"`` sentinel and returns ``x`` unchanged (its frames are
-        repeated by the caller's layout). Later chunks: the time conv runs against the cached
-        frame (zero history right after the sentinel), the chunk's last frames become the next
-        cache entry, and the two channel halves are interleaved along time with the conv bias:
+        """The upsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one);
+        ``x`` unchanged in upsample2d or without a cache. First chunk: records the ``"Rep"``
+        sentinel and returns ``x`` unchanged (its frames are repeated by the caller's layout).
+        Later chunks: the time conv runs against the cached frame (zero history right after the
+        sentinel), the chunk's last frames become the next cache entry, and the two channel
+        halves are interleaved along time with the conv bias:
         ``[B, C, T, H, W] -> [B, C, 2T, H, W]``."""
+        if self.mode != "upsample3d" or feat_cache is None:
+            return x
         batch_size, channels, frames, height, width = x.size()
         idx = feat_idx[0]
         if feat_cache[idx] is None:
@@ -1127,7 +1145,7 @@ class WinoVaeResample(WanResample):
         x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
         return x.reshape(batch_size, channels, frames * 2, height, width)
 
-    def _downsample(
+    def _downsample_space(
         self, x_4d: torch.Tensor, batch_size: int, *, prepadded: bool = False
     ) -> torch.Tensor:
         """The stride-2 3x3 conv of the downsample modes on frames ``[B*T, C, H, W]``, after its
@@ -1173,21 +1191,7 @@ class WinoVaeResample(WanResample):
             self._time_bias = (*key, folded)
         return self._time_bias[4]
 
-    def forward_prepadded(
-        self,
-        x_4d: torch.Tensor,
-        frames: int,
-        feat_cache: list[CacheEntry] | None = None,
-        feat_idx: list[int] | None = None,
-    ) -> torch.Tensor:
-        """Downsample path on an input that already carries the zero row/column the
-        ``ZeroPad2d`` would add; ``x_4d`` is ``[T, C, H+1, W+1]`` channels-last, batch 1."""
-        if not self.mode.startswith("downsample"):
-            raise ValueError("forward_prepadded is for the downsample modes")
-        x = self._downsample(x_4d, 1, prepadded=True)
-        return self._after_resample(x, 1, frames, feat_cache, feat_idx)
-
-    def _after_resample(
+    def _downsample_time(
         self,
         x: torch.Tensor,
         batch_size: int,
@@ -1195,6 +1199,10 @@ class WinoVaeResample(WanResample):
         feat_cache: list[CacheEntry] | None,
         feat_idx: list[int] | None,
     ) -> torch.Tensor:
+        """The space step's frames ``[B*T, C, H, W]`` back as video ``[B, C, T, H, W]``, then
+        the downsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one):
+        the first chunk is cached as is, later chunks run the stride-2 time conv against the
+        cached last frame, with the space conv's deferred bias folded into the time conv's."""
         x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
         x = _channels_last_3d_if_needed(x_5d)
 
@@ -1571,8 +1579,8 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
         if self.downsampler is not None:
             if isinstance(x, PendingAdd) and x.can_fuse():
                 # One pass writes the downsampler's zero-padded input directly.
-                x = self.downsampler.forward_prepadded(
-                    x.materialize_padded_2d(), x.frames, feat_cache=feat_cache, feat_idx=feat_idx
+                x = self.downsampler(
+                    x.materialize_padded_2d(), feat_cache, feat_idx, prepadded=True
                 )
             else:
                 x = self.downsampler(_as_tensor(x), feat_cache=feat_cache, feat_idx=feat_idx)
