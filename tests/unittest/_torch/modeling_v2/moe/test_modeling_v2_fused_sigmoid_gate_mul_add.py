@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fused_sigmoid_gate_mul_add catalog entry.
+"""GPU test for the unified target's fused_sigmoid_gate_mul_add variant
+(catalog/moe/fused_sigmoid_gate_mul_add).
 
-The entry owns the contract. This file turns a cell into operands, locks both
-sides of the in-place write, and holds the claims no cell carries: the empty
-batch and the loud rejection of a wrong-length gate.
+The entry owns the contract. This file turns a cell into operands (a strided gate
+is the call site's `gug` column), locks both sides of the in-place write, and holds
+the claims no cell carries: the strided gate equal to the dense column, CUDA-graph
+capture and replay at the 128-row site, the empty batch and the loud rejection of
+a wrong-length gate.
 """
 
 import zlib
@@ -12,17 +15,21 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fused_sigmoid_gate_mul_add import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_sigmoid_gate_mul_add import (  # noqa: E501
     fused_sigmoid_gate_mul_add as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "fused_sigmoid_gate_mul_add requires a CUDA device"
 
 DEV = "cuda"
 HIDDEN = 2560
+# The shared expert's fused GEMM output: gate|up (2 x 640) plus 8 gate-logit rows, the
+# logit in the first of them. A strided gate is that column, as the call site reads it.
+GUG_WIDTH = 2 * 640 + 8
+GATE_COL = 2 * 640
 
 
 def _operands(spec, seed):
@@ -37,10 +44,10 @@ def _operands(spec, seed):
     final, shared = rand(t, h), rand(t, h)
     gate = rand(t, 1, dtype=spec["gate_dtype"])
     if spec["gate_layout"] == "strided":
-        wide = rand(t, 4, dtype=spec["gate_dtype"])
-        wide[:, 2:3] = gate
-        gate = wide[:, 2:3]
-        assert not gate.is_contiguous()
+        gug = rand(t, GUG_WIDTH, dtype=spec["gate_dtype"])
+        gug[:, GATE_COL : GATE_COL + 1] = gate
+        gate = gug[:, GATE_COL : GATE_COL + 1]
+        assert not gate.is_contiguous() or t == 1
     else:
         assert spec["gate_layout"] == "column", spec["gate_layout"]
     return final, gate, shared
@@ -65,6 +72,51 @@ def test_certified_cells(cell, certifying):  # noqa: F811 — pytest resolves th
 
 
 # ── what a cell cannot carry ──────────────────────────────────────────────
+
+
+def _strided_spec(tokens: int) -> dict:
+    """The certified strided-gate cell at `tokens` rows."""
+    (spec,) = [
+        c.spec
+        for c in op.CELLS
+        if c.spec["tokens"] == tokens and c.spec["gate_layout"] == "strided"
+    ]
+    return dict(spec)
+
+
+def test_strided_gate_is_the_dense_column_bit_for_bit() -> None:
+    """The call site's strided `gug` column and the same logits as a dense `[T, 1]`."""
+    spec = _strided_spec(1024)
+    final, gate, shared = _operands(spec, seed=11)
+    dense_final = final.clone()
+    op(final, gate, shared)
+    op(dense_final, gate.contiguous(), shared)
+    assert torch.equal(final, dense_final)
+
+
+def test_cuda_graph_capture_and_replay() -> None:
+    """The decode sites run captured: one capture at the 128-row site, replayed on
+    refilled operands (the strided gate's densifying copy is captured with it)."""
+    spec = _strided_spec(128)
+    final, gate, shared = _operands(spec, seed=5)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(final.clone(), gate, shared)  # warm-up: the Triton JIT compiles outside capture
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = op(final, gate, shared)
+    assert out.data_ptr() == final.data_ptr()
+
+    for seed in (21, 22):
+        new_final, new_gate, new_shared = _operands(spec, seed=seed)
+        final.copy_(new_final)
+        gate.copy_(new_gate)
+        shared.copy_(new_shared)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(final, op.reference(new_final, new_gate, new_shared))
 
 
 def test_zero_tokens_is_a_no_op():

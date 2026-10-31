@@ -8,13 +8,15 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-# No torch.ops boundary exists around this kernel: the module callable is the
-# stable surface, and its body is one Triton launch after argument checks.
+# The module callable is the surface: outside torch.compile its body is one Triton
+# launch after argument checks. `torch.ops.trtllm.fused_sigmoid_gate_mul_add_` (same
+# module) is only its torch.compile boundary, which the callable takes itself when
+# compiling, with a different signature (mutated `output`, separate addend).
 from tensorrt_llm._torch.moe.fused_shared_expert import (
     fused_sigmoid_gate_mul_add as _fused_sigmoid_gate_mul_add,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 
 def _ckpt(tokens: int, **extra) -> dict:
@@ -65,11 +67,40 @@ class FusedSigmoidGateMulAdd(OpWrapper):
             "GEMM leaves it",
             spec=_ckpt(33, gate_layout="strided"),
         ),
+        # The unified target's call sites, the decode PLE-layer combine and the MTP layer's
+        # MoE, on the gate the shared expert's fused GEMM leaves: column 1280 of the
+        # replicated [T, 1288] `gug` output.
+        Cell(
+            why="unified decode PLE-layer / MTP MoE combine: one token, strided gate",
+            spec=_ckpt(1, gate_layout="strided"),
+        ),
+        Cell(
+            why="unified tp4/tep4 decode batch at the largest captured size: 128 rows",
+            spec=_ckpt(128, gate_layout="strided"),
+        ),
+        Cell(
+            why="unified tep4 MTP-7 at batch 128: 128 x 8 = 1024 rows, strided gate",
+            spec=_ckpt(1024, gate_layout="strided"),
+        ),
+        Cell(
+            why="the envelope's largest row: max_num_tokens 8192, strided gate",
+            spec=_ckpt(8192, gate_layout="strided"),
+        ),
     )
 
     note = """
     Metadata consumed: none; stateless, no autotuner, no architecture branch.
-    The Triton kernel JIT-compiles on first call.
+    Source: a Triton kernel (`_sigmoid_gate_mul_add_kernel`) JIT-compiled on first
+    call for the running device; the cells ran that JIT path on GB300 (sm_103).
+
+    Call sites in the unified target: the decode PLE-layer combine
+    (`DecodeTarget.forward`) and the MTP layer's MoE (`DecodeTarget.mtp_forward`),
+    in place on the routed output. The shared expert is replicated at every member,
+    so the gate is column 1280 of this rank's `[T, 1288]` `gug` output (gate|up 2 x
+    640 plus 8 gate-logit rows) and hidden is 2560 everywhere. Rows are this rank's
+    tokens: decode 1..128 at tp4 / tep4 (1..32 a dep4 rank's own), MTP-7 at batch
+    128 up to 128 x 8 = 1024. Every row count takes one path: hidden 2560 gives
+    one 4096-wide block and 8 warps per row, grid `(T, 1)`.
 
     Preconditions, all enforced loudly by the callable (AssertionError before
     any launch; the test holds the wrong-length gate): `final_hidden_states`
@@ -87,15 +118,28 @@ class FusedSigmoidGateMulAdd(OpWrapper):
     Wrong variants land 29,000-152,000x outside the bf16 band: no sigmoid,
     multiply instead of add, gate on the routed half, gate dropped, one gate
     for the whole batch.
+    Measured at the unified cells (strided `gug` gate, randn operands) against
+    `reference`: bitwise at 1 row; 8 of 327,680 elements differ at 128 rows, 64 of
+    2,621,440 at 1024, 564 of 20,971,520 at 8192. Wherever |out| >= 2^-6 each
+    difference is exactly one bf16 ulp of the output; the rest sit where the sum
+    cancels toward zero, the largest 1.6e-2 absolute at 8192 rows (one ulp of a
+    [2, 4) value). Against a float64 reference the relative L2 is 1.66e-3 at
+    every cell, equal to `reference`'s own (bf16 output rounding); cosine
+    0.9999986. A strided `gug` column and the same logits as a dense `[T, 1]` are
+    bitwise one call (held at 1024 rows). Graph-capturable: one capture at the
+    128-row site, replayed on refilled operands, matches `reference` (held).
 
     Hard limits
       num_tokens  row offset widened to int64 in the kernel; largest run 8192
+                  (max_num_tokens). Column offsets are int32 within one row; the
+                  first int32 element-index overflow, 2^31 / 2560 = 838,860 rows,
+                  is past the envelope and would not occur (int64 row offset).
 
     Not certified: hidden sizes other than 2560 (the column block and warp count
     step with it), gate layouts other than `[T, 1]` and the strided column, an
     `output` buffer (including one aliasing `shared_expert_output`), row-padded
-    operands, host operands, CUDA-graph capture, torch.compile, operands on two
-    devices, float8 activations.
+    operands, host operands, torch.compile, operands on two devices, float8
+    activations, gate dtypes other than bf16, rows past 8192.
     """
 
     def __call__(
