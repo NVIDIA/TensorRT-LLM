@@ -220,9 +220,10 @@ def test_state_workspace_rejects_invalid_buffer(monkeypatch, buffer_index, inval
     kernel.assert_not_called()
 
 
+@pytest.mark.parametrize("with_offsets", [False, True])
 @pytest.mark.parametrize("with_workspace", [False, True])
-def test_state_workspace_dispatch(monkeypatch, with_workspace):
-    """Do not pass the FlashInfer-only option to the Triton fallback."""
+def test_state_workspace_dispatch(monkeypatch, with_workspace, with_offsets):
+    """Do not pass the FlashInfer-only options to the Triton fallback."""
     from unittest.mock import Mock
 
     import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
@@ -230,8 +231,47 @@ def test_state_workspace_dispatch(monkeypatch, with_workspace):
     impl = Mock()
     monkeypatch.setattr(mixer, "_resolve_chunk_gated_delta_rule", lambda: impl)
     workspace = (torch.empty(1), torch.empty(1)) if with_workspace else None
-    mixer.chunk_gated_delta_rule(state_workspace=workspace)
-    assert impl.call_args.kwargs == ({"state_workspace": workspace} if with_workspace else {})
+    offsets = torch.zeros(2, dtype=torch.int64) if with_offsets else None
+    mixer.chunk_gated_delta_rule(state_workspace=workspace, cu_seqlens_cpu=offsets)
+    expected = {}
+    if with_workspace:
+        expected["state_workspace"] = workspace
+        if with_offsets:
+            expected["cu_seqlens_cpu"] = offsets
+    assert impl.call_args.kwargs == expected
+
+
+def test_prefill_cu_seqlens_cpu_matches_mamba_metadata():
+    """Host prefill offsets equal the prefill prefix of ``Mamba2Metadata.query_start_loc``."""
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
+
+    seq_lens = torch.tensor([5, 1, 300, 2, 1, 1], dtype=torch.int32)
+    offsets = mixer._prefill_cu_seqlens_cpu(seq_lens, num_prefills=4)
+    assert offsets.device.type == "cpu" and offsets.dtype == torch.int64
+    assert offsets.tolist() == [0, 5, 6, 306, 308]
+
+
+def test_state_workspace_capacity_is_bounded(monkeypatch):
+    """Large states and batches reserve at most the byte bound per buffer."""
+    from types import SimpleNamespace
+
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
+
+    monkeypatch.setattr(mixer, "_use_flashinfer_gdn_prefill", lambda: True)
+    monkeypatch.setattr(mixer, "is_sm_100f", lambda: False)
+    layer = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}))
+    metadata = SimpleNamespace(max_num_sequences=512, max_num_requests=512, max_num_tokens=2048)
+    state = torch.empty(1, 16, 128, 128, dtype=torch.bfloat16)
+    state_bytes = 16 * 128 * 128 * torch.float32.itemsize
+    workspace = mixer.Qwen3NextGatedDeltaNet._get_prefill_state_workspace(layer, metadata, state)
+    for buffer in workspace:
+        assert buffer.shape == (mixer._PREFILL_STATE_WORKSPACE_BYTES // state_bytes, 16, 128, 128)
+        assert buffer.numel() * buffer.element_size() <= mixer._PREFILL_STATE_WORKSPACE_BYTES
+    # A state larger than the bound still gets room for one sequence.
+    huge = torch.empty(1, mixer._PREFILL_STATE_WORKSPACE_BYTES // (128 * 128 * 4) + 1, 128, 128)
+    layer = SimpleNamespace(model_config=SimpleNamespace(extra_attrs={}))
+    workspace = mixer.Qwen3NextGatedDeltaNet._get_prefill_state_workspace(layer, metadata, huge)
+    assert all(buffer.shape[0] == 1 for buffer in workspace)
 
 
 @pytest.mark.parametrize("metadata_backend", ["base", "trtllm"])
@@ -322,11 +362,83 @@ def test_state_workspace_warmup_growth(monkeypatch):
 
 
 @skip_unsupported
-@pytest.mark.skipif(is_sm_100f(), reason="Mixer-managed state workspace is only used on Hopper")
+@pytest.mark.parametrize("capacity", [1, 3, 64])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_state_workspace_smaller_than_batch(capacity, inplace):
+    """A batch larger than the workspace runs in groups and matches one call over the batch."""
+    from unittest.mock import patch
+
+    import flashinfer
+
+    from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
+
+    seq_lens = [37, 1, 1, 130, 1, 64, 1, 9]
+    num_seqs = len(seq_lens)
+    q, k, v, g, beta, cu = _make_inputs(seq_lens)
+    torch.manual_seed(1)
+    num_heads, head_dim = v.shape[2], v.shape[3]
+    pool = torch.randn(num_seqs + 4, num_heads, head_dim, head_dim, device="cuda") * 0.01
+    pool = pool.to(torch.bfloat16)
+    if inplace:
+        # Nonsequential slots; four slots stay untouched.
+        indices = torch.tensor([9, 0, 4, 11, 2, 7, 5, 1], dtype=torch.int32, device="cuda")
+        initial = pool
+    else:
+        indices, initial = None, pool[:num_seqs]
+    args = dict(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        cu_seqlens=cu,
+        initial_state_indices=indices,
+        inplace_indexed_state_update=inplace,
+        output_final_state=not inplace,
+    )
+    expected_initial = initial.clone()
+    expected, expected_state = chunk_gated_delta_rule(initial_state=expected_initial, **args)
+    state_dtype = pool.dtype if is_sm_100f() else torch.float32
+    workspace = tuple(
+        torch.full((capacity, *pool.shape[1:]), float("nan"), dtype=state_dtype, device="cuda")
+        for _ in range(2)
+    )
+    with patch.object(
+        flashinfer, "chunk_gated_delta_rule", wraps=flashinfer.chunk_gated_delta_rule
+    ) as call:
+        actual, actual_state = chunk_gated_delta_rule(
+            initial_state=initial, state_workspace=workspace, cu_seqlens_cpu=cu.cpu(), **args
+        )
+    num_groups = -(-num_seqs // capacity)
+    assert call.call_count == num_groups
+    # Evenly sized groups: as few as fit, without a small remainder group.
+    group_sizes = [c.kwargs["cu_seqlens"].shape[0] - 1 for c in call.call_args_list]
+    assert sum(group_sizes) == num_seqs and max(group_sizes) - min(group_sizes) <= 1
+    assert max(group_sizes) <= capacity
+    # The kernel's arithmetic depends on the batch it runs, so a group matches the
+    # whole-batch call to accumulation error rather than bitwise. These bounds are
+    # far tighter than the adapter's parity tolerances against the Triton kernel.
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1.6e-2)
+    state_tolerance = dict(atol=2e-3, rtol=1.6e-2)
+    if inplace:
+        torch.testing.assert_close(initial, expected_initial, **state_tolerance)
+        untouched = sorted(set(range(pool.shape[0])) - set(indices.tolist()))
+        torch.testing.assert_close(initial[untouched], expected_initial[untouched], rtol=0, atol=0)
+    else:
+        torch.testing.assert_close(initial, expected_initial, rtol=0, atol=0)
+        torch.testing.assert_close(actual_state, expected_state, **state_tolerance)
+    if capacity < num_seqs:
+        with pytest.raises(AssertionError, match="cu_seqlens_cpu"):
+            chunk_gated_delta_rule(initial_state=initial.clone(), state_workspace=workspace, **args)
+
+
+@skip_unsupported
+@pytest.mark.skipif(is_sm_100f(), reason="Mixer-managed state workspace is not used on SM100f")
 def test_state_workspace_maximum_batch_and_cuda_graph():
-    """A one-sequence warmup must provision state scratch for a full mixed batch."""
+    """A one-sequence warmup provisions bounded scratch that serves a full batch in groups."""
     from types import SimpleNamespace
 
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as mixer
     from tensorrt_llm._torch.modules.fla.flashinfer_chunk import chunk_gated_delta_rule
     from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 
@@ -336,6 +448,11 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
     get_workspace = Qwen3NextGatedDeltaNet._get_prefill_state_workspace
     workspace = get_workspace(layer, metadata, pool)
     assert workspace is not None
+    assert all(
+        buffer.numel() * buffer.element_size() <= mixer._PREFILL_STATE_WORKSPACE_BYTES
+        for buffer in workspace
+    )
+    assert workspace[0].shape[0] < 512
     peaks = []
     for num_seqs in (1, 512):
         q, k, v, g, beta, cu = _make_inputs([2048 // num_seqs] * num_seqs)
@@ -351,6 +468,7 @@ def test_state_workspace_maximum_batch_and_cuda_graph():
             initial_state_indices=indices,
             inplace_indexed_state_update=True,
             state_workspace=workspace,
+            cu_seqlens_cpu=cu.cpu(),
         )
         out, _ = chunk_gated_delta_rule(**args)
         torch.cuda.synchronize()
