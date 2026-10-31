@@ -151,6 +151,10 @@ class CompletionOutput:
     _last_text_len: int = field(default=0, init=False, repr=False)
     _last_token_ids_len: int = field(default=0, init=False, repr=False)
     _last_logprobs_len: int = field(default=0, init=False, repr=False)
+    # Tokens already passed to incremental detokenization. Separate from
+    # _last_token_ids_len: with best_of > n only the top n outputs are
+    # detokenized, and the others must keep their tokens until selected.
+    _detokenized_token_ids_len: int = field(default=0, init=False, repr=False)
     _incremental_states: Optional[dict] = field(default=None,
                                                 init=False,
                                                 repr=False)
@@ -717,6 +721,12 @@ class GenerationResultBase:
                         output_token_ids=output_token_ids,
                         request_perf_metrics=request_perf_metrics)
             else:
+                # Each response carries one sequence. Mark every output's
+                # diffs as consumed so the outputs this response does not
+                # update report no new tokens or logprobs.
+                for output in self._outputs:
+                    output._last_token_ids_len = len(output.token_ids)
+                    output._last_logprobs_len = len(output.logprobs)
                 self._handle_sequence(finish_reasons,
                                       response_result,
                                       response_result.sequence_index,
@@ -1056,8 +1066,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 if hasattr(
                         self.tokenizer, 'decode_incrementally'
                 ) and self._streaming and not self.sampling_params.use_beam_search:
+                    pending_token_ids = beam_output.token_ids[
+                        beam_output._detokenized_token_ids_len:]
+                    beam_output._detokenized_token_ids_len = len(
+                        beam_output.token_ids)
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                        beam_output.token_ids_diff,
+                        pending_token_ids,
                         prev_text=beam_output.text,
                         states=beam_output._incremental_states,
                         flush=self._done,
