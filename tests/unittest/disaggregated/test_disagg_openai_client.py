@@ -17,6 +17,8 @@ import errno
 import json
 import socket
 import struct
+from contextlib import aclosing
+from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -758,6 +760,7 @@ class TestHttpErrorBodyPreservation:
         r.status = status
         r.reason = "Bad Request" if status == 400 else "Internal Server Error"
         r.text = AsyncMock(return_value=body)
+        r.content.read = AsyncMock(side_effect=BytesIO(body.encode("utf-8")).read)
         r.headers = {"Content-Type": "application/json"}
         r.request_info = MagicMock()
         r.history = ()
@@ -765,7 +768,7 @@ class TestHttpErrorBodyPreservation:
         r.__aexit__ = AsyncMock(return_value=False)
         return r
 
-    def _make_client(self, session, **kwargs):
+    def _make_client(self, session, max_retries=0, role=ServerRole.CONTEXT, **kwargs):
         from prometheus_client.registry import REGISTRY
 
         REGISTRY._names_to_collectors = {}
@@ -777,14 +780,17 @@ class TestHttpErrorBodyPreservation:
         router.finish_request = AsyncMock()
         return OpenAIHttpClient(
             router=router,
-            role=ServerRole.CONTEXT,
+            role=role,
             timeout_secs=10,
-            max_retries=0,
+            max_retries=max_retries,
+            retry_interval_sec=0,
             session=session,
             **kwargs,
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+    @pytest.mark.parametrize("stream", [False, True])
     @pytest.mark.parametrize(
         "status,body",
         [
@@ -792,19 +798,137 @@ class TestHttpErrorBodyPreservation:
             (500, "internal failure detail"),
         ],
     )
-    async def test_error_body_in_exception(self, status, body):
+    async def test_error_body_in_exception(self, monkeypatch, status, body, stream, role):
+        monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
         session = AsyncMock(spec=aiohttp.ClientSession)
-        session.post.return_value = self._mock_http_error(status, body)
-        client = self._make_client(session)
+        http_response = self._mock_http_error(status, body)
+        session.post.return_value = http_response
+        next_id = AsyncMock(return_value=2)
+        client = self._make_client(session, max_retries=1, role=role, disagg_id_generator=next_id)
         req = CompletionRequest(
             model="m",
             prompt="hi",
-            stream=False,
-            disaggregated_params=DisaggregatedParams(request_type="context_only", ctx_request_id=1),
+            stream=stream,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only" if role == ServerRole.CONTEXT else "generation_only",
+                disagg_request_id=1,
+            ),
         )
         with pytest.raises(aiohttp.ClientResponseError) as exc_info:
-            await client.send_request(req)
-        assert body[:20] in str(exc_info.value.message)
+            response = await client.send_request(req)
+            if stream:
+                async with aclosing(response):
+                    async for _ in response:
+                        pytest.fail("An HTTP rejection must not yield streaming output")
+        assert exc_info.value.status == status
+        assert exc_info.value.message == f"{http_response.reason}: {body}"
+        assert exc_info.value.headers == http_response.headers
+        # Streaming rejections never replay. Non-streaming CTX retains its retry
+        # budget, but an accepted GEN leg cannot acquire a new pairing identity.
+        retried = not stream and role == ServerRole.CONTEXT
+        assert session.post.call_count == (2 if retried else 1)
+        assert next_id.await_count == int(retried)
+        assert req.disaggregated_params.disagg_request_id == (2 if retried else 1)
+        if not retried:
+            client._router.renew_request.assert_not_awaited()
+        finish_kwargs = {"req_id": 1} if role == ServerRole.CONTEXT else {}
+        client._router.finish_request.assert_awaited_once_with(
+            req, session, success=False, **finish_kwargs
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("role", [ServerRole.CONTEXT, ServerRole.GENERATION])
+    @pytest.mark.parametrize(
+        "error",
+        [aiohttp.ClientPayloadError("truncated body"), ConnectionResetError("reset while reading")],
+    )
+    async def test_streaming_rejected_body_failure_is_not_retried(
+        self, monkeypatch: pytest.MonkeyPatch, error: Exception, role: ServerRole
+    ) -> None:
+        """A diagnostic-read failure cannot replay an already rejected stream."""
+        monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        http_response = self._mock_http_error(500, "unavailable")
+        http_response.content.read.side_effect = error
+        session.post.return_value = http_response
+        next_id = AsyncMock(return_value=2)
+        client = self._make_client(session, max_retries=1, role=role, disagg_id_generator=next_id)
+        req = CompletionRequest(
+            model="m",
+            prompt="hi",
+            stream=True,
+            disaggregated_params=DisaggregatedParams(
+                request_type="context_only" if role == ServerRole.CONTEXT else "generation_only",
+                disagg_request_id=1,
+            ),
+        )
+
+        with pytest.raises(type(error)) as exc_info:
+            response = await client.send_request(req)
+            async with aclosing(response):
+                async for _ in response:
+                    pytest.fail("A rejected stream must not yield output")
+
+        assert exc_info.value is error
+        session.post.assert_called_once()
+        next_id.assert_not_awaited()
+        assert req.disaggregated_params.disagg_request_id == 1
+        client._router.renew_request.assert_not_awaited()
+        http_response.__aexit__.assert_awaited_once()
+        finish_kwargs = {"req_id": 1} if role == ServerRole.CONTEXT else {}
+        client._router.finish_request.assert_awaited_once_with(
+            req, session, success=False, **finish_kwargs
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_error_body_read_is_bounded(self) -> None:
+        """Read only a byte prefix, even when it splits a UTF-8 character."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        body = "x" * 2047 + "\u20ac" + "y" * 8192
+        http_response = self._mock_http_error(500, body)
+        session.post.return_value = http_response
+        client = self._make_client(session)
+        req = CompletionRequest(model="m", prompt="hi", stream=True)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            response = await client.send_request(req)
+            async with aclosing(response):
+                async for _ in response:
+                    pytest.fail("An HTTP rejection must not yield streaming output")
+
+        http_response.content.read.assert_awaited_once_with(2048)
+        http_response.text.assert_not_awaited()
+        assert exc_info.value.status == 500
+        assert exc_info.value.message == f"{http_response.reason}: {'x' * 2047}\ufffd"
+        http_response.__aexit__.assert_awaited_once()
+        client._router.finish_request.assert_awaited_once_with(req, session, success=False)
+
+    @pytest.mark.asyncio
+    async def test_streaming_error_body_preserves_fragmented_diagnostic(self) -> None:
+        """A short network read must not truncate the worker's error classification."""
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        body = '{"error":"input too long","code":"context_length_exceeded"}'
+        http_response = self._mock_http_error(400, body)
+        body_stream = BytesIO(body.encode("utf-8"))
+        http_response.content.read.side_effect = lambda size: body_stream.read(min(size, 9))
+        session.post.return_value = http_response
+        client = self._make_client(session)
+        req = CompletionRequest(model="m", prompt="hi", stream=True)
+
+        with pytest.raises(aiohttp.ClientResponseError) as exc_info:
+            response = await client.send_request(req)
+            async with aclosing(response):
+                async for _ in response:
+                    pytest.fail("An HTTP rejection must not yield streaming output")
+
+        assert exc_info.value.status == 400
+        assert exc_info.value.message == f"{http_response.reason}: {body}"
+        assert http_response.content.read.await_count > 1
+        assert body_stream.tell() == len(body.encode("utf-8"))
+        http_response.text.assert_not_awaited()
+        session.post.assert_called_once()
+        http_response.__aexit__.assert_awaited_once()
+        client._router.finish_request.assert_awaited_once_with(req, session, success=False)
 
 
 class TestDisaggIdRegenOnRetry:
