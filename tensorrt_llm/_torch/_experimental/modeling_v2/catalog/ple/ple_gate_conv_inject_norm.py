@@ -35,7 +35,6 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (
     DEP4_SLOTS,
     TEP4_SLOTS,
@@ -44,6 +43,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed i
     PER_SEQ_MAX_ROWS,
     _seq_of_rows,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 
 @triton.jit
@@ -309,7 +310,7 @@ CKPT_DILATION = 3
 CKPT_CLAMP_MIN = 1e-6
 #: Largest PLE-conv pool seen for this checkpoint at tp1 (see `dilated_short_conv_paged`).
 ENGINE_SLOTS = 461
-#: This target's per-rank PLE-conv pools: the conv state and the n-gram context are
+#: The unified target's per-rank PLE-conv pools: the conv state and the n-gram context are
 #: bound over one slot space (the stock manager asserts their slot counts equal and
 #: logs both on its "PLE state views bound" line), so the counts are the n-gram
 #: pool's, measured with `ngram_token_history` (`TEP4_SLOTS`, `DEP4_SLOTS`). Every
@@ -379,7 +380,7 @@ class PleGateConvInjectNorm(OpWrapper):
             carries=(False, True) + (True,) * 64,
             pool_slots=ENGINE_SLOTS,
         ),
-        # This target's members, each at the per-rank conv pool its rank binds, as
+        # The unified target's members, each at the per-rank conv pool its rank binds, as
         # the forward calls it: decode and verify with `has_initial_states` None and
         # `max_rows` the rows per sequence (a verify step also stages the conv
         # input), prefill with one flag per sequence and `max_rows` the step's rows.
@@ -435,7 +436,7 @@ class PleGateConvInjectNorm(OpWrapper):
     bf16 geometry with every slot live (the target never passes `pad_slot_id`),
     at a 128 x 1-row decode, a 64 x 4-row MTP3 verify, an 8192-row fresh
     prefill and a mixed 2-context + 64-decode step, all on the 461-slot pool;
-    and at this target's per-rank pools (`TEP4_SLOTS` 1874, `DEP4_SLOTS` 850,
+    and at the unified target's per-rank pools (`TEP4_SLOTS` 1874, `DEP4_SLOTS` 850,
     slots spread over the whole pool with both ends taken): a 128 x 1 tep4 and
     a 32 x 1 dep4 decode, 128 x 2 (MTP1) and 128 x 8 (MTP7, the packed-row conv
     with no carry flags) verifies staging `conv_input`, an 8192-row fresh

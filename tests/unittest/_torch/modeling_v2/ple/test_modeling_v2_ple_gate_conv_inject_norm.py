@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's ple_gate_conv_inject_norm__r16 variant.
+"""GPU test for the unified target's ple_gate_conv_inject_norm variant.
 
 Cells are gated against the float64 reference that rounds where the op rounds:
 the stream (`hc_out`) and the normed stream in units of their row's scale, the
@@ -15,7 +15,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ple_gate_conv_inject_norm__r16 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     CKPT_CLAMP_MIN,
     CKPT_DILATION,
     CKPT_HC_COUNT,
@@ -24,11 +24,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     ENGINE_SLOTS,
     TEP4_SLOTS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ple_gate_conv_inject_norm__r16 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_gate_conv_inject_norm import (  # noqa: E501
     ple_gate_conv_inject_norm as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import (  # noqa: E402,F401 — path above; fixture by name
     assert_within_ulp,
     certifying,
@@ -76,7 +76,7 @@ ROW_ULP, RMS_ULP, STATE_ULP = 2.0, 0.1, 2.0
 #: reference over three seeds at 16384 rows, the composition this replaces
 #: reaches 2.91 row-max ulp (normed) and the op 2.94; at 8192 rows 1.89 / 1.89.
 #: Cells above 1024 rows are therefore gated at 4; the RMS gate is unchanged.
-#: At this target's per-rank pools (1874 / 850 slots) the op measured at most 1.54
+#: At the unified target's per-rank pools (1874 / 850 slots) the op measured at most 1.54
 #: row-max ulp (hc_out) and 1.44 (normed) up to 1024 rows, 2.09 (normed) at the
 #: 8192-row envelope step, 0.014 ulp relative RMS and a 1.80-ulp state (the 128 x 8
 #: verify); a reference reading each sequence's neighbouring slot sits at 12.6-38 ulp

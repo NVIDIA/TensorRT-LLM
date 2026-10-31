@@ -215,6 +215,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_gemma
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_gate_conv_inject_norm import (
+    ple_gate_conv_inject_norm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (
     ple_ngram_embed,
 )
@@ -249,7 +252,6 @@ from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
-from .ops.ple.ple_gate_conv_inject_norm__r16 import ple_gate_conv_inject_norm
 from .ops.quantization.fp8_quantize_1x128__r41 import fp8_quantize_1x128
 from .ops.ssm.causal_conv1d_triton_update__r45 import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update__r29 import causal_conv1d_update
