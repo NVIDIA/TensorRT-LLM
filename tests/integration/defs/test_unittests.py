@@ -17,6 +17,7 @@ import re
 import shlex
 import warnings
 from subprocess import CalledProcessError
+from tempfile import TemporaryDirectory
 from typing import NoReturn
 
 from defs.conftest import tests_path
@@ -398,11 +399,16 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ["-p", "no:xdist", f"--periodic-junit-xmlpath={output_xml}"]
         passed = run_command(command)
     else:
+        # Retry state belongs to this attempt, not earlier cases or stages.
+        retry_cache = TemporaryDirectory(prefix="unittest-cache-",
+                                         dir=os.path.abspath(output_dir))
+        request.addfinalizer(retry_cache.cleanup)
+        cache_option = ["-o", f"cache_dir={retry_cache.name}"]
         # Avoid .xml extension to prevent CI from reading failures from it
         parallel_output_xml = os.path.join(
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
-        parallel_command = command + [
+        parallel_command = command + cache_option + [
             "-n", f"{num_workers}",
             f"--periodic-junit-xmlpath={parallel_output_xml}"
         ]
@@ -420,9 +426,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             retry_output_xml = os.path.join(
                 output_dir,
                 f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
-            # Run failed case sequentially.
-            retry_command = command + [
-                "-p", "no:xdist", '--lf',
+            # An empty failure cache must not rerun the full case and mask
+            # a process failure after otherwise passing tests.
+            retry_command = command + cache_option + [
+                "-p", "no:xdist", '--lf', '--lfnf=none',
                 f"--periodic-junit-xmlpath={retry_output_xml}"
             ]
             passed = run_command(retry_command)

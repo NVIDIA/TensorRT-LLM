@@ -15,11 +15,17 @@
 """Tests for culprit attribution in the unittest integration wrapper."""
 
 import importlib.util
+import json
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = _REPO_ROOT / "tests/integration/defs/test_unittests.py"
@@ -214,3 +220,131 @@ def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
     assert "FAILED pkg::test_18" in message
     assert "FAILED pkg::test_19" not in message
     assert message.endswith("(+3 more)")
+
+
+def _run_retry_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_once: bool, stale_cache: bool = False
+) -> list[subprocess.CompletedProcess[str]]:
+    import pandas as pd
+
+    memory_config = pd.DataFrame(
+        [{"gpu": "CPU", "unittest_case_name": "unittest/test_retry.py", "parallel_factor": 2}]
+    )
+    monkeypatch.setattr(pd, "read_csv", lambda path: memory_config)
+    nvml = types.ModuleType("pynvml")
+
+    class NVMLError(Exception):
+        pass
+
+    def nvml_init() -> None:
+        raise NVMLError
+
+    nvml.NVMLError = NVMLError
+    nvml.nvmlInit = nvml_init
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setenv("LLM_TEST_PARALLEL_OVERRIDE", "2")
+    monkeypatch.setattr(_TEST_UNITTESTS, "tests_path", lambda: str(tmp_path))
+
+    test_dir = tmp_path / "unittest"
+    test_dir.mkdir()
+    test_file = test_dir / "test_retry.py"
+    test_file.write_text(
+        "from pathlib import Path\n"
+        "def test_pass():\n"
+        "    with Path('executions.txt').open('a') as stream:\n"
+        "        stream.write('pass\\n')\n"
+        + (
+            "def test_flaky():\n"
+            "    marker = Path('already_failed')\n"
+            "    failed_before = marker.exists()\n"
+            "    marker.touch()\n"
+            "    assert failed_before\n"
+            if fail_once
+            else ""
+        ),
+        encoding="utf-8",
+    )
+    if stale_cache:
+        cache = tmp_path / ".pytest_cache/v/cache"
+        cache.mkdir(parents=True)
+        (cache / "lastfailed").write_text(
+            json.dumps({"unittest/test_other.py::test_stale": True}), encoding="utf-8"
+        )
+
+    results = []
+
+    def run_cmd(command: list[str], cwd: str, env: dict[str, str]) -> None:
+        xml_path = next(
+            arg.split("=", 1)[1] for arg in command if arg.startswith("--periodic-junit-xmlpath=")
+        )
+        child_command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            "/dev/null",
+            "--confcutdir",
+            str(tmp_path),
+            "--rootdir",
+            str(tmp_path),
+            f"--junitxml={xml_path}",
+            str(test_file),
+        ]
+        for index, arg in enumerate(command):
+            if arg == "-o":
+                child_command += [arg, command[index + 1]]
+            elif arg == "-n":
+                child_command += ["-p", "xdist.plugin", arg, command[index + 1]]
+            elif arg == "--lf" or arg.startswith("--lfnf="):
+                child_command.append(arg)
+        result = subprocess.run(
+            child_command,
+            cwd=cwd,
+            env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        results.append(result)
+        result.check_returncode()
+        if not fail_once and len(results) == 1:
+            raise subprocess.CalledProcessError(1, command)
+
+    request = Mock()
+    request.config.getoption.return_value = None
+    finalizers = []
+    request.addfinalizer.side_effect = finalizers.append
+    output = tmp_path / "output"
+    output.mkdir()
+    try:
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path),
+            types.SimpleNamespace(run_cmd=run_cmd),
+            "unittest/test_retry.py",
+            str(output),
+            request,
+        )
+    finally:
+        for finalize in reversed(finalizers):
+            finalize()
+        assert not list(output.glob("unittest-cache-*"))
+    return results
+
+
+@pytest.mark.parametrize("stale_cache", [False, True])
+def test_retry_without_failed_tests_preserves_process_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_cache: bool
+) -> None:
+    with pytest.raises(AssertionError, match="failure reported in unittests"):
+        _run_retry_wrapper(tmp_path, monkeypatch, fail_once=False, stale_cache=stale_cache)
+
+    assert (tmp_path / "executions.txt").read_text(encoding="utf-8").splitlines() == ["pass"]
+
+
+def test_retry_only_runs_current_failed_tests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    results = _run_retry_wrapper(tmp_path, monkeypatch, fail_once=True, stale_cache=True)
+
+    assert [result.returncode for result in results] == [1, 0]
+    assert (tmp_path / "executions.txt").read_text(encoding="utf-8").splitlines() == ["pass"]
