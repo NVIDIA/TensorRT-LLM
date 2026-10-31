@@ -20,7 +20,9 @@ The ``context_kv_fork`` fast path stores the rows unmasked earlier, on a side
 stream that does not wait for the verify. This entry is what is left once the
 accepted counts exist, as two kernels:
 
-* the commit (one program, like ``context_kv_commit``'s): the zeroing of the
+* the commit (one program, like ``context_kv_commit``'s, or with
+  ``parallel_min_requests`` a parallel zeroing and a vectorized length launch on
+  calls of at least that many requests): the zeroing of the
   masked rows in place at their physical columns, the length update, each
   request's shift, the base update and the new physical lengths;
 * the compaction (one program per request, layer, arena and chunk of a
@@ -38,6 +40,8 @@ built-in's bytes.
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
@@ -52,6 +56,11 @@ COMPACT_COLUMNS = 512
 #: Elements of a column one compaction program moves: a column's ``kv_heads *
 #: head_dim`` elements split into chunks of this many.
 COMPACT_CHUNK = 16
+
+#: The compaction's (chunk, columns per tile, warps) behind the parallel commit
+#: (``parallel_min_requests``); the one-program commit's compaction is
+#: (``COMPACT_CHUNK``, ``COMPACT_COLUMNS``, 4). Both write the same bytes.
+COMPACT_TUNED = (64, 256, 8)
 
 
 @triton.jit
@@ -133,6 +142,101 @@ def _commit_windowed_kernel(
     for g in range(num_gens):
         slot = tl.load(slots_ptr + g).to(tl.int64)
         tl.store(num_ctx_ptr + g, tl.load(ctx_len_ptr + slot) - tl.load(ctx_base_ptr + slot))
+
+
+@triton.jit
+def _commit_zero_kernel(
+    k_ptr,
+    v_ptr,
+    ctx_len_ptr,
+    ctx_base_ptr,
+    slots_ptr,
+    accepted_ptr,
+    new_len_ptr,
+    col_limit,
+    k_slot_stride,
+    k_layer_stride,
+    k_col_stride,
+    v_slot_stride,
+    v_layer_stride,
+    v_col_stride,
+    ROWS: tl.constexpr,
+    LAYERS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+    PAIRS: tl.constexpr,
+    HAS_V: tl.constexpr,
+):
+    """The zeroing of ``_commit_windowed_kernel`` for request ``program_id(0)``, and its
+    new length ``ctx_len[slot] + accepted`` into ``new_len`` (lengths and bases only read)."""
+    g = tl.program_id(0)
+    slot = tl.load(slots_ptr + g).to(tl.int64)
+    ctx = tl.load(ctx_len_ptr + slot)
+    phys = ctx - tl.load(ctx_base_ptr + slot)
+    accepted = tl.load(accepted_ptr + g).to(tl.int64)
+    for start in tl.static_range(0, ROWS * LAYERS, PAIRS):
+        k_cols, zeroed = _columns(
+            k_ptr, slot, phys, accepted, col_limit - 1, k_slot_stride, k_layer_stride,
+            k_col_stride, start, ROWS, LAYERS, WIDTH, BLOCK, PAIRS,
+        )  # fmt: skip
+        if HAS_V:
+            v_cols, _ = _columns(
+                v_ptr, slot, phys, accepted, col_limit - 1, v_slot_stride, v_layer_stride,
+                v_col_stride, start, ROWS, LAYERS, WIDTH, BLOCK, PAIRS,
+            )  # fmt: skip
+            k = tl.load(k_cols, mask=zeroed, other=0.0)
+            v = tl.load(v_cols, mask=zeroed, other=0.0)
+            tl.store(k_cols, _times_zero(k), mask=zeroed)
+            tl.store(v_cols, _times_zero(v), mask=zeroed)
+        else:
+            k = tl.load(k_cols, mask=zeroed, other=0.0)
+            tl.store(k_cols, _times_zero(k), mask=zeroed)
+    tl.store(new_len_ptr + g, ctx + accepted)
+
+
+@triton.jit
+def _commit_lengths_kernel(
+    ctx_len_ptr,
+    ctx_base_ptr,
+    slots_ptr,
+    new_len_ptr,
+    new_base_ptr,
+    shift_ptr,
+    num_ctx_ptr,
+    num_gens,
+    num_slots,
+    max_ctx,
+    keep,
+    GENS: tl.constexpr,
+    SLOTS: tl.constexpr,
+):
+    """The length, shift and base updates of ``_commit_windowed_kernel``, vectorized over the
+    requests: a repeated slot (CUDA-graph padding) is written by its last request only, as
+    the request-order scatter leaves it."""
+    gi = tl.arange(0, GENS)
+    gm = gi < num_gens
+    slot = tl.load(slots_ptr + gi, mask=gm, other=-1).to(tl.int64)
+    later = (gi[None, :] > gi[:, None]) & gm[None, :] & (slot[None, :] == slot[:, None])
+    writer = gm & (tl.sum(later.to(tl.int32), 1) == 0)
+    tl.store(ctx_len_ptr + slot, tl.load(new_len_ptr + gi, mask=gm, other=0), mask=writer)
+    tl.debug_barrier()
+    si = tl.arange(0, SLOTS)
+    sm = si < num_slots
+    lengths = tl.load(ctx_len_ptr + si, mask=sm, other=0)
+    tl.store(ctx_len_ptr + si, tl.minimum(lengths, max_ctx), mask=sm)
+    tl.debug_barrier()
+    length = tl.load(ctx_len_ptr + slot, mask=gm, other=0)
+    base = tl.load(ctx_base_ptr + slot, mask=gm, other=0)
+    shift = tl.where(keep > 0, tl.maximum(length - base - keep, 0), 0)
+    tl.store(shift_ptr + gi, shift, mask=gm)
+    tl.store(new_base_ptr + gi, base + shift, mask=gm)
+    tl.debug_barrier()
+    tl.store(ctx_base_ptr + slot, base + shift, mask=writer)
+    tl.debug_barrier()
+    num_ctx = tl.load(ctx_len_ptr + slot, mask=gm, other=0) - tl.load(
+        ctx_base_ptr + slot, mask=gm, other=0
+    )
+    tl.store(num_ctx_ptr + gi, num_ctx, mask=gm)
 
 
 @triton.jit
@@ -223,7 +327,10 @@ class ContextKvCommitWindowed(OpWrapper):
     ``COMPACT_CHUNK`` elements); a program loops over the slot's columns in
     tiles of ``COMPACT_COLUMNS`` in increasing order, loading a tile, a CTA
     barrier, then storing it; it reads its request's shift from the commit's
-    output, so its launch follows the commit on the stream.
+    output, so its launch follows the commit on the stream. With
+    ``parallel_min_requests`` (``windowed_commit_parallel``'s MIN_REQUESTS) a call of
+    at least that many requests runs the commit as a parallel zeroing launch plus a
+    vectorized length launch, and the compaction at ``COMPACT_TUNED``; the same bytes.
 
     Call site: ``context_kv_fork.ContextKvFork.commit`` under the
     ``context_kv_fork`` fast path when the worker's arena is windowed
@@ -259,14 +366,104 @@ class ContextKvCommitWindowed(OpWrapper):
         max_ctx: int,
         col_limit: int,
         keep: int,
+        parallel_min_requests: Optional[int] = None,
     ) -> None:
         num_gens = slots.numel()
         if num_gens == 0:
             return
+        parallel = parallel_min_requests is not None and num_gens >= parallel_min_requests
         layers, width = k_arena.shape[1], k_arena.shape[3] * k_arena.shape[4]
         scratch = torch.empty(3, num_gens, dtype=torch.int64, device=ctx_len.device)
         has_v = v_arena is not None
         values = v_arena if has_v else k_arena
+        if parallel:
+            self._commit_parallel(
+                k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+                scratch, rows, max_ctx, col_limit, keep, layers, width,
+            )  # fmt: skip
+        else:
+            self._commit_one_program(
+                k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+                scratch, rows, max_ctx, col_limit, keep, layers, width,
+            )  # fmt: skip
+        if keep <= 0:
+            return
+        if parallel:
+            chunk, tile, warps = COMPACT_TUNED
+        else:
+            chunk, tile, warps = COMPACT_CHUNK, COMPACT_COLUMNS, 4
+        chunk = min(chunk, triton.next_power_of_2(width))
+        _compact_kernel[(num_gens, layers * (2 if has_v else 1), triton.cdiv(width, chunk))](
+            k_arena,
+            values,
+            slots,
+            scratch[2],
+            k_arena.shape[2],
+            k_arena.stride(0),
+            k_arena.stride(1),
+            k_arena.stride(2),
+            values.stride(0),
+            values.stride(1),
+            values.stride(2),
+            LAYERS=layers,
+            WIDTH=width,
+            CHUNK=chunk,
+            TILE=tile,
+            GENS=triton.next_power_of_2(max(num_gens, 2)),
+            HAS_V=has_v,
+            num_warps=warps,
+        )
+
+    def _commit_parallel(
+        self, k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+        scratch, rows, max_ctx, col_limit, keep, layers, width,
+    ) -> None:  # fmt: skip
+        num_gens = slots.numel()
+        _commit_zero_kernel[(num_gens,)](
+            k_arena,
+            values,
+            ctx_len,
+            ctx_base,
+            slots,
+            num_accepted,
+            scratch[0],
+            col_limit,
+            k_arena.stride(0),
+            k_arena.stride(1),
+            k_arena.stride(2),
+            values.stride(0),
+            values.stride(1),
+            values.stride(2),
+            ROWS=rows,
+            LAYERS=layers,
+            WIDTH=width,
+            BLOCK=triton.next_power_of_2(width),
+            PAIRS=tile_pairs(rows, layers, width),
+            HAS_V=has_v,
+            num_warps=4,
+        )
+        _commit_lengths_kernel[(1,)](
+            ctx_len,
+            ctx_base,
+            slots,
+            scratch[0],
+            scratch[1],
+            scratch[2],
+            num_ctx_out,
+            num_gens,
+            ctx_len.numel(),
+            max_ctx,
+            keep,
+            GENS=triton.next_power_of_2(max(num_gens, 2)),
+            SLOTS=triton.next_power_of_2(max(ctx_len.numel(), 2)),
+            num_warps=4,
+        )
+
+    def _commit_one_program(
+        self, k_arena, values, has_v, ctx_len, ctx_base, slots, num_accepted, num_ctx_out,
+        scratch, rows, max_ctx, col_limit, keep, layers, width,
+    ) -> None:  # fmt: skip
+        num_gens = slots.numel()
         _commit_windowed_kernel[(1,)](
             k_arena,
             values,
@@ -297,29 +494,6 @@ class ContextKvCommitWindowed(OpWrapper):
             HAS_V=has_v,
             num_warps=4,
         )
-        if keep <= 0:
-            return
-        chunk = min(COMPACT_CHUNK, triton.next_power_of_2(width))
-        _compact_kernel[(num_gens, layers * (2 if has_v else 1), triton.cdiv(width, chunk))](
-            k_arena,
-            values,
-            slots,
-            scratch[2],
-            k_arena.shape[2],
-            k_arena.stride(0),
-            k_arena.stride(1),
-            k_arena.stride(2),
-            values.stride(0),
-            values.stride(1),
-            values.stride(2),
-            LAYERS=layers,
-            WIDTH=width,
-            CHUNK=chunk,
-            TILE=COMPACT_COLUMNS,
-            GENS=triton.next_power_of_2(max(num_gens, 2)),
-            HAS_V=has_v,
-            num_warps=4,
-        )
 
     def reference(
         self,
@@ -334,6 +508,7 @@ class ContextKvCommitWindowed(OpWrapper):
         max_ctx: int,
         col_limit: int,
         keep: int,
+        parallel_min_requests: Optional[int] = None,
     ) -> None:
         """The built-in torch ops, in place: mask the stored rows, update the lengths, compact.
 
@@ -381,7 +556,11 @@ class ContextKvCommitWindowed(OpWrapper):
         max_ctx: int,
         col_limit: int,
         keep: int,
+        parallel_min_requests: Optional[int] = None,
     ) -> None:
+        assert parallel_min_requests is None or parallel_min_requests >= 1, (
+            "parallel_min_requests must be None or at least 1"
+        )
         for name, arena in (("k_arena", k_arena), ("v_arena", v_arena)):
             if arena is None and name == "v_arena":
                 continue

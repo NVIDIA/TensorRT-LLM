@@ -81,6 +81,7 @@ from ... import attention as _target_attention
 from ...attention_forward import PREPROCESS_ARGS, eliding, preprocess_reachable
 from ...dispatch import LAUNCH_PDL
 from ...ops.attention.multi_request_prep_append import (
+    MAX_ROWS,
     MAX_ROWS_PER_SEQ,
     MAX_SEQS,
     PACKED_GEOMETRY,
@@ -407,13 +408,15 @@ class MultiRequestPrepAppendAttention:
     built-in attention's generation preprocess stand down for it (``eliding``);
     any other call is exactly the class behind it. Adds two plain attributes set
     for the duration of one forward, and two set by ``install``: the model's
-    ``MultiRequestCensus`` and the fewest sequences of a step it folds.
+    ``MultiRequestCensus`` and the fewest sequences of a step it folds, and the fewest rows
+    of a call on the packed kernel (``packed_prep_append``'s MIN_ROWS, None for off).
     """
 
     _mr_append_metadata: Optional[object]
     _mr_append_folded: Optional[MultiRequestFoldedPreprocess]
     _mr_append_census: Optional[MultiRequestCensus] = None
     _mr_append_min_seqs: int = MIN_SEQS
+    _mr_append_packed_min_rows: Optional[int] = None
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._mr_append_census
@@ -601,6 +604,7 @@ class MultiRequestPrepAppendAttention:
             1.0,
             LAUNCH_PDL,
             prefetch=prefetch,
+            packed_min_rows=self._mr_append_packed_min_rows,
         )
         folded = MultiRequestFoldedPreprocess(
             qkv_out=qkv_out,
@@ -632,13 +636,16 @@ def _folded_class(base: type) -> type:
     return type(f"{base.__name__}MultiRequestAppend", (MultiRequestPrepAppendAttention, base), {})
 
 
-def install(model: torch.nn.Module, min_seqs: int = MIN_SEQS) -> int:
+def install(
+    model: torch.nn.Module, min_seqs: int = MIN_SEQS, packed_min_rows: Optional[int] = None
+) -> int:
     """Re-class every layer's attention with ``MultiRequestPrepAppendAttention`` in front.
 
     Run after every other attention re-class: the mixin goes in front of whatever
     class each layer carries by then, and acts only on decode steps of ``min_seqs``
     or more sequences (a composition whose own paths fold the append of smaller
-    multi-request steps passes the first count they leave to this one).
+    multi-request steps passes the first count they leave to this one). Calls of
+    ``packed_min_rows`` rows or more (``packed_prep_append``) take the packed kernel.
     Every layer is checked before any is re-classed. Idempotent: a model whose
     layers all carry the mixin is left alone. Returns the number of layers
     re-classed.
@@ -657,6 +664,8 @@ def install(model: torch.nn.Module, min_seqs: int = MIN_SEQS) -> int:
         )
     attentions = [layer.self_attn for layer in model.layers]
     if all(isinstance(attention, MultiRequestPrepAppendAttention) for attention in attentions):
+        for attention in attentions:
+            attention._mr_append_packed_min_rows = packed_min_rows
         return 0
     refused = []
     for attention in attentions:
@@ -692,13 +701,21 @@ def install(model: torch.nn.Module, min_seqs: int = MIN_SEQS) -> int:
         attention._mr_append_folded = None
         attention._mr_append_census = census
         attention._mr_append_min_seqs = min_seqs
-    grid = (
+        attention._mr_append_packed_min_rows = packed_min_rows
+    packed = (
         "packed grid (last rows, items per program): "
         f"{[(last, items) for last, items, _, _ in PACKED_GEOMETRY]}, one item per program on "
         "o_proj-prefetching steps"
-        if not torch.cuda.is_available() or launch_kind(torch.device("cuda")) == "packed"
-        else "grid of one program per (row, head)"
     )
+    if not torch.cuda.is_available() or launch_kind(torch.device("cuda")) == "packed":
+        grid = packed
+    elif launch_kind(torch.device("cuda"), MAX_ROWS, packed_min_rows) == "packed":
+        grid = (
+            f"grid of one program per (row, head) up to {packed_min_rows - 1} rows, "
+            f"above it the {packed}"
+        )
+    else:
+        grid = "grid of one program per (row, head)"
     logger.info(
         f"[musespark_open] multi_request_prep_append: the K/V append, E4M3 query and FMHA scales "
         f"of {len(attentions)} layers run in the decode prep on steps of {min_seqs}..{MAX_SEQS} sequences "
