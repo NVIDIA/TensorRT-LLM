@@ -15,7 +15,7 @@
 """Unit tests for the hang-traceback dumping in PeriodicJUnitXML.
 
 These exercise the pure-Python wiring only (timeout resolution and the watchdog
-that writes output-dir/hang_traceback.txt); they need no GPU or model access.
+that writes output-dir/hang_traceback.txt and stderr); they need no GPU or model access.
 
 The module under test lives in the integration-test helper package, which is not
 importable as a package here (its ``__init__`` pulls in torch), so it is imported
@@ -154,14 +154,75 @@ def test_effective_timeout_resolution(make_reporter: ReporterFactory) -> None:
     assert reporter._effective_timeout(_Item()) is None
 
 
-def test_hang_dumps_traceback(make_reporter: ReporterFactory) -> None:
+def test_hang_dumps_traceback(
+    make_reporter: ReporterFactory, capfd: pytest.CaptureFixture[str]
+) -> None:
     reporter = make_reporter(hang_dump_fraction=0.1)
     # timeout 2s * 0.1 -> dump after ~0.2s.
     reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
     path = reporter._hang_traceback_path()
     assert _wait_until(lambda: "hang watchdog fired for pkg/test_x.py::test_y" in _read(path))
+    reporter._hang_timer.join(_POLL_TIMEOUT)
+    assert not reporter._hang_timer.is_alive()
     content = _read(path)
     assert "Thread" in content or 'File "' in content
+    stderr = capfd.readouterr().err
+    assert "hang watchdog fired for pkg/test_x.py::test_y" in stderr
+    assert "_dump_hang" in stderr
+    # The test thread is not the watchdog thread, so this proves all threads were dumped.
+    assert "test_hang_dumps_traceback" in stderr
+    assert 'File "' in stderr
+
+
+def test_hang_watchdog_arms_when_sidecar_cannot_open(
+    tmp_path: Path, request: pytest.FixtureRequest, capfd: pytest.CaptureFixture[str]
+) -> None:
+    # A regular file where the output directory should be makes opening the
+    # sidecar fail; the watchdog must still arm and dump to stderr.
+    blocker = tmp_path / "not_a_dir"
+    blocker.write_text("")
+    reporter = PeriodicJUnitXML(
+        xmlpath=str(blocker / "results.xml"),
+        dump_hang_traceback=True,
+        hang_dump_fraction=0.1,
+    )
+    reporter._setup_hang_dump()
+    request.addfinalizer(lambda: _close(reporter))
+    assert reporter._hang_file is None
+
+    reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
+    timer = reporter._hang_timer
+    assert timer is not None
+    timer.join(_POLL_TIMEOUT)
+    assert not timer.is_alive()
+    stderr = capfd.readouterr().err
+    assert "hang watchdog fired for pkg/test_x.py::test_y" in stderr
+    assert "test_hang_watchdog_arms_when_sidecar_cannot_open" in stderr
+
+
+def test_hang_dump_to_stderr_without_fileno(
+    make_reporter: ReporterFactory, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # capsys swaps sys.stderr for an in-memory stream that faulthandler cannot use.
+    reporter = make_reporter()
+    reporter._dump_hang("pkg/test_x.py::test_y")
+    stderr = capsys.readouterr().err
+    assert "hang watchdog fired for pkg/test_x.py::test_y" in stderr
+    assert "test_hang_dump_to_stderr_without_fileno" in stderr
+    assert 'File "' in stderr
+    assert 'File "' in _read(reporter._hang_traceback_path())
+
+
+def test_hang_dump_reaches_stderr_when_sidecar_fails(
+    make_reporter: ReporterFactory, capfd: pytest.CaptureFixture[str]
+) -> None:
+    reporter = make_reporter()
+    reporter._hang_file.close()
+    reporter._dump_hang("pkg/test_x.py::test_y")
+    stderr = capfd.readouterr().err
+    assert "hang watchdog fired for pkg/test_x.py::test_y" in stderr
+    assert "_dump_hang" in stderr
+    assert 'File "' in stderr
 
 
 def test_subsecond_timeout_arms_before_the_kill(make_reporter: ReporterFactory) -> None:

@@ -234,6 +234,7 @@ def test_e2e_text_e2b_dummy():
 
 
 @requires_gemma4_transformers
+@pytest.mark.private_mpi_session
 @pytest.mark.timeout(600)
 def test_e2e_text_31b_dummy(monkeypatch):
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""

@@ -24,8 +24,10 @@ import faulthandler
 import os
 import platform
 import signal
+import sys
 import threading
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Optional, TextIO
@@ -41,6 +43,22 @@ except ImportError:
     TestReport = None  # type: ignore
     LogXML = None  # type: ignore
     Item = None  # type: ignore
+
+
+def _dump_all_thread_stacks(output: TextIO) -> None:
+    """Write every thread's stack to ``output``, with or without a file descriptor."""
+    try:
+        output.fileno()
+    except (OSError, ValueError):
+        # faulthandler needs a real descriptor; pytest's sys-level capture replaces
+        # sys.stderr with an in-memory stream, so format the stacks in Python.
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        for ident, frame in sys._current_frames().items():
+            output.write(f"\nThread {names.get(ident, '<unknown>')} "
+                         f"({ident:#x}):\n")
+            output.write("".join(traceback.format_stack(frame)))
+        return
+    faulthandler.dump_traceback(file=output, all_threads=True)
 
 
 class PeriodicJUnitXML:
@@ -108,8 +126,8 @@ class PeriodicJUnitXML:
                 reads.
             dump_hang_traceback: If True, dump every thread's stack to
                 output-dir/hang_traceback.txt when a test overruns its timeout or the
-                process is signalled, so a hang leaves a diagnosable stack instead of an
-                empty "Test terminated unexpectedly" record.
+                process is signalled. Watchdog dumps also go to stderr so timeout
+                output includes the traceback without a separate artifact upload.
             hang_dump_fraction: Dump the traceback after this fraction of a test's
                 timeout elapses (default: 0.9), i.e. just before the test is killed.
         """
@@ -453,16 +471,18 @@ class PeriodicJUnitXML:
             return None
 
     def _dump_hang(self, nodeid: str) -> None:
-        """Write every thread's stack to the sidecar file (called from the timer)."""
-        if self._hang_file is None:
-            return
-        try:
-            self._hang_file.write(
-                f"\n===== hang watchdog fired for {nodeid} =====\n")
-            faulthandler.dump_traceback(file=self._hang_file, all_threads=True)
-            self._hang_file.flush()
-        except (OSError, RuntimeError, ValueError):
-            pass
+        """Write every thread's stack to the sidecar and stderr from the timer."""
+        for output in (self._hang_file, sys.stderr):
+            if output is None:
+                continue
+            try:
+                output.write(
+                    f"\n===== hang watchdog fired for {nodeid} =====\n")
+                output.flush()
+                _dump_all_thread_stacks(output)
+                output.flush()
+            except (OSError, RuntimeError, ValueError):
+                pass
 
     def _cancel_hang_timer(self) -> None:
         """Cancel the pending watchdog timer, if any."""
@@ -481,7 +501,9 @@ class PeriodicJUnitXML:
         completed test can never produce a dump. This also makes ``func_only``
         irrelevant: any phase overrunning the timeout dumps.
         """
-        if not self.dump_hang_traceback or self._hang_file is None:
+        # Armed even when the sidecar could not be opened: the dump still goes to
+        # stderr.
+        if not self.dump_hang_traceback:
             return
         self._cancel_hang_timer()  # never leave a stale timer armed
         timeout = self._effective_timeout(item)
