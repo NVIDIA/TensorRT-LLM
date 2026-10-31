@@ -9,70 +9,94 @@ import pytest
 
 pytestmark = pytest.mark.cpu_only
 
-INSTALL_NIXL = Path(__file__).resolve().parents[3] / "docker/common/install_nixl.sh"
+ROOT = Path(__file__).resolve().parents[3]
+INSTALL_NIXL = ROOT / "docker/common/install_nixl.sh"
+
+# Execute the full installer while replacing network, compilation and package installation.
+_COMMAND = r"""
+wget() {
+    [ "$FAIL_STAGE" != download ] || return 23
+    : > libfabric.tar.bz2
+}
+tar() {
+    mkdir libfabric-1.21.0
+    printf '#!/bin/bash\nexit 0\n' > libfabric-1.21.0/autogen.sh
+    cat > libfabric-1.21.0/configure <<'EOF'
+#!/bin/bash
+[ "$FAIL_STAGE" != configure ] || exit 23
+printf '%s\n' "$@" > "$CONFIGURE_ARGS"
+for arg in "$@"; do
+    case "$arg" in --prefix=*) mkdir -p "$(printf '%s' "$arg" | cut -c10-)" ;; esac
+done
+EOF
+    chmod +x libfabric-1.21.0/autogen.sh libfabric-1.21.0/configure
+}
+make() { :; }
+nproc() { echo 2; }
+pip3() {
+    printf '%s\n' "$@" >> "$PIP_ARGS"
+    if [ "$2" = "--no-deps" ] && [ "$FAIL_STAGE" = shim ]; then return 23; fi
+}
+git() { printf '%s\n' "$@" > "$GIT_ARGS"; mkdir nixl; }
+find() { printf '%s\n' /usr/local/cuda/lib64/libcuda.so.1; }
+uname() { echo "$TEST_ARCH"; }
+meson() {
+    printf '%s\n' "$@" > "$MESON_ARGS"
+    if [ -n "$PKG_CONFIG_PATH" ]; then
+        printf '%s' "$PKG_CONFIG_PATH" > "$MESON_PKG_CONFIG_PATH"
+    else
+        printf '<unset>' > "$MESON_PKG_CONFIG_PATH"
+    fi
+    mkdir builddir
+}
+ninja() { [ "$FAIL_STAGE" != ninja ]; }
+source "$INSTALL_NIXL"
+printf '%s' "$LD_LIBRARY_PATH" > "$RESTORED_LD_PATH"
+"""
 
 
-@pytest.mark.parametrize("with_header", (False, True))
-@pytest.mark.parametrize("with_library", (False, True))
-@pytest.mark.parametrize(
-    "missing_hwloc",
-    (None, "all", "include/hwloc.h", "lib/libhwloc.so", "lib/pkgconfig/hwloc.pc"),
-)
-@pytest.mark.parametrize("pkg_config_path", (None, "/custom/lib/pkgconfig"))
-def test_bundled_dependencies_require_development_files(
+def _run_installer(
     tmp_path: Path,
-    with_header: bool,
-    with_library: bool,
-    missing_hwloc: str | None,
-    pkg_config_path: str | None,
-) -> None:
-    efa_path = tmp_path / "efa"
-    for present, name in (
-        (with_header, "include/rdma/fabric.h"),
-        (with_library, "lib/libfabric.so"),
-    ):
-        if present:
-            dependency = efa_path / name
-            dependency.parent.mkdir(parents=True, exist_ok=True)
-            dependency.touch()
-
+    missing_hwloc: str | None = None,
+    pkg_config_path: str | None = None,
+    arch: str = "x86_64",
+    fail_stage: str = "",
+) -> subprocess.CompletedProcess[str]:
     mpi_path = tmp_path / "mpi"
     for name in ("include/hwloc.h", "lib/libhwloc.so", "lib/pkgconfig/hwloc.pc"):
         if missing_hwloc not in ("all", name):
             dependency = mpi_path / name
             dependency.parent.mkdir(parents=True, exist_ok=True)
             dependency.touch()
-
-    # Relocate NGC PyTorch's bundled EFA and MPI prefixes without root access.
     installer = tmp_path / "install_nixl.sh"
-    installer.write_text(
-        INSTALL_NIXL.read_text()
-        .replace("/opt/amazon/efa", str(efa_path))
-        .replace("/usr/local/mpi", str(mpi_path))
-    )
+    installer.write_text(INSTALL_NIXL.read_text().replace("/usr/local/mpi", str(mpi_path)))
     (tmp_path / "github_auth.sh").write_text(":\n")
-    meson_args = tmp_path / "meson_args"
-    command = r"""
-pip3() { :; }
-git() { mkdir nixl; }
-find() { printf '%s\n' /usr/local/cuda/lib64/libcuda.so.1; }
-meson() {
-    printf '%s\n' "$@" > "$MESON_ARGS"
-    printf '%s' "${PKG_CONFIG_PATH-<unset>}" > "$MESON_PKG_CONFIG_PATH"
-    exit 0
-}
-source "$INSTALL_NIXL"
-"""
+    (tmp_path / "scratch").mkdir()
+    # These names used to be vulnerable to the installer's wildcard cleanup.
+    for name in ("libfabric-keep", "nixl-keep"):
+        (tmp_path / name).write_text("keep\n")
     env = {
         "PATH": os.environ["PATH"],
         "INSTALL_NIXL": str(installer),
-        "MESON_ARGS": str(meson_args),
-        "MESON_PKG_CONFIG_PATH": str(tmp_path / "meson_pkg_config_path"),
+        "TMPDIR": str(tmp_path / "scratch"),
+        "ENV": str(tmp_path / "shinit"),
+        "LD_LIBRARY_PATH": "/existing/lib",
+        "TEST_ARCH": arch,
+        "FAIL_STAGE": fail_stage,
     }
+    for name in (
+        "CONFIGURE_ARGS",
+        "PIP_ARGS",
+        "GIT_ARGS",
+        "MESON_ARGS",
+        "MESON_PKG_CONFIG_PATH",
+        "RESTORED_LD_PATH",
+    ):
+        env[name] = str(tmp_path / name.lower())
     if pkg_config_path is not None:
         env["PKG_CONFIG_PATH"] = pkg_config_path
-    result = subprocess.run(
-        ["bash", "-c", command],
+    return subprocess.run(
+        ["bash", "-c", _COMMAND],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -80,15 +104,50 @@ source "$INSTALL_NIXL"
         timeout=30,
     )
 
+
+def _assert_cleaned(tmp_path: Path) -> None:
+    assert not list((tmp_path / "scratch").iterdir())
+    for name in ("libfabric-keep", "nixl-keep"):
+        assert (tmp_path / name).read_text() == "keep\n"
+
+
+@pytest.mark.parametrize("arch", ("x86_64", "aarch64"))
+@pytest.mark.parametrize(
+    "missing_hwloc", (None, "all", "include/hwloc.h", "lib/libhwloc.so", "lib/pkgconfig/hwloc.pc")
+)
+@pytest.mark.parametrize("pkg_config_path", (None, "/custom/lib/pkgconfig"))
+def test_build_only_libfabric_and_hwloc(
+    tmp_path: Path, arch: str, missing_hwloc: str | None, pkg_config_path: str | None
+) -> None:
+    result = _run_installer(tmp_path, missing_hwloc, pkg_config_path, arch)
     assert result.returncode == 0, result.stderr
-    args = meson_args.read_text().splitlines()
-    expected_path = str(efa_path) if with_header and with_library else ""
-    assert [arg for arg in args if arg.startswith("-Dlibfabric_path=")] == [
-        f"-Dlibfabric_path={expected_path}"
-    ]
+    configure_args = (tmp_path / "configure_args").read_text().splitlines()
+    prefix = next(
+        arg.removeprefix("--prefix=") for arg in configure_args if arg.startswith("--prefix=")
+    )
+    assert Path(prefix).is_relative_to(tmp_path / "scratch")
+    assert "--disable-rstream" in configure_args
+    args = (tmp_path / "meson_args").read_text().splitlines()
+    assert f"-Dlibfabric_path={prefix}" in args
     expected_pkg_config_path = pkg_config_path or "<unset>"
-    if with_header and with_library and missing_hwloc is None:
-        expected_pkg_config_path = str(mpi_path / "lib/pkgconfig")
+    if missing_hwloc is None:
+        expected_pkg_config_path = str(tmp_path / "mpi/lib/pkgconfig")
         if pkg_config_path:
             expected_pkg_config_path += f":{pkg_config_path}"
     assert (tmp_path / "meson_pkg_config_path").read_text() == expected_pkg_config_path
+    assert (tmp_path / "restored_ld_path").read_text() == "/existing/lib"
+    shinit = (tmp_path / "shinit").read_text()
+    assert f"/lib/{arch}-linux-gnu:" in shinit
+    assert prefix not in shinit
+    git_args = (tmp_path / "git_args").read_text().splitlines()
+    version = git_args[git_args.index("-b") + 1].removeprefix("v")
+    assert f"nixl=={version}" in (tmp_path / "pip_args").read_text().splitlines()
+    assert f"nixl-cu13=={version}" in (ROOT / "requirements-dev.txt").read_text().splitlines()
+    _assert_cleaned(tmp_path)
+
+
+@pytest.mark.parametrize("fail_stage", ("download", "configure", "ninja", "shim"))
+def test_failed_install_cleans_build_files(tmp_path: Path, fail_stage: str) -> None:
+    result = _run_installer(tmp_path, fail_stage=fail_stage)
+    assert result.returncode != 0
+    _assert_cleaned(tmp_path)
