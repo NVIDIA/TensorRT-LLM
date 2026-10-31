@@ -50,6 +50,15 @@ def _build(spec, seed):
         # Fewer positive scores than the budget, so the zero class straddles it.
         scores = torch.relu(torch.randn(rows, W, generator=g, device=DEV) - 2.2)
         scores[:, ::7] = -0.0  # negative zero ties with zero
+    if spec.get("relu_sum"):
+        # The indexer's form: four heads' ReLUs summed, times a scale (zero in 1 of 16).
+        scores = torch.zeros(rows, W, device=DEV)
+        for _ in range(4):
+            scores += torch.relu(torch.randn(rows, W, generator=g, device=DEV))
+        scores *= 0.0884
+    if spec.get("equal"):
+        # Every score tied: the budget is the highest-index blocks.
+        scores = torch.full((rows, W), 0.5, device=DEV)
     if spec.get("narrow"):
         scores = 1.0 + 0.05 * torch.rand(rows, W, generator=g, device=DEV)
     if spec.get("lognormal"):
@@ -92,10 +101,12 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
 
 
 # The decode-path shapes, captured in the decode CUDA graph: tp1's one row at 2560 columns,
-# and the unified target's relu-sparse decode and verify cells (1 and 128 rows at core's width,
-# 1024 at MTP's).
+# the unified target's relu-sparse decode and verify cells (1 and 128 rows at core's width, 1024
+# at MTP's), and the wide tables' decode cells (`graph` in their spec).
 _GRAPH_SPECS = [dict(rows=1, pos=(8700,), width=2560)] + [
-    c.spec for c in op.CELLS if c.spec.get("relu_sparse") and "out_margin" not in c.spec
+    c.spec
+    for c in op.CELLS
+    if c.spec.get("graph") or (c.spec.get("relu_sparse") and "out_margin" not in c.spec)
 ]
 
 
