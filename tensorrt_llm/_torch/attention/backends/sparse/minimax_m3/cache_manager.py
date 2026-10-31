@@ -520,27 +520,34 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ]
         return super()._build_cache_config(config)
 
-    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role):
+    def get_layer_bytes_per_token(self, local_layer_idx: int, data_role: Role) -> int:
         """Report the hybrid sparse-NVFP4 / dense-FP8 storage footprint."""
-        if self.dtype != DataType.NVFP4:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
         global_layer_idx = int(self.pp_layers[int(local_layer_idx)])
-        if global_layer_idx in self.sparse_layer_ids:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+        has_index_k = global_layer_idx in self.sparse_layer_ids
+        if data_role == Role.INDEX_KEY:
+            return self._index_k_bytes_per_token() if has_index_k else 0
 
-        if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
-            return 0
-        if data_role == Role.ALL:
-            kv_factor = self.kv_factor
-        elif data_role in (Role.KEY, Role.VALUE):
-            kv_factor = 1
+        if self.dtype != DataType.NVFP4 or has_index_k:
+            cache_bytes = super().get_layer_bytes_per_token(local_layer_idx, data_role)
         else:
-            return super().get_layer_bytes_per_token(local_layer_idx, data_role)
-        return (
-            kv_factor
-            * self.num_kv_heads_per_layer[int(local_layer_idx)]
-            * self.head_dim_per_layer[int(local_layer_idx)]
-        )
+            # Existing NVFP4 dense-target / shared-Eagle FP8 cache calculation.
+            if data_role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+                return 0
+            if data_role == Role.ALL:
+                kv_factor = self.kv_factor
+            elif data_role in (Role.KEY, Role.VALUE):
+                kv_factor = 1
+            else:
+                return super().get_layer_bytes_per_token(local_layer_idx, data_role)
+            cache_bytes = (
+                kv_factor
+                * self.num_kv_heads_per_layer[int(local_layer_idx)]
+                * self.head_dim_per_layer[int(local_layer_idx)]
+            )
+
+        if data_role == Role.ALL and has_index_k:
+            cache_bytes += self.get_layer_bytes_per_token(local_layer_idx, Role.INDEX_KEY)
+        return cache_bytes
 
     def is_nvfp4_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` stores packed NVFP4 data and block scales."""
@@ -765,19 +772,17 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             raise NotImplementedError("MiniMax-M3 does not relocate accepted draft tokens.")
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
 
-    def _extra_buffers_per_layer(self, *, tokens_per_block):
+    def _extra_buffers_per_layer(self, *, tokens_per_block: int) -> dict[int, List[BufferConfig]]:
         """Register a per-sparse-layer ``Role.INDEX_KEY`` :class:`BufferConfig`.
 
-        ``size`` is bytes per **block**: ``1 * sparse_index_dim *
-        elem_bytes * tokens_per_block``. Keyed by **local** layer id —
-        the base ``_build_base_config`` iterates local ids, so keying
+        ``size`` is bytes per **block**: :meth:`_index_k_bytes_per_token`
+        times ``tokens_per_block``, the same per-token size
+        :meth:`get_layer_bytes_per_token` reports. Keyed by **local** layer
+        id — the base ``_build_base_config`` iterates local ids, so keying
         by global ids would silently skip registration on non-trivial
         PP ranks.
         """
-        torch_dtype = self._torch_dtype_for_index_cache()
-        elem_bytes = torch.tensor([], dtype=torch_dtype).element_size()
-        bytes_per_token = 1 * self.sparse_index_dim * elem_bytes
-        size_per_block = bytes_per_token * tokens_per_block
+        size_per_block = self._index_k_bytes_per_token() * tokens_per_block
         return {
             self.layer_offsets[layer_id]: [BufferConfig(role=Role.INDEX_KEY, size=size_per_block)]
             for layer_id in self.sparse_layer_ids
@@ -808,6 +813,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         page_upper = self.impl.get_page_index_upper_bound(any_layer_offset, Role.KEY)
         kv_factor = 1 if self.kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         return int((page_upper // kv_factor) * self.tokens_per_block)
+
+    def _index_k_bytes_per_token(self) -> int:
+        """Bytes of one token's index-K row on a sparse layer."""
+        index_dtype = self._torch_dtype_for_index_cache()
+        return self.sparse_index_dim * torch.empty(0, dtype=index_dtype).element_size()
 
     def _torch_dtype_for_index_cache(self) -> torch.dtype:
         """Return the independently configured index-cache storage dtype."""

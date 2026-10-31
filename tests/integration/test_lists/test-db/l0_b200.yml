@@ -51,6 +51,10 @@ l0_b200:
   - unittest/_torch/models/test_minimax_m3_vl.py::test_real_checkpoint_float_media_match_uint8_pixels
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_stays_fp32_when_tf32_is_allowed
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_bf16_split_matches_fp32_router
+  # MiniMax-M3 compressed-tensors NVFP4 MoE packaging, one GPU: expert loading and
+  # eager/graph numerics on CUTLASS; MXFP8 index-projection scales per simulated TP4 rank.
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_nvfp4_experts_load_and_run_on_cutlass
+  - unittest/_torch/models/test_minimax_m3.py::test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank
   - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - unittest/others/test_lora_manager.py
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4

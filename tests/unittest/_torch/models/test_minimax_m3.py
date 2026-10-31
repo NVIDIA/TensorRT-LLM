@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 from types import SimpleNamespace
+from typing import Any, Callable, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
 import pytest
@@ -36,6 +37,7 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from transformers import AutoConfig
 from utils.llm_data import llm_models_root
+from utils.util import skip_blackwell_geforce, skip_pre_blackwell
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
@@ -57,10 +59,14 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
     MiniMaxM3HfWeightMapper,
+)
+from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import (
+    convert_compressed_tensors_nvfp4_weights,
 )
 from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Attention,
@@ -71,6 +77,8 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3QKVIndexerLinear,
     _build_swiglu_oai_dense_mlp,
     _dispatch_attention_over_live_tokens,
+    _get_index_projection_quant_config,
+    _load_index_qk_proj_weights,
     _load_qkv_index_proj_weights,
     _minimax_m3_swiglu_oai,
     _moe_routed_output_is_global,
@@ -1325,6 +1333,221 @@ def test_get_moe_layer_ids_length_mismatch_raises():
     cfg.moe_layer_freq = [0] * (_NUM_HIDDEN_LAYERS - 1)
     with pytest.raises(ValueError, match="moe_layer_freq length"):
         get_moe_layer_ids(cfg)
+
+
+# ---------------------------------------------------------------------------
+# Compressed-tensors NVFP4 MoE packaging of the MiniMax M3 architecture
+# ---------------------------------------------------------------------------
+
+
+def _make_packaged_text_config() -> SimpleNamespace:
+    """The trimmed text config as the compressed-tensors package declares it.
+
+    Every attention layer is sparse and K-only while layers 0-2 keep a dense
+    MLP; rope_theta 1e7, 1M positions, no MTP module and no text model_type.
+    """
+    cfg = _make_text_config()
+    cfg.sparse_attention_config["sparse_attention_freq"] = [1] * _NUM_HIDDEN_LAYERS
+    cfg.sparse_attention_config["sparse_disable_index_value"] = [1] * _NUM_HIDDEN_LAYERS
+    cfg.rope_theta = 10000000
+    cfg.max_position_embeddings = 1048576
+    cfg.num_mtp_modules = 0
+    del cfg.model_type
+    return cfg
+
+
+def _packaged_vl_config(
+    text_config_as_dict: bool = False, **quant_overrides: Any
+) -> SimpleNamespace:
+    quantization_config = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "group_size": 16,
+        "moe_quant_algo": "NVFP4",
+        "moe_quant_format": "nvfp4-pack-quantized",
+        "ignored_layers": [
+            "lm_head",
+            "model.embed_tokens",
+            "vision_tower",
+            "multi_modal_projector",
+            "patch_merge_mlp",
+        ]
+        + [
+            f"language_model.model.layers.{i}.block_sparse_moe.gate"
+            for i in range(3, _NUM_HIDDEN_LAYERS)
+        ],
+    }
+    quantization_config.update(quant_overrides)
+    text_config = _make_packaged_text_config()
+    cfg = _make_vl_config()
+    cfg.text_config = dict(vars(text_config)) if text_config_as_dict else text_config
+    cfg.quantization_config = quantization_config
+    return cfg
+
+
+def _expand_packaged_quant_config(
+    pretrained_config: SimpleNamespace,
+) -> Tuple[QuantConfig, Optional[dict[str, QuantConfig]]]:
+    """Parse the inline config as from_pretrained does, then apply the M3 hook."""
+    quant_config, layer_quant_config = ModelConfig.load_hf_quant_config(
+        pretrained_config.quantization_config, "CUTLASS"
+    )
+    assert quant_config.quant_algo == QuantAlgo.MXFP8
+    assert layer_quant_config is None
+    return ModelConfig._set_minimax_m3_layer_quant_config(
+        pretrained_config, quant_config, layer_quant_config
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("text_config_as_dict", [False, True])
+def test_packaged_moe_config_expands_to_mixed_precision(text_config_as_dict: bool) -> None:
+    quant_config, layer_quant_config = _expand_packaged_quant_config(
+        _packaged_vl_config(text_config_as_dict)
+    )
+
+    assert quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+    assert "model.layers.3.block_sparse_moe.gate" in quant_config.exclude_modules
+    assert not any(name.startswith("language_model.") for name in quant_config.exclude_modules)
+    assert quant_config.is_module_excluded_from_quantization("lm_head")
+
+    expected = {}
+    for layer in range(_NUM_HIDDEN_LAYERS):
+        prefix = f"model.layers.{layer}"
+        names = [
+            f"{prefix}.self_attn.{proj}"
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj", "index_q_proj", "index_k_proj")
+        ]
+        if _MOE_LAYER_FREQ[layer]:
+            names += [
+                f"{prefix}.block_sparse_moe.shared_experts.{proj}"
+                for proj in ("gate_proj", "up_proj", "down_proj")
+            ]
+            expected[f"{prefix}.block_sparse_moe.experts"] = (QuantAlgo.NVFP4, 16)
+        else:
+            names += [f"{prefix}.mlp.{proj}" for proj in ("gate_proj", "up_proj", "down_proj")]
+        expected.update({name: (QuantAlgo.MXFP8, 32) for name in names})
+    assert {k: (v.quant_algo, v.group_size) for k, v in layer_quant_config.items()} == expected
+
+
+@pytest.mark.cpu_only
+def test_packaged_moe_config_honors_ignored_layers() -> None:
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].append(
+        "language_model.model.layers.4.self_attn.o_proj"
+    )
+    quant_config, layer_quant_config = _expand_packaged_quant_config(cfg)
+    assert "model.layers.4.self_attn.o_proj" not in layer_quant_config
+    assert quant_config.is_module_excluded_from_quantization("model.layers.4.self_attn.o_proj")
+    assert "model.layers.5.self_attn.o_proj" in layer_quant_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"moe_quant_algo": "MXFP4"},
+        {"moe_quant_format": "float-quantized"},
+        {"group_size": 32},
+        {"group_size": None},
+        {"moe_quant_format": None},
+        {"moe_quant_algo": None},
+    ],
+)
+def test_packaged_moe_config_rejects_unsupported_expert_recipes(
+    overrides: dict[str, str | int | None],
+) -> None:
+    with pytest.raises(ValueError, match="routed-expert packaging"):
+        _expand_packaged_quant_config(_packaged_vl_config(**overrides))
+
+
+@pytest.mark.cpu_only
+def test_packaged_moe_config_rejects_a_quantized_head() -> None:
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].remove("lm_head")
+    with pytest.raises(ValueError, match="must exclude lm_head"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "module",
+    ["self_attn.q_proj", "mlp.gate_proj", "block_sparse_moe.shared_experts.up_proj"],
+)
+def test_packaged_moe_config_rejects_partly_excluded_fused_projections(module: str) -> None:
+    layer = 1 if module.startswith("mlp.") else 4
+    cfg = _packaged_vl_config()
+    cfg.quantization_config["ignored_layers"].append(
+        f"language_model.model.layers.{layer}.{module}"
+    )
+    with pytest.raises(ValueError, match="all or none of the fused projections"):
+        _expand_packaged_quant_config(cfg)
+
+
+@pytest.mark.cpu_only
+def test_uniform_mxfp8_and_bf16_configs_are_unchanged() -> None:
+    cfg = _packaged_vl_config()
+    for key in ("moe_quant_algo", "moe_quant_format", "group_size"):
+        del cfg.quantization_config[key]
+    quant_config, _ = ModelConfig.load_hf_quant_config(cfg.quantization_config, "CUTLASS")
+    result = ModelConfig._set_minimax_m3_layer_quant_config(cfg, quant_config, None)
+    assert result[0] is quant_config and result[1] is None
+
+    no_quant = QuantConfig()
+    result = ModelConfig._set_minimax_m3_layer_quant_config(_make_vl_config(), no_quant, None)
+    assert result[0] is no_quant and result[1] is None
+
+
+@pytest.mark.cpu_only
+def test_modelopt_mixed_precision_map_is_normalized_as_before() -> None:
+    base_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    expert_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    global_config = QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+    layer_map = {
+        "language_model.model.layers.0.self_attn.o_proj": base_config,
+        "language_model.model.layers.3.block_sparse_moe.experts.0.w1": expert_config,
+    }
+    quant_config, out = ModelConfig._set_minimax_m3_layer_quant_config(
+        _make_vl_config(), global_config, layer_map
+    )
+    assert quant_config is global_config
+    assert out["model.layers.0.self_attn.o_proj"] is base_config
+    assert out["model.layers.3.block_sparse_moe.experts.0.w1"] is expert_config
+    assert not any(key.startswith("language_model.") for key in out)
+    for layer in range(_NUM_HIDDEN_LAYERS):
+        key = f"model.layers.{layer}.block_sparse_moe.experts"
+        if _MOE_LAYER_FREQ[layer]:
+            assert (out[key].quant_algo, out[key].group_size) == (QuantAlgo.NVFP4, 16)
+        else:
+            assert key not in out
+
+
+@pytest.mark.cpu_only
+def test_index_projection_quant_config_follows_declared_entries() -> None:
+    _, layer_quant_config = _expand_packaged_quant_config(_packaged_vl_config())
+    declared = _get_index_projection_quant_config(
+        SimpleNamespace(quant_config_dict=layer_quant_config), 4
+    )
+    assert (declared.quant_algo, declared.group_size) == (QuantAlgo.MXFP8, 32)
+    # Checkpoints without per-layer entries keep the unquantized index projection.
+    for quant_config_dict in (None, {}):
+        assert (
+            _get_index_projection_quant_config(
+                SimpleNamespace(quant_config_dict=quant_config_dict), 4
+            )
+            is None
+        )
+
+    mismatched = dict(layer_quant_config)
+    mismatched["model.layers.4.self_attn.index_k_proj"] = QuantConfig(
+        quant_algo=QuantAlgo.NVFP4, group_size=16
+    )
+    with pytest.raises(ValueError, match="same quantization"):
+        _get_index_projection_quant_config(SimpleNamespace(quant_config_dict=mismatched), 4)
+    del mismatched["model.layers.4.self_attn.index_k_proj"]
+    with pytest.raises(ValueError, match="same quantization"):
+        _get_index_projection_quant_config(SimpleNamespace(quant_config_dict=mismatched), 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3010,3 +3233,434 @@ def test_minimax_m3_dense_backend_library_order(
             )
     kernel.forward.assert_called_once()
     torch.testing.assert_close(output, q)
+
+
+# ---------------------------------------------------------------------------
+# Compressed-tensors NVFP4 MoE packaging: CUDA loading and forward checks
+# ---------------------------------------------------------------------------
+#
+# The references below are written from the checkpoint format (E4M3 / UE8M0 /
+# E2M1 definitions) without calling TensorRT-LLM quantizers. Each forward is
+# checked eagerly and again through CUDA graph capture and replay.
+
+_E2M1_GRID = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _relative_l2(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float((out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6))
+
+
+def _cosine(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float(
+        torch.nn.functional.cosine_similarity(out.float().flatten(), ref.float().flatten(), dim=0)
+    )
+
+
+def _graph_replay(
+    fn: Callable[..., torch.Tensor], *inputs: torch.Tensor
+) -> Callable[..., torch.Tensor]:
+    """Capture ``fn(*inputs)`` in a CUDA graph; return a replay(new_inputs) helper."""
+    static_inputs = [t.clone() for t in inputs]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        fn(*static_inputs)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = fn(*static_inputs)
+
+    def replay(*new_inputs: torch.Tensor) -> torch.Tensor:
+        for static, new in zip(static_inputs, new_inputs):
+            static.copy_(new)
+        graph.replay()
+        torch.cuda.synchronize()
+        return static_output.clone()
+
+    return replay
+
+
+def _mxfp8_dequant(weight: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """E4M3 weight times 2**(UE8M0 - 127) per 32 input channels."""
+    exponent = scale_inv.float().repeat_interleave(32, dim=1) - 127.0
+    return weight.float() * torch.exp2(exponent)
+
+
+@pytest.mark.gpu
+@skip_pre_blackwell
+@skip_blackwell_geforce
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_packaged_index_projection_keeps_mxfp8_scales_per_tp4_rank(
+    use_cuda_graph: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """index_q/k_proj load as MXFP8 with each rank's scale rows next to its weight rows.
+
+    Every index-Q head gets its own scale exponent, so a scale row that lands
+    on another head's weights changes the output by powers of two; index-K is
+    replicated on every rank with all of its scale rows.
+    """
+    import tensorrt_llm._torch.distributed as distributed
+
+    # Simulate each rank on one GPU; COLUMN projections need no collective.
+    monkeypatch.setattr(distributed, "AllReduce", lambda **_kwargs: nn.Identity())
+    torch.manual_seed(0)
+    hidden, index_dim, index_heads, tp_size = 256, 32, 4, 4
+    head_exponents = torch.tensor([127, 123, 130, 125], dtype=torch.int32)
+    q_weight = (torch.randn(index_heads * index_dim, hidden) * 2).to(torch.float8_e4m3fn)
+    q_scale = (
+        head_exponents.repeat_interleave(index_dim)[:, None]
+        + torch.randint(-1, 2, (index_heads * index_dim, hidden // 32))
+    ).to(torch.uint8)
+    k_weight = (torch.randn(index_dim, hidden) * 2).to(torch.float8_e4m3fn)
+    k_scale = torch.randint(121, 129, (index_dim, hidden // 32)).to(torch.uint8)
+    x = torch.randn(48, hidden, device="cuda", dtype=torch.bfloat16)
+    x_next = torch.randn_like(x)
+    ref_q = x.float() @ _mxfp8_dequant(q_weight, q_scale).cuda().T
+    ref_k = x.float() @ _mxfp8_dequant(k_weight, k_scale).cuda().T
+    mxfp8 = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+
+    for rank in range(tp_size):
+        text_cfg, model_cfg = _make_attention_test_config()
+        text_cfg.hidden_size = hidden
+        text_cfg.num_attention_heads = 8
+        text_cfg.num_key_value_heads = 4
+        text_cfg.sparse_attention_config["sparse_num_index_heads"] = index_heads
+        model_cfg.mapping = Mapping(world_size=tp_size, rank=rank, tp_size=tp_size)
+        model_cfg.quant_config_dict = {
+            "model.layers.3.self_attn.index_q_proj": mxfp8,
+            "model.layers.3.self_attn.index_k_proj": mxfp8,
+        }
+        attn = MiniMaxM3Attention(
+            model_config=model_cfg,
+            layer_idx=3,
+            is_sparse_attention_layer=True,
+            disable_index_value=True,
+        )
+        proj = attn.index_qk_proj
+        assert proj.quant_config.quant_algo == QuantAlgo.MXFP8
+        proj.create_weights()
+        assert type(proj.quant_method).__name__ == "MXFP8LinearMethod"
+        proj.cuda()
+
+        layer = nn.Module()
+        layer.self_attn = attn
+        _load_index_qk_proj_weights(
+            layer,
+            {
+                "self_attn.index_q_proj.weight": q_weight,
+                "self_attn.index_q_proj.weight_scale_inv": q_scale,
+                "self_attn.index_k_proj.weight": k_weight,
+                "self_attn.index_k_proj.weight_scale_inv": k_scale,
+            },
+        )
+        rows = slice(rank * index_dim, (rank + 1) * index_dim)
+        expected_weight = torch.cat([q_weight[rows], k_weight]).view(torch.uint8).cuda()
+        assert torch.equal(proj.weight.view(torch.uint8), expected_weight)
+        expected_scale = torch.cat([q_scale[rows], k_scale]).cuda()
+        if proj.quant_method.use_cutlass:
+            expected_scale = torch.ops.trtllm.block_scale_interleave(expected_scale)
+        assert torch.equal(proj.weight_scale.view(torch.uint8).flatten(), expected_scale.flatten())
+
+        def forward(inp: torch.Tensor) -> torch.Tensor:
+            return proj(inp)
+
+        if use_cuda_graph:
+            replay = _graph_replay(forward, x)
+            out, out_next = replay(x), replay(x_next)
+            assert torch.equal(out_next, forward(x_next))
+        else:
+            out = forward(x)
+        ref = torch.cat([ref_q[:, rows], ref_k], dim=1)
+        # Dynamic per-token MXFP8 activations cost ~1% relative error; a scale
+        # row on the wrong head is off by at least a factor of two.
+        assert _relative_l2(out, ref) < 0.05, rank
+        assert _cosine(out, ref) > 0.998, rank
+
+
+def _e2m1_values(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack [rows, K/2] bytes (even element in the low nibble) to float32 [rows, K]."""
+    codes = torch.stack((packed & 0xF, packed >> 4), dim=-1).reshape(packed.shape[0], -1).long()
+    magnitude = torch.tensor(_E2M1_GRID, device=packed.device)[codes & 0x7]
+    return torch.where(codes >= 8, -magnitude, magnitude)
+
+
+def _round_to_e2m1(x: torch.Tensor) -> torch.Tensor:
+    """Round to the E2M1 grid, ties to the even code, saturating at 6."""
+    grid = torch.tensor(_E2M1_GRID, device=x.device)
+    bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device=x.device)
+    magnitude = x.abs()
+    index = torch.bucketize(magnitude, bounds)
+    index = index + torch.isin(magnitude, bounds[[1, 3, 5]]).long()
+    return torch.copysign(grid[index], x)
+
+
+def _nvfp4_activation(x: torch.Tensor, global_scale: float = 1.0) -> torch.Tensor:
+    """Quantize-dequantize with 16-element E4M3 block scales and a static global scale."""
+    blocks = x.float().reshape(*x.shape[:-1], -1, 16)
+    scale = blocks.abs().amax(-1, keepdim=True) * (1.0 / 6.0) * global_scale
+    scale = scale.to(torch.float8_e4m3fn).float()
+    scaled = torch.where(scale > 0, blocks * (global_scale / scale), torch.zeros_like(blocks))
+    return (_round_to_e2m1(scaled) * scale / global_scale).reshape(x.shape)
+
+
+@pytest.mark.gpu
+@skip_pre_blackwell
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("tune", [False, True])
+def test_packaged_nvfp4_experts_load_and_run_on_cutlass(use_cuda_graph: bool, tune: bool) -> None:
+    """Packed experts reach the CUTLASS NVFP4 path intact and compute the static recipe.
+
+    Each expert has its own global scales, so a dropped scale or a wrong
+    expert assignment is visible in the output. The FC1 input is quantized
+    with the static input scale, the FC1 results round to BF16, the FC2 input
+    is quantized from that BF16 activation and the routing weights apply in
+    the finalize.
+    """
+    from tensorrt_llm._torch.moe.fused_moe import SwigluBiasActivation, create_moe
+    from tensorrt_llm.quantization.utils.fp4_utils import float4_sf_dtype
+
+    torch.manual_seed(0)
+    num_experts, top_k, hidden, inter, tokens = 8, 2, 256, 256, 24
+    prefix = "language_model.model.layers.3.block_sparse_moe.experts"
+    generator = torch.Generator().manual_seed(1)
+    checkpoint = {}
+    for e in range(num_experts):
+        for proj, rows, cols, global_scale in (
+            ("w1", inter, hidden, 50.0 + 7.0 * e),
+            ("w3", inter, hidden, 50.0 + 7.0 * e),
+            ("w2", hidden, inter, 60.0 + 5.0 * e),
+        ):
+            name = f"{prefix}.{e}.{proj}"
+            checkpoint[f"{name}.weight_packed"] = torch.randint(
+                0, 256, (rows, cols // 2), dtype=torch.uint8, generator=generator
+            )
+            checkpoint[f"{name}.weight_scale"] = (
+                torch.rand(rows, cols // 16, generator=generator) * 2 + 0.25
+            ).to(torch.float8_e4m3fn)
+            checkpoint[f"{name}.weight_global_scale"] = torch.tensor(global_scale)
+            checkpoint[f"{name}.input_global_scale"] = torch.tensor(1.0)
+
+    _, layer_quant_config = _expand_packaged_quant_config(_packaged_vl_config())
+    pretrained = _make_packaged_text_config()
+    pretrained.num_local_experts = num_experts
+    pretrained.hidden_size = hidden
+    pretrained.intermediate_size = inter
+    pretrained.torch_dtype = torch.bfloat16
+    model_config = ModelConfig(
+        pretrained_config=pretrained,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION),
+        quant_config_dict=layer_quant_config,
+        moe_backend="CUTLASS",
+        max_num_tokens=256,
+    )
+    bias = torch.randn(num_experts, device="cuda") * 0.1
+    routing = MiniMaxM3MoeRoutingMethod(
+        top_k=top_k,
+        num_experts=num_experts,
+        callable_e_score_correction_bias=lambda: bias,
+        routed_scaling_factor=2.0,
+    )
+    moe = create_moe(
+        routing_method=routing,
+        num_experts=num_experts,
+        model_config=model_config,
+        layer_idx=3,
+        override_quant_config=MiniMaxM3MoE._get_experts_quant_config(model_config, 3),
+        activation=SwigluBiasActivation(gate_sigmoid_scale=1.702, linear_offset=1.0, clamp=7.0),
+        allow_backend_degradation=False,
+    )
+    backend = moe.backend
+    assert type(backend).__name__ == "TrtllmCutlassNvfp4Impl"
+    translated = convert_compressed_tensors_nvfp4_weights(dict(checkpoint))
+    module_weights = {
+        key[len(prefix) + 1 :]: value
+        for key, value in translated.items()
+        if key.startswith(prefix + ".")
+    }
+    with torch.device("cuda"):
+        moe.create_weights()
+        assert type(backend.quant_method).__name__ == "NVFP4CutlassFusedMoEMethod"
+        moe.load_weights([module_weights])
+        moe.post_load_weights()
+
+    # Static input scales of 1.0 stay 1.0; alphas are the reciprocal weight global scales.
+    assert backend.fc31_input_scale.item() == 1.0 and backend.fc2_input_scale.item() == 1.0
+    experts = []
+    for e in range(num_experts):
+        source = {
+            proj: (
+                checkpoint[f"{prefix}.{e}.{proj}.weight_packed"],
+                checkpoint[f"{prefix}.{e}.{proj}.weight_scale"],
+                torch.reciprocal(checkpoint[f"{prefix}.{e}.{proj}.weight_global_scale"]).item(),
+            )
+            for proj in ("w1", "w2", "w3")
+        }
+        assert torch.equal(
+            backend.w3_w1_weight[e].view(torch.uint8),
+            torch.cat([source["w3"][0], source["w1"][0]]).cuda(),
+        )
+        assert torch.equal(backend.w2_weight[e].view(torch.uint8), source["w2"][0].cuda())
+        expected_fc31_scale = torch.ops.trtllm.block_scale_interleave(
+            torch.cat([source["w3"][1], source["w1"][1]]).cuda().view(float4_sf_dtype)
+        )
+        assert torch.equal(
+            backend.w3_w1_weight_scale[e].view(torch.uint8).flatten(),
+            expected_fc31_scale.view(torch.uint8).flatten(),
+        )
+        expected_fc2_scale = torch.ops.trtllm.block_scale_interleave(
+            source["w2"][1].cuda().view(float4_sf_dtype)
+        )
+        assert torch.equal(
+            backend.w2_weight_scale[e].view(torch.uint8).flatten(),
+            expected_fc2_scale.view(torch.uint8).flatten(),
+        )
+        alphas = (source["w1"][2], source["w3"][2], source["w2"][2])
+        # The alpha is 1 / (input_scale * (1 / weight_scale_2)): within one ulp.
+        for alpha, golden in (
+            (backend.fc31_alpha[e].item(), source["w1"][2]),
+            (backend.fc2_alpha[e].item(), source["w2"][2]),
+        ):
+            assert abs(alpha - golden) <= 2**-23 * golden, (e, alpha, golden)
+        # Dequantized FP4 weights without the global scale (exact in FP32), and that scale.
+        experts.append(
+            (
+                tuple(
+                    _e2m1_values(w).cuda() * s.float().cuda().repeat_interleave(16, dim=1)
+                    for w, s, _ in (source["w1"], source["w3"], source["w2"])
+                ),
+                alphas,
+            )
+        )
+
+    def gemm(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        """FP32 rounding of the FP64 sum of exactly representable products."""
+        return (a.double() @ w.double().T).float()
+
+    def reference(x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Static unit FC1 scale; BF16 FC1 results; FC2 input quantized from its
+        BF16 cast; routing weights in the finalize."""
+        scores = torch.sigmoid(logits.float())
+        ids = torch.topk(scores + bias, top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = weights / (weights.sum(-1, keepdim=True) + 1e-20) * 2.0
+        x_q = _nvfp4_activation(x)
+        slots = torch.zeros(x.shape[0], top_k, hidden, device="cuda")
+        for e, ((w1, w3, w2), (a1, a3, a2)) in enumerate(experts):
+            rows, slot = (ids == e).nonzero(as_tuple=True)
+            if rows.numel() == 0:
+                continue
+            acc1, acc3 = gemm(x_q[rows], w1), gemm(x_q[rows], w3)
+            w = weights[rows, slot, None]
+            gate = (acc1 * a1).bfloat16().float().clamp(max=7.0)
+            up = (acc3 * a3).bfloat16().float().clamp(-7.0, 7.0)
+            act = (gate * torch.sigmoid(1.702 * gate) * (up + 1.0)).bfloat16().float()
+            y = (gemm(_nvfp4_activation(act), w2) * a2).bfloat16().float()
+            slots[rows, slot] = y * w
+        out = torch.zeros(x.shape[0], hidden, device="cuda")
+        for j in range(top_k):
+            out = out + slots[:, j]
+        return out
+
+    def forward(x: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        return moe(x, logits, all_rank_num_tokens=[tokens], use_dp_padding=False)
+
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    logits = torch.randn(tokens, num_experts, device="cuda")
+    x_next, logits_next = torch.randn_like(x), torch.randn_like(logits)
+    with torch.inference_mode():
+        # Tune the actual shape, then verify the selected tactic eagerly and in a graph.
+        if tune:
+            with autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
+                forward(x, logits)
+        if use_cuda_graph:
+            replay = _graph_replay(forward, x, logits)
+            outputs = [
+                (replay(x, logits), x, logits),
+                (replay(x_next, logits_next), x_next, logits_next),
+            ]
+            # The fused top-k combine may accumulate in a different order per launch.
+            assert _relative_l2(outputs[1][0], forward(x_next, logits_next)) < 1e-3
+        else:
+            outputs = [(forward(x, logits), x, logits)]
+        for out, inp, lg in outputs:
+            ref = reference(inp, lg)
+            assert torch.isfinite(out).all()
+            # Same recipe on both sides; the remainder is accumulation order
+            # and the BF16 rounding of the GEMM outputs.
+            assert _relative_l2(out, ref) < 0.02
+            assert _cosine(out, ref) > 0.999
+
+
+def _stub_minimax_m3_attention_construction(
+    monkeypatch: pytest.MonkeyPatch, *, is_neox: bool = True
+) -> Mock:
+    """Keep the M3 constructor real while removing generic GPU setup and projection allocation."""
+
+    def initialize_attention(self: nn.Module, **kwargs: Any) -> None:
+        nn.Module.__init__(self)
+        config = kwargs["config"]
+        self.pos_embd_params = SimpleNamespace(rope=kwargs["pos_embd_params"].rope, is_neox=is_neox)
+        self.rotary_emb = object()
+        self.head_dim = config.pretrained_config.head_dim
+        self.qkv_proj = nn.Module()
+        self.qkv_proj.mapping = config.mapping
+
+    def make_linear(*args: Any, **kwargs: Any) -> nn.Module:
+        projection = nn.Module()
+        projection.quant_config = kwargs["quant_config"]
+        return projection
+
+    monkeypatch.setattr(modeling_minimaxm3.Attention, "__init__", initialize_attention)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: None)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    projection_factory = Mock(side_effect=make_linear)
+    monkeypatch.setattr(modeling_minimaxm3, "Linear", projection_factory)
+    return projection_factory
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("entries", ["matching", "absent", "mismatched", "missing_k"])
+def test_minimax_m3_index_projection_quantization_follows_checkpoint_entries(
+    monkeypatch: pytest.MonkeyPatch, entries: str
+) -> None:
+    """index_qk_proj is quantized exactly when the checkpoint declares matching per-layer entries."""
+    _, model_config = _make_fused_qk_norm_rope_test_config()
+    # Other-layer entries must not affect the projection being constructed.
+    declared = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
+    other = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
+    layer_quant_config = {
+        "model.layers.2.self_attn.index_q_proj": other,
+        "model.layers.2.self_attn.index_k_proj": other,
+    }
+    if entries != "absent":
+        layer_quant_config["model.layers.3.self_attn.index_q_proj"] = declared
+    if entries in ("matching", "mismatched"):
+        layer_quant_config["model.layers.3.self_attn.index_k_proj"] = (
+            declared if entries == "matching" else other
+        )
+    model_config.quant_config_dict = layer_quant_config
+    projection_factory = _stub_minimax_m3_attention_construction(monkeypatch)
+    lookup = Mock(wraps=_get_index_projection_quant_config)
+    monkeypatch.setattr(modeling_minimaxm3, "_get_index_projection_quant_config", lookup)
+    if entries in ("mismatched", "missing_k"):
+        with pytest.raises(ValueError, match="same quantization"):
+            MiniMaxM3Attention(
+                model_config=model_config,
+                layer_idx=3,
+                is_sparse_attention_layer=True,
+                disable_index_value=True,
+            )
+        projection_factory.assert_not_called()
+    else:
+        layer = MiniMaxM3Attention(
+            model_config=model_config,
+            layer_idx=3,
+            is_sparse_attention_layer=True,
+            disable_index_value=True,
+        )
+        projection_factory.assert_called_once()
+        expected = declared if entries == "matching" else None
+        assert layer.index_qk_proj.quant_config is expected
+        assert projection_factory.call_args.kwargs["quant_config"] is expected
+    lookup.assert_called_once_with(model_config, 3)
