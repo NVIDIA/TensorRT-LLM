@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the vision_rope_2d_packed_qk__tower variant: the vision tower's 2-D rotary,
+"""GPU test for the vision_rope_2d_packed_qk variant: the vision tower's 2-D rotary,
 one Triton launch in place on the q|k prefix of the packed qkv projection.
 
 Each cell builds a packed `[T, 3 * 16, 72]` bf16 qkv projection and the caller's angle
@@ -20,15 +20,15 @@ from typing import List, Sequence, Tuple
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.vision_rope_2d_packed_qk__tower import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.vision_rope_2d_packed_qk import (  # noqa: E501
     HEAD_DIM,
     NUM_HEADS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.vision_rope_2d_packed_qk__tower import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.vision_rope_2d_packed_qk import (  # noqa: E501
     vision_rope_2d_packed_qk as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "vision_rope_2d_packed_qk requires a CUDA device"

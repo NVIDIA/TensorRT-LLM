@@ -129,7 +129,7 @@ def _nested_loop_positions(grid, merge):
     "grid", [[(1, 62, 90)], [(3, 8, 8), (1, 16, 24)], [(2, 4, 6)]], ids=["62x90", "mixed", "t2"]
 )
 def test_the_angle_table_is_the_rotary_entrys_certified_table(grid):
-    """`_rope_tables` builds, bit for bit, the table `vision_rope_2d_packed_qk__tower` is
+    """`_rope_tables` builds, bit for bit, the table `vision_rope_2d_packed_qk` is
     certified with: positions in spatial-merge order, fp64 angles rounded once to fp32,
     height angles then width angles, `[rows, 36]` contiguous."""
     assert V._merge_order_positions(grid, 2).tolist() == [

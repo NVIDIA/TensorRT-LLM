@@ -59,7 +59,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's tower: 1152 / 16 heads = a 72-wide head, spatial_merge_size 2, theta 1e4
 #: (`model.visual.blocks.N.attn.qkv.weight` is [3456, 1152], so a qkv row is 3 * 16 * 72).
