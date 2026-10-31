@@ -16,6 +16,7 @@ import datetime
 import enum
 import gc
 import json
+import os
 import time
 import traceback
 import uuid
@@ -35,6 +36,10 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
+from ..bindings.BuildInfo import check_cuda_architecture_supported
+from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                        configure_moe_launch_queues,
+                                        uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -97,6 +102,18 @@ class BaseWorker(GenerationExecutor):
         tokenizer: Optional[TokenizerBase] = None,
         llm_args: Optional[BaseLlmArgs] = None,
     ) -> None:
+        # Direct worker construction also bypasses BaseLLM/worker_main.
+        launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
+        if llm_args is not None and llm_args.env_overrides:
+            os.environ.update(llm_args.env_overrides)
+        if llm_args is not None and llm_args.backend == "pytorch":
+            queue_overrides = configure_moe_launch_queues(
+                getattr(llm_args, "moe_config", None),
+                llm_args.env_overrides,
+                initial_setting=launch_queues)
+            if queue_overrides is not llm_args.env_overrides:
+                llm_args.env_overrides = queue_overrides
+
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
             num_postprocess_workers=postproc_config.num_postprocess_workers,
@@ -141,6 +158,9 @@ class BaseWorker(GenerationExecutor):
 
     def _configure_device(self):
         device_id = self.global_rank % torch.cuda.device_count()
+        # Fail before loading the model: missing optimized kernels for this GPU otherwise
+        # surface much later as unrelated errors such as running out of memory.
+        check_cuda_architecture_supported(device_id)
         torch.cuda.set_device(device_id)
         configure_cpu_affinity(device_id)
 
@@ -153,6 +173,7 @@ class BaseWorker(GenerationExecutor):
             raise ValueError("llm_args is required to set up the worker engine")
         if self._backend != "pytorch":
             raise ValueError(f"Unsupported backend config: {self._backend}")
+
 
         from tensorrt_llm._torch.pyexecutor.model_loader import \
             _construct_checkpoint_loader
@@ -1061,8 +1082,60 @@ class BaseWorker(GenerationExecutor):
     def shutdown(self):
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        if not uses_collective_shutdown(getattr(self, "llm_args", None)):
+            self._shutdown_rank_local()
+            return
+        self.doing_shutdown = True
+
+        try:
+            if self.engine is not None:
+                engine = self.engine
+                engine_shutdown_completed = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
+                can_shutdown = getattr(engine, "can_shutdown", None)
+                if can_shutdown is None:
+                    can_shutdown = engine.can_enqueue_requests
+                # PyExecutor separates leader-only shutdown publication from the
+                # all-rank join/finalize path. Other backends retain their gate.
+                # A retry must bypass that gate once shutdown already completed.
+                if (engine_shutdown_completed
+                        or getattr(engine, "shutdown_all_ranks", False)
+                        or can_shutdown()):
+                    shutdown_error = None
+                    local_safe = engine_shutdown_completed
+                    if not local_safe:
+                        try:
+                            engine.shutdown()
+                            self._engine_shutdown_completed = True
+                            local_safe = True
+                        except BaseException as error:
+                            shutdown_error = error
+                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                    if terminal_cleanup is not None:
+                        try:
+                            if getattr(engine, "shutdown_all_ranks", False):
+                                terminal_cleanup(local_safe=local_safe)
+                            elif local_safe:
+                                terminal_cleanup()
+                        except BaseException as error:
+                            if shutdown_error is None:
+                                shutdown_error = error
+                    if shutdown_error is not None:
+                        raise shutdown_error
+                    self.engine = None
+                    self._engine_shutdown_completed = False
+        except BaseException:
+            # Keep the engine reachable so a caller can retry a failed
+            # collective terminal cleanup in this long-lived worker process.
+            # Only an explicit call retries it; see __del__.
+            self.doing_shutdown = False
+            self._collective_shutdown_failed = True
+            raise
+        self._collective_shutdown_failed = False
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
+        self.doing_shutdown = True
 
         if self.engine is not None:
             can_shutdown = getattr(self.engine, "can_shutdown", None)
@@ -1070,6 +1143,9 @@ class BaseWorker(GenerationExecutor):
                 can_shutdown = self.engine.can_enqueue_requests
             if can_shutdown():
                 self.engine.shutdown()
+                local_cleanup = getattr(self.engine, "local_cleanup", None)
+                if local_cleanup is not None:
+                    local_cleanup()
                 self.engine = None
 
     def get_disaggregated_params(self) -> dict:
@@ -1247,6 +1323,10 @@ class BaseWorker(GenerationExecutor):
         return exc_type is None or exc_type == self.WorkerExit
 
     def __del__(self):
+        # Finalizers run at a different time on each rank, so they must not
+        # retry a failed collective shutdown.
+        if getattr(self, "_collective_shutdown_failed", False):
+            return
         self.shutdown()
 
 

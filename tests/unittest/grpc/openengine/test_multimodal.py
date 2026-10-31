@@ -1,16 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for OpenEngine image input mapping and discovery."""
+"""Unit tests for OpenEngine multimodal input mapping and discovery."""
 
 import asyncio
 import base64
 import gc
 import re
+import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from contextvars import ContextVar
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -33,11 +36,14 @@ from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa:
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer  # noqa: E402
 from tensorrt_llm.grpc.openengine.errors import UnsupportedFeatureError  # noqa: E402
 from tensorrt_llm.grpc.openengine.servicer import OpenEngineInferenceServicer  # noqa: E402
+from tensorrt_llm.inputs import media_io  # noqa: E402
 from tensorrt_llm.inputs.media_io import MediaFetchError  # noqa: E402
 from tensorrt_llm.inputs.multimodal import MultimodalParams  # noqa: E402
+from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData  # noqa: E402
 from tensorrt_llm.inputs.registry import (  # noqa: E402
     MULTIMODAL_PLACEHOLDER_REGISTRY,
     BaseMultimodalInputProcessor,
+    DefaultInputProcessor,
 )
 from tensorrt_llm.llmapi.llm import PreprocessedInputs  # noqa: E402
 
@@ -54,6 +60,24 @@ def _ignore_synthetic_decoded_size(monkeypatch) -> None:
             handler.validate,
             handler.loader_factory,
             lambda _decoded: 0,
+            handler.runtime_available,
+            handler.reserves_decoded_bytes,
+        ),
+    )
+
+
+def _set_video_runtime_available(monkeypatch, available: bool) -> None:
+    handler = request_mapping._MEDIA_HANDLERS[generation_pb2.MODALITY_VIDEO]
+    monkeypatch.setitem(
+        request_mapping._MEDIA_HANDLERS,
+        generation_pb2.MODALITY_VIDEO,
+        request_mapping._MediaHandler(
+            handler.name,
+            handler.validate,
+            handler.loader_factory,
+            handler.decoded_bytes,
+            lambda: available,
+            handler.reserves_decoded_bytes,
         ),
     )
 
@@ -69,6 +93,10 @@ class _ImageConfig:
 
 class _ImageInputProcessor(BaseMultimodalInputProcessor):
     """Minimal concrete processor used only for capability detection."""
+
+    @property
+    def supported_modalities(self):
+        return frozenset({"image", "video", "audio"})
 
     def __init__(self, config: _ImageConfig) -> None:
         self._config = config
@@ -93,7 +121,32 @@ class _ImageInputProcessor(BaseMultimodalInputProcessor):
         raise NotImplementedError
 
     def get_preferred_media_io_kwargs(self):
-        return {"image": {"format": "np"}}
+        return {
+            "image": {"format": "np"},
+            "video": {"format": "np", "num_frames": 4},
+        }
+
+
+class _AudioInputProcessor:
+    """Registered processor that does not use BaseMultimodalInputProcessor."""
+
+    _registered_model_type = _ImageConfig.model_type
+    supported_modalities = frozenset({"image", "video", "audio"})
+
+    def __init__(self, config: _ImageConfig) -> None:
+        self.config = config
+
+    def __call__(self, inputs, sampling_params):
+        raise NotImplementedError
+
+
+class _NonCallableRegisteredInputProcessor:
+    """Malformed registration used to verify capability discovery fails closed."""
+
+    _registered_model_type = _ImageConfig.model_type
+
+    def __init__(self, config: _ImageConfig) -> None:
+        self.config = config
 
 
 class _Tokenizer:
@@ -215,6 +268,7 @@ class _Frontend:
 
 @pytest.fixture
 def image_llm(monkeypatch):
+    _set_video_runtime_available(monkeypatch, True)
     config = _ImageConfig()
     input_processor = _ImageInputProcessor(config)
     seen_model_types = []
@@ -238,17 +292,137 @@ def image_llm(monkeypatch):
     )
 
 
+@pytest.fixture
+def image_video_llm(monkeypatch):
+    _set_video_runtime_available(monkeypatch, True)
+    config = _ImageConfig()
+    input_processor = _ImageInputProcessor(config)
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "is_valid",
+        lambda model_type, modality: (
+            model_type == _ImageConfig.model_type and modality in {"image", "video"}
+        ),
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: f"<{modality}_{{}}>",
+    )
+    return SimpleNamespace(
+        _hf_model_config=config,
+        input_processor=input_processor,
+    )
+
+
+@pytest.fixture
+def image_video_audio_llm(monkeypatch):
+    _set_video_runtime_available(monkeypatch, True)
+    config = _ImageConfig()
+    input_processor = _ImageInputProcessor(config)
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "is_valid",
+        lambda model_type, modality: (
+            model_type == _ImageConfig.model_type and modality in {"image", "video", "audio"}
+        ),
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: f"<{modality}_{{}}>",
+    )
+    return SimpleNamespace(
+        _hf_model_config=config,
+        input_processor=input_processor,
+    )
+
+
 def test_media_capability_requires_the_loaded_multimodal_processor(image_llm):
     llm, seen_model_types = image_llm
 
     assert request_mapping.media_capabilities_for_model(llm).modalities == {"image"}
-    assert seen_model_types == [_ImageConfig.model_type]
+    assert seen_model_types == [_ImageConfig.model_type] * 3
     assert (
         request_mapping.media_capabilities_for_model(
             SimpleNamespace(_hf_model_config=llm._hf_model_config, input_processor=object())
         ).modalities
         == set()
     )
+
+
+def test_media_capability_accepts_a_registered_non_base_processor(monkeypatch):
+    config = _ImageConfig()
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "is_valid",
+        lambda model_type, modality: model_type == _ImageConfig.model_type and modality == "audio",
+    )
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY,
+        "get_placeholder",
+        lambda model_type, modality: "",
+    )
+    llm = SimpleNamespace(
+        _hf_model_config=config,
+        input_processor=_AudioInputProcessor(config),
+    )
+
+    assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt", ["", "<|startoftranscript|><|fr|><|translate|><|notimestamps|>"])
+async def test_audio_text_prompt_survives_preparation_without_placeholders(monkeypatch, prompt):
+    import soundfile
+
+    config = _ImageConfig()
+    processor = _AudioInputProcessor(config)
+    processor.supports_token_ids_input = False
+    monkeypatch.setattr(
+        MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda _, modality: modality == "audio"
+    )
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "get_placeholder", lambda *_: "")
+    llm = _ImageLlm(processor, config)
+    llm.args.reasoning_parser = None
+    llm.args.max_seq_len = 2048
+    inference = OpenEngineInferenceServicer(llm, "audio-model")
+    control = OpenEngineControlServicer(llm, "audio-model", inference)
+    info = await control.GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
+    assert info.supports_text_input is True
+    assert info.supports_token_ids_input is False
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros(32), 16000, format="WAV")
+    request = generation_pb2.GenerateRequest(
+        request_id="audio-task-prompt",
+        model="audio-model",
+        prompt=prompt,
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                raw_bytes=encoded.getvalue(),
+                mime_type="audio/wav",
+            )
+        ],
+    )
+    responses = [response async for response in inference.Generate(request, FakeServicerContext())]
+    assert responses[-1].HasField("finished")
+    inputs = llm.generate_kwargs["inputs"]
+    assert inputs["prompt"] == prompt
+    samples, rate = inputs["multi_modal_data"]["audio"][0]
+    assert samples.shape == (32,) and rate == 16000
+    assert inference.active_request_count() == 0
+
+
+def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatch):
+    config = _ImageConfig()
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_args: True)
+    llm = SimpleNamespace(
+        _hf_model_config=config,
+        input_processor=_NonCallableRegisteredInputProcessor(config),
+    )
+
+    assert request_mapping.media_capabilities_for_model(llm).modalities == set()
 
 
 @pytest.mark.asyncio
@@ -294,9 +468,535 @@ def test_media_capabilities_are_hashable():
     assert hash(first) == hash(second)
 
 
+def test_media_capability_requires_the_runtime_decoder(image_video_llm, monkeypatch):
+    _set_video_runtime_available(monkeypatch, False)
+
+    assert request_mapping.media_capabilities_for_model(image_video_llm).modalities == {"image"}
+
+
+def test_video_runtime_availability_requires_importable_opencv(monkeypatch):
+    monkeypatch.setattr(request_mapping.importlib, "import_module", lambda _name: object())
+    assert request_mapping._video_runtime_available() is True
+
+
+@pytest.mark.parametrize("error", [ImportError(), OSError()])
+def test_video_runtime_unavailable_when_opencv_fails_to_load(monkeypatch, error):
+    def missing(_name):
+        raise error
+
+    monkeypatch.setattr(request_mapping.importlib, "import_module", missing)
+    assert request_mapping._video_runtime_available() is False
+
+
 def test_unknown_decoded_image_type_is_rejected():
     with pytest.raises(TypeError, match="unsupported decoded image type"):
         request_mapping._decoded_image_bytes(object())
+
+
+def test_decoded_video_bytes_include_frames_and_audio():
+    video = VideoData(
+        frames=np.zeros((2, 3, 4, 3), dtype=np.uint8),
+        metadata={},
+        audio=AudioData(samples=np.zeros(8, dtype=np.float32), sample_rate=16000),
+    )
+
+    assert request_mapping._decoded_video_bytes(video) == 2 * 3 * 4 * 3 + 8 * 4
+    with pytest.raises(TypeError, match="unsupported decoded video type"):
+        request_mapping._decoded_video_bytes(object())
+
+
+def test_decoded_audio_bytes_count_samples_and_reject_unknown_types():
+    assert request_mapping._decoded_audio_bytes((np.zeros(8, dtype=np.float32), 16000)) == 8 * 4
+    with pytest.raises(TypeError, match="unsupported decoded audio type"):
+        request_mapping._decoded_audio_bytes(object())
+
+
+@pytest.mark.parametrize("audio_format", ["FLAC", "MP3"])
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize("source", ["bytes", "base64", "file"])
+def test_audio_reserves_before_decoding_and_preserves_samples(
+    audio_format, channels, source, tmp_path, monkeypatch
+):
+    import base64
+
+    import soundfile
+
+    samples = np.arange(32 * channels, dtype=np.float64).reshape(32, channels) / 128
+    encoded = BytesIO()
+    soundfile.write(encoded, samples, 16000, format=audio_format)
+    data = encoded.getvalue()
+    expected, _ = soundfile.read(BytesIO(data))
+    with soundfile.SoundFile(BytesIO(data)) as audio:
+        reserved_bytes = audio.frames * audio.channels * np.dtype(np.float64).itemsize
+    budget = request_mapping._DecodedMediaBudget(reserved_bytes)
+    original_read = soundfile.SoundFile.read
+
+    def checked_read(audio, *args, **kwargs):
+        assert (budget._used, budget._reserved_retained) == (reserved_bytes, reserved_bytes)
+        assert kwargs["out"].nbytes == reserved_bytes
+        return original_read(audio, *args, **kwargs)
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", checked_read)
+    loader = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve)
+    if source == "bytes":
+        decoded, rate = loader.load_bytes(data)
+    elif source == "base64":
+        decoded, rate = loader.load_base64(
+            "audio/mpeg" if audio_format == "MP3" else "audio/flac",
+            base64.b64encode(data).decode(),
+        )
+    else:
+        path = tmp_path / f"audio.{audio_format.lower()}"
+        path.write_bytes(data)
+        decoded, rate = loader.load_file(path.as_uri())
+    if audio_format == "MP3":
+        # Buffered and ordinary MP3 reads can differ by float32 rounding.
+        np.testing.assert_allclose(decoded, expected, rtol=0, atol=np.finfo(np.float32).eps)
+    else:
+        np.testing.assert_array_equal(decoded, expected)
+    assert rate == 16000
+    assert (budget._used, budget._retained, budget._reserved_retained) == (
+        expected.nbytes,
+        expected.nbytes,
+        0,
+    )
+
+
+@pytest.mark.parametrize("outcome", ["oversized", "failure", "cancelled"])
+def test_audio_budget_rejects_before_allocation_and_cleans_up(outcome, monkeypatch):
+    import soundfile
+
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros((32, 2)), 16000, format="FLAC")
+    budget = request_mapping._DecodedMediaBudget(511 if outcome == "oversized" else 512)
+    loader = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve)
+
+    def read(audio, *args, **kwargs):
+        if outcome == "oversized":
+            pytest.fail("oversized audio must be rejected before decoding")
+        if outcome == "failure":
+            raise RuntimeError("decode failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", read)
+    if outcome == "oversized":
+        monkeypatch.setattr(
+            np, "empty", lambda *args, **kwargs: pytest.fail("allocated oversized audio")
+        )
+    error = {
+        "oversized": ValueError,
+        "failure": RuntimeError,
+        "cancelled": asyncio.CancelledError,
+    }[outcome]
+    with pytest.raises(error):
+        loader.load_bytes(encoded.getvalue())
+    assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize("decoded_frames", [0, 17])
+def test_audio_short_read_preserves_samples_and_accounts_for_owning_storage(
+    channels, decoded_frames, monkeypatch
+):
+    import soundfile
+
+    encoded = BytesIO()
+    samples = np.arange(32 * channels, dtype=np.float64).reshape(32, channels) / 128
+    soundfile.write(encoded, samples, 16000, format="FLAC")
+    expected, _ = soundfile.read(BytesIO(encoded.getvalue()))
+    budget = request_mapping._DecodedMediaBudget(samples.nbytes)
+    original_read = soundfile.SoundFile.read
+
+    def short_read(audio, *args, **kwargs):
+        assert budget._used == samples.nbytes
+        return original_read(audio, *args, **kwargs)[:decoded_frames]
+
+    monkeypatch.setattr(soundfile.SoundFile, "read", short_read)
+    decoded, rate = media_io.AudioMediaIO(decoded_memory_reserver=budget.reserve).load_bytes(
+        encoded.getvalue()
+    )
+    np.testing.assert_array_equal(decoded, expected[:decoded_frames])
+    assert rate == 16000
+    assert decoded.flags.owndata
+    assert decoded.base is None
+    assert (budget._used, budget._retained, budget._reserved_retained) == (
+        decoded.nbytes,
+        decoded.nbytes,
+        0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_audio_request_uses_one_shared_budget_without_double_charging(
+    image_video_audio_llm, monkeypatch
+):
+    import soundfile
+
+    encoded = BytesIO()
+    soundfile.write(encoded, np.zeros(32), 16000, format="FLAC")
+    monkeypatch.setattr(request_mapping, "_MAX_TOTAL_DECODED_MEDIA_BYTES", 256)
+    item = generation_pb2.MediaItem(
+        modality=generation_pb2.MODALITY_AUDIO, raw_bytes=encoded.getvalue(), mime_type="audio/flac"
+    )
+    request = generation_pb2.GenerateRequest(prompt="transcribe", media=[item])
+    mapped = await request_mapping._input_from_request(request, image_video_audio_llm)
+    assert mapped["multi_modal_data"]["audio"][0][0].nbytes == 256
+    request.media.append(item)
+    with pytest.raises(ValueError, match="decoded media exceeds"):
+        await request_mapping._input_from_request(request, image_video_audio_llm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("processor_kind", ["gemma4", "nemotron"])
+@pytest.mark.parametrize("audio_encoder", [False, True])
+async def test_audio_capability_follows_loaded_processor(processor_kind, audio_encoder):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+    from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
+        NemotronHMultimodalInputProcessor,
+    )
+
+    if processor_kind == "gemma4":
+        processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+        config = SimpleNamespace(
+            model_type="gemma4",
+            vision_config=object(),
+            audio_config=object() if audio_encoder else None,
+        )
+    else:
+        processor = NemotronHMultimodalInputProcessor.__new__(NemotronHMultimodalInputProcessor)
+        config = SimpleNamespace(model_type="nemotron_h_omni")
+        processor._audio_extractor = object() if audio_encoder else None
+    processor._config = config
+    llm = _ImageLlm(processor, config)
+    llm.args.reasoning_parser = None
+    llm.args.max_seq_len = 2048
+    inference = OpenEngineInferenceServicer(llm, "audio-model")
+    control = OpenEngineControlServicer(llm, "audio-model", inference)
+    info = await control.GetModelInfo(model_pb2.GetModelInfoRequest(), FakeServicerContext())
+    assert ("audio" in info.extra["trtllm_supported_modalities"]) is audio_encoder
+    assert "image" in info.extra["trtllm_supported_modalities"]
+    assert {"image", "video"} <= processor.supported_modalities
+    assert ("audio" in processor.supported_modalities) is audio_encoder
+    if not audio_encoder:
+        request = generation_pb2.GenerateRequest(
+            request_id="unsupported-audio",
+            model="audio-model",
+            prompt="transcribe",
+            media=[
+                generation_pb2.MediaItem(
+                    modality=generation_pb2.MODALITY_AUDIO,
+                    raw_bytes=b"unused",
+                    mime_type="audio/wav",
+                )
+            ],
+        )
+        with pytest.raises(UnsupportedFeatureError, match="audio"):
+            await request_mapping._input_from_request(request, llm)
+        context = FakeServicerContext()
+        with pytest.raises(AbortError):
+            async for _ in inference.Generate(request, context):
+                pass
+        assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+
+
+@pytest.mark.parametrize("audio_encoder", [False, True])
+def test_gemma4_without_vision_encoder_omits_images_and_video(audio_encoder):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    processor._config = SimpleNamespace(
+        model_type="gemma4", vision_config=None, audio_config=object() if audio_encoder else None
+    )
+    expected = {"audio"} if audio_encoder else frozenset()
+    assert processor.supported_modalities == expected
+    assert (
+        request_mapping.media_capabilities_for_model(
+            SimpleNamespace(input_processor=processor)
+        ).modalities
+        == expected
+    )
+
+
+@pytest.mark.parametrize("config_state", ["absent", "none"])
+def test_gemma4_missing_processor_config_fails_closed(config_state):
+    from tensorrt_llm._torch.models.modeling_gemma4mm import Gemma4InputProcessor
+
+    config = SimpleNamespace(model_type="gemma4", audio_config=object())
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    if config_state == "none":
+        processor._config = None
+    llm = SimpleNamespace(input_processor=processor, _hf_model_config=config)
+    assert processor.supported_modalities == frozenset()
+    assert request_mapping.media_capabilities_for_model(llm).modalities == frozenset()
+
+
+def test_whisper_declares_audio_without_multimodal_base():
+    from tensorrt_llm._torch.models.modeling_whisper import WhisperInputProcessor
+
+    processor = WhisperInputProcessor.__new__(WhisperInputProcessor)
+    processor.config = SimpleNamespace(model_type="whisper")
+    assert processor.supported_modalities == {"audio"}
+    llm = SimpleNamespace(input_processor=processor)
+    assert request_mapping.media_capabilities_for_model(llm).modalities == {"audio"}
+
+
+def test_multimodal_processor_defaults_to_registered_modalities(monkeypatch):
+    from tensorrt_llm.inputs.registry import MultimodalPlaceholderMetadata
+
+    class RegisteredProcessor(_ImageInputProcessor):
+        supported_modalities = BaseMultimodalInputProcessor.supported_modalities
+
+    monkeypatch.setitem(
+        MULTIMODAL_PLACEHOLDER_REGISTRY._multimodal_placeholder_by_model_type,
+        _ImageConfig.model_type,
+        MultimodalPlaceholderMetadata(placeholder_map={"image": "<image>", "audio": "<audio>"}),
+    )
+    processor = RegisteredProcessor(_ImageConfig())
+    assert processor.supported_modalities == {"image", "audio"}
+    processor._config = SimpleNamespace(model_type="openengine_unknown_processor")
+    assert processor.supported_modalities == frozenset()
+
+
+def test_registered_processor_without_modality_contract_fails_closed(monkeypatch):
+    monkeypatch.delattr(_AudioInputProcessor, "supported_modalities")
+    monkeypatch.setattr(MULTIMODAL_PLACEHOLDER_REGISTRY, "is_valid", lambda *_: True)
+    llm = SimpleNamespace(input_processor=_AudioInputProcessor(_ImageConfig()))
+    assert request_mapping.media_capabilities_for_model(llm).modalities == frozenset()
+
+
+def test_default_input_processor_declares_token_ids_supported():
+    processor = DefaultInputProcessor(model_path="unused", config=None, tokenizer=None)
+    assert processor.supports_token_ids_input is True
+    assert processor.supported_modalities == frozenset()
+
+
+def test_decoded_media_budget_settles_peak_to_retained_bytes():
+    budget = request_mapping._DecodedMediaBudget(20, peak_limit=20)
+
+    first = budget.reserve(15, 5)
+    first.commit(5)
+    assert (budget._used, budget._retained, budget._reserved_retained) == (5, 5, 0)
+    second = budget.reserve(15, 5)
+    second.release()
+    assert (budget._used, budget._retained, budget._reserved_retained) == (5, 5, 0)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "resampled",
+        "oversized",
+        "decode_failure",
+        "concat_failure",
+        "no_audio",
+        "cancelled",
+    ],
+)
+def test_embedded_audio_reserves_chunks_and_concatenation(outcome, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(27 if outcome == "oversized" else 35)
+    converted = []
+    concatenated = []
+    grabs = iter([True])
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda _key: 1,
+        grab=lambda: next(grabs, False),
+        retrieve=lambda _scratch: (True, np.zeros((1, 1, 3), dtype=np.uint8)),
+        release=lambda: None,
+    )
+    monkeypatch.setattr(
+        media_io,
+        "_get_cv2",
+        lambda: SimpleNamespace(
+            VideoCapture=lambda _source: capture,
+            CAP_PROP_FRAME_COUNT=0,
+            CAP_PROP_FPS=1,
+            COLOR_BGR2RGB=2,
+            cvtColor=lambda _source, _code, dst: dst.fill(0),
+        ),
+    )
+
+    def audio_frame(index):
+        def to_ndarray():
+            converted.append(index)
+            if outcome == "decode_failure" and index == 1:
+                raise RuntimeError("audio decode failed")
+            if outcome == "cancelled" and index == 0:
+                budget.cancel()
+            return np.full((1, 4), index, dtype=np.float32)
+
+        return SimpleNamespace(
+            samples=4,
+            layout=SimpleNamespace(channels=("mono",)),
+            to_ndarray=to_ndarray,
+        )
+
+    stream = SimpleNamespace(
+        rate=16000,
+        format=SimpleNamespace(name="s16" if outcome == "resampled" else "fltp"),
+        layout=SimpleNamespace(name="mono"),
+    )
+    container = SimpleNamespace(
+        streams=SimpleNamespace(audio=[] if outcome == "no_audio" else [stream]),
+        decode=lambda _stream: [audio_frame(0), audio_frame(1)],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "av",
+        SimpleNamespace(
+            open=lambda _source: nullcontext(container),
+            AudioResampler=lambda **_kwargs: SimpleNamespace(resample=lambda frame: [frame]),
+        ),
+    )
+    monkeypatch.setenv("TRTLLM_ENABLE_PYAV", "1")
+    concatenate = np.concatenate
+
+    def checked_concatenate(chunks, **kwargs):
+        concatenated.append(True)
+        assert (budget._used, budget._retained, budget._reserved_retained) == (67, 0, 35)
+        if outcome == "concat_failure":
+            raise MemoryError("audio concatenation failed")
+        return concatenate(chunks, **kwargs)
+
+    monkeypatch.setattr(media_io.np, "concatenate", checked_concatenate)
+
+    def load():
+        return media_io._load_video_by_cv2(
+            "video.mp4",
+            fps=-1,
+            format="np",
+            extract_audio=True,
+            decoded_memory_reserver=budget.reserve,
+        )
+
+    if outcome in ("success", "resampled", "no_audio"):
+        video = load()
+        retained = media_io._decoded_video_bytes(video)
+        assert retained == (3 if outcome == "no_audio" else 35)
+        assert (budget._used, budget._retained, budget._reserved_retained) == (
+            retained,
+            retained,
+            0,
+        )
+        if outcome != "no_audio":
+            np.testing.assert_array_equal(video.audio.samples, [0] * 4 + [1] * 4)
+            assert video.audio.sample_rate == 16000
+    else:
+        with pytest.raises(MemoryError if outcome == "concat_failure" else ValueError):
+            load()
+        assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+    if outcome in ("oversized", "cancelled"):
+        assert converted == [0]
+        assert not concatenated
+
+
+def test_video_retained_limit_does_not_reject_1080p_conversion_peak():
+    budget = request_mapping._DecodedMediaBudget(512 * 1024 * 1024)
+    values = 10 * 1080 * 1920 * 3
+    reservation = budget.reserve(values * 9, values * 4)
+    reservation.commit(values * 4)
+
+
+@pytest.mark.parametrize("workers", [1, 8])
+def test_three_720p_videos_fit_independently_of_load_concurrency(workers):
+    budget = request_mapping._DecodedMediaBudget(512 * 1024 * 1024)
+    values = 10 * 720 * 1280 * 3
+
+    def decode(_index):
+        reservation = budget.reserve(values * 9, values * 4)
+        reservation.commit(values * 4)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(decode, range(3)))
+
+
+@pytest.mark.parametrize("cancel_during", ["grab", "retrieve", "convert"])
+def test_video_cancellation_stops_between_frame_operations(cancel_during, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(1024)
+    operations = []
+
+    def grab():
+        operations.append("grab")
+        if cancel_during == "grab" and operations.count("grab") == 2:
+            budget.cancel()
+        return True
+
+    def retrieve(_scratch):
+        operations.append("retrieve")
+        if cancel_during == "retrieve" and operations.count("retrieve") == 2:
+            budget.cancel()
+        return True, np.zeros((1, 1, 3), dtype=np.uint8)
+
+    def convert(_source, _code, dst):
+        operations.append("convert")
+        dst.fill(0)
+        if cancel_during == "convert":
+            budget.cancel()
+
+    capture = SimpleNamespace(
+        isOpened=lambda: True,
+        get=lambda key: 3 if key == 0 else 1,
+        grab=grab,
+        retrieve=retrieve,
+        release=lambda: operations.append("release"),
+    )
+    monkeypatch.setattr(
+        media_io,
+        "_get_cv2",
+        lambda: SimpleNamespace(
+            VideoCapture=lambda _source: capture,
+            CAP_PROP_FRAME_COUNT=0,
+            CAP_PROP_FPS=1,
+            COLOR_BGR2RGB=2,
+            cvtColor=convert,
+        ),
+    )
+    with pytest.raises(ValueError, match="cancelled"):
+        media_io._load_video_by_cv2(
+            "video.mp4",
+            num_frames=3,
+            fps=-1,
+            format="np",
+            decoded_memory_reserver=budget.reserve,
+        )
+    expected = ["grab", "retrieve", "convert"]
+    if cancel_during in ("grab", "retrieve"):
+        expected.append("grab")
+    if cancel_during == "retrieve":
+        expected.append("retrieve")
+    assert operations == expected + ["release"]
+    assert (budget._used, budget._retained, budget._reserved_retained) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_video_peak_reservation_waits_for_settlement_or_cancellation(cancel, monkeypatch):
+    budget = request_mapping._DecodedMediaBudget(20, peak_limit=20)
+    first = budget.reserve(15, 5)
+    waiting = threading.Event()
+    wait = budget._condition.wait
+
+    def observed_wait():
+        waiting.set()
+        return wait()
+
+    monkeypatch.setattr(budget._condition, "wait", observed_wait)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        second = pool.submit(budget.reserve, 15, 5)
+        try:
+            assert waiting.wait(timeout=5)
+            assert not second.done()
+            if cancel:
+                budget.cancel()
+                with pytest.raises(ValueError, match="cancelled"):
+                    second.result(timeout=5)
+            else:
+                first.commit(5)
+                second.result(timeout=5).commit(5)
+        finally:
+            budget.cancel()
+            first.release()
 
 
 @pytest.mark.parametrize("abandon_first", [False, True])
@@ -476,7 +1176,7 @@ def test_media_capability_rejects_a_malformed_placeholder_at_startup(image_llm, 
 async def test_handler_table_drives_capability_and_mapping(image_llm, monkeypatch):
     llm, _ = image_llm
 
-    def video_loader_factory(_llm):
+    def video_loader_factory(_llm, _budget):
         async def load(item, index):
             return f"video-{index}:{bytes(item.raw_bytes).decode()}"
 
@@ -539,8 +1239,22 @@ async def test_text_only_input_mapping_is_unchanged():
 
 
 @pytest.mark.asyncio
-async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image_llm, monkeypatch):
+async def test_token_ids_are_rejected_when_the_processor_does_not_consume_them():
+    llm = SimpleNamespace(input_processor=SimpleNamespace(supports_token_ids_input=False))
+    request = generation_pb2.GenerateRequest(token_ids=generation_pb2.TokenIds(ids=[1, 2, 3]))
+
+    with pytest.raises(UnsupportedFeatureError, match="send a text prompt"):
+        await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model_defaults", [None, {"format": "np"}])
+async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(
+    image_llm, monkeypatch, model_defaults
+):
     llm, _ = image_llm
+    if model_defaults is None:
+        monkeypatch.delattr(_ImageInputProcessor, "get_preferred_media_io_kwargs")
     created_with = []
 
     class _ImageIo:
@@ -583,7 +1297,7 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
 
     mapped = await request_mapping._input_from_request(request, llm)
 
-    assert created_with == [({"format": "np"}, None)]
+    assert created_with == [(model_defaults, None)]
     assert mapped["prompt"] == request.prompt
     assert mapped["multi_modal_data"] == {
         "image": [
@@ -597,6 +1311,104 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
         {"modality": "image", "index": 0, "placeholder": "<image_1>"},
         {"modality": "image", "index": 1, "placeholder": "<image_2>"},
         {"modality": "image", "index": 2, "placeholder": "<image_3>"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_media_sources_preserve_global_order(image_video_audio_llm, monkeypatch):
+    created_with = []
+    audio_sources = []
+
+    class _ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            created_with.append(("image", defaults, runtime))
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.full((1, 1, 3), data[0], dtype=np.uint8)
+
+    class _VideoIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            created_with.append(("video", defaults, runtime))
+            return cls()
+
+        async def async_load(self, source):
+            return VideoData(
+                frames=np.zeros((1, 1, 1, 3), dtype=np.uint8),
+                metadata={"source": source},
+            )
+
+    class _AudioIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            created_with.append(("audio", defaults, runtime))
+            return cls()
+
+        async def async_load(self, source):
+            audio_sources.append(source)
+            return np.zeros(8, dtype=np.float32), 16000
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(request_mapping, "VideoMediaIO", _VideoIo)
+    monkeypatch.setattr(request_mapping, "AudioMediaIO", _AudioIo)
+    request = generation_pb2.GenerateRequest(
+        prompt="mixed media",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                url="https://example.com/first.mp4",
+                uuid="video-id",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_IMAGE,
+                raw_bytes=b"i",
+                mime_type="image/png",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                url="https://example.com/audio.wav",
+                uuid="audio-id",
+            ),
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                data_uri="data:video/mp4;base64,dmlkZW8=",
+            ),
+        ],
+    )
+
+    mapped = await request_mapping._input_from_request(request, image_video_audio_llm)
+
+    assert len(created_with) == 3
+    video_modality, video_defaults, video_runtime = created_with[0]
+    assert video_modality == "video"
+    assert video_defaults == {"format": "np", "num_frames": 4}
+    assert set(video_runtime) == {"decoded_memory_reserver"}
+    assert callable(video_runtime["decoded_memory_reserver"])
+    assert created_with[1] == ("image", {"format": "np"}, None)
+    audio_modality, audio_defaults, audio_runtime = created_with[2]
+    assert audio_modality == "audio"
+    assert audio_defaults is None
+    assert set(audio_runtime) == {"decoded_memory_reserver"}
+    assert callable(audio_runtime["decoded_memory_reserver"])
+    assert audio_sources == ["https://example.com/audio.wav"]
+    assert mapped["multi_modal_data"]["audio"][0][1] == 16000
+    assert [video.metadata["source"] for video in mapped["multi_modal_data"]["video"]] == [
+        "https://example.com/first.mp4",
+        "data:video/mp4;base64,dmlkZW8=",
+    ]
+    assert mapped["multi_modal_data"]["image"][0].shape == (1, 1, 3)
+    assert mapped["multi_modal_uuids"] == {
+        "video": ["video-id", None],
+        "image": [None],
+        "audio": ["audio-id"],
+    }
+    assert mapped["mm_item_order"] == [
+        {"modality": "video", "index": 0, "placeholder": "<video_1>"},
+        {"modality": "image", "index": 0, "placeholder": "<image_1>"},
+        {"modality": "audio", "index": 0, "placeholder": "<audio_1>"},
+        {"modality": "video", "index": 1, "placeholder": "<video_2>"},
     ]
 
 
@@ -898,6 +1710,45 @@ async def test_total_decoded_image_bytes_are_bounded(image_llm, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_video_loads_share_budget_before_allocation(image_video_llm, monkeypatch):
+    allocations = []
+
+    class _VideoIo:
+        def __init__(self, reserver):
+            self._reserver = reserver
+
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls(runtime["decoded_memory_reserver"])
+
+        async def async_load_bytes(self, data):
+            reservation = self._reserver(12, 12)
+            allocations.append(bytes(data))
+            try:
+                await asyncio.Future()
+            finally:
+                reservation.release()
+
+    monkeypatch.setattr(request_mapping, "VideoMediaIO", _VideoIo)
+    monkeypatch.setattr(request_mapping, "_MAX_TOTAL_DECODED_MEDIA_BYTES", 20)
+    request = generation_pb2.GenerateRequest(
+        prompt="videos",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=value,
+            )
+            for value in (b"first", b"second")
+        ],
+    )
+
+    with pytest.raises(ValueError, match="decoded media exceeds"):
+        await request_mapping._input_from_request(request, image_video_llm)
+
+    assert allocations == [b"first"]
+
+
+@pytest.mark.asyncio
 async def test_image_mapping_supports_token_ids(image_llm, monkeypatch):
     llm, _ = image_llm
 
@@ -1061,8 +1912,11 @@ async def test_placeholder_mismatch_does_not_poison_hashing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["complete", "local_abort", "coordinator_abort", "rpc_cancel"])
-async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monkeypatch, outcome):
-    capability_llm, _ = image_llm
+@pytest.mark.parametrize("modality", ["image", "video"])
+async def test_media_preprocessing_is_offloaded_and_abort_aware(
+    image_video_llm, monkeypatch, outcome, modality
+):
+    capability_llm = image_video_llm
     llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
     loop = asyncio.get_running_loop()
     serving_thread = threading.get_ident()
@@ -1094,7 +1948,8 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
 
             def decode():
                 assert threading.current_thread().name.startswith("test_media")
-                return np.zeros((1, 1, 3), dtype=np.uint8)
+                frames = np.zeros((1, 1, 3), dtype=np.uint8)
+                return frames if modality == "image" else VideoData(frames=[frames], metadata={})
 
             return await BaseMediaIO._run_in_executor(decode)
 
@@ -1108,9 +1963,9 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
             assert release.wait(timeout=5), "test must release the preprocessing thread"
             import torch
 
-            params.multimodal_data = {"image": {"pixel_values": torch.ones(1024 * 1024)}}
+            params.multimodal_data = {modality: {"pixel_values": torch.ones(1024 * 1024)}}
             params.to_handle("multimodal_data")
-            handle = params.multimodal_data["image"]["pixel_values"]
+            handle = params.multimodal_data[modality]["pixel_values"]
             export_paths.append(
                 Path("/dev/shm") / base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
             )
@@ -1126,6 +1981,7 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
         return llm.result_handle
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
+    monkeypatch.setattr(request_mapping, "VideoMediaIO", _ImageIo)
     monkeypatch.setattr(llm, "preprocess", preprocess)
     monkeypatch.setattr(llm, "generate_async", generate_async)
     # Pools must close during the call phase, before pytest-threadleak's snapshot.
@@ -1144,9 +2000,16 @@ async def test_media_preprocessing_is_offloaded_and_abort_aware(image_llm, monke
         request = generation_pb2.GenerateRequest(
             request_id="preprocessing",
             model="image-model",
-            prompt="<image_1>",
+            prompt=f"<{modality}_1>",
             media=[
-                generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+                generation_pb2.MediaItem(
+                    modality=(
+                        generation_pb2.MODALITY_IMAGE
+                        if modality == "image"
+                        else generation_pb2.MODALITY_VIDEO
+                    ),
+                    raw_bytes=b"media",
+                )
             ],
         )
         context = FakeServicerContext()
@@ -1242,7 +2105,9 @@ async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error
 
     monkeypatch.setattr(request_mapping, "ImageMediaIO", _ImageIo)
     monkeypatch.setattr(llm, "preprocess", preprocess)
-    servicer = OpenEngineInferenceServicer(llm, model="image-model")
+    outcomes = []
+    metrics = SimpleNamespace(record_outcome=lambda *args: outcomes.append(args))
+    servicer = OpenEngineInferenceServicer(llm, model="image-model", metrics=metrics)
     request = generation_pb2.GenerateRequest(
         request_id="preprocess-error",
         model="image-model",
@@ -1258,6 +2123,10 @@ async def test_preprocessing_errors_are_classified(image_llm, monkeypatch, error
             pass
 
     assert context.abort_code == expected_code
+    expected_outcome = (
+        "rejected" if expected_code == grpc.StatusCode.INVALID_ARGUMENT else "engine_error"
+    )
+    assert outcomes == [("aggregated", expected_outcome)]
     assert llm.generate_kwargs is None
     assert servicer.active_request_count() == 0
 
@@ -1556,21 +2425,14 @@ async def test_generate_maps_transient_media_fetch_to_failed_precondition(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("modality", "name"),
-    [
-        (generation_pb2.MODALITY_VIDEO, "video"),
-        (generation_pb2.MODALITY_AUDIO, "audio"),
-    ],
-)
-async def test_video_and_audio_are_explicitly_unsupported(image_llm, modality, name):
+async def test_audio_is_explicitly_unsupported(image_llm):
     llm, _ = image_llm
     request = generation_pb2.GenerateRequest(
         prompt="media",
-        media=[generation_pb2.MediaItem(modality=modality, raw_bytes=b"data")],
+        media=[generation_pb2.MediaItem(modality=generation_pb2.MODALITY_AUDIO, raw_bytes=b"data")],
     )
 
-    with pytest.raises(UnsupportedFeatureError, match=name):
+    with pytest.raises(UnsupportedFeatureError, match="audio"):
         await request_mapping._input_from_request(request, llm)
 
 
@@ -1614,7 +2476,7 @@ async def test_image_is_rejected_for_a_text_only_loaded_model():
                 raw_bytes=b"image",
                 mime_type="video/mp4",
             ),
-            "must be an image type",
+            "must start with image/",
         ),
     ],
 )
@@ -1624,3 +2486,37 @@ async def test_malformed_image_items_are_rejected(image_llm, item, message):
 
     with pytest.raises(ValueError, match=message):
         await request_mapping._input_from_request(request, llm)
+
+
+@pytest.mark.asyncio
+async def test_raw_video_mime_type_is_validated(image_video_llm):
+    request = generation_pb2.GenerateRequest(
+        prompt="video",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_VIDEO,
+                raw_bytes=b"video",
+                mime_type="image/png",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="must start with video/"):
+        await request_mapping._input_from_request(request, image_video_llm)
+
+
+@pytest.mark.asyncio
+async def test_raw_audio_mime_type_is_validated(image_video_audio_llm):
+    request = generation_pb2.GenerateRequest(
+        prompt="audio",
+        media=[
+            generation_pb2.MediaItem(
+                modality=generation_pb2.MODALITY_AUDIO,
+                raw_bytes=b"audio",
+                mime_type="video/mp4",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="must start with audio/"):
+        await request_mapping._input_from_request(request, image_video_audio_llm)

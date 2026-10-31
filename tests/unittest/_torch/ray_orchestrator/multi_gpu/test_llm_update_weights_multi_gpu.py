@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import re
+import time
 from typing import Callable, List, Optional, Tuple
 
 import pytest
@@ -553,6 +554,23 @@ def _run_generate_qwen35_35b(llm, hf_model, prompts, sampling_params):
     return llm_logits, ref_logits
 
 
+def _prefetch_flashinfer_trtllm_gen_artifacts(attempts: int = 3) -> None:
+    """Download FlashInfer's TRT-LLM-Gen artifacts once, before the Ray workers start."""
+    try:
+        from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
+    except ImportError:
+        return
+    enable_rubin = torch.cuda.get_device_capability() == (10, 7)
+    for attempt in range(1, attempts + 1):
+        try:
+            gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=enable_rubin)
+            return
+        except AssertionError:
+            if attempt == attempts:
+                raise
+            time.sleep(5 * attempt)
+
+
 def _run_qwen35_35b_update(
     model_dir: str,
     partial: bool,
@@ -562,6 +580,7 @@ def _run_qwen35_35b_update(
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
+    _prefetch_flashinfer_trtllm_gen_artifacts()
     device_ids = list(range(tp_size))
     hf_model = RefQwen35_35BModelWithIPCHandles(model_dir, device_ids=device_ids)
     cuda_graph_config = (
@@ -610,6 +629,7 @@ def _run_qwen35_35b_fp8_update(partial: bool) -> None:
     if not os.path.isdir(model_dir):
         pytest.skip(f"Model directory {model_dir} does not exist")
 
+    _prefetch_flashinfer_trtllm_gen_artifacts()
     device_ids = list(range(4))
     checkpoint = RefQwen35_35BFP8CheckpointWithIPCHandles(model_dir, device_ids)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)

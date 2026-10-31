@@ -362,6 +362,13 @@ moonshotai/Kimi-K3:
   # 1,319 samples on SM107; 96.0 keeps margin for run-to-run variation.
   - quant_algo: MIXED_PRECISION
     accuracy: 96.0
+  # NVFP4 KV, which selects FP4 MLA (TestKimiK3::test_gsm8k_nvfp4_kv_dep8).
+  # NVFP4 is the lossier cache: an earlier FP4 MLA bring-up measured 95.944
+  # on all 1,319 samples at TP16, about 0.6 points below FP8 KV, so the bar
+  # is set per KV format with the same margin as the FP8 row.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: NVFP4
+    accuracy: 95.4
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8
@@ -581,6 +588,11 @@ zai-org/GLM-5-FP8:
     spec_dec_algo: MTP
     accuracy: 78.0
 zai-org/GLM-5.2:
+  # The non-speculative forward shares the MTP row's anchor: MTP holds the
+  # emitted distribution, so it must not move the score.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 90
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     spec_dec_algo: MTP

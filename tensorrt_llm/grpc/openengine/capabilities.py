@@ -13,6 +13,8 @@ from tensorrt_llm.inputs.registry import (
     BaseMultimodalInputProcessor,
 )
 
+from .kv_events import events_config
+
 # Guides each grammar backend can build, keyed by the `GuidedDecoding` oneof
 # field name. Control advertises from this table and Generate enforces it, so
 # the two cannot disagree. llguidance has no structural-tag matcher.
@@ -64,7 +66,25 @@ def supported_guides(backend: str | None) -> frozenset[str]:
 
 def _loaded_model_type(llm: Any) -> str:
     """Return the top-level model type for the loaded input processor."""
-    return resolve_top_level_model_type(llm.input_processor.config)
+    input_processor = getattr(llm, "input_processor", None)
+    config = getattr(input_processor, "config", None) or getattr(llm, "_hf_model_config", None)
+    if config is None:
+        return ""
+    return resolve_top_level_model_type(config)
+
+
+def supports_image_routing(llm: Any, modalities: Collection[str]) -> bool:
+    """Whether the loaded model exposes the validated image KV-event contract."""
+    processor_config = getattr(getattr(llm, "input_processor", None), "config", None)
+    if "image" not in modalities or resolve_top_level_model_type(processor_config) != "qwen3_vl":
+        return False
+    cache = getattr(llm.args, "kv_cache_config", None)
+    return (
+        getattr(llm.args, "cache_transceiver_config", None) is None
+        and getattr(cache, "use_kv_cache_manager_v2", False) is True
+        and getattr(cache, "enable_block_reuse", False) is True
+        and events_config(llm) is not None
+    )
 
 
 def resolve_media_capabilities(
@@ -72,21 +92,28 @@ def resolve_media_capabilities(
 ) -> MediaCapabilities:
     """Intersect model support with implemented request handlers.
 
-    A live multimodal processor prevents registry-only false positives.
+    A live registered processor prevents registry-only false positives.
     """
     input_processor = getattr(llm, "input_processor", None)
-    if not isinstance(input_processor, BaseMultimodalInputProcessor):
-        return MediaCapabilities({})
     if getattr(getattr(llm, "args", None), "disable_mm_encoder", False):
         return MediaCapabilities({})
+
     model_type = _loaded_model_type(llm)
     if not model_type:
         return MediaCapabilities({})
+    if not isinstance(input_processor, BaseMultimodalInputProcessor):
+        registered_model_type = getattr(type(input_processor), "_registered_model_type", None)
+        if registered_model_type != model_type:
+            return MediaCapabilities({})
+        if not callable(input_processor):
+            return MediaCapabilities({})
 
+    supported_modalities = getattr(input_processor, "supported_modalities", frozenset())
     placeholders = {
         modality: MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(model_type, modality)
         for modality in implemented_modalities
-        if MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
+        if modality in supported_modalities
+        and MULTIMODAL_PLACEHOLDER_REGISTRY.is_valid(model_type, modality)
     }
     # Fail startup before Control advertises a malformed template.
     for modality, template in placeholders.items():
@@ -105,4 +132,5 @@ __all__ = [
     "MediaCapabilities",
     "resolve_media_capabilities",
     "supported_guides",
+    "supports_image_routing",
 ]

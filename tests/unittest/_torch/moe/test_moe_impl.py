@@ -424,6 +424,35 @@ def test_pinned_megamoe_cutedsl_identity_resolves_to_the_leaf():
     assert not report.degraded
 
 
+def test_dynamic_eplb_is_a_declared_backend_capability():
+    assert TrtllmCutedslMegaMoeNvfp4Impl.capabilities.supports_per_layer_dynamic_eplb
+    assert not DeepgemmCudaW4a8Mxfp4Mxfp8Impl.capabilities.supports_per_layer_dynamic_eplb
+
+
+def test_per_layer_dynamic_eplb_filters_backends_by_declared_capability():
+    deployment = dataclasses.replace(
+        _megamoe_cutedsl_deployment(),
+        eplb_enabled=True,
+        eplb_mode="per_layer_dynamic",
+    )
+    accepted = resolve_moe_impl(
+        _megamoe_cutedsl_model_config(),
+        problem=_megamoe_cutedsl_problem(),
+        deployment=deployment,
+        impl_id=_MEGAMOE_CUTEDSL_IMPL_ID,
+    )
+    assert impl_class_for(accepted) is TrtllmCutedslMegaMoeNvfp4Impl
+
+    rejected = resolve_moe_impl(
+        _deepgemm_model_config(QuantAlgo.W4A8_MXFP4_MXFP8),
+        problem=_megamoe_cutedsl_problem(QuantAlgo.W4A8_MXFP4_MXFP8),
+        deployment=deployment,
+        impl_id="deepgemm.cuda.mega_moe.w4a8_mxfp4_mxfp8",
+    )
+    assert rejected.winner is None
+    assert [item.reason for item in rejected.rejected] == [MoERejectReason.EPLB_UNSUPPORTED]
+
+
 def test_pinned_megamoe_cutedsl_identity_fails_hard_on_another_format():
     """A pin that cannot run must fail, not widen to the sibling that can.
 
@@ -1198,7 +1227,7 @@ _CUTLASS_DECLARATIONS = (
     ),
     pytest.param(
         TrtllmTritonFp8BlockScalesImpl,
-        {120},
+        {120, 121},
         {torch.bfloat16},
         (False, False),
         (False, False),
@@ -1498,6 +1527,74 @@ def test_cutedsl_degradation_is_not_blamed_on_the_sm120_leaf():
     assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
         TrtllmCutedslGroupedGemmNvfp4Impl.__name__,
         MoERejectReason.DTYPE_UNSUPPORTED,
+    )
+
+
+def test_cutedsl_float16_nvfp4_on_sm120_falls_back_to_cutlass():
+    """The b12x kernel reads and writes bfloat16 only, so on its own SM a
+    float16 NVFP4 layer goes to the CUTLASS leaf, which takes float16, and the
+    b12x leaf's dtype is named as the reason."""
+    cfg = ModelConfig()
+    cfg.moe_backend = MoeBackendType.CUTEDSL.value
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.NVFP4),
+        dtype_act=torch.float16,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=False,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        env=MoEEnvironment(sm=120, available_deps=(MoEDep.FLASHINFER.value,)),
+    )
+
+    report = resolve_moe_impl(cfg, problem=problem, deployment=deployment)
+
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
+    assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
+        CuteDslB12xNvfp4FusedMoE.__name__,
+        MoERejectReason.DTYPE_UNSUPPORTED,
+    )
+
+
+def test_cutedsl_dynamic_quant_nvfp4_on_sm120_falls_back_to_cutlass():
+    """The b12x decode kernel quantizes against load-time scales, so a layer
+    that forces dynamic quantization goes to the CUTLASS leaf, which honours it
+    on every chunk. The b12x leaf is named as the reason: its rejection must not
+    read as a format mismatch, which ``degraded_from`` passes over."""
+    cfg = ModelConfig()
+    cfg.moe_backend = MoeBackendType.CUTEDSL.value
+    problem = MoEProblem(
+        quant=canonical_quant(QuantAlgo.NVFP4),
+        dtype_act=torch.bfloat16,
+        hidden_size=1024,
+        intermediate_size=1024,
+        num_experts=8,
+        top_k=2,
+        swiglu_gptoss_style=False,
+    )
+    deployment = MoEDeployment(
+        ep_size=1,
+        tp_size=1,
+        parallel_size=1,
+        use_dp=False,
+        num_slots=8,
+        force_dynamic_quantization=True,
+        env=MoEEnvironment(sm=120, available_deps=(MoEDep.FLASHINFER.value,)),
+    )
+
+    report = resolve_moe_impl(cfg, problem=problem, deployment=deployment)
+
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
+    assert (report.degraded_from.legacy_backend, report.degraded_from.reason) == (
+        CuteDslB12xNvfp4FusedMoE.__name__,
+        MoERejectReason.DYNAMIC_QUANT_UNSUPPORTED,
     )
 
 
@@ -2656,16 +2753,20 @@ def test_b12x_cutlass_build_mode_resolution(is_oss, sm, quant_algo, activation, 
             env=MoEEnvironment(sm=sm, oss_cutlass_moe=is_oss, available_deps=(MoEDep.FLASHINFER,)),
         ),
     )
-    rejection = not is_oss and quant_algo == QuantAlgo.NVFP4 and (activation == "Relu2" or dynamic)
-    if rejection:
+    nvfp4 = quant_algo == QuantAlgo.NVFP4
+    if nvfp4 and dynamic:
+        # Declined ahead of the build gate, since decode cannot honour it on
+        # any build; the CUTLASS fallback needs the open-source kernels for it.
+        b12x_rejection = _rejection_of(report, leaf)
+        assert b12x_rejection.reason is MoERejectReason.DYNAMIC_QUANT_UNSUPPORTED
+        if is_oss:
+            assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
+        else:
+            assert report.winner is None
+    elif nvfp4 and not is_oss and activation == "Relu2":
         assert report.winner is None
         b12x_rejection = _rejection_of(report, leaf)
-        expected = (
-            MoERejectReason.ACTIVATION_UNSUPPORTED
-            if activation == "Relu2"
-            else MoERejectReason.QUANT_UNSUPPORTED
-        )
-        assert b12x_rejection.reason is expected
+        assert b12x_rejection.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
         assert "USING_OSS_CUTLASS_MOE_GEMM=ON" in b12x_rejection.detail
         assert leaf.__name__ in b12x_rejection.detail
         assert b12x_rejection.detail.startswith("NVFP4 prefill routes through CUTLASS:")

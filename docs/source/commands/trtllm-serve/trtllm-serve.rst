@@ -79,6 +79,19 @@ The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements t
 shared format. ``--reasoning_parser`` separately controls reasoning extraction;
 ``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
 
+Multiple HTTP Frontends
+-----------------------
+
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, beta). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+
+.. note::
+
+   * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
+   * The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``), ``enable_resource_governor`` or ``--enable_sleep_mode`` it falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead. ``--grpc`` also keeps one frontend unless ``--num_serve_frontends`` is given (only ``--grpc-protocol openengine`` supports more).
+   * Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward ``/metrics``, ``/kv_cache_events``, profiling and the Anthropic batches API to it, and ``/prometheus/metrics`` covers every frontend. Per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, ``/health`` describes the frontend that answered, and each frontend writes its own per-request perf metrics file.
+   * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
+   * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
+
 Inference Endpoints
 -------------------
 
@@ -397,6 +410,48 @@ Example output:
             ...
         }
     ]
+
+Attention-DP statistics
+~~~~~~~~~~~~~~~~~~~~~~~
+
+With attention data parallelism enabled, ``attentionDpRank`` identifies the rank
+that produced each row's scheduled-work and KV-cache measurements. KV snapshots
+are captured with the corresponding iteration and include that rank's capacity,
+occupancy, allocation and reuse counters, and cache hit rate. An idle rank can
+retain cached blocks even when it schedules no requests. If a rank did not
+measure KV statistics for an iteration, its JSON row has ``kvCacheStats: null``;
+absence does not mean an empty cache. ``TLLM_METRICS_ALL_RANKS`` is not required for this
+attention-DP fanout.
+
+The shared Prometheus collector uses ``dp_rank`` on KV-cache and rank-local
+inflight-batching metrics. It takes the rank from ``attentionDpRank``, falls back
+to ``rank`` for all-rank statistics, and uses ``"0"`` for rows without either
+field. These metric families also have ``dp_rank="0"`` in single-rank serving.
+Request metrics and configuration-info metrics retain their existing labels.
+
+KV gauges retain each rank's last measurement until another measured snapshot
+arrives. Used-block counts, utilization, and cache-hit rate can remain stale
+throughout periods without fresh snapshots, including idle periods. Zero
+scheduled requests alone does not imply a missing KV measurement.
+
+Cumulative reused/missed-block counters keep independent baselines per rank
+across absent snapshots. Rows must arrive in producer order for each rank; interleaving
+different ranks is supported. A decrease in a rank's cumulative counter emits a
+warning and updates the baseline without incrementing the counter. This does not
+make stale or reordered rows safe. Repeated cumulative values add no work.
+Per-iteration delta counters are incremented directly and must be delivered once
+per iteration.
+
+Top-level request counts, queue, memory, iteration latency, batch configuration,
+average decoded tokens, and speculative-decoding measurements remain owned by
+rank 0 in the collector. They are not sums of rank-local measurements. The
+separate ``kvCacheIterationStats`` deltas retain their producer ownership and
+are attached only to rank 0 by attention-DP fanout.
+
+When updating dashboards, retain ``dp_rank`` to inspect individual ranks or
+aggregate it explicitly. Used/free block counts can be summed across ranks;
+the maximum utilization identifies the fullest rank. Do not sum utilization or
+cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
 
 .. _runtime-profiling-endpoints:
 
