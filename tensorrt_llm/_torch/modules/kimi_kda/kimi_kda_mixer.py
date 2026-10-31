@@ -1415,6 +1415,13 @@ class KimiKDALinearAttention(nn.Module):
             # tensors.
             A_log=self.A_log.detach(),
             dt_bias=self.dt_bias.detach(),
+            # FP32 copies of A_log / dt_bias for the Kernel Factory verify kernel
+            # (TRTLLM_K3_KDA_VERIFY_KF), which reads them as float32: __init__
+            # casts this module's parameters to BF16 (_meta_safe_cast_dtype).
+            # Built once with the decode constants; the CuTe DSL kernels keep
+            # reading the parameters above.
+            A_log_f32=self._A_log_f32,
+            dt_bias_f32=self._dt_bias_f32,
             recurrent_state=ssm_pool,
             k_cache=layer_cache.kda_k_cache,
             g_cache=layer_cache.kda_g_cache,
