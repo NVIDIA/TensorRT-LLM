@@ -34,6 +34,7 @@ from tensorrt_llm._utils import is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
+from ....autotuner import AutoTuner
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType
 from ..activation import (
@@ -587,6 +588,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         # lockstep for ordinary and GMS RO loads.
         # See ``_alloc_symm_buffer`` for the cache contract.
         self._symm_buffer = None
+        self._kernels_primed = False
 
         # Weight tensors and DG transforms are owned by the quant method.
         self._t_l1 = None
@@ -904,6 +906,52 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         """Whether ``run_moe`` can prepare DG SymmBuffer directly from BF16 input."""
         return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "megamoe_prepare")
 
+    def _launch_kernel(self, output: torch.Tensor) -> None:
+        self._dg.fp8_fp4_mega_moe(
+            output,
+            self._t_l1,
+            self._t_l2,
+            self._symm_buffer,
+            activation=self.dg_activation,
+            activation_clamp=self.act_clamp,
+            fast_math=self.fast_math,
+            situ_beta=self.act_alpha,
+            situ_linear_beta=self.act_beta,
+        )
+
+    def _prime_kernels(self) -> None:
+        """Compile each reachable DeepGEMM tile with all expert routes masked.
+
+        Tile selection is not monotonic in the token count. Query the bundled
+        heuristic over the supported range instead of guessing its boundaries.
+        Every EP rank follows the same ladder before staging the live inputs.
+        """
+        if not AutoTuner.get().is_tuning_mode or torch.cuda.is_current_stream_capturing():
+            return
+        buf = self._symm_buffer
+        buf.x.zero_()
+        buf.x_sf.zero_()
+        buf.topk_weights.zero_()
+        primed_block_sizes = set()
+        for num_tokens in range(self.max_num_tokens + 1):
+            block_m = self._dg.get_block_m_for_mega_moe(
+                self.ep_size,
+                self.num_slots,
+                buf.num_max_tokens_per_rank,
+                num_tokens,
+                self.routing_method.experts_per_token,
+                "fp8xfp4",
+            )
+            if block_m in primed_block_sizes:
+                continue
+            buf.topk_idx.fill_(-1)
+            output = torch.empty(
+                (num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device
+            )
+            self._launch_kernel(output)
+            primed_block_sizes.add(block_m)
+        self._kernels_primed = True
+
     def run_moe(
         self,
         ctx: MoERunContext,
@@ -924,7 +972,6 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         output_dtype = ctx.output_dtype
         if output_dtype is None:
             output_dtype = self.dtype or torch.bfloat16
-        dg = self._dg
         buf = self._symm_buffer
         assert buf is not None, (
             "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer runs in "
@@ -936,6 +983,9 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             f"MegaMoE got {num_tokens} tokens but buffer is sized for "
             f"{self.max_num_tokens}. Raise model_config.moe_max_num_tokens."
         )
+
+        if not self._kernels_primed:
+            self._prime_kernels()
 
         if num_tokens > 0:
             if x_sf is None:
@@ -957,20 +1007,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
                 buf.topk_weights[:num_tokens].copy_(token_final_scales.to(torch.float32))
 
         y = torch.empty((num_tokens, self.hidden_size), dtype=torch.bfloat16, device=buf.x.device)
-        dg.fp8_fp4_mega_moe(
-            y,
-            self._t_l1,
-            self._t_l2,
-            buf,
-            activation=self.dg_activation,
-            # ``situ_beta`` / ``situ_linear_beta`` are the bundled DeepGEMM's own
-            # parameter names: ``_import_deep_gemm`` gates on the installed
-            # signature accepting exactly these, so do not rename them to ours.
-            activation_clamp=self.act_clamp,
-            fast_math=self.fast_math,
-            situ_beta=self.act_alpha,
-            situ_linear_beta=self.act_beta,
-        )
+        self._launch_kernel(y)
         return y.to(output_dtype)
 
 
