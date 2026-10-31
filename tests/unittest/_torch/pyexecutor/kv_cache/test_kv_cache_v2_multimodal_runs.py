@@ -27,6 +27,7 @@ _OTHER_HASH_INTS = (8, 7, 6, 5, 4, 3, 2, 1)
 def _make_manager(vocab_size: int):
     manager = KVCacheManagerV2.__new__(KVCacheManagerV2)
     manager.vocab_size = vocab_size
+    manager.event_manager = None
     return manager
 
 
@@ -380,3 +381,27 @@ def test_augment_tokens_for_block_reuse_keeps_contiguous_metadata_path():
 
     sliced = KVCacheManagerV2._augment_tokens_for_block_reuse(manager, tokens, req, start=1, end=5)
     assert sliced == [tokens[1], *mm_tokens]
+
+
+@pytest.mark.parametrize("exact_runs", [False, True])
+def test_native_uuid_context_survives_text_only_first_prefill_chunk(exact_runs):
+    tokens = list(range(8))
+    request = _make_request(
+        tokens,
+        multimodal_hashes=[_HASH_INTS],
+        multimodal_uuids=["later-image"],
+        multimodal_positions=[2],
+        multimodal_lengths=[4],
+        multimodal_item_run_cu_offsets=[0, 1] if exact_runs else None,
+        multimodal_run_positions=[2] if exact_runs else None,
+        multimodal_run_lengths=[4] if exact_runs else None,
+    )
+    manager = _make_manager(1000)
+    chunks = [
+        manager._augment_tokens_for_block_reuse(tokens, request, start=start, end=start + 2)
+        for start in range(0, len(tokens), 2)
+    ]
+    assert chunks[0] == tokens[:2]
+    assert chunks[1][0].uuid == "later-image"
+    assert chunks[2] == [1002, 1003]
+    assert sum(chunks, []) == manager._augment_tokens_for_block_reuse(tokens, request)

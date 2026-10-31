@@ -1642,6 +1642,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 f"_try_schedule_disagg_gen_init."
             )
 
+    def supports_idle_request_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Allow bridge cancellation or a session-free generation-first CTX wait."""
+        if getattr(self, "_fp4_mla_bridge_enabled", False) is True:
+            return True
+        return (
+            req is not None
+            and req.is_context_only_request
+            and req.py_disaggregated_params is not None
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+            and not self.has_inflight_transfer(req)
+        )
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
@@ -1676,6 +1688,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             elif self._recv_sessions[rid].close() is False:
                 has_transferring = True
             else:
+                # The bridge has a stable, rank-local receive outcome. Keep
+                # an earlier failure when cancellation retires the session.
+                if (
+                    getattr(self, "_fp4_mla_bridge_enabled", False)
+                    and self._recv_sessions[rid].status == SessionStatus.ERROR
+                ):
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 del self._recv_reqs[rid]
                 del self._recv_sessions[rid]
 

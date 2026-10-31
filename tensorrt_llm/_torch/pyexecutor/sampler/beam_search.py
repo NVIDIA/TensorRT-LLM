@@ -42,7 +42,7 @@ from tensorrt_llm.executor.result import Logprob
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
-from .ops.flashinfer import radix_topk_op
+from .ops.flashinfer import radix_topk_op, topk_module_ready
 from .ops.triton import reorder_compact_stop_word_history
 from .sampler_common import _get_beam_width_out, _request_get_sampling_params, int_tensor
 from .sampler_features import _SideStreamCopier
@@ -110,12 +110,14 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     follows flashinfer's own guidance (``flashinfer.top_k`` docstring).
 
     Beam search is not a flashinfer-gated feature, so fall back to torch.topk
-    when flashinfer is missing: real vocabularies are always past the crossover,
-    which would otherwise make the whole default beam path require it. The two
-    kernels agree on values and on descending order; only the index order among
-    equal values may differ, which torch.topk leaves unspecified anyway.
+    when flashinfer is missing or its topk module is not built yet (a cold
+    build takes ~10 minutes, see ``warmup_topk_module``): real vocabularies are
+    always past the crossover, which would otherwise make the whole default
+    beam path require it. The two kernels agree on values and on descending
+    order; only the index order among equal values may differ, which torch.topk
+    leaves unspecified anyway.
     """
-    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000:
+    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000 and topk_module_ready():
         return radix_topk_op(values, k)
     return torch.topk(values, k=k, dim=-1, sorted=True)
 

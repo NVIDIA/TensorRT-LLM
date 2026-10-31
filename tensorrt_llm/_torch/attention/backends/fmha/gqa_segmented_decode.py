@@ -341,6 +341,7 @@ def segment_attention(
         None,  # skip_softmax_threshold_scale_factor
         False,  # uses_shared_paged_kv_idx
         seg_lse,
+        1.0,  # lse_scale
         seg_lse.stride(0),
         seg_lse.stride(1),
         False,  # enable_block_sparse_attention

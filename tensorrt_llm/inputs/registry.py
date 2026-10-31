@@ -196,6 +196,10 @@ class BaseMultimodalInputProcessor(ABC):
     _prefix_token_cache: Optional[PrefixTokenCache] = None
     _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
 
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return per-modality decode defaults, below server and request overrides."""
+        return {}
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],

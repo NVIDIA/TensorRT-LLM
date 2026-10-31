@@ -742,7 +742,7 @@ index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e2
  def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
      """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index e2bbef13c0f552030875e6b433e0fcdb20686cf6..dff16046cf7cf9ff03950043cf462ac28de6c670 100644
+index e2bbef13c0f552030875e6b433e0fcdb20686cf6..17025dbc49ef997993009ddab7ff2250308f035c 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
@@ -771,3 +771,47 @@ index e2bbef13c0f552030875e6b433e0fcdb20686cf6..dff16046cf7cf9ff03950043cf462ac2
  
      return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
  
+@@ -273,7 +274,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
+                 self.sparse_block_size,
+                 self.max_seq_len_kv,
+                 self.release_attention_pdl,
+-                self.locator_head_multiplier,
+             )
+         else:
+             self.metadata_run(
+@@ -289,7 +289,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
+                 self.sparse_block_size,
+                 self.max_seq_len_kv,
+                 self.release_attention_pdl,
+-                self.locator_head_multiplier,
+             )
+ 
+ 
+@@ -1042,13 +1041,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
+         split_kv,
+         share_pattern_across_kv_heads,
+     )
+-    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
+-    # Other profiles and the standalone metadata API retain page-byte masks.
+-    query_major_memberships = (
+-        sparse_block_size == 4
+-        and spec.config.use_fp8_qkv
+-        and spec.config.supports_query_major_memberships
+-    )
++    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
++    # run_*_query_major entry points, so every profile keeps page-byte masks.
++    query_major_memberships = False
+     if query_major_memberships:
+         page_capacity = (page_capacity + 31) // 32 * 32
+     membership_words = (
+@@ -1806,7 +1801,9 @@ def _prepare_q_token_kv_block_sparse_attention(
+             else ()
+         ),
+         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
+-        allow_head_aware_locators=group_size > 1,
++        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
++        # locator_head_multiplier argument and head-stride-1 locators only.
++        allow_head_aware_locators=False,
+     )
+     # Preparation only binds shapes and storage; attention does not read these
+     # outputs until metadata runs. Use its resolved format for the producer.

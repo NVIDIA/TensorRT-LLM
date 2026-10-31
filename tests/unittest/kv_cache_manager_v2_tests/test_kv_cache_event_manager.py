@@ -459,6 +459,14 @@ def test_native_streaming_sink_preserves_multimodal_event_data(real_block_factor
                 for key in expected_keys
             ]
         assert manager.stored_blocks == 4
+        assert stored.trtllm_image_routing.version == 1
+        assert stored.trtllm_image_routing.token_id_offset == 1000
+        assert [[key.uuid for key in keys] for keys in stored.mm_keys] == [
+            [uuid_a],
+            [],
+            [uuid_a] * 2,
+            [uuid_a, uuid_b],
+        ]
     finally:
         manager.shutdown()
 
