@@ -66,7 +66,9 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     Used in llmapi/tensorrt_llm.
     """
     sampling_params_args = [
+        'n',
         'best_of',
+        'use_beam_search',
         'temperature',
         'top_k',
         'top_p',
@@ -88,8 +90,12 @@ def get_sampling_params_from_request(request, batch_size=1, batch_index=0):
     kwargs = convert_request_input_to_dict(request, param_mappings,
                                            default_values, batch_size,
                                            batch_index)
-    # Pasrse stop as a list of strings not scalar
+    # Parse non-scalar sampling parameters.
     kwargs['stop'] = get_input_tensor_by_name(request, 'sampling_param_stop')
+    beam_width_array = get_input_tensor_by_name(
+        request, 'sampling_param_beam_width_array', batch_size, batch_index)
+    if beam_width_array is not None:
+        kwargs['beam_width_array'] = beam_width_array.reshape(-1).tolist()
     return kwargs
 
 
