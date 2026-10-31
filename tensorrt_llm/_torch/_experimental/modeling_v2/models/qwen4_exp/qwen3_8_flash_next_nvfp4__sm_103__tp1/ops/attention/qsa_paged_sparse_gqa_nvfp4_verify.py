@@ -64,23 +64,7 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int32, Int64
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
-
-from .qsa_nvfp4_verify_ptx import (
-    ctz,
-    gemm_ts,
-    groups8,
-    ldg2,
-    popc,
-    red_or_shared,
-    spread4,
-    stg2,
-    stg4,
-    stg4f,
-    tcgen05_fence_after,
-    tcgen05_fence_before,
-)
-from .qsa_paged_sparse_gqa_nvfp4_decode import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4_decode import (
     MAX_SPLITS,
     _bf2_hi,
     _bf2_lo,
@@ -102,6 +86,22 @@ from .qsa_paged_sparse_gqa_nvfp4_decode import (
     _sts4,
     nvfp4_sparse_gqa_decode,
     qsa_paged_sparse_gqa_nvfp4_decode,
+)
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
+from .qsa_nvfp4_verify_ptx import (
+    ctz,
+    gemm_ts,
+    groups8,
+    ldg2,
+    popc,
+    red_or_shared,
+    spread4,
+    stg2,
+    stg4,
+    stg4f,
+    tcgen05_fence_after,
+    tcgen05_fence_before,
 )
 
 try:

@@ -13,11 +13,11 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
+    nvfp4_sparse_gqa_decode as per_row,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4_verify as _verify_module,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import (  # noqa: E501
-    nvfp4_sparse_gqa_decode as per_row,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4_verify as op,
