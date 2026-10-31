@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_post_inject entry (this target's local variant r11).
+"""GPU test for the qwen4_exp_post_inject entry (the unified target's local variant r11).
 
 The cells are gated bitwise (16-bit) by `_compare`. Beyond them: the
 leading-dim guard and graph capture.
@@ -11,11 +11,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.hc.qwen4_exp_post_inject__r11 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_post_inject import (  # noqa: E501
     qwen4_exp_post_inject as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_post_inject requires a CUDA device"

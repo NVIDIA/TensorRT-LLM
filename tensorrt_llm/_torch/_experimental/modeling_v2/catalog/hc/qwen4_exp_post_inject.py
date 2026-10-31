@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's hyper-connection geometry: 4 streams of 2560, packed
 #: stream-major into a 10240-wide residual.

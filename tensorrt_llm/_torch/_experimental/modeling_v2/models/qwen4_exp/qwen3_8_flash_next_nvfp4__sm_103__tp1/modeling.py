@@ -199,6 +199,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_lowra
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (
     qwen4_exp_hc_up_gate_mean,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_post_inject import (
+    qwen4_exp_post_inject,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -273,7 +276,6 @@ from .ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (
     qwen4_exp_hc_up_gate_mean_rstd,
     qwen4_exp_hc_up_gate_mean_rstd_fp4,
 )
-from .ops.hc.qwen4_exp_post_inject import qwen4_exp_post_inject
 from .ops.moe.cute_dsl_nvfp4_gather_grouped_gemm_act_fusion import (
     cute_dsl_nvfp4_gather_grouped_gemm_act_fusion,
 )
