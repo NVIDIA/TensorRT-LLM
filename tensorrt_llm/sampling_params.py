@@ -17,7 +17,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any, List, NamedTuple, Optional, Tuple, Union
+from typing import Any, List, NamedTuple, Optional, Tuple, TypeAlias, Union
 
 import torch
 from pydantic import BaseModel
@@ -182,6 +182,9 @@ class BatchedLogitsProcessor(ABC):
         pass  # noqa
 
 
+EmbeddingBias: TypeAlias = tuple[tuple[int, float], ...]
+
+
 @dataclass(slots=True, kw_only=True)
 class SamplingParams:
     """Sampling parameters for text generation.
@@ -204,7 +207,10 @@ class SamplingParams:
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
-        embedding_bias (torch.Tensor, optional): The embedding bias tensor. Expected type is kFP32 and shape is [vocab_size]. Defaults to None.
+        embedding_bias (EmbeddingBias, torch.Tensor, List[float], optional): The embedding bias tensor in dense or sparse representation.
+            Dense representations can be torch.Tensor (float32 dtype, shape (vocab_size,)) or list of length vocab_size.
+            Sparse representation is a tuple of (vocabulary index, bias value) pairs. The behavior for repeated indices is undefined.
+            Defaults to None.
         logits_processor (tensorrt_llm.sampling_params.LogitsProcessor, List[tensorrt_llm.sampling_params.LogitsProcessor], optional): The logits postprocessor callback(s). Defaults to None.
             If a list, each processor is applied in order during generation (supported in PyTorch backend only).
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
@@ -291,7 +297,8 @@ class SamplingParams:
     include_stop_str_in_output: bool = False
     _stop_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
 
-    embedding_bias: Optional[torch.Tensor] = None
+    embedding_bias: Optional[Union[torch.Tensor, list[float], EmbeddingBias]] = None
+    _embedding_bias_sparse: Optional[EmbeddingBias] = field(default=None, init=False, repr=False)
     logits_processor: Optional[Union[LogitsProcessor, List[LogitsProcessor]]] = None
     apply_batched_logits_processor: bool = False
 
@@ -373,10 +380,18 @@ class SamplingParams:
         self.best_of = self.best_of or self.n
 
         if self.embedding_bias is not None:
-            if isinstance(self.embedding_bias, torch.Tensor):
-                self.embedding_bias = self.embedding_bias.detach().clone()
+            if isinstance(self.embedding_bias, (torch.Tensor, list)):
+                if isinstance(self.embedding_bias, torch.Tensor):
+                    embedding_bias_list = self.embedding_bias.tolist()
+                else:
+                    embedding_bias_list = self.embedding_bias
+                self._embedding_bias_sparse = tuple(
+                    [(idx, val) for idx, val in enumerate(embedding_bias_list) if val != 0]
+                )
             else:
-                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
+                self._embedding_bias_sparse = self.embedding_bias
+        else:
+            self._embedding_bias_sparse = None
 
         self._validate()
 

@@ -482,7 +482,7 @@ class TestComprehensiveSamplingParamsConversion:
 
         # Embedding bias converted to torch.Tensor
         assert params.embedding_bias is not None
-        assert len(params.embedding_bias) == 12
+        assert params.embedding_bias == embedding_bias
 
     def test_embedding_bias_must_match_vocab_size(self):
         """Embedding bias is rejected when it cannot match model vocabulary."""
