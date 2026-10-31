@@ -27,6 +27,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_sparse_decode import (  # noqa: E501
     m3_sparse_decode as op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.triton_sparse_decode_mq import (  # noqa: E501
+    launch_mq_producer,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
     minimax_m3_sparse_attn_decode as stock_decode,
 )
@@ -449,3 +452,42 @@ def test_identity_route_reads_its_own_lengths_not_the_table(requests, fault) -> 
         fault,
         case.seq_lens.tolist(),
     )
+
+
+def test_mq_producer_preserves_strided_query_elements() -> None:
+    case = build_step((129, 257), 4, identity=True, seed=71)
+    # MQ processes one KV head; use the first head's query group for every TP target.
+    heads = NUM_HEADS // case.k_paged.shape[1]
+    q = case.q[:, :heads].contiguous()
+    storage = torch.zeros((*q.shape[:-1], 2 * HEAD_DIM), dtype=q.dtype, device=q.device)
+    strided = storage[..., ::2]
+    strided.copy_(q)
+    assert strided.stride(2) == 2
+    results = []
+    for query in (q, strided):
+        partial = torch.empty(
+            case.topk.shape[-1], q.shape[0], heads, HEAD_DIM, dtype=torch.float32, device=q.device
+        )
+        lse = torch.empty(partial.shape[:-1], dtype=torch.float32, device=q.device)
+        launch_mq_producer(
+            query,
+            case.k_paged[:, :1],
+            case.v_paged[:, :1],
+            case.k_block_scale[:, :1],
+            case.v_block_scale[:, :1],
+            case.k_global_scale,
+            case.v_global_scale,
+            case.topk[:1],
+            case.block_table,
+            case.seq_lens,
+            partial,
+            lse,
+            sm_scale=case.sm_scale,
+            decode_query_len=case.decode_query_len,
+            use_pdl=False,
+            early_trigger=False,
+        )
+        results.append((partial, lse))
+    torch.cuda.synchronize()
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
