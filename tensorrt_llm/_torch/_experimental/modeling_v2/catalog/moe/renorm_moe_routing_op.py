@@ -3,9 +3,10 @@
 """Renormalized MoE routing: top-k over the raw router logits, then a softmax
 over just those k, in one trtllm call.
 
-This target's local variant of
-``qwen3_8_flash_next_nvfp4__sm_103__tp1/ops/moe/renorm_moe_routing_op``, copied
-unchanged."""
+Shared by the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified tp4/tep4/dep4 target
+(`hf_fc694b5_orig__sm_103__unified`);
+promoted from their copies."""
 
 from __future__ import annotations
 
@@ -14,7 +15,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 
 def _ckpt(tokens: int, output_dtype: torch.dtype = torch.bfloat16) -> dict:

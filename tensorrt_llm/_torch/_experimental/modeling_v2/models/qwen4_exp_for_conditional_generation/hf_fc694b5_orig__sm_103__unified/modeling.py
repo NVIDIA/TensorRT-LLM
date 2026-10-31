@@ -206,6 +206,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_m
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -237,7 +240,6 @@ from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
-from .ops.moe.renorm_moe_routing_op__r34 import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm__r36 import flashinfer_gemma_rmsnorm
 from .ops.norm.rms_norm_gated_token_major__r30 import rms_norm_gated_token_major
 from .ops.ple.ple_gate_conv_inject_norm__r16 import ple_gate_conv_inject_norm

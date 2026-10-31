@@ -20,6 +20,9 @@ from pathlib import Path
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (  # noqa: E501
+    renorm_moe_routing_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     ACT_SWIGLU,
     CERTIFIED_PAIRS,
@@ -31,9 +34,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
-    renorm_moe_routing_op,
 )
 
 __extra_import_path__ = ["../../../.."]

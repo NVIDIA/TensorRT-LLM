@@ -208,6 +208,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_m
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fused_sigmoid_gate_mul_add import (
     fused_sigmoid_gate_mul_add,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (
+    renorm_moe_routing_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -291,7 +294,6 @@ from .ops.moe.fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renor
 from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
-from .ops.moe.renorm_moe_routing_op import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm import flashinfer_gemma_rmsnorm
 from .ops.norm.layer_norm import layer_norm
 from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major

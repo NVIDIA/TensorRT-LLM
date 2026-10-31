@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the renorm_moe_routing_op catalog entry.
+"""GPU test for the qwen4 unified target's renorm_moe_routing_op variant
+(catalog/moe/renorm_moe_routing_op), copied from the tp1 target's test.
 
 The entry owns the contract. This file turns a cell into logits and holds the
 claims no cell carries: equivalence to HF's `norm_topk_prob` routing, and the
@@ -12,11 +13,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routing_op import (  # noqa: E501
     renorm_moe_routing_op as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "renorm_moe_routing_op requires a CUDA device"
@@ -113,6 +114,30 @@ def test_equivalent_to_hf_norm_topk_prob():
         atol=1e-7,
     )
     assert (weights - hf_values).abs().max().item() > 1e-2
+
+
+def test_cuda_graph_replay_at_the_captured_batch():
+    """The trunk's decode router runs inside the engine's CUDA graphs: captured
+    once at the largest captured batch (128 rows), each replay over refilled
+    logits answers bit-exactly what the reference does on them."""
+    tokens, num_experts, topk = 128, 512, 10
+    logits = _logits(tokens, num_experts, torch.bfloat16, seed=21)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        op(logits, topk, torch.bfloat16)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        ids, weights = op(logits, topk, torch.bfloat16)
+    for seed in (22, 23):
+        logits.copy_(_logits(tokens, num_experts, torch.bfloat16, seed=seed))
+        graph.replay()
+        torch.cuda.synchronize()
+        _compare(
+            (ids.clone(), weights.clone()),
+            op.reference(logits, topk, torch.bfloat16),
+        )
 
 
 # ── the guard ─────────────────────────────────────────────────────────────
