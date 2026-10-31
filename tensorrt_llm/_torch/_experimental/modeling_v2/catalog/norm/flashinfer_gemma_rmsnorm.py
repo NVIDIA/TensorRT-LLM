@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: The hyper-connection residual: hc_count 4 streams of hidden 2560, row stride 10240.
 _STREAM = dict(row_width=10240, dtype=torch.bfloat16, eps=1e-6)
