@@ -165,6 +165,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_s
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_prefill_compress import (
     qsa_prefill_compress,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import (
+    plane_table as _plane_table,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import (
+    qsa_rollback_gather,
+    qsa_rollback_restore,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -196,8 +203,6 @@ from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
-from .ops.attention.qsa_rollback_planes__r47 import plane_table as _plane_table
-from .ops.attention.qsa_rollback_planes__r47 import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.spec_rollback_commit__r48 import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.thop_attention__r2 import QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE, thop_attention
 from .ops.comm.allgather__r6 import allgather

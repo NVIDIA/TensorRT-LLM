@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qsa_rollback_planes__r47 variant: `qsa_rollback_gather` and
+"""GPU test for the qsa_rollback_planes variant: `qsa_rollback_gather` and
 `qsa_rollback_restore`, each cell through the entry's own reference, bitwise (both are copies).
 
 The pool is filled with a NaN pattern `randn` never draws, then every slot a cell names is
 written, so a whole-pool count of what no longer holds the fill shows that a call wrote nothing
 outside those slots. The tp1 cells run over separate contiguous planes and over the packed
-side-plane page of an FP8 / NVFP4 pool; this target's cells over core's coalesced bf16 pool at a
+side-plane page of an FP8 / NVFP4 pool; the unified target's cells over core's coalesced bf16 pool at a
 tep4 rank's measured page count, with the requests' pages drawn across it and the pool's first
 and last page among them, so the last is addressed past 2^31 elements from a plane's base.
 """
@@ -16,14 +16,14 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_rollback_planes__r47 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import (  # noqa: E501
     ROW,
     plane_table,
     qsa_rollback_gather,
     qsa_rollback_restore,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qsa_rollback_planes requires a CUDA device"

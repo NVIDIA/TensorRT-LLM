@@ -21,7 +21,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_rollback_planes__r47 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import (  # noqa: E501
     plane_table,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.spec_rollback_commit__r48 import (  # noqa: E501

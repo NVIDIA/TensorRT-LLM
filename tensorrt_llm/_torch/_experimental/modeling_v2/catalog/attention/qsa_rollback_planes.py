@@ -4,8 +4,8 @@
 gather the verify rows' slots of all planes before the trunk writes them, and after the
 draft loop write the gathered values back into the slots of the rows the sampler rejected.
 
-Tier 5 (Triton written for the tp1 target, `qwen3_8_flash_next_nvfp4__sm_103__tp1`'s
-`ops/attention/qsa_rollback_planes`, of which this is the 4-GPU target's local variant). The
+Tier 5 (Triton written for the qwen4_exp tp1 target, `qwen3_8_flash_next_nvfp4__sm_103__tp1`,
+and promoted from its copy and the unified 4-GPU target's). The
 planes are separate buffers of the cache manager (one per attention layer, each
 `[pages, tokens_per_block, heads, dim]` with a free page stride and a contiguous tail); the
 kernels reach them through a table of their base addresses and page strides, one program per
@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's index plane row: one index KV head of 128 bf16.
 ROW = 128
@@ -39,7 +39,7 @@ def _verify(requests: int, p: int) -> dict:
     return dict(_TEP4_POOL, rows=requests * p, requests=requests, p=p, rejected="bool")
 
 
-#: The cells both halves are certified at: the tp1 target's own, and this target's MTP verify
+#: The cells both halves are certified at: the tp1 target's own, and the unified target's MTP verify
 #: rows at `max_batch_size` 128 over a tep4 rank's pool.
 _CELLS: tuple[Cell, ...] = (
     Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),

@@ -25,8 +25,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from .qsa_rollback_planes import ROW
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import ROW
 
 #: Rows a program covers.
 _BLOCK_T = 16

@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """`SpeculativeRollback`'s staging and commit of a verify step in one launch each.
 
-Tier 5 (Triton written for the tp1 target, `qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1`'s
-`ops/attention/spec_rollback_commit`, copied here as this target's local variant). Each
+Tier 5 (Triton written for the qwen4_exp tp1 target, `qwen3_8_flash_next_nvfp4__sm_103__tp1`,
+and promoted from its copy and the unified 4-GPU target's). Each
 `__call__` is one launch of a Triton kernel of this file, JIT-compiled on first use for the
 device it runs on. A verify step runs `p` rows per generation request
 through the trunk; the PLE pools and the QSA planes are written for every row. The staging
@@ -30,8 +30,7 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from .qsa_rollback_planes__r47 import ROW
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import ROW
 
 #: Conv channels a program covers.
 _BLOCK_C = 256
