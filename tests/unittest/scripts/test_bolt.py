@@ -30,6 +30,7 @@ import importlib.util
 import shutil
 import stat
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 
@@ -358,6 +359,17 @@ def test_bolt_elf_refuses_binary_with_a53_veneers(apply_bolt, tmp_path, monkeypa
     with pytest.raises(apply_bolt.BoltApplyError, match="cortex-a53-843419"):
         apply_bolt.bolt_elf(elf, profile, [], strip=False, dry_run=False)
     assert calls == [], "llvm-bolt must not run on a binary with these veneers"
+
+
+def test_apply_bolt_import_leaves_sys_path_unchanged():
+    """apply_bolt reaches find_veneers without putting internal/ on sys.path.
+
+    These tests import it in-process, so an entry added there would outlive the
+    import and change how every later test in the session resolves imports.
+    """
+    before = list(sys.path)
+    _load("apply_bolt")
+    assert sys.path == before
 
 
 def test_is_bolt_applicable_treats_readelf_failure_as_no_verdict(apply_bolt, tmp_path, monkeypatch):
