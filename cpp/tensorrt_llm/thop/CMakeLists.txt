@@ -80,12 +80,6 @@ target_include_directories(th_common_attention
 # th_common_attention with target_sources() so the list stays next to the files.
 add_subdirectory(minimaxM3)
 
-target_sources(
-  th_common_attention
-  PRIVATE "${KIMI_K3_MODEL_CSRC}/k3AttnResOp.cpp"
-          "${KIMI_K3_MODEL_CSRC}/k3MnnvlCommOp.cpp"
-          "${KIMI_K3_MODEL_CSRC}/k3MnnvlFusionOp.cpp")
-
 add_th_common_family(
   th_common_gemm_quant
   cutlassScaledMM.cpp

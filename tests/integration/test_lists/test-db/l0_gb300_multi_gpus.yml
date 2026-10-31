@@ -45,7 +45,7 @@ l0_gb300_multi_gpus:
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)

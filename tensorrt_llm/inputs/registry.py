@@ -191,6 +191,10 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return per-modality decode defaults, below server and request overrides."""
+        return {}
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],

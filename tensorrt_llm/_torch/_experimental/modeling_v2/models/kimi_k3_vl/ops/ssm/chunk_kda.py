@@ -16,7 +16,7 @@ class ChunkKda(OpWrapper):
     it as the keyword arguments it reads them from.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             why="TP16: two ragged sequences mixing fresh and continuing states below four chunks",

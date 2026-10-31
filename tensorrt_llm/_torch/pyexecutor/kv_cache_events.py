@@ -83,6 +83,13 @@ class MultimodalKey(
     uuid: str | None = None
 
 
+class ImageRoutingMetadata(msgspec.Struct, frozen=True, gc=False):
+    """Versioned digest-first image normalization metadata for KV routers."""
+
+    version: int
+    token_id_offset: int
+
+
 class BlockStored(KVCacheWireEvent):
     """A sequence of full KV cache blocks was stored."""
 
@@ -100,6 +107,7 @@ class BlockStored(KVCacheWireEvent):
     locality: str | None = None
     # Aligned one-for-one with block_hashes when multimodal decoding is enabled.
     mm_keys: list[list[MultimodalKey]] | None = None
+    trtllm_image_routing: ImageRoutingMetadata | None = None
 
 
 class BlockRemoved(KVCacheWireEvent):
@@ -552,6 +560,7 @@ class _StreamingEventSource:
             raise ValueError("mm_token_id_offset must be non-negative")
         self._block_size = block_size
         self._include_mm_keys = mm_token_id_offset is not None
+        self._mm_token_id_offset = mm_token_id_offset
         self._event_sink = kv_cache_manager_v2_runtime.StreamingEventSink(
             max_entries=max_entries,
             mm_token_id_offset=mm_token_id_offset,
@@ -568,6 +577,21 @@ class _StreamingEventSource:
         result: list[BlockStored | BlockRemoved | AllBlocksCleared] = []
         for event in self._event_sink.drain_iteration_events():
             if isinstance(event, kv_cache_manager_v2_runtime.StreamingBlockStoredData):
+                mm_keys = (
+                    [
+                        [
+                            MultimodalKey(
+                                hash=bytes(key[0]).hex(),
+                                start_offset=key[1],
+                                uuid=key[2] if len(key) >= 3 else None,
+                            )
+                            for key in block_keys
+                        ]
+                        for block_keys in event.mm_keys
+                    ]
+                    if self._include_mm_keys
+                    else None
+                )
                 result.append(
                     BlockStored(
                         block_hashes=list(event.block_hashes),
@@ -577,19 +601,14 @@ class _StreamingEventSource:
                         lora_id=event.lora_id,
                         medium="GPU",
                         lora_name=None,
-                        mm_keys=(
-                            [
-                                [
-                                    MultimodalKey(
-                                        hash=bytes(key[0]).hex(),
-                                        start_offset=key[1],
-                                        uuid=key[2] if len(key) >= 3 else None,
-                                    )
-                                    for key in block_keys
-                                ]
-                                for block_keys in event.mm_keys
-                            ]
-                            if self._include_mm_keys
+                        mm_keys=mm_keys,
+                        trtllm_image_routing=(
+                            ImageRoutingMetadata(
+                                version=1, token_id_offset=self._mm_token_id_offset
+                            )
+                            if mm_keys is not None
+                            and self._mm_token_id_offset is not None
+                            and any(mm_keys)
                             else None
                         ),
                     )

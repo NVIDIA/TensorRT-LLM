@@ -61,7 +61,7 @@ KVCacheManagerConfig makeOptionalDiskConfig(bool hostTier)
         auto layer = std::get<AttentionLayerConfig>(config.layers.front());
         layer.layerId = i;
         layer.slidingWindowSize = i == 1 ? 4 : 2;
-        layer.reusePolicy = AttentionReusePolicy::OPTIONAL;
+        layer.reusePolicy = ReusePolicy::OPTIONAL;
         // Unequal buffer sizes exercise multiple physical pools per page.
         layer.buffers.push_back(BufferConfig{"score", 1024, std::nullopt});
         config.layers.emplace_back(std::move(layer));
@@ -227,6 +227,13 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
 
     auto reader = manager->createKvCache({}, span, 2);
     ASSERT_TRUE(reader->reuseStatus()[encoder.value()].complete);
+    auto reservations
+        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
+    for (auto const& slot : reservations)
+    {
+        // Offload can still be reading the recycled GPU slots on another stream.
+        slot.readyEvent.waitInStream(reinterpret_cast<CudaStream>(stream));
+    }
     // Poison the entire hot Encoder group: a false restore cannot pass using
     // stale bytes from the original slot after it was offloaded to disk.
     for (int p = 0; p < sizes.size().value(); ++p)
@@ -237,8 +244,6 @@ TEST_P(OptionalDiskCheckpointTest, PayloadRestoreRetryAndIndependentEviction)
             cudaSuccess);
     }
     ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
-    auto reservations
-        = storage.newSlotsForPoolGroup(kHotLevel, hotGroup, storage.getStatistics(kHotLevel, hotGroup).free);
     EXPECT_FALSE(reader->resume(stream, std::vector<LifeCycleId>{encoder, peer}));
     EXPECT_FALSE(reader->isActive());
     EXPECT_EQ(reader->numCommittedTokens(), 8);
