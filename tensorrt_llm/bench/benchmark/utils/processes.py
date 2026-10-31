@@ -133,7 +133,6 @@ class IterationWriter:
         """
         context = None
         socket = None
-        message = None
 
         try:
             # Create a ZeroMQ context and socket for inter-process communication
