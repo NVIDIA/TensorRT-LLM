@@ -19,7 +19,7 @@ import flashinfer
 import torch
 from flashinfer.topk import TopKTieBreak
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's block budget: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4.
@@ -205,7 +205,7 @@ class FlashinferTopKRaggedTransform(OpWrapper):
       - No NaN inside a window: the kernel ranks NaN above +inf.
       - Zero sign: the kernel ranks -0.0 below +0.0, while the canonical row (`reference`)
         holds them as one tie class. A row whose tie class at the k-th value mixes the two
-        gets the kernel's order (the test pins it); this target's scores are relu sums
+        gets the kernel's order (the test pins it); the unified target's scores are relu sums
         times a positive scale, so its zeros are +0.0.
 
     Uncertified: `deterministic` True, `dsa_graph_safe` True, non-zero `offsets`, fp16 and
