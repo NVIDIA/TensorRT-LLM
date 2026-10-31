@@ -1181,19 +1181,112 @@ class TestKVCacheFailuresGen:
 
         def alloc_fn(req):
             call_count[0] += 1
-            # gen0 succeeds, then gen1 succeeds only on the immediate retry
-            # after its ordinary victim is upgraded to full recompute teardown.
-            return call_count[0] in (1, 4)
+            # gen1 is the first generation request of the pass, so nothing
+            # else progresses. It succeeds only on the immediate retry after
+            # its ordinary victim is upgraded to full recompute teardown.
+            return call_count[0] == 3
 
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
-        reqs = [make_gen_request(0), make_gen_request(1), victim]
+        reqs = [make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
-        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.generation_requests) == [1]
         assert ids(out.paused_requests) == []
         assert ids(out.recompute_paused_requests) == [99]
-        assert call_count[0] == 4
+        assert call_count[0] == 3
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_recompute_pause_waits_while_generation_progresses(self):
+        """No teardown once a generation request is scheduled in the pass.
+
+        The scheduled request releases pages as it finishes, so the blocked
+        request suspends itself and waits; re-prefilling a victim instead
+        would redo work that is not needed for progress.
+        """
+
+        def alloc_fn(req):
+            return req.request_id == 0
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        out = sched.schedule_request([make_gen_request(0), make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [0]
+        assert set(ids(out.paused_requests)) == {1, 99}
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_recompute_pause_waits_while_generation_progresses_gpu_only(self):
+        """The same holds in a GPU-only pool, where suspension frees nothing.
+
+        There the teardown candidate is a request suspended in an earlier pass:
+        it still holds its pages, and recompute pause is the only way to get
+        them back.
+        """
+
+        def alloc_fn(req):
+            return req.request_id == 0
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn, can_evict=False, has_cache_tier_below_gpu=False
+        )
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        out = sched.schedule_request([make_gen_request(0), make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [0]
+        assert ids(out.paused_requests) == [1]
+        assert out.recompute_paused_requests == []
+        mgr.free_resources.assert_not_called()
+
+    def test_first_generation_request_recompute_pauses_gpu_only(self):
+        """In a GPU-only pool the first generation request of a pass still tears
+        down a request suspended in an earlier pass, which is the only way out
+        of a full pool there.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return req.request_id == 1 and 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=alloc_fn, can_evict=False, has_cache_tier_below_gpu=False
+        )
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        victim = make_gen_request(99)
+        mgr.kv_cache_map[victim.py_request_id].is_active = False
+        out = sched.schedule_request([make_gen_request(1), victim], set())
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
+        mgr.free_resources.assert_called_once_with(victim)
+
+    def test_requests_in_flight_do_not_hold_back_recompute_pause(self):
+        """Work in flight from an earlier pass does not count as progress.
+
+        Under pipeline parallelism the previous micro-batch is still in flight
+        while this one is scheduled. When only a teardown makes room for the
+        first generation request of the pass, it still happens, so the
+        micro-batch does not run empty.
+        """
+        freed_request_ids = set()
+
+        def alloc_fn(req):
+            return 99 in freed_request_ids
+
+        mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn, can_evict=True)
+        mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
+        sched = make_scheduler(mgr, max_num_tokens=100)
+        in_flight = make_gen_request(7)
+        victim = make_gen_request(99)
+        out = sched.schedule_request(
+            [in_flight, make_gen_request(1), victim], {in_flight.request_id}
+        )
+        assert ids(out.generation_requests) == [1]
+        assert out.paused_requests == []
+        assert ids(out.recompute_paused_requests) == [99]
         mgr.free_resources.assert_called_once_with(victim)
 
     def test_recompute_pause_gate_stops_destructive_fallback(self):
@@ -1274,8 +1367,6 @@ class TestKVCacheFailuresGen:
             request_id = req.request_id
             attempts[request_id] = attempts.get(request_id, 0) + 1
             if request_id == 0:
-                return attempts[request_id] == 2
-            if request_id == 1:
                 return 3 in freed_request_ids
             raise AssertionError(f"Evicted request {request_id} was revisited")
 
@@ -1286,18 +1377,20 @@ class TestKVCacheFailuresGen:
         mgr.free_resources.side_effect = lambda req: freed_request_ids.add(req.request_id)
         sched = make_scheduler(mgr, max_num_tokens=100)
 
+        # Suspending the active victim shrinks the ordinary frontier to it and
+        # does not make room; the recompute frontier must still reach the
+        # suspended tail behind it.
         current = make_gen_request(0)
-        next_request = make_gen_request(1)
         active_victim = make_gen_request(2)
         suspended_tail = make_gen_request(3)
         mgr.kv_cache_map[suspended_tail.py_request_id].is_active = False
 
         out = sched.schedule_request(
-            [current, next_request, active_victim, suspended_tail],
+            [current, active_victim, suspended_tail],
             set(),
         )
 
-        assert ids(out.generation_requests) == [0, 1]
+        assert ids(out.generation_requests) == [0]
         assert ids(out.paused_requests) == [2]
         assert ids(out.recompute_paused_requests) == [3]
         mgr.suspend_request.assert_called_once_with(active_victim)
