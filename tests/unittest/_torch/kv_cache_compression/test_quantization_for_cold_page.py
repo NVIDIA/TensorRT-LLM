@@ -22,7 +22,11 @@ from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor.resource_manager import DataType
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm._torch.speculative.utils import update_spec_config_from_model_config
-from tensorrt_llm.llmapi.llm_args import ColdPageQuantizationCompressionConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    ColdPageQuantizationCompressionConfig,
+    DFlashDecodingConfig,
+    MTPDecodingConfig,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
@@ -41,6 +45,7 @@ def _manager(
     pretrained_config=None,
     skip_rope_quantization=False,
     nvfp4_residual_dim=64,
+    global_scale="identity",
 ):
     config = ColdPageQuantizationCompressionConfig(
         scale_checkpoint_path=(
@@ -48,6 +53,7 @@ def _manager(
         ),
         skip_rope_quantization=skip_rope_quantization,
         nvfp4_residual_dim=nvfp4_residual_dim,
+        global_scale=global_scale,
     )
     return Nvfp4ColdPageQuantizationCompression(
         config,
@@ -201,8 +207,10 @@ def _deepseek_v4_csa_cache_config(*, num_model_layers=1, first_layer_id=0, eleme
     return SimpleNamespace(tokens_per_block=128, layers=tuple(layers))
 
 
-def _validate_compression(mode: object | None = None) -> None:
-    spec_config = None if mode is None else SimpleNamespace(spec_dec_mode=mode)
+def _validate_compression(mode: object | None = None, *, spec_config: object | None = None) -> None:
+    assert mode is None or spec_config is None, "pass either mode or spec_config"
+    if spec_config is None and mode is not None:
+        spec_config = SimpleNamespace(spec_dec_mode=mode)
     with patch.object(util_mod, "is_sm_100f", return_value=True):
         util_mod.validate_kv_cache_compression_compatibility(
             ColdPageQuantizationCompressionConfig(),
@@ -1285,12 +1293,41 @@ def test_runtime_admission_is_checked_before_manager_creation(monkeypatch) -> No
 def test_speculative_admission_accepts_verified_one_model_modes() -> None:
     _validate_compression(SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
     _validate_compression(SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
-    for mode in (
-        SpeculativeDecodingMode.MTP,
-        SpeculativeDecodingMode.DFLASH,
-    ):
-        with pytest.raises(ValueError, match="one-model MTP-EAGLE or EAGLE3"):
-            _validate_compression(mode)
+    with pytest.raises(ValueError, match="one-model MTP-EAGLE or EAGLE3"):
+        _validate_compression(SpeculativeDecodingMode.MTP)
+
+
+@pytest.mark.parametrize("attention_backend", ["VANILLA", "FA4"])
+def test_speculative_admission_accepts_dflash_without_draft_kv_cache(attention_backend) -> None:
+    spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend=attention_backend)
+    assert spec_config.spec_dec_mode is SpeculativeDecodingMode.DFLASH
+    assert not util_mod.should_use_separate_draft_kv_cache(spec_config)
+    _validate_compression(spec_config=spec_config)
+
+
+@pytest.mark.parametrize("enable_attention_dp", (False, True))
+@pytest.mark.parametrize("attention_backend", ["VANILLA", "FA4"])
+def test_admitted_dflash_builds_no_draft_kv_cache_and_adds_no_target_layers(
+    attention_backend, enable_attention_dp
+) -> None:
+    """Admission implies the codec can only ever be handed the target KVCM."""
+
+    spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend=attention_backend)
+    _validate_compression(spec_config=spec_config)
+    creator = SimpleNamespace(
+        _speculative_config=spec_config,
+        _mapping=SimpleNamespace(enable_attention_dp=enable_attention_dp, pp_size=1),
+        _sparse_attention_config=None,
+    )
+    assert not util_mod.KvCacheCreator._should_create_separate_draft_kv_cache(creator)
+    assert util_mod.get_num_spec_layers(spec_config) == 0
+
+
+def test_speculative_admission_rejects_dflash_with_draft_kv_cache() -> None:
+    spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
+    assert util_mod.should_use_separate_draft_kv_cache(spec_config)
+    with pytest.raises(ValueError, match="DFlash without a separate draft KV cache"):
+        _validate_compression(spec_config=spec_config)
 
 
 def test_qwen35_mtp3_resolves_to_supported_one_model_mode() -> None:
@@ -1774,3 +1811,185 @@ def test_measured_glm52_and_deepseek_v4_pages_are_reproduced() -> None:
         head_dim_per_layer=(),
     )
     assert _configure_lifecycle(native, hot).cold_page_bytes == 384_512
+
+
+# --- global_scale -----------------------------------------------------------------------------
+
+
+def test_global_scale_defaults_to_identity_and_serializes() -> None:
+    config = ColdPageQuantizationCompressionConfig()
+    assert config.global_scale == "identity"
+    tuned = ColdPageQuantizationCompressionConfig(global_scale="fp8_block_amax")
+    assert ColdPageQuantizationCompressionConfig.model_validate(tuned.model_dump()) == tuned
+    with pytest.raises(ValueError, match="global_scale"):
+        ColdPageQuantizationCompressionConfig(global_scale="per_block")
+
+
+def test_global_scale_and_scale_checkpoint_are_mutually_exclusive(tmp_path) -> None:
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ColdPageQuantizationCompressionConfig(
+            global_scale="fp8_block_amax", scale_checkpoint_path=str(tmp_path)
+        )
+
+
+def test_fp8_block_amax_global_scale_reaches_fp8_launch_metadata() -> None:
+    native, _ = _native()
+    (layout,) = _create(
+        _manager(global_scale="fp8_block_amax"),
+        _cache_config((0, "attention")),
+        native,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(4,),
+        head_dim_per_layer=(64,),
+    )
+    assert _codec_state(native).runtime_type == 2
+    assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [6.0, 6.0]
+    assert [buffer.scales.nvfp4_quant_orig for buffer in layout.buffers] == [1.0 / 6.0] * 2
+    metadata = _configure_lifecycle(native, {0: {"key": 64 * 4 * 64, "value": 64 * 4 * 64}})
+    expected = torch.tensor([6.0, 1.0 / 6.0, 1.0, 1.0], dtype=torch.float32)
+    assert torch.equal(metadata.scales[0], expected)
+    assert torch.equal(metadata.scales[1], expected)
+    # Geometry is unchanged: only the scale rows differ from the identity default.
+    identity_native, _ = _native()
+    _create(
+        _manager(),
+        _cache_config((0, "attention")),
+        identity_native,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(4,),
+        head_dim_per_layer=(64,),
+    )
+    identity = _configure_lifecycle(
+        identity_native, {0: {"key": 64 * 4 * 64, "value": 64 * 4 * 64}}
+    )
+    assert identity.cold_page_bytes == metadata.cold_page_bytes
+    assert torch.equal(identity.integers, metadata.integers)
+    assert identity.scales[0].tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_fp8_block_amax_global_scale_rejects_a_16_bit_target_cache() -> None:
+    native, _ = _native()
+    with pytest.raises(ValueError, match="requires an FP8 KV cache"):
+        _create(
+            _manager(global_scale="fp8_block_amax"),
+            _cache_config((0, "attention")),
+            native,
+            runtime_dtype=DataType.BF16,
+            pp_layers=(0,),
+            num_kv_heads_per_layer=(4,),
+            head_dim_per_layer=(64,),
+        )
+
+
+def test_fp8_block_amax_global_scale_keeps_identity_for_a_16_bit_draft_cache() -> None:
+    native, _ = _native()
+    (layout,) = _create(
+        _manager(global_scale="fp8_block_amax"),
+        _cache_config((0, "attention")),
+        native,
+        runtime_dtype=DataType.BF16,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(4,),
+        head_dim_per_layer=(64,),
+        is_draft=True,
+    )
+    assert [buffer.scales.nvfp4_orig_quant for buffer in layout.buffers] == [1.0, 1.0]
+
+
+def test_fp8_block_amax_global_scale_applies_to_deepseek_v4_compress_rows() -> None:
+    native, _ = _native()
+    manager = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(global_scale="fp8_block_amax"),
+        pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+    )
+    (layout,) = _create(
+        manager,
+        _deepseek_v4_csa_cache_config(element_bytes=1),
+        native,
+        pp_layers=(0,),
+        num_kv_heads_per_layer=(),
+        head_dim_per_layer=(),
+    )
+    compressed = [buffer for buffer in layout.buffers if buffer.scales is not None]
+    assert compressed and all(buffer.scales.nvfp4_orig_quant == 6.0 for buffer in compressed)
+
+
+# --- uncompressed_layer_types -------------------------------------------------------------------
+
+
+def _hybrid_window_cache_config(windows):
+    return SimpleNamespace(
+        tokens_per_block=32,
+        layers=tuple(
+            AttentionLayerConfig(
+                layer_id=layer_id,
+                buffers=[BufferConfig(role=role, size=4 * 32 * 64) for role in ("key", "value")],
+                sliding_window_size=window,
+            )
+            for layer_id, window in enumerate(windows)
+        ),
+    )
+
+
+def _create_with_types(uncompressed_layer_types, windows):
+    native, _ = _native()
+    manager = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(uncompressed_layer_types=uncompressed_layer_types),
+        pretrained_config=SimpleNamespace(model_type="muse_spark"),
+    )
+    _create(
+        manager,
+        _hybrid_window_cache_config(windows),
+        native,
+        pp_layers=tuple(range(len(windows))),
+        num_kv_heads_per_layer=(4,) * len(windows),
+        head_dim_per_layer=(64,) * len(windows),
+    )
+    return native, _codec_state(native)
+
+
+@pytest.mark.parametrize(
+    ("uncompressed_layer_types", "expected_layer_ids"),
+    (
+        ([], (0, 1, 2, 3)),
+        (["sliding_window"], (1, 3)),
+        (["full_attention"], (0, 2)),
+        (["sliding_window", "full_attention"], ()),
+    ),
+)
+def test_uncompressed_layer_types_leave_layers_to_the_lossless_codec(
+    uncompressed_layer_types, expected_layer_ids
+) -> None:
+    _, state = _create_with_types(uncompressed_layer_types, (2048, None, 2048, None))
+    assert state.layer_ids == expected_layer_ids
+    assert tuple(state.layer_layouts) == expected_layer_ids
+
+
+def test_uncompressed_layer_types_keep_full_attention_lifecycle_quantized() -> None:
+    native, _ = _create_with_types(["sliding_window"], (2048, None, 2048, None))
+    metadata = _configure_lifecycle(
+        native, {layer_id: {"key": 4 * 32 * 64, "value": 4 * 32 * 64} for layer_id in (1, 3)}
+    )
+    assert metadata.num_buffers == 4
+    assert metadata.integers[:4, 1].tolist() == [0, 0, 0, 0]
+    assert metadata.cold_page_bytes == 2 * (2 * 4 * 32 * 64 // 2 + 2 * 4 * 32 * 64 // 16)
+
+
+def test_uniform_windows_count_as_full_attention() -> None:
+    _, state = _create_with_types(["sliding_window"], (2048, 2048))
+    assert state.layer_ids == (0, 1)
+    _, state = _create_with_types(["full_attention"], (None, None))
+    assert state.layer_ids == ()
+
+
+def test_uncompressed_layer_types_default_and_validation() -> None:
+    assert ColdPageQuantizationCompressionConfig().uncompressed_layer_types == []
+    config = ColdPageQuantizationCompressionConfig(uncompressed_layer_types=["sliding_window"])
+    assert ColdPageQuantizationCompressionConfig.model_validate(config.model_dump()) == config
+    with pytest.raises(ValueError, match="uncompressed_layer_types"):
+        ColdPageQuantizationCompressionConfig(uncompressed_layer_types=["mamba"])
+    with pytest.raises(NotImplementedError, match="DeepSeek-V4"):
+        Nvfp4ColdPageQuantizationCompression(
+            ColdPageQuantizationCompressionConfig(uncompressed_layer_types=["sliding_window"]),
+            pretrained_config=SimpleNamespace(model_type="deepseek_v4"),
+        )

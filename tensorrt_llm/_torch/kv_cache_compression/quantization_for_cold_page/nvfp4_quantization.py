@@ -31,6 +31,9 @@ _ScalePair = tuple[float, float]
 _LayerScales = dict[str, _ScalePair]
 
 _IDENTITY_NVFP4_SCALE: _ScalePair = (1.0, 1.0)
+# E4M3 values are at most 448 = 6 * 448 / 6, so a global scale of 6 maps each
+# block's E4M3 absolute maximum onto an exact E4M3 block scale and E2M1 value 6.
+_FP8_BLOCK_AMAX_NVFP4_SCALE: _ScalePair = (6.0, 1.0 / 6.0)
 _MODEL_OPT_LANGUAGE_KV_SCALE_KEY = re.compile(
     r"^model(?:\.language_model)?\.layers\.(?P<layer_id>\d+)\.self_attn\."
     r"(?P<kind>[kv])_proj\.(?P=kind)_scale$"
@@ -212,10 +215,16 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         self._model_scales = _load_modelopt_nvfp4_scales(config.scale_checkpoint_path)
         self._skip_rope_quantization = bool(config.skip_rope_quantization)
         self._nvfp4_residual_dim = config.nvfp4_residual_dim
+        self._global_scale = config.global_scale
+        self._uncompressed_layer_types = frozenset(config.uncompressed_layer_types)
         model_type = getattr(pretrained_config, "model_type", None)
         architectures = getattr(pretrained_config, "architectures", None) or []
         if architectures and architectures[0] == "GlmMoeDsaForCausalLM":
             model_type = "glm_moe_dsa"
+        if self._uncompressed_layer_types and model_type == "deepseek_v4":
+            raise NotImplementedError(
+                "uncompressed_layer_types is not supported for DeepSeek-V4 cold pages"
+            )
         if self._skip_rope_quantization and model_type not in _SKIP_ROPE_QUANTIZATION_MODEL_TYPES:
             logger.warning(
                 "skip_rope_quantization is supported for model types "
@@ -223,6 +232,49 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 f"{model_type!r} and turning whole K and V vectors into NVFP4."
             )
             self._skip_rope_quantization = False
+
+    def _default_scale(self, runtime_dtype: DataType, *, is_draft: bool) -> _ScalePair:
+        """Global scale for buffers that have no ModelOpt scale."""
+
+        if self._global_scale == "identity":
+            return _IDENTITY_NVFP4_SCALE
+        if runtime_dtype == DataType.FP8:
+            return _FP8_BLOCK_AMAX_NVFP4_SCALE
+        if is_draft:
+            logger.warning(
+                f"global_scale={self._global_scale!r} needs an FP8 KV cache; the "
+                f"{runtime_dtype} draft KV cache keeps identity global scales."
+            )
+            return _IDENTITY_NVFP4_SCALE
+        raise ValueError(
+            f"global_scale={self._global_scale!r} requires an FP8 KV cache, not {runtime_dtype}"
+        )
+
+    def _uncompressed_layer_ids(
+        self, attention_layers: Sequence["AttentionLayerConfig"]
+    ) -> frozenset[int]:
+        """Attention layers left out of the codec, so their lifecycles use the lossless copy."""
+
+        if not self._uncompressed_layer_types or not attention_layers:
+            return frozenset()
+        windows = {
+            int(layer.layer_id): (
+                math.inf if layer.sliding_window_size is None else layer.sliding_window_size
+            )
+            for layer in attention_layers
+        }
+        longest = max(windows.values())
+        result = frozenset(
+            layer_id
+            for layer_id, window in windows.items()
+            if ("sliding_window" if window < longest else "full_attention")
+            in self._uncompressed_layer_types
+        )
+        logger.info(
+            f"NVFP4 cold pages keep {len(result)} of {len(windows)} Attention layers "
+            f"({sorted(self._uncompressed_layer_types)}) in the active-cache dtype"
+        )
+        return result
 
     def _calculate_quantized_range(
         self,
@@ -320,6 +372,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         runtime_type: int,
         is_draft: bool,
         skip_rope: bool,
+        default_scale: _ScalePair = _IDENTITY_NVFP4_SCALE,
     ) -> dict[int, _Nvfp4LayerLayout | None]:
         """Build layouts for DeepSeek-V4 lifecycles; None selects lossless fallback."""
 
@@ -409,7 +462,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                     f"{configured_bytes} bytes; expected {raw_bytes} for an ordinary runtime Page"
                 )
 
-            scale = _IDENTITY_NVFP4_SCALE
+            scale = default_scale
             if not is_draft:
                 model_scales = self._model_scales.get(model_layers[layer_id])
                 if model_scales:
@@ -475,6 +528,8 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 "NVFP4 cold-page compression supports FP16, BF16, or FP8 "
                 f"Attention KV, not {runtime_dtype}"
             )
+        default_scale = self._default_scale(runtime_dtype, is_draft=is_draft)
+        uncompressed_layers = self._uncompressed_layer_ids(attention_layers)
 
         # The codec holds only the target model's config, so it cannot locate RoPE
         # in a draft model's K vectors: draft KVCMs always quantize whole vectors.
@@ -494,11 +549,14 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 runtime_type=runtime_type if runtime_type is not None else 0,
                 is_draft=is_draft,
                 skip_rope=skip_rope,
+                default_scale=default_scale,
             )
 
         layer_layouts = []
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
+            if layer_id in uncompressed_layers:
+                continue
             if layer_id in deepseek_v4_layouts:
                 layout = deepseek_v4_layouts[layer_id]
                 if layout is not None:
@@ -520,7 +578,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
             if len(compressed_roles) == 2 and model_scales:
                 scales = tuple(model_scales[role] for role in ("k", "v"))
             else:
-                scales = (_IDENTITY_NVFP4_SCALE,) * len(compressed_roles)
+                scales = (default_scale,) * len(compressed_roles)
 
             num_kv_heads = int(num_kv_heads_per_layer[layer_id])
             tokens_per_page = int(cache_config.tokens_per_block)

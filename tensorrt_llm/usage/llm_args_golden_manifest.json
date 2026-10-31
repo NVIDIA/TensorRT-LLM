@@ -560,6 +560,15 @@
       "path": "kv_cache_compression_config.eviction_mode"
     },
     {
+      "allowed_values": [
+        "identity",
+        "fp8_block_amax"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.global_scale"
+    },
+    {
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_compression_config.normalize_scores"
@@ -585,6 +594,15 @@
       "capture_policy": "bool",
       "kind": "value",
       "path": "kv_cache_compression_config.skip_rope_quantization"
+    },
+    {
+      "allowed_values": [
+        "sliding_window",
+        "full_attention"
+      ],
+      "capture_policy": "list[literal]",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.uncompressed_layer_types"
     },
     {
       "capture_policy": "int",
