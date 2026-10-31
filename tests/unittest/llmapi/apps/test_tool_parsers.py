@@ -971,6 +971,33 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         assert result.calls[0].name == "get_weather"
         assert json.loads(result.calls[0].parameters) == {"city": "Paris"}
 
+    @pytest.mark.parametrize("text", [
+        '["apple", "banana", "cherry"]',
+        "[1, 2, 3]",
+        '[["a", 1], ["b", 2]]',
+        "9" * 4500,
+        "[" + "9" * 4500 + "]",
+    ])
+    def test_detect_and_parse_plain_json_answer_is_content(
+            self, sample_tools, parser, text):
+        """A plain JSON answer that is not a tool call stays content.
+
+        Covers arrays whose elements are not objects and integers longer
+        than Python's int-to-str digit limit.
+        """
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.calls == []
+        assert result.normal_text == text
+
+    def test_detect_and_parse_wrapped_non_object_has_no_calls(
+            self, sample_tools, parser):
+        """A `<tool_call>` block holding a JSON scalar yields no calls."""
+        result = parser.detect_and_parse("<tool_call>\nfalse\n</tool_call>",
+                                         sample_tools)
+
+        assert result.calls == []
+
     # ------------------------------------------------------------------
     # NVBug 6240584: bare-JSON fallback in parse_streaming_increment
     #
@@ -1070,6 +1097,72 @@ class TestQwen3ToolParser(BaseToolParserTestClass):
         # Trailing chunk is fully suppressed.
         assert r2.calls == []
         assert r2.normal_text == ""
+
+    @staticmethod
+    def _stream_in_chunks(parser, text, tools, chunk_size=3):
+        content, calls = "", []
+        for i in range(0, len(text), chunk_size):
+            result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                      tools)
+            content += result.normal_text
+            calls.extend(result.calls)
+        result = parser.finish(tools)
+        content += result.normal_text
+        calls.extend(result.calls)
+        return content, calls
+
+    @pytest.mark.parametrize("text", [
+        '["apple", "banana", "cherry"]',
+        "[1, 2, 3]",
+        "[" + "9" * 4500 + "]",
+        "[Note] The weather in Paris is sunny today.",
+        "{greeting} Hello there, how can I help?",
+        "[not JSON </tool_",
+    ])
+    def test_streaming_plain_answer_opening_with_bracket_is_content(
+            self, sample_tools, parser, text):
+        """Plain answers that open with `[` or `{` stream as content."""
+        content, calls = self._stream_in_chunks(parser, text, sample_tools)
+
+        assert calls == []
+        assert content == text
+
+    def test_detect_and_parse_wrapped_oversized_integer_has_no_calls(
+            self, sample_tools, parser):
+        """An integer beyond the digit limit inside a wrapped block yields no calls."""
+        result = parser.detect_and_parse(
+            "<tool_call>\n" + "9" * 4500 + "\n</tool_call>", sample_tools)
+
+        assert result.calls == []
+
+    def test_streaming_text_that_may_become_json_is_held(
+            self, sample_tools, parser):
+        """A valid JSON prefix is held back until it can be classified."""
+        result = parser.parse_streaming_increment('["apple", "ban',
+                                                  sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
+
+    def test_streaming_truncated_json_prefix_flushed_on_finish(
+            self, sample_tools, parser):
+        """A JSON prefix cut off by the end of generation is not dropped."""
+        text = '["apple", "ban'
+        content, calls = self._stream_in_chunks(parser, text, sample_tools)
+
+        assert calls == []
+        assert content == text
+
+    def test_finish_after_bare_json_tool_call_emits_nothing(
+            self, sample_tools, parser):
+        """`finish` adds nothing once a bare-JSON tool call was emitted."""
+        parser.parse_streaming_increment(
+            '{"name":"get_weather","arguments":{"city":"Paris"}}', sample_tools)
+
+        result = parser.finish(sample_tools)
+
+        assert result.normal_text == ""
+        assert result.calls == []
 
     def test_streaming_wrapped_form_unregressed(self, sample_tools, parser):
         """The pre-existing wrapped-form streaming path continues to work."""
