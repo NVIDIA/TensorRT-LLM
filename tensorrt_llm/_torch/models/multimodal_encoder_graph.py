@@ -110,7 +110,8 @@ class EncoderGraphIOAdapter(ABC):
     def capture_buckets(self, max_batch_size: int, max_num_tokens: int) -> list[EncoderGraphKey]:
         """Generate shapes for every batch size within the total token budget.
 
-        Each context count uses per-context capacities starting at 256 tokens and doubling up
+        Each context count uses per-context capacities starting at 256 tokens and growing by 1.25x,
+        rounded up to 256-token tiles, up
         to its share of the budget, followed by the full token budget. Dense ``[batch, time, ...]``
         layouts can round down their time dimension when allocating buffers and check it in
         ``can_replay``. Adapters with additional alignment or minimum-length constraints can
@@ -127,7 +128,7 @@ class EncoderGraphIOAdapter(ABC):
             seq_len = min(256, max_seq_len)
             while seq_len < max_seq_len:
                 buckets.append(EncoderGraphKey(seq_len * num_contexts, num_contexts))
-                seq_len *= 2
+                seq_len = ((seq_len * 5 + 1023) // 1024) * 256
             buckets.append(EncoderGraphKey(max_num_tokens, num_contexts))
         return sorted(buckets)
 
@@ -197,6 +198,11 @@ class PackedEncoderGraphIOAdapter(EncoderGraphIOAdapter):
         input_specs: Non-token dimensions, dtype, and token axis of each graph input.
         output_specs: Token axis of each graph output; outputs preserve the real input token count.
     """
+
+    def can_replay(self, bucket: EncoderGraphKey, seq_lengths: Sequence[int]) -> bool:
+        """Keep graph replay for small calls or at most 25 percent extra token work."""
+        real_tokens = sum(seq_lengths)
+        return real_tokens < 4096 or bucket.total_tokens <= real_tokens * 1.25
 
     def __init__(
         self,
@@ -485,6 +491,13 @@ class MultimodalEncoderGraphRunner(Generic[_MetadataT]):
             if real_tokens > bucket.total_tokens:
                 continue
             if seq_lengths is not None and not self._io_adapter.can_replay(bucket, seq_lengths):
+                if isinstance(self._io_adapter, PackedEncoderGraphIOAdapter):
+                    logger.debug_once(
+                        "Multimodal encoder CUDA graph padding guard: running eager because "
+                        f"padding {(bucket.total_tokens / real_tokens - 1) * 100:.2f}% > 25%",
+                        key="multimodal_encoder_padding_guard",
+                    )
+                    return None
                 continue
             if self._config.enable_padding:
                 # Padding path: exact num_contexts match and real_tokens <= bucket budget.
