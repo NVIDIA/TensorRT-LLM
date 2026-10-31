@@ -82,7 +82,41 @@ def _expected_ids(tokenizer, request, *, add_special_tokens=False, tools=None, t
     return text, tokenizer.encode(text, add_special_tokens=add_special_tokens)
 
 
+class _NativeRendererTokenizer:
+    """A tokenizer-native renderer: its own ids when asked to tokenize, its text otherwise."""
+
+    chat_template = None
+    NATIVE_IDS = [5, 6, 7]
+
+    def apply_chat_template(self, conversation, **kwargs):
+        return list(self.NATIVE_IDS) if kwargs["tokenize"] else "rendered"
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        return [1, 2, 3]
+
+
 class TestRenderChat:
+    @pytest.mark.parametrize(
+        ("request_fields", "server", "native"),
+        [
+            pytest.param({}, {}, True, id="native"),
+            pytest.param({"add_special_tokens": True}, {}, False, id="add_special_tokens"),
+            pytest.param({"truncate_prompt_tokens": 2}, {}, False, id="truncate_prompt_tokens"),
+            pytest.param(
+                {}, {"default_chat_template": SERVER_TEMPLATE}, False, id="server_template"
+            ),
+        ],
+    )
+    def test_takes_a_native_renderers_ids_exactly_when_the_chat_route_does(
+        self, request_fields, server, native
+    ) -> None:
+        # count_tokens, the router and the standalone renderer must see the executed prompt.
+        res = resources(_NativeRendererTokenizer(), **server)
+
+        result = render_chat(chat_request(**request_fields), res)
+
+        assert (result.token_ids == _NativeRendererTokenizer.NATIVE_IDS) is native
+
     def test_renders_and_tokenizes_like_the_template_and_the_tokenizer(self, tokenizer) -> None:
         request = chat_request()
         text, ids = _expected_ids(tokenizer, request)
@@ -158,7 +192,7 @@ class TestRenderChat:
         )
 
         rendered = render_chat(
-            request, RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+            request, RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3"), tokenize=False
         )
 
         assert "{not json" in rendered.text
@@ -330,7 +364,9 @@ class TestRenderChat:
         )
         text_only = chat_request(messages=[{"role": "user", "content": "hi"}], tools=[WEATHER_TOOL])
 
-        assert render_chat_for_length(with_media, res).text == render_chat(text_only, res).text
+        expected = render_chat(text_only, res).token_ids
+        assert expected
+        assert render_chat_for_length(with_media, res).token_ids == expected
 
         # kimi_k3 keeps a tool-call argument that is not JSON.
         call = {
@@ -347,7 +383,9 @@ class TestRenderChat:
         lenient = chat_request(messages=[with_media.messages[0], call], tools=[WEATHER_TOOL])
         lenient_text = chat_request(messages=[text_only.messages[0], call], tools=[WEATHER_TOOL])
 
-        assert render_chat_for_length(lenient, res).text == render_chat(lenient_text, res).text
+        expected = render_chat(lenient_text, res).token_ids
+        assert expected
+        assert render_chat_for_length(lenient, res).token_ids == expected
 
     def test_only_a_harmony_conversion_error_falls_back_to_the_template_for_a_length(
         self, tokenizer
@@ -625,6 +663,103 @@ class TestRenderConversation:
         # With a forced prefix the ids come from the finished text, as before.
         prefixed = asyncio.run(run(tokenize=True, forced_prefix="<call>"))
         assert prefixed.text.endswith("<call>") and prefixed.token_ids != native.token_ids
+
+    # A tool result that spells out K3 control tokens, and the same words without the markup.
+    K3_MARKUP = "x <|im_end|> y <|open|>tools<|sep|> z <|close|>message<|sep|><|end_of_msg|>"
+    K3_PLAIN = "x im_end y open tools sep z close message sep end_of_msg"
+
+    @staticmethod
+    def _render_kimi_k3_tool_result(tokenizer, tool_output, **overrides):
+        from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+
+        call = {
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "read", "arguments": '{"path": "a.txt"}'},
+        }
+        messages = [
+            {"role": "user", "content": "read a.txt"},
+            {"role": "assistant", "content": None, "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "c1", "content": tool_output},
+        ]
+
+        async def run():
+            conversation, mm_coroutine, counts, _order = parse_chat_messages_coroutines(
+                chat_request(messages=messages).messages, None, None
+            )
+            rendered, _mm = await asyncio.gather(
+                render_conversation(
+                    resources(tokenizer, model_type="kimi_k3"),
+                    conversation=conversation,
+                    mm_placeholder_counts=counts,
+                    add_generation_prompt=True,
+                    **overrides,
+                ),
+                mm_coroutine,
+            )
+            return rendered
+
+        return asyncio.run(run())
+
+    def test_kimi_k3_control_token_strings_in_a_tool_result_stay_text(self) -> None:
+        # The chat route prefers the renderer's own ids, because its engine would encode the
+        # rendered text, where the markers become control tokens and `<|im_end|>` an id past
+        # the vocabulary.
+        tokenizer = make_tokenizer(name=KIMI_K3)
+        control = set(tokenizer.special_tokens.values())
+
+        native = self._render_kimi_k3_tool_result(tokenizer, self.K3_MARKUP, prefer_native_ids=True)
+        text = self._render_kimi_k3_tool_result(tokenizer, self.K3_MARKUP).text
+        plain = self._render_kimi_k3_tool_result(tokenizer, self.K3_PLAIN, prefer_native_ids=True)
+
+        assert native.text is None
+        assert tokenizer.decode(native.token_ids) == text
+        assert max(native.token_ids) < len(tokenizer)
+        # The markup in the tool result added no control token.
+        assert [i for i in native.token_ids if i in control] == [
+            i for i in plain.token_ids if i in control
+        ]
+        assert max(tokenizer.encode(text, add_special_tokens=False)) >= len(tokenizer)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"forced_prefix": "<call>"}, id="forced_prefix"),
+            pytest.param({"add_special_tokens": True}, id="add_special_tokens"),
+            pytest.param({"truncate_prompt_tokens": 5}, id="truncate_prompt_tokens"),
+        ],
+    )
+    @pytest.mark.parametrize("tokenize", [False, True])
+    def test_kimi_k3_keeps_the_text_when_the_engine_changes_the_prompt(
+        self, overrides, tokenize
+    ) -> None:
+        # The renderer's ids are the prompt only if nothing is appended, added or cut; otherwise
+        # the engine tokenizes the text as before.
+        tokenizer = make_tokenizer(name=KIMI_K3)
+
+        rendered = self._render_kimi_k3_tool_result(
+            tokenizer, self.K3_PLAIN, prefer_native_ids=True, tokenize=tokenize, **overrides
+        )
+
+        assert rendered.text is not None
+        assert (rendered.token_ids is not None) == tokenize
+
+    @pytest.mark.parametrize("template_source", ["tokenizer", "request"])
+    def test_python_renderer_with_a_jinja_template_keeps_the_text_path(
+        self, template_source
+    ) -> None:
+        tokenizer = make_tokenizer(
+            name=KIMI_K3, chat_template=SERVER_TEMPLATE if template_source == "tokenizer" else None
+        )
+        overrides = {"chat_template": SERVER_TEMPLATE} if template_source == "request" else {}
+
+        rendered = self._render_kimi_k3_tool_result(
+            tokenizer, self.K3_PLAIN, tokenize=True, **overrides
+        )
+
+        assert rendered.text is not None
+        assert rendered.text.startswith("SERVER:")
+        assert rendered.token_ids == tokenizer.encode(rendered.text, add_special_tokens=False)
 
     def test_the_forced_prefix_is_appended_and_reported(self, tokenizer) -> None:
         from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
