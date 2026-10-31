@@ -813,7 +813,8 @@ if _AVAILABLE:
                         from_prev = _shfl_idx_b32(
                             moved_r, (lane_r + Uint32(world - 1)) & Uint32(world - 1)
                         )
-                        half = self.place == PLACE_HALF
+                        # Not ``half``: the publication loop below binds that name to its row half.
+                        place_half = self.place == PLACE_HALF
                         if cutlass.const_expr(self.publish != 0):
                             # Early ids: CTA 0 publishes every row's placed ids, before its own
                             # rows' stores, as in pool_gather_route.
@@ -826,7 +827,7 @@ if _AVAILABLE:
                                     pslot = prow * TOP_K + lane
                                     pg = _ld_shared_b32(sSelected.iterator + pslot)
                                     pplaced = _placed_expert(
-                                        pg, words, xs, self.peer_rank, x2s, world, half
+                                        pg, words, xs, self.peer_rank, x2s, world, place_half
                                     )
                                     pplaced = _sel(
                                         _lt_u(Uint32(prow), Uint32(M)),
@@ -848,7 +849,9 @@ if _AVAILABLE:
                         if writes != Uint32(0):
                             slot_index = own_row * TOP_K + lane
                             g = _ld_shared_b32(sSelected.iterator + slot_index)
-                            placed = _placed_expert(g, words, xs, self.peer_rank, x2s, world, half)
+                            placed = _placed_expert(
+                                g, words, xs, self.peer_rank, x2s, world, place_half
+                            )
                             _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                             w_bits = _ld_shared_b32(sWeights.iterator + slot_index)
                             _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
