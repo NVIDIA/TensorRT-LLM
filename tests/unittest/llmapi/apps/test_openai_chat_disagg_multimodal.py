@@ -150,7 +150,7 @@ def route_client(tmp_path):
 
     def generate_async(*, inputs, **kwargs):
         captured["inputs"] = inputs
-        return SimpleNamespace(prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
+        return SimpleNamespace(request_id=1, prompt_token_ids=RELAYED_TOKEN_IDS, finished=True)
 
     server = make_stub_openai_server(tmp_path, MODEL, _StubModelConfig(), generate_async)
     server.await_disconnected = AsyncMock()

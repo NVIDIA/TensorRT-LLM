@@ -16,6 +16,7 @@
 
 import asyncio
 import json
+import re
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -273,6 +274,83 @@ def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
     }
 
 
+def _records_engine_request_id(request_id):
+    """An openai_chat stand-in that, like the real one, notes the engine's id on the request."""
+
+    async def answer(chat_request, raw_request):
+        raw_request.state.engine_request_id = request_id
+        return _json_chat_response()
+
+    return answer
+
+
+def test_nonstream_message_is_named_after_the_engine_request():
+    client, backend = _make_route_client("standard", _json_chat_response())
+    backend.side_effect = _records_engine_request_id(42)
+
+    response = client.post("/v1/messages", json=_request())
+
+    assert response.status_code == 200
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+
+
+def test_batched_message_is_named_after_the_engine_request():
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    server = object.__new__(OpenAIServer)
+    server.model = MODEL
+    server.openai_chat = AsyncMock(side_effect=_records_engine_request_id(7))
+
+    status, message = asyncio.run(
+        server._run_batched_message(AnthropicMessagesRequest(**_request()))
+    )
+
+    assert status == "succeeded"
+    assert re.fullmatch(r"msg_7_[0-9a-f]{16}", message["id"])
+
+
+class _FixedPromptTokenizer:
+    """Renders every conversation to one fixed prompt."""
+
+    def __init__(self):
+        self.tokenizer = self
+        self.vocab_size = 1024
+        self.name_or_path = None
+
+    def apply_chat_template(self, *args, **kwargs) -> str:
+        return "<rendered>"
+
+    def encode(self, text, **kwargs):
+        return [1, 2, 3]
+
+
+def test_nonstream_message_takes_the_id_the_real_chat_route_notes(tmp_path):
+    """Through the real openai_chat: the chat completion's id has no request id in it."""
+    from .openai_server_stub import make_stub_openai_server
+
+    def generate_async(**kwargs):
+        return SimpleNamespace(request_id=42, prompt_token_ids=[1, 2, 3])
+
+    server = make_stub_openai_server(
+        tmp_path,
+        MODEL,
+        SimpleNamespace(model_type="llama", vocab_size=1024),
+        generate_async,
+        tokenizer=_FixedPromptTokenizer(),
+    )
+    server.await_disconnected = AsyncMock()
+    server._create_chat_response = AsyncMock(return_value=_chat_response())
+    app = FastAPI()
+    _anthropic_validation_handler(app)
+    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
+
+    response = TestClient(app).post("/v1/messages", json=_request())
+
+    assert response.status_code == 200, response.text
+    assert _chat_response().id == "chatcmpl-route-test"
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+
+
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
 def test_messages_route_reframes_streaming_response(server_kind):
     client, backend = _make_route_client(server_kind, _streaming_chat_response())
@@ -295,6 +373,7 @@ class _StreamedGeneration:
     for the next step, as a generation does while the model is still running.
     """
 
+    request_id = 1
     prompt_token_ids = [1, 2, 3]
 
     def __init__(self, steps, *, then=None, hang=False):

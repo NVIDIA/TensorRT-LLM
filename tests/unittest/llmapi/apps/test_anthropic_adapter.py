@@ -22,6 +22,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -2128,3 +2129,47 @@ def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
 
     events = parse_frames(asyncio.run(asyncio.wait_for(collect(), 5)))
     assert "ping" in [name for name, _ in events]
+
+
+# Message ids carry the engine request id
+# ---------------------------------------------------------------------------
+
+
+def test_message_id_carries_the_engine_request_id():
+    """``chatcmpl-<engine id>`` becomes ``msg_<engine id>_<hex>``, unique per message."""
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-123"
+
+    first = convert_chat_response(response).id
+    second = convert_chat_response(response).id
+
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", first)
+    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", second)
+    assert first != second
+
+
+def test_message_id_without_an_engine_request_id_is_random():
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-0a1b2c3d4e5f"
+
+    assert re.fullmatch(r"msg_[0-9a-f]{32}", convert_chat_response(response).id)
+
+
+def test_nonstreamed_message_id_takes_the_engine_request_id_from_the_caller():
+    """A non-streamed chat completion's own id is random; the caller's request id names it."""
+    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
+    response.id = "chatcmpl-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
+
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", convert_chat_response(response, request_id=42).id)
+
+
+def test_streamed_message_id_carries_the_engine_request_id():
+    first = chunk({"role": "assistant", "content": "hi"})
+    first.id = "chatcmpl-77"
+    last = chunk({}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1))
+    last.id = "chatcmpl-77"
+
+    events = run_reframer([first, last])
+
+    start = next(payload for name, payload in events if name == "message_start")
+    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", start["message"]["id"])
