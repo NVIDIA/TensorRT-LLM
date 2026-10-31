@@ -1,72 +1,120 @@
 <!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# ModelingV2
+# Modeling V2
 
-One self-contained modeling codebase per deployment target, beside the
-built-in model zoo rather than inside it.
-
-Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
-R1 and V3.2 across every GPU generation and parallel topology,
-`_torch/_experimental/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
-GPU architecture, parallel topology) triple — assembled from certified `OpWrapper`
-entries and trusted through accuracy gates. Model-family ops and kernels may be
-shared by that family's targets; target-only code remains inside its target.
-The one-to-one correspondence between `models/<x>/` here and `modeling_<x>.py`
-there is the point of the exercise.
+Modeling V2 is designed to accelerate model development and performance optimization
+in the agent era. Coding agents make specialized code cheaper to produce, while
+understanding, verifying, reviewing, and maintaining changes across a highly shared
+framework increasingly become bottlenecks. Modeling V2 organizes model logic and
+specialized kernels around isolated model families and deployment targets, while
+reusing TensorRT-LLM’s serving runtime and general-purpose operators. This gives
+developers and agents focused goals, makes the computation easier to follow, and
+reduces the impact of model-specific changes on unrelated models, accepting some
+code duplication in exchange for faster iteration. For example, the DeepSeek R1
+target owns its weight loading and explicitly composes its MLA projections,
+normalization, RoPE, and attention operations, allowing its execution path to be
+optimized within the target.
 
 ## Using it
 
+Set the `modeling_v2` LLM API flag to choose the model implementation:
+
+| `modeling_v2` | Behaviour |
+|---|---|
+| `off` (default) | Use the existing Modeling V1 implementation; disable Modeling V2. |
+| `auto` | Use a matching Modeling V2 implementation when available; otherwise use Modeling V1. |
+| `require` | Require a matching Modeling V2 implementation; raise an error if none is available. |
+
+For the Python API:
+
 ```python
-LLM(model, modeling_v2="require")        # off | auto | require
+LLM(model, modeling_v2="require")
 ```
+
+For `trtllm-serve`, set the same flag in the serving configuration:
 
 ```yaml
 # trtllm-serve --config serve.yaml
 modeling_v2: require
 ```
 
-| `modeling_v2` | Behaviour |
-|---|---|
-| `off` (default) | The resolver returns immediately. Nothing beyond it is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one claims this exact configuration; falls back to the built-in implementation otherwise, logging why. |
-| `require` | Raises instead of falling back, saying which criterion did not hold. |
+Use `require` when validating or benchmarking a Modeling V2 implementation
+so the run cannot fall back to Modeling V1.
 
-It is an LLM API argument rather than an environment variable so that it
-reaches every rank the way the rest of the arguments do; a variable set after
-MPI initialized reached the driver and not the workers, and a driver building
-a target while its workers build the built-in is exactly the split `require`
-exists to catch.
+## Families and targets
 
-The decision is one function, `route`, in the family's `routing.py`. It reads
-the facts that fix which code runs -- the checkpoint's config shape, the
-parallel mapping, the GPU's compute capability, the speculative-decoding
-config, the KV cache algorithm the engine will run with, and the engine choices
-it derives from the `ModelConfig` and the LLM arguments it is also given
-(such as the MoE backend, recurrent-state cache dtype and prefill CUDA graph
-backend) -- and either returns a target class or raises `NoTarget` with the
-reason in words. A target declines what its
-constructor would refuse, so that `auto` falls back instead of failing mid-build.
-Tuning knobs such as `max_batch_size`, `max_num_tokens` and the CUDA graph
-bucket lists are not routing inputs: they do not change which code runs, so a
-target claims a configuration regardless of them. `require` therefore promises
-that the target ran, not that a particular knob setting was measured. The model
-loader decides when it is about to build the model, after the built-in model's
-defaults have been applied to the arguments, and carries the answer on
-`ModelConfig.modeling_v2_target`.
+A **model family** groups related model implementations and owns their routing
+and family-shared code. A useful starting point is a model architecture in
+Hugging Face Transformers. Developers can choose a broader scope by grouping
+related architectures, or a narrower scope by specializing around a subset of
+models or checkpoints, according to their implementation and ownership needs.
 
-**Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
-a configuration that misses a target's criteria silently gets the built-in
-implementation — and a performance curve measured that way reads as
-modeling_v2's. That is the single most expensive mistake available here.
+A **target** is a self-contained model implementation selected by routing or
+dispatch for a defined set of supported configurations or execution conditions.
+Self-contained describes its ownership and isolation: a target can reuse
+family-shared code, catalog operations and runtime services.
 
-The predecessor `MODELING_V2_TARGET` is gone. It named a *target*; this names
-only a mode, and routing picks the target from the configuration.
+The family/target hierarchy is part of the design: a family lives under
+`modeling_v2/models/<family>/`, and its targets live under
+`modeling_v2/models/<family>/<target>/`. The package name identifies the
+implementation; its routing and dispatch logic define the conditions it supports.
 
-The checkpoint is read exactly as published, with no target-owned
-`config.json`.
+In this guide, "target" refers to the whole implementation package. A target may
+contain runtime specializations for different execution paths; classes named
+`PrefillTarget` and `DecodeTarget` are examples of specializations within a target.
 
-## How a config finds its target
+## Designing a target
+
+Choose a target's scope around the checkpoint, GPU architecture,
+parallel topology and features that affect the computation. A target can cover
+multiple configurations when they share an implementation; introduce a specialized
+target when a deployment needs a different execution path.
+
+For example, the
+[DeepSeek R1 NVFP4 target](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/)
+belongs to the `deepseek_v3` family and supports SM100 and SM103 across the
+parallel layouts admitted by its router.
+Its `default` suffix identifies an implementation that handles multiple layouts.
+
+Keep model construction, forward execution, weight loading and specialized kernels
+within the owning family or target. Reuse runtime services for scheduling, cache
+management, distributed execution, sampling and serving.
+
+### Model lifecycle
+
+Targets integrate with TensorRT-LLM through the existing `DecoderModel` and
+`DecoderModelForCausalLM` lifecycle interfaces. Targets can inherit, override or
+delegate their implementations as needed:
+
+* **Construction:** establishes the model structure and parameters.
+* **`load_weights`:** loads checkpoint weights into the model. Weight mapping,
+  transformation and sharding may be handled by loaders or helpers.
+* **`post_load_weights`:** provides post-load preparation, such as weight transforms
+  and derived execution state. A default implementation is available; override or
+  extend it when the target needs additional preparation.
+* **`forward`:** executes the model using the inputs and metadata supplied by the
+  engine.
+
+The conventional target files are `modeling.py` for construction and execution,
+and `weights.py` for checkpoint mapping, loading and sharding. Keep the operator
+sequence and its arguments easy to follow. Families may use helpers, modules and
+separate prefill/decode implementations when those improve clarity or performance.
+See the [GPT-OSS implementation](models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py)
+and its [weight loader](models/gpt_oss/gpt_oss_120b__sm_10x__default/weights.py)
+for an example.
+
+### Routing
+
+Each model family defines a `route` function in its `routing.py`; see
+[DeepSeek R1 routing](models/deepseek_v3/routing.py) for an example. It selects
+a target from the model configuration, GPU architecture, parallel topology
+and relevant engine options, or raises `NoTarget` if none matches. Reject
+unsupported configurations with a reason that explains which requirement failed.
+
+The loader applies model defaults before resolving the target and constructs the
+selected class through the model lifecycle. Targets are selected through their
+family's router, alongside the existing Modeling V1 model registry.
 
 ```
 LLM(model=..., modeling_v2=...)  ->  ModelLoader
@@ -86,332 +134,233 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                      returns that class; the registry is not consulted
 ```
 
-## What may decide a target
+Use engine-lifetime configuration to select a deployment target. Handle changing
+batch composition and prefill/decode decisions inside the target.
 
-A quantity may be a routing criterion only if it is known when
-`_resolve_class` runs **and** constant for the engine's life — and only if it
-changes the *structure of the forward*. Config shape, SM version, parallel
-topology qualify. `max_num_tokens` and `cuda_graph_config.max_batch_size` pass
-the first test and fail the second: they are tuning knobs — LLM API arguments,
-not identity. Batch composition and `num_contexts` fail the
-first outright — those move every step, and a target chosen from them would
-be chosen once and then be wrong. Per-step specialization is a separate
-mechanism (dispatch inside a target's `forward`), not a routing dimension.
+Routing uses checkpoint configuration fields to recognize a supported model shape.
+A fine-tuned checkpoint with the same shape may select the same target, but its
+accuracy still needs to be evaluated on that checkpoint.
 
-### Checkpoint identity is a shape fingerprint
+## Code organization and ownership
 
-Routing recognizes a checkpoint by `(num_hidden_layers, hidden_size, ...)`,
-the same sniffing idiom as `is_mla` / `is_nemotron_hybrid` upstream. It cannot
-tell a fine-tune from the original. That is a deliberate trade, and it changes
-what a gate record means: not "this target passed" but "this modeling code
-passed **on the checkpoint the accuracy gate names**". Running it on any other
-checkpoint of the same shape is ungated.
+Use three ownership scopes:
 
-## Layout
+| Scope | Use for | Location |
+|---|---|---|
+| Target | Code specific to a deployment target | `models/<family>/<target>/` |
+| Family | Code shared by targets in one model family | `models/<family>/` |
+| Catalog | Operations shared across model families | `catalog/<category>/` |
 
-The tree below is a suggested convention. Each model family can organize its
-internal ops, kernels and helpers to suit its implementation, while keeping
-family-owned code isolated from unrelated families and sibling-target
-implementations. Shared code within a family can live at family scope.
+Preserve isolation between unrelated families and between sibling-target
+implementations. Share family code at family scope instead of importing it from a
+sibling target. Code duplication is acceptable when it keeps targets independent;
+consolidation is a family-level decision.
 
+### Shared structure
+
+The top-level structure defines the shared architecture, ownership boundaries and
+registration points. Keep cross-family operations in `catalog/`, model families
+in `models/<family>/`, and targets within their owning family.
+
+```text
+modeling_v2/
+├── _router_index.py                 # Family registration and target resolution
+├── _native.py                       # Native family-library loading
+├── catalog/
+│   ├── _op.py                       # Operation contract and test-cell definitions
+│   └── <category>/                  # Operations shared across families
+└── models/
+    └── <family>/
+        ├── routing.py               # Target selection
+        └── <target>/                # Target-owned implementation
 ```
-_router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
-_native.py          loads a target's native code (see "Native code" below)
+
+Target directory names contain the checkpoint, GPU architecture and parallel
+configuration, for example `gpt_oss_120b__sm_10x__default`. The target class name
+carries the same identity. Register a new family's route with `@routes(...)` and
+import that routing module in `models/__init__.py`.
+
+### Family and target internals
+
+Within a family or target, choose the organization that suits its implementation.
+Use the following layout as a starting convention; wrappers and kernels may live
+together, and families may introduce their own helpers and submodules.
+
+```text
 models/<family>/
-  routing.py        one forward-reading decision tree per architecture family
-  ops/<category>/   entries shared only by this family
-  kernels/          family-owned CuTe DSL packages
-  fake_ops.py       fakes of the family's shared native ops, if it has any
-  csrc/             the family's CMakeLists.txt and the native code its targets share
-  <checkpoint>__<gpu arch>__<parallel>/
-                      modeling.py  weights.py
-                      ops/<category>/   entries only this target calls
-                      kernels/<category>/  kernel sources its entries launch (optional)
-                      fake_ops.py       fakes of the target's native ops, if it has any
-                      csrc/             the target's own kernels and torch bindings
-catalog/<category>/ entries shared across model families
+├── ops/, kernels/                   # Optional family-shared implementation
+└── <target>/
+    ├── modeling.py                  # Model construction and execution
+    ├── weights.py                   # Weight mapping, loading and sharding
+    └── ops/, kernels/               # Optional target-owned implementation
 ```
 
-By convention, `ops/` holds operation wrappers and `kernels/` holds their
-kernel implementations. Matching category directories and a `common/`
-directory for shared helpers can make the relationship easy to follow;
-families may also co-locate wrappers and kernels.
+Preserve the entry points used by routing and the model lifecycle. Native build
+declarations, sources and fake registrations follow the locations required by the
+build and loader; see the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
 
-An entry, shared or owned, is one `OpWrapper` subclass: `__call__` is the op
-call a target makes, `reference` is what it is supposed to compute in plain
-torch, `is_valid` names the inputs it accepts and answers wrongly, and `CELLS`
-/ `ARCHS` are the configurations and architectures it is proven at. The
-wrapper is stateless and `__call__` reads nothing off `self`, so a call site
-shows exactly what the kernel receives; `catalog/_op.py` states the rest.
+Place tests under `tests/` at the ownership level corresponding to the code they
+validate: shared catalog, family or target. Follow the code's internal layout
+where useful; see [Testing and validation](#testing-and-validation) for the test
+directory conventions.
 
-Accuracy anchors are not kept here. They live where every other model's do,
-`tests/integration/defs/accuracy/references/`, read by the accuracy gates.
+## Writing operations
 
-An entry's GPU test lives in the tests tree. A suggested layout mirrors the
-entry's ownership scope:
+Use thin operation wrappers to make kernel calls and their contracts explicit.
+The [OpWrapper interface](catalog/_op.py) defines:
 
-```
-tests/unittest/_torch/modeling_v2/
-  test_modeling_v2_claims.py     source-level gates over the whole package (no GPU)
-  test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
-  _validating.py                 the fixtures that interpose is_valid and arm reference
-  <category>/test_modeling_v2_<entry>.py                      shared entries
-  models/<family>/test_<entry>.py                            family-owned entries
-  models/<family>/<target>/<category>/test_modeling_v2_<entry>.py   owned entries
-  comm/_<entry>_op_matrix.py   the collectives' rank bodies
-  comm/_lockstep.py            the stateful matrices' launcher and shared reference
-  comm/_rank_job.py            starts one at a world size and asserts on its exit code
-  models/<family>/<target>/comm/_<entry>_op_matrix.py   an owned collective's rank bodies
-```
+| Member | Purpose |
+|---|---|
+| `__call__` | Invoke the operation with explicit arguments. |
+| `reference` | Express the expected computation in PyTorch. |
+| `is_valid` | Reject inputs known to be accepted by the underlying operation but computed incorrectly. |
+| `CELLS` | Describe the input configurations used to validate the operation. |
+| `ARCHS` | Declare the GPU architectures covered by that validation. |
 
-Tests and test-only helpers belong under `tests/`. A family can group its
-tests at family level or mirror its target directories. Operation tests are
-parametrized off the entry's `CELLS` and compare `__call__` against `reference`
-within a band the test states and derives.
+Keep wrappers stateless: weights, workspace, batch state and configuration are
+explicit call arguments. The target owns persistent execution state. Implement
+`reference` and `is_valid` with compatible call signatures; a collective reference
+may take the whole group's inputs when its result depends on other ranks.
 
-The collectives' rank bodies sit in the tests tree with everything else
-that only tests run. Both halves are started by file path -- the launcher must
-not import `tensorrt_llm`, because that calls `MPI_Init` and an
-MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
-by absolute import -- so neither needs a package to live in. Neither those
-file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed sequence over one job's ranks that cannot run as
-independent cases. A stateful entry's launcher also takes
-`--world-size N --launcher srun`, which runs the same
-body as one of N ranks started across nodes: that is how its multi-node
-receipt is recorded.
+`is_valid` is a test-time contract, not an automatic guard on the production call
+path. Use the helpers in
+[tests/_validating.py](../../../../tests/unittest/_torch/modeling_v2/_validating.py)
+to exercise it. Derive numerical tolerances in the test, accounting for
+accumulation order, quantization and output dtype. The reference should be at
+least as precise as the computation it checks.
 
-Stateful matrices compare ordered per-tensor SHA-256 fingerprints of raw
-bytes together with shape and dtype across ranks.
+Extend the cells and tests when using an operation with new target-specific
+shapes, layouts or dtypes. A configuration outside the validated cells is
+unverified; acceptance by the kernel alone does not establish correctness.
 
-Identity is the directory name, and it carries all three segments:
-`gpt_oss_120b__sm_10x__default`. They were three nested directories once, which
-read as a hierarchy that was never one -- every level had exactly one child,
-and each needed an `__init__.py` whose only job was to exist. The class name
-carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
+## Native code
 
-### Native code
+For model-owned C++/CUDA code, see the
+[native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
+It covers source placement, family libraries, operation and fake registration,
+build configuration and loading.
 
-A target's model-owned C++/CUDA belongs with its Python code: `<target>/csrc/`,
-and the family's `csrc/` for code several targets share. The family-library
-build discovers `models/<family>/csrc/CMakeLists.txt` and builds one torch-op library,
-`libth_modeling_v2_<family>.so`, installed next to `libth_common.so`; nothing of it is
-linked into the stock libraries, and it loads only when routing picks one of the
-family's targets. Adding a model with kernels edits nothing under `cpp/`.
-`models/gpt_oss/` is the example: one kernel, used by its weight loader.
+## Testing and validation
 
-The shared discovery, namespace macros and linker script live under
-`cpp/tensorrt_llm/modeling_v2/`; the build helpers are in
-`cpp/cmake/modules/modeling_v2.cmake`. See the native infrastructure's
-[README](../../../../cpp/tensorrt_llm/modeling_v2/README.md) for that layout.
+Keep tests and test-only helpers under `tests/`, organized by the ownership scope
+of the code they validate. Within each family or target, the test layout can
+follow the implementation's organization. The suggested locations are:
 
-Adding native code to target `foo_nvfp4__sm_103__tp4` of family `foo`:
+| Tests | Suggested location |
+|---|---|
+| Routing and package contracts | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
+| Shared operation tests | `tests/unittest/_torch/modeling_v2/<category>/` |
+| Family-shared tests | `tests/unittest/_torch/modeling_v2/models/<family>/` |
+| Target-specific tests | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
+| Whole-model accuracy tests | `tests/integration/defs/accuracy/modeling_v2/test_<family>.py` |
+| Accuracy references | `tests/integration/defs/accuracy/references/` |
 
-1. **Declare it** in `models/foo/csrc/CMakeLists.txt`:
+### Whole-model validation
 
-   ```cmake
-   add_modeling_v2_family(foo)
-   add_modeling_v2_target(foo foo_nvfp4__sm_103__tp4 ARCHS 103a SOURCES *.cu *.cpp)
-   ```
+Validate each target and feature path with `modeling_v2="require"`:
 
-2. **Write the kernels and their torch bindings** in `foo_nvfp4__sm_103__tp4/csrc/`, in
-   the target's namespaces:
+* **Boot:** construct the engine, load the weights and generate short deterministic
+  continuations. Check weight coverage and basic execution.
+* **Accuracy:** use the checkpoint's evaluation protocol and reference tolerance.
+  Re-evaluate when changes affect model numerics, weight loading or execution.
 
-   ```cpp
-   TRTLLM_MV2_NAMESPACE_BEGIN   // tensorrt_llm::modeling_v2::foo::foo_nvfp4_sm_103_tp4
-   ...
-   TRTLLM_MV2_NAMESPACE_END
-   TRTLLM_MV2_LIBRARY_FRAGMENT(m) { m.def("my_op(Tensor x) -> Tensor"); }
-   TRTLLM_MV2_LIBRARY_IMPL(CUDA, m) { m.impl("my_op", &TRTLLM_MV2_NS::myOp); }
-   ```
+Keep workload settings and measured results with the tests or evaluation report.
 
-   Include the family's own headers from `models/` (`"foo/foo_nvfp4__sm_103__tp4/csrc/x.h"`);
-   any stock header is fine, another target's or family's code is not.
+## FAQ
 
-3. **Load it** from the target's `__init__.py`, `native_ops = load_target_ops(__name__)`
-   (from `_native`); the target's modules use `from . import native_ops`.
+### Will duplication between models make the codebase unmanageable?
 
-4. **Fake every op** in the target's `fake_ops.py`, which the loader imports right after
-   the library opens: `@torch.library.register_fake(f"{namespace_of(__name__)}::my_op")`.
+Some duplication is expected. Its cost should be evaluated across the full
+software lifecycle: development, review, testing, optimization and maintenance.
+Several factors can make that trade-off worthwhile:
 
-5. **Test it** under `tests/unittest/_torch/modeling_v2/models/foo/`, including
-   the native operation's reference comparison and fake implementation.
+* **Simpler implementations:** each family or target can focus on the configurations
+  it supports, with fewer branches and abstractions to accommodate unrelated
+  models. This can make its code easier to understand, review, test, debug and
+  optimize, even when similar code exists elsewhere.
+* **Agent-assisted maintenance:** coding agents can generate specialized code and
+  help port fixes and features between implementations. This can reduce the cost of
+  maintaining similar code; ported changes still need validation in each affected
+  implementation.
+* **Selective sharing:** reusable code can move to family scope, and standard
+  operations used across families can move to the shared catalog. Sharing remains
+  available when the behavior and interfaces are sufficiently common.
 
-Code several targets call goes once in the family's `csrc/`, declared with
-`add_modeling_v2_shared(foo ARCHS ... SOURCES ...)`; its ops are in `torch.ops.mv2_foo`,
-reached with `load_family_ops(__name__)` and faked in `models/foo/fake_ops.py`. A target
-with no code of its own declares no `SOURCES`.
+Model-specific optimizations can stay local without first being generalized.
+Fixes that clearly benefit existing users of common code can still be made in
+the shared implementation.
 
-- **`ARCHS`** (`NN`, `NNa`, `NNf`) is intersected with the build's architectures; a target
-  with none is not built, and is a `NoTarget` at run time. `REQUIRES` (`MULTI_DEVICE`,
-  `NVSHMEM`) and `DEPS` (a closed list) are the other keywords; a per-file compile option
-  goes on the file with `set_source_files_properties`.
-- **Loading**: a library this installation does not carry, or a target it did not build,
-  is a `NoTarget` (`auto` keeps the built-in model); one that is installed but fails to
-  load, or lacks an op a `fake_ops.py` declares, is a `NativeLoadError`.
-- **Building only your family**: `build_wheel.py -D "TRTLLM_MODELING_V2_TARGETS=foo/*"`, and
-  after an edit `cmake --build cpp/build --target th_modeling_v2_foo`.
-- `test_modeling_v2_native_claims.py` checks these rules on CPU; run it before sending the PR.
+Duplication still adds maintenance work. The aim is to balance that work against
+the clarity, isolation and faster iteration gained from independent implementations.
+The benefit should be judged by the effort needed to develop and maintain the
+implementations over time.
 
-### Default and specialized targets
+### How does Modeling V2 make code review easier?
 
-The parallel segment of a target's name is either one topology (for
-example `dep4`) or `default`. A `default` target computes its weight shapes
-from the engine's `Mapping` and covers every layout its routing module
-admits. A named topology is a specialization, written only where one layout
-earns its own forward, and routing tries it before the default. This keeps
-the number of targets proportional to the specializations someone chose to
-write, not to the number of layouts a model is deployed at. Neither model
-has one today: the default forward computes the same thing at every layout
-a specialization once served.
+Coding agents can produce large specialized implementations. For example, the
+[Kimi K3 integration in PR #20893](https://github.com/NVIDIA/TensorRT-LLM/pull/20893)
+contains over 70,000 added lines, including model-specific kernels, target
+implementations and tests. Reviewing every generated kernel line in depth scales
+poorly. Modeling V2 gives reviewers explicit ownership boundaries so they can
+focus their effort according to the impact of each change.
 
-The architecture segment `sm_10x` covers sm_100 (B200, GB200) and sm_103
-(B300, GB300): both run the same kernels, and every entry the two targets
-call is certified on both. A node holds four GPUs on GB200/GB300 and eight
-on B200/B300, so the same layout can sit inside one node on one machine and
-span two on the other; the target picks its allreduce from the mapping, not
-from the GPU name.
+* **Runtime interfaces and shared code:** review these carefully because changes
+  can affect multiple consumers. This includes model/runtime contracts, common
+  runtime behavior, and operations shared across targets or families.
+* **Target structure:** review the implementation's scope, routing, weight loading
+  and high-level execution flow. Confirm that model-specific changes remain
+  isolated and that dependencies on shared components are explicit.
+* **Isolated model-specific kernels:** use a more focused review centered on the
+  operation contracts, test results, accuracy and performance evidence. Detailed
+  inspection can concentrate on unclear assumptions, failures or suspicious
+  results, without requiring the same line-by-line depth for every generated
+  kernel as for shared infrastructure.
 
-`gpt_oss_120b__sm_10x__default` is the first, and gpt-oss's only target. It
-admits 12 layouts, the ones it has been gated on: tp1, tp2 (MoE split by
-intermediate or by expert), tp4 (by intermediate, by expert, or tp2 x ep2),
-tp8 (by intermediate or by expert), dep2, dep4 (by expert or tp2 x ep2) and
-dep8. No layout has a specialization: at one GPU the default forward is the
-single-GPU forward, with no collective. The layout is settled once, when a
-target is constructed, not by branching in the forward: at one GPU both
-residual-norm slots are the local fused-add norm; under attention TP they are
-an allreduce with the norm fused in (`comm/allreduce` inside one node,
-`comm/mnnvl_allreduce` across the trays of an NVLink domain); under attention DP they are the local
-fused-add norm and the MoE runs between `comm/allgather` and
-`comm/reducescatter`. Routing also refuses three mapping facts the table does
-not show: an attention TP size other than the TP size, lm_head TP under
-attention DP, and attention TP across nodes without multi-node NVLink (the
-built-in model falls back to NCCL there; the target has no such path).
+The reduced review scope depends on verified isolation and clear ownership.
+Shared changes within a large model contribution still deserve careful review;
+being part of a model-specific PR does not make those changes isolated.
+Keep shared changes easy to identify and, when practical, review them separately
+from the target integration.
 
-Where it differs from the built-in `GptOssForCausalLM` at the same layout:
+### Do I have to use a particular agent or workflow?
 
-| | built-in | default target |
-|---|---|---|
-| allreduce inside one node | `AllReduce` module: symmetric memory, then the raw op with a strategy autotuner | the raw op with AUTO: one-shot / two-shot over the IPC workspace |
-| MoE under attention DP, pure EP | all-to-all (NVLink one-sided first) when available | always allgather + reduce-scatter |
-| embedding under attention TP | vocab-split, then gathered | replicated on every rank |
+No. The reference agent workflow is one way to develop Modeling V2 implementations.
+Developers can use their own agents, skills or direct implementation. The same
+flexibility applies to later fixes and optimizations.
 
-Across trays the two agree: both run the MNNVL kernel with the norm fused
-in, the built-in model through `MNNVLAllReduce` and this target through
-`comm/mnnvl_allreduce`.
+What matters is that the implementation follows the shared interfaces, has clear
+ownership and isolation, and has evidence supporting its correctness and performance.
+Choose the workflow that helps you achieve these goals.
 
-`r1_0528_nvfp4__sm_10x__default` is the second, and the only deepseek
-target: at dep4 it computes what a dep4 specialization would, so there is
-none. It admits tp2, tp4 and tp8 (experts split by intermediate or by
-expert, tp4 also by tp2 x ep2, and tp8 also by tp4 x ep2 and tp2 x ep4),
-dep2, dep4 with experts split by expert, by intermediate or tp2 x ep2, dep8
-with experts split by expert, by intermediate or tp2 x ep4, and dep16. dep16
-runs the same allgather and reduce-scatter round trip as dep8. The bitwise
-collective matrices stop at 8 ranks: their exact value sets and the ring
-summation order they pin hold only up to there. So dep16 rests on the gsm8k
-run that admitted it. Under attention TP a rank holds its share of the 128
-MLA heads (`q_b_proj` and `kv_b_proj` rows, `o_proj` columns) and of every
-dense MLP and shared expert; `q_a_proj`, `kv_a_proj_with_mqa` and the latent
-KV cache are the same on every rank. The residual-norm slots and the
-attention-DP round trip are bound the same way as gpt-oss's.
+### Who owns and reviews a family or target?
 
-The checkpoint's MTP layer (one-model MTP-Eagle) is one more decoder layer of
-this target, cut per rank like the others and run through the same
-residual-norm slots and expert round trip. Its experts are bf16 -- modelopt
-excludes layer 61 from NVFP4 -- so they go to `fused_moe`, an entry this
-target owns, rather than the NVFP4-only trtllm-gen runner. The forward
-computes the MTP layer at every layout, but routing admits a
-`speculative_config` only at the six its draft acceptance was measured at:
-dep4, tp4, tp4+ep4, dep4 with experts split by intermediate, tp8 with tp2 x
-ep4, and dep8 -- each residual-norm path and each expert split.
+The developers contributing a family or target should also take responsibility
+for its maintenance, including its specialized kernels and tests. Record that
+ownership in [CODEOWNERS](../../../../.github/CODEOWNERS).
 
-Where it differs from the built-in `DeepseekV3ForCausalLM` at the same layout,
-beyond the two allreduce and all-to-all rows above:
+Model owners review the implementation's content and quality. Modeling V2
+maintainers focus on the shared design, interfaces and organization. Changes to
+common runtime code or shared operations also need review from the owners of
+those components, following the repository's normal review requirements.
 
-| | built-in | default target |
-|---|---|---|
-| dense MLP (layers 0-2) at tp8 over two trays | split 4 ways inside a tray (`_compute_mlp_tp_size`) | split 8 ways, completed by the same allreduce |
-| fusions around the norms | NVFP4 quantization fused into the norm, MoE allreduce fused with the residual add | separate quantize and norm calls |
+### Does Modeling V2 replace V1 or require different user APIs?
 
-### Why beside `_torch/models/`, not inside it
+Modeling V1 and V2 coexist. Adding a V2 implementation does not require migrating
+existing V1 models. Developers can choose the implementation approach that fits
+their model and optimization needs.
 
-Targets are not registered in the model zoo: `route` returns the class and the
-loader builds it. Inside `_torch/models/` they would still be swept up by the
-zoo's own guards -- `test_lazy_model_zoo.py` scans that directory and expects
-every modeling module there to appear in the built-in static index.
+Users continue to use the LLM API and `trtllm-serve`. The `modeling_v2` flag
+selects the implementation, as described in [Using it](#using-it). Modeling V2 is
+currently opt-in, with `off` as the default.
 
-Conceptually `models/` means "one architecture, one class, shared across
-checkpoints", which is the opposite of what this package is for.
+### What stays shared? Is Modeling V2 a separate inference engine?
 
-## Gates
+Modeling V2 runs within TensorRT-LLM. It reuses the serving runtime and common
+services such as scheduling, cache management, distributed execution and sampling,
+along with general-purpose operations. Families and targets own their model logic
+and specialized implementations.
 
-1. **Boot** — minutes, binary. `examples/llm-api/quickstart_advanced.py` with
-   the target's topology flags and `modeling_v2=require` passed. Engine
-   cold start, weight-manifest coverage, a handful of greedy continuations.
-   Catches catastrophes, not accuracy. A variant that changes the forward gets
-   its own minutes-scale gate on the same footing.
-2. **Accuracy** — the release criterion. `trtllm-eval` with the protocol from
-   `tests/integration/defs/accuracy/references/` and `modeling_v2=require`
-   passed. One-sided: measured >= reference − tol. Whole-model gates live in
-   `tests/integration/defs/accuracy/modeling_v2/test_<family>.py`.
-3. **Acceptance** — required whenever a variant is distribution-preserving by
-   construction, speculative decoding above all. Rejection sampling holds the
-   emitted distribution to the target model's, so a *miscomputed* draft path
-   produces correct text more slowly: boot passes, accuracy passes, only
-   speed moves. The detector is `acceptance_length` against the same
-   checkpoint under stock in-tree modeling at the same workload and the same
-   `speculative_config` — i.e. `modeling_v2=off` versus `=require`,
-   which is now one variable rather than two harnesses.
-
-Compare a variant against an identity run **in the same session**: one target
-measured 94.7688 and 95.0720 on a bit-identical forward a day apart, so a
-cross-session delta carries session variance into the judgement.
-
-Perf is measured, never gated.
-
-## Validation contracts
-
-Certification is per architecture: `ARCHS` says where an entry's cells were
-driven; a missing architecture is unknown. The entry's tests describe the
-inputs and numerical tolerances behind its claim. Whole-model accuracy
-references live under `tests/integration/defs/accuracy/references/`.
-
-Matrix subprocesses use the launcher's interpreter and inherited Python search
-path to import the installed TensorRT-LLM package. Install a matching wheel or
-complete editable build before running them; an unbuilt checkout must not be
-prepended to `PYTHONPATH` in place of the installed package.
-
-### Numerical references
-
-A reference should be at least as precise as the operation it checks. State
-and derive the comparison band in the test, accounting for accumulation order,
-quantization and output dtype. For example, `cublas_mm` uses
-`true_fp32_matmul` to disable TF32 while computing its reference. An operation
-accepting a dtype or layout does not by itself certify that configuration;
-its cells and tests describe the coverage.
-
-### Engine metadata
-
-Targets use private engine metadata, so their step contracts must be checked
-against the engine that supplies it. `TRTLLM_MODELING_V2_VALIDATE=1` enables the
-opt-in check: a target calls its own `step_args` on the metadata it receives,
-covering the fields its forward consumes. Pass the setting through
-`LLM(env_overrides=...)` so it reaches the worker ranks.
-
-## Op ownership
-
-Use these three ownership scopes as the convention for organizing operations
-and their implementations:
-
-* **Target:** an entry specific to one deployment lives under
-  `models/<family>/<target>/ops/`, with target-owned kernels alongside it.
-* **Family:** entries and kernels shared within a model family can live under
-  `models/<family>/ops/` and `models/<family>/kernels/`.
-* **Catalog:** entries shared across model families live under
-  `catalog/<category>/`.
-
-When promoting an entry to a shared scope, move its test with it so the
-reference comparisons and certified cells stay attached to the operation.
-Each family chooses its internal structure and whether to consolidate
-similar implementations; it must preserve isolation from unrelated families
-and sibling-target implementations.
+The boundary can evolve as models need more customization. Model-specific runtime
+policy and adapters can be separated from shared services, while changes to common
+runtime behavior still need to account for other models. Further runtime
+specialization is active design work.
