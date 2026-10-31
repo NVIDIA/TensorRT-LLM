@@ -9,7 +9,8 @@ from typing import NamedTuple
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's block budget: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4. The op's own default, 2048, is the *token* budget.

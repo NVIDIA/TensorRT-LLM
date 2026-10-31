@@ -171,6 +171,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_ex
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     supports as _topk_expand_supports,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_select import (
+    qsa_topk_select,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.spec_rollback_commit import (
     spec_rollback_commit,
     spec_rollback_stage,
@@ -210,7 +213,6 @@ from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decod
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import qsa_paged_sparse_gqa_nvfp4_verify
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import takes_grouped as _verify_takes_grouped
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
-from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
