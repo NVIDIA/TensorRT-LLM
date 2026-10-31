@@ -1487,6 +1487,24 @@ class KVCacheManager(BaseResourceManager):
             return None
 
         beam_width = max_beam_width
+        if beam_width > 1:
+            # Each beam owns a copy of the partial last block and its new
+            # tokens, so a beam dummy can need several blocks. Report the
+            # shortage like the check above instead of failing the native
+            # allocation. Only the target cache is counted: speculative
+            # decoding requires beam width 1 (SpecSampler asserts it), so a
+            # draft cache never receives beam dummies.
+            new_tokens = self.num_extra_kv_tokens + (_kv_draft if is_gen else 0)
+            needed_blocks = 0
+            for i in range(len(request_ids)):
+                token_num = (token_nums[i] if token_nums is not None else 1 +
+                             max_num_draft_tokens)
+                if self.mapping.has_cp_helix():
+                    token_num = max(token_num, 2)
+                needed_blocks += self._num_blocks_to_completion(
+                    token_num, new_tokens, beam_width)
+            if available_blocks < needed_blocks:
+                return None
         requests = []
         batch_request_infos = []
         batch_llm_requests = []

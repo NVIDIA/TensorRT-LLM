@@ -1170,6 +1170,88 @@ class TestResourceManager(unittest.TestCase):
         finally:
             kv_cache_manager.shutdown()
 
+    def test_beam_dummy_returns_none_when_its_beams_do_not_fit(self):
+        """A beam dummy needs one private block per beam; with fewer free
+        blocks V1 returns None, as for an empty pool, instead of failing the
+        native allocation."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=2,
+            max_beam_width=4,
+            mapping=Mapping(),
+        )
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            # Leave two free blocks.
+            filler = kv_cache_manager.add_dummy_requests(
+                [0], token_nums=[(total_free - 2) * 8])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
+
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests([1],
+                                                    is_gen=True,
+                                                    max_beam_width=4))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 2)
+
+            kv_cache_manager.free_resources(filler[0])
+            requests = kv_cache_manager.add_dummy_requests([1],
+                                                           is_gen=True,
+                                                           max_beam_width=4)
+            self.assertIsNotNone(requests)
+            kv_cache_manager.free_resources(requests[0])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
+    def test_beam_dummy_capacity_counts_draft_blocks_of_every_request(self):
+        """Two width-4 generation dummies with four draft tokens each need two
+        blocks per beam (5 + 4 tokens), 16 in total; with 15 free blocks V1
+        returns None without allocating any."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=192,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=128,
+            max_batch_size=3,
+            max_beam_width=4,
+            mapping=Mapping(),
+        )
+        try:
+            total_free = kv_cache_manager.get_num_free_blocks()
+            filler = kv_cache_manager.add_dummy_requests(
+                [0], token_nums=[(total_free - 15) * 8])
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 15)
+
+            self.assertIsNone(
+                kv_cache_manager.add_dummy_requests([1, 2],
+                                                    is_gen=True,
+                                                    max_num_draft_tokens=4,
+                                                    max_beam_width=4))
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), 15)
+
+            kv_cache_manager.free_resources(filler[0])
+            requests = kv_cache_manager.add_dummy_requests(
+                [1, 2], is_gen=True, max_num_draft_tokens=4, max_beam_width=4)
+            self.assertIsNotNone(requests)
+            for request in requests:
+                kv_cache_manager.free_resources(request)
+            self.assertEqual(kv_cache_manager.get_num_free_blocks(), total_free)
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
