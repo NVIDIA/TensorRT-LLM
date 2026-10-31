@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import datetime
-import glob
 import logging as _logger
 import os as _os
 import pathlib as _pl
@@ -156,11 +155,11 @@ def parallel_run_ctest(
     env['CTEST_PARALLEL_LEVEL'] = str(parallel)
 
     def get_report():
-        reports = glob.glob("results-*.xml", root_dir=cwd)
-        if not reports:
-            return ''
-
-        return reports[0]
+        try:
+            report = cwd / command[command.index("--output-junit") + 1]
+        except (IndexError, ValueError):
+            return None
+        return report if report.is_file() else None
 
     report = None
     try:
@@ -169,13 +168,14 @@ def parallel_run_ctest(
     # Deliberately let timeout propagate. We don't want to retry on timeout
     except _sp.CalledProcessError:
         report = get_report()
-        if report == '':
+        if report is None:
             # Some catastrophic fail happened that there's no report generated
             raise
 
         # Avoid .xml extension to prevent CI from reading failures from it
-        parallel_report = 'parallel-' + report + ".intermediate"
-        _os.rename(cwd / report, cwd / parallel_report)
+        parallel_report = report.with_name('parallel-' + report.name +
+                                           ".intermediate")
+        _os.rename(report, parallel_report)
 
         try:
             _logger.info("Parallel test failed, retry serial on failed tests")
@@ -183,17 +183,17 @@ def parallel_run_ctest(
             command = [*command, "--rerun-failed"]
             run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)
         finally:
-            if not _os.path.exists(cwd / report):
+            if not report.exists():
                 # Some catastrophic fail happened that there's no report generated
                 # Use parallel result as final report
-                _os.rename(cwd / parallel_report, cwd / report)
+                _os.rename(parallel_report, report)
             else:
-                retry_report = 'retry-' + report + ".intermediate"
-                _os.rename(cwd / report, cwd / retry_report)
-                merge_report(cwd / parallel_report, cwd / retry_report,
-                             cwd / report)
+                retry_report = report.with_name('retry-' + report.name +
+                                                ".intermediate")
+                _os.rename(report, retry_report)
+                merge_report(parallel_report, retry_report, report)
     finally:
         if report is None:
             report = get_report()
         if report:
-            add_parallel_info(cwd / report, parallel)
+            add_parallel_info(report, parallel)
