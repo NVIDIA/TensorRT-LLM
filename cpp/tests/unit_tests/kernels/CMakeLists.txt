@@ -159,6 +159,16 @@ target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
 add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
+add_tllm_gtest(
+  moeFinalizeKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeFinalizeKernelTest.cu
+  FULL_STACK
+  LABELS
+  "unit;kernel;gpu"
+  REQUIRES_GPU)
 
 add_tllm_gtest(
   moeLoadBalanceKernelTest
