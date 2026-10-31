@@ -229,6 +229,38 @@ def test_llm_invalid_input_token_async():
             [42],
         ]
         fail_idx = [0]
+        # The invalid prompt is rejected by generate_async before submission;
+        # the valid request submitted before or after it must still complete.
+        for submit_order in [[0, 1], [1, 0]]:
+            print(f"submitting {submit_order}")
+            futures = []
+            for submit_idx in submit_order:
+                with _validate_invalid_token_error_scope(
+                ) if submit_idx in fail_idx else nullcontext():
+                    futures.append(
+                        llm.generate_async(
+                            prompts[submit_idx],
+                            sampling_params=SamplingParams(max_tokens=5),
+                        ))
+            for future in futures:
+                future.result()
+
+
+@force_ampere
+@pytest.mark.part0
+def test_llm_invalid_input_token_async_executor_check(monkeypatch):
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    with llm:
+        # Bypass the pre-submission check so the invalid prompt reaches the
+        # executor: its range check must fail only that request, through its
+        # future, while the other in-flight request completes.
+        monkeypatch.setattr(llm, "_check_prompt_token_ids",
+                            lambda *args, **kwargs: None)
+        prompts = [
+            [-1],
+            [42],
+        ]
+        fail_idx = [0]
         for submit_order in [[0, 1], [1, 0]]:
             for collect_order in [[0, 1], [1, 0]]:
                 print(f"submitting {submit_order}")
@@ -239,13 +271,19 @@ def test_llm_invalid_input_token_async():
                     ) for submit_idx in submit_order
                 ]
                 for collect_idx in collect_order:
-                    with _validate_invalid_token_error_scope(
-                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
-                    ):
-                        print(
-                            f"collect order {collect_order}, collecting {collect_idx}"
-                        )
+                    print(
+                        f"collect order {collect_order}, collecting {collect_idx}"
+                    )
+                    if submit_order[collect_idx] not in fail_idx:
                         futures[collect_idx].result()
+                        continue
+                    with pytest.raises(RuntimeError) as exc_info:
+                        futures[collect_idx].result()
+                    message = str(exc_info.value)
+                    assert "Token ID out of range" in message
+                    # The pre-submission check's wording; it must not be the
+                    # one that fired.
+                    assert "must be non-negative" not in message
 
 
 @skip_ray
