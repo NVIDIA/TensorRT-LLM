@@ -2118,6 +2118,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         local delay=\${4:-60}
                         local attempt=1
                         local tmp_path
+                        local import_tmp_dir
 
                         # Best-effort lock so racing jobs don't all import the same
                         # image. flock may be a no-op on some shared filesystems;
@@ -2139,12 +2140,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                         rm -f "\$tmp_path"
 
-                        until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
+                        # Unpack the image in a job-private directory instead of the
+                        # node's shared ENROOT_TEMP_PATH. See TRTLLMINF-548
+                        import_tmp_dir=\$(mktemp -d /tmp/enroot-import.XXXXXX)
+                        echo "Enroot import temp dir: \$import_tmp_dir"
+                        df -hP "\$import_tmp_dir" || true
+
+                        until ENROOT_TEMP_PATH="\$import_tmp_dir" enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
                         do
                             if ((attempt >= max_attempts))
                             then
                                 echo "enroot import failed after \$max_attempts attempts"
                                 rm -f "\$tmp_path"
+                                rm -rf "\$import_tmp_dir"
                                 flock -u 9 || true
                                 return 1
                             fi
@@ -2155,6 +2163,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             attempt=\$((attempt + 1))
                         done
 
+                        rm -rf "\$import_tmp_dir"
                         mv -f "\$tmp_path" "\$output_path"
                         flock -u 9 || true
                     }
