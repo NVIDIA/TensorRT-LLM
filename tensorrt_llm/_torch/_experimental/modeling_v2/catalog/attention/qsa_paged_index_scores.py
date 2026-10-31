@@ -6,14 +6,14 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Approved exception: QSA's selection path is Triton called as Python, with no
 # torch.ops boundary. The engine's own sparse hook (`select_qsa_paged_tokens`
 # in `_torch/attention/backends/sparse/qsa/module.py`) calls this same callable.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_index_scores as _triton_qsa_paged_index_scores,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 _CHECKPOINT = dict(
     heads=4,

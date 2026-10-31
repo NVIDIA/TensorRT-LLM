@@ -141,6 +141,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_mtp_reuse_topk import (
     qsa_mtp_reuse_topk,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -172,7 +175,6 @@ from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
-from .ops.attention.qsa_paged_index_scores__r20 import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store__r18 import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store__r25 import qsa_paged_kv_store
 from .ops.attention.qsa_paged_kv_store_nvfp4__r37 import qsa_paged_kv_store_nvfp4

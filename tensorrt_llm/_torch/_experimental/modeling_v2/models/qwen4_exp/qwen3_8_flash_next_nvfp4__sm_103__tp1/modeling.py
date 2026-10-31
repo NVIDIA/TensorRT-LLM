@@ -134,6 +134,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_mtp_reuse_topk import (
     qsa_mtp_reuse_topk,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_scores import (
+    qsa_paged_index_scores,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -169,7 +172,6 @@ from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
 from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
-from .ops.attention.qsa_paged_index_scores import qsa_paged_index_scores
 from .ops.attention.qsa_paged_index_store import qsa_paged_index_store
 from .ops.attention.qsa_paged_kv_store import qsa_paged_kv_store
 from .ops.attention.qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4
