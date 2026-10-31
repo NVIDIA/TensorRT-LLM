@@ -227,6 +227,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quan
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (
     fp8_quantize_1x128,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_triton_update import (
+    causal_conv1d_triton_update,
+)
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -255,7 +258,6 @@ from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
-from .ops.ssm.causal_conv1d_triton_update__r45 import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update__r29 import causal_conv1d_update
 from .ops.ssm.cu_seqlens_from_seq_lens__r33 import cu_seqlens_from_seq_lens
 from .ops.ssm.flashinfer_chunk_gated_delta_rule__r28 import flashinfer_chunk_gated_delta_rule

@@ -17,10 +17,11 @@ from typing import Optional, Union
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.mamba.causal_conv1d_triton import (
     causal_conv1d_update as _causal_conv1d_triton_update,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's GDN `[q|k|v]` width; the conv is width 4 over a 3-column pool.
 CKPT_DIM = 10240
@@ -151,7 +152,7 @@ class CausalConv1dTritonUpdate(OpWrapper):
                 snapshot_steps=8,
             ),
         ),
-        # This target's tep4 member (the MTP unit's): a rank's 4 k / 12 v heads.
+        # The unified target's tep4 member (the MTP unit's): a rank's 4 k / 12 v heads.
         Cell(
             why="tep4 verify, 1 row x 4 tok (MTP3) at 2560 / stride 4120, the 1874-slot page",
             spec=_tep4(1, 4),
@@ -185,7 +186,7 @@ class CausalConv1dTritonUpdate(OpWrapper):
     step), and 8 rows at seqlen 5 into an 8-step buffer (a buffer deeper than
     seqlen keeps its later steps untouched); bf16, W 4, no bias, SiLU only.
 
-    This target's tep4 member (the MTP unit's verify, `DecodeTarget._gdn_verify`):
+    The unified target's tep4 member (the MTP unit's verify, `DecodeTarget._gdn_verify`):
     a rank's 4 k / 12 v heads, so `x` is the `[n, 2560, p]` view of the q|k|v
     columns of the `[n * p, 4120]` in_proj output (strides `(p * 4120, 1,
     4120)`); the pool is one layer's view of the V2 manager's 36-layer conv page

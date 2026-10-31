@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_triton_update import (  # noqa: E501
+    causal_conv1d_triton_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm.fp8_gemv import (  # noqa: E501
     dequantize_fp8_block,
     fp8_gemv_conv1d_op,
@@ -16,9 +19,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     fp8_gemv_op,
     pack_weight,
     quantize_fp8_block,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_triton_update import (  # noqa: E501
-    causal_conv1d_triton_update,
 )
 
 assert torch.cuda.is_available(), "fp8_gemv requires a CUDA device"
