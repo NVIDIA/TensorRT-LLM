@@ -171,6 +171,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_ex
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     supports as _topk_expand_supports,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.spec_rollback_commit import (
+    spec_rollback_commit,
+    spec_rollback_stage,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
@@ -210,7 +214,6 @@ from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
 from .ops.attention.qwen4_exp_qk_norm_rope import qwen4_exp_qk_norm_rope
-from .ops.attention.spec_rollback_commit import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.verify_step_setup import _BLOCK_S as _VERIFY_SETUP_MAX_SEQS
 from .ops.attention.verify_step_setup import verify_step_setup
 from .ops.attention.vision_rope_2d import vision_rope_2d

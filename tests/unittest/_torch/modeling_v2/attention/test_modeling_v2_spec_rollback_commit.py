@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU tests for the spec_rollback_commit__r48 variant: `spec_rollback_stage` and
+"""GPU tests for the spec_rollback_commit variant: `spec_rollback_stage` and
 `spec_rollback_commit`, every cell through the entry's own reference, bitwise (both are data
 movement).
 
@@ -9,7 +9,7 @@ request's rows at consecutive positions on pages of their own, int32 `accepted` 
 `ids` and int64 `pages` / `within` as `SpeculativeRollback` hands them. The index-K planes are
 `[pages, 32, 1, 128]` bf16 views addressed through `plane_table`: separate buffers in the tp1
 cells, the KV cache manager's coalesced pool (12 planes side by side in a 49152-element page) at
-a tep4 rank's measured page count in this target's. Request 0's rows straddle the pool's first
+a tep4 rank's measured page count in the unified target's. Request 0's rows straddle the pool's first
 and last page and it accepts one row, so its rejected rows are restored on the last page, past
 2^31 elements from a plane's base. The pools are filled with a NaN pattern `randn` never draws
 and the trunk's writes are put at every row's slot, so a whole-pool count shows the commit
@@ -24,13 +24,13 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollback_planes import (  # noqa: E501
     plane_table,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.spec_rollback_commit__r48 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.spec_rollback_commit import (  # noqa: E501
     ROW,
     spec_rollback_commit,
     spec_rollback_stage,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "spec_rollback_commit requires a CUDA device"
