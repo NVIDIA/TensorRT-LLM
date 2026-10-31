@@ -514,10 +514,7 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             "midc",
             Kind.NUMERIC,
             _wide_steps,
-            gates=(
-                _router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),
-                _router_gate(Role.AGG, "aggregated servers at tep4 with max_batch_size 2..4"),
-            ),
+            gates=(_router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),),
         ),
         "wide_oproj_publish": Rule("midc", Kind.BITWISE, _wide_steps),
         "wide_finalize_transport": Rule(

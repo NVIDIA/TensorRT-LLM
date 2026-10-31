@@ -267,7 +267,7 @@ REGIONS = [
         "agg",
         (2, 3, 4),
         "windowed",
-        MIDC | {"wide_router_per_row"} | LL | {"half_window_experts"} | PREFILL,
+        MIDC | LL | {"half_window_experts"} | PREFILL,
         id="agg-caps-2-4",
     ),
     pytest.param(
@@ -366,6 +366,9 @@ def test_the_router_per_row_gates():
     assert on.on and on.source == "auto" and "gate" in on.why
     off = table((107, 4), 8, "agg", "windowed").decisions["wide_router_per_row"]
     assert not off.on and off.source == "gate"
+    for mbs in (2, 3, 4):
+        off = table((107, 4), mbs, "agg", "windowed").decisions["wide_router_per_row"]
+        assert not off.on and off.source == "gate", mbs
     assert not table((107, 4), 1, "agg", "windowed").on("wide_router_per_row")
 
 
@@ -555,7 +558,11 @@ def test_the_ladder_shapes_resolve_alike_on_agg_and_gen(key, mbs, arm):
         lever_table = table(key, mbs, role, "windowed", arm)
         return {n: (d.on, dict(d.params)) for n, d in lever_table.decisions.items()}
 
-    assert selection("agg") == selection("gen")
+    agg, gen = selection("agg"), selection("gen")
+    # The router-per-row accuracy gate holds on generation servers only.
+    gated = {"wide_router_per_row"} if gen.get("wide_router_per_row", (False,))[0] else set()
+    assert {n for n in agg if agg[n] != gen[n]} == gated
+    assert all(not agg[n][0] for n in gated)
 
 
 # --------------------------------------------------------------------------
