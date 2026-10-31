@@ -665,7 +665,7 @@ def test_tp4_experts_hold_the_rank_slice_zero_padded_per_half(configs, rank, exp
     zero-extended to 256 rows (FC2 to 256 columns) *before* the `[up ; gate]` concatenation,
     then interleaved, block-shuffled and swizzled as at the whole width. The bytes are
     nonzero, so every zero in the operand is padding. The scale swizzle is the formula
-    `fp4_block_scale_moe_runner__r4`'s test writes out, standing in for the native op on
+    `fp4_block_scale_moe_runner`'s test writes out, standing in for the native op on
     the CPU; the shrunk axes (FC1's input bytes, FC2's output rows) take no cut."""
     monkeypatch.setattr(WT, "_swizzle", _swizzle_flat)
     d = _dims(configs, "tp4", rank, mtp=False)

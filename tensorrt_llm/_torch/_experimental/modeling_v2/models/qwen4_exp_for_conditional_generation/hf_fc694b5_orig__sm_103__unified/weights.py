@@ -329,7 +329,7 @@ LOADED_EXPERT_SPLITS = ("ep", "tp")
 #: engine's own storage rule for an NVFP4 trtllm-gen shard
 #: (`NVFP4TRTLLMGenFusedMoEMethod.resolve_alignments`: a padded intermediate that is not a
 #: multiple of 128 drops to a 128 weight alignment), which turns tp4's 160 into 256, the
-#: width `fp4_block_scale_moe_runner__r4` certifies the padded 512-expert stack at. 640
+#: width `fp4_block_scale_moe_runner` certifies the padded 512-expert stack at. 640
 #: (tep4, dep4) is already a multiple.
 EXPERT_INTER_ALIGN = 128
 

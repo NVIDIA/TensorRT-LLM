@@ -195,7 +195,7 @@ def test_a_tp4_rank_holds_every_expert_at_its_padded_intermediate_slice(rank) ->
     """tp4 cuts attention and Gated-DeltaNet as tep4 does, and holds all 512 experts at a
     160-row intermediate slice stored 256 wide: the runner is handed the whole routing space
     (`local_expert_offset` 0, `local_num_experts` 512) at `intermediate_size` 256, the
-    stack `fp4_block_scale_moe_runner__r4` certifies, and the scalars span every expert."""
+    stack `fp4_block_scale_moe_runner` certifies, and the scalars span every expert."""
     core = _core(rank, _TP4)
     assert (core.heads_q, core.heads_kv, core.kv_head_start) == (6, 1, rank * 2 // WORLD)
     assert (core.num_k_heads, core.num_v_heads, core.attn_in_width) == (4, 12, 4352)

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp4_block_scale_moe_runner catalog entry."""
+"""GPU test for the fp4_block_scale_moe_runner catalog entry (with the qwen4 unified
+target's layouts merged in from its variant r4)."""
 
 import zlib
 
@@ -8,7 +9,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
     Fp4BlockScaleMoeRunner,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (  # noqa: E501
@@ -89,7 +90,12 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     geometry (512 experts, top-10, H 2560 / I 640) is the least strained:
     3.82 / 0.70 over its column, element tails re-drawn over 12 seeds up to
     10.67 at T=4096 with the RMS figure at 0.67-0.69, and 5.39 / 0.67 with
-    uniform rather than renormalized weights.
+    uniform rather than renormalized weights. The qwen4 unified target's
+    layouts of that stack sit in the same place, measured on GB300: its 13
+    cells (128- and 256-expert windows at I 640, the 512 stack at a 160-wide
+    intermediate zero-padded to 256) at most 9.22 / 0.72, the largest element
+    figure at T=8192 as everywhere; the windows swept over 1..8192 rows at most
+    8.60 / 0.72, and summed back to the 512 stack 4.03 / 0.86.
 
     Both were sized against deliberately wrong computations: a gate/up swap
     (263-278 ulp), a scalar-role swap (177/48), a missing scale swizzle
@@ -97,7 +103,10 @@ def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     FC1 requantization (43/28 element, 23/23 RMS). The smallest RMS distance
     any of them reaches is 39.8 at the deepseek geometries; at qwen4_exp's the
     same five land 223, 62, 265, 362 and 23 RMS ulp out, the last the closest
-    any wrong variant comes.
+    any wrong variant comes. The unified layouts add three more, all far out:
+    one window left out of the sum (>= 126 RMS ulp), the whole stack's weights
+    beside a window's scales (361-362), and tp4's padding applied after the
+    `[up | gate]` concatenation (289).
     """
     assert out.dtype == ref.dtype == torch.bfloat16, (out.dtype, ref.dtype)
     assert out.shape == ref.shape, (out.shape, ref.shape)
@@ -602,6 +611,78 @@ def _many_experts():
 _MANY_TOKENS = (1, 2, 3, 4, 5, 8, 16, 64, 256, 1024, 4096, 8192)
 
 
+# The qwen4 unified target's tp4 routed layer: all 512 experts at each rank's
+# 160-wide slice of the 640 intermediate (moe_tp 4). 160 breaks both layout
+# rules the kernel's operands need -- 2*I = 320 is not a multiple of the row
+# shuffle's and swizzle's 128, and I/16 = 10 is not a multiple of the swizzle's
+# 4 -- so the target pads each rank's slice to 256 (2*I = 512, I/16 = 16) with
+# zero codes and zero block scales: rows [160, 256) of the up and of the gate
+# half, and columns [160, 256) of the down projection.
+_TP4_LOGICAL_INTER = 160
+_TP4_PADDED_INTER = 256
+_TP4 = None
+
+
+def _pad_zero(codes: torch.Tensor, sf: torch.Tensor, dim: int, size: int):
+    """Extend a `(codes, scales)` stack with zero codes and zero (e4m3 +0.0)
+    block scales along `dim` (1 = rows, 2 = the K columns) to `size`."""
+    pad_codes = list(codes.shape)
+    pad_codes[dim] = size - codes.shape[dim]
+    pad_sf = list(sf.shape)
+    pad_sf[dim] = pad_codes[dim] if dim == 1 else pad_codes[dim] // SV
+    codes = torch.cat([codes, torch.zeros(pad_codes, dtype=codes.dtype, device=DEV)], dim=dim)
+    sf_u8 = torch.cat(
+        [sf.view(torch.uint8), torch.zeros(pad_sf, dtype=torch.uint8, device=DEV)], dim=dim
+    )
+    return codes.contiguous(), sf_u8.view(torch.float8_e4m3fn).contiguous()
+
+
+def _pack(codes: torch.Tensor) -> torch.Tensor:
+    return (codes[..., 0::2] | (codes[..., 1::2] << 4)).contiguous()
+
+
+def _tp4_padded():
+    """The tp4 layer, built once: kernel-ready operands at I = 256, reference
+    operands at I = 256 (the padded ones the kernel reads), and under
+    `ref["logical"]` the unpadded 160-wide operands -- the layer the padded one
+    has to compute."""
+    global _TP4
+    if _TP4 is None:
+        e, h, i, ip = 512, 2560, _TP4_LOGICAL_INTER, _TP4_PADDED_INTER
+        gen = torch.Generator(device=DEV).manual_seed(512160)
+        _, up_s, up_c = _rand_nvfp4(e, i, h, gen)
+        _, gt_s, gt_c = _rand_nvfp4(e, i, h, gen)
+        _, dn_s, dn_c = _rand_nvfp4(e, h, i, gen)
+        logical = dict(up=(up_c, up_s), gate=(gt_c, gt_s), down=(dn_c, dn_s))
+        up_cp, up_sp = _pad_zero(up_c, up_s, 1, ip)
+        gt_cp, gt_sp = _pad_zero(gt_c, gt_s, 1, ip)
+        dn_cp, dn_sp = _pad_zero(dn_c, dn_s, 2, ip)
+        up_p, gt_p, dn_p = _pack(up_cp), _pack(gt_cp), _pack(dn_cp)
+        w1, s1 = _prep_fc1(up_p, gt_p, up_sp, gt_sp)
+        w2, s2 = _prep_fc2(dn_p, dn_sp)
+        args = dict(
+            gemm1_weights=w1,
+            gemm1_weights_scale=s1,
+            gemm2_weights=w2,
+            gemm2_weights_scale=s2,
+            intermediate_size=ip,
+        )
+        ref = dict(
+            up=(up_cp, up_sp),
+            gate=(gt_cp, gt_sp),
+            down=(dn_cp, dn_sp),
+            raw=(up_p, gt_p, up_sp, gt_sp, dn_p, dn_sp),
+            logical=logical,
+            logical_raw=(_pack(up_c), _pack(gt_c), up_s, gt_s),
+            hidden=h,
+            inter=ip,
+            num_experts=e,
+            gen=gen,
+        )
+        _TP4 = (args, ref)
+    return _TP4
+
+
 def _renorm_routing(num_tokens, num_experts, top_k, gen):
     """Pre-routed ids/weights in the form a renormalising router emits.
 
@@ -621,14 +702,25 @@ def _renorm_routing(num_tokens, num_experts, top_k, gen):
 def test_layout_helpers_match():
     """The trtllm preprocessing ops reproduce the pure-torch layout exactly.
 
-    The last two scale shapes are the DeepSeek-R1 routed geometry's, at
+    The next two scale shapes are the DeepSeek-R1 routed geometry's, at
     H = 7168 / I = 2048: FC1 `[E, 2*I, H/16] = [E, 4096, 448]` and FC2
     `[E, H, I/16] = [E, 7168, 128]`. Both satisfy the swizzle's `M % 128 == 0`
     and `C % 4 == 0`, so `block_scale_interleave` returns exactly `E*M*C` bytes
     and reshapes back — no padding enters either operand at this geometry.
+    The last four are the qwen4 unified target's, at H = 2560: FC1 and FC2 at
+    I = 640 (`[E, 1280, 160]`, `[E, 2560, 40]`) and at tp4's I = 256
+    (`[E, 512, 160]`, `[E, 2560, 16]`), the 160-wide slice zero-padded.
     """
     gen = torch.Generator(device=DEV).manual_seed(201)
-    for rows, cols in ((256, 12), (4096, 448), (7168, 128)):
+    for rows, cols in (
+        (256, 12),
+        (4096, 448),
+        (7168, 128),
+        (1280, 160),
+        (2560, 40),
+        (512, 160),
+        (2560, 16),
+    ):
         x = torch.randint(0, 256, (4, rows, cols), dtype=torch.uint8, device=DEV, generator=gen)
         perm = _fc1_perm(rows)
         for e in range(x.shape[0]):
@@ -1709,6 +1801,320 @@ def test_many_experts_top10_geometry():
     )
 
 
+# The qwen4 unified target's expert-parallel windows of the 512-expert stack:
+# four 128-wide ones at tep4 and dep4, two 256-wide ones at dep2 (the disagg
+# engines). The token column: decode, the dep4 gathered batch and tep4's 128
+# requests, the MTP-7 verify of 128 requests, a prefill chunk at max_num_tokens.
+_UNIFIED_WINDOWS = (128, 256)
+_UNIFIED_TOKENS = (1, 128, 1024, 8192)
+
+
+def _renorm_weights(num_tokens: int, top_k: int, gen: torch.Generator) -> torch.Tensor:
+    """Slot weights summing to 1 per row, for a hand-placed routing."""
+    w = torch.rand(num_tokens, top_k, device=DEV, generator=gen) + 0.05
+    return (w / w.sum(-1, keepdim=True)).to(torch.bfloat16).contiguous()
+
+
+def test_unified_ep_windows_sum_to_the_512_stack():
+    """The unified target's split of the 512-expert stack into windows.
+
+    `num_experts` stays 512 on every call -- the router ranks every expert on
+    every rank -- while `local_expert_offset` walks the windows. Per window
+    width and token count: each window against its own reference, a row whose
+    token routes no slot into the window comes back bitwise zero, and the
+    windows' bf16 outputs summed in fp32 (what the target's all-reduce or
+    reduce-scatter adds) sit inside the gate against the 512-expert reference
+    -- while the sum with any one window left out lands far outside it. Then a
+    routing that puts every slot into the first 128-wide window: that window
+    reproduces the 512-expert call bitwise and the other three return zero.
+    """
+    args, ref = _many_experts()
+    num_experts, hidden, top_k = 512, 2560, 10
+    gen = torch.Generator(device=DEV).manual_seed(51228)
+    g1 = 137.0
+    worst_win = (0.0, 0.0)
+    worst_sum = (0.0, 0.0)
+    worst_drop = 1e9
+    for shard in _UNIFIED_WINDOWS:
+        windows = [(r * shard, shard) for r in range(num_experts // shard)]
+        win_args = [_window_args(args, off, n) for off, n in windows]
+        win_ref = [_window_ref(ref, off, n) for off, n in windows]
+        for num_tokens in _UNIFIED_TOKENS:
+            data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+            ids, wts = _renorm_routing(num_tokens, num_experts, top_k, gen)
+            g2 = _calibrate_g2(x, ids, ref)
+            s1, sg, s2 = _scalars(num_experts, g1, g2)
+            exp_full = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(
+                torch.bfloat16
+            )
+            parts = []
+            for (off, n), wa, wr in zip(windows, win_args, win_ref):
+                y = _call(
+                    data,
+                    sf,
+                    wa,
+                    num_experts,
+                    top_k,
+                    local_expert_offset=off,
+                    local_num_experts=n,
+                    topk_ids=ids,
+                    topk_weights=wts,
+                    **_window_scalars(s1, sg, s2, off, n),
+                )[0]
+                assert y.shape == (num_tokens, hidden), y.shape
+                exp = moe.reference(
+                    x,
+                    ids,
+                    wts,
+                    wr["up"],
+                    wr["gate"],
+                    wr["down"],
+                    g2,
+                    local_expert_offset=off,
+                    local_num_experts=n,
+                ).to(torch.bfloat16)
+                _compare(y, exp)
+                outside = ~((ids >= off) & (ids < off + n)).any(dim=1)
+                assert torch.equal(y[outside], torch.zeros_like(y[outside])), (
+                    f"window (off={off}, n={n}) wrote into rows whose token routes "
+                    f"entirely elsewhere ({int(outside.sum())} such rows at T={num_tokens})"
+                )
+                worst_win = tuple(max(a, b) for a, b in zip(worst_win, _dev(y, exp)))
+                parts.append(y)
+            summed = sum(p.float() for p in parts).to(torch.bfloat16)
+            _compare(summed, exp_full)
+            worst_sum = tuple(max(a, b) for a, b in zip(worst_sum, _dev(summed, exp_full)))
+            # Only once every window carries a settled share of the slots: at
+            # one token a window can legitimately hold none.
+            if num_tokens >= 128:
+                for drop in range(len(parts)):
+                    partial = sum(p.float() for i, p in enumerate(parts) if i != drop)
+                    _, rms = _dev(partial.to(torch.bfloat16), exp_full)
+                    assert rms > 25.0, (
+                        f"dropping window {drop} of {len(parts)} at T={num_tokens} is only "
+                        f"{rms:.1f} rms ulp away"
+                    )
+                    worst_drop = min(worst_drop, rms)
+
+    shard, num_tokens = 128, 64
+    data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+    ids = torch.stack(
+        [torch.randperm(shard, device=DEV, generator=gen)[:top_k] for _ in range(num_tokens)]
+    ).to(torch.int32)
+    wts = _renorm_weights(num_tokens, top_k, gen)
+    g2 = _calibrate_g2(x, ids, ref)
+    s1, sg, s2 = _scalars(num_experts, g1, g2)
+    full = _call(
+        data,
+        sf,
+        args,
+        num_experts,
+        top_k,
+        topk_ids=ids,
+        topk_weights=wts,
+        output1_scale_scalar=s1,
+        output1_scale_gate_scalar=sg,
+        output2_scale_scalar=s2,
+    )[0]
+    for off in range(0, num_experts, shard):
+        y = _call(
+            data,
+            sf,
+            _window_args(args, off, shard),
+            num_experts,
+            top_k,
+            local_expert_offset=off,
+            local_num_experts=shard,
+            topk_ids=ids,
+            topk_weights=wts,
+            **_window_scalars(s1, sg, s2, off, shard),
+        )[0]
+        if off == 0:
+            assert torch.equal(y, full), (
+                "the window holding every routed slot did not reproduce the 512-expert call bitwise"
+            )
+        else:
+            assert torch.equal(y, torch.zeros_like(y)), (
+                f"window off={off} holds no routed slot but returned nonzero rows"
+            )
+    print(
+        f"  test_unified_ep_windows_sum_to_the_512_stack OK (window {worst_win[0]:.2f} elt / "
+        f"{worst_win[1]:.2f} rms, sum {worst_sum[0]:.2f} elt / {worst_sum[1]:.2f} rms, "
+        f"one window dropped >= {worst_drop:.0f} rms ulp)"
+    )
+
+
+def test_tp4_zero_padded_intermediate():
+    """tp4's 160-wide slice, zero-padded to 256, computes the 160-wide layer.
+
+    The cells gate the padded call against the padded operands' reference and
+    against the unpadded 160-wide one. This adds the padding's own claims: the
+    two references agree, padding the concatenated `[up | gate]` stack (320
+    rows to 512) rather than each half moves gate rows into the up half and
+    lands far outside the gate, and naming the 160 a caller means rather than
+    the 256 the operands hold is rejected by the op itself.
+    """
+    args, ref = _tp4_padded()
+    num_experts, hidden, top_k = 512, 2560, 10
+    gen = torch.Generator(device=DEV).manual_seed(160256)
+    g1 = 137.0
+    num_tokens = 128
+    data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+    ids, wts = _renorm_routing(num_tokens, num_experts, top_k, gen)
+    g2 = _calibrate_g2(x, ids, ref)
+    s1, sg, s2 = _scalars(num_experts, g1, g2)
+    kw = dict(
+        topk_ids=ids,
+        topk_weights=wts,
+        output1_scale_scalar=s1,
+        output1_scale_gate_scalar=sg,
+        output2_scale_scalar=s2,
+    )
+    y = _call(data, sf, args, num_experts, top_k, **kw)[0]
+    logical = ref["logical"]
+    exp_logical = _ref_moe(x, ids, wts, logical, g2).to(torch.bfloat16)
+    exp_padded = moe.reference(x, ids, wts, ref["up"], ref["gate"], ref["down"], g2).to(
+        torch.bfloat16
+    )
+    _compare(y, exp_logical)
+    _compare(y, exp_padded)
+    # Measured 0.000 / 0.000: the zero pad adds nothing in the fp32 model, so
+    # the padded operands' reference is the 160-wide layer's.
+    ref_gap = _dev(exp_padded, exp_logical)
+    assert ref_gap[1] < 0.1, f"the padded and 160-wide references differ by {ref_gap} ulp"
+
+    # Padded after the concatenation: the kernel's `up` half is then
+    # up[0:160] + gate[0:96] and its `gate` half gate[96:160] + 192 zero rows.
+    up_lp, gt_lp, up_ls, gt_ls = ref["logical_raw"]
+    cat_c, cat_s = _pad_zero(
+        torch.cat([up_lp, gt_lp], dim=1),
+        torch.cat([up_ls.view(torch.uint8), gt_ls.view(torch.uint8)], dim=1).view(
+            torch.float8_e4m3fn
+        ),
+        1,
+        2 * _TP4_PADDED_INTER,
+    )
+    half = _TP4_PADDED_INTER
+    bw1, bs1 = _prep_fc1(cat_c[:, :half], cat_c[:, half:], cat_s[:, :half], cat_s[:, half:])
+    bad = _call(
+        data,
+        sf,
+        dict(args, gemm1_weights=bw1, gemm1_weights_scale=bs1),
+        num_experts,
+        top_k,
+        **kw,
+    )[0]
+    bad_dev = _dev(bad, exp_logical)
+    assert bad_dev[1] > 25.0, (
+        f"padding the concatenated stack is only {bad_dev[1]:.1f} rms ulp from the "
+        f"160-wide layer -- the gate would not catch it"
+    )
+    del bw1, bs1, cat_c, cat_s
+    torch.cuda.empty_cache()
+
+    # Loud either way: the runner's default-config lookup for the GEMM shape
+    # the wrong width names (M=T, N=2*160) finds no kernel before the shape
+    # checks would compare 160 with the 512 FC1 rows.
+    with pytest.raises(RuntimeError, match="No valid config found|intermediate_size has incorrect"):
+        _call(data, sf, args, num_experts, top_k, **kw, intermediate_size=_TP4_LOGICAL_INTER)
+    print(
+        f"  test_tp4_zero_padded_intermediate OK (kernel vs 160-wide reference "
+        f"{_dev(y, exp_logical)[0]:.2f} elt / {_dev(y, exp_logical)[1]:.2f} rms; padded vs "
+        f"160-wide reference {ref_gap[0]:.3f} / {ref_gap[1]:.3f}; padded after the "
+        f"concatenation {bad_dev[0]:.0f} elt / {bad_dev[1]:.0f} rms ulp)"
+    )
+
+
+def test_window_weights_must_hold_only_the_window():
+    """The op compares the scales' and scalars' expert dimension with
+    `local_num_experts`, not the weights'. Handed the whole 512-stack's
+    `gemm1_weights` or `gemm2_weights` beside a 128-wide window's scales, it
+    reads the stack's first 128 experts for the window's ids and answers
+    without an error. The guard refuses both.
+    """
+    args, ref = _many_experts()
+    num_experts, hidden, top_k = 512, 2560, 10
+    gen = torch.Generator(device=DEV).manual_seed(384128)
+    g1 = 137.0
+    num_tokens = 128
+    data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+    ids, wts = _renorm_routing(num_tokens, num_experts, top_k, gen)
+    g2 = _calibrate_g2(x, ids, ref)
+    s1, sg, s2 = _scalars(num_experts, g1, g2)
+    off, n = 384, 128
+    wa = _window_args(args, off, n)
+    wr = _window_ref(ref, off, n)
+    sc = _window_scalars(s1, sg, s2, off, n)
+    good_ref = moe.reference(
+        x,
+        ids,
+        wts,
+        wr["up"],
+        wr["gate"],
+        wr["down"],
+        g2,
+        local_expert_offset=off,
+        local_num_experts=n,
+    ).to(torch.bfloat16)
+    measured = {}
+    for name in ("gemm1_weights", "gemm2_weights"):
+        bad = dict(wa, **{name: args[name]})
+        raw = torch.ops.trtllm.fp4_block_scale_moe_runner(
+            None,
+            None,
+            data,
+            sf.view(torch.float8_e4m3fn),
+            bad["gemm1_weights"],
+            bad["gemm1_weights_scale"],
+            None,
+            None,
+            None,
+            None,
+            bad["gemm2_weights"],
+            bad["gemm2_weights_scale"],
+            None,
+            sc["output1_scale_scalar"],
+            sc["output1_scale_gate_scalar"],
+            sc["output2_scale_scalar"],
+            num_experts,
+            top_k,
+            None,
+            None,
+            bad["intermediate_size"],
+            off,
+            n,
+            None,
+            1,
+            True,
+            0,
+            topk_weights=wts,
+            topk_ids=ids,
+        )[0]
+        measured[name] = _dev(raw, good_ref)
+        assert measured[name][1] > 25.0, (
+            f"the whole stack's {name} with a window's scales is only "
+            f"{measured[name][1]:.1f} rms ulp off -- the hazard this guard covers is gone"
+        )
+        with pytest.raises(AssertionError, match="local_num_experts"):
+            _call(
+                data,
+                sf,
+                bad,
+                num_experts,
+                top_k,
+                local_expert_offset=off,
+                local_num_experts=n,
+                topk_ids=ids,
+                topk_weights=wts,
+                **sc,
+            )
+    print(
+        "  test_window_weights_must_hold_only_the_window OK (unguarded: "
+        + ", ".join(f"{k} {v[0]:.0f} elt / {v[1]:.0f} rms ulp" for k, v in measured.items())
+        + ")"
+    )
+
+
 def test_narrow_intermediate_is_nvfp4_requantized():
     """The FC1 epilogue quantizes once, and still exactly, at I = 640.
 
@@ -2003,6 +2409,90 @@ def test_many_experts_autotuner_cache_is_inert(clear_autotuner_cache):
     )
 
 
+def test_unified_layouts_autotuner_cache_is_inert(clear_autotuner_cache):
+    """A warm autotuner cache does not change the unified target's layouts.
+
+    `local_num_experts` and the intermediate width separate the tuner's cache
+    entries, so a cache warmed on the 512-expert stack at I 640 says nothing
+    about a 128- or 256-expert window of it or about tp4's padded I 256 stack,
+    and a serving engine runs warm. Same shape as the two tests above: cold
+    results over the unified target's token column, warm through trtllm's own
+    `autotune()` at its top count per layout, re-run, demand **bitwise**
+    equality, and clear the cache at the end.
+    """
+    many_args, many_ref = _many_experts()
+    tp4_args, tp4_ref = _tp4_padded()
+    num_experts, hidden, top_k = 512, 2560, 10
+    layouts = {
+        "128-wide window at 384": (384, 128, _window_args(many_args, 384, 128), many_ref),
+        "256-wide window at 256": (256, 256, _window_args(many_args, 256, 256), many_ref),
+        "tp4 padded I 256 stack": (0, num_experts, tp4_args, tp4_ref),
+    }
+    gen = torch.Generator(device=DEV).manual_seed(5124)
+    g1 = 137.0
+    token_counts = (1, 4, 5, 128, 1024, 8192)
+    cases = {}
+    for name, (_, _, _, lref) in layouts.items():
+        for num_tokens in token_counts:
+            data, sf, x = _rand_activation(num_tokens, hidden, g1, gen)
+            ids, wts = _renorm_routing(num_tokens, num_experts, top_k, gen)
+            g2 = _calibrate_g2(x, ids, lref)
+            cases[(name, num_tokens)] = (data, sf, ids, wts, _scalars(num_experts, g1, g2))
+
+    def run(name, num_tokens):
+        off, n, wa, _ = layouts[name]
+        data, sf, ids, wts, (s1, sg, s2) = cases[(name, num_tokens)]
+        return _call(
+            data,
+            sf,
+            wa,
+            num_experts,
+            top_k,
+            local_expert_offset=off,
+            local_num_experts=n,
+            topk_ids=ids,
+            topk_weights=wts,
+            **_window_scalars(s1, sg, s2, off, n),
+        )[0]
+
+    tuner = AutoTuner.get()
+    op = "trtllm::fp4_block_scale_moe_runner"
+
+    def entries():
+        return [k for k in tuner.profiling_cache.cache if k[0] == op]
+
+    assert not entries(), (
+        "the profiling cache already holds entries for this op — the cold-cache "
+        "receipt every other test in this file records would be void"
+    )
+    cold = {key: run(*key) for key in cases}
+    assert not entries(), (
+        "an ordinary call wrote a profiling-cache entry — calls outside "
+        "autotune() are not cold after all"
+    )
+    with autotune():
+        for name in layouts:
+            run(name, token_counts[-1])
+    keys = entries()
+    assert keys, "autotune() recorded nothing for this op — nothing was warmed"
+    tactics = {str(tuner.profiling_cache.cache[k][1]) for k in keys}
+    assert "-1" not in tactics, (
+        f"the tuner recorded the fallback tactic, so warm and cold are the same "
+        f"execution and this comparison proves nothing: {sorted(tactics)}"
+    )
+    for key in cases:
+        warm = run(*key)
+        assert torch.equal(warm, cold[key]), (
+            f"a warm autotuner cache changed the result at {key[0]}, T={key[1]}: "
+            f"{_dev(warm, cold[key].float())} (elt / rms ulp)"
+        )
+    print(
+        f"  test_unified_layouts_autotuner_cache_is_inert OK ({len(keys)} tuned "
+        f"entries, {len(tactics)} distinct tactics; all {len(cases)} (layout, T) "
+        f"results bitwise unchanged)"
+    )
+
+
 def test_do_finalize_and_output_buffer():
     """Both output modes, and what `do_finalize=False` actually returns."""
     num_experts, hidden, inter, top_k, num_tokens = 8, 256, 128, 2, 16
@@ -2118,7 +2608,12 @@ def test_inert_and_rejected_arguments():
         (dict(topk_ids=ids.long()), "topk_ids must be int"),
         (dict(topk_ids=None, topk_weights=None), "must be provided"),
         (dict(intermediate_size=inter // 2), "incorrect dim 2"),
-        (dict(num_experts_override=top_k), "num_experts must be greater than top_k"),
+        # local_num_experts stays at the 8 the weights hold, so the weights'
+        # expert-dimension guard admits the call and the op's own check answers.
+        (
+            dict(num_experts_override=top_k, local_num_experts=num_experts),
+            "num_experts must be greater than top_k",
+        ),
     )
     for over, msg in rejections:
         ne = over.pop("num_experts_override", num_experts)
@@ -2321,7 +2816,11 @@ def test_strided_inputs_are_silently_wrong():
 
 # The shared layer each cell's (num_experts, hidden, intermediate) names. An
 # R1 cell at a moe_tp slice of the intermediate takes `_dsr1_at` instead.
-_GEOMETRIES = {(256, 7168, 2048): _dsr1, (512, 2560, 640): _many_experts}
+_GEOMETRIES = {
+    (256, 7168, 2048): _dsr1,
+    (512, 2560, 640): _many_experts,
+    (512, 2560, _TP4_PADDED_INTER): _tp4_padded,
+}
 
 
 def _cell_layer(spec: dict):
@@ -2347,6 +2846,83 @@ _QWEN4_EXP = dict(
     local_expert_offset=0,
     local_num_experts=512,
     routing="renormalized",
+)
+
+# The qwen4 unified target's (tp4 / tep4 / dep4, and dep2 for the disagg
+# engines) routed layer: the same 512 experts, top-10 renormalized, H 2560,
+# called pre-routed (renorm_moe_routing_op's ids and bf16 weights) and
+# finalized. tep4 and dep4 call a 128-expert window of the stack at I 640,
+# dep2 a 256-expert window, tp4 all 512 experts at its 160-wide intermediate
+# slice zero-padded to 256 (`_tp4_padded`). Rows: 1 decode token, 4 and 5
+# (the static-block / single-cluster permutation boundary), 2 (dep2's gathered
+# decode), 128 (dep4's 4 x 32 gathered rows, tep4's 128 requests), 1024 (an
+# MTP-7 verify of 128 requests) and 8192 (a prefill chunk at max_num_tokens,
+# the top of the column). The window offsets cover every rank.
+_UNIFIED = dict(hidden=2560, num_experts=512, top_k=10, routing="renormalized")
+_UNIFIED_TP4 = dict(
+    intermediate=_TP4_PADDED_INTER,
+    logical_intermediate=_TP4_LOGICAL_INTER,
+    local_expert_offset=0,
+    local_num_experts=512,
+    **_UNIFIED,
+)
+
+
+def _ep(tokens: int, off: int, n: int) -> dict:
+    return dict(
+        tokens=tokens, intermediate=640, local_expert_offset=off, local_num_experts=n, **_UNIFIED
+    )
+
+
+_QWEN4_UNIFIED_CELLS = (
+    Cell(why="unified ep4 decode: one token, rank 0's 128-expert window", spec=_ep(1, 0, 128)),
+    Cell(
+        why="unified ep4 at 4 rows, rank 1's window: the static-block permutation kernel's last",
+        spec=_ep(4, 128, 128),
+    ),
+    Cell(
+        why="unified ep4 at 5 rows, rank 2's window: the single-cluster kernel's first",
+        spec=_ep(5, 256, 128),
+    ),
+    Cell(
+        why="unified ep4 at 128 rows (dep4 gathered 4 x 32, tep4 128 requests), rank 3's window",
+        spec=_ep(128, 384, 128),
+    ),
+    Cell(
+        why="unified ep4 MTP-7 verify of 128 requests: 1024 rows, rank 0's window",
+        spec=_ep(1024, 0, 128),
+    ),
+    Cell(
+        why="unified ep4 prefill chunk at max_num_tokens 8192, rank 3's window",
+        spec=_ep(8192, 384, 128),
+    ),
+    Cell(
+        why="unified tp4 decode: one token, I 160 zero-padded to 256 over all 512 experts",
+        spec=dict(tokens=1, **_UNIFIED_TP4),
+    ),
+    Cell(
+        why="unified tp4 at 5 rows, I 160 padded to 256: the single-cluster kernel",
+        spec=dict(tokens=5, **_UNIFIED_TP4),
+    ),
+    Cell(
+        why="unified tp4 at 128 rows (128 requests), I 160 padded to 256",
+        spec=dict(tokens=128, **_UNIFIED_TP4),
+    ),
+    Cell(
+        why="unified tp4 prefill chunk at max_num_tokens 8192, I 160 padded to 256",
+        spec=dict(tokens=8192, **_UNIFIED_TP4),
+    ),
+    Cell(
+        why="unified dep2 decode: 2 gathered rows, rank 0's 256-expert window",
+        spec=_ep(2, 0, 256),
+    ),
+    Cell(
+        why="unified dep2 at 128 gathered rows, rank 1's 256-expert window", spec=_ep(128, 256, 256)
+    ),
+    Cell(
+        why="unified dep2 prefill chunk at max_num_tokens 8192, rank 1's 256-expert window",
+        spec=_ep(8192, 256, 256),
+    ),
 )
 
 # The shapes each shipped target calls this entry with, by target directory
@@ -2420,6 +2996,7 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(tokens=8192, **_QWEN4_EXP),
         ),
     ),
+    "qwen4_exp_for_conditional_generation/hf_fc694b5_orig__sm_103__unified": _QWEN4_UNIFIED_CELLS,
 }
 
 CELLS = certified_cells(moe, TARGET_CELLS)
@@ -2485,3 +3062,16 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     )[0]
     assert y.shape == (spec["tokens"], hidden), y.shape
     _compare(y, entry_ref.to(torch.bfloat16))
+    elt, rms = _dev(y, entry_ref.to(torch.bfloat16))
+    print(f"  cell {cell.why[:72]!r}: {elt:.2f} elt / {rms:.2f} rms ulp")
+
+    # 3. A zero-padded intermediate computes the layer it pads: the kernel
+    # against the reference over the unpadded operands, through the same gate.
+    if "logical_intermediate" in spec:
+        logical = ref["logical"]
+        assert logical["up"][0].shape[1] == spec["logical_intermediate"], logical["up"][0].shape
+        assert args["intermediate_size"] == spec["intermediate"], args["intermediate_size"]
+        exp_logical = _ref_moe(x, ids, wts, logical, g2).to(torch.bfloat16)
+        _compare(y, exp_logical)
+        elt, rms = _dev(y, exp_logical)
+        print(f"    against the {spec['logical_intermediate']}-wide layer: {elt:.2f} / {rms:.2f}")

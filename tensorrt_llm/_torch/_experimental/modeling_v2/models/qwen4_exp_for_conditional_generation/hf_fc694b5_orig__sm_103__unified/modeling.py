@@ -205,6 +205,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_ga
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp4_block_scale_moe_runner import (
+    fp4_block_scale_moe_runner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (
     fp8_block_scale_moe_runner,
 )
@@ -279,8 +285,6 @@ from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
 from .ops.comm.reducescatter__r7 import reducescatter
 from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
-from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
-from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
