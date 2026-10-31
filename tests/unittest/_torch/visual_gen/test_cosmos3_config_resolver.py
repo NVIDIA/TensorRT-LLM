@@ -32,8 +32,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.config_resolver import (
     Default,
     Key,
     Rule,
-    Serving,
-    architecture_defaults,
     fill_pretrained_config,
 )
 
@@ -51,9 +49,9 @@ def _write(checkpoint_dir: Path, files: dict) -> Path:
     return checkpoint_dir
 
 
-def _resolver(tmp_path: Path, files: dict, serving=None) -> Cosmos3ConfigResolver:
+def _resolver(tmp_path: Path, files: dict) -> Cosmos3ConfigResolver:
     _write(tmp_path, files)
-    return Cosmos3ConfigResolver(str(tmp_path), files.get(TRANSFORMER, {}), serving)
+    return Cosmos3ConfigResolver(str(tmp_path), files.get(TRANSFORMER, {}))
 
 
 class TestRule:
@@ -67,13 +65,6 @@ class TestRule:
         r = _resolver(tmp_path, {CONFIG: {"a": None}, MODEL_INDEX: {"a": 2}})
         rule = Rule((Key(CONFIG, "a"), Key(MODEL_INDEX, "a"), Key(CHECKPOINT, "a")))
         assert r.resolve_one("a", rule).value == 2
-
-    def test_nullable_keeps_an_explicit_null(self, tmp_path):
-        r = _resolver(tmp_path, {CONFIG: {"a": None}, MODEL_INDEX: {"a": 2}})
-        rule = Rule(
-            (Key(CONFIG, "a"), Key(MODEL_INDEX, "a")), conflict=Conflict.IGNORE, nullable=True
-        )
-        assert r.resolve_one("a", rule).value is None
 
     def test_default_only_when_nothing_is_declared(self, tmp_path):
         r = _resolver(tmp_path, {})
@@ -101,12 +92,6 @@ class TestRule:
         )
         rule = Rule((Key(CONFIG, "a"), Key(MODEL_INDEX, "a")), conflict=Conflict.ERROR)
         assert r.resolve_one("a", rule).disagreeing == ()
-
-    def test_serving_config_is_a_source(self, tmp_path):
-        serving = SimpleNamespace(sampling=SimpleNamespace(flow_shift=0.5))
-        r = _resolver(tmp_path, {}, serving)
-        rule = Rule((Serving("sampling.flow_shift"),))
-        assert r.resolve_one("f", rule).value == 0.5
 
 
 def _files():
@@ -175,7 +160,7 @@ def test_fill_pretrained_config_sets_only_missing_attributes():
     declared = SimpleNamespace(temporal_compression_factor=8)
     fill_pretrained_config(declared)
     assert declared.temporal_compression_factor == 8
-    assert declared.position_embedding_type == architecture_defaults()["position_embedding_type"]
+    assert declared.position_embedding_type == "unified_3d_mrope"
     assert declared.max_position_embeddings == 262144
     assert declared.temporal_compression_factor_sound == 1
 

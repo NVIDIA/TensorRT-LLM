@@ -193,13 +193,6 @@ class TestPolicyFacts:
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(config)
         assert Cosmos3SamplingPolicy.from_scheduler(scheduler).fixed_sigmas == (1.0, 0.5)
 
-    def test_generation_default_overrides(self):
-        assert _distilled_policy().generation_default_overrides() == {
-            "num_inference_steps": 4,
-            "guidance_scale": DISTILLED_GUIDANCE_SCALE,
-        }
-        assert _base_policy().generation_default_overrides() == {}
-
     def test_num_steps(self):
         assert _distilled_policy().num_steps(2) == 4
         assert _base_policy().num_steps(2) == 2
@@ -1409,8 +1402,8 @@ class TestDistilledForwardDefaults:
         assert f"guidance_scale={COSMOS3_720P_PARAMS['guidance_scale']:.2f}" not in dims
 
     def test_base_checkpoint_still_uses_the_mode_table(self, monkeypatch):
-        """The checkpoint-first step must be a no-op for a base checkpoint:
-        ``generation_default_overrides()`` is empty, so the mode tables win."""
+        """The checkpoint-first step must be a no-op for a base checkpoint: there is no
+        fixed schedule, so the mode tables win."""
         import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as mod
 
         pipeline = _bare_pipeline()

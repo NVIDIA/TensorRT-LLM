@@ -928,9 +928,6 @@ class TestCosmos3V2V:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((target, use_karras_sigmas))
                 return scheduler
@@ -989,9 +986,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
@@ -1054,9 +1048,6 @@ class TestCosmos3V2V:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 return scheduler
 
@@ -1111,9 +1102,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((scheduler.name, target, use_karras_sigmas))
@@ -1219,9 +1207,6 @@ class TestCosmos3TransferRouting:
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
 
-            def generation_default_overrides(self):
-                return {}
-
         pipeline.sampling = FakeSampling()
         pipeline._forward_transfer = lambda **kwargs: None
         # A precomputed control and no video: an existing guard already rejects
@@ -1273,9 +1258,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         captured = {}

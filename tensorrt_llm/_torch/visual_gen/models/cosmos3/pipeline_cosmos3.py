@@ -71,7 +71,6 @@ from .action import (
 from .config_resolver import Cosmos3ConfigResolver
 from .defaults import (
     COSMOS3_720P_PARAMS,
-    COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
     COSMOS3_DURATION_TEMPLATE,
@@ -83,13 +82,12 @@ from .defaults import (
     COSMOS3_V2V_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
-    find_closest_target_size,
     resolve_checkpoint_policy_defaults,
-    resolve_domain_action_config,
 )
+from .geometry import COSMOS3_ASPECT_RATIO_BUCKETS, find_closest_target_size
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
-from .request_resolver import RequestContext, resolve_generation
+from .request_resolver import RequestContext, resolve_domain_action_config, resolve_generation
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
@@ -312,19 +310,6 @@ def _assert_anchor_matches(image_latent: torch.Tensor, latents: torch.Tensor) ->
         )
 
 
-def _validate_temporal_compression(transformer, vae_scale_factor_temporal: int) -> None:
-    """A config-declared temporal compression factor must match the VAE."""
-    if (
-        getattr(transformer, "temporal_compression_factor_declared", False)
-        and transformer.temporal_compression_factor != vae_scale_factor_temporal
-    ):
-        raise ValueError(
-            f"Transformer config declares temporal_compression_factor="
-            f"{transformer.temporal_compression_factor}, but the VAE reports "
-            f"scale_factor_temporal={vae_scale_factor_temporal}."
-        )
-
-
 def _condition_pixel_frame_count(
     condition_video_latent_indexes: Iterable[int],
     temporal_compression: int,
@@ -454,33 +439,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         super().__init__(pipeline_config)
 
-    def _mode_params(
-        self,
-        output_type: str,
-        *,
-        action_mode: Optional[str] = None,
-        checkpoint_policy_domain_matches: bool = True,
-    ) -> dict:
-        """Generation defaults selected from the request's output and action mode."""
-        normalized_action_mode = normalize_action_mode(action_mode)
-        request_mode = "action" if normalized_action_mode is not None else output_type
-        params = COSMOS3_GENERATION_DEFAULTS[(self.family, request_mode)]
-        checkpoint_policy_defaults = getattr(self, "checkpoint_policy_defaults", {})
-        if (
-            normalized_action_mode == ACTION_MODE_POLICY
-            and checkpoint_policy_domain_matches
-            and checkpoint_policy_defaults
-        ):
-            sampling_keys = {"num_inference_steps", "guidance_scale", "guidance_interval"}
-            return {
-                **params,
-                **{
-                    key: value
-                    for key, value in checkpoint_policy_defaults.items()
-                    if key in sampling_keys
-                },
-            }
-        return params
+    def _mode_table(self, output_type: str, action_mode: Optional[str] = None) -> dict:
+        """The family's generation table for the request's output and action mode. The
+        request rules read it through :func:`resolve_generation`; the pipeline reads
+        only ``flow_shift`` from it directly."""
+        request_mode = "action" if normalize_action_mode(action_mode) is not None else output_type
+        return COSMOS3_GENERATION_DEFAULTS[(self.family, request_mode)]
 
     def _request_context(
         self,
@@ -488,7 +452,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         *,
         action_mode: Optional[str] = None,
         checkpoint_policy_domain_matches: bool = True,
-        **workflow,
     ) -> RequestContext:
         normalized_action_mode = normalize_action_mode(action_mode)
         policy_defaults = getattr(self, "checkpoint_policy_defaults", {}) or {}
@@ -505,7 +468,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 and bool(policy_defaults)
             ),
             checkpoint_use_system_prompt=getattr(self, "default_use_system_prompt", False),
-            **workflow,
         )
 
     def _resolve_generation_params(
@@ -653,9 +615,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # The transformer config is read from the checkpoint directory, not from the
         # loaded pretrained config, whose omitted keys the transformer has already filled.
-        self.cosmos3_config = Cosmos3ConfigResolver(
-            checkpoint_dir, serving=getattr(self, "pipeline_config", None)
-        ).resolve()
+        self.cosmos3_config = Cosmos3ConfigResolver(checkpoint_dir).resolve()
         logger.info(self.cosmos3_config.describe())
         cfg = self.cosmos3_config
         self.default_use_system_prompt = cfg.prompt.use_system_prompt
@@ -697,7 +657,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 dtype=torch.bfloat16,
             )
 
-            _validate_temporal_compression(self.transformer, self.vae_scale_factor_temporal)
             self.transformer.temporal_compression_factor = self.vae_scale_factor_temporal
 
         if PipelineComponent.SCHEDULER not in skip_components:
@@ -707,7 +666,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             # distilled ones. The policy holds the derived immutable facts.
             self.scheduler = load_scheduler(checkpoint_dir)
             self.sampling = Cosmos3SamplingPolicy.from_scheduler(
-                self.scheduler, native_flow_schedule=self.use_native_flow_schedule
+                self.scheduler,
+                native_flow_schedule=self.use_native_flow_schedule,
+                fixed_sigmas=cfg.sampling.fixed_sigmas,
             )
             _validate_sampling_recipe(self.family, self.use_native_flow_schedule, self.sampling)
             # Each stream's variants derive from that stream's own instance, so
@@ -756,12 +717,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
     @property
     def default_warmup_resolutions(self):
-        video = self._mode_params("video")
+        video = self.default_generation_params
         return [(video["height"], video["width"])]
 
     @property
     def default_warmup_num_frames(self):
-        return [self._mode_params("video")["num_frames"]]
+        return [self.default_generation_params["num_frames"]]
 
     @property
     def default_warmup_steps(self):
@@ -778,15 +739,15 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def default_generation_params(self):
         """Fields merged by the executor into every request.
 
-        These are the video-mode values — what an unmodified request runs.
-        A request that selects another mode re-resolves them in ``infer()``,
-        which tells a merged default from a caller-supplied value via
-        ``model_fields_set``. Key membership also declares these fields
-        supported during request validation. ``flow_shift`` is
+        These are the video-mode values by the request rules — what an unmodified
+        request runs, the distilled schedule included. A request that selects another
+        mode re-resolves them in ``infer()``, which tells a merged default from a
+        caller-supplied value via ``model_fields_set``. Key membership also declares
+        these fields supported during request validation. ``flow_shift`` is
         pipeline-internal, not a request field.
         """
-        defaults = {k: v for k, v in self._mode_params("video").items() if k != "flow_shift"}
-        return {**defaults, **self.sampling.generation_default_overrides()}
+        fields = [k for k in self._mode_table("video") if k != "flow_shift"]
+        return self._resolve_generation_params("video", **{f: None for f in fields})
 
     def classify_request_failure(self, exc: BaseException) -> Optional[str]:
         """Cosmos3 rejects unusable request content with ``ValueError`` and
@@ -822,12 +783,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         }
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
-        # Checkpoint-aware guidance: distilled defaults carry a concrete 1.0;
-        # base defaults leave it None ("by mode") — warmup runs the video mode.
-        defaults = self.default_generation_params
+        defaults = self.default_generation_params  # the video mode, distilled schedule included
         guidance_scale = defaults["guidance_scale"]
-        if guidance_scale is None:
-            guidance_scale = self._mode_params("video")["guidance_scale"]
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
@@ -1734,11 +1691,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     + ", ".join(f"{k} [{v}]" for k, v in action_cfg["sources"].items())
                 )
 
-        mode_params = self._mode_params(
-            output_type,
-            action_mode=normalized_action_mode,
-            checkpoint_policy_domain_matches=checkpoint_policy_domain_matches,
-        )
+        mode_table = self._mode_table(output_type, normalized_action_mode)
         values_to_resolve = {
             "num_inference_steps": num_inference_steps,
             "guidance_scale": guidance_scale,
@@ -1818,7 +1771,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_state = action_cfg["use_state"]
             enable_audio = False
 
-        mode_shift = mode_params.get("flow_shift")
+        mode_shift = mode_table.get("flow_shift")
         if mode_shift is None:
             mode_shift = self.sampling.checkpoint_flow_shift
         if is_v2v:

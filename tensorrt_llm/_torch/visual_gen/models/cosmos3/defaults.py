@@ -12,101 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Per-model default generation parameters for Cosmos3 pipelines.
-
-Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
+"""The Cosmos3 tables: generation defaults per family and mode, the action and
+policy presets per embodiment domain, the prompt templates, and the schema of the
+request's extra parameters. The request resolver reads them in precedence order.
 """
 
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, TypedDict
 
+from tensorrt_llm._torch.visual_gen.models.cosmos3.action import EMBODIMENT_TO_DOMAIN_ID
+from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
+    COSMOS3_ACTION_RESOLUTIONS,
+    VIDEO_RES_SIZE_INFO,
+    normalize_action_resolution,
+)
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
 # ---------------------------------------------------------------------------
-
-# The reference's ``W,H`` aspect buckets: every canvas is one of these shapes, and a
-# request's bucket string is carried into the caption verbatim, so a resolved frame
-# size maps back to the nearest bucket rather than to its exact reduced ratio
-# (832x480 reduces to "15,26", which the model never saw).
-COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
-
-
-# Output sizes per resolution level and aspect bucket, as (width, height).
-VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
-    "256": {
-        "1,1": (256, 256),
-        "4,3": (320, 256),
-        "3,4": (256, 320),
-        "16,9": (320, 192),
-        "9,16": (192, 320),
-    },
-    "480": {
-        "1,1": (640, 640),
-        "4,3": (736, 544),
-        "3,4": (544, 736),
-        "16,9": (832, 480),
-        "9,16": (480, 832),
-    },
-    "704": {
-        "1,1": (960, 960),
-        "4,3": (1088, 832),
-        "3,4": (832, 1088),
-        "16,9": (1280, 704),
-        "9,16": (704, 1280),
-    },
-    "720": {
-        "1,1": (960, 960),
-        "4,3": (1104, 832),
-        "3,4": (832, 1104),
-        "16,9": (1280, 720),
-        "9,16": (720, 1280),
-    },
-}
-
-
-COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
-
-
-def normalize_action_resolution(resolution: Any) -> int:
-    if resolution is None:
-        raise ValueError("Cosmos3 action_resolution is required for action generation.")
-    try:
-        bucket = int(resolution)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
-        ) from exc
-    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
-        raise ValueError(
-            f"Unknown Cosmos3 action_resolution={bucket}; "
-            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
-        )
-    return bucket
-
-
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
-    """The ``resolution`` bucket whose aspect ratio is closest to ``h/w``, as
-    ``(width, height)``, so a source frame lands on a supported size undistorted."""
-    key = str(resolution)
-    if key not in VIDEO_RES_SIZE_INFO:
-        raise ValueError(
-            f"Unknown Cosmos3 resolution={resolution!r}; "
-            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
-        )
-    input_ratio = h / w
-    best_size = None
-    best_diff = float("inf")
-    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
-        diff = abs(input_ratio - cand_h / cand_w)
-        if diff < best_diff:
-            best_diff = diff
-            best_size = (cand_w, cand_h)
-    assert best_size is not None
-    return best_size
-
 
 # The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
 _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
@@ -564,8 +489,6 @@ def canonical_domain_preset_key(
     if resolved_id == 0:
         return None
 
-    from .action import EMBODIMENT_TO_DOMAIN_ID
-
     candidates: list[str] = []
     for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items():
         if mapped_id != resolved_id:
@@ -587,67 +510,6 @@ def get_domain_preset(
     if key is None:
         return None
     return COSMOS3_DOMAIN_PRESETS[key]
-
-
-def resolve_domain_action_config(
-    *,
-    domain_name: str | None = None,
-    domain_id: str | int | None = None,
-    raw_action_dim: int | None = None,
-    action_chunk_size: int | None = None,
-    action_resolution: int | None = None,
-    frame_rate: float | None = None,
-    action_fps: float | None = None,
-    use_state: bool | None = None,
-    checkpoint_policy_defaults: Mapping[str, Any] | None = None,
-    embodiments: Mapping[str, Any] | None = None,
-    input_action_dim: int | None = None,
-) -> dict[str, Any]:
-    """The action fields a request runs with, by the request rules
-    (``request_resolver.ACTION_RULES``): the caller's value, else the checkpoint policy
-    block when its domain is the request's, else the checkpoint's embodiment table
-    (``embodiments``) or the code's width table, else the domain preset, else the
-    generic action defaults. ``num_frames`` is always ``action_chunk_size + 1``. A
-    caller's value that differs from the recommendation is reported in ``warnings``.
-    """
-    from .request_resolver import RequestContext, embodiment_entry, policy_domain, resolve_action
-
-    policy_defaults = dict(checkpoint_policy_defaults or {})
-    domain_name, policy_active, warnings = policy_domain(policy_defaults, domain_name, domain_id)
-    ctx = RequestContext(
-        family="",
-        action_mode="action",
-        policy_defaults=policy_defaults,
-        policy_active=policy_active,
-        domain_name=domain_name,
-        domain_id=None if domain_id is None else int(domain_id),
-        embodiment=embodiment_entry(embodiments or {}, input_action_dim, domain_name, domain_id),
-        checkpoint_has_embodiments=bool(embodiments),
-    )
-    resolved = resolve_action(
-        ctx,
-        raw_action_dim=raw_action_dim,
-        action_chunk_size=action_chunk_size,
-        action_resolution=action_resolution,
-        frame_rate=frame_rate,
-        action_fps=action_fps,
-        use_state=use_state,
-    )
-    width = resolved["raw_action_dim"]
-    return {
-        "domain_name": domain_name,
-        "checkpoint_policy_domain_matches": policy_active,
-        "raw_action_dim": None if width is None else int(width),
-        "action_chunk_size": int(resolved["action_chunk_size"]),
-        "action_resolution": resolved["action_resolution"],
-        "frame_rate": float(resolved["frame_rate"]),
-        "action_fps": float(resolved["action_fps"]),
-        "use_state": bool(resolved["use_state"]),
-        "num_frames": int(resolved["num_frames"]),
-        "preset_key": ctx.preset_key,
-        "warnings": warnings + resolved.warnings,
-        "sources": {name: r.source for name, r in resolved.values.items()},
-    }
 
 
 # Video-to-video and transfer sample on the shifted flow grid with this shift; the

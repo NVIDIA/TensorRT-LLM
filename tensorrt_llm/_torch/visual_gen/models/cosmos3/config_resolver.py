@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One place that turns a Cosmos3 checkpoint and the serving config into settings.
+"""One place that turns a Cosmos3 checkpoint's files into settings.
 
 A Cosmos3 export carries the same facts in several files, written by different
 exporters that are not kept in sync: the training config (``config.json``), the
@@ -33,7 +33,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Optional
 
@@ -70,17 +70,6 @@ class Key:
 
 
 @dataclass(frozen=True)
-class Serving:
-    """An attribute path in the serving config (``VisualGenArgs`` as the pipeline sees it)."""
-
-    path: str
-
-    @property
-    def label(self) -> str:
-        return f"serving:{self.path}"
-
-
-@dataclass(frozen=True)
 class Default:
     """The value used when no source declares the setting."""
 
@@ -98,9 +87,6 @@ class Rule:
     conflict: Conflict = Conflict.WARN
     required: bool = True
     """``False``: an unresolved setting is ``None`` instead of an error."""
-    nullable: bool = False
-    """``True``: a source holding ``null`` declares the setting (e.g. "no window");
-    otherwise ``null`` counts as absent."""
 
 
 @dataclass(frozen=True)
@@ -111,9 +97,9 @@ class Resolved:
     """Lower-priority sources that held a different value."""
 
 
-# Settings every Cosmos3 checkpoint resolves. Priority: serving config, then the
-# training config (config.json), then the component configs, then the export
-# metadata and the diffusers index.
+# Settings every Cosmos3 checkpoint resolves. Priority: the training config
+# (config.json), then the component configs, then the export metadata and the
+# diffusers index.
 RULES: dict[str, Rule] = {
     "architecture.position_embedding_type": Rule(
         (
@@ -228,7 +214,7 @@ def _step(obj: Any, key: str) -> Any:
         return obj.get(key, _MISSING)
     if obj is None or isinstance(obj, (str, int, float, bool, list, tuple)):
         return _MISSING
-    return getattr(obj, key, _MISSING)
+    return getattr(obj, key, _MISSING)  # a pretrained config object standing in for a file
 
 
 def _walk(doc: Any, path: str) -> Any:
@@ -255,21 +241,15 @@ def same_value(a: Any, b: Any) -> bool:
 
 
 class Cosmos3ConfigResolver:
-    """Applies :data:`RULES` to a checkpoint directory and the serving config.
+    """Applies :data:`RULES` to a checkpoint directory.
 
-    ``checkpoint_dir`` may be ``None``: only ``pretrained_config`` (standing in for
-    ``transformer/config.json``) and ``serving`` are consulted then.
+    ``pretrained_config`` stands in for ``transformer/config.json`` when given;
+    ``checkpoint_dir`` may then be ``None``.
     """
 
-    def __init__(
-        self,
-        checkpoint_dir: Optional[str],
-        pretrained_config: Any = None,
-        serving: Any = None,
-    ) -> None:
+    def __init__(self, checkpoint_dir: Optional[str], pretrained_config: Any = None) -> None:
         self._dir = checkpoint_dir
         self._pretrained = pretrained_config
-        self._serving = serving
         self._docs: dict[str, Any] = {}
 
     def _doc(self, file: str) -> Any:
@@ -289,8 +269,6 @@ class Cosmos3ConfigResolver:
         if isinstance(source, Key):
             doc = self._doc(source.file)
             return _MISSING if doc is None else _walk(doc, source.path)
-        if isinstance(source, Serving):
-            return _MISSING if self._serving is None else _walk(self._serving, source.path)
         if isinstance(source, Default):
             return source.value
         raise TypeError(f"unknown source {source!r}")
@@ -302,14 +280,10 @@ class Cosmos3ConfigResolver:
             if winner is not None and isinstance(source, Default):
                 break
             value = self._lookup(source)
-            if value is _MISSING or (value is None and not rule.nullable):
-                continue
-            if value is None and isinstance(source, Serving):
-                continue  # an unset serving field defers to the checkpoint
+            if value is _MISSING or value is None:
+                continue  # a null in a file counts as absent
             if winner is None:
                 winner = Resolved(value, source.label)
-                if isinstance(source, Serving):
-                    break  # an override is meant to differ from the checkpoint
             elif not same_value(value, winner.value):
                 disagreeing.append(f"{source.label}={value!r}")
         if winner is None:
@@ -377,14 +351,6 @@ ARCHITECTURE_ATTRIBUTES = {
 """``pretrained_config`` attributes the transformer reads, and the setting each holds."""
 
 
-def architecture_defaults() -> dict[str, Any]:
-    """The table's default for each attribute in :data:`ARCHITECTURE_ATTRIBUTES`."""
-    out = {}
-    for attr, name in ARCHITECTURE_ATTRIBUTES.items():
-        out[attr] = next(s.value for s in RULES[name].sources if isinstance(s, Default))
-    return out
-
-
 def fill_pretrained_config(pretrained_config: Any) -> Any:
     """Set the transformer-construction attributes of ``pretrained_config`` that the
     export omits, from :data:`RULES`. Idempotent; returns the config.
@@ -397,11 +363,11 @@ def fill_pretrained_config(pretrained_config: Any) -> Any:
         if getattr(pretrained_config, attr, None) is not None:
             continue
         rule = RULES[name]
-        transformer_only = Rule(
-            tuple(s for s in rule.sources if not isinstance(s, Key) or s.file == TRANSFORMER),
-            rule.conflict,
-            rule.required,
-            rule.nullable,
+        transformer_only = replace(
+            rule,
+            sources=tuple(
+                s for s in rule.sources if not isinstance(s, Key) or s.file == TRANSFORMER
+            ),
         )
         r = resolver.resolve_one(name, transformer_only)
         if r is not None:

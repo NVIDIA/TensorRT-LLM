@@ -17,7 +17,7 @@ import math
 from contextlib import nullcontext
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Callable, ContextManager, Optional, Tuple, TypeVar
+from typing import Any, Callable, ContextManager, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -43,21 +43,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .config_resolver import architecture_defaults, fill_pretrained_config
-
-# Some Cosmos3OmniTransformer checkpoint configs omit these fields; the values come
-# from the precedence table in config_resolver, the one place that declares them.
-PRETRAINED_CONFIG_COMPAT_DEFAULTS = architecture_defaults()
-
-
-_PretrainedConfigT = TypeVar("_PretrainedConfigT")
-
-
-def apply_pretrained_config_compat_defaults(
-    pretrained_config: _PretrainedConfigT,
-) -> _PretrainedConfigT:
-    """Fill missing schema fields in place (idempotent); returns the config."""
-    return fill_pretrained_config(pretrained_config)
+from .config_resolver import fill_pretrained_config
 
 
 def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:
@@ -1205,10 +1191,8 @@ class Cosmos3LanguageModel(nn.Module):
 class Cosmos3VFMTransformer(BaseDiffusionModel):
     def __init__(self, model_config: DiffusionModelConfig):
         super().__init__(model_config)
-        self.temporal_compression_factor_declared = (
-            getattr(model_config.pretrained_config, "temporal_compression_factor", None) is not None
-        )
-        pretrained_config = apply_pretrained_config_compat_defaults(model_config.pretrained_config)
+        # Some exports omit a few schema fields; the checkpoint resolver's table fills them.
+        pretrained_config = fill_pretrained_config(model_config.pretrained_config)
         self.recipe = resolve_arch_recipe(pretrained_config)
         # Installed in post_load_weights when the checkpoint is static FP8.
         self.step_precision_controller: Optional[StepPrecisionController] = None

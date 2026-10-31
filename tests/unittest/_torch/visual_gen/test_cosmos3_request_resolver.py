@@ -21,10 +21,10 @@ from pathlib import Path
 import pytest
 from cosmos3_request_golden import record
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import resolve_domain_action_config
 from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
     RequestContext,
     resolve_action,
+    resolve_domain_action_config,
     resolve_generation,
 )
 
@@ -34,8 +34,9 @@ FIXTURE = Path(__file__).parent / "test_data" / "cosmos3_request_defaults.json"
 
 
 def test_defaults_match_the_recorded_grid():
-    """Every (family, mode, domain) combination resolves to the values recorded before
-    the rules existed; a change here is a visible change of a default."""
+    """Every (family, mode, domain) combination resolves to the recorded values, so a
+    change of any default, or of the precedence behind it, is a visible diff of the
+    fixture rather than a silent change of what requests run with."""
     recorded = json.loads(FIXTURE.read_text())
     current = json.loads(json.dumps(record()))
     for section in ("generation", "action", "system_prompt"):
@@ -76,16 +77,18 @@ class TestSources:
             "Cosmos3 action_chunk_size=16 differs from recommended 60 for domain 'av'."
         ]
 
-    def test_checkpoint_embodiments_replace_the_code_table(self):
-        embodiments = {"agibotworld": {"domain_id": 15, "input_action_dim": 59}}
-        cfg = resolve_domain_action_config(domain_name="agibotworld", embodiments=embodiments)
-        assert cfg["raw_action_dim"] == 59
-        assert cfg["sources"]["raw_action_dim"] == "checkpoint:conditioning.embodiments.action_dim"
-        assert cfg["warnings"] == []
-        # The same request against a checkpoint without a table: the code's width.
-        plain = resolve_domain_action_config(domain_name="agibotworld")
-        assert plain["raw_action_dim"] == 29
-        assert plain["sources"]["raw_action_dim"] == "embodiment table (defaults)"
+    def test_explicit_none_in_a_mode_table_is_a_value(self):
+        """Edge text-to-image switches the guidance window off with an explicit ``None``;
+        that must not fall through to the video table."""
+        ctx = RequestContext(family="nemotron_dense", mode="image")
+        r = resolve_generation(ctx, guidance_interval=None)
+        assert r["guidance_interval"] is None
+        assert r.source_of("guidance_interval") == "mode table.guidance_interval"
+
+    def test_disagreeing_recommendation_names_its_source(self):
+        cfg = resolve_domain_action_config(domain_name="av", action_chunk_size=16)
+        assert cfg["action_chunk_size"] == 16
+        assert cfg["sources"]["action_chunk_size"] == "request"
 
     def test_unresolvable_field_is_an_error(self):
         ctx = RequestContext(family="no-such-family")

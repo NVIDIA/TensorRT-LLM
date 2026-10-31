@@ -14,14 +14,13 @@
 # limitations under the License.
 """Per-request resolution of Cosmos3 generation and action settings.
 
-The engine-level :mod:`config_resolver` settles what the checkpoint and the serving
-config say. This module settles what one request runs with: for every field,
-:data:`GENERATION_RULES` and :data:`ACTION_RULES` name the sources in priority order,
-the caller's value first, then the checkpoint's facts (the distilled schedule, the
-policy block, the embodiment table), then the per-mode and per-domain tables, then a
-default. The first source holding a value wins; a lower source that disagrees with a
-caller's value is reported as a warning (or an error, where the checkpoint is the
-authority), and every resolved value remembers its source.
+The engine-level :mod:`config_resolver` settles what the checkpoint says. This module
+settles what one request runs with: for every field, :data:`GENERATION_RULES` and
+:data:`ACTION_RULES` name the sources in priority order, the caller's value first,
+then the checkpoint's facts (the distilled schedule, the policy block), then the
+per-mode and per-domain tables, then a default. The first source holding a value
+wins; where a rule says so, a recommendation that disagrees with the caller's value
+is reported as a warning, and every resolved value remembers its source.
 """
 
 from __future__ import annotations
@@ -37,8 +36,8 @@ from .defaults import (
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_GENERATION_DEFAULTS,
     canonical_domain_preset_key,
-    normalize_action_resolution,
 )
+from .geometry import normalize_action_resolution
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
 _MISSING = object()
@@ -60,10 +59,6 @@ class RequestContext:
     """The policy block applies: policy mode, and the request's domain is the block's."""
     domain_name: Optional[str] = None
     domain_id: Optional[int] = None
-    embodiment: Mapping[str, Any] = field(default_factory=dict)
-    """The checkpoint's entry for the request's embodiment: ``domain_id``,
-    ``action_dim``. Empty when the checkpoint declares no embodiment table."""
-    checkpoint_has_embodiments: bool = False
     checkpoint_use_system_prompt: bool = False
     is_v2v: bool = False
     is_transfer: bool = False
@@ -121,30 +116,12 @@ class Policy:
         return _MISSING if value is None else value
 
 
-@dataclass(frozen=True)
-class Embodiment:
-    """The checkpoint's embodiment table."""
-
-    key: str
-
-    @property
-    def label(self) -> str:
-        return f"checkpoint:conditioning.embodiments.{self.key}"
-
-    def lookup(self, ctx, field_name, given, values):
-        value = ctx.embodiment.get(self.key)
-        return _MISSING if value is None else value
-
-
 class KnownWidth:
-    """The code's table of action widths per embodiment; silent when the checkpoint
-    declares its own embodiments."""
+    """The code's table of action widths per embodiment."""
 
     label = "embodiment table (defaults)"
 
     def lookup(self, ctx, field_name, given, values):
-        if ctx.checkpoint_has_embodiments:
-            return _MISSING
         width = resolve_raw_action_dim(domain_name=ctx.domain_name, domain_id=ctx.domain_id)
         return _MISSING if width is None else width
 
@@ -176,24 +153,16 @@ class Table:
 
     def lookup(self, ctx, field_name, given, values):
         table = COSMOS3_GENERATION_DEFAULTS.get((ctx.family, self.mode or ctx.table_mode))
-        value = table.get(self.key) if table else None
-        return _MISSING if value is None else value
+        if not table or self.key not in table:
+            return _MISSING
+        return table[self.key]  # an explicit ``None`` in a table is a value: the field is off
 
 
 @dataclass(frozen=True)
-class Workflow:
-    """A value a workflow fixes: transfer never prepends the system prompt, V2V does."""
+class Context:
+    """A value the request context fixes: a workflow rule (transfer never prepends the
+    system prompt, video-to-video always does) or a checkpoint fact."""
 
-    label: str
-    pick: Callable[[RequestContext], Any]
-
-    def lookup(self, ctx, field_name, given, values):
-        value = self.pick(ctx)
-        return _MISSING if value is None else value
-
-
-@dataclass(frozen=True)
-class Checkpoint:
     label: str
     pick: Callable[[RequestContext], Any]
 
@@ -218,6 +187,8 @@ class Derived:
 class RequestRule:
     sources: tuple
     conflict: Conflict = Conflict.IGNORE
+    """``WARN``: a caller's value that differs from the first recommendation below it
+    is reported in the result's warnings."""
     required: bool = True
 
 
@@ -261,18 +232,16 @@ GENERATION_RULES: dict[str, RequestRule] = {
     "use_system_prompt": RequestRule(
         (
             Given(),
-            Workflow("transfer (never)", lambda ctx: False if ctx.is_transfer else None),
-            Workflow("video-to-video (always)", lambda ctx: True if ctx.is_v2v else None),
-            Checkpoint(
-                "checkpoint:use_system_prompt", lambda ctx: ctx.checkpoint_use_system_prompt
-            ),
+            Context("transfer (never)", lambda ctx: False if ctx.is_transfer else None),
+            Context("video-to-video (always)", lambda ctx: True if ctx.is_v2v else None),
+            Context("checkpoint:use_system_prompt", lambda ctx: ctx.checkpoint_use_system_prompt),
         )
     ),
 }
 
 ACTION_RULES: dict[str, RequestRule] = {
     "raw_action_dim": RequestRule(
-        (Given(), Policy("raw_action_dim"), Embodiment("action_dim"), KnownWidth()),
+        (Given(), Policy("raw_action_dim"), KnownWidth()),
         conflict=Conflict.WARN,
         required=False,
     ),
@@ -324,10 +293,6 @@ class ResolvedRequest:
     def __getitem__(self, name: str) -> Any:
         return self.values[name].value
 
-    def get(self, name: str, default: Any = None) -> Any:
-        r = self.values.get(name)
-        return default if r is None else r.value
-
     def source_of(self, name: str) -> str:
         return self.values[name].source
 
@@ -342,7 +307,7 @@ def _resolve(
     plain: dict[str, Any] = {}
     for name, rule in rules.items():
         winner: Optional[Resolved] = None
-        disagreeing: list[str] = []
+        disagreeing: list[tuple[str, Any]] = []
         for source in rule.sources:
             if winner is not None and isinstance(source, Default):
                 break
@@ -357,7 +322,7 @@ def _resolve(
                 continue
             # Only the first recommendation below the caller's value is compared.
             if not same_value(value, winner.value):
-                disagreeing.append(f"{value}")
+                disagreeing.append((source.label, value))
             break
         if winner is None:
             if rule.required:
@@ -365,16 +330,14 @@ def _resolve(
             out.values[name] = Resolved(None, "unresolved")
             plain[name] = None
             continue
-        if disagreeing and winner.source == Given.label:
-            message = (
+        if disagreeing and winner.source == Given.label and rule.conflict is Conflict.WARN:
+            out.warnings.append(
                 f"Cosmos3 {name}={winner.value} differs from recommended "
-                f"{' / '.join(disagreeing)} for domain {domain_label}."
+                f"{' / '.join(str(v) for _, v in disagreeing)} for domain {domain_label}."
             )
-            if rule.conflict is Conflict.ERROR:
-                raise ValueError(message)
-            if rule.conflict is Conflict.WARN:
-                out.warnings.append(message)
-        out.values[name] = Resolved(winner.value, winner.source, tuple(disagreeing))
+        out.values[name] = Resolved(
+            winner.value, winner.source, tuple(f"{label}={v!r}" for label, v in disagreeing)
+        )
         plain[name] = winner.value
     return out
 
@@ -459,30 +422,55 @@ def resolve_action(ctx: RequestContext, **given: Any) -> ResolvedRequest:
     return resolved
 
 
-def embodiment_entry(
-    embodiments: Mapping[str, Any], input_action_dim: Optional[int], domain_name, domain_id
-):
-    """The checkpoint's embodiment facts for a request: ``{"domain_id", "action_dim"}``,
-    found by name or by id; empty when the checkpoint lists no such embodiment."""
-    name = str(domain_name).strip().lower() if domain_name and str(domain_name).strip() else None
-    spec = None
-    if name is not None:
-        spec = embodiments.get(name)
-    elif domain_id is not None:
-        spec = next(
-            (
-                s
-                for s in embodiments.values()
-                if s.get("domain_id") is not None and int(s["domain_id"]) == int(domain_id)
-            ),
-            None,
-        )
-    if not spec:
-        return {}
-    width = spec.get("input_action_dim")
-    if width is None:
-        width = spec.get("raw_action_dim", input_action_dim)
+def resolve_domain_action_config(
+    *,
+    domain_name: str | None = None,
+    domain_id: str | int | None = None,
+    raw_action_dim: int | None = None,
+    action_chunk_size: int | None = None,
+    action_resolution: int | None = None,
+    frame_rate: float | None = None,
+    action_fps: float | None = None,
+    use_state: bool | None = None,
+    checkpoint_policy_defaults: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The action fields a request runs with, by :data:`ACTION_RULES`: the caller's
+    value, else the checkpoint policy block when its domain is the request's, else the
+    code's width table, else the domain preset, else the generic action defaults.
+    ``num_frames`` is always ``action_chunk_size + 1``. A caller's value that differs
+    from the recommendation is reported in ``warnings``.
+    """
+    policy_defaults = dict(checkpoint_policy_defaults or {})
+    domain_name, policy_active, warnings = policy_domain(policy_defaults, domain_name, domain_id)
+    ctx = RequestContext(
+        family="",
+        action_mode="action",
+        policy_defaults=policy_defaults,
+        policy_active=policy_active,
+        domain_name=domain_name,
+        domain_id=None if domain_id is None else int(domain_id),
+    )
+    resolved = resolve_action(
+        ctx,
+        raw_action_dim=raw_action_dim,
+        action_chunk_size=action_chunk_size,
+        action_resolution=action_resolution,
+        frame_rate=frame_rate,
+        action_fps=action_fps,
+        use_state=use_state,
+    )
+    width = resolved["raw_action_dim"]
     return {
-        "domain_id": None if spec.get("domain_id") is None else int(spec["domain_id"]),
-        "action_dim": None if width is None else int(width),
+        "domain_name": domain_name,
+        "checkpoint_policy_domain_matches": policy_active,
+        "raw_action_dim": None if width is None else int(width),
+        "action_chunk_size": int(resolved["action_chunk_size"]),
+        "action_resolution": resolved["action_resolution"],
+        "frame_rate": float(resolved["frame_rate"]),
+        "action_fps": float(resolved["action_fps"]),
+        "use_state": bool(resolved["use_state"]),
+        "num_frames": int(resolved["num_frames"]),
+        "preset_key": ctx.preset_key,
+        "warnings": warnings + resolved.warnings,
+        "sources": {name: r.source for name, r in resolved.values.items()},
     }

@@ -13,7 +13,7 @@ import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
-from .defaults import find_closest_target_size
+from .geometry import find_closest_target_size
 
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
