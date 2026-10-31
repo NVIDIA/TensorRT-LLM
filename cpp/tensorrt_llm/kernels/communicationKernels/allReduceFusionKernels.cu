@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -266,6 +266,20 @@ public:
                 m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
+        }
+        else if constexpr (GetQuantType<Pattern> == QuantType::kMXFP8)
+        {
+            // The four consecutive threads holding one 32-element block share its UE8M0 scale. The input is the
+            // norm output already rounded to DType, as the standalone MXFP8 quantization kernel would read it.
+            constexpr int SF_VEC_SIZE = 32;
+            constexpr int THREADS_PER_SF = SF_VEC_SIZE / kElemsPerAccess<DType>;
+            using PackedVec = PackedVec<DType>;
+            PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, THREADS_PER_SF>(std::nullopt, token_id,
+                m_access_id_in_token, std::nullopt, m_params.hidden_dim / SF_VEC_SIZE,
+                reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            reinterpret_cast<uint64_t*>(m_params.quant_out)[m_access_id]
+                = cvt_warp_fp16_to_mxfp8<DType, SF_VEC_SIZE>(pack_val, sf_out);
         }
         else if constexpr (GetQuantType<Pattern> == QuantType::kFP8)
         {
@@ -791,6 +805,32 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     else if (params.pattern == AllReduceFusionPattern::kARRMSNorm)                                                     \
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARRMSNorm, NRanks);                                          \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant)                                   \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<DType, float>)                                                                   \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant, NRanks);                    \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false,                                                                                \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormMXFP8Quant can not work with "      \
+                "DType=float!");                                                                                       \
+        }                                                                                                              \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant)                                \
+    {                                                                                                                  \
+        if constexpr (!std::is_same_v<DType, float>)                                                                   \
+        {                                                                                                              \
+            DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant, NRanks);                 \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false,                                                                                \
+                "allreduce_fusion_kernel: AllReduceFusionPattern=kARResidualRMSNormOutMXFP8Quant can not work with "   \
+                "DType=float!");                                                                                       \
+        }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

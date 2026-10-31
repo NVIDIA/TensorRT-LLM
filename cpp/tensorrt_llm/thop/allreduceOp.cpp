@@ -87,6 +87,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
+// Defined in mxFp8Quantize.cpp (trtllm::mxfp8_quantize).
+std::tuple<at::Tensor, at::Tensor> mxfp8_quantize(at::Tensor const& self, bool isSfSwizzledLayout, int64_t alignment);
+
 #if ENABLE_MULTI_DEVICE
 
 namespace
@@ -781,7 +784,8 @@ private:
             }
         }
         else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF)
         {
             // TODO: Better check for each pattern
             int64_t sf_vec_size = 16;
@@ -798,24 +802,55 @@ private:
             std::vector<int64_t> output_shape(input_shape.begin(), input_shape.end());
             output_shape[r - 1] = k / 2;
 
+            bool const linear_sf = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF;
+            auto const sf_size = linear_sf ? tensorrt_llm::computeLinearLayoutSFSize(m, k / sf_vec_size)
+                                           : tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size);
+
             quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
-                SF_DTYPE, input.device(), std::nullopt);
+            scale_out = at::detail::empty_cuda({sf_size}, SF_DTYPE, input.device(), std::nullopt);
+            residual_out = torch::empty_like(residual.value());
+
+            allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+            allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+            allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
+            allreduce_fusion_params.layout
+                = linear_sf ? tensorrt_llm::QuantizationSFLayout::LINEAR : tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+            allreduce_fusion_params.pattern
+                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant;
+
+            // norm out is required
+            if (mOp != AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4)
+            {
+                norm_out = torch::empty_like(input);
+                allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
+                allreduce_fusion_params.pattern
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+            }
+        }
+        else if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_MXFP8
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            int64_t constexpr sf_vec_size = 32;
+            TORCH_CHECK(mType != tensorrt_llm::DataType::kFLOAT, "MXFP8 allreduce fusion requires fp16/bf16 input.");
+            TORCH_CHECK(hidden_size % sf_vec_size == 0, "MXFP8 allreduce fusion requires hidden_size % 32 == 0.");
+            int64_t const m = size / hidden_size;
+            quant_out = at::detail::empty_cuda(input.sizes(), torch::kFloat8_e4m3fn, input.device(), std::nullopt);
+            int64_t const sf_size = tensorrt_llm::computeSwizzledLayoutSFSize(m, hidden_size / sf_vec_size);
+            scale_out = at::detail::empty_cuda({sf_size}, SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(residual.value());
 
             allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
             allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
             allreduce_fusion_params.residual_out = residual_out.mutable_data_ptr();
             allreduce_fusion_params.pattern
-                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP4Quant;
+                = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormMXFP8Quant;
 
-            // norm out is required
-            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4)
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
             {
                 norm_out = torch::empty_like(input);
                 allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
                 allreduce_fusion_params.pattern
-                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
+                    = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutMXFP8Quant;
             }
         }
         else
@@ -847,7 +882,8 @@ private:
         bool const is_scale_factor_required = mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8
             || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4
-            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4;
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF;
 
         allreduce_fusion_params.scale_factor
             = is_scale_factor_required ? static_cast<float*>(scale.value().data_ptr()) : nullptr;
@@ -864,6 +900,10 @@ private:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4: return {quant_out, scale_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF:
+            return {norm_out, quant_out, scale_out, residual_out};
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_MXFP8: return {quant_out, scale_out, residual_out};
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
             return {norm_out, quant_out, scale_out, residual_out};
         default: TORCH_CHECK(false, "Unsupported fusion operation: " + tensorrt_llm::kernels::toString(mOp));
         }
@@ -911,6 +951,17 @@ private:
         {
             return {norm_out, reduce_output};
         }
+        // MXFP8 has no per-tensor scale: quantize the norm output as the fused kernel does.
+        if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_MXFP8
+            || mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8)
+        {
+            auto [quant_out, scale_out] = mxfp8_quantize(norm_out, /*isSfSwizzledLayout=*/true, /*alignment=*/32);
+            if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_MXFP8)
+            {
+                return {quant_out, scale_out, reduce_output};
+            }
+            return {norm_out, quant_out, scale_out, reduce_output};
+        }
 
         int64_t const sf_vecsize = 16;
         bool const sf_use_ue8m0 = false;
@@ -940,6 +991,12 @@ private:
         {
             auto [quant_out, scale_out]
                 = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, is_sf_swizzled_layout);
+            return {norm_out, quant_out, scale_out, reduce_output};
+        }
+        case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF:
+        {
+            auto [quant_out, scale_out]
+                = torch_ext::fp4_quantize(norm_out, scale.value(), sf_vecsize, sf_use_ue8m0, /*swizzled=*/false);
             return {norm_out, quant_out, scale_out, reduce_output};
         }
         default: break;
@@ -2093,7 +2150,7 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
     torch::optional<torch::Tensor> const& residual, torch::Tensor const& norm_weight,
     torch::Tensor const& expanded_idx_to_permuted_idx, torch::optional<torch::Tensor> const& shared_expert_output,
     torch::optional<torch::Tensor> const& expert_scale_factor, torch::Tensor workspace, int64_t const rank,
-    int64_t const nranks, double const eps)
+    int64_t const nranks, double const eps, bool const match_unfused_numerics, bool const mxfp8_out)
 {
     auto allreduce_fusion_params = tensorrt_llm::kernels::ar_fusion::moe::MoeFinalizeAllReduceFusionParams();
 
@@ -2155,6 +2212,32 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
 
     allreduce_fusion_params.norm_out = norm_out.mutable_data_ptr();
 
+    // Round the routed sum before the shared-expert add and size the launch as the one-shot AllReduce fusion
+    // kernel does, so the result equals a finalize kernel, a separate add and RESIDUAL_RMS_NORM bit for bit.
+    allreduce_fusion_params.round_routed_first = match_unfused_numerics;
+    allreduce_fusion_params.adaptive_launch = match_unfused_numerics;
+
+    torch::Tensor quant_out;
+    torch::Tensor scale_out;
+    if (mxfp8_out)
+    {
+        int64_t constexpr sf_vec_size = 32;
+        TORCH_CHECK(input.scalar_type() == torch::kBFloat16
+                && (!expert_scale_factor.has_value() || expert_scale_factor->scalar_type() == torch::kBFloat16),
+            "moe_finalize_allreduce: MXFP8 output needs bf16 input and expert scales");
+        TORCH_CHECK(
+            nranks == 2 || nranks == 4 || nranks == 8, "moe_finalize_allreduce: MXFP8 output needs 2, 4 or 8 ranks");
+        TORCH_CHECK(hidden_dim % sf_vec_size == 0, "moe_finalize_allreduce: MXFP8 output needs hidden_dim % 32 == 0");
+        quant_out = torch::empty({num_tokens, hidden_dim}, output_opts.dtype(torch::kFloat8_e4m3fn));
+        scale_out
+            = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)},
+                SF_DTYPE, input.device(), std::nullopt);
+        allreduce_fusion_params.quant_out = quant_out.mutable_data_ptr();
+        allreduce_fusion_params.scale_out = scale_out.mutable_data_ptr();
+        allreduce_fusion_params.layout = tensorrt_llm::QuantizationSFLayout::SWIZZLED;
+        allreduce_fusion_params.quant_mxfp8 = true;
+    }
+
     if (residual.has_value())
     {
         residual_out = torch::empty_like(residual.value());
@@ -2167,11 +2250,17 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input,
 
     tensorrt_llm::kernels::ar_fusion::moe::moefinalize_allreduce_fusion_op(allreduce_fusion_params);
 
+    std::vector<torch::Tensor> outputs{norm_out};
+    if (mxfp8_out)
+    {
+        outputs.push_back(quant_out);
+        outputs.push_back(scale_out);
+    }
     if (residual.has_value())
     {
-        return {norm_out, residual_out};
+        outputs.push_back(residual_out);
     }
-    return {norm_out};
+    return outputs;
 }
 
 namespace
@@ -2596,7 +2685,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor workspace,"
         "int rank,"
         "int nranks,"
-        "float eps) -> Tensor[]");
+        "float eps,"
+        "bool match_unfused_numerics=False,"
+        "bool mxfp8_out=False) -> Tensor[]");
     m.def("preallocate_nccl_window_buffer(Tensor input, int[] group, int count) -> ()");
     m.def("is_nccl_window_buffer(Tensor input, int[] group) -> bool");
     // Scope boundaries modify host-side allocator ownership but do not mutate their tensors.

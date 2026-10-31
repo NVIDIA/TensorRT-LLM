@@ -86,7 +86,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 )
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
-from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
+from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
@@ -94,6 +94,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.utils import AuxStreamType, EventType
+from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -515,6 +516,94 @@ def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
     assert loaded == [target]
     assert layers[0].next_layer_layernorm is layers[1].input_layernorm
     assert layers[1].next_layer_layernorm is final_norm
+
+
+def _mxfp8_qkv_proj() -> SimpleNamespace:
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    return SimpleNamespace(quant_method=method, in_features=6144, _mxfp8_offered_input=None)
+
+
+@pytest.mark.cpu_only
+def test_setup_aliases_wires_next_layer_mxfp8_qkv_proj() -> None:
+    target = MiniMaxM3ForCausalLM.__new__(MiniMaxM3ForCausalLM)
+    mxfp8_qkv = _mxfp8_qkv_proj()
+    layers = [
+        SimpleNamespace(input_layernorm=object()),
+        SimpleNamespace(input_layernorm=object(), self_attn=SimpleNamespace(qkv_proj=mxfp8_qkv)),
+        SimpleNamespace(
+            input_layernorm=object(),
+            self_attn=SimpleNamespace(qkv_proj=SimpleNamespace(quant_method=object())),
+        ),
+    ]
+    object.__setattr__(
+        target,
+        "draft_model",
+        SimpleNamespace(load_weights_from_target_model=lambda unused_target: None),
+    )
+    object.__setattr__(target, "model", SimpleNamespace(layers=layers, norm=object()))
+
+    target.setup_aliases()
+
+    assert layers[0].next_layer_qkv_proj is mxfp8_qkv
+    assert not hasattr(layers[1], "next_layer_qkv_proj")
+    assert not hasattr(layers[2], "next_layer_qkv_proj")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "strategy, mnnvl, in_features",
+    [
+        (AllReduceStrategy.AUTO, False, 6144),
+        (AllReduceStrategy.UB, False, 6144),
+        (AllReduceStrategy.MNNVL, True, 6144),
+        (AllReduceStrategy.AUTO, False, 6144 + 32),
+    ],
+)
+def test_next_layer_norm_emits_mxfp8_qkv_input(
+    strategy: AllReduceStrategy, mnnvl: bool, in_features: int
+) -> None:
+    """POST fusion also emits the next MXFP8 QKV input, except under UB, MNNVL or an unaligned hidden size."""
+    calls = []
+    norm_out, act, scale, residual_out = (
+        torch.ones(1),
+        torch.zeros(1),
+        torch.zeros(1),
+        torch.ones(2),
+    )
+
+    def allreduce(hidden_states, *, all_reduce_params):
+        calls.append(all_reduce_params.fusion_op)
+        if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8:
+            return norm_out, act, scale, residual_out
+        return norm_out, residual_out
+
+    qkv_proj = _mxfp8_qkv_proj()
+    qkv_proj.in_features = in_features
+    allreduce_module = SimpleNamespace(
+        strategy=strategy, mnnvl_allreduce=object() if mnnvl else None
+    )
+    layer = SimpleNamespace(
+        next_layer_layernorm=SimpleNamespace(weight=torch.ones(1), variance_epsilon=1e-6),
+        next_layer_qkv_proj=qkv_proj,
+        post_feed_forward_fusion=True,
+        allreduce=allreduce,
+    )
+    layer._quantizes_next_layer_input = lambda: MiniMaxM3DecoderLayer._quantizes_next_layer_input(
+        SimpleNamespace(next_layer_qkv_proj=qkv_proj, allreduce=allreduce_module)
+    )
+
+    hidden, residual = MiniMaxM3DecoderLayer._apply_next_layer_layernorm(
+        layer, torch.zeros(1), torch.zeros(2)
+    )
+
+    assert hidden is norm_out and residual is residual_out
+    if strategy == AllReduceStrategy.UB or mnnvl or in_features % 256:
+        assert calls == [AllReduceFusionOp.RESIDUAL_RMS_NORM]
+        assert qkv_proj._mxfp8_offered_input is None
+    else:
+        assert calls == [AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8]
+        assert qkv_proj._mxfp8_offered_input == (norm_out, act, scale)
 
 
 @pytest.mark.cpu_only

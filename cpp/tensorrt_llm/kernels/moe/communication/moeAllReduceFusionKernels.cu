@@ -133,7 +133,7 @@ __device__ __forceinline__ PackedType rms_norm(
     return norm_out;
 }
 
-template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typename PackedType>
+template <bool ResidualOut, bool NormOut, bool QuantOut, typename DType, typename PackedType, bool MxFp8 = false>
 __device__ __forceinline__ void fused_op(
     PackedType const& val, int access_id, int token_id, int access_id_in_token, AllReduceFusionParams& params)
 {
@@ -157,7 +157,21 @@ __device__ __forceinline__ void fused_op(
     {
         reinterpret_cast<float4*>(params.norm_out)[access_id] = norm_val;
     }
-    if constexpr (QuantOut)
+    if constexpr (QuantOut && MxFp8)
+    {
+        // The four consecutive threads holding one 32-element block share its UE8M0 scale, as in the one-shot
+        // allreduce_fusion_kernel's MXFP8 epilogue; the input is the DType-rounded norm output.
+        constexpr int SF_VEC_SIZE = 32;
+        constexpr int THREADS_PER_SF = SF_VEC_SIZE / kElemsPerAccess;
+        using PackedVec = PackedVec<DType>;
+        PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&norm_val);
+        auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, THREADS_PER_SF>(std::nullopt /* batchIdx */, token_id,
+            access_id_in_token, std::nullopt /* numRows */, params.hidden_dim / SF_VEC_SIZE,
+            reinterpret_cast<uint32_t*>(params.scale_out), params.layout);
+        reinterpret_cast<uint64_t*>(params.quant_out)[access_id]
+            = cvt_warp_fp16_to_mxfp8<DType, SF_VEC_SIZE>(pack_val, sf_out);
+    }
+    else if constexpr (QuantOut)
     {
         constexpr int SF_VEC_SIZE = 16;
         using PackedVec = PackedVec<DType>;
@@ -499,7 +513,8 @@ void moereduction_allreduce_fusion_op(MoeReductionAllReduceFusionParams const& p
 //                  * MoE Finalize Allreduce Fusion *                   //
 /////////////////////////////////////////////////////////////////
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType,
+    bool MxFp8 = false>
 __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeAllReduceFusionParams params)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -600,6 +615,15 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
             }
         }
 
+        if (params.round_routed_first)
+        {
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess; ++i)
+            {
+                facc[i] = static_cast<float>(static_cast<DType>(facc[i]));
+            }
+        }
+
         // * Add shared expert output  (fp32 accumulation)
         if (params.shared_expert_output)
         {
@@ -679,22 +703,50 @@ __global__ void moefinalize_allreduce_fusion_kernel_oneshot_lamport(MoeFinalizeA
         }
 
         // * Fuse
-        fused_op<ResidualOut, NormOut, QuantOut, DType>(sum_val, idx, tidx, access_id_in_token, params);
+        fused_op<ResidualOut, NormOut, QuantOut, DType, float4, MxFp8>(sum_val, idx, tidx, access_id_in_token, params);
     }
     comm.update(params.size * NRanks);
 
 #endif
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType,
+    bool MxFp8 = false>
 void launch_oneshot_moefinalize_lamport(MoeFinalizeAllReduceFusionParams const& params, cudaLaunchConfig_t& cfg)
 {
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&cfg,
-        moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>,
+        moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType,
+            MxFp8>,
         params));
 }
 
-template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType>
+// The CTA and cluster shape allreduce_fusion_kernel_launcher picks for a one-shot launch over token_num tokens:
+// one cluster per token, CTAs of at least 128 threads, and wider CTAs in smaller clusters while the clusters would
+// not fit on the SMs at once.
+inline void adaptive_oneshot_shape(int token_num, int hidden_dim, int sm_count, int& cluster_size, int& block_size)
+{
+    int const threads_per_token = hidden_dim / kElemsPerAccess;
+    cluster_size = 8;
+    while (threads_per_token % cluster_size != 0 && cluster_size > 1)
+    {
+        cluster_size /= 2;
+    }
+    int threads_per_block = threads_per_token / cluster_size;
+    while (threads_per_block < 128 && cluster_size >= 2)
+    {
+        threads_per_block *= 2;
+        cluster_size /= 2;
+    }
+    while (token_num * cluster_size > sm_count && cluster_size > 1 && threads_per_block <= 512)
+    {
+        threads_per_block *= 2;
+        cluster_size /= 2;
+    }
+    block_size = threads_per_block;
+}
+
+template <typename DType, int NRanks, bool ResidualOut, bool NormOut, bool QuantOut, typename ScaleType = DType,
+    bool MxFp8 = false>
 void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionParams const& params)
 {
     int token_num = params.size / params.hidden_dim;
@@ -715,8 +767,13 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
         cluster_size /= 2;
     }
     int block_size = warps_per_token / cluster_size * 32;
-    TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
     int sm_count = get_sm_count();
+    if (params.adaptive_launch)
+    {
+        adaptive_oneshot_shape(token_num, params.hidden_dim, sm_count, cluster_size, block_size);
+    }
+    TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
+    TLLM_CHECK(block_size * cluster_size * kElemsPerAccess >= params.hidden_dim);
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
     cudaLaunchConfig_t cfg;
     cudaLaunchAttribute attribute[2];
@@ -734,7 +791,8 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
     cfg.numAttrs = 2;
     if (oneshot)
     {
-        launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType>(params, cfg);
+        launch_oneshot_moefinalize_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut, ScaleType, MxFp8>(
+            params, cfg);
     }
 }
 
@@ -758,6 +816,33 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
     TLLM_CHECK(params.rms_gamma);
     TLLM_CHECK(params.size % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess == 0);
+    if (params.quant_mxfp8)
+    {
+#define MOE_FINALIZE_MXFP8_DISPATCH(NRANKS, RESIDUAL_OUT)                                                              \
+    if (params.nranks == NRANKS && params.dtype == tensorrt_llm::DataType::kBF16                                       \
+        && params.scale_dtype == tensorrt_llm::DataType::kBF16)                                                        \
+    {                                                                                                                  \
+        return moefinalize_allreduce_fusion_kernel_launcher<__nv_bfloat16, NRANKS, RESIDUAL_OUT, true, true,           \
+            __nv_bfloat16, true>(params);                                                                              \
+    }
+        TLLM_CHECK_WITH_INFO(params.norm_out && params.quant_out && params.scale_out,
+            "moefinalize_allreduce_fusion_op: MXFP8 output needs norm_out, quant_out and scale_out");
+        TLLM_CHECK_WITH_INFO(params.hidden_dim % 32 == 0, "moefinalize_allreduce_fusion_op: MXFP8 needs hidden % 32");
+        if (params.residual_out)
+        {
+            MOE_FINALIZE_MXFP8_DISPATCH(2, true);
+            MOE_FINALIZE_MXFP8_DISPATCH(4, true);
+            MOE_FINALIZE_MXFP8_DISPATCH(8, true);
+        }
+        else
+        {
+            MOE_FINALIZE_MXFP8_DISPATCH(2, false);
+            MOE_FINALIZE_MXFP8_DISPATCH(4, false);
+            MOE_FINALIZE_MXFP8_DISPATCH(8, false);
+        }
+#undef MOE_FINALIZE_MXFP8_DISPATCH
+        TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: MXFP8 output needs bf16 and nranks in {2,4,8}");
+    }
     if (params.residual_out && not params.norm_out && params.quant_out)
     {
         // pattern1: AR+Add_RMS+Quant

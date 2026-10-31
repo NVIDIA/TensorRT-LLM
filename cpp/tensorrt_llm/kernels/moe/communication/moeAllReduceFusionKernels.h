@@ -101,6 +101,16 @@ struct MoeFinalizeAllReduceFusionParams : public AllReduceFusionParams
     // [num_tokens, top_k]
     int32_t* expanded_idx_to_permuted_idx = nullptr;
     // allreduce_in [maxPermutedPaddedCount, hidden_dim]
+
+    // Round the routed top-k sum to DType before adding the shared-expert output, as a finalize kernel followed by
+    // a separate DType add does; otherwise both are accumulated in FP32 and rounded once.
+    bool round_routed_first = false;
+    // Size the CTAs and clusters as the one-shot allreduce_fusion_kernel does for the same token count (fewer
+    // clusters of wider CTAs above sm_count / 8 tokens) instead of one 8-CTA cluster per token on at most sm_count
+    // CTAs, so the per-token RMSNorm reduction runs in the same order as that kernel.
+    bool adaptive_launch = false;
+    // With quant_out: emit MXFP8 (E4M3, one swizzled UE8M0 scale per 32 elements) instead of NVFP4.
+    bool quant_mxfp8 = false;
 };
 
 void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& params);

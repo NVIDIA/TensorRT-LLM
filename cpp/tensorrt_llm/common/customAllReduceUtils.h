@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -73,6 +73,10 @@ inline std::unordered_map<AllReduceFusionOp, int> mapFusionOpToIndex = {
     // norm out quant fusion ops share the same index with norm quant fusion ops
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8, 2},
     {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4, 3},
+    // MXFP8 quantization fusion ops have no measured entries; they use the FP8 quantization ones.
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_MXFP8, 2},
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8, 2},
+    {AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF, 3},
 };
 
 // AllReduce lookup: [tp][fusion][hidden][tokens] = strategy

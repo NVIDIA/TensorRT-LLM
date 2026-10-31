@@ -193,6 +193,18 @@ def run_allreduce_op(
                                                         1 / scale.cpu(), 16, 1)
         return norm_out, dequant_fp4, residual_out
 
+    def calc_residual_rms_norm_out_quant_nvfp4_linear_sf(x, res):
+        norm_out, quant_fp4, scale_factor, residual_out = calc_fused_allreduce(
+            x, res)
+        dequant_fp4 = e2m1_and_ufp8sf_scale_to_float_v2(
+            quant_fp4.cpu(),
+            scale_factor.cpu(),
+            1 / scale.cpu(),
+            16,
+            1,
+            is_sf_swizzled_layout=False)
+        return norm_out, dequant_fp4, residual_out
+
     def ref_allreduce(x, res):
         linear_out = linear(x)
         return [linear_out]
@@ -238,6 +250,19 @@ def run_allreduce_op(
                                                         1 / scale.cpu(), 16, 1)
         return norm_out, dequant_fp4, residual_out
 
+    def ref_residual_rms_norm_out_quant_nvfp4_linear_sf(x, res):
+        norm_out, residual_out = ref_residual_rms_norm(x, res)
+        quant_fp4, scale_factor = torch.ops.trtllm.fp4_quantize(
+            norm_out.clone(), scale, 16, False, False)
+        dequant_fp4 = e2m1_and_ufp8sf_scale_to_float_v2(
+            quant_fp4.cpu(),
+            scale_factor.cpu(),
+            1 / scale.cpu(),
+            16,
+            1,
+            is_sf_swizzled_layout=False)
+        return norm_out, dequant_fp4, residual_out
+
     fusion_op_to_func = {
         AllReduceFusionOp.NONE: (calc_fused_allreduce, ref_allreduce),
         AllReduceFusionOp.RMS_NORM: (calc_fused_allreduce, ref_rms_norm),
@@ -253,6 +278,9 @@ def run_allreduce_op(
         AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4:
         (calc_residual_rms_norm_out_quant_nvfp4,
          ref_residual_rms_norm_out_quant_nvfp4),
+        AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF:
+        (calc_residual_rms_norm_out_quant_nvfp4_linear_sf,
+         ref_residual_rms_norm_out_quant_nvfp4_linear_sf),
     }
 
     calc_func, ref_func = fusion_op_to_func[fusion_op]
@@ -304,6 +332,10 @@ def run_allreduce_op(
         pytest.param(AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4,
                      id="residual_rms_norm_out_quant_nvfp4",
                      marks=skip_pre_blackwell),
+        pytest.param(
+            AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4_LINEAR_SF,
+            id="residual_rms_norm_out_quant_nvfp4_linear_sf",
+            marks=skip_pre_blackwell),
     ],
 )
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
@@ -930,6 +962,248 @@ def test_minimax_allreduce_rms_qk(mpi_pool_executor, non_contiguous_input):
         *zip(*[(tensor_parallel_size, run_minimax_allreduce_rms_qk_op, q_input,
                 k_input, rms_weights_q, rms_weights_k, eps,
                 non_contiguous_input)] * tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+def _mxfp8_valid_scales(scale: torch.Tensor, rows: int,
+                        hidden_size: int) -> torch.Tensor:
+    """The [rows, hidden_size / 32] UE8M0 scales out of the 128x4-swizzled buffer."""
+    cols = hidden_size // 32
+    padded_cols = (cols + 3) // 4 * 4
+    r = torch.arange(rows, device=scale.device).view(-1, 1)
+    c = torch.arange(cols, device=scale.device).view(1, -1)
+    index = ((c % 4) + (c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 +
+             (r // 128) * (128 * padded_cols))
+    return scale.view(torch.uint8).reshape(-1)[index]
+
+
+@torch.inference_mode()
+def run_allreduce_mxfp8_op(x: torch.Tensor, residual: torch.Tensor,
+                           hidden_size: int, dtype: torch.dtype,
+                           tensor_parallel_size: int, tensor_parallel_rank: int,
+                           weights, strategy: AllReduceStrategy):
+    """The MXFP8 fusion ops must match RESIDUAL_RMS_NORM + mxfp8_quantize bit for bit."""
+    x = x.cuda()
+    residual = residual.cuda()
+    torch.manual_seed(1)
+    norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
+    eps = 1e-6
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=tensor_parallel_rank)
+    AutoTuner.get().clear_cache()
+    AutoTuner.get().setup_distributed_state(mapping)
+    allreduce = AllReduce(mapping=mapping, strategy=strategy).cuda()
+    xs = torch.chunk(x.clone(), tensor_parallel_size, dim=-1)
+    partial = xs[tensor_parallel_rank] @ torch.chunk(
+        weights[0].cuda(), tensor_parallel_size,
+        dim=-1)[tensor_parallel_rank].t()
+    rows = partial.shape[0]
+
+    def mxfp8_quantize(t):
+        # Kept nested: cloudpickle cannot ship a by-value function that reads torch.ops directly.
+        return torch.ops.trtllm.mxfp8_quantize(t, True)
+
+    def params(fusion_op):
+        return AllReduceParams(fusion_op=fusion_op,
+                               residual=residual,
+                               norm_weight=norm_weight,
+                               eps=eps)
+
+    for tune in (True, False):
+        with autotune(tune):
+            norm_ref, residual_ref = allreduce(
+                partial,
+                all_reduce_params=params(AllReduceFusionOp.RESIDUAL_RMS_NORM))
+            act_ref, scale_ref = mxfp8_quantize(norm_ref)
+            act, scale, residual_out = allreduce(
+                partial,
+                all_reduce_params=params(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_MXFP8))
+            norm_out, act_out, scale_out, residual_out2 = allreduce(
+                partial,
+                all_reduce_params=params(
+                    AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_MXFP8))
+        assert torch.equal(norm_out, norm_ref)
+        for got_act, got_scale, got_residual in ((act, scale, residual_out),
+                                                 (act_out, scale_out,
+                                                  residual_out2)):
+            assert got_act.dtype == torch.float8_e4m3fn
+            assert got_scale.numel() == scale_ref.numel()
+            assert torch.equal(got_act.view(torch.uint8),
+                               act_ref.view(torch.uint8))
+            assert torch.equal(
+                _mxfp8_valid_scales(got_scale, rows, hidden_size),
+                _mxfp8_valid_scales(scale_ref, rows, hidden_size))
+            assert torch.equal(got_residual, residual_ref)
+
+
+def run_mxfp8_single_rank(tensor_parallel_size, single_rank_forward_func, input,
+                          residual, weights, hidden_size, dtype, strategy):
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        single_rank_forward_func(input, residual, hidden_size, dtype,
+                                 tensor_parallel_size, rank, weights, strategy)
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2,
+                    reason="Requires at least 2 GPUs for this test")
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len", [1, 33, 72, 200, 257, 2048],
+                         ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [2048, 6144],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("strategy", [
+    AllReduceStrategy.AUTO, AllReduceStrategy.ONESHOT,
+    AllReduceStrategy.TWOSHOT, AllReduceStrategy.NCCL,
+    AllReduceStrategy.NCCL_SYMMETRIC
+],
+                         ids=lambda x: x.name)
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_allreduce_residual_rms_norm_mxfp8(seq_len, hidden_size, strategy,
+                                           mpi_pool_executor):
+    if torch.cuda.device_count() < mpi_pool_executor.num_workers:
+        pytest.skip(f"Requires {mpi_pool_executor.num_workers} GPUs")
+    if (strategy == AllReduceStrategy.TWOSHOT
+            and seq_len < mpi_pool_executor.num_workers):
+        pytest.skip("TWOSHOT needs at least one token per rank")
+    if strategy == AllReduceStrategy.ONESHOT and seq_len > 256:
+        pytest.skip("ONESHOT serves decode-sized messages")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    x = torch.randn((seq_len, hidden_size), dtype=dtype)
+    residual = torch.randn_like(x)
+    weight = torch.randn((hidden_size, hidden_size), dtype=dtype) * 0.05
+    results = mpi_pool_executor.map(
+        run_mxfp8_single_rank,
+        *zip(*[(tensor_parallel_size, run_allreduce_mxfp8_op, x, residual,
+                [weight], hidden_size, dtype, strategy)] *
+             tensor_parallel_size),
+    )
+    for r in results:
+        assert r is True
+
+
+def _valid_swizzled_ue8m0_scales(scale: torch.Tensor, rows: int,
+                                 hidden_size: int) -> torch.Tensor:
+    """The [rows, hidden_size / 32] UE8M0 scales out of a 128x4-swizzled buffer (padding excluded)."""
+    cols = hidden_size // 32
+    padded_cols = (cols + 3) // 4 * 4
+    r = torch.arange(rows, device=scale.device).view(-1, 1)
+    c = torch.arange(cols, device=scale.device).view(1, -1)
+    index = ((c % 4) + (c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 +
+             (r // 128) * (128 * padded_cols))
+    return scale.view(torch.uint8).reshape(-1)[index]
+
+
+@torch.inference_mode()
+def run_moe_finalize_allreduce_unfused_numerics_op(
+        fc2_output: torch.Tensor, residual: torch.Tensor,
+        shared_expert_output: torch.Tensor,
+        expanded_idx_to_permuted_idx: torch.Tensor, scale: torch.Tensor,
+        tensor_parallel_rank: int, tensor_parallel_size: int):
+    """match_unfused_numerics must equal finalize + add + RESIDUAL_RMS_NORM (+ mxfp8_quantize) bit for bit."""
+    fc2_output = fc2_output.cuda()
+    residual = residual.cuda()
+    shared_expert_output = shared_expert_output.cuda()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.cuda()
+    scale = scale.cuda()
+    num_tokens, hidden_size = residual.shape
+    torch.manual_seed(7)
+    norm_weight = torch.randn((hidden_size, ),
+                              dtype=residual.dtype,
+                              device="cuda")
+    eps = 1e-6
+    mapping = Mapping(world_size=tensor_parallel_size,
+                      tp_size=tensor_parallel_size,
+                      rank=tensor_parallel_rank)
+
+    # Unfused: the finalize kernel's FP32 sum over the top-k slots in slot
+    # order (each BF16 x BF16 product is exact in FP32) rounded to BF16, the
+    # BF16 shared-expert add, then the one-shot AllReduce + RMSNorm.
+    routed = torch.zeros((num_tokens, hidden_size),
+                         dtype=torch.float32,
+                         device="cuda")
+    for k in range(expanded_idx_to_permuted_idx.shape[1]):
+        rows = fc2_output[expanded_idx_to_permuted_idx[:, k].long()].float()
+        routed = routed + scale[:, k:k + 1].float() * rows
+    partial = routed.to(torch.bfloat16) + shared_expert_output
+    allreduce = AllReduce(mapping=mapping,
+                          strategy=AllReduceStrategy.ONESHOT).cuda()
+    norm_ref, residual_ref = allreduce(
+        partial,
+        all_reduce_params=AllReduceParams(
+            fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps))
+    act_ref, act_scale_ref = torch.ops.trtllm.mxfp8_quantize(norm_ref, True)
+
+    moe_allreduce = MoEAllReduce(mapping=mapping)
+    for mxfp8_out in (False, True):
+        outputs = moe_allreduce(
+            fc2_output,
+            all_reduce_params=MoEAllReduceParams(
+                expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+                expert_scale_factor=scale,
+                shared_expert_output=shared_expert_output,
+                residual=residual,
+                norm_weight=norm_weight,
+                eps=eps,
+                match_unfused_numerics=True,
+                mxfp8_out=mxfp8_out,
+            ))
+        assert len(outputs) == (4 if mxfp8_out else 2)
+        assert torch.equal(outputs[0], norm_ref)
+        assert torch.equal(outputs[-1], residual_ref)
+        if mxfp8_out:
+            act, act_scale = outputs[1], outputs[2]
+            assert act.dtype == torch.float8_e4m3fn
+            assert torch.equal(act.view(torch.uint8), act_ref.view(torch.uint8))
+            assert torch.equal(
+                _valid_swizzled_ue8m0_scales(act_scale, num_tokens,
+                                             hidden_size),
+                _valid_swizzled_ue8m0_scales(act_scale_ref, num_tokens,
+                                             hidden_size))
+    return True
+
+
+@torch.inference_mode()
+@skip_pre_blackwell
+@pytest.mark.parametrize("seq_len", [1, 16, 128], ids=lambda x: f"seqlen:{x}")
+@pytest.mark.parametrize("hidden_size", [3072, 7168],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("mpi_pool_executor", [2, 4], indirect=True)
+def test_moe_finalize_allreduce_unfused_numerics(seq_len, hidden_size,
+                                                 mpi_pool_executor):
+    if torch.cuda.device_count() < mpi_pool_executor.num_workers:
+        pytest.skip(f"Requires {mpi_pool_executor.num_workers} GPUs")
+    torch.manual_seed(42)
+    dtype = torch.bfloat16
+    tensor_parallel_size = mpi_pool_executor.num_workers
+    top_k = 8
+    shared_expert_output = torch.randn((seq_len, hidden_size), dtype=dtype)
+    fc2_output = torch.randn((seq_len * top_k, hidden_size), dtype=dtype)
+    scale = torch.rand((seq_len, top_k), dtype=dtype)
+    expanded_idx_to_permuted_idx = torch.randperm(seq_len * top_k,
+                                                  dtype=torch.int32).view(
+                                                      seq_len, top_k)
+    residual = torch.randn_like(shared_expert_output)
+
+    results = mpi_pool_executor.map(
+        run_moe_finalize_single_rank,
+        *zip(*[(tensor_parallel_size,
+                run_moe_finalize_allreduce_unfused_numerics_op, fc2_output,
+                residual, shared_expert_output, expanded_idx_to_permuted_idx,
+                scale)] * tensor_parallel_size),
     )
     for r in results:
         assert r is True
