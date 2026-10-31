@@ -581,3 +581,59 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
             need_response=False)
         assert request.id == 7
         assert proxy._results == {7: result, 8: peer_result}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("ignore_eos", [False, True])
+@pytest.mark.parametrize("simple", [False, True])
+def test_worker_enqueues_serializable_python_input_envelope(ignore_eos, simple):
+    import pickle
+
+    from tensorrt_llm._torch.pyexecutor.llm_request import \
+        executor_request_to_llm_request
+    from tensorrt_llm._torch.pyexecutor.request_inputs import ExecutorRequest
+    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.sampling_params import LogprobMode
+
+    captured = []
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = True
+    worker._lora_manager = None
+    worker.max_seq_len = 20
+    worker.engine = SimpleNamespace(
+        enqueue_request=lambda request: captured.append(request) or 42)
+    request = GenerationRequest(
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(
+            max_tokens=2,
+            end_id=7,
+            ignore_eos=ignore_eos,
+            n=3,
+            top_k=10,
+            logprobs=0 if simple else 2,
+            logprobs_mode=LogprobMode.PROCESSED,
+            logprobs_simple_format=simple,
+            return_routed_experts=True,
+        ),
+        multimodal_params=MultimodalParams(
+            multimodal_data={"embedding": torch.ones(2, 4)}),
+        arrival_time=123.0,
+    ).set_id(11)
+
+    assert worker._enqueue_request(request) == 42
+    assert len(captured) == 1
+    envelope = captured[0]
+    assert isinstance(envelope, ExecutorRequest)
+    assert not hasattr(envelope.request, "py_logprobs_mode")
+    restored = pickle.loads(pickle.dumps(envelope))
+    parent = executor_request_to_llm_request(42, restored, [43, 44], False)
+    for translated in (parent, *parent.child_requests):
+        assert translated.py_client_id == 11
+        assert translated.py_original_end_id == 7
+        assert translated.py_end_id == (-1 if ignore_eos else 7)
+        assert translated.py_logprobs_mode == LogprobMode.PROCESSED
+        assert translated.py_logprobs_simple_format is simple
+        assert translated.py_num_logprobs == (0 if simple else 2)
+        assert translated.py_return_routed_experts
+        torch.testing.assert_close(translated.py_multimodal_data["embedding"],
+                                   torch.ones(2, 4))

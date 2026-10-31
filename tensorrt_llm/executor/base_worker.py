@@ -32,6 +32,8 @@ from tensorrt_llm.logger import logger
 from .._torch.peft.lora.manager import LoraManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
+from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
+                                                PythonRequestInputs)
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
@@ -377,7 +379,7 @@ class BaseWorker(GenerationExecutor):
         else:
             prompt_token_ids = list(request.prompt_token_ids)
         # MULTIMODAL
-        # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
+        # NOTE: Since, we only support PyTorch backend for multimodal, we send multimodal_data through the internal Python input payload
         # except `multimodal_input` as it needs to go through the C++ runtime.
         multimodal_input = None
         if request.multimodal_params is not None and request.multimodal_params.has_content(
@@ -385,7 +387,7 @@ class BaseWorker(GenerationExecutor):
             if request.multimodal_params.multimodal_input is not None:
                 multimodal_input = request.multimodal_params.multimodal_input.to_binding(
                     tllm)
-            # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
+            # NOTE: Setting to None here to avoid sending multimodal_input again through the Python input payload
             request.multimodal_params.multimodal_input = None
 
         context_phase_params = None
@@ -483,43 +485,34 @@ class BaseWorker(GenerationExecutor):
                 disagg_request_id=disagg_request_id,
                 cache_salt=request.cache_salt,
                 priority=request.priority)
-            executor_request.py_original_end_id = request.sampling_params.end_id
-            executor_request.py_num_logprobs = request.sampling_params.logprobs
-            executor_request.py_lora_path = py_lora_path
-            executor_request.py_lora_ckpt_source = py_lora_ckpt_source
-            executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
-            executor_request.py_logprobs_simple_format = (
-                request.sampling_params.logprobs_simple_format)
-            executor_request.py_return_routed_experts = (
-                request.sampling_params.return_routed_experts)
-
-            # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
-            if request.disaggregated_params is not None:
-                executor_request.py_disaggregated_params = request.disaggregated_params
             if request.multimodal_params is not None:
-                if request.multimodal_params.multimodal_data is not None:
-                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
-                    # E/P handoff embedding handles parked under "multimodal_embedding".
-                    request.multimodal_params.to_tensor("multimodal_data")
-                    executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
-
-            if request.sampling_params.logits_processor:
-                # For PyTorch backend, we attach logits processors as a dynamic Python attribute
-                # instead of using the C++ binding, since the latter will cause PyCapsule pickling issues.
-                lp = request.sampling_params.logits_processor
-                executor_request.py_logits_post_processors = lp if isinstance(
-                    lp, list) else [lp]
-
-            executor_request.py_scheduling_params = None
-            if request.scheduling_params is not None:
-                executor_request.py_scheduling_params = request.scheduling_params
-
-            executor_request.py_conversation_params = None
-            if request.conversation_params is not None:
-                executor_request.py_conversation_params = request.conversation_params
-
-            if request.arrival_time is not None:
-                executor_request.py_arrival_time = request.arrival_time
+                # Resolve worker-handoff handles before constructing the input envelope.
+                request.multimodal_params.to_tensor("multimodal_data")
+            processors = request.sampling_params.logits_processor
+            executor_request = ExecutorRequest(
+                executor_request,
+                PythonRequestInputs(
+                    original_end_id=request.sampling_params.end_id,
+                    num_logprobs=request.sampling_params.logprobs,
+                    lora_path=py_lora_path,
+                    lora_ckpt_source=py_lora_ckpt_source,
+                    logprobs_mode=request.sampling_params.logprobs_mode,
+                    logprobs_simple_format=request.sampling_params.
+                    logprobs_simple_format,
+                    return_routed_experts=request.sampling_params.
+                    return_routed_experts,
+                    disaggregated_params=request.disaggregated_params,
+                    multimodal_data=(request.multimodal_params.multimodal_data
+                                     if request.multimodal_params is not None
+                                     else None),
+                    logits_post_processors=(processors if isinstance(
+                        processors, list) else [processors])
+                    if processors else None,
+                    scheduling_params=request.scheduling_params,
+                    conversation_params=request.conversation_params,
+                    arrival_time=request.arrival_time,
+                ),
+            )
 
             if result_wait_queue is not None:
                 req_id = self.engine.enqueue_request(

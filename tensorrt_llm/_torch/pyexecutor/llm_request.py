@@ -19,6 +19,8 @@ from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             get_multimodal_item_metadata)
 from tensorrt_llm.sampling_params import LogprobMode
 
+from .request_inputs import ExecutorRequest, PythonRequestInputs
+
 SamplingConfig = tllm_executor.SamplingConfig
 
 MAX_SPEC_DECODE_POSITIONS = 16
@@ -36,7 +38,6 @@ UNKNOWN: typing.ClassVar[LlmRequestState]  # value = <LlmRequestState.UNKNOWN: 0
 LlmRequestState = tensorrt_llm.bindings.LlmRequestState
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
 
-ExecutorRequest = tllm_executor.Request
 ExecutorResponse = tllm_executor.Response
 FinishReason = tllm_executor.FinishReason
 
@@ -1219,6 +1220,20 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                 or self.py_mm_encoder_event is not None):
             raise RuntimeError(
                 "Child requests must be created before MM encoder admission")
+        inputs = PythonRequestInputs(
+            logits_post_processors=self.py_logits_post_processors,
+            multimodal_data=self.py_multimodal_data,
+            num_logprobs=self.py_num_logprobs,
+            disaggregated_params=self.py_disaggregated_params,
+            lora_path=self.py_lora_path,
+            lora_ckpt_source=self.py_lora_ckpt_source,
+            logprobs_mode=self.py_logprobs_mode,
+            logprobs_simple_format=self.py_logprobs_simple_format,
+            return_routed_experts=self.py_return_routed_experts,
+            original_end_id=self.py_original_end_id,
+            conversation_params=self.py_conversation_params,
+            uncached_prefill_tokens=self.py_uncached_prefill_tokens,
+        ).copy_for_child()
         child = LlmRequest(
             parent_request=self,
             child_id=child_id,
@@ -1245,17 +1260,15 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             end_id=self.py_end_id,
             py_lora_path=self.py_lora_path,
             py_lora_ckpt_source=self.py_lora_ckpt_source,
-            py_logits_post_processors=(self.py_logits_post_processors.copy()
-                                       if self.py_logits_post_processors
-                                       is not None else None),
-            py_multimodal_data=deepcopy(self.py_multimodal_data),
+            py_logits_post_processors=inputs.logits_post_processors,
+            py_multimodal_data=inputs.multimodal_data,
             encoder_input_features=self.py_encoder_input_features,
         )
         child.py_bad_words = deepcopy(self.py_bad_words)
         child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
         child.py_original_end_id = self.py_original_end_id
-        child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
-        child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_disaggregated_params = inputs.disaggregated_params
+        child.py_conversation_params = inputs.conversation_params
         child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
         child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
         child.is_attention_dp_dummy = self.is_attention_dp_dummy
@@ -1564,11 +1577,14 @@ def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
 
 def executor_request_to_llm_request(
         req_id: int,
-        executor_request: ExecutorRequest,
+        executor_request: ExecutorRequest | tllm_executor.Request,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
         input_token_ids: Optional[List] = None,
         position_ids: Optional[List] = None) -> LlmRequest:
+    envelope = ExecutorRequest.adapt(executor_request)
+    inputs = envelope.inputs
+    executor_request = envelope.request
     sampling_config = executor_request.sampling_config
 
     input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
@@ -1605,7 +1621,7 @@ def executor_request_to_llm_request(
     # Python multimodal data is the canonical source for mRoPE model inputs.
     # Preserve input-processor values and fill only missing entries when a
     # directly constructed executor request carries the public MropeConfig.
-    py_multimodal_data = getattr(executor_request, "py_multimodal_data", None)
+    py_multimodal_data = inputs.multimodal_data
     if executor_request.mrope_config is not None:
         if py_multimodal_data is None:
             py_multimodal_data = {}
@@ -1620,8 +1636,8 @@ def executor_request_to_llm_request(
         mrope_config.setdefault("mrope_position_deltas", mrope_position_deltas)
 
     agent_hierarchy = None
-    if getattr(executor_request, "py_scheduling_params", None) is not None:
-        agent_hierarchy = executor_request.py_scheduling_params.agent_hierarchy
+    if inputs.scheduling_params is not None:
+        agent_hierarchy = inputs.scheduling_params.agent_hierarchy
 
     # Audio encoder-decoder models (e.g. Whisper) carry the encoder input as a
     # feature tensor, not encoder token ids. Python owns the payload; native
@@ -1679,11 +1695,10 @@ def executor_request_to_llm_request(
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
-        py_lora_path=getattr(executor_request, "py_lora_path", None),
-        py_lora_ckpt_source=getattr(executor_request, "py_lora_ckpt_source",
-                                    None),
+        py_lora_path=inputs.lora_path,
+        py_lora_ckpt_source=inputs.lora_ckpt_source,
         return_log_probs=executor_request.output_config.return_log_probs,
-        num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
+        num_logprobs=inputs.num_logprobs,
         return_context_logits=executor_request.output_config.
         return_context_logits,
         return_perf_metrics=executor_request.output_config.return_perf_metrics,
@@ -1699,8 +1714,7 @@ def executor_request_to_llm_request(
         exclude_input_from_output=executor_request.output_config.
         exclude_input_from_output,
         guided_decoding_params=executor_request.guided_decoding_params,
-        py_logits_post_processors=getattr(executor_request,
-                                          "py_logits_post_processors", None),
+        py_logits_post_processors=inputs.logits_post_processors,
         encoder_input_tokens=executor_request.encoder_input_token_ids,
         encoder_input_features=encoder_input_features,
         encoder_output_len=encoder_output_len,
@@ -1712,16 +1726,13 @@ def executor_request_to_llm_request(
         llm_request_type=llm_request_type,
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
-        arrival_time=getattr(executor_request, "py_arrival_time", None),
+        arrival_time=inputs.arrival_time,
         py_multimodal_data=py_multimodal_data,
         kv_cache_retention_config=executor_request.kv_cache_retention_config,
         agent_hierarchy=agent_hierarchy,
-        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
-                              LogprobMode.RAW),
-        logprobs_simple_format=getattr(executor_request,
-                                       "py_logprobs_simple_format", False),
-        return_routed_experts=getattr(executor_request,
-                                      "py_return_routed_experts", False),
+        logprobs_mode=inputs.logprobs_mode,
+        logprobs_simple_format=inputs.logprobs_simple_format,
+        return_routed_experts=inputs.return_routed_experts,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
@@ -1738,17 +1749,11 @@ def executor_request_to_llm_request(
     ngram_size = executor_request.sampling_config.no_repeat_ngram_size
     llm_request.py_no_repeat_ngram_size = ngram_size if ngram_size else None
 
-    llm_request.py_original_end_id = getattr(executor_request,
-                                             "py_original_end_id",
-                                             llm_request.py_end_id)
-    llm_request.py_disaggregated_params = getattr(executor_request,
-                                                  "py_disaggregated_params",
-                                                  None)
-    llm_request.py_conversation_params = getattr(executor_request,
-                                                 "py_conversation_params", None)
+    llm_request.py_original_end_id = inputs.original_end_id
+    llm_request.py_disaggregated_params = inputs.disaggregated_params
+    llm_request.py_conversation_params = inputs.conversation_params
     # Published by the attention-DP router before this conversion, if at all.
-    llm_request.py_uncached_prefill_tokens = getattr(
-        executor_request, "py_uncached_prefill_tokens", None)
+    llm_request.py_uncached_prefill_tokens = inputs.uncached_prefill_tokens
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)
