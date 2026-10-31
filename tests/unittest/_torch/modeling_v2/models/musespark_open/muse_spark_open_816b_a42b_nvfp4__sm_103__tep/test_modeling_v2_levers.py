@@ -154,6 +154,7 @@ def _compositions(dispatch):
 LEVERS, DISPATCH = _load()
 TARGET_PATHS = _compositions(DISPATCH)
 RULES = LEVERS.RULES
+HC_MIN_BATCH = LEVERS.HC_MIN_BATCH
 BASELINE = {LEVERS.DEFAULT_KNOB: "baseline"}
 
 
@@ -292,9 +293,9 @@ REGIONS = [
     pytest.param(
         (107, 4),
         "agg",
-        (48,),
+        (48, 64),
         "windowed",
-        HC | MIDC | {"head_sampler_coop_fold", "hot_replicas"} | PREFILL,
+        HC | {"graph_start_qkv_prefetch", "hot_replicas"} | PREFILL,
         id="agg-hc",
     ),
     pytest.param(
@@ -532,23 +533,29 @@ def test_a_replay_set_is_the_whole_plan_it_replays(key, mbs, role, arena, knob_s
     assert set(table(key, mbs, role, arena, knob_set).paths()) == want
 
 
-def test_auto_differs_from_r_h_only_by_the_small_step_levers():
+def test_auto_at_the_high_concurrency_selection_is_r_h():
     opt_ins = knobs(context_fp8_dense="on", context_fp8_attn_gather="on")
-    auto = table((107, 4), 48, "agg", "windowed", opt_ins).decisions
-    replay = table((107, 4), 48, "agg", "windowed", R_H).decisions
-    differ = {
-        name
-        for name, d in auto.items()
-        if (d.on, dict(d.params)) != (replay[name].on, dict(replay[name].params))
-    }
-    assert differ == {
-        "graph_start_qkv_prefetch",
-        "head_sampler_coop_fold",
-        "wide_direct_transports",
-        "wide_finalize_transport",
-        "wide_oproj_publish",
-        "windowed_commit_parallel",
-    }
+    for mbs in (HC_MIN_BATCH, 64):
+        auto = table((107, 4), mbs, "agg", "windowed", opt_ins).decisions
+        replay = table((107, 4), mbs, "agg", "windowed", R_H).decisions
+        assert {
+            name
+            for name, d in auto.items()
+            if (d.on, dict(d.params)) != (replay[name].on, dict(replay[name].params))
+        } == set(), mbs
+
+
+def test_the_high_concurrency_selection_is_aggregated_tep4_from_its_batch():
+    below = table((107, 4), HC_MIN_BATCH - 1, "agg", "windowed")
+    assert below.param("windowed_commit_parallel", "MIN_REQUESTS") == 5
+    assert below.on("wide_direct_transports") and not below.on("graph_start_qkv_prefetch")
+    hc = table((107, 4), HC_MIN_BATCH, "agg", "windowed")
+    assert hc.param("windowed_commit_parallel", "MIN_REQUESTS") == 1
+    assert not hc.on("wide_direct_transports") and hc.on("graph_start_qkv_prefetch")
+    for key, role in (((107, 4), "gen"), ((107, 8), "agg")):
+        other = table(key, HC_MIN_BATCH, role, "windowed")
+        assert other.param("windowed_commit_parallel", "MIN_REQUESTS") == 5, (key, role)
+        assert not other.on("graph_start_qkv_prefetch"), (key, role)
 
 
 @pytest.mark.parametrize("arm", [None, B_LL, BASELINE], ids=["auto", "b-ll", "baseline"])

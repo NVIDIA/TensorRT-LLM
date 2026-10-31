@@ -61,6 +61,10 @@ DRAFT_LEN = 7
 ROWS_PER_REQUEST = DRAFT_LEN + 1
 #: The fewest decode rows of a step of two requests, where the wide TP4 paths start.
 WIDE_MIN_ROWS = 2 * ROWS_PER_REQUEST
+#: Aggregated sm107 TEP4 servers of at least this max_batch_size run the high-concurrency
+#: selection: no wide decode paths or cooperative head fold, the graph-start QKV prefetch,
+#: and the parallel windowed context commit from one request.
+HC_MIN_BATCH = 48
 
 #: The prefix of every lever knob.
 PREFIX = "MUSESPARK_OPEN_LEVER_"
@@ -240,7 +244,8 @@ class Param:
 
     An integer in ``low..high``, or, with ``choices``, a non-empty subset of ``choices``
     (comma-separated, kept in ``choices`` order). A lossy lever's range is a subset of
-    the values its accuracy gate covered.
+    the values its accuracy gate covered. ``default_for``, when set, gives the default
+    per deployment; the knob still wins over it.
     """
 
     key: str
@@ -248,6 +253,10 @@ class Param:
     low: int = 1
     high: int = 1 << 30
     choices: Tuple[str, ...] = ()
+    default_for: Optional[Callable[["Deployment"], object]] = None
+
+    def default_of(self, deployment: "Deployment") -> object:
+        return self.default if self.default_for is None else self.default_for(deployment)
 
     def parse(self, raw: str) -> object:
         """The value ``raw`` gives this parameter.
@@ -367,6 +376,29 @@ class Resolving:
 # The deployment rules
 # --------------------------------------------------------------------------
 _NO_DECODE = "the server runs no decode step"
+_HC = f"aggregated sm107 tep4 servers of max_batch_size {HC_MIN_BATCH} or more"
+
+
+def _hc_selection(d: Deployment) -> bool:
+    """Whether ``d`` runs the high-concurrency selection (``HC_MIN_BATCH``)."""
+    return (
+        d.sm == 107
+        and d.tp == 4
+        and d.role is Role.AGG
+        and d.max_batch_size is not None
+        and d.max_batch_size >= HC_MIN_BATCH
+    )
+
+
+def _off_at_hc(rule: "RuleFn") -> "RuleFn":
+    """``rule``, except off on the high-concurrency selection."""
+
+    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
+        if _hc_selection(d):
+            return False, f"{_HC} run without it"
+        return rule(d, t, p)
+
+    return wrapped
 
 
 def _reaching(rows: int, what: str) -> RuleFn:
@@ -442,6 +474,17 @@ def _not_on_sm107(why_off: str, why_on: str) -> RuleFn:
     return rule
 
 
+def _graph_start_prefetch(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
+    if d.sm != 107:
+        return True, "graph starts of split-K row counts"
+    if _hc_selection(d):
+        return True, f"graph starts of split-K row counts on {_HC}"
+    return False, (
+        "on sm107 a captured decode graph starts without a fork, and layer 0's QKV weight is "
+        "not prefetched"
+    )
+
+
 def _coop_fold(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
     if not d.decodes():
         return False, _NO_DECODE
@@ -491,7 +534,9 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             "HC",
             Kind.BITWISE,
             _windowed_commit_parallel,
-            params=(Param("MIN_REQUESTS", 5, 1, 64),),
+            params=(
+                Param("MIN_REQUESTS", 5, 1, 64, default_for=lambda d: 1 if _hc_selection(d) else 5),
+            ),
         ),
         "context_fp8_dense": Rule(
             "HC",
@@ -509,16 +554,18 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "context_fp8_attn_gather": Rule(
             "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_attn_gather_excluded
         ),
-        "wide_direct_transports": Rule("midc", Kind.BITWISE, _wide_steps),
+        "wide_direct_transports": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
         "wide_router_per_row": Rule(
             "midc",
             Kind.NUMERIC,
             _wide_steps,
             gates=(_router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),),
         ),
-        "wide_oproj_publish": Rule("midc", Kind.BITWISE, _wide_steps),
+        "wide_oproj_publish": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
         "wide_finalize_transport": Rule(
-            "midc", Kind.BITWISE, _always("17..32-token finalize calls on a 32-token transport")
+            "midc",
+            Kind.BITWISE,
+            _off_at_hc(_always("17..32-token finalize calls on a 32-token transport")),
         ),
         "lm_head_inbox": Rule(
             "upstream",
@@ -531,11 +578,7 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "graph_start_qkv_prefetch": Rule(
             "upstream",
             Kind.COMPOSITION,
-            _not_on_sm107(
-                "on sm107 a captured decode graph starts without a fork, and layer 0's QKV "
-                "weight is not prefetched",
-                "graph starts of split-K row counts",
-            ),
+            _graph_start_prefetch,
             baseline=_always("graph starts of split-K row counts"),
         ),
         "step_loop_on_execution_stream": Rule(
@@ -560,7 +603,7 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
         "head_sampler_coop_fold": Rule(
             "LL",
             Kind.BITWISE,
-            _coop_fold,
+            _off_at_hc(_coop_fold),
             params=(Param("MAX_ROWS", 16, 1, 128),),
         ),
         "head_multimem_gather": Rule(
@@ -1015,7 +1058,7 @@ def resolve(
         rule = RULES.get(name)
         mode = knobs.modes.get(name)
         params = {
-            param.key: knobs.params.get((name, param.key), param.default)
+            param.key: knobs.params.get((name, param.key), param.default_of(d))
             for param in (rule.params if rule is not None else ())
         }
         decision = _decide(
