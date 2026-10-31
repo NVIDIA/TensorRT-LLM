@@ -218,6 +218,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm impor
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (
+    ple_ngram_embed,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -302,7 +305,6 @@ from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
 from .ops.ple.ple_gate_conv_inject_norm import ple_gate_conv_inject_norm
-from .ops.ple.ple_ngram_embed import ple_ngram_embed
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
 from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update

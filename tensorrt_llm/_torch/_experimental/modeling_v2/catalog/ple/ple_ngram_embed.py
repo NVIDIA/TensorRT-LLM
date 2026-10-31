@@ -4,12 +4,16 @@
 table gather and per-tensor fp8 dequantization in one Triton launch, with the
 per-slot n-gram context published back in the same pass.
 
-Tier 5 (Triton written for this target). It replaces, on the decode path,
+Shared by the qwen4_exp tp1 target and the unified target (promoted from their
+copies): the Triton kernels written for the tp1 target, reading the window and hash
+references of ``ngram_token_history`` and
+``ngram_hash``. It replaces, on the decode path,
 the composition ``ngram_token_history`` (~20 launches) + ``ngram_hash`` (~30
 launches) + ``nn.functional.embedding`` + ``dequantize_e4m3_per_tensor`` --
-nothing registered under ``torch.ops.trtllm`` or in the installed FlashInfer hashes
-n-grams or gathers-and-dequantizes, and each of those entries is launch-bound
-at decode (0.3-0.4 ms eager each).
+nothing registered under ``torch.ops.trtllm`` or in the installed FlashInfer
+gathers-and-dequantizes n-gram rows (``torch.ops.trtllm.qwen4_exp_ple_ngram_hash``
+hashes a window only), and each of those entries is launch-bound at decode
+(0.3-0.4 ms eager each).
 
 One program per **sequence**, which loops over that sequence's rows: the carry
 read and the publish of one slot happen in one program, so no other program can
@@ -29,11 +33,14 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import ngram_hash
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (
+    DEP4_SLOTS,
+    TEP4_SLOTS,
     ngram_token_history,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's PLE geometry: 3-gram, 16 heads of 160 fp8 columns.
 CKPT_NGRAM_SIZE = 3
@@ -41,8 +48,14 @@ CKPT_HEAD_DIM = 160
 CKPT_TABLE_ROWS = 320001536
 CKPT_EOS_TOKEN_ID = 248044
 CKPT_SCALE = 0.00019931793212890625
-#: Largest `ple_ngram` pool seen for this checkpoint (see `ngram_token_history`).
+#: Largest `ple_ngram` pool seen for this checkpoint at tp1 (see `ngram_token_history`).
 ENGINE_SLOTS = 461
+#: A tp4 rank's pool. No engine has run tp4 to count it (the stock MoE refuses the
+#: 160-row per-rank expert slice), and a tp4 rank holds the same per-rank PLE and GDN
+#: state as a tep4 rank, so the pool is bounded by the largest one measured at that
+#: geometry: tep4's, host-resident table (`TEP4_SLOTS`, the n-gram pool this entry
+#: publishes to, measured with `ngram_token_history`).
+TP4_SLOTS = TEP4_SLOTS
 #: Above this many rows per sequence (MTP verify carries at most 4) the call
 #: takes the context-shaped path: packed row tiles plus a separate publish.
 PER_SEQ_MAX_ROWS = 4
@@ -344,6 +357,62 @@ class PleNgramEmbed(OpWrapper):
             pool_slots=ENGINE_SLOTS,
             eos_density=0.05,
         ),
+        # The unified target's members, each at the per-rank n-gram pool its rank binds,
+        # as the forward calls it: decode and verify with `has_initial_states`
+        # None and `max_rows` the rows per sequence, prefill with one flag per
+        # sequence and `max_rows` the step's row count.
+        _cell(
+            f"tep4 decode: 128 x 1 row, host-resident table, {TEP4_SLOTS} slots",
+            (1,) * 128,
+            pool_slots=TEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"dep4 decode: a rank's 32 x 1 row, host-resident table, {DEP4_SLOTS} slots",
+            (1,) * 32,
+            pool_slots=DEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"tp4 decode: 128 x 1 row, the full checkpoint-height table, {TP4_SLOTS} slots",
+            (1,) * 128,
+            pool_slots=TP4_SLOTS,
+            table="ckpt",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
+            (2,) * 128,
+            pool_slots=TEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row form), {TEP4_SLOTS} slots",
+            (8,) * 128,
+            pool_slots=TEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
+            (8192,),
+            carries=(False,),
+            pool_slots=TEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
+        _cell(
+            f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
+            (8192 - 127,) + (1,) * 127,
+            carries=(False,) + (True,) * 127,
+            max_rows=8192,
+            pool_slots=TEP4_SLOTS,
+            table="host",
+            eos_density=0.05,
+        ),
     )
 
     note = """
@@ -368,6 +437,27 @@ class PleNgramEmbed(OpWrapper):
     on the per-sequence path, and a mixed step of 2 contexts (one fresh, one
     carrying) + 64 decode rows on the packed-row form. Not certified:
     zero-row sequences.
+
+    At the unified target's per-rank n-gram pools, with slots spread over the whole
+    pool and both ends taken (a lone sequence on the last slot):
+    - tep4 (`TEP4_SLOTS` 1874): 128 x 1 decode; MTP1 verify, 128 x 2 rows,
+      on the per-sequence path; MTP7 verify, 128 x 8 rows, on the packed-row
+      form with no carry flags (the decode call site's `None`); one fresh
+      8192-token context; and the envelope's largest step, 8192 rows over
+      128 sequences (one fresh 8065-token context + 127 carrying decode rows).
+    - dep4 (`DEP4_SLOTS` 850): a rank's 32 x 1 decode.
+    - tp4 (`TP4_SLOTS`, bounded by tep4's pool; no engine has counted a tp4
+      rank's): 128 x 1 decode on the full checkpoint-height device table.
+    The pools are the stock engine's at core's config, host-resident table;
+    an MTP member reserves its own pool and was not counted. CUDA-graph replay
+    is certified at 16 x 1 rows over 461 slots and at 128 x 1 and 128 x 8
+    rows over 1874 slots.
+
+    The kernels are Triton, JIT-compiled on first call for the running
+    device: every cell above ran that path on sm_103. The host-resident
+    cells read a pinned host table through its mapped device address, the
+    stock PLE host offload's placement. The checkpoint-height cells allocate
+    the 47.7 GiB table on the device.
 
     Bitwise equal to `ngram_token_history` + `ngram_hash` + embedding +
     `dequantize_e4m3_per_tensor`, window, rows, values and pool alike.

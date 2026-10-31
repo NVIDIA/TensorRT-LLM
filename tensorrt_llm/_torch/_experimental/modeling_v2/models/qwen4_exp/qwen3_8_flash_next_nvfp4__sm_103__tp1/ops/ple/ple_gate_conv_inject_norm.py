@@ -33,8 +33,10 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from .ple_ngram_embed import PER_SEQ_MAX_ROWS, _seq_of_rows
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (
+    PER_SEQ_MAX_ROWS,
+    _seq_of_rows,
+)
 
 
 @triton.jit

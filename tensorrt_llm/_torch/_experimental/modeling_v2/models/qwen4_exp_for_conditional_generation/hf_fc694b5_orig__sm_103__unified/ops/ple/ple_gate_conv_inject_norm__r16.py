@@ -40,8 +40,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_histo
     DEP4_SLOTS,
     TEP4_SLOTS,
 )
-
-from .ple_ngram_embed__r15 import PER_SEQ_MAX_ROWS, _seq_of_rows
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (
+    PER_SEQ_MAX_ROWS,
+    _seq_of_rows,
+)
 
 
 @triton.jit

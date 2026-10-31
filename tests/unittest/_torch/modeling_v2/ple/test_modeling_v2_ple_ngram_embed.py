@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ple_ngram_embed entry (this target's variant r15).
+"""GPU test for the ple_ngram_embed entry (the unified target's variant r15).
 
 Integer bookkeeping plus a one-rounding dequantize, so gated bitwise -- the
 embedding and the whole published pool -- against the entry's reference, which
@@ -25,7 +25,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ngram_token_history import (  # noqa: E501
     ngram_token_history,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ple_ngram_embed__r15 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (  # noqa: E501
     CKPT_EOS_TOKEN_ID,
     CKPT_HEAD_DIM,
     CKPT_SCALE,
@@ -33,12 +33,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditio
     ENGINE_SLOTS,
     TEP4_SLOTS,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.ple.ple_ngram_embed__r15 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed import (  # noqa: E501
     ple_ngram_embed as op,
 )
 from tensorrt_llm._utils import CUASSERT
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "ple_ngram_embed requires a CUDA device"
@@ -191,7 +191,7 @@ def test_guard_refuses_short_query_start_loc() -> None:
         op(*args)
 
 
-#: Captured decode shapes: tp1's, and this target's 128-request decode and MTP7
+#: Captured decode shapes: tp1's, and the unified target's 128-request decode and MTP7
 #: verify (the packed-row form's two launches) at a tep4 rank's pool.
 GRAPH_SPECS = (
     dict(lengths=(1,) * 16, pool_slots=ENGINE_SLOTS, eos_density=0.1),
