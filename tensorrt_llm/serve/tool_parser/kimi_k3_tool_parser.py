@@ -207,13 +207,16 @@ class KimiK3ToolParser(BaseToolParser):
         if value_type == "string":
             return value
         try:
-            return json.loads(value)
-        except json.JSONDecodeError:
+            parsed = json.loads(value)
+            # The value is sent inside the arguments object, one level deeper.
+            json.dumps([parsed])
+        except (ValueError, RecursionError):
             logger.warning(
                 f"kimi_k3 tool parser: argument declared type={value_type} but "
                 "body is not valid JSON; keeping raw text"
             )
             return value
+        return parsed
 
     def _parse_call_arguments(self, body: str) -> str:
         """Reconstruct the OpenAI ``function.arguments`` JSON string from a call body."""
@@ -222,7 +225,7 @@ class KimiK3ToolParser(BaseToolParser):
             raw = json_match.group("value").strip()
             try:
                 return json.dumps(json.loads(raw), ensure_ascii=False)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 logger.warning(
                     "kimi_k3 tool parser: json block is not valid JSON; passing raw text through"
                 )
@@ -281,7 +284,7 @@ class KimiK3ToolParser(BaseToolParser):
         for call in calls:
             try:
                 arguments = json.loads(call.parameters)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 arguments = call.parameters
             self.prev_tool_call_arr.append(
                 {

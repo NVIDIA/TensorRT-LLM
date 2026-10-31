@@ -4287,6 +4287,58 @@ class TestPoolsideV1ToolParser(BaseToolParserTestClass):
             },
         }
 
+    @pytest.mark.parametrize("raw, arg_type, expected", [
+        ("1e999", "integer", "1e999"),
+        ("-Infinity", "integer", "-Infinity"),
+        ("NaN", "integer", "NaN"),
+        ("1e999", "number", "1e999"),
+        ("NaN", "number", "NaN"),
+        ("1.e999", "number", "1.e999"),
+        ("9" * 400, "number", int("9" * 400)),
+        ("[1e999]", "array", "[1e999]"),
+        ("[" * 100000 + "]" * 100000, "array", "[" * 100000 + "]" * 100000),
+    ],
+                             ids=[
+                                 "integer-1e999", "integer--Infinity",
+                                 "integer-NaN", "number-1e999", "number-NaN",
+                                 "number-1.e999", "number-400_digits",
+                                 "array-1e999", "array-deeply_nested"
+                             ])
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_values_without_strict_json_keep_text(self, parser, raw, arg_type,
+                                                  expected, streaming):
+        """Values that overflow, nest too deeply or are NaN keep their text."""
+        tools = [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "v": {
+                                "type": arg_type
+                            }
+                        },
+                    },
+                ),
+            )
+        ]
+        text = f"<tool_call>f\n<arg_key>v</arg_key>\n<arg_value>{raw}</arg_value>\n</tool_call>"
+
+        if streaming:
+            calls = parser.parse_streaming_increment(text, tools).calls
+        else:
+            calls = parser.detect_and_parse(text, tools).calls
+
+        def reject_constant(name):
+            raise ValueError(f"{name} is not strict JSON")
+
+        assert json.loads(calls[-1].parameters,
+                          parse_constant=reject_constant) == {
+                              "v": expected
+                          }
+
     def test_parse_streaming_increment_split_tags(self, sample_tools, parser):
         result = parser.parse_streaming_increment("<tool", sample_tools)
         assert result.normal_text == ""
@@ -5212,6 +5264,63 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         assert len(result.calls) == 1
         assert json.loads(result.calls[0].parameters) == {}
 
+    @pytest.mark.parametrize("nested", [
+        "opts:" + "{a:" * 5000 + "1" + "}" * 5000,
+        "tags:" + "[" * 5000 + "]" * 5000,
+    ],
+                             ids=["object", "array"])
+    def test_deeply_nested_arguments_do_not_raise(self, sample_tools, parser,
+                                                  nested):
+        """Arguments nested deeper than the recursion limit skip that call."""
+        text = ("Sure. " + _g4_tc("get_weather", nested) +
+                _g4_tc("search_web", f'query:{_g4_s("AI")}'))
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert result.normal_text == "Sure."
+        assert [(call.name, json.loads(call.parameters))
+                for call in result.calls] == [("search_web", {
+                    "query": "AI"
+                })]
+
+        streaming = Gemma4ToolParser()
+        streamed = {}
+        calls = []
+        for i in range(0, len(text), 4):
+            calls += streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        # Assemble parameter deltas as the streaming client does.
+        for call in calls:
+            entry = streamed.setdefault(call.tool_index, {})
+            if call.name:
+                entry["name"] = call.name
+            if call.parameters:
+                entry["parameters"] = entry.get("parameters",
+                                                "") + call.parameters
+        assert [(entry["name"], json.loads(entry["parameters"]))
+                for _, entry in sorted(streamed.items())] == [
+                    ("search_web", {
+                        "query": "AI"
+                    }),
+                ]
+
+    def test_streaming_reports_no_call_without_end_token(
+            self, sample_tools, parser):
+        """A stream that stops before the end token reports no call."""
+        text = ("Sure. " + f'{BOT_TOKEN}{CALL_PREFIX}'
+                f'get_weather{{location:{_g4_s("NYC")}}}')
+
+        assert parser.detect_and_parse(text, sample_tools).calls == []
+
+        streaming = Gemma4ToolParser()
+        calls = []
+        for i in range(0, len(text), 4):
+            calls += streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        assert calls == []
+
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
         info = info_fn("get_weather")
@@ -5232,12 +5341,13 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         chunk1 = (f'{BOT_TOKEN}{CALL_PREFIX}'
                   f'get_weather{{location:')
         result1 = parser.parse_streaming_increment(chunk1, sample_tools)
-        assert len(result1.calls) == 1
-        assert result1.calls[0].name == "get_weather"
+        assert result1.calls == []
 
         chunk2 = f'{_g4_s("Tokyo")}}}{EOT_TOKEN}'
         result2 = parser.parse_streaming_increment(chunk2, sample_tools)
-        assert len(result2.calls) >= 1
+        assert len(result2.calls) == 1
+        assert result2.calls[0].name == "get_weather"
+        assert json.loads(result2.calls[0].parameters) == {"location": "Tokyo"}
 
     def test_parse_streaming_increment_multiple_tools(self, sample_tools,
                                                       parser):
@@ -6041,6 +6151,54 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
         assert json.loads(result.calls[0].parameters) == {
             "count": "not-a-number"
         }
+
+    @pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
+                             ids=["deeply_nested", "too_many_digits"])
+    def test_undecodable_json_falls_back_to_raw(self, sample_tools, parser,
+                                                value):
+        """JSON that nests too deeply or has too many digits keeps its text."""
+        argument_text = self._section(
+            self._call("get_weather", 1, self._argument("count", "object",
+                                                        value)))
+        json_text = self._section(
+            self._call(
+                "get_weather", 1, f'<|open|>json type="object"<|sep|>{value}'
+                '<|close|>json<|sep|>'))
+
+        for text, expected in ((argument_text, json.dumps({"count": value})),
+                               (json_text, value)):
+            result = parser.detect_and_parse(text, sample_tools)
+            assert result.calls[0].parameters == expected
+
+            streaming = KimiK3ToolParser()
+            calls = streaming.parse_streaming_increment(text,
+                                                        sample_tools).calls
+            calls += streaming.finish(sample_tools).calls
+            assert calls[-1].parameters == expected
+
+    def test_value_that_fails_serialization_keeps_raw_text(
+            self, sample_tools, parser, monkeypatch):
+        """A value that decodes but fails the json.dumps probe keeps its text."""
+        value = '{"probe": 1}'
+        real_dumps = json.dumps
+
+        def dumps(obj, *args, **kwargs):
+            if obj == [{"probe": 1}]:
+                raise RecursionError("maximum recursion depth exceeded")
+            return real_dumps(obj, *args, **kwargs)
+
+        monkeypatch.setattr(json, "dumps", dumps)
+        text = self._section(
+            self._call("get_weather", 1, self._argument("count", "object",
+                                                        value)))
+
+        result = parser.detect_and_parse(text, sample_tools)
+        assert json.loads(result.calls[0].parameters) == {"count": value}
+
+        streaming = KimiK3ToolParser()
+        calls = streaming.parse_streaming_increment(text, sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        assert json.loads(calls[-1].parameters) == {"count": value}
 
     def test_attribute_unescaping(self, sample_tools, parser):
         """Unescape encoded XTML attribute values.
@@ -7630,3 +7788,73 @@ def test_dsml_stream_cut_inside_the_block_keeps_only_the_content(
     assert content == "Checking."
     assert parser_cls().detect_and_parse(text,
                                          sample_tools).normal_text == content
+
+
+# ============================================================================
+# MiniMaxM3ToolParser
+# ============================================================================
+
+
+def _minimax_m3_options_call(
+        value: str) -> tuple[str, list[ChatCompletionToolsParam]]:
+    """A MiniMax-M3 call that passes `value` as an object parameter."""
+    tools = [
+        ChatCompletionToolsParam(
+            type="function",
+            function=FunctionDefinition(
+                name="configure",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "options": {
+                            "type": "object"
+                        }
+                    },
+                },
+            ),
+        )
+    ]
+    ns = "]<]minimax[>["
+    text = (f'{ns}<tool_call>\n{ns}<invoke name="configure">\n'
+            f"{ns}<options>{value}{ns}</options>\n{ns}</invoke>\n"
+            f"{ns}</tool_call>")
+    return text, tools
+
+
+@pytest.mark.parametrize("value", ["[" * 100000 + "]" * 100000, "9" * 5000],
+                         ids=["deeply_nested", "too_many_digits"])
+def test_minimax_m3_undecodable_json_keeps_text(value):
+    """JSON that nests too deeply or has too many digits keeps its text."""
+    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
+        MiniMaxM3ToolParser
+    text, tools = _minimax_m3_options_call(value)
+
+    result = MiniMaxM3ToolParser().detect_and_parse(text, tools)
+
+    assert [(call.name, json.loads(call.parameters))
+            for call in result.calls] == [("configure", {
+                "options": value
+            })]
+
+
+def test_minimax_m3_value_that_fails_serialization_keeps_text(monkeypatch):
+    """A value that decodes but fails the json.dumps probe keeps its text."""
+    from tensorrt_llm.serve.tool_parser.minimax_m3_parser import \
+        MiniMaxM3ToolParser
+    value = '{"probe": 1}'
+    real_dumps = json.dumps
+
+    def dumps(obj, *args, **kwargs):
+        if obj == [{"probe": 1}]:
+            raise RecursionError("maximum recursion depth exceeded")
+        return real_dumps(obj, *args, **kwargs)
+
+    monkeypatch.setattr(json, "dumps", dumps)
+    text, tools = _minimax_m3_options_call(value)
+
+    result = MiniMaxM3ToolParser().detect_and_parse(text, tools)
+
+    assert [(call.name, json.loads(call.parameters))
+            for call in result.calls] == [("configure", {
+                "options": value
+            })]
