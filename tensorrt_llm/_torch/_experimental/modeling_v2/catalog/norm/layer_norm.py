@@ -16,8 +16,9 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.layernorm_gated import layernorm_fn as _layernorm_fn
+
+from .._op import Arch, Cell, OpWrapper
 
 #: The vision tower's norm1 / norm2 / merger.norm: width 1152 with a bias, eps
 #: 1e-6. The merger norm runs before the 4-to-1 merge, so it too sees 1152.
@@ -57,6 +58,14 @@ class LayerNorm(OpWrapper):
     )
 
     note = """
+    Source: the in-tree Python callable `layernorm_fn`
+    (`tensorrt_llm/_torch/modules/fla/layernorm_gated.py`: `LayerNormFn.apply`
+    -> `_layer_norm_fwd` -> `_layer_norm_fwd_1pass_kernel`). A Triton kernel,
+    JIT-compiled on first use, not in the wheel. Measured on GB300: the JIT path
+    ran and compiled `GPUTarget(backend='cuda', arch=103)`, PTX `.target
+    sm_103a`, at BLOCK_N 2048 and 8 warps for width 1152; `M` and both row
+    strides are passed as `i32`. One program per row.
+
     Metadata consumed: none. Inputs are not mutated; two scratch fp32 [M]
     tensors (mean, rstd) are allocated per call and discarded.
 
@@ -74,17 +83,44 @@ class LayerNorm(OpWrapper):
     64KB` raises "This layer norm doesn't support feature dim >= 64KB" (N =
     65536 in bf16); CPU tensors fail before or at the Triton launch.
 
-    Accuracy, measured beyond the cells' default gate and not certified: at
-    the checkpoint's affine (weights to 17.5, biases to -25.6) the bf16 result
-    is the correctly rounded fp64 value on >= 99.9989% of elements; where it
-    differs, by <= 2^-7 of the summed term magnitude. A constant row returns
-    `bias` bitwise. `eps` sits inside the sqrt.
+    Hard limit: the row offsets `row * stride_x_row` and `row * stride_y_row`
+    are `i32` products. At width 1152 the first row whose offset reaches 2^31
+    is 1864136, so an `x` of >= 1864137 rows wraps. In a fresh process this
+    was measured as a CUDA illegal memory access. With other allocations
+    mapped below `x`, the wrapped read could land in them and be silent; that
+    was not measured and is not guarded. The envelope never reaches it:
+    `VisionTower` cuts a request's frames into calls of at most 32768 rows.
+
+    Accuracy at the cells against an fp64 reference, measured on GB300 beyond
+    the default gate:
+      rows    differs from the correctly rounded fp64   worst |err| / row max
+      1       0 / 1152                                  0.907 bf16 ulp
+      1024    37 / 1179648 (3.1e-5)                     0.949 bf16 ulp
+      32768   1096 / 37748736 (2.9e-5)                  0.995 bf16 ulp
+    Cosine 0.9999986 and relative L2 1.65e-3 at every cell (the bf16 output
+    rounding itself). The elements that differ are outputs where `x_hat * w`
+    and `b` cancel toward zero: up to 205 ulp of their own tiny magnitude,
+    and each within torch's bf16 tolerance. A constant row returns `bias`
+    bitwise. `eps` sits inside the sqrt.
+
+    What the default bf16 gate tells apart, as negative controls against the
+    same output: an unbiased (N - 1) variance, a missing mean subtraction and
+    a missing bias each fail it at every cell (8.6e-2, 0.79 and 0.999 of the
+    elements then differ from the correctly rounded value). An eps of 1e-5,
+    or eps outside the sqrt, moves 1.7e-3 and 2.5e-4 of the elements and fails
+    the gate only at some cells, so the gate does not certify the eps
+    placement. `test_the_gate_discriminates_a_wrong_normalization` holds the
+    first three. At residual-stream-like inputs (scale 8, offset 3; not a
+    cell) the result differs on 3.4e-5 of the elements, worst 0.984 bf16 ulp
+    of the row max.
 
     Accepted but not certified: an fp8-e4m3 `x` returns fp8-e4m3 (output is
     `empty_like(x)`), within one e4m3 ulp of the exact value; fp64 `x`.
     Forward only: the autograd Function has no backward. Measured, not
     certified: one kernel launch, runs unchanged under `inference_mode`,
-    CUDA-graph capturable after a warm-up call compiles the Triton kernel.
+    CUDA-graph capturable after a warm-up call compiles the Triton kernel (a
+    1024-row capture replayed on refilled input is bitwise the eager call).
+    The call site is eager-only. 32768 rows take about 61 us per call.
     """
 
     def __call__(

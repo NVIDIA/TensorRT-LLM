@@ -214,6 +214,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.renorm_moe_routin
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_gemma_rmsnorm import (
     flashinfer_gemma_rmsnorm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.layer_norm import layer_norm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -297,7 +298,6 @@ from .ops.moe.fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renor
 from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
-from .ops.norm.layer_norm import layer_norm
 from .ops.norm.rms_norm_gated_token_major import rms_norm_gated_token_major
 from .ops.ple.ple_gate_conv_inject_norm import ple_gate_conv_inject_norm
 from .ops.ple.ple_ngram_embed import ple_ngram_embed
