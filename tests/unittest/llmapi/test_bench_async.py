@@ -555,23 +555,61 @@ async def test_iteration_worker_closes_socket_when_sentinel_send_fails():
     context.term.assert_called_once()
 
 
-def test_iteration_writer_exits_when_no_message_arrives(tmp_path):
-    # The sender never connected, so no end sentinel will come. Once
-    # stop_event is set the writer must return instead of blocking forever.
-    stop = Event()
-    socket = MagicMock()
-
-    def poll(timeout):
-        # No message arrives; shutdown is signalled while the writer polls.
-        stop.set()
-        return 0
-
-    socket.poll.side_effect = poll
+def _run_writer(socket, tmp_path, stop):
     context = MagicMock()
     context.socket.return_value = socket
     with mock.patch.object(processes, "Context", return_value=context):
         IterationWriter.run("ipc://unused", tmp_path / "iter.log", stop)
-    socket.poll.assert_called_once()
-    socket.recv_json.assert_not_called()
     socket.close.assert_called_once()
     context.term.assert_called_once()
+    return (tmp_path / "iter.log").read_text().splitlines()
+
+
+def _polls(stop, *results):
+    """poll() side effect: return each result in turn, then fail the test.
+
+    A result of None means "time out and signal shutdown". Running out of
+    results means the writer ignored stop_event, so fail instead of hanging.
+    """
+    remaining = list(results)
+
+    def poll(timeout):
+        assert remaining, "writer kept polling after stop_event was set"
+        result = remaining.pop(0)
+        if result is None:
+            stop.set()
+            return 0
+        return result
+
+    return poll
+
+
+def test_iteration_writer_logs_until_end_sentinel(tmp_path):
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 1, 1, 1)
+    socket.recv_json.side_effect = [{"iter": 1}, {"iter": 2}, {"end": True}]
+    assert _run_writer(socket, tmp_path, stop) == ["{'iter': 1}", "{'iter': 2}"]
+
+
+def test_iteration_writer_exits_when_no_message_arrives(tmp_path):
+    # The sender never connected, so no end sentinel will come. An empty poll
+    # alone must not end the loop; once stop_event is set the writer returns.
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 0, None)
+    assert _run_writer(socket, tmp_path, stop) == []
+    assert socket.poll.call_count == 2
+    socket.recv_json.assert_not_called()
+
+
+def test_iteration_writer_exits_when_end_sentinel_is_lost(tmp_path):
+    # The sender's final send failed after some stats were delivered: the
+    # writer must not block in recv_json() waiting for a sentinel that never
+    # comes.
+    stop = Event()
+    socket = MagicMock()
+    socket.poll.side_effect = _polls(stop, 1, 0, None)
+    socket.recv_json.side_effect = [{"iter": 1}]
+    assert _run_writer(socket, tmp_path, stop) == ["{'iter': 1}"]
+    assert socket.poll.call_count == 3
