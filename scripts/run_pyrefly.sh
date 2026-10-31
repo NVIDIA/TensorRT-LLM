@@ -5,6 +5,7 @@
 # Run Pyrefly on changed product Python files, or the whole project with
 # --full-project. Add --rebase-upstream to check the current branch (or HEAD
 # when detached) in a new worktree rebased on upstream main and emit its diff.
+# Rebased checks include non-ignored untracked product Python files.
 # Excluded paths and third-party symbols are removed from the JSON report by
 # scripts/pyrefly_exclusion.py. This hook is advisory and always returns success;
 # the filtered diagnostic report is written to pyrefly_final_report.json and
@@ -200,6 +201,8 @@ run_rebased_check() {
         fi
         git -C "$worktree_path" reset --mixed HEAD
     fi
+
+    python3 "$WORKFLOW_SCRIPT" copy-untracked-product-files "$PROJECT_DIR" "$worktree_path"
 
     local workflow_relative helper_relative
     workflow_relative="scripts/$(basename "${BASH_SOURCE[0]}")"
