@@ -31,6 +31,7 @@ Every tensor arrives as a lazy safetensors slice, so only the rank-local
 expert range and the rank's attention shard are ever materialized.
 """
 
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,7 +39,11 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ...modeling_musespark_open import PERCEPTION_KEY_PREFIXES, head_interleaved_q_gate
+from ...modeling_musespark_open import (
+    PERCEPTION_KEY_PREFIXES,
+    excluded_layer_experts_nvfp4_enabled,
+    head_interleaved_q_gate,
+)
 from .musespark_open_format import OPEN_FORMAT_SENTINEL_KEY, build_open_format_rename
 
 _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
@@ -411,6 +416,126 @@ def build_expert_weights(
     return entries
 
 
+#: E2M1 max (6) times E4M3 max (448). An NVFP4 global scale maps a tensor's
+#: amax onto it; the checkpoint stores the inverse (``amax / 2688``) as
+#: ``weight_scale_2`` and ``input_scale``.
+NVFP4_GLOBAL_RANGE = 6.0 * 448.0
+
+#: Elements per NVFP4 block scale (the checkpoint's ``group_size``).
+NVFP4_BLOCK = 16
+
+
+def nvfp4_quantize_weight(weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize one ``[rows, cols]`` weight to the checkpoint's NVFP4 layout.
+
+    Returns ``(packed, block_scale, weight_scale_2)``: ``packed`` is ``uint8
+    [rows, cols / 2]`` (two E2M1 values per byte, the lower column in the low
+    nibble), ``block_scale`` is ``float8_e4m3fn [rows, cols / 16]`` in row-major
+    (unswizzled) order, and ``weight_scale_2`` is the FP32 0-d per-tensor scale
+    ``amax / 2688``. Dequantization is ``e2m1 * block_scale * weight_scale_2``,
+    the same as for the checkpoint's quantized layers; the NVFP4 MoE method
+    swizzles and shuffles these at load exactly as it does theirs.
+    """
+    rows, cols = weight.shape
+    source = weight.to(device="cuda", dtype=torch.bfloat16).contiguous()
+    amax = source.abs().amax().float().clamp_min(torch.finfo(torch.float32).tiny)
+    global_scale = (NVFP4_GLOBAL_RANGE / amax).reshape(1)
+    packed, block_scale = torch.ops.trtllm.fp4_quantize(
+        source, global_scale, NVFP4_BLOCK, False, False
+    )
+    block_scale = block_scale.view(torch.uint8).reshape(rows, cols // NVFP4_BLOCK)
+    return (
+        packed.reshape(rows, cols // 2),
+        block_scale.view(torch.float8_e4m3fn),
+        (amax / NVFP4_GLOBAL_RANGE).cpu().reshape([]),
+    )
+
+
+def excluded_layer_fc2_amax(layer_idx: int) -> float:
+    """The calibrated FC2-input amax of a quant-excluded layer.
+
+    Read from MUSESPARK_OPEN_L061_EXPERTS_NVFP4_FC2_AMAX, a comma-separated
+    list of ``layer=amax`` pairs. The FC2 input (the SwiGLU product) has no
+    bound that follows from the layer's weights alone, so its static NVFP4
+    global scale needs a measured value, as the checkpoint's quantized layers
+    have.
+
+    Raises:
+        ValueError: if the variable does not name ``layer_idx``.
+    """
+    spec = os.environ.get("MUSESPARK_OPEN_L061_EXPERTS_NVFP4_FC2_AMAX", "")
+    for item in spec.split(","):
+        if "=" not in item:
+            continue
+        layer, value = item.split("=", 1)
+        if int(layer) == layer_idx:
+            amax = float(value)
+            if not amax > 0.0:
+                raise ValueError(f"MuseSparkOpen: FC2 amax of layer {layer_idx} must be > 0")
+            return amax
+    raise ValueError(
+        f"MuseSparkOpen: layer {layer_idx} experts are quantized at load, but "
+        "MUSESPARK_OPEN_L061_EXPERTS_NVFP4_FC2_AMAX names no FC2 amax for it"
+    )
+
+
+def build_nvfp4_expert_weights_from_bf16(
+    weights,
+    prefix: str,
+    expert_start: int,
+    expert_end: int,
+    num_experts: int,
+    intermediate_size: int,
+    fc1_amax: float,
+    fc2_amax: float,
+    accounting: WeightAccounting,
+) -> Dict[str, Any]:
+    """The entries :func:`build_expert_weights` yields for a quantized layer, from BF16 experts.
+
+    Quantizes this rank's ``[expert_start, expert_end)`` experts of a layer the
+    checkpoint stores in BF16 into the checkpoint's NVFP4 entry layout: per
+    expert and projection an E2M1 ``weight``, its E4M3 ``weight_scale`` and its
+    FP32 ``weight_scale_2``, with gate (``w1``) and up (``w3``) scaled
+    separately as the checkpoint's per-half ``w13_weight_scale_2`` does. Every
+    expert gets the same activation scales, ``fc1_amax / 2688`` for both FC1
+    halves and ``fc2_amax / 2688`` for FC2, so the layer-level maxima the MoE
+    method takes are those two values on every rank.
+    """
+    entries: Dict[str, Any] = {}
+    w13 = _slice_experts(weights, f"{prefix}.w13_weight", expert_start, expert_end, accounting)
+    w2 = _slice_experts(weights, f"{prefix}.w2_weight", expert_start, expert_end, accounting)
+    for local_idx, expert_id in enumerate(range(expert_start, expert_end)):
+        for name, weight in (
+            ("w1", w13[local_idx, :intermediate_size]),
+            ("w3", w13[local_idx, intermediate_size:]),
+            ("w2", w2[local_idx]),
+        ):
+            packed, block_scale, weight_scale_2 = nvfp4_quantize_weight(weight)
+            entries[f"{expert_id}.{name}.weight"] = packed
+            entries[f"{expert_id}.{name}.weight_scale"] = block_scale
+            entries[f"{expert_id}.{name}.weight_scale_2"] = weight_scale_2
+    fc1_input_scale = torch.tensor(fc1_amax / NVFP4_GLOBAL_RANGE, dtype=torch.float32)
+    fc2_input_scale = torch.tensor(fc2_amax / NVFP4_GLOBAL_RANGE, dtype=torch.float32)
+    for expert_id in range(num_experts):
+        entries[f"{expert_id}.w1.input_scale"] = fc1_input_scale
+        entries[f"{expert_id}.w3.input_scale"] = fc1_input_scale
+        entries[f"{expert_id}.w2.input_scale"] = fc2_input_scale
+    return entries
+
+
+def pre_expert_norm_amax(norm_weight: torch.Tensor, hidden_size: int) -> float:
+    """An upper bound on ``|RMSNorm(x)|`` for the Gemma-style pre-expert norm.
+
+    The norm computes ``x / rms(x) * gain`` with ``gain = bf16(weight + 1)``.
+    Since ``|x_i| <= sqrt(n) * rms(x)`` for any ``n``-element ``x`` (equality
+    only for a one-hot ``x``; the epsilon only lowers it), every output element
+    is at most ``sqrt(n) * max|gain|``. Used as the FC1 activation amax of the
+    layers quantized at load: no input can saturate the NVFP4 block scales.
+    """
+    gain = (norm_weight.float() + 1.0).to(torch.bfloat16).float()
+    return float(hidden_size**0.5 * gain.abs().max().item())
+
+
 def load_layer(
     model,
     layer,
@@ -488,16 +613,45 @@ def load_layer(
     experts_prefix = f"{ffn_prefix}.experts"
     is_quantized = f"{experts_prefix}.w13_weight_scale" in weights
     expert_start, expert_end = _local_expert_range(moe.experts, config.num_experts)
-    expert_weights = build_expert_weights(
-        weights,
-        experts_prefix,
-        expert_start,
-        expert_end,
-        config.num_experts,
-        config.intermediate_size,
-        is_quantized,
-        accounting,
-    )
+    experts_backend = getattr(moe.experts, "backend", moe.experts)
+    if not is_quantized and getattr(experts_backend, "has_nvfp4", False):
+        if not excluded_layer_experts_nvfp4_enabled():
+            raise ValueError(
+                f"MuseSparkOpen: layer {layer_idx} experts are BF16 in the checkpoint "
+                "but were built NVFP4"
+            )
+        fc1_amax = pre_expert_norm_amax(moe.pre_expert_norm.weight, config.expert_hidden_size)
+        fc2_amax = excluded_layer_fc2_amax(layer_idx)
+        logger.info(
+            f"MuseSparkOpen: quantizing layer {layer_idx} experts "
+            f"[{expert_start}, {expert_end}) to NVFP4 at load "
+            f"(FC1 amax bound {fc1_amax:.6g}, FC2 amax {fc2_amax:.6g})"
+        )
+        expert_weights = build_nvfp4_expert_weights_from_bf16(
+            weights,
+            experts_prefix,
+            expert_start,
+            expert_end,
+            config.num_experts,
+            config.intermediate_size,
+            fc1_amax,
+            fc2_amax,
+            accounting,
+        )
+        # Fast paths tuned from served routing of the checkpoint's quantized layers
+        # (hot_replicas' census) have no data for this layer.
+        moe.experts_quantized_at_load = True
+    else:
+        expert_weights = build_expert_weights(
+            weights,
+            experts_prefix,
+            expert_start,
+            expert_end,
+            config.num_experts,
+            config.intermediate_size,
+            is_quantized,
+            accounting,
+        )
     moe.experts.load_weights([expert_weights])
     expert_weights.clear()
 
