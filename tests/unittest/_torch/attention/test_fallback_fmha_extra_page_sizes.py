@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""FallbackFmha's refusal of paged prefill at a KV manager's TRTLLM-Gen extra page sizes: kept on every SM but SM107,
-where no TRTLLM-Gen FMHA exists and the thop paged-context kernel serves those pages (its SM107 P128 oracle is
-test_modeling_v2_m3_draft_attention_paged_context.py). CPU only: the check runs before any kernel."""
+"""Manager-specific extra page sizes stay on the TRTLLM-Gen route on every SM."""
 
 from types import SimpleNamespace
 
@@ -37,16 +35,10 @@ def _context_batch(tokens_per_block: int = 128, paged: bool = True):
     )
 
 
-@pytest.mark.parametrize("sm", [90, 100, 103, 120])
-def test_extra_page_paged_prefill_is_refused_off_sm107(monkeypatch, sm) -> None:
+@pytest.mark.parametrize("sm", [90, 100, 103, 107, 120])
+def test_extra_page_paged_prefill_is_refused(monkeypatch, sm) -> None:
     monkeypatch.setattr(fallback, "get_sm_version", lambda: sm)
     with pytest.raises(RuntimeError, match="cannot serve paged prefill with 128-token KV pages"):
-        _fmha()._is_supported(None, None, None, _context_batch(), None, phase=FmhaPhase.CONTEXT)
-
-
-def test_extra_page_paged_prefill_is_served_on_sm107(monkeypatch) -> None:
-    monkeypatch.setattr(fallback, "get_sm_version", lambda: 107)
-    with pytest.raises(_PastRefusal):
         _fmha()._is_supported(None, None, None, _context_batch(), None, phase=FmhaPhase.CONTEXT)
 
 

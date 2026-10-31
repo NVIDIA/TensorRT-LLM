@@ -39,6 +39,7 @@ def _preparer(once: bool, disable_overlap: bool = False) -> DecoderInputPreparer
         previous_kv_lens_offsets_cuda=torch.full((16,), -3, dtype=torch.int32),
     )
     r.mapping = types.SimpleNamespace(has_cp_helix=lambda: False)
+    r.decode_prologue = None
     r.guided_decoder = None
     return r
 

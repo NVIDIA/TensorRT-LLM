@@ -65,7 +65,9 @@ def test_a_model_without_hooks_gets_the_all_off_default(model):
 def test_every_field_defaults_to_off():
     for field in dataclasses.fields(RuntimeHooks):
         value = getattr(DEFAULT_RUNTIME_HOOKS, field.name)
-        if dataclasses.is_dataclass(value):
+        if field.name == "first_content_emit_iters":
+            assert value == 1
+        elif dataclasses.is_dataclass(value):
             assert all(
                 getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
             )
