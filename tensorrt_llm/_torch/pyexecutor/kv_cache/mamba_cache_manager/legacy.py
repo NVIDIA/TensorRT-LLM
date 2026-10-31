@@ -1630,6 +1630,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
         use_replay_state_update: bool | None = False,
         mamba_ssm_stochastic_rounding: bool = False,
         model_type: str = "nemotron_hybrid",
+        gdn_fused_verify: bool = False,
         **kwargs,
     ) -> None:
         # 3 kinds of layers:
@@ -1681,6 +1682,7 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
             and model_type == "qwen3_next"
             and self.local_num_mamba_layers > 0
         )
+        self.gdn_fused_verify = gdn_fused_verify
         self.replay_step_width: Optional[int] = (
             spec_config.tokens_per_gen_step
             if spec_config is not None and use_replay_state_update
@@ -1965,13 +1967,11 @@ class CppMambaHybridCacheManager(KVCacheManager, _LegacyMambaHybridCacheManager)
     ) -> None:
         """Synchronously advance every local GDN checkpoint in one launch."""
         from tensorrt_llm._torch.modules.fla.cached_replay import (
-            CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
             commit_gdn_cached_replay_history_layers,
         )
 
-        if (
-            not self._use_gdn_cached_replay_all_layer_commit
-            or num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+        if not self._use_gdn_cached_replay_all_layer_commit or not self.gdn_replay_partitioned(
+            num_decodes
         ):
             return
         if (

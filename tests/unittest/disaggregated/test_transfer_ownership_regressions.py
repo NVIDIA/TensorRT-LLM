@@ -443,6 +443,7 @@ def test_remote_cancelled_session_is_retained_until_writers_drain() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     transceiver._mapping = SimpleNamespace(
         pp_size=1,
         enable_attention_dp=False,
@@ -477,6 +478,7 @@ def test_failed_receive_session_is_retained_until_writers_drain() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     transceiver._mapping = SimpleNamespace(
         pp_size=1,
         enable_attention_dp=False,
@@ -519,6 +521,7 @@ def test_failed_receive_consensus_waits_for_every_rank_to_drain() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = True
+    transceiver._init_gen_idle_poll(False)
     transceiver._mapping = SimpleNamespace(
         pp_size=1,
         enable_attention_dp=False,
@@ -1140,6 +1143,7 @@ def test_completed_session_is_not_reported_retired_when_close_refuses() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     # `rank` is read only when the timing-output env var is set, so leaving it out is a failure
     # that waits for whoever sets that variable process-wide.
     transceiver._mapping = SimpleNamespace(
@@ -1182,6 +1186,7 @@ def test_cancelled_session_close_refusal_fails_stop_after_consensus() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     transceiver._recv_sessions = {rid: session}
     transceiver._recv_reqs = {rid: request}
     transceiver._gen_allgather = Mock()

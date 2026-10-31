@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams, AllReduceStrategy
@@ -14,6 +16,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
 from ..distributed import allgather
+from .fla.op import gdc_wait_with_memory_clobber
 from .linear import Linear, TensorParallelMode
 
 
@@ -32,6 +35,55 @@ def _matmul_with_output_dtype(input: torch.Tensor, weight: torch.Tensor,
         mm_kwargs["out_dtype"] = output_dtype
     output = torch.mm(input_2d, weight.t(), **mm_kwargs)
     return output.view(output_shape)
+
+
+@triton.jit
+def _embedding_gather_kernel(ids_ptr, w_ptr, out_ptr, num_embeddings,
+                             H: tl.constexpr, BLOCK: tl.constexpr,
+                             PDL: tl.constexpr):
+    """out[t] = weight[ids[t]] for ids in [0, num_embeddings), zeros otherwise (flashinfer's rejection sampler
+    pads with -1): the non-parallel masked lookup's values in one launch per call."""
+    t = tl.program_id(0)
+    if PDL:
+        gdc_wait_with_memory_clobber()
+    tok = tl.load(ids_ptr + t).to(tl.int64)
+    ok = (tok >= 0) & (tok < num_embeddings)
+    row = tl.where(ok, tok, 0)
+    for h0 in tl.static_range(0, H, BLOCK):
+        offs = h0 + tl.arange(0, BLOCK)
+        m = offs < H
+        v = tl.load(w_ptr + row * H + offs, mask=m & ok, other=0.0)
+        tl.store(out_ptr + t.to(tl.int64) * H + offs, v, mask=m)
+    if PDL:
+        # PDL rule: release the dependents only after a CTA barrier that follows the last global access (the ids
+        # may live in a block the caching allocator recycles for a dependent's pre-wait write)
+        tl.debug_barrier()
+        tl.extra.cuda.gdc_launch_dependents()
+
+
+def embedding_gather(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """One-launch lookup of a full (non-parallel) table, bitwise the masked F.embedding path."""
+    ids = input.reshape(-1)
+    if not ids.is_contiguous():
+        ids = ids.contiguous()
+    num_embeddings, hidden = weight.shape
+    out = torch.empty((ids.numel(), hidden),
+                      dtype=weight.dtype,
+                      device=weight.device)
+    if ids.numel() > 0:
+        from ..flashinfer_utils import get_env_enable_pdl
+        pdl = get_env_enable_pdl()
+        block = min(triton.next_power_of_2(hidden), 8192)
+        _embedding_gather_kernel[(ids.numel(), )](ids,
+                                                  weight,
+                                                  out,
+                                                  num_embeddings,
+                                                  H=hidden,
+                                                  BLOCK=block,
+                                                  PDL=pdl,
+                                                  num_warps=4,
+                                                  launch_pdl=pdl)
+    return out.view(*input.shape, hidden)
 
 
 class LMHead(Linear):
@@ -177,7 +229,12 @@ class LMHead(Linear):
         all_reduce_params: Optional[AllReduceParams] = None,
         mapping_lm_head_tp: Optional[Mapping] = None,
         is_spec_decoding_head: bool = False,
+        gather_output: bool = True,
     ) -> torch.Tensor:
+        """``gather_output=False`` (COLUMN tensor parallel): this rank's
+        vocabulary shard, without the all-gather."""
+        if not gather_output and self.tp_mode == TensorParallelMode.COLUMN:
+            return self.apply_linear(input, self.bias)
         if is_spec_decoding_head and self.enable_lm_head_tp_in_adp:
             # For LM head TP in ADP, we need to slice the weight for the LM head
             tp_rank = mapping_lm_head_tp.tp_rank
@@ -316,6 +373,8 @@ class Embedding(LMHead):
         dtype (Optional[torch.dtype]): type of the parameters.
         mapping (Optional[Mapping]): parallelism configuration.
             If not provided, the embedding is not parallelized.
+        use_gather_kernel (bool): a non-parallel table looks tokens up with one
+            gather launch (``embedding_gather``) instead of the masked lookup.
     """
 
     def __init__(
@@ -329,6 +388,7 @@ class Embedding(LMHead):
         reduce_output: bool = True,
         enable_torch_compile_for_embedding: Optional[bool] = False,
         use_custom_cublas_mm: bool = False,
+        use_gather_kernel: bool = False,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
     ):
         super().__init__(
@@ -344,6 +404,13 @@ class Embedding(LMHead):
         )
 
         self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
+        self.use_gather_kernel = use_gather_kernel
+        # Built once: every torch.compile() call deep-copies the Inductor
+        # config, even with disable=True; compilation itself is lazy.
+        self._pre_comm_ops_func = (torch.compile(pre_comm_embedding_ops,
+                                                 options={"max-autotune": True})
+                                   if enable_torch_compile_for_embedding else
+                                   pre_comm_embedding_ops)
 
         if self.tp_size > 1:
             slice_width = math.ceil(num_embeddings / self.tp_size)
@@ -355,7 +422,14 @@ class Embedding(LMHead):
             self.vocab_end_index = num_embeddings
 
     def forward(self, input):
-        if self.tp_size > 1:
+        """Embedding lookup; with ``use_gather_kernel`` a non-parallel table does the masked lookup as one
+        gather launch."""
+        if (self.tp_size == 1 and self.use_gather_kernel and input.is_cuda
+                and self.weight.dim() == 2 and self.weight.is_contiguous()):
+            return embedding_gather(input, self.weight)
+        if self.tp_size > 1 and not torch.compiler.is_compiling():
+            embedding_ops_func = self._pre_comm_ops_func
+        elif self.tp_size > 1:
             # Run the ops before all_reduce/all_gather.
             # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
             embedding_ops_func = torch.compile(

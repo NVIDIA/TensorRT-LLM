@@ -210,6 +210,10 @@ l0_b200:
   - unittest/_torch/modules/test_swiglu_2in.py
   - unittest/_torch/modules/test_gated_mlp_split.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_low_m_mma_gemm.py
+  - unittest/_torch/moe/test_moe_decode_front.py
+  - unittest/_torch/modules/test_embedding_lookup.py
+  - unittest/_torch/moe/test_draft_experts_nvfp4.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # DWDP expert prefetch on real streams and copies; the peer-GPU gather
@@ -307,9 +311,12 @@ l0_b200:
   - unittest/_torch/speculative/test_dynamic_tree_rejection_op.py
   - unittest/_torch/speculative/test_dynamic_tree_sampling_dispatch.py
   # One-model speculative decoding step-copy kernels and the engine's decode
-  # step that runs them (SM 100; they skip on other GPUs).
+  # step that runs them (SM 100 / SM 103; they skip on other GPUs).
   - unittest/_torch/kernels/test_spec_step_copies.py
   - unittest/_torch/pyexecutor/engine/runners/decoder/test_inputs.py -k "test_spec_decode_graph_step_gather_kernel"
+  - unittest/_torch/speculative/test_fused_accept.py
+  - unittest/_torch/pyexecutor/test_steady_spec_prepare.py
+  - unittest/_torch/modules/test_mxfp8_draft_head.py
   # Shared fused_qk_norm_rope cells used by the K3 drafter.
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   # Vocab-parallel token selection kernels on a single shard.

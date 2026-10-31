@@ -31,6 +31,7 @@ from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.dwdp import get_global_dwdp_manager
 from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
+from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
@@ -1375,6 +1376,9 @@ class MTPForCausalLM(nn.Module):
         model_type = model_config.pretrained_config.model_type
         mtp_layer = None
         lm_head_quant_config = None
+        # Whether the MTP layer's forward takes the draft loop's deferred
+        # ``kv_lens_increment``.
+        folds_kv_lens_increment = False
         match model_type:
             case "glm4_moe":
                 from .modeling_glm import Glm4MTP
@@ -1391,6 +1395,7 @@ class MTPForCausalLM(nn.Module):
             case "qwen3_next" | "qwen3_5_text" | "qwen3_5_moe_text":
                 from .modeling_qwen3_next import Qwen3NextMTP
                 mtp_layer = Qwen3NextMTP
+                folds_kv_lens_increment = True
             case "qwen4_exp_text":
                 from .modeling_qwen4_exp import Qwen4ExpMTP
                 mtp_layer = Qwen4ExpMTP
@@ -1439,6 +1444,7 @@ class MTPForCausalLM(nn.Module):
                       model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        self.folds_kv_lens_increment = folds_kv_lens_increment
         dwdp_manager = get_global_dwdp_manager()
         if dwdp_manager is not None and mtp_repeat_count > 1:
             for layer_idx in range(mtp_num_layers):
@@ -1706,8 +1712,32 @@ def get_draft_model(model_config, draft_config, lm_head, model):
     return builder(model_config, draft_config, lm_head, model)
 
 
+# The step-loop hooks of a model with the one-engine speculative fast paths.
+_FAST_PATH_RUNTIME_HOOKS = RuntimeHooks(loop_on_execution_stream=True)
+
+
 class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                   Generic[TModel, TConfig]):
+
+    # Set per instance from supports_spec_decode_fast_paths in __init__.
+    spec_decode_fast_paths: bool = False
+
+    @property
+    def runtime_hooks(self) -> Optional[RuntimeHooks]:
+        """The fast paths run the overlap loop on the execution stream."""
+        return (_FAST_PATH_RUNTIME_HOOKS
+                if self.spec_decode_fast_paths else None)
+
+    @classmethod
+    def supports_spec_decode_fast_paths(cls, model_config: ModelConfig) -> bool:
+        """Whether one-engine speculative decoding of this model takes the
+        fast paths (``spec_decode_fast_paths``): greedy and temperature-only
+        tokens of vocabulary-sharded logits through the TP key exchange, the
+        temperature-only CUDA graph variant, the overlap loop on the execution
+        stream, the hoisted position ids, the MTP-Eagle draft loop's step-0
+        epilogue and the recorded steady decode-step prepare. A model enables
+        them where they are validated."""
+        return False
 
     def __init__(self,
                  model: TModel,
@@ -1731,7 +1761,18 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.use_separate_draft_kv_cache = False
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
+        self.spec_decode_fast_paths = False
+        key_exchange = None
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            self.spec_decode_fast_paths = self.supports_spec_decode_fast_paths(
+                model_config)
+            if self.spec_decode_fast_paths:
+                # Greedy tokens of vocabulary-sharded draft / target logits
+                # come from one peer-memory key exchange per step (TP groups
+                # only; None elsewhere).
+                from ..distributed import ll_exchange
+                key_exchange = ll_exchange.create_tp_key_exchange(
+                    model_config.mapping, model_config.max_num_tokens)
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 requested_draft_moe_backend = _get_requested_draft_moe_backend(
@@ -1826,7 +1867,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 model_config.spec_config,
                 model_config,
                 model_config.mapping.mapping_for_full_rows(),
-                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache)
+                use_separate_draft_kv_cache=self.use_separate_draft_kv_cache,
+                key_exchange=key_exchange,
+                spec_decode_fast_paths=self.spec_decode_fast_paths)
             if self.spec_worker is not None:
                 # Cache the static draft->target vocab map now that the draft
                 # model is loaded, so workers read self._d2t instead of probing
@@ -1841,6 +1884,22 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 and getattr(self.draft_model, "shares_target_kv_cache", False)):
             self.draft_model.load_weights_from_target_model(self)
 
+    def cache_derived_state(self) -> None:
+        super().cache_derived_state()
+        spec_config = self.spec_config
+        if (self.spec_worker is not None and spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+                and spec_config.draft_lm_head_dtype == "mxfp8"):
+            from ..modules.mxfp8_draft_head import build_mxfp8_draft_head
+
+            # Rebuilt from the current BF16 weights (idempotent on reloads),
+            # from the LM head the draft passes project with.
+            draft_lm_head = getattr(self.draft_model, "lm_head", None)
+            self.spec_worker.draft_head = None
+            self.spec_worker.draft_head = build_mxfp8_draft_head(
+                self.lm_head if draft_lm_head is None else draft_lm_head,
+                self.model_config.mapping, self.spec_worker.key_exchange)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1852,6 +1911,16 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # A padded generation batch's (mrope) positions are a strided view; one
+        # copy here instead of one per attention layer that needs them dense.
+        # Not with context requests: a breakable prefill CUDA graph replays its
+        # body against the capture-time position tensor.
+        hoist_positions = (self.spec_decode_fast_paths
+                           and self.spec_worker is not None
+                           and position_ids is not None
+                           and attn_metadata.num_contexts == 0)
+        if hoist_positions:
+            position_ids = position_ids.contiguous()
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
@@ -1903,6 +1972,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 if position_ids is not None:
                     spec_position_ids = _slice_spec_position_ids(
                         position_ids, attn_metadata.num_tokens)
+                    if hoist_positions:
+                        # The padded batch's slice is strided again.
+                        spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
             return self.spec_worker(input_ids=spec_input_ids,

@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -46,6 +47,10 @@ skip_no_cuda = pytest.mark.skipif(
 
 class _GdnReplayCacheManager:
     use_gdn_cached_replay_all_layer_commit = True
+
+    @staticmethod
+    def gdn_replay_partitioned(num_decodes):
+        return num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     def __init__(self, prev_num_accepted_tokens, cache_buf_idx):
         self.prev_num_accepted_tokens = prev_num_accepted_tokens

@@ -548,6 +548,7 @@ def test_nonblocking_gen_progress_notifies_unsettled_senders_once(terminal: str)
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = True
     transceiver._gen_need_sync = False
+    transceiver._init_gen_idle_poll(False)
     transceiver._mapping = SimpleNamespace(enable_attention_dp=False, world_size=1, pp_size=1)
     transceiver._recv_sessions, transceiver._recv_reqs = {401: session}, {401: object()}
     transceiver._gen_allgather = Mock()

@@ -459,6 +459,9 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report how many admitted receives the caller has not started yet. No-op by default."""
+
     def get_data_transceiver_state(self) -> bytes:
         """Get the serialized DataTransceiverState (CacheState + CommState)."""
         return b""

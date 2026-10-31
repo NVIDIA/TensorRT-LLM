@@ -22,7 +22,8 @@ engine's for max batch 8 and max draft length 7 (sampler stores [8, slots, 1], [
   narrower than (dynamic draft length), as wide as and wider than the stores, and mixed per field; row_begin 0 and
   > 0; shuffled distinct slot tables; accepted lengths from 0 to past the output width. A mixed context / generation
   batch laid out as the one-model worker writes it (a context row's tokens past column 0 never written) stores zeros
-  there.
+  there. The one-model MTP-Eagle worker's outputs, next new tokens and next draft tokens as transposed views of one
+  token buffer, are read through their strides.
 * ``StepInputGather.gather`` vs ModelEngine._prepare_tp_inputs's torch overlap gathers (the stores by slot into
   the input ids and draft tokens, the lengths by the per-token index list into the position offsets,
   ``new_tokens_lens - T`` by slot into the KV-length offsets): the engine's offsets (the requests without a previous
@@ -65,7 +66,7 @@ def _supported() -> bool:
 
 
 pytestmark = pytest.mark.skipif(
-    not _supported(), reason="the step-copy kernels run on SM 100 with the CuTe DSL"
+    not _supported(), reason="the step-copy kernels run on SM 100 / SM 103 with the CuTe DSL"
 )
 
 
@@ -519,6 +520,28 @@ def test_scatter_zeros_past_accepted_length(poison):
     assert torch.equal(store_new, want), (store_new, want)
 
 
+@pytest.mark.parametrize("rows,tokens", [(1, 8), (3, 4), (8, 8)], ids=["1x8", "3x4", "8x8"])
+def test_scatter_token_buffer_views(rows, tokens):
+    """The one-model MTP-Eagle worker's outputs (eagle3._forward_linear_draft_loop): next_new_tokens and
+    next_draft_tokens are ``buffer.t()`` and ``buffer[1:].t()`` of one int32 [T, N] token buffer, strided for N > 1;
+    the kernel reads them through their strides, bit-identical to the torch ops."""
+    n = rows + 1
+    st = Step(
+        rows, tokens, _seed(7, rows, tokens, 0), num_slots=2 * MAX_BATCH, row_begin=1, out_rows=n
+    )
+    buffer = torch.empty((tokens, n), dtype=torch.int32, device="cuda")
+    st.bufs["out_next"] = buffer.t()
+    st.bufs["out_draft"] = buffer[1:].t()
+    st.rewrite()
+    assert not st.bufs["out_next"].is_contiguous() and not st.bufs["out_draft"].is_contiguous()
+    bad = compare(
+        st.bufs,
+        lambda b: torch_scatter(*st.scatter_args(b)),
+        lambda b: kernel_scatter(st.scatter_args(b)),
+    )
+    assert not any(bad.values()), bad
+
+
 def test_contract():
     """rows == 0 launches nothing; every call the kernels do not cover returns False and launches nothing, so the
     caller keeps its torch path."""
@@ -546,13 +569,11 @@ def test_contract():
         assert not op.StepInputGather().gather(*args), (
             f"gather argument {index} = {value!r} was launched"
         )
-    # Outputs of 8 rows with rows 1 .. 8 asked, an int64 slot table, a non-contiguous output.
+    # Outputs of 8 rows with rows 1 .. 8 asked, an int64 slot table, an int64 output.
     assert not op.SlotScatter().scatter(scatter[0], 1, *scatter[2:])
     assert not op.SlotScatter().scatter(*scatter[:3], b["slot_table"].long(), *scatter[4:])
-    strided = dict(
-        scatter[0], next_draft_tokens=torch.empty_like(b["out_draft"]).t().contiguous().t()
-    )
-    assert not op.SlotScatter().scatter(strided, *scatter[1:])
+    wide = dict(scatter[0], next_draft_tokens=b["out_draft"].long())
+    assert not op.SlotScatter().scatter(wide, *scatter[1:])
     torch.cuda.synchronize()
     assert not mismatches(before, b), "a declined call wrote"
 

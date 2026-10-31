@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -118,6 +118,23 @@ inline const AlgoListType fp8_algo_list = {
     // Llama-3.3-70B TP4 (this is the default algo on B200. Here we aim to use the same algo on GB200.)
     // [-algo66 -m_tile393 -m_stages36 -m_numsK1 -m_reduction0 -m_swizzle0 -m_custom1 -m_mma0 -m_cga4 -m_scheduling1]
     {{8, 8192, 14336}, {66, 393, 36, 1, 0, 1, 1, 4}},
+};
+
+// fp8*fp8 on SM 10.3, keyed {m, k, n} with the exact m; looked up before fp8_algo_list
+inline const AlgoListType sm103_fp8_exact_m_algo_list = {
+    {{224, 4096, 2560}, {66, 321, 36, 1, 0, 0, 3, 3}},
+    {{280, 4096, 2560}, {66, 324, 36, 1, 0, 0, 1, 3}},
+    {{336, 4096, 2560}, {66, 328, 36, 1, 0, 0, 3, 3}},
+    {{392, 4096, 2560}, {66, 331, 36, 1, 0, 0, 3, 3}},
+    {{448, 4096, 2560}, {66, 333, 36, 1, 0, 0, 1, 3}},
+    {{504, 4096, 2560}, {66, 19, 36, 1, 0, 0, 1, 3}},
+    {{560, 4096, 2560}, {66, 20, 36, 1, 0, 0, 1, 4}},
+    {{616, 4096, 2560}, {66, 412, 36, 1, 0, 0, 1, 4}},
+    {{672, 4096, 2560}, {66, 30, 36, 1, 0, 0, 0, 6}},
+    {{728, 4096, 2560}, {66, 118, 36, 1, 0, 0, 1, 3}},
+    {{784, 4096, 2560}, {66, 29, 36, 1, 0, 0, 3, 3}},
+    {{840, 4096, 2560}, {66, 119, 36, 1, 0, 0, 1, 3}},
+    {{896, 4096, 2560}, {66, 119, 36, 1, 0, 0, 1, 3}},
 };
 
 } // namespace cublas_lut

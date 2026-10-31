@@ -598,6 +598,18 @@ class _Stream:
     def wait_stream(self, other: "_Stream") -> None:
         self.log.append(f"{self.name} waits for {other.name}")
 
+    def wait_event(self, event: "_Event") -> None:
+        self.log.append(f"{self.name} waits for {event.stream.name}")
+
+
+class _Event:
+    """A reused ordering event: a wait sees the stream of its latest record."""
+
+    stream: _Stream | None = None
+
+    def record(self, stream: _Stream) -> None:
+        self.stream = stream
+
 
 def _forward_step_executor(monkeypatch, log: list):
     """A ``PyExecutor`` with only what ``_forward_step`` reads, logging its stream work."""
@@ -634,6 +646,8 @@ def _forward_step_executor(monkeypatch, log: list):
     executor._attach_encoder_output_to_execution_stream = lambda requests: None
     executor._mark_cross_kv_projection_consumed = lambda requests: None
     executor._kv_connector_wait_for_save = lambda: None
+    executor._stream_ordering_events = (_Event(), _Event())
+    executor._finish_inforward_snapshots = False
     return executor
 
 

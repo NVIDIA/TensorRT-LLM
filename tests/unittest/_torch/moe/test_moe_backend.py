@@ -569,6 +569,29 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
 
 
+@pytest.mark.parametrize("decode_tuning", [False, True])
+def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+    """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
+    rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
+    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
+    assert config.distributed_tuning_strategy == (
+        DistributedTuningStrategy.BROADCAST
+        if decode_tuning
+        else DistributedTuningStrategy.INDEPENDENT
+    )
+    (spec,) = config.dynamic_tensor_specs
+    pow2 = (1, 2, 4, 8, 16, 32, 64, 128)
+    if decode_tuning:
+        assert {3, 7, 24, 120} <= set(spec.gen_tuning_buckets)
+        assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [7, 8, 24, 128]
+    else:
+        assert set(spec.gen_tuning_buckets) & set(range(1, 129)) == set(pow2)
+        assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
+
+
 @pytest.mark.parametrize(
     "disable_value,expected_disabled",
     [

@@ -41,6 +41,8 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
+from .impl_contract import PreroutedRouting
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -170,8 +172,12 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        prerouted: Optional[PreroutedRouting] = None,
+        decode_tuning: bool = False,
     ) -> List[torch.Tensor]:
-        """Run FP4 block scale MoE computation."""
+        """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
+        computed (native op backend only). ``decode_tuning``: the native NVFP4 op
+        tunes for the model's decode steps (``FP4BlockScaleMoERunner``)."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -338,6 +344,8 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
+        decode_tuning=False,
     ):
         # The native runners take the block scales as one flat linear-layout
         # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
@@ -448,8 +456,22 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    prerouted_tables=None if prerouted is None else prerouted.tables,
+                    prerouted_ids=None if prerouted is None else prerouted.topk_ids,
+                    prerouted_weights=None if prerouted is None else prerouted.topk_weights,
+                    prerouted_tactic=None if prerouted is None else prerouted.tactic,
+                    decode_tuning=decode_tuning,
                 )
                 if not do_finalize:
+                    if prerouted is not None:
+                        # The op returns the FC2 rows; the top-k weights and the
+                        # expanded -> permuted index (head of the tables) are ours.
+                        num_tokens = prerouted.topk_ids.shape[0]
+                        outputs = [
+                            outputs[0],
+                            prerouted.topk_weights,
+                            prerouted.tables[: num_tokens * top_k].view(num_tokens, top_k),
+                        ]
                     return outputs
                 else:
                     final_hidden_states = outputs[0]
@@ -787,7 +809,12 @@ class FlashinferOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
+        decode_tuning=False,
     ):
+        del decode_tuning  # FlashInfer tunes its own way.
+        if prerouted is not None:
+            raise ValueError("prerouted routing needs the native TRT-LLM op backend")
         # The framework hands the scales over token-major 2-D as
         # ``quantize_input`` produced them, which is exactly what the
         # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.

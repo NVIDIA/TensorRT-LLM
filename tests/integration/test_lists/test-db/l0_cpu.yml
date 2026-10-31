@@ -316,6 +316,7 @@ l0_cpu:
   - unittest/llmapi/test_runtime_memory_api.py
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_serve_frontend_affinity.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_num_frontends_default.py

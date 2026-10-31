@@ -47,7 +47,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -191,6 +191,11 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    # Set by `_init_tokenization_cache`; None (no cache) for a processor that
+    # never calls it.
+    _prefix_token_cache: Optional[PrefixTokenCache] = None
+    _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
+
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
         """Return per-modality decode defaults, below server and request overrides."""
         return {}
@@ -234,10 +239,18 @@ class BaseMultimodalInputProcessor(ABC):
                                     if enable_tokenization_cache else None)
 
     def _encode_with_tokenization_cache(
-            self, prompt: str,
-            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        self,
+        prompt: str,
+        sampling_params: Optional[SamplingParams],
+        adds_no_special_tokens: bool = False,
+    ) -> Optional[List[int]]:
+        """Cached ids of `prompt`, or None to tokenize it in full.
+
+        `adds_no_special_tokens`: the caller verified that its tokenizer adds no
+        special tokens, so `add_special_tokens=True` does not change the ids.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens and not adds_no_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(
@@ -1171,6 +1184,12 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            elif enable_tokenization_cache:
+                logger.warning_once(
+                    f"enable_tokenization_cache is ignored: "
+                    f"{input_processor_cls.__name__} does not support the "
+                    "prefix tokenization cache.",
+                    key="tokenization_cache_unsupported_processor")
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that

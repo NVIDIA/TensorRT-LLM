@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
 
@@ -132,6 +132,7 @@ class MTPSpecMetadata(SpecMetadata):
     """
     Metadata for MTP.
     """
+    supports_steady_prepare: ClassVar[bool] = True
     # The number of MTP modules in the model
     mtp_num_modules: int = 1
     # The hidden states manager for MTP

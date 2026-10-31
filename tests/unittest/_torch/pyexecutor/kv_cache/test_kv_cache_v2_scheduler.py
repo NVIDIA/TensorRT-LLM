@@ -18,6 +18,7 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import pytest
@@ -34,7 +35,11 @@ from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MIN_GAIN_BLOCKS,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import BudgetTracker, ScheduleAction
-from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy, ContextChunkingPolicy
+from tensorrt_llm.llmapi.llm_args import (
+    CapacitySchedulerPolicy,
+    ContextChunkingPolicy,
+    ContextSchedulingPolicy,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -396,11 +401,13 @@ def make_ctx_request(
     req.encoder_output_len = encoder_output_len
     req.py_encoder_output_ready_event = None
     req.py_skip_cross_kv_projection = False
+    req.py_ctx_sched_since_iter = None
     return req
 
 
 def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
+    req.py_ctx_sched_since_iter = None
     req.py_csa2_remote_tail_mode = None
     req.request_id = request_id
     req.py_request_id = request_id
@@ -638,6 +645,7 @@ def make_kv_cache_manager(
     )
     mgr.can_evict = can_evict
     mgr._has_cp_helix = False
+    mgr.inforward_snapshot_rows = 0
     mgr.is_vswa = is_vswa
     # Default: no request contributes a full new block, so the prefix-aware
     # skip never fires and tests that don't care about it are unaffected.
@@ -729,6 +737,8 @@ def make_scheduler(
     cross_kv_cache_manager: Mock | None = None,
     enable_prefix_aware_scheduling: bool = True,
     enable_recompute_pause: bool = True,
+    context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
+    context_starvation_iterations: int | None = None,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -756,6 +766,8 @@ def make_scheduler(
             scheduler_capacity=scheduler_capacity,
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             enable_recompute_pause=enable_recompute_pause,
+            context_scheduling_policy=context_scheduling_policy,
+            context_starvation_iterations=context_starvation_iterations,
             **kwargs,
         )
 
@@ -5443,3 +5455,309 @@ class TestLongContextDemotion:
             assert ids(out.context_requests) == [long_id]
         else:
             assert ids(out.recompute_paused_requests) == [long_id]
+
+
+# ===========================================================================
+# Shortest-uncached-first context order and its starvation limit
+# ===========================================================================
+
+
+def _make_srpt_scheduler(
+    budget=8192, mgr=None, max_batch_size=100, policy=None, starvation_iterations=None
+):
+    """Shortest-uncached-first with 64-token chunk units; scheduler iterations count from 101."""
+    sched = make_scheduler(
+        mgr or make_kv_cache_manager(tokens_per_block=64),
+        max_batch_size=max_batch_size,
+        max_num_tokens=budget,
+        ctx_chunk_config=(policy, 64),
+        context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+        context_starvation_iterations=starvation_iterations,
+    )
+    sched._sched_iter = 100
+    return sched
+
+
+def _ctx_batch(first_id, lengths, seen_at=None):
+    reqs = [
+        make_ctx_request(first_id + i, context_remaining_length=n) for i, n in enumerate(lengths)
+    ]
+    for req in reqs:
+        req.py_ctx_sched_since_iter = seen_at
+    return reqs
+
+
+@pytest.mark.parametrize(
+    "lengths, chunks",
+    [
+        ([50000, 3000], [5184, 3000]),  # 5184 = (8192 - 3000) // 64 * 64
+        ([6000, 6000, 6000], [6000, 2176, 0]),  # ties keep arrival order
+    ],
+)
+def test_shortest_first_order(lengths, chunks):
+    reqs = _ctx_batch(0, lengths)
+    out = _make_srpt_scheduler().schedule_request(reqs, set())
+    scheduled = ids(out.context_requests)
+    assert [r.context_chunk_size if r.request_id in scheduled else 0 for r in reqs] == chunks
+
+
+def test_shortest_first_reusable_prefix_is_probed_every_pass():
+    """A mostly-cached first chunk sorts ahead of a shorter uncached prompt until its prefix is
+    evicted; the probe claims nothing."""
+    mgr = make_kv_cache_manager(tokens_per_block=64)
+    reusable = {0: 0, 1: 9000}
+    mgr.probe_context_reuse.side_effect = lambda req: reusable[req.py_request_id]
+    sched = _make_srpt_scheduler(mgr=mgr)
+    uncached, cached = _ctx_batch(0, [6000, 10000])
+    sched.schedule_request([], set())
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [cached, uncached]
+    reusable[1] = 0
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [cached, uncached]
+    sched.schedule_request([], set())
+    assert sched._order_ctx_shortest_first([uncached, cached]) == [uncached, cached]
+    mgr.prepare_context.assert_not_called()
+    mgr.prepare_context_cache.assert_not_called()
+
+
+class TestShortestFirstStarvation:
+    """8192-token budget: a starved request holds 8192 // 4 = 2048 tokens."""
+
+    @pytest.mark.parametrize("limit", [None, 8])
+    def test_starved_request_takes_its_share_first(self, limit):
+        sched = _make_srpt_scheduler(starvation_iterations=limit)
+        (long,) = _ctx_batch(0, [50000], seen_at=0)
+        shorts = _ctx_batch(1, [2100] * 4)
+        out = sched.schedule_request([long] + shorts, set())
+        if limit is None:
+            # 3 x 2100 + 1856 leave 36 tokens: less than one 64-token unit for the long prefill.
+            assert 0 not in ids(out.context_requests)
+        else:
+            assert sorted(ids(out.context_requests)) == [0, 1, 2, 3]
+            assert [s.context_chunk_size for s in shorts[:3]] == [2100, 2100, 1920]
+            assert long.context_chunk_size == 2048
+
+    def test_starved_requests_oldest_first_take_the_leftover(self):
+        sched = _make_srpt_scheduler(starvation_iterations=8)
+        (younger,) = _ctx_batch(0, [30000], seen_at=50)
+        (older,) = _ctx_batch(1, [60000], seen_at=10)
+        (short,) = _ctx_batch(2, [1000])
+        sched.schedule_request([younger, older, short], set())
+        assert short.context_chunk_size == 1000
+        # Both hold 2048; the 3096 left by the short request goes to the older one first.
+        assert older.context_chunk_size == 5120
+        assert younger.context_chunk_size == 2048
+
+    def test_wait_counts_from_first_sight(self):
+        sched = _make_srpt_scheduler(starvation_iterations=8)
+        (long,) = _ctx_batch(0, [50000])
+        # First seen in iteration 101; up to iteration 109 it has not waited more than 8.
+        for it in range(101, 110):
+            out = sched.schedule_request([long] + _ctx_batch(10 * it, [2100] * 4), set())
+            assert 0 not in ids(out.context_requests), it
+        out = sched.schedule_request([long] + _ctx_batch(2000, [2100] * 4), set())
+        assert 0 in ids(out.context_requests)
+        assert long.context_chunk_size == 2048
+
+    def test_small_budget_funds_whole_chunks_oldest_first(self):
+        """128-token budget: a quarter (32) is below a 64-token unit, so the two oldest get a unit
+        each instead of 32-token shares that only the younger ones could turn into chunks."""
+        sched = _make_srpt_scheduler(budget=128, starvation_iterations=8)
+        starved = _ctx_batch(0, [50000] * 4)
+        for req, seen_at in zip(starved, [40, 30, 20, 10]):
+            req.py_ctx_sched_since_iter = seen_at
+        out = sched.schedule_request(starved, set())
+        assert sorted(ids(out.context_requests)) == [2, 3]
+        assert [r.context_chunk_size for r in starved[2:]] == [64, 64]
+
+    def test_starved_request_keeps_a_request_slot(self):
+        sched = _make_srpt_scheduler(max_batch_size=2, starvation_iterations=8)
+        (long,) = _ctx_batch(0, [50000], seen_at=0)
+        out = sched.schedule_request([long] + _ctx_batch(1, [500] * 3), set())
+        assert sorted(ids(out.context_requests)) == [0, 1]
+        assert long.context_chunk_size == 7680  # 8192 - 500, in 64-token units
+
+
+class TestFirstChunkBudgetBeforeClaim:
+    """Under shortest-uncached-first a first chunk that cannot run is turned away before its
+    prefix is claimed."""
+
+    @staticmethod
+    def _claimed(mgr):
+        return {call.args[0].py_request_id for call in mgr.prepare_context.call_args_list}
+
+    @pytest.mark.parametrize("holds_cache", [False, True])
+    def test_leftover_below_a_unit(self, holds_cache):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = _make_srpt_scheduler(mgr=mgr, policy=ContextChunkingPolicy.FORCE_CHUNK)
+        (long,) = _ctx_batch(0, [50000])
+        long.expect_snapshot_points = [49998]
+        if holds_cache:
+            mgr.kv_cache_map[0].is_active = True  # admitted in a pass whose batch did not run
+        shorts = _ctx_batch(1, [2100, 2100, 2100, 1856])  # leave 36 tokens
+        out = sched.schedule_request([long] + shorts, set())
+        assert 0 not in ids(out.context_requests)
+        if holds_cache:
+            # It goes through preparation, so the failed admission releases its claim.
+            assert 0 in self._claimed(mgr)
+            mgr.free_resources.assert_called_once_with(long)
+        else:
+            assert self._claimed(mgr) == {1, 2, 3, 4}
+
+    def test_unfunded_starved_request_is_not_claimed(self):
+        mgr = make_kv_cache_manager(tokens_per_block=64)
+        sched = _make_srpt_scheduler(
+            mgr=mgr, policy=ContextChunkingPolicy.FORCE_CHUNK, starvation_iterations=8
+        )
+        lengths = [50000, 50000, 50000, 2000, 50000]
+        starved = _ctx_batch(0, lengths)
+        for i, (req, length) in enumerate(zip(starved, lengths)):
+            req.py_ctx_sched_since_iter = i
+            if length > 2000:
+                req.expect_snapshot_points = [length - 2]
+        out = sched.schedule_request(starved, set())
+        # Shares 2048 x 3 + 2000 leave 48 tokens: no chunk for the youngest, which is never claimed.
+        assert sorted(ids(out.context_requests)) == [0, 1, 2, 3]
+        assert starved[3].context_chunk_size == 2000
+        assert self._claimed(mgr) == {0, 1, 2, 3}
+
+
+class TestInforwardMambaSnapshot:
+    """A forced chunk ending at the last snapshot point P runs through the prompt end
+    instead when the Mamba manager takes the snapshot inside the forward."""
+
+    PROMPT = 4000
+
+    def _sched(self, rows=2, max_num_tokens=8192):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        mgr.inforward_snapshot_rows = rows
+        mgr.inforward_snapshot_max_tail = 16
+        mgr.inforward_snapshot_min_main = 3
+        return make_scheduler(
+            mgr,
+            max_num_tokens=max_num_tokens,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+
+    def _req(self, rid, points=(PROMPT - 2,)):
+        req = make_ctx_request(rid, context_remaining_length=self.PROMPT)
+        req.expect_snapshot_points = list(points)
+        req.py_multimodal_data = None
+        req.py_mamba_inforward_snapshot_point = None
+        return req
+
+    def test_context_only_chunk_runs_through_the_prompt_end(self):
+        req = self._req(0)
+        out = self._sched().schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == self.PROMPT
+        assert req.py_mamba_inforward_snapshot_point == self.PROMPT - 2
+
+    @pytest.mark.parametrize(
+        "rows, max_num_tokens, points, with_gen",
+        [
+            (0, 8192, [PROMPT - 2], False),
+            (2, 8192, [PROMPT - 2], True),
+            (2, 8192, [PROMPT - 17], False),  # tail longer than max_tail
+            (2, PROMPT - 1, [PROMPT - 2], False),  # tail does not fit the token budget
+            (2, 8192, [2944, PROMPT - 2], False),  # interior point: a plain chunk boundary
+        ],
+        ids=["no_rows", "with_gen", "long_tail", "over_budget", "interior_point"],
+    )
+    def test_keeps_the_split(self, rows, max_num_tokens, points, with_gen):
+        req = self._req(0, points=points)
+        extra = [make_gen_request(1)] if with_gen else []
+        self._sched(rows=rows, max_num_tokens=max_num_tokens).schedule_request([req] + extra, set())
+        assert req.context_chunk_size == points[0]
+        assert req.py_mamba_inforward_snapshot_point is None
+
+    def test_staging_rows_cap_the_requests_per_batch(self):
+        reqs = [self._req(i) for i in range(2)]
+        self._sched(rows=1, max_num_tokens=3 * self.PROMPT).schedule_request(reqs, set())
+        assert [r.context_chunk_size for r in reqs] == [self.PROMPT, self.PROMPT - 2]
+        assert [r.py_mamba_inforward_snapshot_point for r in reqs] == [self.PROMPT - 2, None]
+
+
+# ===========================================================================
+# The disagg KV-transfer window applied before KV allocation
+# ===========================================================================
+
+
+class TestDisaggAdmitBeforeAlloc:
+    """With a registered admission controller the scheduler skips the generation-init requests
+    after the one that closed the pass's gate. The admitted set, limited_by_budget and the
+    blocked-by-active-transfers signal match the ungated pass; only the allocate / revert work
+    changes."""
+
+    @staticmethod
+    def _req(request_id, prompt_len):
+        req = make_disagg_request(request_id, context_remaining_length=prompt_len)
+        req.total_input_len_cp = prompt_len
+        req.py_prompt_len = prompt_len
+        req.is_disagg_generation_transmission_in_progress = False
+        return req
+
+    @staticmethod
+    def _gen(request_id):
+        req = make_gen_request(request_id)
+        req.is_disagg_generation_transmission_in_progress = False
+        return req
+
+    @staticmethod
+    def _run_pass(max_tokens_in_buffer, requests, use_gate, prepare_fn=None):
+        """One scheduling pass plus the coordinator's admission and revert."""
+        from tensorrt_llm._torch.disaggregation.orchestration.admission import (
+            DisaggTransferAdmissionController,
+        )
+
+        controller = DisaggTransferAdmissionController(
+            max_tokens_in_buffer=max_tokens_in_buffer, tokens_per_block=64
+        )
+        mgr = make_kv_cache_manager(prepare_disagg_gen_init_fn=prepare_fn)
+        sched = make_scheduler(mgr, max_num_tokens=4096)
+        if use_gate:
+            sched.set_disagg_transfer_admission_controller(controller)
+        out = sched.schedule_request(requests, set())
+        candidates = out.fitting_disagg_gen_init_requests
+        result = controller.select(requests, candidates)
+        admitted = ids(result.admitted_requests)
+        return SimpleNamespace(
+            admitted=admitted,
+            reverted=[r.request_id for r in candidates if r.request_id not in admitted],
+            allocated=[c.args[0].request_id for c in mgr.prepare_disagg_gen_init.call_args_list],
+            result=result,
+            out=out,
+        )
+
+    def _both(self, max_tokens_in_buffer, requests, **kwargs):
+        base = self._run_pass(max_tokens_in_buffer, requests, use_gate=False, **kwargs)
+        gated = self._run_pass(max_tokens_in_buffer, requests, use_gate=True, **kwargs)
+        assert base.admitted == gated.admitted
+        assert base.result.limited_by_budget == gated.result.limited_by_budget
+        assert (
+            base.result.is_blocked_by_active_transfers()
+            == gated.result.is_blocked_by_active_transfers()
+        )
+        return base, gated
+
+    def test_skips_allocation_after_budget_closes(self):
+        # 100-token prompts = 2 blocks of 64; budget 320 tokens = 5 blocks: 2 admitted, the 3rd closes.
+        base, gated = self._both(320, [self._req(i, 100) for i in range(6)])
+        assert gated.admitted == [0, 1] and gated.result.limited_by_budget
+        assert (base.allocated, base.reverted) == ([0, 1, 2, 3, 4, 5], [2, 3, 4, 5])
+        assert (gated.allocated, gated.reverted) == ([0, 1, 2], [2])
+
+    def test_allocation_failure_keeps_gate_open(self):
+        # Request 1 cannot be allocated (not a candidate in either path); 0 and 2 fit, 3 closes.
+        _, gated = self._both(
+            256,
+            [self._req(i, 100) for i in range(6)],
+            prepare_fn=lambda req: req.request_id != 1,
+        )
+        assert gated.admitted == [0, 2]
+        assert (gated.allocated, gated.reverted) == ([0, 1, 2, 3], [3])
+
+    def test_generation_requests_still_scheduled(self):
+        reqs = [self._req(0, 64), self._req(1, 64), self._gen(2), self._req(3, 64), self._gen(4)]
+        base, gated = self._both(64, reqs)
+        assert ids(base.out.generation_requests) == ids(gated.out.generation_requests) == [2, 4]
+        assert gated.admitted == [0] and gated.allocated == [0, 1]

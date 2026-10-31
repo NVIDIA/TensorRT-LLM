@@ -160,6 +160,7 @@ class _StubQueueItem:
             request_type = RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION
         self.request = types.SimpleNamespace(
             input_token_ids=input_token_ids,
+            num_input_tokens=len(input_token_ids),
             request_type=request_type,
         )
         self.is_normal_request = is_normal_request

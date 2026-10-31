@@ -1786,6 +1786,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # True on hybrid Mamba/GDN managers; __init__ then coerces a positive
     # recompute tail to a full re-prefill.
     _has_recurrent_state: bool = False
+    # Staging rows per batch for recurrent-state snapshots taken inside the
+    # forward (MambaHybridCacheManagerV2); 0 = none.
+    inforward_snapshot_rows: int = 0
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
@@ -4677,8 +4680,11 @@ class KVCacheManagerV2(BaseResourceManager):
             ctx_draft_tokens = req.context_phase_params.draft_tokens
             if ctx_draft_tokens is not None:
                 draft_len = len(ctx_draft_tokens)
-            if draft_len == 0 and not self.is_draft and not req.py_disable_speculative_decoding:
-                draft_len = self.max_total_draft_tokens
+            if not self.is_draft and not req.py_disable_speculative_decoding:
+                # The GEN pads a CTX draft shorter than its own width (no draft,
+                # or a CTX with a smaller max_draft_len) up to
+                # max_total_draft_tokens, so reserve for the padded width.
+                draft_len = max(draft_len, self.max_total_draft_tokens)
         return draft_len
 
     def _helix_local_len(self, global_len: int) -> int:
@@ -8150,6 +8156,41 @@ class KVCacheManagerV2(BaseResourceManager):
             host_rows,
             stream=stream,
         )
+
+    # Trailing blocks of a request that a decode step can change at an unchanged block count: a step appends at
+    # most one block and the rewind of its rejected drafts frees at most one, so only the last block can come back
+    # on another page; two cover any step of fewer than two blocks' tokens.
+    _BLOCK_TABLE_KEY_TAIL_BLOCKS = 2
+
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
+        copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
+        the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
+        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        finite attention window freeing earlier blocks, other beams)."""
+        if (
+            self.enable_swa_scratch_reuse
+            or self.enable_block_reuse
+            or self.max_beam_width > 1
+            or any(
+                window is not None and window < self.max_seq_len
+                for window in self.max_attention_window_vec
+            )
+            or self._use_per_layer_page_tables
+            or self.sparse_metadata_batch is not None
+        ):
+            return None
+        host = self.host_kv_cache_block_offsets.numpy()
+        keys = []
+        for request_id in request_ids:
+            kv_cache = self.kv_cache_map.get(request_id)
+            if kv_cache is None:
+                return None
+            num_blocks = int(kv_cache.num_blocks)
+            row = self.index_mapper.get_index(request_id) * self.max_beam_width
+            first = max(0, num_blocks - self._BLOCK_TABLE_KEY_TAIL_BLOCKS)
+            keys.append((num_blocks, host[:, row, 0, first:num_blocks].tobytes()))
+        return tuple(keys)
 
     @staticmethod
     def _derive_reuse_salt(cache_salt: str | None) -> str | None:

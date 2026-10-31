@@ -24,10 +24,14 @@ class PreparedInputs:
     """Wrap, rather than replace, the keyword arguments passed to a model.
 
     ``runtime_draft_len`` is the draft length the prepared step runs with.
+    ``static_inputs_staged`` is the number of tokens whose input ids and
+    positions the preparation already wrote to the CUDA graph's static inputs
+    (0: none).
     """
 
     kwargs: dict[str, Any]
     runtime_draft_len: int = 0
+    static_inputs_staged: int = 0
 
 
 @dataclass(frozen=True)

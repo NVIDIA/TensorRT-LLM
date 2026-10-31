@@ -2733,6 +2733,11 @@ class KVCacheManager(BaseResourceManager):
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)
 
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key under which ``copy_batch_block_offsets`` rows of ``request_ids`` are unchanged (see
+        ``KVCacheManagerV2.batch_block_table_key``); None: always copy."""
+        return None
+
     def copy_batch_block_offsets(self,
                                  dst_tensor: torch.Tensor,
                                  request_ids: List[int],

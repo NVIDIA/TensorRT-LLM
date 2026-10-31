@@ -104,30 +104,48 @@ def maybe_execute_in_parallel(
         tuple[Any, Any]: the return values of fn0() and fn1().
     """
 
+    result0, result1, event1 = maybe_execute_in_parallel_deferred_join(
+        fn0, fn1, event0, event1, aux_stream, disable_on_compile)
+    if event1 is not None:
+        event1.wait()
+    return (result0, result1)
+
+
+def maybe_execute_in_parallel_deferred_join(
+    fn0: Callable,
+    fn1: Callable,
+    event0: torch.cuda.Event,
+    event1: torch.cuda.Event,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    disable_on_compile: bool = False
+) -> tuple[Any, Any, Optional[torch.cuda.Event]]:
+    """maybe_execute_in_parallel without the final join.
+
+    Returns:
+        fn0() and fn1(), and the event the calling stream must wait on before
+        it reads fn1()'s outputs (None when both ran on the calling stream).
+    """
     multi_stream = (do_multi_stream() and aux_stream is not None and
                     not (disable_on_compile and torch.compiler.is_compiling()))
+    if not multi_stream:
+        return fn0(), fn1(), None
 
-    if multi_stream:
-        event0.record()
-        result0 = fn0()
+    event0.record()
+    result0 = fn0()
 
-        with torch.cuda.stream(aux_stream):
-            event0.wait()
-            result1 = fn1()
-            event1.record()
-        event1.wait()
-        # Without the record, freeing fn1's outputs hands their memory to later
-        # aux_stream work (caching allocator) or frees it in aux_stream order
-        # (cudaMallocAsync) while the calling stream's reads may still be
-        # queued. Under graph capture the caching allocator would hold every
-        # recorded block freed in the capture until it ends, and under
-        # cudaMallocAsync freeing a recorded output inside the capture fails it
-        # ("capturing stream has unjoined work"). Dynamo traces neither the
-        # capture query nor record_stream, so compiled callers skip both.
-        if not (torch.compiler.is_compiling()
-                or torch.cuda.is_current_stream_capturing()):
-            _record_stream(result1, torch.cuda.current_stream())
-    else:
-        result0 = fn0()
+    with torch.cuda.stream(aux_stream):
+        event0.wait()
         result1 = fn1()
-    return (result0, result1)
+        event1.record()
+    # Without the record, freeing fn1's outputs hands their memory to later
+    # aux_stream work (caching allocator) or frees it in aux_stream order
+    # (cudaMallocAsync) while the calling stream's reads may still be
+    # queued. Under graph capture the caching allocator would hold every
+    # recorded block freed in the capture until it ends, and under
+    # cudaMallocAsync freeing a recorded output inside the capture fails it
+    # ("capturing stream has unjoined work"). Dynamo traces neither the
+    # capture query nor record_stream, so compiled callers skip both.
+    if not (torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()):
+        _record_stream(result1, torch.cuda.current_stream())
+    return result0, result1, event1

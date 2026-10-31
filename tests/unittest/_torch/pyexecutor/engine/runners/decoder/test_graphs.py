@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import collections
 import contextlib
 import unittest
 from collections.abc import Iterator
 from types import SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import pytest
 import torch
@@ -548,3 +549,37 @@ class TestWarmupCleanup(unittest.TestCase):
             )
             generation.assert_not_called()
             piecewise.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("graphable_breaks", [False, True])
+def test_prefill_capture_skips_break_graphs_without_graphable_breaks(
+    graphable_breaks: bool,
+) -> None:
+    """Only a bucket whose breakable graph has graphable breaks captures break graphs."""
+    dummy_requests = MagicMock()
+    dummy_requests.release_batch_context.return_value.__enter__.return_value = object()
+    graphs = decoder_graphs(
+        decoder_config(
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            prefill_cuda_graph_num_tokens=[16, 128],
+            max_num_tokens=256,
+        ),
+        dummy_requests=dummy_requests,
+    )
+    runner = Mock(metrics={}, num_break_graphs=0)
+    runner.has_graphable_breaks.return_value = graphable_breaks
+    graphs.breakable_cuda_graph_runner = runner
+    graphs._metrics = collections.defaultdict(float)
+
+    with (
+        patch.object(graphs, "_capture_break_graphs") as capture_break_graphs,
+        patch("torch.cuda.mem_get_info", return_value=(0, 0)),
+        patch("torch.cuda.synchronize"),
+    ):
+        graphs._capture_prefill_cuda_graphs(ResourceManager({}))
+
+    assert [c.args[0] for c in runner.capture.call_args_list] == [128, 16]
+    # Bucket 128 exceeds max_num_tokens // 4, so only bucket 16 is a candidate.
+    captured = [c.args[1] for c in capture_break_graphs.call_args_list]
+    assert captured == ([16] if graphable_breaks else [])

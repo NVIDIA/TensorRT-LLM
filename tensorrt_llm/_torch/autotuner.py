@@ -2213,8 +2213,8 @@ class AutoTuner:
             return True
 
         if strategy == DistributedTuningStrategy.BROADCAST:
-            # Only rank 0 tunes
-            return self.mapping.rank == 0
+            # Only the tuning group's root (the broadcast root) tunes
+            return self._tuning_group()[1] == 0
         elif strategy in {
                 DistributedTuningStrategy.INDEPENDENT,
                 DistributedTuningStrategy.MERGE,

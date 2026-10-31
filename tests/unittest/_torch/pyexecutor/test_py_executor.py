@@ -91,7 +91,10 @@ def _forward_step_executor(
         _attach_encoder_output_to_execution_stream=Mock(),
         _mark_cross_kv_projection_consumed=Mock(),
         _kv_connector_wait_for_save=Mock(),
+        _stream_ordering_events=(Mock(), Mock()),
         _handle_errors=Mock(),
+        _finish_inforward_snapshots=False,
+        kv_cache_manager=Mock(),
     )
 
 
@@ -217,6 +220,24 @@ def test_forward_step_passes_spec_state_and_takes_length_update(outputs, expecte
     assert executor.runtime_draft_len == expected_draft_len
     if isinstance(outputs, dict):
         assert "runtime_draft_len" not in outputs
+
+
+def test_forward_step_finishes_inforward_snapshots_before_the_stream_handoff():
+    """The snapshot copies run on the execution stream ahead of the batch's sampler event."""
+    engine = Mock(route_capture=None)
+    engine.forward.return_value = {"logits": None}
+    executor = _forward_step_executor(engine)
+    executor._finish_inforward_snapshots = True
+    calls = []
+    executor.kv_cache_manager.finish_inforward_snapshots.side_effect = lambda batch: calls.append(
+        ("finish", batch)
+    )
+    executor._stream_ordering_events[1].record.side_effect = lambda stream: calls.append("handoff")
+    batch = ScheduledRequests()
+
+    _run_forward_step(executor, batch)
+
+    assert calls == [("finish", batch), "handoff"]
 
 
 def test_forward_step_keeps_draft_len_when_forward_fails():
@@ -4657,3 +4678,51 @@ def test_first_token_response_carries_the_prefill_logits(monkeypatch, overlap):
         assert py_result.generation_logits is None
         py_result.append_generation_logits(first_logits + 10)  # the next decode step lands
         assert torch.equal(response.result.generation_logits, first_logits.transpose(0, 1))
+
+
+def _make_gen_only_stream_request(request_id, decoding_iter):
+    request = MagicMock()
+    request.py_request_id = request_id
+    request.is_attention_dp_dummy = False
+    request.py_kv_transfer_timed_out = False
+    request.is_generation_only_request = True
+    request.is_disagg_generation_transmission_in_progress = False
+    request.py_csa2_remote_tail_mode = None
+    request.py_draft_tokens = []
+    request.py_decoding_iter = decoding_iter
+    request.return_perf_metrics = False
+    request.is_finished = False
+    request.py_gen_first_emitted = False
+    request.py_total_draft_tokens = 0
+    return request
+
+
+def _make_stream_executor(requests):
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = list(requests)
+    executor.perf_manager = MagicMock()
+    executor.iter_counter = 1
+    executor.stream_interval = 20
+    executor.disable_overlap_scheduler = False
+    executor.dist = types.SimpleNamespace(rank=0, world_size=1)
+    executor.kv_cache_transceiver = None
+    executor.enable_attention_dp = False
+    executor._enqueue_responses = MagicMock()
+    return executor
+
+
+def test_disagg_gen_first_step_is_streamed_once():
+    # Under the overlap scheduler a generation-only request skips iteration 1
+    # (the CTX returned the first token); its first GEN step is iteration 2.
+    request = _make_gen_only_stream_request(1, decoding_iter=2)
+    executor = _make_stream_executor([request])
+
+    PyExecutor._handle_responses(executor)
+    assert request.create_response.call_count == 1
+    assert request.py_gen_first_emitted is True
+
+    # Later steps follow stream_interval again.
+    request.py_decoding_iter = 3
+    executor.active_requests = [request]
+    PyExecutor._handle_responses(executor)
+    assert request.create_response.call_count == 1

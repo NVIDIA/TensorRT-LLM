@@ -2723,7 +2723,9 @@ class AllReduceRunner(TunableRunner):
         eps: float,
         trigger_completion_at_end: bool,
         input_uses_nccl_window: bool = False,
+        exclude_nccl_symmetric: bool = False,
     ):
+        """``exclude_nccl_symmetric``: NCCL_SYMMETRIC is neither tuned nor run (plain NCCL instead)."""
         self.tp_size = tp_size
         self.op = op
         self.group = group
@@ -2731,8 +2733,10 @@ class AllReduceRunner(TunableRunner):
         self.eps = eps
         self.trigger_completion_at_end = trigger_completion_at_end
         self.input_uses_nccl_window = input_uses_nccl_window
+        self.exclude_nccl_symmetric = exclude_nccl_symmetric
 
-    def unique_id(self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool]:
+    def unique_id(
+            self) -> Tuple[int, Tuple[int, ...], torch.dtype, int, bool, bool]:
         return (
             self.tp_size,
             # Keep Python cache entries aligned with the native tactic cache:
@@ -2741,6 +2745,7 @@ class AllReduceRunner(TunableRunner):
             self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
+            self.exclude_nccl_symmetric,
         )
 
     @classmethod
@@ -2806,6 +2811,8 @@ class AllReduceRunner(TunableRunner):
             AllReduceStrategy.NCCL_SYMMETRIC.value,
             AllReduceStrategy.NCCL.value,
         ]
+        if self.exclude_nccl_symmetric:
+            valid_strategies = [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
         # So we need to check if the workspace size is too large to avoid hanging.
         workspace_size = inputs[0].numel() * inputs[0].element_size()
@@ -2897,6 +2904,9 @@ class AllReduceRunner(TunableRunner):
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+        if (self.exclude_nccl_symmetric
+                and tactic == AllReduceStrategy.NCCL_SYMMETRIC.value):
+            tactic = AllReduceStrategy.NCCL.value
 
         return torch.ops.trtllm.allreduce(
             input,
@@ -2970,6 +2980,7 @@ def tunable_allreduce(
     op: int,
     eps: float,
     trigger_completion_at_end: bool,
+    exclude_nccl_symmetric: bool = False,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -2992,6 +3003,7 @@ def tunable_allreduce(
         eps,
         trigger_completion_at_end,
         input_uses_nccl_window,
+        exclude_nccl_symmetric,
     )
 
     def _inputs_pre_hook_register_nccl_symmetric_memory_window(
@@ -3048,6 +3060,7 @@ def _(
     op: int,
     eps: float,
     trigger_completion_at_end: bool,
+    exclude_nccl_symmetric: bool = False,
 ) -> List[torch.Tensor]:
     if op == int(AllReduceFusionOp.NONE):
         return [torch.empty_like(input)]

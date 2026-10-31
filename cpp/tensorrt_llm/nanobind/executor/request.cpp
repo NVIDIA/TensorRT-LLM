@@ -21,6 +21,7 @@
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
+#include "tensorrt_llm/nanobind/common/tokenIds.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -590,32 +591,11 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<tle::IdType>>(state[23]), nb::cast<std::optional<std::string>>(state[24]));
     };
 
-    // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
-    // ndarray is memcpy'd into the vector (no per-element PyLong cast, which is
-    // O(ISL) on the GIL-held submit path). Anything else (list[int], etc.) falls
-    // back to the default nanobind sequence cast, so this is fully back-compatible.
-    // This complements PR #15134 (which bytes-encodes Request *pickling*); here we
-    // target Request *construction* on the RpcWorker.submit / _enqueue_request path.
-    auto toVecTokens = [](nb::handle ids) -> tle::VecTokens
-    {
-        nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> arr;
-        if (nb::try_cast(ids, arr, /*convert=*/false))
-        {
-            tle::VecTokens out(arr.shape(0));
-            if (arr.shape(0) > 0)
-            {
-                std::memcpy(out.data(), arr.data(), arr.shape(0) * sizeof(int32_t));
-            }
-            return out;
-        }
-        return nb::cast<tle::VecTokens>(ids);
-    };
-
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
     request
         .def(
             "__init__",
-            [toVecTokens](tle::Request* self,
+            [](tle::Request* self,
                 nb::handle input_token_ids, // list[int] or int32 ndarray
                 tle::SizeType32 max_tokens, bool streaming, tle::SamplingConfig const& sampling_config,
                 tle::OutputConfig const& output_config, std::optional<tle::SizeType32> const& end_id,
@@ -632,13 +612,13 @@ void initRequestBindings(nb::module_& m)
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
                 std::optional<std::string> cache_salt)
             {
-                new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
-                    output_config, end_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
-                    std::move(embedding_bias), std::move(multimodal_input), std::move(mrope_config),
-                    std::move(lora_config), std::move(kv_cache_retention_config), std::move(encoder_input_token_ids),
-                    client_id, return_all_generated_tokens, priority, type, std::move(context_phase_params),
-                    std::move(encoder_input_features), encoder_output_length, std::move(guided_decoding_params),
-                    allotted_time_ms, disagg_request_id, std::move(cache_salt));
+                new (self) tle::Request(NanobindUtils::toVecTokens(input_token_ids), max_tokens, streaming,
+                    sampling_config, output_config, end_id, std::move(position_ids), std::move(bad_words),
+                    std::move(stop_words), std::move(embedding_bias), std::move(multimodal_input),
+                    std::move(mrope_config), std::move(lora_config), std::move(kv_cache_retention_config),
+                    std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
+                    std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
+                    std::move(guided_decoding_params), allotted_time_ms, disagg_request_id, std::move(cache_salt));
             },
             // clang-format off
         nb::arg("input_token_ids"),

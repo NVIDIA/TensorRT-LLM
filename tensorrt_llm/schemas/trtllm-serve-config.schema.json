@@ -629,6 +629,15 @@
       "title": "ContextChunkingPolicy",
       "type": "string"
     },
+    "ContextSchedulingPolicy": {
+      "description": "Order in which the scheduler admits pending context requests.",
+      "enum": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "title": "ContextSchedulingPolicy",
+      "type": "string"
+    },
     "CpConfig": {
       "additionalProperties": false,
       "description": "Configuration for context parallelism.",
@@ -3541,6 +3550,28 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_lm_head_dtype": {
+          "default": "auto",
+          "description": "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "mxfp8"
+          ],
+          "status": "prototype",
+          "title": "Draft Lm Head Dtype",
+          "type": "string"
+        },
+        "draft_moe_dtype": {
+          "default": "auto",
+          "description": "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "Draft Moe Dtype",
+          "type": "string"
+        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -5941,6 +5972,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_scheduling_policy": {
+          "$ref": "#/$defs/ContextSchedulingPolicy",
+          "default": "fcfs",
+          "description": "Order in which pending context requests are admitted: 'fcfs' (arrival order) or 'shortest_uncached_first' (fewest prompt tokens not covered by reusable KV cache first, which lowers TTFT under load at the cost of fairness). Only the KV cache manager V2 scheduler supports 'shortest_uncached_first'.",
+          "status": "prototype"
+        },
+        "context_starvation_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With context_scheduling_policy='shortest_uncached_first', chunked prefill and a max_num_tokens budget: a context request pending for more than this many scheduler iterations takes up to a quarter of max_num_tokens of each iteration's budget ahead of the shortest-first order, oldest first. None disables it.",
+          "status": "prototype",
+          "title": "Context Starvation Iterations"
+        },
         "dynamic_batch_config": {
           "anyOf": [
             {
@@ -7215,6 +7267,13 @@
       "title": "Mm Encoder Only",
       "type": "boolean"
     },
+    "mnnvl_allreduce_fp8_payload": {
+      "default": false,
+      "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+      "status": "prototype",
+      "title": "Mnnvl Allreduce Fp8 Payload",
+      "type": "boolean"
+    },
     "model": {
       "anyOf": [
         {
@@ -7597,6 +7656,13 @@
       "description": "The request reordering policy to use.",
       "status": "prototype"
     },
+    "replicate_embedding": {
+      "default": false,
+      "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+      "status": "prototype",
+      "title": "Replicate Embedding",
+      "type": "boolean"
+    },
     "request_stats_max_iterations": {
       "anyOf": [
         {
@@ -7643,6 +7709,21 @@
       "$ref": "#/$defs/SchedulerConfig",
       "description": "Scheduler config.",
       "status": "prototype"
+    },
+    "serve_frontend_affinity_port_stride": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+      "status": "prototype",
+      "title": "Serve Frontend Affinity Port Stride"
     },
     "skip_tokenizer_init": {
       "default": false,

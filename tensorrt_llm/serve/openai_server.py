@@ -2012,18 +2012,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    if woken_by_timer:
-                        # Idle poll: a non-blocking read on the metrics
-                        # thread, idle while this loop owns the queue.
-                        for llm_stat in await asyncio.get_running_loop(
-                        ).run_in_executor(self._metrics_stats_executor,
-                                          self.generator.get_stats, 0):
-                            self._record_iteration_stat(llm_stat)
-                    else:
-                        async for llm_stat in self.generator.get_stats_async(
-                                timeout=0.5):
-                            self._record_iteration_stat(llm_stat)
+                    # A timer wakeup (multi-frontend launcher poll) reads
+                    # without waiting.
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats,
+                                      0 if woken_by_timer else 0.5):
+                        self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",

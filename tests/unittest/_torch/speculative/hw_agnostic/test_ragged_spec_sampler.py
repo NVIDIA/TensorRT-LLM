@@ -277,7 +277,11 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
     config = types.SimpleNamespace(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1)
     requests = [
         types.SimpleNamespace(
-            sampling_config=config, state=state, py_seq_slot=slot, py_verify_len=window
+            py_request_id=slot,
+            sampling_config=config,
+            state=state,
+            py_seq_slot=slot,
+            py_verify_len=window,
         )
         for slot, (state, window) in enumerate(
             [
@@ -292,6 +296,10 @@ def test_sampling_parameter_rows_follow_metadata_not_stale_request_windows(ragge
         is_ragged_verify=ragged,
         dummy_slot_row=9,
         group_all_greedy_sample=None,
+        _sampling_scan_cache=None,
+        temperature_only_graphs=False,
+        use_rejection_sampling=False,
+        enable_penalty=False,
     )
     normalized, slots = SpecMetadata._scan_one_model_sampling(metadata, requests)
     assert [row[-1] for row in normalized] == ([1, 2, 4] if ragged else [1, 6, 6])

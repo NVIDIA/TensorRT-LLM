@@ -270,7 +270,9 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             semantic_attn_metadata.update_spec_dec_param.call_args.kwargs["num_contexts"], 1
         )
         prepared_inputs = engine._inputs.prepare_inputs.return_value.kwargs
-        runner.replay.assert_called_once_with(key, prepared_inputs, position_id_offsets=None)
+        runner.replay.assert_called_once_with(
+            key, prepared_inputs, position_id_offsets=None, static_inputs_staged=0
+        )
 
     def test_zero_runtime_draft_speculation_graph_miss_is_semantic_eager(self) -> None:
         engine, runner, resource_manager, semantic_attn_metadata, outputs = _make_decoder_runner(
