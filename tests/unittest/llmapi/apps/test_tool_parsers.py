@@ -5788,6 +5788,45 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         assert [json.loads(args) for args in streaming.streamed_args_for_tool
                 ] == [args for _, args in expected]
 
+    @pytest.mark.parametrize("text,expected_normal,expected_names", [
+        ("Sure. " + _g4_tc("search_web", f'query:{_g4_s("a")}') + " Done.",
+         "Sure.  Done.", ["search_web"]),
+        ("Sure. " + _g4_tc("search_web", f'query:{_g4_s("a")}') + " Then. " +
+         _g4_tc("get_weather", f'location:{_g4_s("LA")}') + " Done.",
+         "Sure.  Then.  Done.", ["search_web", "get_weather"]),
+        ("Sure. " + _g4_tc("search_web", f'query:{_g4_s("a")}') + " Then. " +
+         _g4_tc("get_weather", "opts:" + "{a:" * 5000 + "1" + "}" * 5000) +
+         " Done.", "Sure.  Then.  Done.", ["search_web"]),
+    ],
+                             ids=[
+                                 "text_after_a_call", "text_between_calls",
+                                 "valid_then_unparsable"
+                             ])
+    def test_text_around_calls_is_content(self, sample_tools, parser, text,
+                                          expected_normal, expected_names):
+        """Text before, between and after calls is content in both paths.
+
+        A call whose arguments fail to parse is skipped with its markup.
+        """
+        result = parser.detect_and_parse(text, sample_tools)
+        assert result.normal_text == expected_normal
+        assert [call.name for call in result.calls] == expected_names
+
+        streaming = Gemma4ToolParser()
+        normal, calls = "", []
+        for i in range(0, len(text), 4):
+            increment = streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools)
+            normal += increment.normal_text
+            calls += increment.calls
+        increment = streaming.finish(sample_tools)
+        normal += increment.normal_text
+        calls += increment.calls
+        assert normal.strip() == expected_normal
+        assert [(call.name, json.loads(call.parameters)) for call in calls] == [
+            (call.name, json.loads(call.parameters)) for call in result.calls
+        ]
+
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
         info = info_fn("get_weather")

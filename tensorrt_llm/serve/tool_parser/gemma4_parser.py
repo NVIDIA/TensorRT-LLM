@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import json
-from typing import List, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ChatCompletionToolsParam as Tool
@@ -251,12 +251,13 @@ def _parse_gemma4_args(text: str) -> dict:
     return result
 
 
-def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
-    """Extract all tool call blocks from text.
+def _iter_tool_call_blocks(text: str) -> Iterator[Tuple[int, int, Optional[Tuple[str, str]]]]:
+    """Yield each block from a start token to the next end token.
 
-    Returns list of (function_name, args_string) tuples.
+    Yields (start, end, call) where text[start:end] is the block and call is
+    a (function_name, args_string) tuple, or None for a block without a
+    `call:` header. A start token with no end token after it ends the scan.
     """
-    calls = []
     search_from = 0
     while True:
         start = text.find(BOT_TOKEN, search_from)
@@ -266,6 +267,7 @@ def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
         if end == -1:
             break
 
+        call = None
         inner = text[start + len(BOT_TOKEN) : end].strip()
         if inner.startswith(CALL_PREFIX):
             inner = inner[len(CALL_PREFIX) :]
@@ -279,10 +281,18 @@ def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
                     args_str = inner[brace_pos + 1 : close]
                 else:
                     args_str = inner[brace_pos + 1 :]
-                calls.append((func_name, args_str))
+                call = (func_name, args_str)
 
         search_from = end + len(EOT_TOKEN)
-    return calls
+        yield start, search_from, call
+
+
+def _extract_tool_calls(text: str) -> List[Tuple[str, str]]:
+    """Extract all tool call blocks from text.
+
+    Returns list of (function_name, args_string) tuples.
+    """
+    return [call for _, _, call in _iter_tool_call_blocks(text) if call is not None]
 
 
 class Gemma4ToolParser(BaseToolParser):
@@ -325,10 +335,18 @@ class Gemma4ToolParser(BaseToolParser):
             return StreamingParseResult(normal_text=text, calls=[])
 
         tool_indices = self._get_tool_indices(tools)
-        raw_calls = _extract_tool_calls(text)
 
+        # Normal text is the text outside the call blocks, as the streaming
+        # path reports it. A block that is skipped contributes no text.
+        normal_parts = []
+        cursor = 0
         calls = []
-        for func_name, args_str in raw_calls:
+        for start, end, call in _iter_tool_call_blocks(text):
+            normal_parts.append(text[cursor:start])
+            cursor = end
+            if call is None:
+                continue
+            func_name, args_str = call
             try:
                 parsed_args = _parse_gemma4_args(args_str)
             except (ValueError, IndexError, TypeError, KeyError, RecursionError) as e:
@@ -347,9 +365,14 @@ class Gemma4ToolParser(BaseToolParser):
                 )
             )
 
-        # Normal text is everything before the first tool call
-        first_tc = text.find(BOT_TOKEN)
-        normal_text = text[:first_tc].strip() if first_tc > 0 else ""
+        # After the last block: text up to a call that never ends, otherwise
+        # all of it without stray end tokens.
+        tail = text[cursor:]
+        unterminated = tail.find(BOT_TOKEN)
+        normal_parts.append(
+            tail.replace(EOT_TOKEN, "") if unterminated == -1 else tail[:unterminated]
+        )
+        normal_text = "".join(normal_parts).strip()
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
 
