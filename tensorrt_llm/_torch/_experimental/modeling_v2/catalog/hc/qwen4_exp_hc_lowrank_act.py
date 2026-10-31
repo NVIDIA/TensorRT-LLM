@@ -4,9 +4,10 @@
 the rank-`R` bottleneck and the block-injection weights, from the first
 projection's fp32 logits, in one Triton row kernel.
 
-This target's local variant (r9) of the tp1 target's
-`ops/hc/qwen4_exp_hc_lowrank_act.py` (qwen3_8_flash_next_nvfp4__sm_103__tp1),
-copied as it stands; the Triton kernel below was written for that target.
+Shared by the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified tp4/tep4/dep4 target
+(`hf_fc694b5_orig__sm_103__unified`); promoted from their copies. The Triton kernel below was written for the
+tp1 target.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 
 @triton.jit

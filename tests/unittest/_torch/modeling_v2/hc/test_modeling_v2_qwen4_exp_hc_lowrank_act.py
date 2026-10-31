@@ -1,18 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_hc_lowrank_act entry: cells within one ulp of the
-float64 reference, the fp32-logits guard, graph capture."""
+"""GPU test for the unified target's qwen4_exp_hc_lowrank_act variant
+(catalog/hc/qwen4_exp_hc_lowrank_act): cells within one ulp of the float64
+reference, the fp32-logits and narrow-logits guards, graph capture."""
 
 import zlib
 
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_lowrank_act import (  # noqa: E501
     qwen4_exp_hc_lowrank_act as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_hc_lowrank_act requires a CUDA device"
@@ -60,6 +61,21 @@ def test_guard_refuses_bf16_logits() -> None:
     logits, rank, c, wi, dt = _build(dict(rows=4), seed=4)
     with validating(op), pytest.raises(AssertionError):
         op(logits.to(torch.bfloat16), rank, c, wi, dt)
+
+
+def test_guard_refuses_narrow_logits() -> None:
+    """A view narrower than `rank + hc_count` is read past its last column, into
+    the buffer it views, with no error: the injection weights then come from
+    columns the caller never handed over."""
+    wide, rank, c, wi, dt = _build(dict(rows=4, logits_width=352), seed=7)
+    narrow = wide[:, :rank]
+    _, unguarded_inject = op(narrow, rank, c, wi, dt)
+    _, wide_inject = op(wide, rank, c, wi, dt)
+    torch.cuda.synchronize()
+    assert torch.equal(unguarded_inject, wide_inject), "the hazard this guard covers is gone"
+
+    with validating(op), pytest.raises(AssertionError, match="too narrow"):
+        op(narrow, rank, c, wi, dt)
 
 
 def test_cuda_graph_capture_and_replay() -> None:
