@@ -225,6 +225,13 @@ def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
     return args.stream_response_id, args.stream_created
 
 
+def _carries_stream_output(choice: ChatCompletionResponseStreamChoice) -> bool:
+    """Whether a stream choice carries generated output or its logprobs."""
+    delta = choice.delta
+    return bool(delta.content or delta.reasoning_content or delta.tool_calls
+                or (choice.logprobs is not None and choice.logprobs.content))
+
+
 def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
                     logprobs: List[float] | TokenLogprobs,
                     top_logprobs: bool) -> ChatCompletionLogProbs:
@@ -610,19 +617,35 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
-        chunk = ChatCompletionStreamResponse(choices=[choice],
-                                             model=args.model,
-                                             id=stream_response_id,
-                                             created=stream_created)
-        if include_continuous_usage:
-            chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
-                                    completion_tokens=output.length,
-                                    total_tokens=output.length + prompt_tokens,
-                                    prompt_tokens_details=PromptTokensDetails(
-                                        cached_tokens=rsp.cached_tokens))
-            rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
-        data = chunk.model_dump_json(exclude_none=True)
-        res.append(f"data: {data}\n\n")
+        stream_choices = [choice]
+        if choice.finish_reason is not None and _carries_stream_output(choice):
+            # The finish goes on a chunk of its own after the output, with an
+            # empty delta, as OpenAI streams it: a client that stops reading
+            # at the first finish_reason would otherwise drop the output that
+            # shares its chunk, such as the closing fragment of a tool call's
+            # arguments. The stop reason and the spec-decode stats describe
+            # the finish; the logprobs describe the output.
+            output_choice = choice.model_copy(update=dict(
+                finish_reason=None, stop_reason=None,
+                speculative_decoding=None))
+            finish_choice = choice.model_copy(
+                update=dict(delta=DeltaMessage(), logprobs=None))
+            stream_choices = [output_choice, finish_choice]
+        for stream_choice in stream_choices:
+            chunk = ChatCompletionStreamResponse(choices=[stream_choice],
+                                                 model=args.model,
+                                                 id=stream_response_id,
+                                                 created=stream_created)
+            if include_continuous_usage:
+                chunk.usage = UsageInfo(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=output.length,
+                    total_tokens=output.length + prompt_tokens,
+                    prompt_tokens_details=PromptTokensDetails(
+                        cached_tokens=rsp.cached_tokens))
+                rewrite_usage_info_from_ctx(chunk.usage, ctx_usage)
+            data = chunk.model_dump_json(exclude_none=True)
+            res.append(f"data: {data}\n\n")
 
     if include_usage and rsp._done:
         completion_tokens = sum(output.length for output in rsp.outputs)
