@@ -52,6 +52,42 @@ SCAN_ROOT = "scan"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+LLM_ARTIFACTS_LOCATIONS = [
+    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local"],
+    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic"],
+]
+
+def llmArtifactsPrimary()
+{
+    def primary = env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+def llmArtifactsLayoutPath(String legacyPath)
+{
+    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
+    if (!layoutPath.startsWith("llm-artifacts/")) {
+        error("Not an llm-artifacts path: ${legacyPath}")
+    }
+    return layoutPath
+}
+
+def llmArtifactsRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+def llmArtifactsUrl(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
+}
+
 // GitLab project id for TRT-LLM repo, used to set GitLab status. Only needed when triggering by timer or by hand.
 withCredentials([string(credentialsId: 'gitlab-llm-repo-id', variable: 'GITLAB_PROJECT_ID')]) {
     GITLAB_PROJECT_ID = env.gitlabProjectId ? env.gitlabProjectId : "${GITLAB_PROJECT_ID}"
@@ -332,6 +368,10 @@ def BOLT_CONSUME_TRIPLES = "bolt_consume_triples"
 def RELEASE_TARGET = "release_target"
 @Field
 def JOB_TYPE = "job_type"
+// The primary location of build artifacts (see llmArtifactsPrimary), passed to every child job.
+// Child jobs run on other Jenkins controllers, whose own LLM_ARTIFACTS_PRIMARY can differ.
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (BASE_COMMIT): gitlabParamsFromBot.get('base_commit', null),
@@ -637,8 +677,12 @@ def mergeWaiveList(pipeline, globalVars)
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
-        trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
-        echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+        def primary = llmArtifactsPrimary()
+        def waiveListTarget = primary == "aws" ?
+            "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/waive_list/" : "${UPLOAD_PATH}/waive_list/"
+        trtllm_utils.uploadArtifacts("waives*.txt", waiveListTarget, primary)
+        def waiveListUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/waive_list/waives.txt")
+        echo "New merged test waive list: ${waiveListUrl}"
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
@@ -743,8 +787,12 @@ def preparation(pipeline, testFilter, globalVars)
                     "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
                     "jenkins_url=${env.BUILD_URL}"
                 writeFile file: 'build_info.txt', text: buildInfo
-                trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                pipeline.echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+                def primary = llmArtifactsPrimary()
+                def buildInfoTarget = primary == "aws" ?
+                    "${llmArtifactsRepoPath('aws', UPLOAD_PATH)}/" : "${UPLOAD_PATH}/"
+                trtllm_utils.uploadArtifacts("build_info.txt", buildInfoTarget, primary)
+                def buildInfoUrl = llmArtifactsUrl(primary, "${UPLOAD_PATH}/build_info.txt")
+                pipeline.echo "Build info: ${buildInfoUrl}"
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1484,6 +1532,7 @@ def _cbtsCoverageDecline(boolean pilotEligible, String reason)
 def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
 {
     def pilotEligible = false
+    def artifactoryNetrc = ""
     try {
         // artifact.py resolves, downloads and merges the x86/SBSA DBs; paths come back
         // ${LLM_ROOT}-relative, matching the main.py caller's `cd ${LLM_ROOT}`.
@@ -1495,6 +1544,39 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
             return _cbtsCoverageDecline(
                 pilotEligible, "PR identity unavailable for coverage DB pin")
         }
+
+        // artifact.py reads build_info.txt with jenkins/scripts/fetch_build_artifact.sh, which
+        // looks in the primary location first and authenticates to aws with this netrc. It holds
+        // the publishing credential, the one the pipelines publish build artifacts with.
+        // When artifactory.nvidia.com is the primary location and rejects the credential, the
+        // helper prints a message naming it, artifact.py exits 1, and the coverage tier declines
+        // like after any other failure; a rejection while it is the secondary counts as a failed
+        // read, and artifact.py skips that build.
+        // While artifactory.nvidia.com is the primary location (the default) and is down or
+        // unreachable, every build_info.txt read fails after the helper's retries. artifact.py
+        // skips each build whose read fails, so the coverage tier declines only after
+        // --resolve-pin has tried every recent build that has both coverage archives, or after
+        // --prepare has tried the pinned one. Setup Environment, which runs this before any build
+        // starts, waits for those reads; build_commit in artifact.py says how long each takes and
+        // what changes after a rollback to urm.
+        def artifactoryCredentialId = 'aws-artifactory-credentials'
+        def artifactsPrimary = llmArtifactsPrimary()
+        artifactoryNetrc = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+        withCredentials([usernamePassword(credentialsId: artifactoryCredentialId,
+                usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+            withEnv(["ARTIFACTORY_NETRC=${artifactoryNetrc}"]) {
+                sh(label: "Write Artifactory netrc", script: '''
+                    set +x
+                    umask 077
+                    printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+                ''')
+            }
+        }
+        def artifactEnv = [
+            "LLM_ARTIFACTS_PRIMARY=${artifactsPrimary}",
+            "ARTIFACTORY_NETRC=${artifactoryNetrc}",
+            "ARTIFACTORY_CREDENTIAL_ID=${artifactoryCredentialId}",
+        ]
 
         def readyJson = ""
         def prAuthor = ""
@@ -1511,13 +1593,15 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
             ).trim()
             pilotEligible = prAuthor && CBTS_COVERAGE_PILOT_USERS.any { it.equalsIgnoreCase(prAuthor) }
             pipeline.echo("CBTS coverage pilot: pr_author=${prAuthor ?: 'unknown'}, eligible=${pilotEligible}")
-            pinPlanJson = sh(
-                script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
-                        "python3 -m cbts.command coverage selection artifact " +
-                        "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
-                        "--pr-head ${prHead} || true",
-                returnStdout: true,
-            ).trim()
+            withEnv(artifactEnv) {
+                pinPlanJson = sh(
+                    script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                            "python3 -m cbts.command coverage selection artifact " +
+                            "--resolve-pin cbts_db_pin.json --pr-number ${prNumber} " +
+                            "--pr-head ${prHead} || true",
+                    returnStdout: true,
+                ).trim()
+            }
         }
         if (!pinPlanJson) {
             pipeline.echo("CBTS audit: coverage DB pin could not be resolved")
@@ -1551,15 +1635,17 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
                 usernameVariable: 'NOT_USED_YET',
                 passwordVariable: 'GITHUB_API_TOKEN'),
         ]) {
-            readyJson = sh(
-                script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
-                        "python3 -m cbts.command coverage selection artifact " +
-                        "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
-                        " --pr-head ${prHead}" +
-                        " --build ${pinPlan.build}" +
-                        " --expected-commit ${pinPlan.commit} || true",
-                returnStdout: true,
-            ).trim()
+            withEnv(artifactEnv) {
+                readyJson = sh(
+                    script: "cd ${LLM_ROOT} && PYTHONPATH=jenkins/scripts/cbts " +
+                            "python3 -m cbts.command coverage selection artifact " +
+                            "--prepare cbts_cov --paths-json cbts_coverage_residual.json" +
+                            " --pr-head ${prHead}" +
+                            " --build ${pinPlan.build}" +
+                            " --expected-commit ${pinPlan.commit} || true",
+                    returnStdout: true,
+                ).trim()
+            }
         }
         if (!readyJson) {
             pipeline.echo("CBTS audit: no coverage DB could be prepared — Tier 2 decision unavailable")
@@ -1579,6 +1665,10 @@ def _cbtsCoverageAudit(pipeline, globalVars, String residualPath)
     } catch (Exception e) {
         pipeline.echo("CBTS audit: skipped (non-fatal): ${e.message}")
         return [db: null, pilotEligible: pilotEligible]
+    } finally {
+        if (artifactoryNetrc) {
+            sh(label: "Remove Artifactory netrc", script: "rm -f '${artifactoryNetrc}'")
+        }
     }
 }
 
@@ -2385,6 +2475,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
     // trigger "Argument list too long" when passed to downstream jobs.
     def globalVarsToPass = globalVars.findAll { key, value -> key != CACHED_CHANGED_FILE_LIST }
+    globalVarsToPass[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
     String globalVarsJson = writeJSON returnText: true, json: globalVarsToPass
     parameters += [
         'enableFailFast': enableFailFast,
