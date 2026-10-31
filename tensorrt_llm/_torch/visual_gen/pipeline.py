@@ -453,7 +453,11 @@ class BasePipeline(nn.Module):
         raise NotImplementedError
 
     def _sleep_loading_context(
-        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+        self,
+        restore_mode: "SleepRestoreMode",
+        *,
+        device: torch.device,
+        release_host_backup: bool = False,
     ) -> contextlib.AbstractContextManager[None]:
         """Capture persistent allocations for pipelines that explicitly support sleep.
 

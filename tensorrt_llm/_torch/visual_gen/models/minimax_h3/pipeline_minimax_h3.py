@@ -302,7 +302,11 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @contextmanager
     def _sleep_loading_context(
-        self, restore_mode: "SleepRestoreMode", *, device: torch.device
+        self,
+        restore_mode: "SleepRestoreMode",
+        *,
+        device: torch.device,
+        release_host_backup: bool = False,
     ) -> Iterator[None]:
         """Back persistent H3 allocations while keeping warmup outside the pool."""
         config = self.pipeline_config
@@ -320,7 +324,9 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         from ...sleep import PipelineSleepManager
 
-        manager = PipelineSleepManager(restore_mode, device)
+        manager = PipelineSleepManager(
+            restore_mode, device, release_host_backup=release_host_backup
+        )
         with manager.loading():
             yield
         self._sleep_manager = manager
