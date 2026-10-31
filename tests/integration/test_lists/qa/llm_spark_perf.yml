@@ -44,6 +44,45 @@ llm_spark_perf:
   # Qwen3.6-35B-A3B NVFP4: baseline and the same checkpoint with MTP drafting
   - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
   - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:1-con:1]
+  # Agentic context: 8K input, 512 output, one agent and four agents.
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:8192,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:8192,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:8192,512-reqs:16-con:4]
+  # Agentic context, decode at large cached input: one agent, one model per attention type
+  # (gpt-oss sliding window + sinks, Qwen3.6 linear attention, Gemma 4 VSWA, Nemotron-H Mamba).
+  # Prompts longer than 8192 tokens are prefilled in 8192-token chunks (pytorch_model_config.py).
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[gemma_4_26b_a4b_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[nvidia_nemotron_nano_9b_v2_nvfp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:65536,512-reqs:4-con:1]
+  # Multi-agent long context: four 32K-input agents at once.
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:32768,512-reqs:8-con:4]
+  # Speculative decoding at long context (small batch).
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-bench-pytorch-streaming-float4-maxbs:1-maxnt:8192-input_output_len:32768,512-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4_mtp-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:32768,512-kv_cache_dtype:fp8-reqs:4-con:1]
+  # Tool-call style: 16K input, 128 output, eight agents.
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-bench-pytorch-streaming-float4-maxbs:8-maxnt:8192-input_output_len:16384,128-reqs:32-con:8]
+  # Agents sharing context: 28K shared prefix + 4K own input per request, KV block reuse on and off
+  # (sliding window + sinks, linear attention, Mamba).
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_fp4-serve-pytorch-streaming-float4-maxbs:4-maxnt:8192-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:reuse]
+  - perf/test_perf.py::test_perf[nemotron_3_super_120b_nvfp4-serve-pytorch-streaming-float4-maxbs:8-maxnt:4096-input_output_len:4096,512-reqs:16-con:4-prefix:28672-cfg:noreuse]
+  # Speculative decoding on real text (cnn_dailymail), so draft tokens can be accepted. Compare TPOT with the
+  # bench cases of the base checkpoint at the same input/output length.
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:1-input_output_len:128,2048-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[gpt_oss_120b_eagle3-serve-pytorch-streaming-float4-maxbs:4-input_output_len:128,2048-reqs:16-con:4]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:4-input_output_len:2048,256-reqs:16-con:4]
+  - perf/test_perf.py::test_perf[qwen3.6_35b_a3b_fp4_mtp-serve-pytorch-streaming-float4-maxbs:1-input_output_len:2048,256-reqs:4-con:1-cfg:mtp3]
 # ===============================================================================
 # 2: Multi-GPU (2 GPUs) Spark perf cases with multinode support
 # ===============================================================================
