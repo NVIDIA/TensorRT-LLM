@@ -8,8 +8,8 @@ every rank of a tp4, tep4, dep4 or dep2 mapping, so nothing here touches a devic
 what the forward addresses: the fused attention row and the split the norm + rope reads it
 through, the Gated-DeltaNet projection's column split, the routed experts a rank holds (an
 expert window, or tp4's padded intermediate slice of every expert) and the per-expert scalars
-cut to them, the attention-DP round trip's padding and slicing, and the
-layouts this core does not assemble.
+cut to them, and the attention-DP round trip's padding and slicing. MTP under attention DP is
+pinned in `test_mtp_attention_dp.py`.
 """
 
 from __future__ import annotations
@@ -258,20 +258,6 @@ def test_a_spread_fc1_input_scale_is_refused() -> None:
     }
     with pytest.raises(AssertionError, match="one gate_proj.input_scale"):
         M._moe_layer_scalars(w, 0, 0, 128)
-
-
-@pytest.mark.parametrize(
-    "layout, spec_config, missing",
-    [
-        (_DEP4, MTPDecodingConfig(max_draft_len=3), "MTP under attention DP"),
-    ],
-    ids=["mtp-dep4"],
-)
-def test_what_this_core_does_not_assemble_is_refused_at_construction(
-    layout, spec_config, missing
-) -> None:
-    with pytest.raises(NotImplementedError, match=missing):
-        _core(0, layout, spec_config)
 
 
 @pytest.mark.parametrize("rank", range(WORLD))

@@ -75,15 +75,23 @@ module (`MTPLayer`), replayed `max_draft_len` times by the engine's spec worker,
 runs every generation request's `max_draft_len + 1` verify rows:
 
 * The draft layer is one more full-attention QSA layer, cut like a trunk attention layer (this
-  rank's q heads, its KV head, the replicated indexer), over the manager the draft step is
-  handed: under attention TP that is a separate draft KV cache, whose K/V, index and position
-  pages hold the draft layer alone (`_bind_draft_cache_manager`). Its front end, router,
-  shared expert and hyper-connections are replicated; its FP8 block-scale experts run as this
-  rank's window of `num_experts / tp_size` experts (`fp8_block_scale_moe_runner`'s window), and
-  the o_proj and expert partials are completed by the same plain sum as the trunk's. That
-  window is the same at tp4 as at tep4: the FP8 experts' 128x128 weight blocks do not take the
-  trunk's 160-row intermediate split, and a sum of whole-expert windows is the layer's output
-  whichever way the trunk's experts are cut.
+  rank's q heads, its KV head, the replicated indexer; every head under attention DP), over the
+  manager the draft step is handed: under attention TP that is a separate draft KV cache, whose
+  K/V, index and position pages hold the draft layer alone; under attention DP the engine
+  builds none and the trunk's manager maps the draft layer too (`_bind_draft_cache_manager`).
+  Its front end, router, shared expert and hyper-connections are replicated; its FP8
+  block-scale experts run as this rank's window of `num_experts / tp_size` experts
+  (`fp8_block_scale_moe_runner`'s window). Under attention TP the o_proj and expert partials
+  are completed by the same plain sum as the trunk's. That window is the same at tp4 as at
+  tep4: the FP8 experts' 128x128 weight blocks do not take the trunk's 160-row intermediate
+  split, and a sum of whole-expert windows is the layer's output whichever way the trunk's
+  experts are cut.
+* Under attention DP each rank drafts for its own requests, and the draft MoE runs the trunk's
+  round trip (`_expert_sum_op`): the group's rows gathered, routed and run through this rank's
+  window, reduce-scattered back. The spec worker hands each draft step the group's row counts
+  (the trunk step's tokens on the first, one row a request on the rest, attention-DP dummy
+  requests included) without writing them into the metadata; `_dp_pad_rows` pads this rank's
+  rows by them, so every rank issues the same collectives at every draft step.
 * A verify step's Gated-DeltaNet rows take the multi-token conv with per-step window snapshots
   and the stock Triton cached replay over the bf16 pool, which commits a full history in the
   kernel below `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` requests and leaves it to the
@@ -96,9 +104,8 @@ runs every generation request's `max_draft_len + 1` verify rows:
   the draft-extend step captures each request's selection and the later draft steps rebuild
   theirs from it (`qsa_mtp_reuse_topk`).
 
-Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`), and
-MTP under attention DP (dep4, dep2): the draft layer's experts are completed by the TP sum,
-not the attention-DP round trip. Each refusal names what is missing.
+Not assembled here: the legacy per-step recurrent verify (`TRTLLM_USE_GDN_REPLAY=0`); its
+refusal names what is missing.
 
 Integration facts this file depends on:
 
@@ -302,6 +309,10 @@ _QSA_MROPE_SECTION = None
 _TIE_BREAK_LARGE = int(TopKTieBreak.LARGE)
 # The draft experts' activation scales are fp32, not the UE8M0 power-of-two form.
 _MTP_MOE_USE_UE8M0 = False
+# Rows per draft FP8 runner call: its 128-expert windows are certified up to one 8192-row
+# chunk (`fp8_block_scale_moe_runner__r40`). The rows an attention-DP group gathers (up to
+# its size times a rank's) run in chunks of it.
+_MTP_MOE_MAX_ROWS = 8192
 
 _PLE_HOST_OFFLOAD_ENV = "TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD"
 _PLE_HOST_OFFLOAD_OFF = frozenset({"0", "false", "no", "off"})
@@ -413,14 +424,11 @@ class Qwen4ExpUnifiedModelingV2(DecoderModel):
         # module, built only when the engine asked for speculation.
         spec_config = getattr(model_config, "spec_config", None)
         self.mtp_enabled = spec_config is not None
-        if self.mtp_enabled and mapping.enable_attention_dp:
-            raise NotImplementedError(
-                "MTP under attention DP (dep4): the draft layer's attention-DP MoE round trip "
-                "and per-rank draft batch are not assembled in this target yet"
-            )
         # The draft layer's FP8 block-scale experts are whole-expert windows over the TP group
-        # at every attention-TP layout, tp4 included: their 128x128 weight blocks do not take
-        # the trunk's 160-row intermediate split (`weights.rank_dims`, `mtp_local_experts`).
+        # at every layout, tp4 included: their 128x128 weight blocks do not take the trunk's
+        # 160-row intermediate split (`weights.rank_dims`, `mtp_local_experts`). Under
+        # attention DP each rank drafts for its own requests, and the window runs over the
+        # rows the group gathers, as the trunk's does (`_mtp_moe_block`).
         # Rows per generation request of the widest verify step (`max_draft_len + 1`); 1
         # without MTP.
         self.max_verify_rows = spec_config.max_draft_len + 1 if self.mtp_enabled else 1
@@ -1618,56 +1626,100 @@ def _mtp_index_branch(core, M: _MtpWeights, mixed, draft: _DraftBound, qsa) -> t
     return _index_query(core, index_scratch)
 
 
-def _mtp_moe_block(core, M: _MtpWeights, x) -> torch.Tensor:
+def _mtp_moe_block(core, M: _MtpWeights, x, pad_rows: int = 0) -> torch.Tensor:
     """The draft layer's MoE: renormalized top-k over the whole routing space, the FP8
-    block-scale routed experts over this rank's window (1x128 activation scales, pre-routed;
-    the window partials summed over the TP group), and the replicated bf16 shared expert in
-    the trunk's form -- one GEMM forms gate|up and the per-token gate logit -- combined as
-    `routed + sigmoid(gate logit) * shared`. The activation scales come back transposed
-    `[hidden / 128, tokens]` and go straight to the runner."""
-    logits = cublas_mm(x, M.router)
-    topk_ids, topk_w = renorm_moe_routing_op(logits, topk=core.topk, output_dtype=x.dtype)
-    xq, xsf = fp8_quantize_1x128(x, use_ue8m0=_MTP_MOE_USE_UE8M0)
-    routed = fp8_block_scale_moe_runner(
-        routing_logits=None,
-        routing_bias=None,
-        hidden_states=xq,
-        hidden_states_scale=xsf,
-        gemm1_weights=M.fc1_w,
-        gemm1_weights_scale=M.fc1_s,
-        gemm2_weights=M.fc2_w,
-        gemm2_weights_scale=M.fc2_s,
-        num_experts=core.num_experts,
-        top_k=core.topk,
-        num_fused_shared_experts=None,
-        n_group=None,
-        topk_group=None,
-        intermediate_size=core.moe_inter,
-        local_expert_offset=core.mtp_expert_offset,
-        local_num_experts=core.mtp_local_experts,
-        routed_scaling_factor=None,
-        routing_method_type=_ROUTING_METHOD_RENORM,
-        topk_weights=topk_w,
-        topk_ids=topk_ids,
-        act_type=_ACT_TYPE_SWIGLU,
-        gemm1_clamp_limit=None,
-    )
-    routed = core.tp_sum(routed)
+    block-scale routed experts over this rank's window (1x128 activation scales, pre-routed),
+    and the replicated bf16 shared expert in the trunk's form -- one GEMM forms gate|up and
+    the per-token gate logit -- combined as `routed + sigmoid(gate logit) * shared`. The
+    activation scales come back transposed `[hidden / 128, tokens]` and go straight to the
+    runner.
+
+    The window's partial is completed as the trunk's is: under attention TP summed over the
+    TP group; under attention DP by the round trip over the group's gathered rows
+    (`core.expert_sum`), `pad_rows` padding this rank's (`_draft_pad_rows`). The routing,
+    the quantization and the runner are row-wise and run on the rows the window sees, in
+    chunks of at most `_MTP_MOE_MAX_ROWS`: one chunk at a TP rank's rows, several over the
+    rows an attention-DP group gathers."""
+
+    def run(rows: torch.Tensor) -> torch.Tensor:
+        parts = []
+        for lo in range(0, rows.shape[0], _MTP_MOE_MAX_ROWS):
+            chunk = rows[lo : lo + _MTP_MOE_MAX_ROWS]
+            logits = cublas_mm(chunk, M.router)
+            topk_ids, topk_w = renorm_moe_routing_op(
+                logits, topk=core.topk, output_dtype=chunk.dtype
+            )
+            xq, xsf = fp8_quantize_1x128(chunk, use_ue8m0=_MTP_MOE_USE_UE8M0)
+            parts.append(
+                fp8_block_scale_moe_runner(
+                    routing_logits=None,
+                    routing_bias=None,
+                    hidden_states=xq,
+                    hidden_states_scale=xsf,
+                    gemm1_weights=M.fc1_w,
+                    gemm1_weights_scale=M.fc1_s,
+                    gemm2_weights=M.fc2_w,
+                    gemm2_weights_scale=M.fc2_s,
+                    num_experts=core.num_experts,
+                    top_k=core.topk,
+                    num_fused_shared_experts=None,
+                    n_group=None,
+                    topk_group=None,
+                    intermediate_size=core.moe_inter,
+                    local_expert_offset=core.mtp_expert_offset,
+                    local_num_experts=core.mtp_local_experts,
+                    routed_scaling_factor=None,
+                    routing_method_type=_ROUTING_METHOD_RENORM,
+                    topk_weights=topk_w,
+                    topk_ids=topk_ids,
+                    act_type=_ACT_TYPE_SWIGLU,
+                    gemm1_clamp_limit=None,
+                )
+            )
+        return parts[0] if len(parts) == 1 else torch.cat(parts, 0)
+
+    if core.dp_size == 1:
+        routed = core.tp_sum(run(x))
+    else:
+        routed = core.expert_sum(run, x, pad_rows)
     gug = cublas_mm(x, M.sh_gug)
     shared = cublas_mm(silu_and_mul_rows(gug, core.shared_inter), M.sh_dn)
     gate_logits = gug[:, 2 * core.shared_inter : 2 * core.shared_inter + 1]
     return fused_sigmoid_gate_mul_add(routed, gate_logits, shared)
 
 
-def _mtp_tail(core, M: _MtpWeights, x, attn, inject) -> torch.Tensor:
+def _mtp_tail(core, M: _MtpWeights, x, attn, inject, pad_rows: int) -> torch.Tensor:
     """The draft layer after its attention core: the gated output projection's partial summed
     over the TP group and injected, the MoE-side hyper-connection, the MoE and its injection.
-    `attn` is the `[T, q_width]` gated attention output."""
+    `attn` is the `[T, q_width]` gated attention output; `pad_rows` is the MoE round trip's
+    padding under attention DP (`_draft_pad_rows`)."""
     x = qwen4_exp_post_inject(x, core.tp_sum(cublas_mm(attn, M.o)), inject)
     mixed, inject = qwen4_exp_gated_residual(
         _grouped_norm(core, x, M.mhc_norm), M.mhc_down, M.mhc_up, M.mhc_inject, core.hc_count
     )
-    return qwen4_exp_post_inject(x, _mtp_moe_block(core, M, mixed), inject)
+    return qwen4_exp_post_inject(x, _mtp_moe_block(core, M, mixed, pad_rows), inject)
+
+
+class _DraftRowCounts(NamedTuple):
+    """The group's per-rank row counts of one draft step, in the field `_dp_pad_rows` reads."""
+
+    all_rank_num_tokens: list
+
+
+def _draft_pad_rows(core, all_rank_num_tokens, rows: int) -> int:
+    """Rows a draft step pads its MoE input with before the attention-DP round trip:
+    `_dp_pad_rows` over the counts the spec worker hands this draft step -- every rank's
+    trunk tokens on the loop's first step, its request count on the later ones (attention-DP
+    dummy requests included) -- which it passes alongside the metadata rather than writing
+    into it. Zero without attention DP, and under a decode CUDA graph, which pads every rank
+    to the captured batch."""
+    if core.dp_size == 1:
+        return 0
+    assert all_rank_num_tokens is not None, (
+        "a draft step under attention DP came without the group's row counts; the MoE round "
+        "trip cannot pad this rank's rows to the group's largest count"
+    )
+    return core._dp_pad_rows(_DraftRowCounts(list(all_rank_num_tokens)), rows)
 
 
 def _hc_mixer(core, normed, first, up, with_inject):
@@ -2796,7 +2848,8 @@ class PrefillTarget:
 
         The draft layer's attention is the trunk prefill target's: the context rows score
         as query tiles and bound their sparse scan by their positions, the generation rows
-        (`p` a request) score row by row. `all_rank_num_tokens` is accepted and unused."""
+        (`p` a request) score row by row. `all_rank_num_tokens` is the group's row counts of
+        this draft step, which pad the MoE round trip under attention DP (`_draft_pad_rows`)."""
         core = self.core
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
         assert core._bound is not None, "the trunk's cache-manager bind has not run"
@@ -2818,6 +2871,7 @@ class PrefillTarget:
             f"the draft step carries {rows} rows for a batch its metadata describes as "
             f"{md.num_tokens} tokens; the QSA row mapping covers the second"
         )
+        pad_rows = _draft_pad_rows(core, all_rank_num_tokens, rows)
         # The trunk's dense/sparse decision from the same host buffer: every draft step of
         # one engine forward takes the branch its trunk took.
         batch = md.num_seqs
@@ -2907,7 +2961,7 @@ class PrefillTarget:
                 **_CALL_CONSTANTS,
             )
         mtp_fused_sigmoid_mul_inplace(attn, gate)
-        return _mtp_tail(core, M, x, attn, inject)
+        return _mtp_tail(core, M, x, attn, inject, pad_rows)
 
 
 # ------------------------------------------------------------------- decode ---
@@ -3331,8 +3385,9 @@ class DecodeTarget:
         appends the groups completed since (the expansion adds the incomplete tail, so the
         tokens drafted since stay visible). What a skipped step would have written to the
         index plane sits at or past the newly committed length, and the next engine step's
-        draft-extend rewrites it before anything reads it. `all_rank_num_tokens` is accepted
-        and unused."""
+        draft-extend rewrites it before anything reads it. `all_rank_num_tokens` is the
+        group's row counts of this draft step, which pad the MoE round trip under attention DP
+        (`_draft_pad_rows`)."""
         core = self.core
         assert isinstance(attn_metadata, TrtllmAttentionMetadata)
         assert core._bound is not None, "the trunk's cache-manager bind has not run"
@@ -3353,6 +3408,7 @@ class DecodeTarget:
             f"the draft step carries {rows} rows for a batch its metadata describes as "
             f"{md.num_tokens} tokens; the QSA row mapping covers the second"
         )
+        pad_rows = _draft_pad_rows(core, all_rank_num_tokens, rows)
         # The trunk's dense/sparse decision from the same host buffer: the worker advances
         # only the device KV lengths through the draft loop, so every draft step of one engine
         # forward takes the branch its trunk took, in the graph family the runner chose.
@@ -3467,7 +3523,7 @@ class DecodeTarget:
                 **_CALL_CONSTANTS,
             )
         mtp_fused_sigmoid_mul_inplace(attn, gate)
-        return _mtp_tail(core, M, x, attn, inject)
+        return _mtp_tail(core, M, x, attn, inject, pad_rows)
 
 
 # ------------------------------------------------------------ the MTP module ---

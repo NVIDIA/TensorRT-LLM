@@ -4,8 +4,9 @@
 
 Two families route `Qwen4ExpForConditionalGeneration`: `qwen4_exp` claims one rank and
 `qwen4_exp_for_conditional_generation` claims tp4 and tep4 with or without MTP, and the
-attention-DP layouts dep4 and dep2 (the disaggregated-serving engines' layout) without
-speculation or a breakable prefill graph. Each layout lands on its own family's target,
+attention-DP layouts dep4 (with or without MTP) and dep2 (the disaggregated-serving engines'
+layout, without speculation), neither with a breakable prefill graph. Each layout lands on its
+own family's target,
 and the layouts neither one serves fall back under `auto`.
 """
 
@@ -187,17 +188,27 @@ def test_dep2_routes_to_the_unified_target(dtype):
     _claimed(config, kv_cache_config=KvCacheConfig(dtype=dtype, mamba_ssm_cache_dtype="bfloat16"))
 
 
+@pytest.mark.parametrize("max_draft_len", _DRAFT_LENS)
+def test_mtp_at_every_draft_length_routes_at_dep4(max_draft_len):
+    """Each dep4 rank drafts for its own requests and the draft layer's FP8 expert window runs
+    the trunk's attention-DP round trip: the tune's ht_dep4 config may serve MTP."""
+    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_LAYOUTS["dep4"])
+    assert routing.layout(config.mapping) == "dep4"
+    for dtype in ("bfloat16", "auto"):
+        _claimed(config, kv_cache_config=KvCacheConfig(mamba_ssm_cache_dtype=dtype))
+    _claimed(config, kv_cache_config=KvCacheConfig(dtype="fp8", mamba_ssm_cache_dtype="bfloat16"))
+
+
 # --- what the target does not run under attention DP ------------------------------
 
 
 @pytest.mark.parametrize("max_draft_len", [1, 3, 7])
-@pytest.mark.parametrize("member", sorted(_ATTENTION_DP))
-def test_attention_dp_declines_speculation(member, max_draft_len):
-    """The MTP draft layer's FP8 expert window is completed by the attention-TP sum, which
-    under attention DP leaves out the other ranks' partials; neither family claims it."""
-    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_ATTENTION_DP[member])
-    assert routing.layout(config.mapping) == member
-    _declined(config, match=rf"speculative decoding with attention DP \({member}\)")
+def test_dep2_declines_speculation(max_draft_len):
+    """MTP under attention DP is admitted only where its draft acceptance was measured (dep4);
+    neither family claims dep2 with speculation."""
+    config = _model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_DEP2)
+    assert routing.layout(config.mapping) == "dep2"
+    _declined(config, match=r"speculative decoding with attention DP \(dep2\)")
 
 
 @pytest.mark.parametrize("member", sorted(_ATTENTION_DP))
@@ -214,11 +225,24 @@ def test_attention_dp_declines_the_breakable_prefill_graph(member):
 
 
 def test_attention_dp_declines_speculation_before_the_engine_choices(monkeypatch):
-    """A draft that the legacy recurrent path also refuses is declined for attention DP:
-    that is the structural reason, and no engine choice would lift it."""
+    """A draft that the legacy recurrent path also refuses is declined at dep2 for attention
+    DP: that is the structural reason, and no engine choice would lift it. At dep4 the same
+    draft is declined for the legacy recurrent path alone."""
     monkeypatch.setenv("TRTLLM_USE_GDN_REPLAY", "0")
+    config = _model_config(MTPDecodingConfig(max_draft_len=7), **_DEP2)
+    _declined(config, match=r"speculative decoding with attention DP \(dep2\)")
     config = _model_config(MTPDecodingConfig(max_draft_len=7), **_LAYOUTS["dep4"])
-    _declined(config, match=r"speculative decoding with attention DP \(dep4\)")
+    _declined(config, match="TRTLLM_USE_GDN_REPLAY=0")
+
+
+def test_dep4_declines_mtp_with_the_breakable_prefill_graph():
+    """Admitting MTP at dep4 keeps the breakable prefill graph's refusal under attention DP."""
+    config = _model_config(MTPDecodingConfig(max_draft_len=3), **_LAYOUTS["dep4"])
+    _declined(
+        config,
+        match=r"prefill_cuda_graph_backend='breakable' with attention DP \(dep4\)",
+        prefill_cuda_graph_backend="breakable",
+    )
 
 
 @pytest.mark.parametrize("spec_config", [None, MTPDecodingConfig(max_draft_len=3)])

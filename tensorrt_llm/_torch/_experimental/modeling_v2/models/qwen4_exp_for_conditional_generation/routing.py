@@ -178,18 +178,23 @@ def _check_engine(
         )
 
 
+# The attention-DP layouts MTP is admitted at: those its draft acceptance was measured at.
+_ATTENTION_DP_MTP_LAYOUTS = ("dep4",)
+
+
 def _check_attention_dp(member: str, spec_config: Optional[Any], engine: EngineChoices) -> None:
     """Decline what the target does not run under attention DP (dep4, dep2), where each rank
     serves its own requests and only the routed experts cross ranks.
 
-    Routing admits both at the attention-TP layouts (tp4, tep4).
+    MTP is admitted at dep4, where each rank drafts for its own requests and the draft layer's
+    FP8 expert window runs the trunk's attention-DP round trip. Routing admits both MTP and
+    the breakable prefill graph at the attention-TP layouts (tp4, tep4).
     """
-    if spec_config is not None:
+    if spec_config is not None and member not in _ATTENTION_DP_MTP_LAYOUTS:
         raise NoTarget(
-            f"speculative decoding with attention DP ({member}): the target's MTP draft layer "
-            "completes its FP8 expert window with the attention-TP sum, not the attention-DP "
-            "allgather / reduce-scatter round trip, so it would drop the other ranks' expert "
-            "partials, and no draft acceptance was measured under attention DP"
+            f"speculative decoding with attention DP ({member}): no draft acceptance was "
+            "measured at this layout; MTP under attention DP is admitted at "
+            f"{', '.join(_ATTENTION_DP_MTP_LAYOUTS)}"
         )
     if engine.prefill_cuda_graph_backend == "breakable":
         raise NoTarget(
@@ -254,8 +259,8 @@ def route(
         and spec_config.max_total_draft_tokens == spec_config.max_draft_len
     )
 
-    # Qwen3.8-Flash-Next-NVFP4 on four GB300s (sm103) at tp4 or tep4, MTP-Eagle or no
-    # speculation, or at dep4; on two at dep2. Attention DP runs without speculation.
+    # Qwen3.8-Flash-Next-NVFP4 on four GB300s (sm103) at tp4, tep4 or dep4, MTP-Eagle or no
+    # speculation; on two at dep2, without speculation.
     member = layout(mapping)
     if (
         compute_capability == _SM
@@ -285,8 +290,8 @@ def route(
         f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}, "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; the unified qwen4_exp target is "
         "Qwen3.8-Flash-Next-NVFP4 on sm103 in one node: at 4 ranks tp4 (attention TP4, "
-        "experts split by intermediate) or tep4 (attention TP4, experts EP4) with one-model "
-        f"MTP-Eagle (max_draft_len 1..{_MAX_DRAFT_LEN}) or no speculative decoding, or dep4 "
-        "(attention DP, experts EP4); at 2 ranks dep2 (attention DP, experts EP2); attention "
-        "DP without speculative decoding"
+        "experts split by intermediate), tep4 (attention TP4, experts EP4) or dep4 (attention "
+        f"DP, experts EP4), with one-model MTP-Eagle (max_draft_len 1..{_MAX_DRAFT_LEN}) or no "
+        "speculative decoding; at 2 ranks dep2 (attention DP, experts EP2) without speculative "
+        "decoding"
     )
