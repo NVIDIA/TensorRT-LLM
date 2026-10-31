@@ -4,11 +4,10 @@
 table gather and per-tensor fp8 dequantization in one Triton launch, with the
 per-slot n-gram context published back in the same pass.
 
-This target's local variant of
-``qwen3_8_flash_next_nvfp4__sm_103__tp1/ops/ple/ple_ngram_embed``: the Triton
-kernels written for that target, copied unchanged, reading the window and hash
-references of this target's own ``ngram_token_history__r14`` and
-``ngram_hash__r13``. It replaces, on the decode path,
+Shared by the qwen4_exp tp1 target and the unified target (promoted from their
+copies): the Triton kernels written for the tp1 target, reading the window and hash
+references of ``ngram_token_history`` and
+``ngram_hash``. It replaces, on the decode path,
 the composition ``ngram_token_history`` (~20 launches) + ``ngram_hash`` (~30
 launches) + ``nn.functional.embedding`` + ``dequantize_e4m3_per_tensor`` --
 nothing registered under ``torch.ops.trtllm`` or in the installed FlashInfer
@@ -35,8 +34,8 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import ngram_hash
 
-from ..embedding.ngram_hash__r13 import ngram_hash
 from .ngram_token_history__r14 import DEP4_SLOTS, TEP4_SLOTS, ngram_token_history
 
 #: This checkpoint's PLE geometry: 3-gram, 16 heads of 160 fp8 columns.

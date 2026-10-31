@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's `ple_embedding` buffers: 3-gram, 8 heads per order.
 CKPT_MULTIPLIERS = (23703573157769, 20109073645365, 8052911324071)

@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ngram_hash entry.
+"""GPU test for the unified target's ngram_hash variant (catalog/embedding/ngram_hash).
 
 Exact integer arithmetic, gated bitwise against the entry's scalar reference.
 Beyond the cells: the EOS reset that `ngram_token_history`'s EOS seed relies
-on, the narrow-multiplier guard and graph capture.
+on, the narrow-multiplier and query-count guards, and graph capture at the
+captured decode and MTP-7 verify widths.
 """
 
 import zlib
@@ -12,7 +13,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import (  # noqa: E501
     CKPT_CONTEXT_LEN,
     CKPT_EOS_TOKEN_ID,
     CKPT_HEAD_OFFSETS,
@@ -20,11 +21,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     CKPT_MULTIPLIERS,
     CKPT_VOCAB_SIZE,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.embedding.ngram_hash import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import (  # noqa: E501
     ngram_hash as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "ngram_hash requires a CUDA device"
@@ -111,8 +112,21 @@ def test_guard_refuses_narrow_multipliers() -> None:
             op(ids, narrow, sizes, offsets, EOS, 4)
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    ids = _tokens(8, CKPT_CONTEXT_LEN + 1, seed=53, lead_eos=False, eos_density=0.2)
+def test_guard_refuses_more_queries_than_history() -> None:
+    """A history of 3 asked for 8 query tokens returns 3 of them, without an error."""
+    ids = _tokens(128, CKPT_CONTEXT_LEN + 1, seed=59, lead_eos=False, eos_density=0.05)
+    unguarded = _hash(ids, 8)
+    assert unguarded.shape == (128, CKPT_CONTEXT_LEN + 1, NGRAM_HEADS), (
+        "the hazard this guard covers is gone"
+    )
+    with pytest.raises(AssertionError, match="num_query_tokens must be in"):
+        with validating(op):
+            _hash(ids, 8)
+
+
+@pytest.mark.parametrize("windows", [128, 1024], ids=["decode_128", "mtp7_verify_1024"])
+def test_cuda_graph_capture_and_replay(windows) -> None:
+    ids = _tokens(windows, CKPT_CONTEXT_LEN + 1, seed=53, lead_eos=False, eos_density=0.2)
     constants = _constants()
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())
@@ -125,7 +139,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     with torch.cuda.graph(graph):
         captured = op(ids, *constants, EOS, 1)
 
-    fresh = _tokens(8, CKPT_CONTEXT_LEN + 1, seed=54, lead_eos=False, eos_density=0.2)
+    fresh = _tokens(windows, CKPT_CONTEXT_LEN + 1, seed=54, lead_eos=False, eos_density=0.2)
     ids.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()

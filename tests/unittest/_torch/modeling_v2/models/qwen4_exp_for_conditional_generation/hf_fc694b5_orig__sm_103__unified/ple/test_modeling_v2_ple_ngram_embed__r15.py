@@ -16,7 +16,7 @@ import pytest
 import torch
 from cuda.bindings import runtime as cudart
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.embedding.ngram_hash__r13 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.embedding.ngram_hash import (  # noqa: E501
     CKPT_HEAD_OFFSETS,
     CKPT_HEAD_VOCAB_SIZES,
     CKPT_MULTIPLIERS,
