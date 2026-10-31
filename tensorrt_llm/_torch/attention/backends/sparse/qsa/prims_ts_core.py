@@ -338,16 +338,14 @@ class _PrimsTSSparseCore:
                     max_seq_len_kv=max_seq_len_kv,
                     o_data_type=out_dtype,
                     qo_indptr=qo_indptr,
-                    seq_len_q=None if is_decode else group_size,
+                    group_size=group_size,
                     kv_block_size=_KV_BLOCK_SIZE,
                     split_kv=split_kv,
                 )
                 workspace = self._workspace_for(nbytes, q.device)
                 wrapper = wrapper_cls()
-                # The vendored API names the route width seq_len_q.
                 wrapper.plan(
                     num_routes,
-                    group_size,
                     num_qo_heads,
                     num_kv_heads,
                     head_dim,
@@ -357,6 +355,7 @@ class _PrimsTSSparseCore:
                     max_seq_len_kv,
                     device=q.device,
                     workspace_buffer=workspace,
+                    group_size=group_size,
                     use_packed_q=not is_decode,
                     split_kv=split_kv,
                     q_data_type=q.dtype,
