@@ -113,10 +113,17 @@ class DirectPublish:
     ``PostAttnHopCall.armed`` calls ``recover`` on any exception after ``arm``: a
     collective reset of the transport. A reset that fails poisons this object: every
     later ``arm`` raises.
+
+    ``rows`` are the row counts this publication serves, each on the same workspace: by
+    default ``ROWS``; the wide direct publication (``wide_oproj_publish``) serves
+    ``WIDE_PUBLISH_ROWS`` on the 32-row direct transport. A step of any of them arms every
+    layer with that row count's slots, so the parity sequence above holds across steps of
+    different row counts too.
     """
 
-    #: The one row count published directly: the K = 7 verify step. Other row counts keep
-    #: the post-attention hop, on its own workspace.
+    #: The one row count the 8-row publication serves: the K = 7 verify step. Other row
+    #: counts keep the post-attention hop, on its own workspace, unless the wide
+    #: publication serves them.
     ROWS = 8
     #: The o_proj kernel families that store straight into the slot, per device compute
     #: capability: the families of that arch's ``post_attn_hop.VALIDATED_PRODUCERS``. The
@@ -131,6 +138,7 @@ class DirectPublish:
         workspace: "_hop.PostAttnDirectWorkspace",
         dispatchers: tuple,
         joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]",
+        rows: Tuple[int, ...] = (ROWS,),
     ) -> None:
         if len(dispatchers) != len(joins) or len(joins) % 2:
             raise ValueError(
@@ -142,11 +150,23 @@ class DirectPublish:
         self.workspace = workspace
         self.dispatchers = tuple(dispatchers)
         self.joins = tuple(joins)
-        self.slots = tuple(workspace.slot(index % 2, self.ROWS) for index in range(len(joins)))
+        #: The row counts this publication serves; ``slots`` are those of the first.
+        self.rows = tuple(int(r) for r in rows)
+        self.slots_by_rows = {
+            r: tuple(workspace.slot(index % 2, r) for index in range(len(joins))) for r in self.rows
+        }
+        self.slots = self.slots_by_rows[self.rows[0]]
         #: Why the transport could not be reset after a failed step, or ``None``.
         self.poisoned: Optional[str] = None
 
-    def check_step(self, residual: torch.Tensor) -> None:
+    def serves(self, rows: Optional[int]) -> bool:
+        """Whether a decode step of ``rows`` rows publishes through this object."""
+        return rows in self.slots_by_rows
+
+    def _label(self) -> str:
+        return "/".join(str(r) for r in self.rows)
+
+    def check_step(self, residual: torch.Tensor, rows: Optional[int] = None) -> None:
         """Before anything is published: the step's input residual is what the consumer takes.
 
         Every layer's consumer call reads the residual the previous layer returned, which
@@ -156,26 +176,30 @@ class DirectPublish:
         left to check, and it is checked before layer 0's o_proj stores anything.
 
         Raises:
-            ValueError: if ``residual`` is not a contiguous FP32 ``[ROWS, 8192]`` tensor on
-                the workspace's device, or the step is being compiled.
+            ValueError: if ``residual`` is not a contiguous FP32 ``[rows, 8192]`` tensor on
+                the workspace's device, or the step is being compiled. ``rows`` is the step's
+                row count (by default the first this object serves).
         """
+        rows = self.rows[0] if rows is None else int(rows)
         device = getattr(self.workspace, "device", residual.device)
         if (
             residual.dtype != torch.float32
-            or tuple(residual.shape) != (self.ROWS, _hop.HIDDEN)
+            or tuple(residual.shape) != (rows, _hop.HIDDEN)
             or not residual.is_contiguous()
             or residual.device != device
             or torch.compiler.is_compiling()
         ):
             raise ValueError(
-                f"[musespark_open] attention_output_into_hop: a {self.ROWS}-row step's residual is {residual.dtype} "
+                f"[musespark_open] attention_output_into_hop: a {rows}-row step's residual is {residual.dtype} "
                 f"{tuple(residual.shape)} on {residual.device} (contiguous="
                 f"{residual.is_contiguous()}); the consumer hop takes a contiguous FP32 "
-                f"[{self.ROWS}, {_hop.HIDDEN}] tensor on {device}, not compiled"
+                f"[{rows}, {_hop.HIDDEN}] tensor on {device}, not compiled"
             )
 
-    def arm(self) -> None:
-        """Hand every layer's o_proj its slot and every join its slot and parity.
+    def arm(self, rows: Optional[int] = None) -> None:
+        """Hand every layer's o_proj its slot and every join its slot, parity and this object.
+
+        ``rows`` is the step's row count, one of ``self.rows`` (by default the first).
 
         Raises:
             RuntimeError: if an earlier failed step left the transport unreset.
@@ -185,11 +209,12 @@ class DirectPublish:
                 "[musespark_open] attention_output_into_hop: the direct transport was not reset after "
                 "a failed step "
                 f"({self.poisoned}); its buffers may hold words no call consumed, so no "
-                f"{self.ROWS}-row step may publish into it"
+                f"{self._label()}-row step may publish into it"
             )
+        slots = self.slots_by_rows[self.rows[0] if rows is None else int(rows)]
         for index, (dispatcher, join) in enumerate(zip(self.dispatchers, self.joins)):
-            dispatcher.publish = self.slots[index]
-            join._direct = (self.slots[index], index % 2)
+            dispatcher.publish = slots[index]
+            join._direct = (slots[index], index % 2, self)
 
     def disarm(self) -> None:
         for dispatcher, join in zip(self.dispatchers, self.joins):
@@ -210,7 +235,7 @@ class DirectPublish:
         except RuntimeError:
             pass
         logger.error(
-            f"[musespark_open] attention_output_into_hop: a {self.ROWS}-row decode step raised while "
+            f"[musespark_open] attention_output_into_hop: a {self._label()}-row decode step raised while "
             "o_proj published into the "
             f"post-attention hop's direct transport ({error!r}); resetting the transport on "
             "every rank of the group (collective: a rank that did not raise leaves this one "
@@ -223,7 +248,7 @@ class DirectPublish:
             logger.error(
                 "[musespark_open] attention_output_into_hop: the direct transport could not be reset "
                 f"({reset_error!r}); every "
-                f"later {self.ROWS}-row step raises"
+                f"later {self._label()}-row step raises"
             )
         else:
             logger.warning(
@@ -237,7 +262,9 @@ class PostAttnHopCall:
 
     With ``attention_output_into_hop``, also the ``DirectPublish`` that steps of its row count arm.
     With ``wide_post_attention_hop``, also the wide transport (``wide``) that steps of
-    ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows run on.
+    ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows run on. With both and ``wide_oproj_publish``,
+    also the wide ``DirectPublish`` (``wide_direct``) that steps of
+    ``WIDE_PUBLISH_ROWS`` rows arm instead of the wide transport.
     """
 
     def __init__(
@@ -246,12 +273,23 @@ class PostAttnHopCall:
         joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]" = (),
         direct: Optional[DirectPublish] = None,
         wide: "Optional[_hop.PostAttnHopWorkspace]" = None,
+        wide_direct: Optional[DirectPublish] = None,
     ) -> None:
         self.op = _hop.post_attn_hop
         self.workspace = workspace
         self.joins = tuple(joins)
         self.direct = direct
         self.wide = wide
+        self.wide_direct = wide_direct
+
+    def publication_for(self, rows: Optional[int]) -> Optional[DirectPublish]:
+        """The direct publication a decode step of ``rows`` rows arms, or ``None`` (the hop)."""
+        if self.direct is not None and rows == DirectPublish.ROWS:
+            return self.direct
+        wide_direct = getattr(self, "wide_direct", None)
+        if wide_direct is not None and wide_direct.serves(rows):
+            return wide_direct
+        return None
 
     def takes_call(
         self,
@@ -294,20 +332,21 @@ class PostAttnHopCall:
         """Arm every join for the duration of one decode forward; disarm on any exit.
 
         A step of ``DirectPublish.ROWS`` rows (``attention_output_into_hop``) also arms the
-        direct publication,
+        direct publication, and a step of ``WIDE_PUBLISH_ROWS`` rows the wide one when it is
+        built (``publication_for``),
         after ``DirectPublish.check_step`` on the step's input ``residual`` (when given);
         an exception after that hands the transport to ``DirectPublish.recover`` before it
         propagates.
         """
-        direct = self.direct if self.direct is not None and rows == DirectPublish.ROWS else None
+        direct = self.publication_for(rows)
         for join in self.joins:
             join._armed = self
         direct_armed = False
         try:
             if direct is not None:
                 if residual is not None:
-                    direct.check_step(residual)
-                direct.arm()
+                    direct.check_step(residual, rows)
+                direct.arm(rows)
                 direct_armed = True
             yield
         except Exception as error:
@@ -453,7 +492,8 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
     kernel cannot read in place is copied (``readable``) rather than declined.
 
     With ``attention_output_into_hop`` armed for the step (``DirectPublish.arm``) the join also holds
-    ``_direct``, its layer's slot and parity: o_proj has already written the
+    ``_direct``, its layer's slot, parity and the ``DirectPublish`` that armed it (the 8-row
+    one or the wide one, whose op and workspace the call runs on): o_proj has already written the
     partial into that slot of every rank, so the join runs the consumer hop.
     That call cannot fall back to the built-in all-reduce (every peer polls this
     rank's slot, and nothing may read the slot's multicast address), so a call
@@ -523,15 +563,16 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
 
     def _consume_published(self, call, residual, branch, eps, next_norm, gain):
         """The consumer hop on the slot o_proj published into (see the class docstring)."""
-        slot, parity = self._direct
+        slot, parity, direct = self._direct
         alpha, beta = self.coefficients()
         weight = next_norm.weight
+        max_rows = getattr(direct.workspace, "max_rows", _hop.MAX_ROWS)
         if not (
             gain is None
             and self._fused_enabled
             and next_norm.use_gemma
             and not torch.compiler.is_compiling()
-            and _hop.hop_takes(slot, residual, alpha, beta, weight)
+            and _hop.hop_takes(slot, residual, alpha, beta, weight, max_rows)
             and tuple(branch.shape) == tuple(slot.shape)
         ):
             raise RuntimeError(
@@ -549,7 +590,6 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
             )
             _hop.publish_copy(slot, branch)
         residual, alpha, beta, weight = _hop.readable(residual, alpha, beta, weight)
-        direct = call.direct
         return direct.op(
             slot,
             residual,
@@ -853,6 +893,123 @@ def _build_direct_publish(
     return DirectPublish(workspace, tuple(dispatchers), call.joins)
 
 
+#: The row counts the wide direct publication serves: two to four requests' K = 7 verify steps.
+WIDE_PUBLISH_ROWS = (16, 24, 32)
+#: Whether the published wide row counts fork the o_proj -> pool-weight prefetch: as at 8 rows,
+#: the consumer hop ends before the prefetch would, so none is forked.
+WIDE_PUBLISH_DROPS_PREFETCH = True
+
+
+def _build_wide_direct_publish(
+    model: MuseSparkOpenModel, call: PostAttnHopCall, early_trigger: bool = False
+) -> Tuple[Optional[DirectPublish], Optional[str]]:
+    """``attention_output_into_hop`` on the wide TP4 steps (``wide_oproj_publish``).
+
+    On a decode step of ``WIDE_PUBLISH_ROWS`` rows layer ``l``'s o_proj (the ``wide_dense_gemms``
+    split-K tactic of the step's rows) stores straight into this rank's ``[rows, 8192]`` slot of
+    a 32-row direct transport (``PostAttnDirectWorkspace(max_rows=WIDE_MAX_ROWS)``, buffer
+    ``l mod 2``), and the join runs the consumer hop there instead of the wide hop
+    (``wide_post_attention_hop``), which would load the partial and publish it itself. Same
+    bits: the same tactic writes the same partial; the consumer's rank-order sum and 4-CTA
+    boundary are the wide hop's statements (a published ``-0`` adds what the hop's cleared
+    ``+0`` adds).
+
+    Collective: every rank of the TP group calls it when the plan carries the lever. Builds
+    on the 8-row publication (``call.direct``: its o_proj dispatchers and their producer
+    policy) and the wide hop (``call.wide``: the joins take 9..32-row calls); checked first
+    and agreed over the group before the workspace's collective construction: TP4, and an
+    o_proj kernel of the policy's families at every served row count on every layer. A
+    refusal leaves every rank on the wide hop. Returns ``(the wide publication, None)`` or
+    ``(None, the agreed refusal)``.
+    """
+    from .ops.gemm.dense_gemm import parse_kernel
+
+    layers = list(model.layers)
+    mapping = layers[0].mapping
+    direct = call.direct
+    reasons = []
+    if direct is None:
+        reasons.append("o_proj does not publish its 8-row steps (attention_output_into_hop)")
+    if call.wide is None:
+        reasons.append("no wide post-attention hop transport (wide_post_attention_hop)")
+    tp_size = getattr(mapping, "tp_size", None)
+    if tp_size != 4:
+        reasons.append(f"the wide direct transport is TP4 only, got TP{tp_size}")
+    kernels = {}
+    if direct is not None:
+        for dispatcher in direct.dispatchers:
+            policy = dispatcher.publish_policy
+            plan = dispatcher.site.plan
+            for rows in WIDE_PUBLISH_ROWS:
+                kernel = plan.kernel_for(dispatcher.site.role, rows)
+                family = None if kernel is None else parse_kernel(kernel)[0]
+                if policy is None or family not in policy.direct:
+                    reasons.append(
+                        f"layer {dispatcher.site.layer_idx}: o_proj runs {kernel} at {rows} rows, "
+                        "not a kernel family that publishes directly "
+                        f"({sorted(policy.direct) if policy is not None else []})"
+                    )
+                kernels[rows] = kernel
+            if reasons:
+                break
+    refusal = _tp_agreement.agreed_refusal(mapping, " | ".join(reasons) if reasons else None)
+    if refusal is not None:
+        return None, f"{refusal}; the wide steps keep wide_post_attention_hop"
+    variants = sorted(
+        {
+            (
+                float(layer.post_attn_norm.variance_epsilon),
+                float(layer.pre_ffn_norm.variance_epsilon),
+                bool(layer.add_attn._preqkv_norm_fp32),
+            )
+            for layer in layers
+        }
+    )
+    workspace = _hop.shared_direct_workspace(
+        mapping, variants=variants, early_trigger=early_trigger, max_rows=_hop.WIDE_MAX_ROWS
+    )
+    dropped = 0
+    if WIDE_PUBLISH_DROPS_PREFETCH:
+        for dispatcher in direct.dispatchers:
+            site = dispatcher.site
+            site.skip_prefetch_rows = frozenset(site.skip_prefetch_rows | set(WIDE_PUBLISH_ROWS))
+            dropped += int(bool(site.plan.prefetch) and site.next_weight is not None)
+    described = ", ".join(f"{kernels[rows]}@{rows}" for rows in WIDE_PUBLISH_ROWS)
+    _hop.log_once_wide_direct(len(layers), WIDE_PUBLISH_ROWS, described, dropped)
+    return DirectPublish(workspace, direct.dispatchers, call.joins, rows=WIDE_PUBLISH_ROWS), None
+
+
+def _check_wide_publication(direct: DirectPublish, o_proj, rows: int) -> str:
+    """Layer 0's real dispatcher publishes a ``rows``-row product into the wide transport's
+    slot 0 inside a capture that is never replayed; the workspace checks the captured kernel
+    (``check_producer``, collective). Returns its name."""
+    dispatcher = direct.dispatchers[0]
+    slot = direct.slots_by_rows[rows][0]
+    weight = o_proj.weight
+    x = torch.zeros(rows, int(weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    site = dispatcher.site
+
+    def publish() -> None:
+        dispatcher.publish = slot
+        # The capture holds the producer only: no prefetch fork at the checked row count.
+        skipped = site.skip_prefetch_rows
+        site.skip_prefetch_rows = frozenset(skipped | {rows})
+        try:
+            with torch.inference_mode():
+                dispatcher.apply(o_proj, x, weight, None)
+        finally:
+            dispatcher.publish = None
+            site.skip_prefetch_rows = skipped
+
+    def warm() -> None:
+        # The same kernel, disarmed, into a fresh output: library state and a flashinfer
+        # kernel's compilation happen outside the capture.
+        with torch.inference_mode():
+            dispatcher.apply(o_proj, x, weight, None)
+
+    return direct.workspace.check_producer(publish, warm)
+
+
 def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
     """``attention_output_into_hop``, once the weights are final: the kernel the published o_proj runs.
 
@@ -897,7 +1054,13 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
         with torch.inference_mode():
             dispatcher.apply(o_proj, x, weight, None)
 
-    return direct.workspace.check_producer(publish, warm)
+    name = direct.workspace.check_producer(publish, warm)
+    wide = getattr(call, "wide_direct", None)
+    if wide is not None:
+        # The wide publication's tactics (one per served row count), the same check.
+        for rows in wide.rows:
+            _check_wide_publication(wide, o_proj, rows)
+    return name
 
 
 def _raise_refusal(reason: Optional[str], path: str) -> None:
@@ -1092,8 +1255,15 @@ def adopt_model(
             from .ops.attention.swa_block import MULTI_MAX_REQUESTS as _swa_multi_max
 
             min_seqs = 1 + max(_full_multi_max, _swa_multi_max)
+        # packed_prep_append: calls of its MIN_ROWS rows or more on the packed kernel.
+        packed_min_rows = (
+            plan.param("packed_prep_append", "MIN_ROWS")
+            if plan.enabled("packed_prep_append")
+            else None
+        )
         _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: multi_request_append.install(model, min_seqs)
+            model.layers[0].mapping,
+            lambda: multi_request_append.install(model, min_seqs, packed_min_rows),
         )
     if decode_kv_splits is not None:
         # After every other attention re-class: the mixed-step mixin goes in front of all of
@@ -1152,7 +1322,11 @@ def adopt_model(
     if plan.enabled("wide_prologue"):
         from .kernels.wide_prologue import prologue as wide_prologue
 
-        wide_prologue.install(model)
+        wide_prologue.install(
+            model,
+            router_rows=plan.enabled("wide_router_per_row"),
+            direct=plan.enabled("wide_direct_transports"),
+        )
     router_gemm = None
     if plan.enabled("router_gemm"):
         # After moe_prologue and the router fork, which check the MoE class they re-class:
@@ -1243,6 +1417,22 @@ def adopt_model(
         from .kernels.pool_into_route import route as _pool_direct
 
         pool_direct = _pool_direct.install(model, dense_gemm_plan, mapping=model.layers[0].mapping)
+    if plan.enabled("wide_direct_transports"):
+        # Both transports' wide layouts follow construction-time state wide_prologue.install
+        # agreed over the TP group, so every rank reports the same.
+        unbuilt = [
+            name
+            for name, built in (
+                ("pool_into_route", pool_direct),
+                ("unpool_into_boundary", unpool_direct),
+            )
+            if built is None or built.wide_workspace is None
+        ]
+        plan.installed(
+            "wide_direct_transports",
+            not unbuilt,
+            "no wide direct transport on " + ", ".join(unbuilt),
+        )
     # finalize_transport replaces only the object every MoE layer calls its fused
     # finalize on, whatever class the MoE has.
     finalize_transport = None
@@ -1251,7 +1441,9 @@ def adopt_model(
         # and runs nothing beyond the built-in modules.
         from .kernels.finalize_transport import transport as _finalize_transport
 
-        finalize_transport = _finalize_transport.install(model)
+        finalize_transport = _finalize_transport.install(
+            model, wide=plan.enabled("wide_finalize_transport")
+        )
     wide_moe_allreduce = None
     if plan.enabled("wide_moe_allreduce"):
         # Replaces only the module every MoE layer reduces its unfused output with;
@@ -1280,6 +1472,12 @@ def adopt_model(
     if plan.enabled("attention_output_into_hop"):
         # After dense_gemms (its o_proj dispatchers) and post_attention_hop (its joins).
         post_attn_hop.direct = _build_direct_publish(model, post_attn_hop, early_trigger=True)
+        if plan.enabled("wide_oproj_publish"):
+            # The wide steps' publication (a collective agreement on every rank).
+            post_attn_hop.wide_direct, refusal = _build_wide_direct_publish(
+                model, post_attn_hop, early_trigger=True
+            )
+            plan.installed("wide_oproj_publish", refusal is None, refusal or "")
     wide_hop = None
     if plan.enabled("multi_request_post_attention_hop"):
         # After post_attention_hop, whose joins it arms on 9..1024-row decode steps.

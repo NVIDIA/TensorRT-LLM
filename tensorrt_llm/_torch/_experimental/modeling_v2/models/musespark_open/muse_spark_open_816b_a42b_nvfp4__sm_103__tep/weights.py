@@ -63,16 +63,19 @@ def install_loaded_features(
 
     Then ``hot_replicas`` (``hot_replicas.install``: hooks only, at tp 4; the copies are
     gathered on the first forward of a deployment that serves 33..512-row decode steps),
-    then, on Rubin (sm107) at tp 4 (``prefill_cutedsl_experts.serves`` of
-    ``compute_capability``, the device's; None installs it nowhere),
-    ``prefill_cutedsl_experts`` (``prefill_cutedsl_experts.install``: the
+    then, with ``prefill_cutedsl_experts`` on Rubin (sm107) at tp 4
+    (``prefill_cutedsl_experts.serves`` of ``compute_capability``, the device's; None
+    installs it nowhere), ``prefill_cutedsl_experts`` (``prefill_cutedsl_experts.install``: the
     4096..8192-row expert calls of the NVFP4 layers on the Rubin CuTe DSL GEMMs),
     then ``early_expert_ids`` (``early_ids.install``, on the layers just installed),
     then ``pool_into_route`` (``DirectPool.install_sites``, whose routed kernel
     variants carry the placement and the early expert ids), each collective over the
-    TP group, and last ``next_qkv_prefetch``'s wrapper around every hooked layer's
+    TP group, then ``next_qkv_prefetch``'s wrapper around every hooked layer's
     expert forward (``prefetch.wrap_expert_forwards``, outermost, so it sees
-    whichever expert call the paths above installed).
+    whichever expert call the paths above installed), and last, with the lossy
+    ``context_fp8_dense`` lever, ``context_fp8_dense.install`` (FP8 copies of the dense
+    projections for the large context calls, at the lever's parameters, with
+    ``context_fp8_attn_gather``'s gather; collective).
     """
     if plan.enabled("replicated_experts"):
         _install_ring_buddy(text_model, mapping, plan)
@@ -83,13 +86,21 @@ def install_loaded_features(
 
         # After the owner-window install, whose expert and routing hooks it wraps.
         _hot_replicas.install(text_model, mapping)
-    if compute_capability is not None:
+    if plan.enabled("prefill_cutedsl_experts"):
         from .kernels.prefill_cutedsl_experts import install as _prefill_cutedsl
 
-        if _prefill_cutedsl.serves(compute_capability, mapping.tp_size):
+        serves = compute_capability is not None and _prefill_cutedsl.serves(
+            compute_capability, mapping.tp_size
+        )
+        if serves:
             # After the expert paths above, whose expert forwards it wraps for the large
             # prefill calls only.
             _prefill_cutedsl.install(text_model, mapping)
+        plan.installed(
+            "prefill_cutedsl_experts",
+            serves,
+            f"written for sm107 at tp 4, not {compute_capability} at tp {mapping.tp_size}",
+        )
     if plan.enabled("early_expert_ids"):
         _install_early_expert_ids(text_model, mapping)
     if plan.enabled("pool_into_route"):
@@ -104,6 +115,26 @@ def install_loaded_features(
         from .kernels.next_qkv_prefetch import prefetch as _qkv_prefetch
 
         _qkv_prefetch.wrap_expert_forwards(text_model)
+    if plan.enabled("context_fp8_dense"):
+        from .kernels.context_fp8_dense import install as _context_fp8_dense
+
+        # Lossy, on only by its knob; the dense projections' BF16 weights are untouched.
+        gather = plan.enabled("context_fp8_attn_gather")
+        names = _context_fp8_dense.install(
+            text_model,
+            mapping,
+            compute_capability,
+            min_rows=plan.param("context_fp8_dense", "MIN_ROWS"),
+            projections=plan.param("context_fp8_dense", "PROJECTIONS"),
+            gather=gather,
+        )
+        plan.installed("context_fp8_dense", bool(names), "no projection got an MXFP8 copy")
+        if gather:
+            plan.installed(
+                "context_fp8_attn_gather",
+                "qkv" in names,
+                "the QKV projection keeps BF16 here, so its input is gathered in BF16",
+            )
 
 
 def _install_ring_buddy(text_model, mapping, plan: "_dispatch.Plan") -> None:

@@ -2,22 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 """Which fast paths a model of this target is built with, decided once at construction.
 
-``FAST_PATHS`` names every fast path of the target and the fast paths each one
-builds on (``depends_on``). A composition (``TargetPaths``) is the set of fast
-paths served on one GPU architecture at one tensor-parallel size (its
-``CompositionKey``), closed under ``depends_on``, with the GPU topology it was
-validated on; it applies when the drafter is DFlash drafting a linear chain of
-``DRAFT_LEN`` tokens on an NVFP4 checkpoint. Those facts are structural: a
-deployment that misses one has no composition, and runs the built-in forward
-under ``modeling_v2="auto"`` (``NO_PATHS``) or raises under ``require``. Nothing
-reads the environment to pick or trim a composition.
+``FAST_PATHS`` names every lever of the target -- each fast path, and the refinements
+and installs registered beside them -- and the levers each one builds on
+(``depends_on``). A composition (``TargetPaths``) is the set of levers served on one
+GPU architecture at one tensor-parallel size (its ``CompositionKey``), closed under
+``depends_on``, with the GPU topology it was validated on; it applies when the
+drafter is DFlash drafting a linear chain of ``DRAFT_LEN`` tokens on an NVFP4
+checkpoint. Those facts are structural: a deployment that misses one has no
+composition, and runs the built-in forward under ``modeling_v2="auto"``
+(``NO_PATHS``) or raises under ``require``.
 
-``compose`` then checks the public preconditions the planned fast paths are
-written against (``PRECONDITIONS``, and the composition's own), once, agreed
-over the TP group. A missing one, on any rank, raises ``ValueError`` naming each
-one, under ``auto`` as under ``require``: a composition is never served in part
-and never dropped because of a setting. The model's installers ask the
-resulting ``Plan`` per fast path (``Plan.enabled``).
+``compose`` resolves the composition's lever table (``levers.resolve``): the
+structural rules of the deployment's drafter arena and facts
+(``structural_rules``), then each lever's knob and deployment rule. The lever
+table is the only environment ``compose`` reads (``levers.environment``). It then
+checks the public preconditions the planned fast paths are written against
+(``PRECONDITIONS``, and the composition's own), once, agreed over the TP group
+together with the arena and the lever environment. A missing precondition, a lever
+error or a disagreement, on any rank, raises ``ValueError`` on every rank, under
+``auto`` as under ``require``: a composition is never served in part because of a
+missing setting. The model's installers ask the resulting ``Plan`` per lever
+(``Plan.enabled``, ``Plan.param``) and report what they installed and what a step
+declined (``Plan.installed``, ``Plan.declined``).
 """
 
 from __future__ import annotations
@@ -44,8 +50,10 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import Modeling
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm.logger import logger
 
+from . import levers as _levers
+
 #: The draft tokens per step of the one speculative-decoding mode the compositions serve.
-DRAFT_LEN = 7
+DRAFT_LEN = _levers.DRAFT_LEN
 
 #: The log tag of this family.
 TAG = "[musespark_open]"
@@ -57,7 +65,7 @@ LAUNCH_PDL = True
 
 @dataclasses.dataclass(frozen=True)
 class FastPath:
-    """One fast path: what it replaces, the fast paths it builds on, and when it installs.
+    """One lever of this target: what it changes, the levers it builds on, and when it installs.
 
     ``hook`` names the shell hook that installs it: ``construct`` (the shell's
     constructor, on the built model), ``load`` (after the target weights load),
@@ -250,6 +258,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         "construct",
     ),
     FastPath(
+        "wide_finalize_transport",
+        "expert finalize all-reduce of 17..32-token calls on a 32-token TP4 transport layout",
+        "construct",
+        ("finalize_transport",),
+    ),
+    FastPath(
         "router_gemm",
         "router logits of 9..512-row calls as a BF16x3 split-K tensor-core GEMM",
         "construct",
@@ -413,12 +427,139 @@ FAST_PATHS: Tuple[FastPath, ...] = (
     # Executor.
     FastPath("deferred_input_prep", "a decode step's input writes as one launch", "executor"),
     FastPath("sampler_store", "the sampler's store update and snapshots as one launch", "executor"),
+    # Levers on the paths above (``LEVER_NAMES``): each changes how the path it builds on
+    # runs, or is an install the plan carries; their rules are ``levers.RULES``.
+    FastPath(
+        "packed_prep_append",
+        "multi-request decode prep-append calls of MIN_ROWS rows or more on the packed kernel",
+        "construct",
+        ("multi_request_prep_append",),
+    ),
+    FastPath(
+        "windowed_commit_parallel",
+        "windowed context-K/V commits of MIN_REQUESTS requests or more as a parallel zeroing "
+        "and a tuned compaction",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "context_fp8_dense",
+        "the dense projections of context calls of MIN_ROWS rows or more on the Rubin MXFP8 "
+        "GEMM (lossy)",
+        "load",
+    ),
+    FastPath(
+        "context_fp8_attn_gather",
+        "the sequence-parallel attention input all-gathered in MXFP8 (lossy)",
+        "load",
+        ("context_fp8_dense", "context_sequence_parallel"),
+    ),
+    FastPath(
+        "wide_direct_transports",
+        "the pool and unpool direct transports of 16..32-row captured decode steps",
+        "construct",
+        ("wide_prologue", "pool_into_route", "unpool_into_boundary"),
+    ),
+    FastPath(
+        "wide_router_per_row",
+        "the router shard of 16..32-row decode steps with each row's one-request logits",
+        "construct",
+        ("wide_prologue",),
+    ),
+    FastPath(
+        "wide_oproj_publish",
+        "o_proj of 16..32-row decode steps publishing into the hop's 32-row direct transport",
+        "construct",
+        ("attention_output_into_hop", "wide_post_attention_hop"),
+    ),
+    FastPath(
+        "graph_start_qkv_prefetch",
+        "layer 0's QKV weight prefetch forked at the start of a decode forward",
+        "construct",
+        ("next_qkv_prefetch",),
+    ),
+    FastPath(
+        "step_loop_on_execution_stream",
+        "the executor's overlap loop issuing the sample and prepare launches on the execution "
+        "stream",
+        "executor",
+        ("deferred_input_prep",),
+    ),
+    FastPath(
+        "incremental_block_offsets",
+        "the staged block-offset copy of only the columns whose page index changed",
+        "executor",
+        ("deferred_input_prep",),
+    ),
+    FastPath(
+        "drafter_kv_side_chain",
+        "the context-K/V side chain with its prologue and arena store fused (dense arena)",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "drafter_fc_early_fork",
+        "the side chain's local fc GEMM forked after the last DFlash capture layer",
+        "draft",
+        ("drafter_kv_side_chain", "drafter_fc_shard"),
+    ),
+    FastPath(
+        "drafter_preamble_from_commit",
+        "the drafter forward's integer preamble written by the folded step's commit (dense arena)",
+        "draft",
+        ("verify_fold", "context_kv_fork"),
+    ),
+    FastPath(
+        "head_sampler_coop_fold",
+        "the head sampler's kernel A with the soft cap computed by the whole CTA, head calls "
+        "of MAX_ROWS rows or fewer",
+        "draft",
+        ("split_sampler",),
+    ),
+    FastPath(
+        "head_multimem_gather",
+        "the 8-row head logits all-gathered over NVLink multicast (MULTIMEM)",
+        "draft",
+        ("split_sampler",),
+    ),
+    FastPath(
+        "prefill_cutedsl_experts",
+        "the NVFP4 experts of 4096..8192-row calls on the Rubin CuTe DSL GEMMs",
+        "load",
+    ),
 )
 
 #: The name of every fast path.
 FAST_PATH_NAMES: FrozenSet[str] = frozenset(path.name for path in FAST_PATHS)
 
+#: The levers registered beside the fast paths (the last group of ``FAST_PATHS``).
+LEVER_NAMES: FrozenSet[str] = frozenset(
+    {
+        "packed_prep_append",
+        "windowed_commit_parallel",
+        "context_fp8_dense",
+        "context_fp8_attn_gather",
+        "wide_direct_transports",
+        "wide_router_per_row",
+        "wide_oproj_publish",
+        "graph_start_qkv_prefetch",
+        "step_loop_on_execution_stream",
+        "incremental_block_offsets",
+        "drafter_kv_side_chain",
+        "drafter_fc_early_fork",
+        "drafter_preamble_from_commit",
+        "head_sampler_coop_fold",
+        "head_multimem_gather",
+        "prefill_cutedsl_experts",
+    }
+)
+#: The fast paths a composition is built from; a composition lists its levers explicitly.
+BASE_PATH_NAMES: FrozenSet[str] = FAST_PATH_NAMES - LEVER_NAMES
+
 _BY_NAME: Dict[str, FastPath] = {path.name: path for path in FAST_PATHS}
+
+#: Every lever and the levers it builds on, in ``FAST_PATHS`` order (``levers.resolve``).
+DEPENDS_ON: Mapping[str, Tuple[str, ...]] = {path.name: path.depends_on for path in FAST_PATHS}
 
 
 def closure(names: Iterable[str]) -> FrozenSet[str]:
@@ -519,11 +660,17 @@ class TargetPaths:
             raise ValueError(f"{TAG} a served fast path builds on unserved {missing}")
 
 
+#: Steps between two log lines of the lever decline counts (``Plan.step``).
+DECLINE_REPORT_STEPS = 10_000
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
-    """The fast paths a model is built with: a whole composition, or none (``NO_PATHS``).
+    """The levers a model is built with: a whole composition's table, or none (``NO_PATHS``).
 
-    Closed under ``depends_on`` like a composition (``plan_of`` closes a set).
+    Closed under ``depends_on`` like a composition (``plan_of`` closes a set). ``levers``
+    is the table ``compose`` resolved (None for ``NO_PATHS`` and for a plan built from
+    names); ``rank0`` says whether this rank logs the per-server lines.
 
     Raises:
         ValueError: at construction, for a name that is not a fast path or a fast
@@ -531,6 +678,18 @@ class Plan:
     """
 
     paths: FrozenSet[str] = frozenset()
+    levers: Optional[_levers.LeverTable] = dataclasses.field(default=None, compare=False)
+    rank0: bool = dataclasses.field(default=True, compare=False)
+    #: Lever -> (installed, why not), as the installers reported (``installed``).
+    reports: Dict[str, Tuple[bool, str]] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False
+    )
+    #: (lever, reason) -> steps declined (``declined``).
+    declines: Dict[Tuple[str, str], int] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False
+    )
+    #: Steps counted by ``step``, in a one-element list so the frozen plan can count.
+    clock: List[int] = dataclasses.field(default_factory=lambda: [0], compare=False, repr=False)
 
     def __post_init__(self) -> None:
         unknown = sorted(set(self.paths) - FAST_PATH_NAMES)
@@ -549,6 +708,65 @@ class Plan:
         if path not in FAST_PATH_NAMES:
             raise KeyError(f"{TAG} not a fast path: {path!r}")
         return path in self.paths
+
+    def param(self, name: str, key: str) -> Any:
+        """Lever ``name``'s parameter ``key``: as resolved, else its declared default.
+
+        Raises:
+            KeyError: for a name that is not a fast path, or a parameter ``name`` does
+                not declare.
+        """
+        if name not in FAST_PATH_NAMES:
+            raise KeyError(f"{TAG} not a fast path: {name!r}")
+        if self.levers is not None:
+            return self.levers.param(name, key)
+        return _levers.default_param(name, key)
+
+    def installed(self, name: str, ok: bool, why: str = "") -> None:
+        """An installer's report on lever ``name``: installed, or refused for ``why``.
+
+        The installer passes an outcome agreed over the TP group, so every rank reports
+        the same. A refusal of a lever its knob set ``on`` raises; any other refusal is
+        a warning, and the installed table (``report``) shows it.
+
+        Raises:
+            ValueError: for a refusal of a lever set ``on`` by its knob.
+        """
+        self.reports[name] = (bool(ok), why)
+        if ok:
+            return
+        decision = self.levers.decisions.get(name) if self.levers is not None else None
+        message = f"{TAG} lever {name} is not installed: {why}"
+        if decision is not None and decision.source == "knob":
+            raise ValueError(f"{message} ({_levers.knob_name(name)}=on)")
+        if self.rank0:
+            logger.warning(f"{message}; the model runs without it")
+
+    def declined(self, name: str, reason: str, shape: str = "") -> None:
+        """A step lever ``name`` left to the path below it, for ``reason``.
+
+        Counted per (lever, reason); the first of each is logged as a warning with the
+        step's ``shape``, and ``step`` logs the counts.
+        """
+        key = (name, reason)
+        count = self.declines.get(key, 0) + 1
+        self.declines[key] = count
+        if count == 1 and self.rank0:
+            at = f" ({shape})" if shape else ""
+            logger.warning(f"{TAG} lever {name} declined a step{at}: {reason}")
+
+    def step(self) -> None:
+        """Count one executor step; every ``DECLINE_REPORT_STEPS`` log the decline counts."""
+        self.clock[0] += 1
+        if self.clock[0] % DECLINE_REPORT_STEPS == 0 and self.declines and self.rank0:
+            counts = {f"{name}: {reason}": count for (name, reason), count in self.declines.items()}
+            logger.info(f"{TAG} lever declines after {self.clock[0]} steps: {counts}")
+
+    def report(self) -> str:
+        """The installed lever table as one JSON line (``levers.LeverTable.as_json``)."""
+        if self.levers is None:
+            return "{}"
+        return self.levers.as_json({name: ok for name, (ok, _) in self.reports.items()})
 
     def __bool__(self) -> bool:
         return bool(self.paths)
@@ -1031,101 +1249,101 @@ def dependents(names: Iterable[str]) -> FrozenSet[str]:
     return frozenset(path for path in FAST_PATH_NAMES if closure((path,)) & names)
 
 
-def windowed_context_arena(spec_worker: Any) -> bool:
-    """Whether the DFlash worker keeps only a window of each slot's context K/V.
-
-    Read off the worker the built-in model built (``DFlashWorker.windowed_ctx_arena``).
-    """
-    return bool(getattr(spec_worker, "windowed_ctx_arena", False))
-
-
-_WINDOWED_ARENA = "a windowed drafter context arena"
-
-
-@dataclasses.dataclass(frozen=True)
-class CapacityGate:
-    """A served fast path left out above a request capacity, because of what it costs.
-
-    ``path`` (and every fast path built on it) is in the plan only when the
-    engine's ``max_batch_size`` is at most ``most_requests``; an unknown
-    ``max_batch_size`` leaves it out. ``cost`` says in words what the path takes
-    from the deployment.
-    """
-
-    path: str
-    most_requests: int
-    cost: str
-
-
-#: The fast paths a plan carries only at a few concurrent requests.
-#: ``half_window_experts`` stacks a second half expert window on every TP4 rank,
-#: which takes 45 GiB per rank from the KV cache; it is measured ahead of the
-#: owner-only window through 8 concurrent requests, and beyond that the
-#: prefix cache's capacity is worth more.
-CAPACITY_GATES: Tuple[CapacityGate, ...] = (
-    CapacityGate(
-        "half_window_experts",
-        8,
-        "a second half expert window per TP4 rank, 45 GiB of KV cache",
-    ),
+#: The levers that write the dense full-length drafter arena by its own column rule, and so
+#: need it: the context-K/V side chain with its fused store, its early fc fork, and the
+#: folded commit that also writes the drafter's preamble.
+DENSE_ARENA_LEVERS: Tuple[str, ...] = (
+    "drafter_kv_side_chain",
+    "drafter_fc_early_fork",
+    "drafter_preamble_from_commit",
 )
 
 
-def capacity_gated(
-    paths: FrozenSet[str], max_batch_size: Optional[int]
-) -> Tuple[FrozenSet[str], List[CapacityGate]]:
-    """``paths`` without the gates closed at ``max_batch_size``, and the gates that closed.
+@dataclasses.dataclass(frozen=True)
+class StructuralRules:
+    """What a deployment's drafter arena, architecture and facts exclude or require.
 
-    A gate closes when its path is in ``paths`` and ``max_batch_size`` is None or
-    above its ``most_requests``; the path and its dependents leave the set, which
-    stays closed under ``depends_on``. Changes nothing.
+    ``exclusions`` maps each served lever a rule leaves out to the reason; ``requires``
+    adds the levers a served lever needs on this deployment (``levers.resolve``).
     """
-    closed = [
-        gate
-        for gate in CAPACITY_GATES
-        if gate.path in paths and (max_batch_size is None or max_batch_size > gate.most_requests)
-    ]
-    if not closed:
-        return paths, closed
-    return paths - dependents(gate.path for gate in closed), closed
+
+    exclusions: Mapping[str, str]
+    requires: Mapping[str, Tuple[str, ...]]
+
+
+def structural_rules(served: FrozenSet[str], deployment: "_levers.Deployment") -> StructuralRules:
+    """The structural rules of ``deployment`` for the levers of ``served``. Pure.
+
+    * Over a windowed arena, on an architecture outside ``WINDOWED_COMMIT_SMS``, the
+      arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) need this target's compaction
+      (``WINDOWED_CONTEXT_ARENA_PATHS``), and are left out where it is not served.
+    * Any other arena leaves the compaction out.
+    * ``DENSE_ARENA_LEVERS`` need a dense full-length arena.
+    * ``windowed_commit_parallel`` runs inside the windowed commit of an architecture of
+      ``WINDOWED_COMMIT_SMS``, so it needs a windowed arena there.
+    * A paged arena leaves out ``incremental_block_offsets``: the step-input stager
+      declines the block-table copy while a draft KV cache manager is attached.
+    * ``TRTLLM_KV_DEFER_CLOSE=1`` leaves out ``step_loop_on_execution_stream``, which is
+      not validated with the deferred close.
+    """
+    arena = deployment.arena
+    exclusions: Dict[str, str] = {}
+    requires: Dict[str, Tuple[str, ...]] = {}
+    if arena is _levers.Arena.WINDOWED:
+        if deployment.sm not in WINDOWED_COMMIT_SMS:
+            compaction = tuple(name for name in WINDOWED_CONTEXT_ARENA_PATHS if name in served)
+            for name in FULL_CONTEXT_ARENA_PATHS:
+                if name not in served:
+                    continue
+                if compaction:
+                    requires[name] = compaction
+                else:
+                    exclusions[name] = (
+                        f"a windowed drafter context arena on sm{deployment.sm}, which serves "
+                        "neither the window compaction nor a commit that compacts"
+                    )
+    else:
+        for name in WINDOWED_CONTEXT_ARENA_PATHS:
+            if name in served:
+                exclusions[name] = f"the drafter context arena is {arena.value}, not windowed"
+    if arena is not _levers.Arena.DENSE:
+        for name in DENSE_ARENA_LEVERS:
+            if name in served:
+                exclusions[name] = (
+                    f"it needs a dense full-length drafter context arena, not a {arena.value} one"
+                )
+    if "windowed_commit_parallel" in served and (
+        arena is not _levers.Arena.WINDOWED or deployment.sm not in WINDOWED_COMMIT_SMS
+    ):
+        exclusions["windowed_commit_parallel"] = (
+            "it needs a windowed drafter context arena on an architecture whose commit "
+            f"compacts (sm{', sm'.join(str(sm) for sm in sorted(WINDOWED_COMMIT_SMS))}); this "
+            f"is a {arena.value} arena on sm{deployment.sm}"
+        )
+    if arena is _levers.Arena.PAGED and "incremental_block_offsets" in served:
+        exclusions["incremental_block_offsets"] = (
+            "the step-input stager declines the block-table copy over a paged drafter context"
+        )
+    if deployment.facts.kv_defer_close and "step_loop_on_execution_stream" in served:
+        exclusions["step_loop_on_execution_stream"] = (
+            f"{_levers.KV_DEFER_CLOSE_ENV}=1: the deferred close is not validated with it"
+        )
+    return StructuralRules(exclusions, requires)
 
 
 @dataclasses.dataclass(frozen=True)
-class Yield:
-    """A served fast path left out of a plan that carries another one doing its job.
+class _EngineFacts:
+    """The engine facts ``compose`` falls back to without ``_router_index.DeploymentFacts``."""
 
-    ``path`` (and every fast path built on it) leaves the plan when ``to`` is in it,
-    after the capacity gates. ``why`` says in words what the two share.
-    """
-
-    path: str
-    to: str
-    why: str
+    max_batch_size: Optional[int]
+    max_num_tokens: Optional[int] = None
+    disaggregated: Optional[bool] = None
 
 
-#: The fast paths a plan leaves to another one it carries. ``hot_replicas`` and
-#: ``half_window_experts`` both stack extra NVFP4 experts on every TP4 rank and place
-#: each step's experts over them; the half window is measured ahead through 8
-#: concurrent requests (its capacity gate), so a plan carrying it leaves the hot copies
-#: out and the two never both hold memory or both arm.
-YIELDS: Tuple[Yield, ...] = (
-    Yield(
-        "hot_replicas",
-        "half_window_experts",
-        "both stack extra NVFP4 experts per TP4 rank and place each step's experts over them",
-    ),
-)
-
-
-def yielded(paths: FrozenSet[str]) -> Tuple[FrozenSet[str], List[Yield]]:
-    """``paths`` without those that yield to another path in it, and the yields applied.
-
-    Closed under ``depends_on`` like ``capacity_gated``. Changes nothing.
-    """
-    applied = [rule for rule in YIELDS if rule.path in paths and rule.to in paths]
-    if not applied:
-        return paths, applied
-    return paths - dependents(rule.path for rule in applied), applied
+#: The prefix of the drafter arena item of the TP agreement.
+_ARENA_TAG = "drafter context arena: "
+#: The prefix of a rank's lever error carried through the TP agreement.
+_LEVER_ERROR = "lever table: "
 
 
 def compose(
@@ -1136,79 +1354,147 @@ def compose(
     compute_capability: Optional[Tuple[int, int]],
     spec_worker: Any = None,
     max_batch_size: Optional[int] = None,
+    *,
+    draft_model: Any = None,
+    facts: Any = None,
+    snapshot: Optional[Mapping[str, str]] = None,
 ) -> Plan:
-    """The plan this model is built with: its composition, or ``NO_PATHS``.
+    """The plan this model is built with: its composition's lever table, or ``NO_PATHS``.
 
     Call after the built-in constructor and before anything is installed. A
-    deployment without a composition (``composition``, structural) gets
-    ``NO_PATHS`` under ``auto`` and raises under ``require``. Otherwise the plan
-    is the composition's fast paths, less those written for a windowed arena when
-    the worker's arena is not windowed, and, over a windowed arena, less the
-    arena-writing paths (``FULL_CONTEXT_ARENA_PATHS``) unless the composition also
-    serves the window compaction or the architecture is one of
-    ``WINDOWED_COMMIT_SMS`` (whose windowed commit addresses the arena by its
-    physical columns and compacts itself; structural as well), less the paths a
-    capacity gate closes at the engine's ``max_batch_size`` (``CAPACITY_GATES``;
-    every rank reads the same engine argument), less the paths that yield to another
-    path still in the plan (``YIELDS``), and the preconditions of those
-    paths and the arena kind are checked once, agreed over the TP group
-    (collective; every rank returns the same plan or raises the same error).
+    deployment without a composition (``composition``, structural) gets ``NO_PATHS``
+    under ``auto`` and raises under ``require``; its lever environment is still
+    validated (``levers.no_composition_notes``). Otherwise:
+
+    1. the drafter context arena (``levers.arena_of``, the worker's own predicate over
+       ``spec_worker`` and ``draft_model``) and the ``levers.Deployment``
+       (``levers.deployment_of``; ``facts`` are the engine's
+       ``_router_index.DeploymentFacts``, else ``max_batch_size`` alone);
+    2. the lever table (``levers.resolve`` under ``structural_rules``), whose levers on
+       are the plan;
+    3. the preconditions of those levers, the arena, the lever environment and any
+       rank's lever error, agreed over the TP group in one collective: every rank
+       returns the same plan or raises the same error.
+
+    The lever table is logged once, on TP rank 0. ``snapshot`` stands in for the
+    process's environment snapshot (``levers.environment``).
 
     Raises:
         ValueError: under ``modeling_v2="require"`` when the deployment has no
-            composition; under any mode when a precondition is missing on some
-            rank, or the ranks disagree on the drafter arena (on every rank alike).
+            composition; under any mode for a lever error (``levers.resolve``), a
+            precondition missing on some rank, or ranks that disagree on the drafter
+            arena or the lever environment (on every rank alike).
     """
+    snapshot = _levers.environment() if snapshot is None else snapshot
     served = composition(model_config, compositions, compute_capability)
     mapping = getattr(model_config, "mapping", None)
     if served is None:
         require_served(model_config, mode, compositions, compute_capability)
+        notes = _levers.no_composition_notes(snapshot, DEPENDS_ON)
         reason = unserved_reason(model_config, compositions, compute_capability)
         logger.info(
             f"{TAG} no fast path for this deployment ({reason}); running the built-in forward"
         )
+        for note in notes:
+            logger.info(f"{TAG} {note}")
         return NO_PATHS
     from tensorrt_llm._torch.speculative.dflash import _PAGED_ATTENTION_BACKENDS
 
-    # The worker pages the drafter's context on these backends, and windows only a dense arena.
-    paged = getattr(spec_worker, "_dflash_attention_backend", None) in _PAGED_ATTENTION_BACKENDS
-    windowed = windowed_context_arena(spec_worker) and not paged
-    paths, gated = capacity_gated(frozenset(served.served), max_batch_size)
-    paths, yields = yielded(paths)
-    if windowed:
-        if not paths & frozenset(WINDOWED_CONTEXT_ARENA_PATHS) and (
-            sm_of(compute_capability) not in WINDOWED_COMMIT_SMS
-        ):
-            paths = paths - dependents(FULL_CONTEXT_ARENA_PATHS)
-    else:
-        paths = paths - dependents(WINDOWED_CONTEXT_ARENA_PATHS)
-    local = missing_preconditions(text_model, model_config, preconditions(paths, served))
-    agreed = agreed_union(mapping, local + ([_WINDOWED_ARENA] if windowed else []))
-    missing = [item for item in agreed if not item.startswith(_WINDOWED_ARENA)]
-    split = [
-        item for item in agreed if item.startswith(_WINDOWED_ARENA) and item != _WINDOWED_ARENA
-    ]
-    if split:
-        missing.append(f"the same drafter context arena on every rank ({split[0]})")
+    arena = _levers.arena_of(spec_worker, draft_model, _PAGED_ATTENTION_BACKENDS)
+    engine = facts if facts is not None else _EngineFacts(max_batch_size)
+    table: Optional[_levers.LeverTable] = None
+    local: List[str] = []
+    try:
+        # Every grammar error first, the role hint's included, before the role is derived.
+        _levers.parse_knobs(snapshot, DEPENDS_ON)
+        deployment = _levers.deployment_of(
+            model_config, compute_capability, arena, engine, snapshot
+        )
+        rules = structural_rules(served.served, deployment)
+        table = _levers.resolve(
+            deployment, served.served, rules.exclusions, snapshot, DEPENDS_ON, rules.requires
+        )
+    except ValueError as error:
+        local.append(f"{_LEVER_ERROR}{error}")
+    if table is not None:
+        local += missing_preconditions(
+            text_model, model_config, preconditions(table.paths(), served)
+        )
+    tags = [f"{_ARENA_TAG}{arena.value}", *_levers.tagged(snapshot)]
+    agreed = agreed_union(mapping, local + tags)
+    own = set(tags)
+    tagged = (_ARENA_TAG, _levers.AGREEMENT_TAG)
+    split = [item for item in agreed if item.startswith(tagged) and item not in own]
+    errors = [item[len(_LEVER_ERROR) :] for item in agreed if item.startswith(_LEVER_ERROR)]
+    missing = [item for item in agreed if not item.startswith(tagged + (_LEVER_ERROR,))]
     composed = (
         f"{TAG} sm{sm_of(compute_capability)} tep{mapping.tp_size} on {served.topology.description}"
     )
+    if split:
+        raise ValueError(
+            f"{composed}: the TP ranks disagree on the drafter context arena or the lever "
+            "environment: " + "; ".join(split)
+        )
+    if errors:
+        raise ValueError(f"{composed}: " + "; ".join(errors))
     if missing:
         raise ValueError(f"{composed}: the fast paths need " + "; ".join(missing))
-    plan = Plan(paths)
-    if windowed:
-        composed += f" with {_WINDOWED_ARENA}"
-    if paged:
-        composed += " with a paged drafter context"
-    for gate in gated:
-        composed += (
-            f" without {gate.path} (max_batch_size {max_batch_size} above {gate.most_requests};"
-            f" it costs {gate.cost})"
-        )
-    for rule in yields:
-        composed += f" without {rule.path} (it yields to {rule.to}: {rule.why})"
-    logger.info(f"{composed}: {plan.describe()}")
+    rank0 = int(getattr(mapping, "tp_rank", 0) or 0) == 0
+    plan = Plan(table.paths(), levers=table, rank0=rank0)
+    logger.info(f"{composed} with a {arena.value} drafter context arena: {plan.describe()}")
+    if rank0:
+        for line in table.describe():
+            logger.info(f"{TAG} {line}")
+        for warning in table.warnings:
+            logger.warning(f"{TAG} lever warning: {warning}")
     return plan
+
+
+def table_for(
+    compositions: Mapping[CompositionKey, TargetPaths],
+    sm: int,
+    tp: int,
+    max_batch_size: Optional[int],
+    role: str,
+    arena: str,
+    knobs: Optional[Mapping[str, str]] = None,
+    facts: Optional["_levers.Facts"] = None,
+    max_num_tokens: Optional[int] = None,
+    role_source: Optional[str] = None,
+) -> "_levers.LeverTable":
+    """The lever table ``compose`` resolves for a deployment, without a model or a device.
+
+    For tests and for reviewing a deployment's levers. ``role`` and ``arena`` are ``levers.Role`` /
+    ``levers.Arena`` values; ``knobs`` the lever environment (names under
+    ``levers.PREFIX``); ``facts`` the shared-path facts; ``role_source`` defaults to what
+    a served deployment of that role reports (agg servers derive their role, the others
+    take the hint).
+
+    Raises:
+        KeyError: for a key no composition serves.
+        ValueError: as ``levers.resolve``.
+    """
+    served = compositions[(sm, tp)].served
+    role = _levers.Role(role)
+    if role_source is None:
+        role_source = {
+            _levers.Role.AGG: "no cache transceiver",
+            _levers.Role.UNKNOWN: _levers.DISAGGREGATED_UNHINTED,
+        }.get(role, "hint")
+    deployment = _levers.Deployment(
+        sm=sm,
+        tp=tp,
+        max_batch_size=max_batch_size,
+        max_num_tokens=max_num_tokens,
+        role=role,
+        role_source=role_source,
+        arena=_levers.Arena(arena),
+        facts=facts or _levers.Facts(),
+    )
+    rules = structural_rules(served, deployment)
+    return _levers.resolve(
+        deployment, served, rules.exclusions, dict(knobs or {}), DEPENDS_ON, rules.requires
+    )
 
 
 # --------------------------------------------------------------------------

@@ -190,7 +190,11 @@ Hops and boundaries:
   Other row counts keep the hop (``DirectPublish``). At those 8 rows o_proj
   forks no prefetch of the pool weight. After the weights load,
   ``verify_direct_publish`` checks the kernel the published o_proj captures; a
-  step that raises while armed resets the transport.
+  step that raises while armed resets the transport. With ``wide_post_attention_hop``
+  and the ``wide_oproj_publish`` lever, the
+  TP4 decode steps of 16, 24 and 32 rows publish the same way into a 32-row direct
+  transport (``layers.WIDE_PUBLISH_ROWS``, the ``wide_dense_gemms`` o_proj tactics) instead
+  of running the wide hop; same bits.
 * ``multi_request_post_attention_hop`` (sm103 tep4 only) arms the same joins on decode
   steps of 9..1024 rows (two to 128 requests at K = 7) with ``ops/allreduce/post_attn_hop_wide``:
   the o_proj partial skips the built-in MNNVL all-reduce and one kernel reduces it, joins
@@ -257,6 +261,13 @@ MoE:
   of 1..16 tokens run ``ops/moe/finalize_allreduce_transport``, bitwise the
   built-in kernel's result on a different transport; larger calls run the
   built-in kernel. No module is re-classed.
+* ``wide_finalize_transport`` (tep4 on sm_107 only) has that workspace build a
+  second one on a 32-token layout (its own receive area, arrival counter and
+  kernel build): calls of 17..32 tokens -- decode steps of three or four
+  requests at K = 7 -- run the same kernel there, bitwise the built-in TP4
+  kernel's result (one CTA per token at every count up to its 128), and only
+  calls above 32 tokens run the built-in kernel. Calls of 1..16 tokens keep the
+  16-token workspace.
 * ``router_gemm`` re-classes every MoE layer once more, with ``RouterGemmMoE`` in
   front of the class the paths above left it with, and ``DecodeTarget`` arms it on
   decode steps of 9..512 rows (two or more requests, which the 8-row prologue does
@@ -320,12 +331,12 @@ installed by the shell's ``load_weights`` after the built-in loader
 * ``three_window_placement`` stacks a third ring window on them.
 * ``half_window_experts`` (tp 4) stacks the ring predecessor's upper expert half on
   them, which the prologue's routed kernel places onto (and, on calls of 9..32 rows
-  that reach the routing method, ``ring_buddy_assign``'s half flow); only up to the
-  ``max_batch_size`` of its capacity gate (``dispatch.CAPACITY_GATES``).
+  that reach the routing method, ``ring_buddy_assign``'s half flow); only up to its
+  lever's ``MAX_BATCH`` (``levers.RULES``).
 * ``bf16_routed_experts`` gives the two BF16 layers' stacked calls unpacked
   routing (on the owner-only window as well).
-* ``hot_replicas`` (tep4, in a plan without ``half_window_experts``:
-  ``dispatch.YIELDS``) hooks the NVFP4 layers' expert and routing
+* ``hot_replicas`` (tep4, in a plan without ``half_window_experts``: the two
+  levers conflict) hooks the NVFP4 layers' expert and routing
   calls after the owner-window install; the copies themselves are gathered on the
   first forward of a deployment whose largest decode step (``max_batch_size`` times
   the verify width) reaches 33 rows (``HotReplicas.decide``), and ``DecodeTarget``
@@ -409,6 +420,7 @@ from typing import Optional, Tuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    resolved_facts,
     resolved_max_batch_size,
     resolved_mode,
 )
@@ -418,6 +430,7 @@ from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMode
 from tensorrt_llm._torch.models.modeling_musespark_open_omni import (
     MuseSparkOpenOmniForConditionalGeneration,
 )
+from tensorrt_llm.logger import logger
 
 from . import dispatch as _dispatch
 from . import layers as _layers
@@ -532,6 +545,10 @@ class MuseSparkOpenTepModelingV2(MuseSparkOpenModel):
             # The first forward decides whether this deployment allocates the hot
             # expert copies (kernels/replicated_experts/hot_replicas.py).
             hot.decide(attn_metadata, kwargs.get("spec_metadata"))
+        check = self.__dict__.get("_arena_check")
+        if check is not None and check():
+            # The worker built its drafter arena, and it is the one the plan resolved for.
+            self.__dict__["_arena_check"] = None
         return self._select_target(attn_metadata).forward(
             attn_metadata,
             input_ids=input_ids,
@@ -621,6 +638,22 @@ class PrefillTarget:
         return hidden_states
 
 
+def _early_fc_index(fork, spec_metadata, num_layers: int) -> int:
+    """The decoder-layer index at whose start ``fork.fire_early()`` runs, or -1.
+
+    The index after the last DFlash capture layer (``spec_metadata.layers_to_capture``), when
+    the fork carries ``drafter_fc_early_fork`` (``ContextKvFork.early_fc_on``) and that index
+    is a decoder layer (all capture rows are final when it starts).
+    """
+    if fork is None or not fork.early_fc_on or spec_metadata is None:
+        return -1
+    capture = getattr(spec_metadata, "layers_to_capture", None)
+    if not capture or min(capture) < 0:
+        return -1
+    index = max(capture) + 1
+    return index if 0 < index < num_layers else -1
+
+
 class DecodeTarget:
     """The specialization: routed to only when there are no context rows.
 
@@ -669,11 +702,12 @@ class DecodeTarget:
     With ``pool_into_route``, a forward of exactly 8 rows captured into a CUDA
     graph arms every routed layer's pool transport (``DirectPool.armed``): the
     pool GEMM writes into the layer's pool slot, the forked router shard into its
-    logit boxes, and the routed pool kernel only polls them.
+    logit boxes, and the routed pool kernel only polls them. With ``wide_prologue``
+    a captured forward of 16..32 rows arms the wide transport's sites the same way.
 
-    With ``next_qkv_prefetch``, the forward first forks the L2 prefetch of layer
-    0's QKV weight (``QkvPrefetch.graph_start``); every other layer's is forked by
-    the previous layer's expert call.
+    With ``next_qkv_prefetch`` every other layer's QKV weight L2 prefetch is forked by
+    the previous layer's expert call; with ``graph_start_qkv_prefetch`` the forward first
+    forks layer 0's (``QkvPrefetch.graph_start``).
 
     With ``router_gemm``, a step of 9..512 rows arms the router GEMM
     (``RouterGemmCall.armed``): every MoE layer's router logits run
@@ -727,6 +761,7 @@ class DecodeTarget:
         self.unpool_direct = getattr(core, "_unpool_direct", None)
         self.pool_direct = getattr(core, "_pool_direct", None)
         self.qkv_prefetch = getattr(core, "_qkv_prefetch", None)
+        self.graph_start_prefetch = core._plan.enabled("graph_start_qkv_prefetch")
         self.router_gemm = getattr(core, "_router_gemm", None)
         self.kv_splits = getattr(core, "_decode_kv_splits", None)
         self.wide_moe_allreduce = getattr(core, "_wide_moe_allreduce", None)
@@ -747,7 +782,7 @@ class DecodeTarget:
         core = self.core
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
-        if self.qkv_prefetch is not None:
+        if self.qkv_prefetch is not None and self.graph_start_prefetch:
             # Layer 0's QKV weight, asked of the L2 while the embedding chain runs.
             self.qkv_prefetch.graph_start(
                 int((input_ids if input_ids is not None else inputs_embeds).shape[0])
@@ -786,6 +821,8 @@ class DecodeTarget:
         fork = getattr(core, "_context_kv_fork", None)
         if fork is not None:
             fork.arm(kwargs.get("spec_metadata"), attn_metadata)
+        # drafter_fc_early_fork: the layer before which the side chain's local part forks.
+        early_index = _early_fc_index(fork, kwargs.get("spec_metadata"), len(core.layers))
 
         direct = self.unpool_direct
         rows = hidden_states.shape[0]
@@ -833,6 +870,8 @@ class DecodeTarget:
             model_boundary.armed() if model_boundary is not None else contextlib.nullcontext(),
         ):
             for index, decoder_layer in enumerate(layers):
+                if index == early_index:
+                    fork.fire_early()
                 next_norm = layers[index + 1].pre_qkv_proj_norm if index + 1 < len(layers) else None
                 result = decoder_layer(
                     position_ids=position_ids,
@@ -912,11 +951,15 @@ _SM103_TEP4_ONLY_PATHS = frozenset(
 )
 #: The fast paths validated at a tep4 rank's shape on sm107 only: the generation rows of
 #: mixed steps on the multi-request decode FMHA (on sm103 flashinfer's trtllm-gen FMHA
-#: already serves both phases of a mixed step).
-_SM107_TEP4_ONLY_PATHS = frozenset({"mixed_step_gen_rows"})
-#: TEP8: every fast path but the TP4-only ones of either architecture.
+#: already serves both phases of a mixed step), and the finalize transport's 32-token
+#: layout for the expert finalize + all-reduce of 17..32-token calls (decode steps of
+#: three or four requests at K = 7, which the 16-token transport hands to the built-in
+#: kernel).
+_SM107_TEP4_ONLY_PATHS = frozenset({"mixed_step_gen_rows", "wide_finalize_transport"})
+#: TEP8: every base fast path (``dispatch.BASE_PATH_NAMES``) but the TP4-only ones of
+#: either architecture.
 _TEP8_PATHS = (
-    _dispatch.FAST_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS - _SM107_TEP4_ONLY_PATHS
+    _dispatch.BASE_PATH_NAMES - _TEP4_ONLY_PATHS - _SM103_TEP4_ONLY_PATHS - _SM107_TEP4_ONLY_PATHS
 )
 #: The fast paths written for any rank count whose output is bitwise the built-in
 #: model's.
@@ -959,9 +1002,9 @@ _TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
 #: prologue's routed kernel, those of 9..32 rows (two to four requests, behind the
 #: multi-request router GEMM and projection gathers) by ``ring_buddy_assign``'s half
 #: flow, both balancing the selected experts over the four ranks. As on sm107 the
-#: window costs 45 GiB of KV cache per rank and is carried only up to
-#: ``max_batch_size`` 8 (``dispatch.CAPACITY_GATES``); a plan carrying it leaves
-#: ``hot_replicas`` out (``dispatch.YIELDS``).
+#: window costs 45 GiB of KV cache per rank and is carried only up to its lever's
+#: ``MAX_BATCH`` (``levers.RULES``); a plan carrying it leaves ``hot_replicas`` out (the
+#: two levers conflict).
 _SM103_TEP4_PATHS = (
     _TEP4_PATHS
     | _SM103_TEP4_ONLY_PATHS
@@ -1020,7 +1063,7 @@ _SM107_TEP4_COMM_PATHS = frozenset(
 #: hold their ring predecessor's upper expert half (``half_window_experts``), so the
 #: routed kernel balances the selected experts of a step of at most 8 rows over the
 #: four ranks; that window costs 45 GiB of KV cache per rank, so a plan carries it
-#: only up to ``max_batch_size`` 8 (``dispatch.CAPACITY_GATES``). The sharded drafter fc
+#: only up to its lever's ``MAX_BATCH`` (``levers.RULES``). The sharded drafter fc
 #: of up to 128 rows is gathered over the tray's NVLink (``drafter_fc_inbox``). Decode
 #: steps of two to four
 #: requests (16..32 rows) also take the TP4 sharded MoE prologue and projection gathers
@@ -1076,8 +1119,8 @@ _SM107_TEP4_PATHS |= _SM107_TEP4_COMM_PATHS
 #: rows stay on ``wide_prologue``'s router shard), with one CTA per SM of the device;
 #: the attention block's QKV TGV GEMM on the rows of the R200 table and the PDL
 #: norm-gates of 33..512-row decode steps (``batch_dense_gemms``); and the hot NVFP4
-#: expert copies of 33..512-row decode steps, which yield to ``half_window_experts``
-#: wherever its capacity gate keeps it (``dispatch.YIELDS``).
+#: expert copies of 33..512-row decode steps, which conflict with ``half_window_experts``
+#: and stay out of a plan that carries it (``levers.RULES``).
 _SM107_TEP4_GEMM_EXPERT_PATHS = frozenset({"router_gemm", "batch_dense_gemms", "hot_replicas"})
 _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_GEMM_EXPERT_PATHS
 #: The sm103 tep4 decode-prep and drafter-at-batch paths sm107 TEP4 serves too, above
@@ -1104,14 +1147,62 @@ _SM107_TEP4_PATHS = _SM107_TEP4_PATHS | _SM107_TEP4_DRAFTER_AT_BATCH_PATHS
 #: other sm107 TEP4 paths.
 _SM107_TEP4_CONTEXT_PATHS = frozenset({"context_sequence_parallel", "context_prep"})
 
+#: The levers registered beside the fast paths (``dispatch.LEVER_NAMES``) that a
+#: composition serving ``next_qkv_prefetch`` serves with it: layer 0's QKV weight prefetch
+#: forked at the start of a decode forward.
+_PREFETCH_LEVERS = frozenset({"graph_start_qkv_prefetch"})
+#: The levers both sm107 compositions serve on top of their paths: the executor's step loop
+#: on the execution stream and its incremental block-offset copy, the windowed commit's
+#: parallel form (a windowed arena) and the head sampler's cooperative kernel A. Each
+#: lever's rule (``levers.RULES``) decides where it is on; sm103 serves no lever beyond
+#: the upstream target's.
+_SM107_LEVERS = frozenset(
+    {
+        "step_loop_on_execution_stream",
+        "incremental_block_offsets",
+        "windowed_commit_parallel",
+        "head_sampler_coop_fold",
+    }
+)
+#: The levers sm107 TEP8 adds: the drafter's fused context-K/V side chain, its early fc fork
+#: and the drafter preamble written by the folded commit (a dense arena), and the 8-row head
+#: logits gathered over MULTIMEM.
+_SM107_TEP8_LEVERS = frozenset(
+    {
+        "drafter_kv_side_chain",
+        "drafter_fc_early_fork",
+        "drafter_preamble_from_commit",
+        "head_multimem_gather",
+    }
+)
+#: The levers sm107 TEP4 adds, on its TP4 paths: the multi-request prep append's packed
+#: kernel, the 16..32-row steps' direct transports, per-row router shard and o_proj
+#: publication, the lossy MXFP8 dense projections of large context calls and the MXFP8
+#: gather of the sequence-parallel attention input, and the NVFP4 experts of large prefill
+#: calls on the Rubin CuTe DSL GEMMs.
+_SM107_TEP4_LEVERS = frozenset(
+    {
+        "packed_prep_append",
+        "wide_direct_transports",
+        "wide_router_per_row",
+        "wide_oproj_publish",
+        "context_fp8_dense",
+        "context_fp8_attn_gather",
+        "prefill_cutedsl_experts",
+    }
+)
+
 #: The compositions, per (SM, tensor-parallel size) (``dispatch.CompositionKey``):
-#: the fast paths served and the GPU topology they were validated on, with DFlash
-#: drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
-#: checkpoint; every other deployment runs the built-in modules only.
+#: the fast paths and levers served and the GPU topology they were validated on, with
+#: DFlash drafting a linear chain of ``dispatch.DRAFT_LEN`` tokens on an NVFP4
+#: checkpoint; every other deployment runs the built-in modules only. The lever table
+#: (``dispatch.compose``) decides which served levers a deployment is built with.
 TARGET_PATHS = {
-    (103, 8): _dispatch.TargetPaths(served=_TEP8_PATHS, topology=_dispatch.TWO_TRAYS_OF_4),
+    (103, 8): _dispatch.TargetPaths(
+        served=_TEP8_PATHS | _PREFETCH_LEVERS, topology=_dispatch.TWO_TRAYS_OF_4
+    ),
     (107, 8): _dispatch.TargetPaths(
-        served=_TEP8_PATHS,
+        served=_TEP8_PATHS | _PREFETCH_LEVERS | _SM107_LEVERS | _SM107_TEP8_LEVERS,
         topology=_dispatch.TWO_TRAYS_OF_4,
         preconditions=(_dispatch.SM107_FUSED_KERNELS,),
     ),
@@ -1121,11 +1212,47 @@ TARGET_PATHS = {
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL,),
     ),
     (107, 4): _dispatch.TargetPaths(
-        served=_SM107_TEP4_PATHS | _SM107_TEP4_CONTEXT_PATHS,
+        served=(
+            _SM107_TEP4_PATHS
+            | _SM107_TEP4_CONTEXT_PATHS
+            | _PREFETCH_LEVERS
+            | _SM107_LEVERS
+            | _SM107_TEP4_LEVERS
+        ),
         topology=_dispatch.ONE_TRAY_OF_4,
         preconditions=(_dispatch.NO_PREFILL_SEQUENCE_PARALLEL, _dispatch.SM107_FUSED_KERNELS),
     ),
 }
+
+
+def _arena_check(spec_worker, planned):
+    """A check of the drafter context arena the DFlash worker builds against ``planned``.
+
+    The plan's arena-bound levers were resolved for ``planned`` (``levers.arena_of``,
+    ``dispatch.structural_rules``); the worker builds its arena at its first drafter step.
+    The returned callable answers False until the worker has built it
+    (``levers.worker_arena``), then True when it is ``planned``, and raises otherwise.
+    None without a worker.
+
+    Raises (from the callable):
+        RuntimeError: when the worker built another arena than the plan's.
+    """
+    if spec_worker is None:
+        return None
+    from . import levers as _levers
+
+    def check() -> bool:
+        built = _levers.worker_arena(spec_worker)
+        if built is None:
+            return False
+        if built is not planned:
+            raise RuntimeError(
+                f"{_dispatch.TAG} the DFlash worker built a {built.value} drafter context arena; "
+                f"the plan's levers were resolved for a {planned.value} one"
+            )
+        return True
+
+    return check
 
 
 def device_compute_capability() -> Optional[Tuple[int, int]]:
@@ -1162,11 +1289,15 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         before the built-in constructor runs. The preconditions read the built
         model (and the drafter arena its DFlash worker keeps), so the plan is
         decided right after it, before anything is installed
-        (``dispatch.compose``, agreed over the TP group).
+        (``dispatch.compose``: the lever table over the engine facts
+        ``_router_index.resolved_facts`` recorded, agreed over the TP group). The
+        drafter arena the worker builds at its first drafter step is checked
+        against the plan's at the first forward after it.
 
         Raises:
             ValueError: under ``require`` without a composition; under any mode
-                with a precondition of the plan missing (``dispatch.compose``).
+                with a lever error or a precondition of the plan missing
+                (``dispatch.compose``).
         """
         mode = resolved_mode(type(self))
         capability = device_compute_capability()
@@ -1180,6 +1311,8 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
             capability,
             spec_worker=getattr(self.llm, "spec_worker", None),
             max_batch_size=resolved_max_batch_size(type(self)),
+            draft_model=getattr(self.llm, "draft_model", None),
+            facts=resolved_facts(type(self)),
         )
         self._plan = plan
         self._mapping = getattr(model_config, "mapping", None)
@@ -1192,6 +1325,10 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         # The built-in constructor returns early when it is re-entered; adopt once.
         if not isinstance(self.llm.model, MuseSparkOpenTepModelingV2):
             MuseSparkOpenTepModelingV2.adopt(self.llm.model, plan, capability)
+        if plan.levers is not None:
+            self.llm.model._arena_check = _arena_check(
+                getattr(self.llm, "spec_worker", None), plan.levers.deployment.arena
+            )
 
     def load_weights(self, weights, weight_mapper=None):
         """The built-in load, then the plan's weight-dependent fast paths (the expert
@@ -1293,4 +1430,9 @@ class ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep(MuseSparkOpenOmniForCondition
         """
         from . import drafter as _drafter
 
-        _drafter.adopt_drafter(self, self._plan)
+        plan = self._plan
+        _drafter.adopt_drafter(self, plan)
+        if plan.levers is not None and plan.rank0 and not self.__dict__.get("_table_logged"):
+            # Once the drafter installs reported: the table every lever was installed with.
+            self._table_logged = True
+            logger.info(f"{_dispatch.TAG} lever table json (installed): {plan.report()}")

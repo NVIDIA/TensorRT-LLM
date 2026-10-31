@@ -26,7 +26,8 @@ Tuning knobs -- ``max_batch_size``, ``max_num_tokens``, CUDA graph settings --
 are deliberately not routing inputs. They do not change which target runs, so a
 target claims a configuration regardless of them; ``require`` promises that the
 target ran, not that a particular knob setting was measured. The resolver records
-``max_batch_size`` for the target it returns (``resolved_max_batch_size``), which a
+``max_batch_size`` for the target it returns (``resolved_max_batch_size``), and the
+engine facts a target's own rules read (``resolved_facts``: ``DeploymentFacts``), which a
 target may read to size or leave out a fast path inside itself.
 
 Routing modules are imported lazily: resolving a GptOss config never imports
@@ -36,6 +37,7 @@ the DeepSeek tree, and a target's modeling code is imported only on the
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import os
 from importlib import import_module
@@ -137,6 +139,48 @@ def resolved_max_batch_size(target: type) -> Optional[int]:
     return _RESOLVED_MAX_BATCH_SIZES.get(target)
 
 
+@dataclasses.dataclass(frozen=True)
+class DeploymentFacts:
+    """The engine settings ``modeling_v2_resolve`` saw for a target, for the target's own rules.
+
+    Not routing inputs. ``disaggregated`` is whether the engine carries a cache transceiver
+    (a context or generation server of a disaggregated deployment); ``graph_batch_sizes``
+    the CUDA graph batch sizes it captures (None when it captures none or lists none).
+    """
+
+    max_batch_size: Optional[int]
+    max_num_tokens: Optional[int]
+    disaggregated: bool
+    graph_batch_sizes: Optional[Tuple[int, ...]]
+
+
+# The engine facts each target class was last resolved under.
+_RESOLVED_FACTS: Dict[type, DeploymentFacts] = {}
+
+
+def resolved_facts(target: type) -> Optional[DeploymentFacts]:
+    """The ``DeploymentFacts`` ``modeling_v2_resolve`` saw for ``target``; None for a class built without them."""
+    return _RESOLVED_FACTS.get(target)
+
+
+def _facts_of(llm_args: "TorchLlmArgs") -> DeploymentFacts:
+    def count(name: str) -> Optional[int]:
+        value = getattr(llm_args, name, None)
+        return None if value is None else int(value)
+
+    graphs = getattr(llm_args, "cuda_graph_config", None)
+    sizes = getattr(graphs, "batch_sizes", None) if graphs is not None else None
+    # The executor builds a cache transceiver only for a config with a backend
+    # (``disaggregation.kv_cache_transceiver``).
+    transceiver = getattr(llm_args, "cache_transceiver_config", None)
+    return DeploymentFacts(
+        max_batch_size=count("max_batch_size"),
+        max_num_tokens=count("max_num_tokens"),
+        disaggregated=transceiver is not None and getattr(transceiver, "backend", None) is not None,
+        graph_batch_sizes=tuple(int(size) for size in sizes) if sizes else None,
+    )
+
+
 def routing_module(arch: str):
     """Import and return the routing module for ``arch``, or None."""
     name = MODELING_V2_ROUTERS.get(arch)
@@ -196,4 +240,5 @@ def modeling_v2_resolve(config: "ModelConfig", llm_args: "TorchLlmArgs") -> Opti
             _RESOLVED_MAX_BATCH_SIZES.pop(target, None)
         else:
             _RESOLVED_MAX_BATCH_SIZES[target] = int(max_batch_size)
+        _RESOLVED_FACTS[target] = _facts_of(llm_args)
     return target
