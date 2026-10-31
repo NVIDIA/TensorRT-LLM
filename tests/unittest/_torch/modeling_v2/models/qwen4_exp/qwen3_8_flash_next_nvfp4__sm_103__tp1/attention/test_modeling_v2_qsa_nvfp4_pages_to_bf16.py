@@ -17,7 +17,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention import (
     qsa_paged_sparse_gqa_nvfp4 as _gqa,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_nvfp4_pages_to_bf16 import (  # noqa: E501
