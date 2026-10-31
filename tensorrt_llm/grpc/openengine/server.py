@@ -37,7 +37,8 @@ from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from ._health import OpenEngineHealthServicer
 from .bindings import openengine_pb2_grpc
 from .control import OpenEngineControlServicer
-from .coordinator import CoordinationError, Coordinator, FrontendClient
+from .coordinator import CoordinationError, FrontendClient
+from .coordinator_reactor import CoordinatorReactor
 from .kv_events import KvEventsUnavailableError, _format_host_port, events_config
 from .metrics import MetricsDirectory, OpenEngineMetrics
 from .servicer import OpenEngineInferenceServicer
@@ -387,11 +388,15 @@ def launch_server(
 
         def fail(reason: str) -> None:
             nonlocal failure
-            if not stop_event.is_set():
+            first_failure = failure is None and not stop_event.is_set()
+            if first_failure:
                 failure = reason
-                logger.error(reason)
+            if coordinator is not None:
+                coordinator.report_owner_failure(failure if failure is not None else reason)
             startup_cancelled.set()
             stop_event.set()
+            if first_failure:
+                logger.error(reason)
 
         def signal_handler(signum: int, frame: Any) -> None:
             # A Python handler also observes signals while synchronous model
@@ -404,6 +409,7 @@ def launch_server(
         }
 
         def healthy() -> bool:
+            # The coordinator's thread only reads cached state here.
             return (
                 not stop_event.is_set()
                 and server is not None
@@ -484,14 +490,16 @@ def launch_server(
             instance_id = llm_args["_openengine_discovery"]["engine_id"]
             if mode.is_launcher:
                 directory = tempfile.TemporaryDirectory(prefix="tllm-openengine-")
-                longest_name = max("coordinator", f"frontend-{mode.num_frontends - 1}", key=len)
+                longest_name = max(
+                    "coordinator-abort", f"frontend-{mode.num_frontends - 1}", key=len
+                )
                 socket_path = os.path.join(directory.name, longest_name)
                 if len(os.fsencode(socket_path)) >= 108:
                     raise ValueError(
                         f"OpenEngine private Unix socket path exceeds 107 bytes: {socket_path}. "
                         "Set TMPDIR to a shorter directory."
                     )
-                coordinator = Coordinator(
+                coordinator = CoordinatorReactor(
                     directory.name, mode.num_frontends, instance_id, healthy, fail
                 )
                 await coordinator.start()
@@ -547,47 +555,60 @@ def launch_server(
                 raise RuntimeError("An OpenEngine frontend exited during startup")
             _signal_frontend_ready(mode)
             if coordinator is not None:
-                coordinator.ready = True
+                try:
+                    await coordinator.set_ready()
+                except CoordinationError as error:
+                    if failure is not None:
+                        raise RuntimeError(failure) from error
+                    raise
                 await server._refresh_inference_health()
             await stop_event.wait()
         finally:
             startup_cancelled.set()
-            if coordinator is not None:
-                coordinator.ready = False
-                coordinator.stopping = True
-            elif mode.is_attached_frontend and frontend is not None:
-                try:
-                    await frontend.request("withdraw", frontend=frontend.frontend_id)
-                except CoordinationError:
-                    pass
-            if monitor is not None:
-                monitor.cancel()
-                await asyncio.gather(monitor, return_exceptions=True)
             try:
-                if server is not None:
-                    await server.stop()
+                if coordinator is not None:
+                    try:
+                        await coordinator.stop_admission()
+                    except (CoordinationError, RuntimeError) as error:
+                        fail(f"OpenEngine admission shutdown failed: {error}")
+                elif mode.is_attached_frontend and frontend is not None:
+                    try:
+                        await frontend.request("withdraw", frontend=frontend.frontend_id)
+                    except CoordinationError:
+                        pass
             finally:
+                if monitor is not None:
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
                 try:
-                    if children:
-                        await asyncio.to_thread(_terminate_attached_frontends, children)
-                    if frontend is not None:
-                        await frontend.close()
-                    if coordinator is not None:
-                        await coordinator.close()
+                    if server is not None:
+                        await server.stop()
                 finally:
                     try:
-                        if llm is not None:
-                            await asyncio.to_thread(llm.shutdown)
+                        try:
+                            if children:
+                                await asyncio.to_thread(_terminate_attached_frontends, children)
+                        finally:
+                            try:
+                                if frontend is not None:
+                                    await frontend.close()
+                            finally:
+                                if coordinator is not None:
+                                    await coordinator.close()
                     finally:
-                        if metrics is not None:
-                            await metrics.wait_for_collection()
-                        if directory is not None:
-                            directory.cleanup()
-                        if metrics_directory is not None:
-                            metrics_directory.close()
-                        for sig, previous in previous_handlers.items():
-                            signal.signal(sig, previous)
-                logger.info("LLM engine stopped")
+                        try:
+                            if llm is not None:
+                                await asyncio.to_thread(llm.shutdown)
+                        finally:
+                            if metrics is not None:
+                                await metrics.wait_for_collection()
+                            if directory is not None:
+                                directory.cleanup()
+                            if metrics_directory is not None:
+                                metrics_directory.close()
+                            for sig, previous in previous_handlers.items():
+                                signal.signal(sig, previous)
+                    logger.info("LLM engine stopped")
         if failure is not None:
             raise RuntimeError(failure)
 

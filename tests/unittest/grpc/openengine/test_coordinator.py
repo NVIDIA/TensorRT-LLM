@@ -4,8 +4,10 @@
 """Exercise request ownership over real private gRPC sockets."""
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+import threading
+from contextlib import asynccontextmanager, contextmanager, suppress
 from tempfile import TemporaryDirectory
+from time import monotonic
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.coordinator as coordination  # noqa: E402
+import tensorrt_llm.grpc.openengine.coordinator_reactor as reactor_module  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     generation_pb2,
     lifecycle_pb2,
@@ -26,6 +29,7 @@ from tensorrt_llm.grpc.openengine.coordinator import (  # noqa: E402
     DuplicateRequestError,
     FrontendClient,
 )
+from tensorrt_llm.grpc.openengine.coordinator_reactor import CoordinatorReactor  # noqa: E402
 from tensorrt_llm.grpc.openengine.server import OpenEngineServer  # noqa: E402
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
@@ -43,19 +47,22 @@ class Handle:
 
 
 @asynccontextmanager
-async def group(coordinator_type=Coordinator, client_type=FrontendClient):
+async def group(
+    coordinator_type=CoordinatorReactor, client_type=FrontendClient, healthy=lambda: True
+):
     # Short paths avoid the AF_UNIX pathname limit under pytest's tmp_path.
     with TemporaryDirectory(prefix="oe-test-") as directory:
         failures = []
-        coordinator = coordinator_type(directory, 2, "shared-engine", lambda: True, failures.append)
+        coordinator = coordinator_type(directory, 2, "shared-engine", healthy, failures.append)
         clients = [client_type(directory, i, failures.append) for i in range(2)]
         await coordinator.start()
         for client in clients:
             await client.start()
-        coordinator.ready = True
+        await coordinator.set_ready()
         try:
             yield coordinator, clients, failures
         finally:
+            await coordinator.stop_admission()
             for client in clients:
                 await client.close()
             await coordinator.close()
@@ -96,21 +103,22 @@ async def test_cross_frontend_ownership_load_and_abort():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_reservation_releases_after_commit_before_reply():
+async def test_cancelled_reservation_releases_after_commit_before_reply(monkeypatch):
     """Cancellation at the IPC boundary must not permanently occupy an ID."""
-    committed, reply_allowed = asyncio.Event(), asyncio.Event()
+    committed, reply_allowed = threading.Event(), threading.Event()
 
     class DelayedCoordinator(Coordinator):
-        async def _dispatch(self, message, context):
-            result = await super()._dispatch(message, context)
+        def _dispatch(self, message, context):
+            result = super()._dispatch(message, context)
             if message["operation"] == "reserve":
                 committed.set()
-                await reply_allowed.wait()
+                assert reply_allowed.wait(3)
             return result
 
-    async with group(DelayedCoordinator) as (_, (first, second), failures):
+    monkeypatch.setattr(reactor_module, "Coordinator", DelayedCoordinator)
+    async with group() as (_, (first, second), failures):
         task = asyncio.create_task(first.reserve("cancelled"))
-        await asyncio.wait_for(committed.wait(), 2)
+        assert await asyncio.to_thread(committed.wait, 2)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -133,17 +141,16 @@ async def test_cancelled_reservation_releases_after_commit_before_reply():
 @pytest.mark.parametrize("all_requests", [False, True])
 async def test_delayed_abort_cannot_cancel_reused_request_id(all_requests):
     """An abort snapshot must stay fenced when the old stream finishes."""
-    async with group() as (coordinator, (first, second), failures):
-        old = await first.reserve("reused")
-        entered, proceed = asyncio.Event(), asyncio.Event()
-        original = coordinator._peers[0].request
+    entered, proceed = asyncio.Event(), asyncio.Event()
 
-        async def delayed(message):
+    class DelayedFrontend(FrontendClient):
+        async def _abort(self, message, context):
             entered.set()
             await proceed.wait()
-            return await original(message)
+            return await super()._abort(message, context)
 
-        coordinator._peers[0].request = delayed
+    async with group(client_type=DelayedFrontend) as (_, (first, second), failures):
+        old = await first.reserve("reused")
         fields = {} if all_requests else {"request_id": "reused"}
         abort = asyncio.create_task(second.request("abort", **fields))
         await asyncio.wait_for(entered.wait(), 2)
@@ -271,7 +278,8 @@ async def test_standard_health_tracks_frontend_group_readiness():
                     await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
                 ).state == lifecycle_pb2.HEALTH_STATE_READY
 
-                coordinator.ready = False
+                with coordinator._coordinator._admission_lock:
+                    coordinator._coordinator.ready = False
                 await server._refresh_inference_health()
                 assert (
                     await health.Check(request, timeout=5)
@@ -283,7 +291,8 @@ async def test_standard_health_tracks_frontend_group_readiness():
                     await health.Check(health_pb2.HealthCheckRequest(service="liveness"), timeout=5)
                 ).status == health_pb2.HealthCheckResponse.SERVING
 
-                coordinator.ready = True
+                with coordinator._coordinator._admission_lock:
+                    coordinator._coordinator.ready = True
                 await server._refresh_inference_health()
                 assert (
                     await health.Check(request, timeout=5)
@@ -292,7 +301,8 @@ async def test_standard_health_tracks_frontend_group_readiness():
                     await control.Health(lifecycle_pb2.HealthRequest(), timeout=5)
                 ).state == lifecycle_pb2.HEALTH_STATE_READY
 
-                coordinator.stopping = True
+                with coordinator._coordinator._admission_lock:
+                    coordinator._coordinator.stopping = True
                 await server._refresh_inference_health()
                 assert (
                     await health.Check(request, timeout=5)
@@ -427,27 +437,26 @@ async def test_abort_all_deadline_preserves_group_and_partial_outcomes(monkeypat
     monkeypatch.setattr(coordination, "_ABORT_TIMEOUT", 2.0)
     monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 1.0)
     monkeypatch.setattr(coordination, "_ABORT_BATCH_SIZE", 1)
-    async with group() as (coordinator, (first, second), failures):
-        for i in range(3):
-            reservation = await first.reserve(str(i))
-            reservation.bind(Handle())
-        original_request = coordinator._peers[0].request
-        calls = 0
-        cancelled = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = 0
 
-        async def delayed_batch(message):
+    class DelayedFrontend(FrontendClient):
+        async def _abort(self, message, context):
             nonlocal calls
             calls += 1
             if calls == 1:
-                return await original_request(message)
+                return await super()._abort(message, context)
             try:
                 await asyncio.Event().wait()
             finally:
                 cancelled.set()
 
-        monkeypatch.setattr(coordinator._peers[0], "request", delayed_batch)
+    async with group(client_type=DelayedFrontend) as (_, (first, second), failures):
+        for i in range(3):
+            reservation = await first.reserve(str(i))
+            reservation.bind(Handle())
         assert await second.request("abort") == {"aborted": 1, "failed": 2}
-        assert cancelled.is_set()
+        await asyncio.wait_for(cancelled.wait(), 2)
         assert calls == 2
         assert (await second.request("status"))["ready"]
         assert not failures
@@ -474,33 +483,143 @@ async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_unavailable_abort_peer_cancels_slow_sibling(monkeypatch):
+async def test_slow_abort_requests_do_not_starve_reservations_or_heartbeats():
+    """A saturated abort pool must not block control-plane progress."""
+    all_started = asyncio.Event()
+    release = asyncio.Event()
+    started = 0
+
+    class BlockingFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            nonlocal started
+            started += 1
+            if started == coordination._ABORT_THREADS:
+                all_started.set()
+            await release.wait()
+            return await super()._abort(message, context)
+
+    async with group(client_type=BlockingFrontend) as (_, (first, second), failures):
+        held = await first.reserve("held")
+        held.bind(Handle())
+        aborts = [
+            asyncio.create_task(second.request("abort", request_id="held"))
+            for _ in range(coordination._ABORT_THREADS)
+        ]
+        try:
+            await asyncio.wait_for(all_started.wait(), 3)
+            with pytest.raises(CoordinationError, match="OpenEngine abort capacity exhausted"):
+                await asyncio.wait_for(second.request("abort", request_id="held"), 2)
+
+            llm = SimpleNamespace(
+                llm_id="shared-engine",
+                args=SimpleNamespace(guided_decoding_backend=None),
+                tokenizer=None,
+            )
+            server = OpenEngineServer("127.0.0.1", 0, llm, "test-model", frontend=second)
+            await server.start()
+            try:
+                async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                    control = openengine_pb2_grpc.ControlStub(channel)
+                    with pytest.raises(grpc.aio.AioRpcError) as error:
+                        await control.Abort(
+                            lifecycle_pb2.AbortRequest(request_id="held"), timeout=2
+                        )
+                    assert error.value.code() == grpc.StatusCode.UNAVAILABLE
+            finally:
+                await server.stop()
+
+            status = await asyncio.wait_for(first.request("heartbeat", frontend=0), 2)
+            assert status["ready"]
+            reservation = await asyncio.wait_for(second.reserve("while-aborts-wait"), 2)
+            await reservation.release()
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*aborts), 3)
+        assert all(result == {"aborted": 1, "failed": 0} for result in results)
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_cancelled_abort_cancels_outstanding_frontend_rpc():
+    """Cancelling an outer abort must release its in-flight peer RPC."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class BlockingFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    async with group(client_type=BlockingFrontend) as (_, (first, second), failures):
+        reservation = await first.reserve("pending")
+        task = asyncio.create_task(second.request("abort", request_id="pending"))
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await asyncio.wait_for(cancelled.wait(), 3)
+            assert (await second.request("status"))["ready"]
+            assert not failures
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await reservation.release()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cancels_outstanding_abort_without_frontend_failure():
+    """Shutdown-induced peer cancellation is not a frontend failure."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class BlockingFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    async with group(client_type=BlockingFrontend) as (coordinator, (first, second), failures):
+        await first.reserve("pending")
+        task = asyncio.create_task(second.request("abort", request_id="pending"))
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            await asyncio.wait_for(coordinator.close(), 3)
+            await asyncio.wait_for(cancelled.wait(), 3)
+            await asyncio.gather(task, return_exceptions=True)
+            assert not any("Frontend control connection failed" in reason for reason in failures)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_abort_peer_cancels_slow_sibling():
     """A lost peer must stop admission before another peer's abort deadline."""
-    async with group() as (coordinator, (first, second), failures):
-        unavailable = await first.reserve("unavailable")
-        slow = await second.reserve("slow")
-        await first._server.stop(0)
-        slow_started = asyncio.Event()
-        slow_cancelled = asyncio.Event()
-        unavailable_request = coordinator._peers[0].request
+    slow_started = asyncio.Event()
+    slow_cancelled = asyncio.Event()
 
-        async def peer_unavailable(message):
-            await slow_started.wait()
-            return await unavailable_request(message)
-
-        async def slow_peer(message):
+    class FailingFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            if self.frontend_id == 0:
+                await slow_started.wait()
+                await context.abort(grpc.StatusCode.UNAVAILABLE, "frontend unavailable")
             slow_started.set()
             try:
                 await asyncio.Event().wait()
             finally:
                 slow_cancelled.set()
 
-        monkeypatch.setattr(coordinator._peers[0], "request", peer_unavailable)
-        monkeypatch.setattr(coordinator._peers[1], "request", slow_peer)
+    async with group(client_type=FailingFrontend) as (_, (first, second), failures):
+        unavailable = await first.reserve("unavailable")
+        slow = await second.reserve("slow")
         with pytest.raises(CoordinationError):
             await asyncio.wait_for(second.request("abort"), timeout=2)
-        assert slow_cancelled.is_set()
-        assert not coordinator.ready
+        await asyncio.wait_for(slow_cancelled.wait(), 2)
+        assert not (await first.request("status"))["ready"]
         assert failures
         await unavailable.release()
         await slow.release()
@@ -537,8 +656,195 @@ async def test_frontend_withdraw_stops_group_admission():
         status = await second.request("status")
         assert not status["ready"]
         assert status["stopping"]
-        assert not coordinator.ready
+        assert not (await second.request("status"))["ready"]
         assert failures == ["OpenEngine frontend 0 is stopping"]
         with pytest.raises(CoordinationError):
             await second.reserve("new-work")
         await reservation.release()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_receiver_progresses_while_owner_loop_is_paused() -> None:
+    """Private ownership must progress independently of the inference loop."""
+    with TemporaryDirectory(prefix="oe-test-") as directory:
+        failures = []
+        errors = []
+        client_ready = threading.Event()
+        begin_reserve = threading.Event()
+        reply_received = threading.Event()
+        release_owner = threading.Event()
+        reactor = CoordinatorReactor(directory, 1, "shared-engine", lambda: True, failures.append)
+
+        async def exercise_frontend() -> None:
+            client = FrontendClient(directory, 0, failures.append)
+            try:
+                await client.start()
+                client_ready.set()
+                await asyncio.to_thread(begin_reserve.wait)
+                reservation = await client.reserve("independent-frontend")
+                reply_received.set()
+                release_owner.set()
+                await reservation.release()
+            finally:
+                await client.close()
+
+        def run_frontend() -> None:
+            try:
+                asyncio.run(exercise_frontend())
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                client_ready.set()
+                release_owner.set()
+
+        frontend = None
+        try:
+            await reactor.start()
+            frontend = threading.Thread(target=run_frontend, name="test-openengine-frontend")
+            frontend.start()
+            assert await asyncio.to_thread(client_ready.wait, 5)
+            assert not errors
+            await reactor.set_ready()
+            begin_reserve.set()
+            # Keep the owner loop busy in Python while the receiver and independent
+            # frontend deliver the reply. Python still switches between threads.
+            deadline = monotonic() + 3
+            while not release_owner.is_set() and monotonic() < deadline:
+                pass
+            assert release_owner.is_set() and reply_received.is_set(), (
+                f"Private control waited for the inference owner loop: {errors}"
+            )
+        finally:
+            begin_reserve.set()
+            release_owner.set()
+            try:
+                if frontend is not None:
+                    await asyncio.to_thread(frontend.join, 10)
+            finally:
+                await reactor.close()
+        assert frontend is not None and not frontend.is_alive()
+        assert not errors
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_coordinator_start_failure_preserves_error_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later bind failure must release the already-started endpoint."""
+    servers = []
+    make_server = grpc.server
+
+    def fail_second_bind(*args, **kwargs):
+        server = make_server(*args, **kwargs)
+        if servers:
+            monkeypatch.setattr(server, "add_insecure_port", lambda address: 0)
+        servers.append(server)
+        return server
+
+    with TemporaryDirectory(prefix="oe-test-") as directory:
+        reactor = CoordinatorReactor(
+            directory, 1, "shared-engine", lambda: True, lambda reason: None
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(grpc, "server", fail_second_bind)
+            with pytest.raises(RuntimeError, match="Failed to bind.*coordinator-abort"):
+                await asyncio.wait_for(reactor.start(), 3)
+        assert len(servers) == 2
+
+        # A new group must be able to acquire both endpoints after the failure.
+        replacement = CoordinatorReactor(
+            directory, 1, "shared-engine", lambda: True, lambda reason: None
+        )
+        await asyncio.wait_for(replacement.start(), 3)
+        await asyncio.wait_for(replacement.close(), 3)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_cached_health_recovers_without_reopening_a_fenced_group() -> None:
+    healthy = threading.Event()
+    healthy.set()
+    async with group(coordinator_type=CoordinatorReactor, healthy=healthy.is_set) as (
+        reactor,
+        (client, _),
+        failures,
+    ):
+        assert (await client.request("status"))["ready"]
+        healthy.clear()
+        assert not (await client.request("status"))["ready"]
+        assert not failures
+        healthy.set()
+        assert (await client.request("status"))["ready"]
+
+        reactor.report_owner_failure("terminal owner failure")
+        with pytest.raises(CoordinationError, match="fenced"):
+            await reactor.set_ready()
+        healthy.set()
+        status = await client.request("status")
+        assert not status["ready"] and status["stopping"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_failure_first", [True, False])
+async def test_terminal_owner_failure_is_ordered_with_reservation_commit(
+    owner_failure_first: bool,
+) -> None:
+    """A published terminal failure cannot race with a new ownership commit."""
+    async with group(coordinator_type=CoordinatorReactor) as (reactor, (client, _), _):
+        coordinator = reactor._coordinator
+        assert coordinator is not None
+        admission_lock = coordinator._admission_lock
+        entered, proceed = threading.Event(), threading.Event()
+        publishing, published = threading.Event(), threading.Event()
+
+        @contextmanager
+        def paused_admission():
+            if owner_failure_first:
+                entered.set()
+                assert proceed.wait(3)
+            with admission_lock:
+                if not owner_failure_first:
+                    entered.set()
+                    assert proceed.wait(3)
+                yield
+
+        def publish_failure() -> None:
+            publishing.set()
+            reactor.report_owner_failure("terminal owner failure")
+            published.set()
+
+        coordinator._admission_lock = paused_admission()
+        publisher = None
+        reserve = asyncio.create_task(
+            client.request("reserve", request_id="racing", token="generation", frontend=0)
+        )
+        try:
+            assert await asyncio.to_thread(entered.wait, 3)
+            if owner_failure_first:
+                # The receiver is paused before acquiring the lock. Publication
+                # returns before it resumes, and its queued fence cannot run yet.
+                publish_failure()
+                assert published.is_set()
+            else:
+                # The receiver already owns the lock. Publication must wait for
+                # this reservation to commit, without either thread deadlocking.
+                publisher = threading.Thread(target=publish_failure)
+                publisher.start()
+                assert await asyncio.to_thread(publishing.wait, 3)
+                assert not await asyncio.to_thread(published.wait, 0.1)
+            proceed.set()
+            reply = await asyncio.wait_for(reserve, 3)
+        finally:
+            proceed.set()
+            if publisher is not None:
+                await asyncio.to_thread(publisher.join, 3)
+                assert not publisher.is_alive()
+            coordinator._admission_lock = admission_lock
+            await asyncio.gather(reserve, return_exceptions=True)
+
+        assert published.is_set()
+        assert reply["reserved"] is not owner_failure_first
+        assert await client.request(
+            "reserve", request_id="after-failure", token="late", frontend=0
+        ) == {"ready": False, "reserved": False}
+        assert (await client.request("status"))["count"] == int(not owner_failure_first)
