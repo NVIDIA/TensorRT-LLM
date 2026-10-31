@@ -268,6 +268,11 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    # GEN idle-poll skip state; _init_gen_idle_poll sets the instance values.
+    _gen_idle_poll_skip: bool = False
+    _gen_idle_agreed: bool = False
+    _gen_deferred_receives: int = 0
+
     @property
     def consumes_transfer_buffer(self) -> bool:
         return False
