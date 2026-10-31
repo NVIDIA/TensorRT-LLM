@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA sparse GQA: attention over an explicitly selected set of paged K/V tokens.
 
-This target's local variant of the tp1 target's `ops/attention/qsa_paged_sparse_gqa`,
-carrying the tp4/tep4 and dep4 cells until the promotion merges the two into the catalog.
+Promoted from the copies of the qwen4_exp tp1 target and the unified target; the cells are
+the tp1 target's and the unified target's tp4/tep4 and dep4 ones.
 """
 
 from __future__ import annotations
@@ -13,8 +13,6 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Approved exception: QSA's sparse path never reaches the thop attention op's
 # sparse argument group, so there is no torch.ops surface for this computation.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
@@ -23,6 +21,8 @@ from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import (
     triton_qsa_paged_sparse_gqa as _triton_qsa_paged_sparse_gqa,
 )
+
+from .._op import Arch, Cell, OpWrapper
 
 _CHECKPOINT = dict(
     q_heads=24,
@@ -102,7 +102,7 @@ def _straddling(segments, kv_heads: int) -> int:
 
 
 def _unified(segments, member: dict, launches, **overrides) -> dict:
-    """A cell of this target's call: `member`'s heads, table and trunk layout, its pool
+    """A cell of the unified target's call: `member`'s heads, table and trunk layout, its pool
     straddling `_OFFSET_EDGE`."""
     return _decode(
         segments,

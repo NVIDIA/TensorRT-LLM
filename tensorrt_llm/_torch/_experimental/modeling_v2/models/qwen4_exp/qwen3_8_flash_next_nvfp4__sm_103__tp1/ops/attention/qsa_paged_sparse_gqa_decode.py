@@ -51,12 +51,13 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass.cute.runtime import from_dlpack, make_ptr
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa import (
+    qsa_paged_sparse_gqa as _composition,
+)
 
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
 # surface; its row-count PDL policy is reached as Python.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
-
-from .qsa_paged_sparse_gqa import qsa_paged_sparse_gqa as _composition
 
 #: Output elements a merge CTA covers (four adjacent ones a lane of each warp).
 CHUNK = 128

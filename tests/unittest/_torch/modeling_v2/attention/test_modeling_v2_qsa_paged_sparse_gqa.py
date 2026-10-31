@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's qsa_paged_sparse_gqa variant (`__r26`).
+"""GPU test for the unified target's qsa_paged_sparse_gqa variant (`__r26`).
 
 The paged state is real: one `[pages, slot_pages, kv, tpb, D]` HND pool whose
 layer planes are the call's K and V -- tp1's cells one layer's adjacent pair,
@@ -24,12 +24,12 @@ import re
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_paged_sparse_gqa__r26 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa import (  # noqa: E501
     qsa_paged_sparse_gqa as op,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_sparse_gqa requires a CUDA device"
