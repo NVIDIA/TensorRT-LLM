@@ -202,6 +202,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_ga
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (
+    fp8_block_scale_moe_runner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -283,7 +286,6 @@ from .ops.moe.cute_dsl_nvfp4_grouped_gemm import cute_dsl_nvfp4_grouped_gemm
 from .ops.moe.fp4_block_scale_moe_renorm_permuted import fp4_block_scale_moe_renorm_permuted
 from .ops.moe.fp4_block_scale_moe_renorm_routed import fp4_block_scale_moe_renorm_routed
 from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
-from .ops.moe.fp8_block_scale_moe_runner import fp8_block_scale_moe_runner
 from .ops.moe.fused_sigmoid_gate_mul_add import fused_sigmoid_gate_mul_add
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace

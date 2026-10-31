@@ -200,6 +200,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_ga
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_post_inject import (
     qwen4_exp_post_inject,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.fp8_block_scale_moe_runner import (
+    fp8_block_scale_moe_runner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -231,7 +234,6 @@ from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
 from .ops.gemm.cublas_mm__r1 import cublas_mm
 from .ops.moe.fp4_block_scale_moe_runner__r4 import MAX_CERTIFIED_TOKENS as _MOE_MAX_ROWS
 from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
-from .ops.moe.fp8_block_scale_moe_runner__r40 import fp8_block_scale_moe_runner
 from .ops.moe.fused_sigmoid_gate_mul_add__r12 import fused_sigmoid_gate_mul_add
 from .ops.moe.renorm_moe_routing_op__r34 import renorm_moe_routing_op
 from .ops.norm.flashinfer_gemma_rmsnorm__r36 import flashinfer_gemma_rmsnorm
@@ -354,7 +356,7 @@ _TIE_BREAK_LARGE = int(TopKTieBreak.LARGE)
 # The draft experts' activation scales are fp32, not the UE8M0 power-of-two form.
 _MTP_MOE_USE_UE8M0 = False
 # Rows per draft FP8 runner call: its 128-expert windows are certified up to one 8192-row
-# chunk (`fp8_block_scale_moe_runner__r40`). The rows an attention-DP group gathers (up to
+# chunk (`fp8_block_scale_moe_runner`). The rows an attention-DP group gathers (up to
 # its size times a rank's) run in chunks of it.
 _MTP_MOE_MAX_ROWS = 8192
 

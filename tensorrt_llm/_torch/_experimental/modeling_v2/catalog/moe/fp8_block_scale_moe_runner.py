@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """DeepSeek-style FP8 block-scale mixture-of-experts layer: given top-k +
 grouped FC1 GEMM + SwiGLU + FP8 requantization + grouped FC2 GEMM +
-routing-weighted combine, in one trtllm-gen call."""
+routing-weighted combine, in one trtllm-gen call.
+
+The qwen4 unified target's variant (r40) of the qwen4_exp tp1 target's
+`ops/moe/fp8_block_scale_moe_runner`, copied from it."""
 
 from __future__ import annotations
 
@@ -11,12 +14,8 @@ from typing import Optional
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+
+from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
 #: Block edge on every scale axis: 1x128 activations, 128x128 weights.
 BLOCK = 128
@@ -67,6 +66,12 @@ def _geom(hidden, inter, num_experts, top_k, offset=0, local=None):
 _CKPT = _geom(2560, 640, 512, 10)
 
 
+def _window(offset: int) -> dict:
+    """One rank's 128-expert window of the 512 (the qwen4 unified target at tp4,
+    tep4 and dep4): the router still ranks all 512, so `num_experts` stays 512."""
+    return _geom(2560, 640, 512, 10, offset=offset, local=128)
+
+
 class Fp8BlockScaleMoeRunner(OpWrapper):
     """One FP8 block-scale MoE layer over e4m3 activations, entered pre-routed.
 
@@ -115,13 +120,41 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
             why="16384 rows: max_num_tokens of the tuned config; past the last tuning bucket",
             spec=dict(tokens=16384, **_CKPT),
         ),
+        # The qwen4 unified target: every member runs the MTP experts as four
+        # 128-wide windows, one per rank -- at tp4 too, where 640 / 4 = 160 is not
+        # a multiple of 128 and the intermediate cannot be split. One cell per
+        # window offset, each at a row count the MTP layer reaches.
+        Cell(
+            why="unified MTP drafter decode: one token, rank 0's 128-expert window",
+            spec=dict(tokens=1, **_window(0)),
+        ),
+        Cell(
+            why="unified: 128 drafter rows, the largest captured batch; rank 1's window",
+            spec=dict(tokens=128, **_window(128)),
+        ),
+        Cell(
+            why="unified: 1024 rows, the first draft over mtp7's 128 x 8 verify rows; window 2",
+            spec=dict(tokens=1024, **_window(256)),
+        ),
+        Cell(
+            why="unified: 8192 rows, a max_num_tokens context chunk; the last window (384)",
+            spec=dict(tokens=8192, **_window(384)),
+        ),
     )
 
     note = """
     Metadata consumed: none. Two process-global caches sit behind the call --
     the autotuner's profiling cache and the C++ runner cache -- and a warm
     tuned tactic is bitwise equal to the cold fallback (the test holds this at
-    256 tokens).
+    256 tokens, for the whole stack and for a 128-expert window, which tunes
+    under its own `local_num_experts` key).
+
+    The op is a Python `torch.library.custom_op`
+    (`trtllm::fp8_block_scale_moe_runner` in
+    `_torch/custom_ops/trtllm_gen_custom_ops.py`) over the compiled-in C++ class
+    `torch.classes.trtllm.FP8BlockScaleMoERunner`
+    (`cpp/tensorrt_llm/thop/moe/trtllmGen/fp8BlockScaleMoe.cpp`), which launches
+    trtllm-gen's precompiled batched-GEMM cubins: nothing is JIT-compiled.
 
     Preconditions. `hidden_states` is `[T, H]` e4m3 and `hidden_states_scale`
     `[H/128, T]` fp32 (see the class docstring); weights are the checkpoint's
@@ -135,13 +168,33 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     Supply distinct ids per row: a repeated id counted once at 16 tokens and
     twice at 256 (the token count picks the routing kernel).
 
-    The window: local slot i answers for global id `local_expert_offset + i`.
-    Nothing checks the window against `num_experts`; a token with no slot in it
-    comes back bitwise zero, and a window starting at `num_experts` returns all
-    zeros. Ids outside the routing space (negative, `>= num_experts`) were
-    measured to be dropped; the router never emits one, and no cell certifies it.
-    Four 128-wide windows of 512 summed match the full call inside the test's band
-    but not bitwise (each rounds its partial to bf16).
+    The window: local slot i answers for global id `local_expert_offset + i`,
+    and `num_experts` stays the routing space (512) on every window call. The
+    weights and all four scale tensors hold the window's experts only: the op
+    compares each one's dim 0 with `local_num_experts` and raises on the whole
+    stack (the test holds all four). A token with no slot in the window comes
+    back bitwise zero (every window cell holds this).
+
+    The qwen4 unified target's four 128-wide windows of 512 are certified at the
+    row counts its MTP layer reaches, one window offset per cell, on sm_103: 1
+    to 8192 rows, at most 7.95 bf16 ulp per element of the row max and 0.227
+    ulp RMS, inside the test's 16 / 0.75 gate. Each cell asserts some slot routes
+    into its window (2 of 10 at one token, 20345 of 81920 at 8192 rows). The four
+    windows' bf16 outputs added in fp32 -- what the target's all-reduce or
+    reduce-scatter adds -- sit at most 4.41 / 0.297 ulp from the 512-expert
+    reference at 1, 128 and 1024 rows, and the sum with any one window left out
+    fails the gate. Not bitwise to the 512-expert call (each window rounds its
+    partial to bf16): at most 1.97 / 0.187 ulp from it.
+
+    `num_experts` passed as the window's own count (128) puts windows 1..3 past
+    the routing space: at 1, 4 and 5 rows the op answers all zeros with no
+    error, and at 16 rows it reads out of bounds (an illegal memory access) --
+    ids `>= num_experts` are dropped only at small row counts. `is_valid`
+    refuses a window that starts outside `[0, num_experts)`; window 0 of that
+    mistake still passes it, and ids past `num_experts` cannot be seen without
+    reading the ids. A window that starts inside the routing space and runs
+    past its end ([448, 576) of 512) computes its in-range experts correctly
+    (measured at 1 to 1024 rows).
 
     Inert on the certified path, bitwise: `routing_method_type` 0/1/2/4 (the
     pre-routed path forces the routing postprocess), `n_group`/`topk_group`
@@ -150,10 +203,11 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     applied after the FC1 requantization; None is bitwise equal to omitting it.
 
     Silent on the raw op, refused by `is_valid` (the test holds the strided
-    `hidden_states` refusal): any non-contiguous tensor (read as dense, 55-115
-    ulp RMS off); `act_type != 0` (the Python runner forces
-    SwiGlu, so 1 and 2 are bitwise identical to 0); `routing_bias` alongside
-    `topk_ids` (ignored; a +-1e3 bias leaves the output bitwise unchanged).
+    `hidden_states` and the outside-the-routing-space refusals): any
+    non-contiguous tensor (read as dense, 55-115 ulp RMS off); `act_type != 0`
+    (the Python runner forces SwiGlu, so 1 and 2 are bitwise identical to 0);
+    `routing_bias` alongside `topk_ids` (ignored; a +-1e3 bias leaves the output
+    bitwise unchanged); a `local_expert_offset` outside `[0, num_experts)`.
     `num_fused_shared_experts > 0` is rejected loudly on the pre-routed path,
     which is the only path the C++ runner's small-tile tactic exclusion guards.
 
@@ -161,21 +215,26 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
     states): an upstream defect, eager is unaffected.
 
     Hard limits
-      T            certified at 1, 20 and 16384 (max_num_tokens of the tuned config);
-                   chunk above it, not probed. Autotuner buckets stop at
+      T            whole stack certified at 1, 20 and 16384 (max_num_tokens of the
+                   tuned config); 128-expert windows at 1, 128, 1024 and 8192
+                   (the unified target's max_num_tokens chunk). Chunk above
+                   them, not probed. Autotuner buckets stop at
                    `tune_max_num_tokens` (default 8192, which the target
                    leaves): past it a call runs the 8192 bucket's tactic; a
                    larger value makes the op append a bucket at that size
       top_k        <= 32 (raises past it); certified 10, the checkpoint's
       E, H, I      certified at the checkpoint's 512, 2560, 640
+      window       the whole stack, and 128 wide at offsets 0, 128, 256 and 384 of 512
 
     Not certified (the statements above were measured at bring-up and are not
-    re-driven by the test): expert windows (`local_expert_offset` /
-    `local_num_experts` other than the full stack), repeated or out-of-range
-    ids, `gemm1_clamp_limit`, the inert arguments, `output=`, the registered
-    fake, the op's loud rejections. Nor: the in-kernel routing path
-    (`routing_logits` given), multi-rank execution, geometries other than the
-    checkpoint's, sm_100.
+    re-driven by the test): windows of other widths (a 256-wide dep2 window,
+    say) or offsets, a window past the routing space's end, repeated or
+    out-of-range ids, `gemm1_clamp_limit`, the inert arguments, `output=`, the
+    registered fake, the op's other loud rejections. Nor: CUDA-graph capture
+    of the call (the cells run eager), the in-kernel routing path
+    (`routing_logits` given), multi-rank execution (every window here runs on
+    one device; the cross-rank sum is the collective's), geometries other than
+    the checkpoint's, sm_100.
     """
 
     def __call__(
@@ -325,9 +384,9 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
     ) -> None:
-        """Three inputs the op accepts and answers wrongly, each measured.
+        """Four inputs the op accepts and answers wrongly, each measured.
 
-        The transposed activation-scale buffer at `T == H/128` is the fourth,
+        The transposed activation-scale buffer at `T == H/128` is the fifth,
         and no metadata check can see it.
         """
         # The kernel takes raw data pointers: a strided view is read as dense.
@@ -360,6 +419,16 @@ class Fp8BlockScaleMoeRunner(OpWrapper):
                 "routing_bias is ignored when topk_ids/topk_weights are given "
                 "(routing has already happened); fold it into the router logits"
             )
+        # `num_experts` is the routing space, not the window: a window that
+        # starts at or past it holds no routable id. Passing the window's own
+        # count as `num_experts` puts ranks 1..3 there, and the op answers all
+        # zeros with no error (measured at 1, 4 and 5 rows; at 16 rows the ids
+        # past the routing space then read out of bounds).
+        assert 0 <= local_expert_offset < num_experts, (
+            f"local_expert_offset={local_expert_offset} is outside the routing space "
+            f"[0, num_experts={num_experts}); num_experts is every routed expert "
+            "(512 for a 128-expert window of 512), not the window's count"
+        )
 
 
 fp8_block_scale_moe_runner = Fp8BlockScaleMoeRunner()
