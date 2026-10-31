@@ -1052,6 +1052,9 @@ class KvCacheCreator:
         self._max_seq_len = max_seq_len
         # Estimation can shrink _max_seq_len; cache ownership must stay fixed.
         self._unification_max_seq_len = max_seq_len
+        # The estimation KV manager can lower _max_seq_len to what its small
+        # pool fits; serving restores this value.
+        self._configured_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
@@ -2045,7 +2048,7 @@ class KvCacheCreator:
             self._mapping,
             max_batch_size=self._max_batch_size,
             max_num_tokens=self._max_num_tokens,
-            max_seq_len=self._max_seq_len,
+            max_seq_len=self._configured_max_seq_len,
             enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
         )
         # A decode arena can first appear after the peak prefill step. Reserve
@@ -2078,7 +2081,7 @@ class KvCacheCreator:
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
-                self._max_num_tokens, self._max_seq_len)
+                self._max_num_tokens, self._configured_max_seq_len)
             budget_before = kv_cache_max_memory
             workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
                 budget_before, workspace_memory)
@@ -2120,7 +2123,7 @@ class KvCacheCreator:
             self._kv_cache_config,
             self._max_batch_size,
             self._max_num_tokens,
-            self._max_seq_len,
+            self._configured_max_seq_len,
             self._llm_args.enable_chunked_prefill,
             workspace_is_chunked_prefill_bounded,
             chunked_workspace_profiled=profiled_mla_chunks,
@@ -2132,19 +2135,28 @@ class KvCacheCreator:
                 and get_sm_version() >= 100))
         if w_bytes_per_token > 0 and kv_len_cap:
             budget_before = kv_cache_max_memory
+            k_bytes_per_token = self._get_kv_size_per_token().slope
+            if (mapping.cp_config.get('cp_type') == CpType.HELIX
+                    and not self._is_disagg):
+                # The cap counts global attended tokens; Helix stores each
+                # token's KV on one CP rank, so a global token costs this rank
+                # 1/cp of the rank-local slope.
+                k_bytes_per_token /= mapping.cp_size
             workspace_reserve, self._fp8_ctx_mla_kv_len_cap = (
-                get_mla_context_workspace_reserve(
-                    budget_before,
-                    self._get_kv_size_per_token().slope, w_bytes_per_token,
-                    kv_len_cap))
+                get_mla_context_workspace_reserve(budget_before,
+                                                  k_bytes_per_token,
+                                                  w_bytes_per_token,
+                                                  kv_len_cap))
             if (mapping.cp_config.get('cp_type') == CpType.HELIX
                     and not self._is_disagg):
                 # Aggregated helix ranks schedule independently but must admit
                 # the same context batches, so they agree on the smallest cap.
-                local_cap = self._fp8_ctx_mla_kv_len_cap or 0
-                cap = py_executor.dist.allreduce(local_cap, op=ReduceOp.MIN)
-                self._fp8_ctx_mla_kv_len_cap = cap
-                workspace_reserve = cap * w_bytes_per_token
+                # A rank without a cap sends -1, which leaves every rank uncapped.
+                local_cap = self._fp8_ctx_mla_kv_len_cap
+                cap = py_executor.dist.allreduce(
+                    -1 if local_cap is None else local_cap, op=ReduceOp.MIN)
+                self._fp8_ctx_mla_kv_len_cap = cap if cap >= 0 else None
+                workspace_reserve = max(cap, 0) * w_bytes_per_token
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(

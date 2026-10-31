@@ -2483,9 +2483,13 @@ def test_helix_estimation_profiles_agg_and_keeps_fraction_for_disagg(is_disagg) 
         assert kv_cache_config.max_tokens is None  # temporary estimation size not kept
 
 
-def test_agg_helix_syncs_context_mla_admission_cap() -> None:
-    """Aggregated helix ranks must admit the same context batches, so the
-    context-MLA admission cap is the minimum across ranks."""
+def _configure_context_mla_capacity(mapping: Mapping, other_rank_cap: int = 100):
+    """Run configure_kv_cache_capacity with the context-MLA reserve active.
+
+    The estimation KV manager lowers _max_seq_len from 4096 to 1024 before
+    capacity is configured. ``other_rank_cap`` is what the cross-rank MIN
+    returns under aggregated helix.
+    """
     kv_cache_config = KvCacheConfig(enable_block_reuse=False)
     model_engine = Mock()
     model_engine.model.model_config.attn_backend = "TRTLLM"
@@ -2499,7 +2503,7 @@ def test_agg_helix_syncs_context_mla_admission_cap() -> None:
     ):
         creator = KvCacheCreator(
             model_engine=model_engine,
-            mapping=Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+            mapping=mapping,
             net_max_seq_len=4096,
             kv_connector_manager=None,
             max_num_tokens=256,
@@ -2520,13 +2524,14 @@ def test_agg_helix_syncs_context_mla_admission_cap() -> None:
     py_executor.warmup_scope.return_value = nullcontext()
     py_executor.dist.mapping.rank = 0
     py_executor.dist.broadcast.side_effect = lambda value, root: value
-    # Another rank has a smaller budget and so a smaller cap.
-    py_executor.dist.allreduce.return_value = 100
+    py_executor.dist.allreduce.return_value = other_rank_cap
     py_executor.enqueue_requests.return_value = [1]
     py_executor.await_responses.return_value = []
     kv_manager = Mock()
     kv_manager.get_kv_cache_stats.return_value = SimpleNamespace(allocated_bytes=0)
     py_executor.resource_manager.resource_managers.get.side_effect = [kv_manager, None]
+    get_kv_len_cap = Mock(wraps=get_mla_context_workspace_kv_len_cap)
+    get_fixed_bytes = Mock(return_value=0)
 
     with (
         patch("tensorrt_llm._torch.pyexecutor._util.get_sm_version", return_value=100),
@@ -2550,11 +2555,48 @@ def test_agg_helix_syncs_context_mla_admission_cap() -> None:
             "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_is_chunked_prefill_bounded",
             return_value=True,
         ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_mla_context_workspace_kv_len_cap",
+            get_kv_len_cap,
+        ),
+        patch(
+            "tensorrt_llm._torch.pyexecutor._util.get_attention_workspace_fixed_bytes",
+            get_fixed_bytes,
+        ),
     ):
         assert creator.try_prepare_estimation()
+        # The estimation KV manager can lower _max_seq_len to what its small pool fits.
+        creator._max_seq_len = 1024
         creator.configure_kv_cache_capacity(py_executor)
+    return creator, py_executor, kv_cache_config, get_kv_len_cap, get_fixed_bytes
 
-    # Local cap: the 512-byte budget split at k=3, w=1 reserves 128 bytes -> 128 tokens.
-    py_executor.dist.allreduce.assert_called_once_with(128, op=ReduceOp.MIN)
-    assert creator._fp8_ctx_mla_kv_len_cap == 100
-    assert kv_cache_config.max_gpu_total_bytes == 512 - 100
+
+@pytest.mark.parametrize(
+    "other_rank_cap, expected_cap", [(100, 100), (-1, None)], ids=["min_cap", "uncapped_rank"]
+)
+def test_agg_helix_syncs_context_mla_admission_cap(
+    other_rank_cap: int, expected_cap: int | None
+) -> None:
+    """Aggregated helix ranks must admit the same context batches, so the
+    context-MLA admission cap is the minimum across ranks. A rank without a cap
+    sends -1, which leaves every rank uncapped."""
+    creator, py_executor, kv_cache_config, _, _ = _configure_context_mla_capacity(
+        Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
+        other_rank_cap,
+    )
+
+    # Local cap: k is per global token under helix (3 / cp=2 = 1.5), so the 512-byte
+    # budget split at k=1.5, w=1 reserves 204.8 bytes -> 204 tokens.
+    py_executor.dist.allreduce.assert_called_once_with(204, op=ReduceOp.MIN)
+    assert creator._fp8_ctx_mla_kv_len_cap == expected_cap
+    assert kv_cache_config.max_gpu_total_bytes == 512 - (expected_cap or 0)
+
+
+def test_capacity_reserves_use_configured_max_seq_len() -> None:
+    """Workspace reserves are sized for the max_seq_len serving runs with, not
+    the shorter one the estimation KV manager settled on."""
+    _, py_executor, _, get_kv_len_cap, get_fixed_bytes = _configure_context_mla_capacity(Mapping())
+
+    assert get_kv_len_cap.call_args.args[3] == 4096
+    assert get_fixed_bytes.call_args.kwargs["max_seq_len"] == 4096
+    py_executor.dist.allreduce.assert_not_called()
