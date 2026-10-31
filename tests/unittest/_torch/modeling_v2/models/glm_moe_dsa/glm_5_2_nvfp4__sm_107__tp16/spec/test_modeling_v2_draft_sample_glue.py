@@ -7,6 +7,7 @@ The cells, a draft loop of the target's shape (eager and as CUDA-graph replays) 
 16-rank run over four nodes.
 """
 
+__extra_import_path__ = ["."]
 import _draft_step_rank_job
 import pytest
 

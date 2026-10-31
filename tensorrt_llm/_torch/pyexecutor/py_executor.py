@@ -121,7 +121,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
-from .runtime_hooks import ExecutorEvents, runtime_hooks_of
+from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -422,6 +422,21 @@ class PendingEncoderStep:
     requests: List[LlmRequest]
     future: Future[EncoderStepResult]
     result: Optional[EncoderStepResult] = None
+
+
+def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
+    """Arm the process-wide features ``hooks`` opt into; return whether to arm
+    the late-compile detector after warmup.
+
+    Both are off for a model that declares neither: the SM107 MXFP8 GEMM
+    tactic table (the GEMM runner does not know the model, so it is armed
+    here) and the late-compile detector.
+    """
+    if hooks.mxfp8_pinned_tactics:
+        # Imported on use: only an opted-in model needs the table.
+        from tensorrt_llm._torch.custom_ops import mxfp8_cute_pinned_tactics
+        mxfp8_cute_pinned_tactics.arm()
+    return hooks.late_compile_detect
 
 
 def _request_flag(request, name: str) -> bool:
@@ -779,6 +794,20 @@ class PyExecutor:
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
         self.stream_interval = self.llm_args.stream_interval
+        # Streaming: also emit on decoding iterations 2..N when the model's
+        # runtime hooks ask for it (RuntimeHooks.first_content_emit_iters; 1,
+        # the default, keeps the stock schedule).
+        model_hooks = runtime_hooks_of(model_engine.model)
+        self.first_content_emit_iters = max(
+            1, model_hooks.first_content_emit_iters)
+        if self.stream_interval > 1 and self.first_content_emit_iters > 1:
+            logger.info(
+                f"first-content emission engaged: emit on decoding iters "
+                f"<= {self.first_content_emit_iters} (stream_interval "
+                f"{self.stream_interval}), rank {self.dist.rank}")
+        self._late_compile_detect = False
+        if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
+            self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
@@ -1135,6 +1164,10 @@ class PyExecutor:
                 with _distributed_warmup_guard(self.dist, self.dist.mapping):
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
+
+        if self._late_compile_detect:
+            from tensorrt_llm._torch.late_compile import mark_server_ready
+            mark_server_ready()
 
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
@@ -10352,6 +10385,28 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _should_emit_response(self,
+                              request: LlmRequest,
+                              emit_first_iter: bool = True,
+                              first_gen_emit: bool = False) -> bool:
+        """Whether ``_handle_responses`` emits a response for ``request`` now.
+
+        Emits on decoding iteration 1, on finish, every ``stream_interval``
+        iterations, on the first generation-only content, and on iterations
+        ``2..first_content_emit_iters``.
+        """
+        decoding_iter = request.py_decoding_iter
+        if request.is_finished:
+            return True
+        if decoding_iter == 1:
+            # The early-emit prototype issues the (non-terminal) iter-1
+            # response from `_emit_first_token_responses`; suppress it here.
+            return emit_first_iter
+        if (self.first_content_emit_iters > 1
+                and 1 < decoding_iter <= self.first_content_emit_iters):
+            return True
+        return first_gen_emit or decoding_iter % self.stream_interval == 0
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -10445,20 +10500,12 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
-            # A generation-only request skipped its iteration-1 response (the
-            # CTX returned the first token); without this its first streamed
-            # content waits for decoding iteration stream_interval.
+            # A generation-only request's first streamed content must not wait
+            # for stream_interval after the context-side first token.
             first_gen_emit = (request.is_generation_only_request
                               and not request.py_gen_first_emitted)
-            should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or first_gen_emit or
-                           request.py_decoding_iter % self.stream_interval == 0)
-            # The early-emit prototype issues the (non-terminal) iter-1
-            # response from `_emit_first_token_responses`; suppress it here.
-            if (not emit_first_iter and request.py_decoding_iter == 1
-                    and not request.is_finished):
-                should_emit = False
-            if should_emit:
+            if self._should_emit_response(request, emit_first_iter,
+                                          first_gen_emit):
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(

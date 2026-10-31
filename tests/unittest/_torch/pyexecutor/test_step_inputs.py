@@ -602,3 +602,343 @@ def test_threads_with_their_own_packs_keep_them_apart():
     assert results == {0: (True, 1), 1: (True, 1)}
     assert dsts[0].tolist() == [1] * 4
     assert dsts[1].tolist() == [2] * 4
+
+
+def _random_pack_run(parallel: bool, seed: int, overlap: bool):
+    """Stage a fixed random mix of host copies (2-D page-table rows included) and device copies that read a host
+    copy's destination; return every destination after the flush."""
+    g = torch.Generator().manual_seed(seed)
+    pack = StepInputPack(_device(), parallel_scatter=parallel)
+    big = _zeros(4096)
+    table = torch.zeros((8, 64), dtype=torch.int32, device=_device())
+    out = _zeros(256)
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        for k in range(24):
+            n = int(torch.randint(1, 64, (1,), generator=g))
+            step_inputs.copy_(
+                big[k * 128 : k * 128 + n],
+                torch.randint(0, 1 << 30, (n,), generator=g, dtype=torch.int32),
+            )
+        step_inputs.copy_(
+            table[:3, :40], torch.randint(0, 1 << 30, (3, 40), generator=g, dtype=torch.int32)
+        )
+        if overlap:
+            # A later host copy overwrites part of an earlier one: order matters, so the serial scatter must run.
+            step_inputs.copy_(big[0:4], torch.full((4,), -7, dtype=torch.int32))
+        step_inputs.copy_(out[:64], big[:64])
+        step_inputs.copy_(out[64:96], big[128:160])
+        step_inputs.flush()
+    torch.cuda.synchronize()
+    return big.cpu(), table.cpu(), out.cpu()
+
+
+@pytest.mark.parametrize("overlap", [False, True], ids=["disjoint", "overlapping"])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_parallel_scatter_writes_what_the_serial_scatter_writes(seed, overlap):
+    serial = _random_pack_run(False, seed, overlap)
+    parallel = _random_pack_run(True, seed, overlap)
+    for a, b in zip(serial, parallel):
+        assert torch.equal(a, b)
+
+
+def _compiled_variants(kernel) -> int:
+    """Compiled variants of a Triton kernel on this device, or -1 where this Triton keeps them elsewhere."""
+    caches = getattr(kernel, "device_caches", None)
+    if not caches:
+        return -1
+    cache = caches.get(torch.cuda.current_device())
+    return len(cache[0]) if cache else 0
+
+
+@pytest.mark.parametrize("count", [1, 15, 16, 17, 120])  # 120: 240 of the 256 descriptors
+def test_parallel_scatter_is_bitwise_for_every_copy_count(count):
+    """``first`` (the device copies' descriptor offset) is the step's host-copy count: one compiled variant serves
+    every count, so a new count never compiles mid-serving."""
+    pack = StepInputPack(_device(), parallel_scatter=True)
+    width = 3
+    dst = _zeros(count * width)
+    mirror = _zeros(count * width)
+    g = torch.Generator().manual_seed(count)
+    values = torch.randint(
+        -(1 << 31), (1 << 31) - 1, (count, width), generator=g, dtype=torch.int32
+    )
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        for i in range(count):
+            step_inputs.copy_(dst[i * width : (i + 1) * width], values[i])
+        for i in range(count):
+            step_inputs.copy_(mirror[i * width : (i + 1) * width], dst[i * width : (i + 1) * width])
+        assert len(pack.h2d) == count and len(pack.d2d) == count
+        step_inputs.flush()
+    torch.cuda.synchronize()
+    assert torch.equal(dst.cpu(), values.flatten())
+    assert torch.equal(mirror.cpu(), values.flatten())
+    variants = _compiled_variants(step_inputs._parallel_scatter_kernel)
+    assert variants in (-1, 1, 2), variants  # at most one per DEVICE_SRC
+
+
+def test_parallel_scatter_only_for_order_free_packs():
+    assert step_inputs._parallel_ok([(0, 0, 8), (8, 0, 8)], [])
+    assert not step_inputs._parallel_ok([(0, 0, 8), (4, 0, 8)], [])
+    # A device copy may read a host copy's destination (the launches run in order) ...
+    assert step_inputs._parallel_ok([(0, 0, 8)], [(100, 0, 8)])
+    # ... but not another device copy's destination, and device destinations must be disjoint.
+    assert not step_inputs._parallel_ok([], [(100, 0, 8), (200, 100, 8)])
+    assert not step_inputs._parallel_ok([], [(100, 0, 8), (104, 300, 8)])
+
+
+def test_parallel_scatter_is_off_by_default():
+    assert not StepInputPack(_device()).parallel_scatter
+
+
+def _graph_case(early=False, epoch=False):
+    """A pack with the in-graph prologue and a graph that starts with it and then reads the destinations."""
+    pack = StepInputPack(
+        _device(), parallel_scatter=True, in_graph=True, early_copy=early, step_epoch=epoch
+    )
+    a, b, c = _zeros(16), _zeros(16), _zeros(16)
+    out = _zeros(48)
+    graph = torch.cuda.CUDAGraph()
+    with step_inputs.active(pack):
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            assert step_inputs.capture_prologue() is pack
+            out.copy_(torch.cat([a, b, c]))
+    return pack, graph, (a, b, c), out
+
+
+def _step(pack, graph, dsts, values, overlap=False, flush=True):
+    a, b, c = dsts
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        step_inputs.copy_(a, _host(values[0]))
+        step_inputs.copy_(b, _host(values[1]))
+        if overlap:
+            step_inputs.copy_(a[:4], _host([-1, -2, -3, -4]))
+        step_inputs.copy_(c, a)  # a device copy reading a host copy's destination
+        if flush:
+            step_inputs.flush(in_graph=True)
+        else:
+            step_inputs.discard()
+            step_inputs.flush(in_graph=True)
+    graph.replay()
+
+
+def test_in_graph_pack_is_issued_by_the_replay():
+    pack, graph, dsts, out = _graph_case()
+    for step in range(5):
+        va = [step * 100 + i for i in range(16)]
+        vb = [step * 1000 - i for i in range(16)]
+        _step(pack, graph, dsts, (va, vb))
+        torch.cuda.synchronize()
+        assert out.tolist() == va + vb + va, step
+        # Nothing was issued outside the graph: the window carried the copies.
+        assert int(pack.ghost[:8].view(torch.int64)[0]) == 2
+
+
+def test_in_graph_pack_not_order_free_is_issued_eagerly():
+    pack, graph, dsts, out = _graph_case()
+    va = list(range(16))
+    vb = list(range(100, 116))
+    _step(pack, graph, dsts, (va, vb), overlap=True)
+    torch.cuda.synchronize()
+    expect_a = [-1, -2, -3, -4] + va[4:]
+    assert out.tolist() == expect_a + vb + expect_a
+    # The window was zeroed, so the prologue wrote nothing over the eager result.
+    assert not pack.ghost[:16].any()
+
+
+def test_in_graph_replay_without_a_pack_reapplies_nothing():
+    pack, graph, dsts, out = _graph_case()
+    _step(pack, graph, dsts, (list(range(16)), list(range(16))))
+    torch.cuda.synchronize()
+    dsts[0].fill_(7)
+    _step(pack, graph, dsts, ([0] * 16, [0] * 16), flush=False)
+    torch.cuda.synchronize()
+    assert dsts[0].tolist() == [7] * 16
+
+
+@pytest.mark.parametrize("early", [False, True], ids=["prologue_copy", "early_copy"])
+def test_in_graph_pack_lands_every_step(early):
+    pack, graph, dsts, out = _graph_case(early)
+    assert pack.early_copy is early
+    for step in range(6):
+        va = [step * 100 + i for i in range(16)]
+        vb = [step * 1000 - i for i in range(16)]
+        _step(pack, graph, dsts, (va, vb), overlap=step % 2 == 1)
+        torch.cuda.synchronize()
+        head = [-1, -2, -3, -4] if step % 2 == 1 else []
+        expect_a = head + va[len(head) :]
+        assert out.tolist() == expect_a + vb + expect_a, step
+
+
+def _history_run(pack, graph, dsts, out, steps, before_replay=None, before_upload=None):
+    """Steps back to back without host syncs; each replay's output is copied to a history row behind it (same
+    stream), so a later upload that overwrote the window too early shows up as the wrong step's values."""
+    hist = _zeros(steps, out.numel())
+    expect = []
+    for step in range(steps):
+        va = [step * 100 + i for i in range(16)]
+        vb = [step * 1000 - i for i in range(16)]
+        expect.append(va + vb + va)
+        a, b, c = dsts
+        with step_inputs.active(pack):
+            step_inputs.begin()
+            step_inputs.copy_(a, _host(va))
+            step_inputs.copy_(b, _host(vb))
+            step_inputs.copy_(c, a)
+            if before_upload is not None:
+                before_upload(step)
+            step_inputs.flush(in_graph=True)
+        if before_replay is not None:
+            before_replay(step)
+        graph.replay()
+        hist[step].copy_(out)
+    torch.cuda.synchronize()
+    return hist.tolist(), expect
+
+
+def test_early_copy_waits_for_the_previous_prologue_before_overwriting_the_window():
+    """A slow GPU: the replay of step N (and its prologue) is held back behind a long kernel while the host already
+    uploads step N+1; that upload must wait for step N's prologue to consume the window."""
+    pack, graph, dsts, out = _graph_case(early=True)
+    hist, expect = _history_run(
+        pack, graph, dsts, out, 4, before_replay=lambda step: torch.cuda._sleep(_SLEEP_CYCLES // 4)
+    )
+    assert hist == expect
+
+
+def test_early_copy_prologue_waits_for_a_slow_upload():
+    """A slow copy stream: each step's upload is held back behind a long kernel on the copy stream; the prologue must
+    wait for it (staged_ready), and the next host fill must wait for the upload to have read the window."""
+    pack, graph, dsts, out = _graph_case(early=True)
+
+    def slow_copy(step):
+        with torch.cuda.stream(pack.copy_stream):
+            torch.cuda._sleep(_SLEEP_CYCLES // 4)
+
+    hist, expect = _history_run(pack, graph, dsts, out, 4, before_upload=slow_copy)
+    assert hist == expect
+
+
+def test_early_copy_with_a_slow_host():
+    """A slow host: the GPU idles between steps (the window lands long before the replay)."""
+    import time
+
+    pack, graph, dsts, out = _graph_case(early=True)
+    hist, expect = _history_run(
+        pack, graph, dsts, out, 3, before_replay=lambda step: time.sleep(0.05)
+    )
+    assert hist == expect
+
+
+@pytest.mark.parametrize("early", [False, True], ids=["prologue_copy", "early_copy"])
+def test_in_graph_replay_after_quiesce_reapplies_nothing(early):
+    pack, graph, dsts, out = _graph_case(early)
+    _step(pack, graph, dsts, (list(range(16)), list(range(16))))
+    torch.cuda.synchronize()
+    dsts[0].fill_(7)
+    pack.quiesce_graph_window()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert dsts[0].tolist() == [7] * 16
+
+
+def test_early_copy_needs_in_graph():
+    assert not StepInputPack(_device(), parallel_scatter=True, early_copy=True).early_copy
+
+
+def test_prologue_op_needs_early_copy_and_is_off_by_default():
+    def op(window, epoch, max_desc):
+        raise AssertionError("not called")
+
+    assert StepInputPack(_device(), parallel_scatter=True, early_copy=True).prologue_op is None
+    assert (
+        StepInputPack(_device(), parallel_scatter=True, in_graph=True, prologue_op=op).prologue_op
+        is None
+    )
+
+
+def test_in_graph_needs_parallel_scatter_and_is_off_by_default():
+    assert not StepInputPack(_device()).in_graph
+    assert not StepInputPack(_device(), in_graph=True).in_graph
+
+
+def test_in_graph_replay_outside_the_pack_context_reapplies_nothing():
+    pack, graph, dsts, out = _graph_case()
+    _step(pack, graph, dsts, (list(range(16)), list(range(16))))
+    torch.cuda.synchronize()
+    dsts[0].fill_(7)
+    # What the graph runner does for a replay outside the pack's context.
+    assert not step_inputs.is_active(pack)
+    pack.quiesce_graph_window()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert dsts[0].tolist() == [7] * 16
+
+
+def test_step_epoch_is_off_by_default_and_needs_in_graph():
+    assert StepInputPack(_device(), parallel_scatter=True, in_graph=True).epoch is None
+    assert StepInputPack(_device(), parallel_scatter=True, step_epoch=True).epoch is None
+    with step_inputs.active(StepInputPack(_device(), parallel_scatter=True, in_graph=True)):
+        assert step_inputs.step_epoch() is None
+    assert step_inputs.step_epoch() is None
+
+
+@pytest.mark.parametrize("early", [False, True], ids=["prologue_copy", "early_copy"])
+def test_step_epoch_advances_once_per_replay_and_never_resets(early):
+    pack, graph, dsts, out = _graph_case(early, epoch=True)
+    with step_inputs.active(pack):
+        assert step_inputs.step_epoch() is pack.epoch
+    torch.cuda.synchronize()
+    start = int(pack.epoch.item())  # the warm-up compile launched the prologue once
+    assert start == 1
+    for step in range(5):
+        va = [step * 100 + i for i in range(16)]
+        vb = [step * 1000 - i for i in range(16)]
+        # A replay with a new pack, one with an eagerly issued pack, and one with nothing to scatter.
+        _step(pack, graph, dsts, (va, vb), overlap=step == 2, flush=step != 3)
+        torch.cuda.synchronize()
+        assert int(pack.epoch.item()) == start + step + 1, step
+    # The copies are unchanged by the epoch.
+    _step(pack, graph, dsts, (list(range(16)), list(range(16, 32))))
+    torch.cuda.synchronize()
+    assert out.tolist() == list(range(16)) + list(range(16, 32)) + list(range(16))
+    assert int(pack.epoch.item()) == start + 6
+
+
+def test_step_epoch_is_ordered_before_the_graph_body():
+    """A kernel after the prologue in the same graph reads the bumped epoch of its own replay."""
+    pack = StepInputPack(_device(), parallel_scatter=True, in_graph=True, step_epoch=True)
+    seen = torch.zeros(4, dtype=torch.int64, device="cuda")
+    slot = torch.zeros(1, dtype=torch.int64, device="cuda")
+    graph = torch.cuda.CUDAGraph()
+    with step_inputs.active(pack):
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            step_inputs.capture_prologue()
+            seen.index_copy_(0, slot, pack.epoch)
+            slot.add_(1)
+    torch.cuda.synchronize()
+    start = int(pack.epoch.item())
+    for _ in range(4):
+        with step_inputs.active(pack):
+            pack.quiesce_graph_window()
+        graph.replay()
+    torch.cuda.synchronize()
+    assert seen.tolist() == [start + 1, start + 2, start + 3, start + 4]
+
+
+def test_eager_flush_does_not_advance_the_step_epoch():
+    pack = StepInputPack(_device(), parallel_scatter=True, in_graph=True, step_epoch=True)
+    torch.cuda.synchronize()
+    start = int(pack.epoch.item())
+    dst = _zeros(4)
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        step_inputs.copy_(dst, _host([1, 2, 3, 4]))
+        step_inputs.flush()
+    torch.cuda.synchronize()
+    assert dst.tolist() == [1, 2, 3, 4]
+    assert int(pack.epoch.item()) == start

@@ -48,7 +48,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
 from ...pyexecutor import step_inputs
 from ...pyexecutor.config_utils import is_mla
-from ...pyexecutor.h2d_cache import copy_h2d_if_changed
+from ...pyexecutor.h2d_cache import copy_h2d_pool_shared
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
 from ..kernels.sage_quant import SageQuantized, sage_quantize
@@ -1023,8 +1023,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        copy_h2d_if_changed(self.prompt_lens_cuda[:self.num_seqs],
-                            self.prompt_lens_cpu[:self.num_seqs])
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:self.num_seqs],
+                             self.prompt_lens_cpu[:self.num_seqs],
+                             pack=True)
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1228,7 +1229,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        copy_h2d_if_changed(self.prompt_lens_cuda[:num_seqs], prompt_lens)
+        copy_h2d_pool_shared(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens

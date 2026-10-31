@@ -7634,6 +7634,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                  torch_compile_config=TorchCompileConfig()
                  if piecewise else None,
                  max_seq_len=4096,
+                 modeling_v2="off",
                  trust_remote_code=True) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
             if kv_dtype == "nvfp4":
@@ -7757,6 +7758,7 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
                 # Keep the whole acceptance probe: the default buffer holds
                 # only the latest 1000 iterations.
                 max_stats_len=5000,
+                modeling_v2="off",
                 trust_remote_code=True,
                 **piecewise_kwargs) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
