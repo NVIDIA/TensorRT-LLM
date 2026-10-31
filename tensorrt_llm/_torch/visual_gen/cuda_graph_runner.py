@@ -179,10 +179,8 @@ class CUDAGraphRunner:
         logger.info(f"Capturing graph for key: {key}")
 
         # One time clone of inputs
-        static_args = [arg.clone() if isinstance(arg, torch.Tensor) else arg for arg in args]
-        static_kwargs = {
-            k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()
-        }
+        static_args = [self._clone_input(arg) for arg in args]
+        static_kwargs = {k: self._clone_input(v) for k, v in kwargs.items()}
 
         graph = torch.cuda.CUDAGraph()
         # Warmup and capture both see the host-resolved extra keys, so a
@@ -219,19 +217,34 @@ class CUDAGraphRunner:
         static_args, static_kwargs = self.static_inputs[key]
 
         for i, arg in enumerate(args):
-            if isinstance(arg, torch.Tensor):
-                static_args[i].copy_(arg)
-            else:
-                static_args[i] = arg
+            static_args[i] = self._copy_input(static_args[i], arg)
 
         for k, v in kwargs.items():
-            if isinstance(v, torch.Tensor):
-                static_kwargs[k].copy_(v)
-            else:
-                static_kwargs[k] = v
+            static_kwargs[k] = self._copy_input(static_kwargs.get(k), v)
 
         self.graphs[key].replay()
         return self.graph_outputs[key]
+
+    @staticmethod
+    def _clone_input(value: Any) -> Any:
+        """Clone one forward input into a static buffer at capture time.
+
+        Tensors are cloned; everything else is kept by reference. Subclasses extend this for
+        inputs that bundle tensors (dataclasses of tensors) so those join the static buffers.
+        """
+        return value.clone() if isinstance(value, torch.Tensor) else value
+
+    @staticmethod
+    def _copy_input(static: Any, value: Any) -> Any:
+        """Refresh one static buffer from the live input at replay time; returns the static value.
+
+        Tensors are copied in place; a non-tensor replaces the stored value. Subclasses extend
+        this together with ``_clone_input``.
+        """
+        if isinstance(value, torch.Tensor) and isinstance(static, torch.Tensor):
+            static.copy_(value)
+            return static
+        return value
 
     def wrap(self, fn):
         """Wrap a callable with CUDA graph capture/replay.

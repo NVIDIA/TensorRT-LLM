@@ -370,6 +370,36 @@ def build_packed_sequence(
     )
 
 
+def pad_packed_sequence(layout: MiniMaxH3PackedSequence, multiple: int) -> MiniMaxH3PackedSequence:
+    """Append trailing padding rows so the packed length is a multiple of ``multiple``.
+
+    Padding rows carry token tag ``-1`` and zero positions; the transformer masks them out of
+    attention through ``key_padding_mask`` (VANILLA, or FA4 via ``seqused_k`` since the padding
+    trails), writes nothing into them and never reads them back: the modality index tensors are
+    unchanged. ``build_row_timesteps`` gives them the video timestep.
+    """
+    if multiple <= 1:
+        return layout
+    pad = (-layout.sequence_length) % multiple
+    if pad == 0:
+        return layout
+    return MiniMaxH3PackedSequence(
+        sequence_length=layout.sequence_length + pad,
+        position_ids=torch.cat(
+            (
+                layout.position_ids,
+                layout.position_ids.new_zeros((pad, layout.position_ids.shape[1])),
+            )
+        ),
+        token_tags=torch.cat((layout.token_tags, layout.token_tags.new_full((pad,), -1))),
+        video_indices=layout.video_indices,
+        audio_indices=layout.audio_indices,
+        text_indices=layout.text_indices,
+        num_condition_video_rows=layout.num_condition_video_rows,
+        num_condition_audio_rows=layout.num_condition_audio_rows,
+    )
+
+
 def build_row_timesteps(
     layout: MiniMaxH3PackedSequence,
     video_timestep: float,

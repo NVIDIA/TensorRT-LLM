@@ -1692,3 +1692,76 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
     # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)
+
+
+def _layout_key_inputs(token_tags: torch.Tensor, device: str = "cpu") -> dict[str, torch.Tensor]:
+    n = token_tags.numel()
+    patch = _TINY_CONFIG["patch_size"]
+    video_patch_dim = _TINY_CONFIG["in_channels"] * patch[0] * patch[1] * patch[2]
+    return dict(
+        hidden_states=torch.randn(1, 2, video_patch_dim, device=device),
+        audio_hidden_states=torch.randn(1, 1, _TINY_CONFIG["audio_in_channels"], device=device),
+        encoder_hidden_states=None,
+        timestep=torch.tensor([1.0], device=device),
+        conditioning_timesteps=torch.tensor([1.0], device=device),
+        timestep_indices=torch.zeros(n, dtype=torch.long, device=device),
+        token_tags=token_tags.to(device),
+        position_ids=torch.zeros(n, 3, dtype=torch.long, device=device),
+        video_indices=torch.tensor([2, 3], device=device),
+        audio_indices=torch.tensor([4], device=device),
+        text_indices=torch.tensor([0, 1], device=device),
+        return_dict=False,
+    )
+
+
+def test_cuda_graph_layout_key_resolves_padding_outside_capture() -> None:
+    """The extra key validates the layout host-side and reports the padding flags."""
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    key = model._cuda_graph_layout_key
+
+    assert key(**_layout_key_inputs(torch.tensor([1, 1, 0, 0, 2]))) == (False, False)
+    assert key(**_layout_key_inputs(torch.tensor([1, 1, 0, 0, 2, -1, -1]))) == (True, False)
+    assert key(**_layout_key_inputs(torch.tensor([1, -1, 0, 0, 2, -1]))) == (True, True)
+    with pytest.raises(ValueError, match="token_tags values"):
+        key(**_layout_key_inputs(torch.tensor([1, 1, 0, 0, 5])))
+    bad = _layout_key_inputs(torch.tensor([1, 1, 0, 0, 2]))
+    bad["timestep_indices"] = torch.ones(5, dtype=torch.long)
+    with pytest.raises(ValueError, match="timestep table"):
+        key(**bad)
+
+
+def test_cuda_graph_layout_key_is_registered_with_the_runner() -> None:
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    registered: dict[str, object] = {}
+    runner = SimpleNamespace(
+        register_extra_key_fn=lambda name, fn: registered.__setitem__(name, fn)
+    )
+    model.register_cuda_graph_extra_key_fns(runner)
+    assert (
+        registered[h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY]
+        == model._cuda_graph_layout_key
+    )
+
+
+@requires_cuda
+def test_forward_with_resolved_layout_matches_eager() -> None:
+    """With the layout pre-resolved (as under graph capture) the forward is unchanged."""
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_keys_scope
+
+    torch.manual_seed(0)
+    model = h3.MiniMaxH3Transformer3DModel(_make_model_config())
+    # TRT-LLM Linears allocate their parameters uninitialised; an exact comparison needs
+    # defined weights (NaN never compares equal).
+    _initialize_diffusers_golden_weights(model)
+    model = model.to("cuda")
+    inputs = _layout_key_inputs(torch.tensor([1, 1, 0, 0, 2]), device="cuda")
+    inputs["encoder_hidden_states"] = torch.randn(1, 2, _TINY_CONFIG["text_dim"], device="cuda")
+    with torch.inference_mode():
+        eager = model(**inputs)
+        flags = model._cuda_graph_layout_key(**inputs)
+        with resolved_extra_keys_scope(
+            {h3.MiniMaxH3Transformer3DModel.CUDA_GRAPH_LAYOUT_KEY: flags}
+        ):
+            resolved = model(**inputs)
+    torch.testing.assert_close(resolved[0], eager[0], rtol=0, atol=0)
+    torch.testing.assert_close(resolved[1], eager[1], rtol=0, atol=0)

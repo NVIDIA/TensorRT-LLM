@@ -21,9 +21,10 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
+import inspect
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
 )
@@ -47,6 +49,9 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -890,6 +895,51 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb=self.rope(position_ids),
         )
 
+    CUDA_GRAPH_LAYOUT_KEY = "h3_layout"
+
+    @staticmethod
+    def _layout_flags(token_tags: torch.Tensor) -> tuple[bool, bool]:
+        """Return ``(has_padding, interior_padding)`` of a packed layout; syncs on the device."""
+        has_padding = bool((token_tags < 0).any())
+        interior_padding = has_padding and bool(
+            ((token_tags[:-1] < 0) & (token_tags[1:] >= 0)).any()
+        )
+        return has_padding, interior_padding
+
+    def _cuda_graph_layout_key(self, *args, **kwargs) -> tuple[bool, bool]:
+        """Validate the packed layout and resolve its padding flags outside graph capture.
+
+        Called by the CUDA-graph runner with the forward's arguments before every call; the
+        value joins the graph key and is republished to the captured forward through
+        ``resolved_extra_key`` so no device-to-host sync happens during capture.
+        """
+        bound = inspect.signature(MiniMaxH3Transformer3DModel.forward).bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        arguments = bound.arguments
+        position_ids = arguments["position_ids"]
+        static_context = arguments["static_context"]
+        if position_ids is not None:
+            sequence_length = position_ids.shape[0]
+        elif static_context is not None:
+            sequence_length = static_context.sequence_length
+        else:
+            raise ValueError("position_ids is required when static_context is not provided.")
+        token_tags = arguments["token_tags"]
+        self._validate_layout(
+            sequence_length,
+            token_tags,
+            arguments["timestep_indices"],
+            arguments["conditioning_timesteps"],
+        )
+        pad = _padding_to_multiple(sequence_length, self.sharder.size)
+        if pad:
+            token_tags = _pad_tensor_dim(token_tags, 0, pad, -1)
+        return self._layout_flags(token_tags)
+
+    def register_cuda_graph_extra_key_fns(self, runner: "CUDAGraphRunner") -> None:
+        super().register_cuda_graph_extra_key_fns(runner)
+        runner.register_extra_key_fn(self.CUDA_GRAPH_LAYOUT_KEY, self._cuda_graph_layout_key)
+
     def _validate_layout(
         self,
         sequence_length: int,
@@ -944,7 +994,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     f"position_ids must have shape [sequence_length, 3], got {list(position_ids.shape)}."
                 )
             sequence_length = position_ids.shape[0]
-        self._validate_layout(sequence_length, token_tags, timestep_indices, conditioning_timesteps)
+        # Under a CUDA-graph runner the layout was validated and its flags resolved host-side
+        # before capture (``_cuda_graph_layout_key``); the syncing checks must not run inside it.
+        layout_flags = resolved_extra_key(self.CUDA_GRAPH_LAYOUT_KEY)
+        if layout_flags is None:
+            self._validate_layout(
+                sequence_length, token_tags, timestep_indices, conditioning_timesteps
+            )
 
         if static_context is None:
             if encoder_hidden_states is None or position_ids is None:
@@ -991,7 +1047,10 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
         key_padding_mask = None
-        if bool((token_tags_for_mask < 0).any()):
+        if layout_flags is None:
+            layout_flags = self._layout_flags(token_tags_for_mask)
+        has_padding, interior_padding = layout_flags
+        if has_padding:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
@@ -1001,9 +1060,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 )
             # FA4 expresses padding through seqused_k, which requires valid
             # tokens to form a prefix. Ulysses appends padding in this layout.
-            if self._attn_backend == "FA4" and bool(
-                ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
-            ):
+            if self._attn_backend == "FA4" and interior_padding:
                 raise NotImplementedError(
                     "FA4 requires trailing packed-row padding; use VANILLA for interior padding."
                 )
