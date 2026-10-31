@@ -6,11 +6,11 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's selection width: `indexer_budget` 2048 tokens over
 #: `indexer_compress_ratio` 4.
@@ -108,7 +108,7 @@ class QsaMtpReuseTopk(OpWrapper):
     the expansion into token indices plus the incomplete causal tail
     (`qsa_expand_block_indices`) are the caller's.
 
-    This target's variant of the qwen4_exp tp1 target's entry of the same name.
+    The unified target's variant of the qwen4_exp tp1 target's entry of the same name.
     """
 
     ARCHS = frozenset({Arch.SM_103})

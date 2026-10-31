@@ -13,14 +13,14 @@ from types import SimpleNamespace
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_mtp_reuse_topk import (  # noqa: E501
+    qsa_mtp_reuse_topk as reuse,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501
     modeling as m,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_canonical_selection import (  # noqa: E501
     qsa_canonical_selection as canonical,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_mtp_reuse_topk import (  # noqa: E501
-    qsa_mtp_reuse_topk as reuse,
 )
 
 assert torch.cuda.is_available(), "the IndexShare plumbing runs on a CUDA device"

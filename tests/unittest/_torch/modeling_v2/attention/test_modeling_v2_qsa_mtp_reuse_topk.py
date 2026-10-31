@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's qsa_mtp_reuse_topk__r43 variant.
+"""GPU test for the unified target's qsa_mtp_reuse_topk variant.
 
 Captured rows are built the way `qsa_topk_select` emits them: `min(K, visible)`
 distinct complete groups in an arbitrary order as a prefix, then `-1`. Inputs
@@ -15,11 +15,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_mtp_reuse_topk__r43 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_mtp_reuse_topk import (  # noqa: E501
     qsa_mtp_reuse_topk as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_mtp_reuse_topk requires a CUDA device"
