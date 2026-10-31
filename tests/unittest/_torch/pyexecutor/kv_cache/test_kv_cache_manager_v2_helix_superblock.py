@@ -402,6 +402,45 @@ def test_host_tier_allowed_under_agg_helix(host_cache_size: Optional[int]) -> No
     assert manager.has_cache_tier_below_gpu
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="allocates real KV cache pools")
+def test_helix_dummy_min_tokens_applies_to_generation_only() -> None:
+    """Warmup splits a full max_num_tokens context batch as [n - 1, 1]. Under
+    helix only generation dummies are raised to 2 tokens, so a context batch
+    keeps its total and stays within max_num_tokens."""
+    from unittest.mock import Mock, patch
+
+    from tensorrt_llm._torch.distributed.communicator import Distributed
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import CpType, Mapping
+
+    distributed = Mock()
+    distributed.allreduce.side_effect = lambda value, op: value
+    distributed.local_world_size = 1
+    mapping = Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX})
+    with patch.object(Distributed, "get", return_value=distributed):
+        manager = KVCacheManagerV2(
+            KvCacheConfig(max_tokens=512, enable_block_reuse=False),
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            tokens_per_block=32,
+            max_seq_len=1024,
+            max_batch_size=3,
+            mapping=mapping,
+            is_disagg=False,
+        )
+    ctx = manager.add_dummy_requests([0, 1], token_nums=[63, 1])
+    gen = manager.add_dummy_requests([2], token_nums=[1], is_gen=True)
+    try:
+        assert [req.get_num_tokens(0) for req in ctx] == [63, 1]
+        assert gen[0].get_num_tokens(0) == 2
+    finally:
+        for req in ctx + gen:
+            manager.free_resources(req)
+        manager.shutdown()
+
+
 def test_estimation_prepare_promotes_skip_est_for_v2() -> None:
     """Disaggregated helix disables estimation; with a V2 manager it must also
     promote _skip_est so build_managers() calls configure_kv_cache_capacity().

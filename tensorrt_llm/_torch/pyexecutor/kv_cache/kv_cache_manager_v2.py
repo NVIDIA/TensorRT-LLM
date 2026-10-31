@@ -7200,7 +7200,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
-            if self._has_cp_helix:
+            if self._has_cp_helix and is_gen:
                 # Keep the frozen dummy fields self-consistent (the active
                 # rank's past_seen = seqlen - 1 must stay >= 1).
                 token_num = max(token_num, 2)
