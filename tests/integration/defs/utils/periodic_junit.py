@@ -24,6 +24,7 @@ import faulthandler
 import os
 import platform
 import signal
+import sys
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -108,8 +109,8 @@ class PeriodicJUnitXML:
                 reads.
             dump_hang_traceback: If True, dump every thread's stack to
                 output-dir/hang_traceback.txt when a test overruns its timeout or the
-                process is signalled, so a hang leaves a diagnosable stack instead of an
-                empty "Test terminated unexpectedly" record.
+                process is signalled. Watchdog dumps also go to stderr so timeout
+                output includes the traceback without a separate artifact upload.
             hang_dump_fraction: Dump the traceback after this fraction of a test's
                 timeout elapses (default: 0.9), i.e. just before the test is killed.
         """
@@ -453,16 +454,18 @@ class PeriodicJUnitXML:
             return None
 
     def _dump_hang(self, nodeid: str) -> None:
-        """Write every thread's stack to the sidecar file (called from the timer)."""
+        """Write every thread's stack to the sidecar and stderr from the timer."""
         if self._hang_file is None:
             return
-        try:
-            self._hang_file.write(
-                f"\n===== hang watchdog fired for {nodeid} =====\n")
-            faulthandler.dump_traceback(file=self._hang_file, all_threads=True)
-            self._hang_file.flush()
-        except (OSError, RuntimeError, ValueError):
-            pass
+        for output in (self._hang_file, sys.stderr):
+            try:
+                output.write(
+                    f"\n===== hang watchdog fired for {nodeid} =====\n")
+                output.flush()
+                faulthandler.dump_traceback(file=output, all_threads=True)
+                output.flush()
+            except (OSError, RuntimeError, ValueError):
+                pass
 
     def _cancel_hang_timer(self) -> None:
         """Cancel the pending watchdog timer, if any."""
