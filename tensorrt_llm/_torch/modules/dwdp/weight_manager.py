@@ -74,6 +74,29 @@ _CopyBatch = Tuple[List[int], List[int], List[int]]
 _GatherPlan = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]
 
 
+def expert_transfer(copy_mode: Optional[str], contention_opt: bool) -> Tuple[bool, bool]:
+    """``(use_gather, use_batched_prefetch)`` of the expert DWDP prefetch.
+
+    ``copy_mode`` (``DwdpConfig.copy_mode``) picks the transfer when it is set: ``"gather"`` (the
+    SM fabric gather), ``"batched"`` (one batched copy-engine copy per layer) or ``"per_slice"``
+    (one copy-engine copy per slice).  When it is None, the gather runs if
+    ``TRTLLM_DWDP_PREFETCH_GATHER`` asks for it and its op is registered
+    (``fabric_gather.available``), and ``contention_opt`` selects the batched copy.
+
+    Raises:
+        ValueError: ``copy_mode`` is ``"gather"`` and ``trtllm::dwdp_fabric_gather`` is not
+            registered.
+    """
+    if copy_mode is None:
+        return fabric_gather.available(), contention_opt
+    if copy_mode == "gather" and fabric_gather.gather_op() is None:
+        raise ValueError(
+            "dwdp_config.copy_mode='gather' needs trtllm::dwdp_fabric_gather, which this build "
+            "does not register; set copy_mode to 'batched' or 'per_slice'"
+        )
+    return copy_mode == "gather", copy_mode == "batched"
+
+
 class DWDPWeightManager:
     """Runtime P2P copy orchestrator for DWDP expert weight prefetch.
 
@@ -129,10 +152,12 @@ class DWDPWeightManager:
         dwdp_size: int,
         contention_opt: bool = False,
         repeated_layer_indices: Sequence[int] = (),
+        copy_mode: Optional[str] = None,
+        copy_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         """Initialize the DWDPWeightManager.
 
-        Creates a dedicated copy stream and pre-allocates the CUDA events of
+        Takes or creates the copy stream and pre-allocates the CUDA events of
         every buffer slot. The consume_events are recorded immediately so the
         first prefetch does not stall waiting for a never-recorded event.
 
@@ -141,11 +166,12 @@ class DWDPWeightManager:
             peer_views: Mapping of (peer_rank, layer_idx, weight_name) to tensor
                 views into peer's MNNVL handle. These are IMMUTABLE — the source
                 GPU never writes to them during inference.
-            peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples
-                indexed by DWDP rank.  ``prefetch_layer`` resolves the owner of
-                a remote expert id with ``lookup_owner(expert_id, peer_ranges)``,
-                which handles non-uniform partition (tail-rank padding) and
-                redundancy (overlapping ranges) uniformly.
+            peer_ranges: Every rank's ``(start, end)`` in the expert partition,
+                indexed by DWDP rank (``ExpertPartition.peer_ranges``);
+                peer ``p``'s views have ``end - start`` rows.  ``prefetch_layer``
+                resolves the owner of a remote expert id with
+                ``lookup_owner(expert_id, peer_ranges)``, the lowest-rank owner
+                under redundancy (overlapping ranges).
             moe_layer_indices: Sorted list of decoder layer indices that are MoE
                 layers (e.g., layers 3..60 in a typical MoE model where the first
                 few layers are dense).
@@ -162,10 +188,18 @@ class DWDPWeightManager:
             repeated_layer_indices: MoE layers that run several times in a row
                 within a forward pass; their repeats bind the copy still in
                 the slot (see ``PrefetchSchedule``).
+            copy_mode: ``DwdpConfig.copy_mode``: the transfer, which overrides
+                ``contention_opt`` and ``TRTLLM_DWDP_PREFETCH_GATHER`` when set
+                (see ``expert_transfer``).
+            copy_stream: The stream every prefetch copy runs on; a new stream
+                on the buffer's device if None.  With attached dense DWDP,
+                ``DwdpManager.setup`` passes the stream the dense copies
+                already run on.
 
         Raises:
             ValueError: If dwdp_rank is out of range, dwdp_size is invalid,
-                there are no MoE layers or a repeated layer is not one of them.
+                there are no MoE layers, a repeated layer is not one of them,
+                or copy_stream is on another device than the weight buffer.
         """
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
@@ -181,16 +215,23 @@ class DWDPWeightManager:
         self._dwdp_rank = dwdp_rank
         self._dwdp_size = dwdp_size
 
-        # Storage chunk size of every peer's MNNVL handle.  Uniform across
-        # ranks (Phase 1 made ``num_experts_per_worker`` the storage size for
-        # every rank) — the variability lives in the *valid* sub-range
-        # tracked by ``_peer_ranges``.
+        # The number of experts this rank stores.  Peers may store another
+        # number (e.g. one more or one fewer under the balanced partition):
+        # each peer's range is in ``_peer_ranges``, and its view has its rows.
         self._experts_per_rank = weight_buffer.local_end - weight_buffer.local_start
 
         # Dedicated CUDA stream for P2P copy operations.
         # Using a separate stream allows copy/compute overlap.
         device = torch.device("cuda", weight_buffer.device_id)
-        self._copy_stream = torch.cuda.Stream(device=device)
+        if copy_stream is None:
+            copy_stream = torch.cuda.Stream(device=device)
+        elif copy_stream.device != device:
+            raise ValueError(
+                f"copy_stream is on {copy_stream.device}, the weight buffer on {device}"
+            )
+        # Attached dense DWDP, set up before this manager exists, already runs on a given
+        # stream: one copy stream, one FIFO, for the dense and the expert copies.
+        self._copy_stream = copy_stream
 
         num_slots = weight_buffer.num_slots
         self._layer_order = {layer: order for order, layer in enumerate(self._moe_layer_indices)}
@@ -230,21 +271,19 @@ class DWDPWeightManager:
         # do not move during inference) so we cache one ``(dst_ptrs,
         # src_ptrs, sizes)`` tuple per layer to avoid host-side rebuild on
         # every prefetch.
-        self._use_batched_prefetch = contention_opt
+        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
+        # engine (see ``fabric_gather``).  Opt-in; without copy_mode it is off if the
+        # op is not registered.  Layers whose descriptors are not 16-byte aligned
+        # cache None and fall back to the copy engine.
+        self._use_gather, self._use_batched_prefetch = expert_transfer(copy_mode, contention_opt)
         self._batched_copy_plans: Dict[int, _CopyBatch] = {}
         self._released = False
-
-        # SM gather: the same per-peer plan, pulled by a kernel instead of the copy
-        # engine (see ``fabric_gather``).  Opt-in; off if the op is not registered.
-        # Layers whose descriptors are not 16-byte aligned cache None and fall back
-        # to the copy engine.
-        self._use_gather = fabric_gather.available()
         if self._use_gather:
             # Pin the dense GEMM to the CLC scheduler and turn off cooperative MoE
             # routing unless the user set them explicitly.  Runs during setup, before
             # the first forward.  The persistent grids' SM reserve is set by DwdpManager.
             fabric_gather.apply_compute_side_defaults()
-        if fabric_gather.is_enabled() and not self._use_gather:
+        if copy_mode is None and fabric_gather.is_enabled() and not self._use_gather:
             logger.warning(
                 "[DWDPWeightManager] Fabric gather requested but trtllm::dwdp_fabric_gather is "
                 "not registered; falling back to the copy-engine prefetch"
@@ -255,9 +294,12 @@ class DWDPWeightManager:
             f"[DWDPWeightManager] Initialized: rank={dwdp_rank}/{dwdp_size}, "
             f"moe_layers={len(self._moe_layer_indices)}, "
             f"weights={self._weight_names}, "
-            f"experts_per_rank={self._experts_per_rank}, "
+            f"local_experts={self._experts_per_rank} "
+            f"[{weight_buffer.local_start}, {weight_buffer.local_end}), "
             f"contention_opt={contention_opt}, "
-            f"gather={self._use_gather}"
+            f"copy_mode={copy_mode}, "
+            f"gather={self._use_gather}, "
+            f"batched={self._use_batched_prefetch}"
         )
 
     @property
@@ -274,6 +316,21 @@ class DWDPWeightManager:
     def dwdp_size(self) -> int:
         """Total number of DWDP ranks."""
         return self._dwdp_size
+
+    @property
+    def copy_stream(self) -> torch.cuda.Stream:
+        """The CUDA stream every DWDP prefetch copy runs on."""
+        return self._copy_stream
+
+    @property
+    def use_gather(self) -> bool:
+        """Whether prefetches use the SM fabric gather (``TRTLLM_DWDP_PREFETCH_GATHER``)."""
+        return self._use_gather
+
+    @property
+    def use_batched_prefetch(self) -> bool:
+        """Whether prefetches use one batched copy-engine copy per layer (``contention_opt``)."""
+        return self._use_batched_prefetch
 
     def is_moe_layer(self, layer_idx: int) -> bool:
         """Check if a given layer index is a MoE layer.

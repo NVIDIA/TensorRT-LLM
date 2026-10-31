@@ -75,6 +75,7 @@ from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
@@ -206,6 +207,41 @@ def _fill_stall_timeout_sec() -> float:
             f"using {_BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC:.0f}s")
         return _BENCHMARK_DISAGG_FILL_STALL_DEFAULT_SEC
     return value
+
+
+def _resolve_drop_inflight_on_shutdown(llm_args: object, pp_size: int,
+                                       disable_overlap_scheduler: bool) -> bool:
+    """Whether a requested shutdown may drop the requests still in flight.
+
+    ``llm_args.drop_inflight_requests_on_shutdown`` asks for it. Only the
+    pp_size == 1 loop without the overlap scheduler may stop with requests in
+    flight: a pipeline-parallel loop can still have microbatches travelling
+    between ranks, whose send handles the loop cleanup waits on, and the
+    overlap loop still owes the previous batch its processing. TorchLlmArgs
+    accepts the setting only with that configuration; a value that reaches the
+    executor without it is ignored with a warning. Read through getattr, so
+    llm_args stand-ins without the field keep the drain.
+
+    Args:
+        llm_args: The executor's LLM arguments.
+        pp_size: Pipeline-parallel size of the executor.
+        disable_overlap_scheduler: Whether the executor runs the loop without
+            the overlap scheduler.
+
+    Returns:
+        True when a requested shutdown may drop the requests that are still
+        active or queued.
+    """
+    if not getattr(llm_args, "drop_inflight_requests_on_shutdown", False):
+        return False
+    if pp_size == 1 and disable_overlap_scheduler:
+        return True
+    logger.warning_once(
+        "drop_inflight_requests_on_shutdown is ignored: it needs "
+        "pp_size == 1 and disable_overlap_scheduler, but pp_size="
+        f"{pp_size} and disable_overlap_scheduler={disable_overlap_scheduler}",
+        key="executor_shutdown_drop_inflight_ignored")
+    return False
 
 
 # Environment variable to control which ranks print step logging.
@@ -475,6 +511,7 @@ class PyExecutorResources:
     virtual_memory_pools: Optional[dict]
     kv_connector_manager: Optional[KvCacheConnectorManager]
     dwdp_manager: Optional[DwdpManager]
+    dense_dwdp_manager: Optional[DenseDwdpManager]
     max_seq_len: Optional[int]
     max_num_sequences: int
     waiting_queue_policy: WaitingQueuePolicy
@@ -545,6 +582,7 @@ class PyExecutor:
         waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
         adp_router: Optional[ADPRouter] = None,
         dwdp_manager: Optional[DwdpManager] = None,
+        dense_dwdp_manager: Optional[DenseDwdpManager] = None,
         enable_kv_pool_rebalance: bool = False,
         kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL,
         enable_adp_dummy_fixes: bool = False,
@@ -653,6 +691,7 @@ class PyExecutor:
                 virtual_memory_pools=virtual_memory_pools,
                 kv_connector_manager=kv_connector_manager,
                 dwdp_manager=dwdp_manager,
+                dense_dwdp_manager=dense_dwdp_manager,
                 max_seq_len=max_seq_len,
                 max_num_sequences=max_num_sequences,
                 waiting_queue_policy=waiting_queue_policy,
@@ -674,6 +713,7 @@ class PyExecutor:
         virtual_memory_pools = resources.virtual_memory_pools
         kv_connector_manager = resources.kv_connector_manager
         dwdp_manager = resources.dwdp_manager
+        dense_dwdp_manager = resources.dense_dwdp_manager
         max_seq_len = resources.max_seq_len
         max_num_sequences = resources.max_num_sequences
         waiting_queue_policy = resources.waiting_queue_policy
@@ -688,6 +728,10 @@ class PyExecutor:
         resource_governor_queue = self._execution_config.resource_governor_queue
         hang_detection_timeout = self._execution_config.hang_detection_timeout
         enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
+        # Before anything is bound or warmed up, so that a combination this
+        # executor cannot drive fails before the warmup forwards.
+        self._validate_dwdp_managers(dwdp_manager, dense_dwdp_manager,
+                                     disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
         # profile config
@@ -706,6 +750,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.kv_connector_manager = kv_connector_manager
         self.dwdp_manager = dwdp_manager
+        self.dense_dwdp_manager = dense_dwdp_manager
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
@@ -1128,6 +1173,11 @@ class PyExecutor:
             self.kv_cache_manager.snapshot_warmup_baseline()
 
         self.is_shutdown = False
+        # Whether a requested shutdown may drop the requests still in flight.
+        # Read through getattr, so executors assembled without __init__ (unit
+        # tests) keep draining.
+        self._drop_inflight_on_shutdown = _resolve_drop_inflight_on_shutdown(
+            self.llm_args, self.dist.pp_size, self.disable_overlap_scheduler)
         # Set at the executor loops' normal-exit `break` sites, and ONLY
         # there. It answers exactly one question for _event_loop_wrapper:
         # "did event_loop() reach its own termination?" -- which decides
@@ -1136,6 +1186,8 @@ class PyExecutor:
         # rank-locally on a fatal error (e.g. a CUDA illegal address on this
         # rank alone) while peers are told nothing and the loop keeps running
         # collectives, so a crash after that point still strands them.
+        # _executor_loop also reads it once its loop ends, so that only the
+        # normal exit releases what a dropping shutdown left behind.
         self._event_loop_completed = False
         self._fatal_error: Optional[BaseException] = None
         self._kv_connector_failed = False
@@ -1320,11 +1372,6 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if dwdp_manager is not None and not self.disable_overlap_scheduler:
-            raise ValueError(
-                "DWDP requires disable_overlap_scheduler=True. "
-                "Overlap scheduler is not yet supported with DWDP.")
-
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -1399,6 +1446,32 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
+
+    @staticmethod
+    def _validate_dwdp_managers(dwdp_manager: Optional[DwdpManager],
+                                dense_dwdp_manager: Optional[DenseDwdpManager],
+                                disable_overlap_scheduler: bool) -> None:
+        """Reject DWDP managers this executor cannot drive.
+
+        Expert DWDP (``dwdp_manager``) runs only with the overlap scheduler
+        off. A standalone dense DWDP manager runs with either loop: the
+        non-overlap loop primes it before each forward, and in the overlap loop
+        the model's forward entry (H0) primes it. With expert DWDP,
+        ``DwdpManager`` drives dense DWDP itself, so only one of the two
+        managers may be given.
+
+        Raises:
+            ValueError: ``dwdp_manager`` with the overlap scheduler on, or both
+                managers given.
+        """
+        if dwdp_manager is not None and not disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+        if dwdp_manager is not None and dense_dwdp_manager is not None:
+            raise ValueError(
+                "pass dense_dwdp_manager only without DWDP: with dwdp_manager, "
+                "DwdpManager drives dense DWDP")
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
@@ -2379,6 +2452,9 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        if self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.__exit__(None, None, None)
+            self.dense_dwdp_manager = None
         # Released in full: the next release, after a rebind or of resources a
         # failed rebind bound, starts over.
         self._shutdown_runtime_complete = False
@@ -2620,8 +2696,48 @@ class PyExecutor:
 
     @property
     def should_stop_processing(self) -> bool:
-        return self.is_shutdown and len(self.active_requests) == 0 and \
-            len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
+        if not self.is_shutdown:
+            return False
+        if len(self.active_requests) == 0 and len(self.waiting_queue) == 0:
+            return not self._has_pending_connector_transfers()
+        # Requests are still active or queued. They are drained unless
+        # drop_inflight_requests_on_shutdown is in effect, and even then a
+        # pending connector transfer is waited for. The loop hands what they
+        # hold back through _release_requests_dropped_at_shutdown.
+        if (not getattr(self, "_drop_inflight_on_shutdown", False)
+                or self._has_pending_connector_transfers()):
+            return False
+        logger.warning_once(
+            f"shutdown requested: dropping {len(self.active_requests)} active "
+            f"and {len(self.waiting_queue)} queued requests instead of "
+            "draining them (drop_inflight_requests_on_shutdown)",
+            key="executor_shutdown_drop_inflight")
+        return True
+
+    def _release_requests_dropped_at_shutdown(self) -> None:
+        """Release what the requests dropped by a non-draining shutdown hold.
+
+        Runs once the loop has stopped. A no-op unless
+        drop_inflight_requests_on_shutdown is in effect, since a draining
+        shutdown only stops with no request left. Queued items hold no
+        executor resources and are discarded. Each active request goes through
+        ``_terminate_request``, as a finished or cancelled one does, so its KV
+        cache, sequence slot and per-request state are back with their
+        managers before ``shutdown`` tears those down. A request whose KV cache
+        the transfer fabric may still access keeps it, as it would on
+        cancellation; the KV cache manager closes that cache at its own
+        shutdown, as it does for a context still in transfer. No dropped
+        request gets a final response.
+        """
+        if not getattr(self, "_drop_inflight_on_shutdown", False):
+            return
+        while self.waiting_queue:
+            self.waiting_queue.pop_request()
+        dropped_requests = list(self.active_requests)
+        self.active_requests.clear()
+        for request in dropped_requests:
+            if not self._is_request_in_transmission(request):
+                self._terminate_request(request)
 
     def _has_pending_connector_transfers(self) -> bool:
         connector = getattr(self, "kv_connector_manager", None)
@@ -4583,6 +4699,17 @@ class PyExecutor:
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
+        # The V2 scheduler also admits the draft pool's mirror while it
+        # schedules the dummy (KVCacheV2Scheduler._admit_unpaired_draft), so
+        # that pool holds an empty cache under the dummy ID too. Left behind,
+        # it outlives this dummy, and the deferred previous batch -- which
+        # still holds the earlier, finished dummy with the same ID -- resizes
+        # it to that dummy's history in update_resources ("History length
+        # cannot exceed capacity").
+        draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+        if (getattr(self, "_is_kv_manager_v2", False)
+                and draft_kv_cache_manager is not None):
+            draft_kv_cache_manager.free_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -5533,6 +5660,24 @@ class PyExecutor:
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
 
+    def _prime_dwdp(self) -> None:
+        """Start DWDP for the next forward of the non-overlap loop.
+
+        Expert DWDP starts its prefetch (``DwdpManager.start_forward``): the
+        first MoE layers, unless the previous forward already prefetched them,
+        each after the layer's dense weights when dense DWDP is attached. A
+        standalone dense DWDP manager enqueues the dense weights of the first
+        two layers. Dense DWDP skips what is primed already and leaves the
+        recovery after an aborted forward to the model's forward entry (H0).
+        The overlap and pipeline-parallel loops do not call this: expert DWDP
+        refuses the overlap scheduler, and a standalone dense DWDP manager is
+        primed by H0 in every forward there.
+        """
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.start_forward()
+        elif self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.prefetch_first_layers()
+
     def _executor_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -5702,8 +5847,7 @@ class PyExecutor:
                         with self.perf_manager.record_perf_events(
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
-                            if self.dwdp_manager is not None:
-                                self.dwdp_manager.start_forward()
+                            self._prime_dwdp()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -5837,6 +5981,12 @@ class PyExecutor:
                     self.disagg.pace_idle()
 
                 self.iter_counter += 1
+
+            # Rank-local, after the loop's last collective and once the loop
+            # has marked itself completed, so an error here is a teardown error
+            # rather than a stranded peer.
+            if getattr(self, "_event_loop_completed", False):
+                self._release_requests_dropped_at_shutdown()
 
     def _prepare_draft_requests(self):
         try:

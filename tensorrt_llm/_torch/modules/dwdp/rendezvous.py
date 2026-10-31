@@ -31,7 +31,7 @@ import os
 import pickle  # nosec B403
 import time
 from datetime import timedelta
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Protocol
 
 from tensorrt_llm._utils import global_mpi_rank
 from tensorrt_llm.logger import logger
@@ -79,6 +79,27 @@ def dwdp_global_rank() -> int:
     if rank < 0:
         raise ValueError(f"{DWDP_RANK_ENV} must be non-negative, got {rank}")
     return rank
+
+
+class GroupComm(Protocol):
+    """The collective calls DWDP setup makes on its group.
+
+    An mpi4py sub-communicator, or :class:`StoreDwdpGroup` under a store rendezvous, implements
+    them; so does the MPI sub-communicator over the attention-DP group that dense DWDP uses
+    without expert DWDP.
+    """
+
+    def allgather(self, obj: object) -> list[object]:
+        """Gather one picklable object per rank, ordered by rank."""
+        ...
+
+    def Get_rank(self) -> int:
+        """This rank within the group."""
+        ...
+
+    def Get_size(self) -> int:
+        """Ranks in the group."""
+        ...
 
 
 class StoreDwdpGroup:

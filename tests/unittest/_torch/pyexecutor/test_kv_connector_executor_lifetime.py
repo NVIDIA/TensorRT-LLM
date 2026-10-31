@@ -797,6 +797,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     executor.virtual_memory_pools = None
     executor.sampler = Mock()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
 
     executor.shutdown()
 

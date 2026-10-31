@@ -75,12 +75,23 @@ DWDP is wrapper-owned lifecycle, not a scheduler or backend variant:
 
 ```text
 Executor construction
-  → register eligible MoE layer indices
-  → after weight loading: create VMM transport + composite VA + page pool
+  → ConfigurableMoE decides, once its backend exists, whether DWDP manages
+    the layer (CuTeDSL, NVFP4, no locality domain): a managed layer is sized
+    to this rank's ExpertPartition range and registered; any other layer
+    keeps the full expert table and logs one warning
+  → after weight loading: DwdpManager.setup
+      → dense DWDP first (models with dense roots): setup collectives #1-#6;
+        the commit frees the replicated dense weights
+      → then expert DWDP: partition handshake, VMM transport + composite VA
+        + page pool (the prefetch ring), on the copy stream dense DWDP runs
+        on, weight manager, then the vote that exchanges the small expert
+        parameters (_exchange_expert_scalars) and the backend fixup
+      → the committed dense runtime goes to the attached DenseDwdpManager
 
 PyExecutor forward start
-  → DwdpManager.start_forward(): first MoE layers, unless the previous
-    pass already prefetched them
+  → DwdpManager.start_forward(): the dense weights of the first two layers,
+    then the experts of the first MoE layers, unless the previous pass
+    already prefetched them
   → ConfigurableMoE.wait_and_bind(composite VA)
   → MoEScheduler.forward(... ordinary CuTeDSL kernel ...)
   → main stream joins scheduler auxiliary work
@@ -92,6 +103,7 @@ Control action (weight update, sleep/wakeup)
   → DwdpManager.invalidate_prefetch()
 
 Executor shutdown or construction rollback
+  → release dense DWDP (zero-size dense weights, slots and row store)
   → detach model references
   → synchronize outstanding device work
   → release composite VA, page pool, transport, and MPI sub-communicator
@@ -102,6 +114,43 @@ allocations on GB200, composite mappings, page pool, copy stream, and event
 protocol. `ConfigurableMoE` owns wait/bind/record placement so those calls
 happen once per layer rather than once per scheduler chunk. Schedulers must not
 perform DWDP lifecycle calls.
+
+`ExpertPartition` (`modules/dwdp/specs.py`) is the only source of every
+rank's expert range `[start, end)`. `DwdpManager.expert_partition` computes it
+from `DwdpConfig`, `dwdp_size` and the layer's expert count;
+`MoE._init_dwdp_expert_layout` sets a managed layer's `slot_start`,
+`slot_end` and `expert_size_per_partition` from it before the backend sync and
+`create_weights`, and `setup_dwdp` and the transport read the same table. Ranks
+may store different counts: the balanced default stores `floor` or `ceil` of
+`num_experts / dwdp_size` experts per rank. `ConfigurableMoE._decide_dwdp`
+makes the decision, since eligibility needs the backend; `MoE.__init__` leaves
+every layer with the full table. After setup, `fixup_moe_backends` widens a
+managed layer to the composite-VA view (`ep_size = 1`, `[0, num_experts)`).
+
+Dense DWDP (`dwdp_config.enable_dense`, which row-shards the replicated dense
+weights of the MoE decoder layers the same way) is owned by `DenseDwdpManager`
+(`modules/dwdp/dense/manager.py`), which the model's decoder-layer hooks reach
+through `get_global_dense_dwdp_manager()`. With expert DWDP, `DwdpManager`
+builds the dense manager and drives it: dense DWDP shards over the DWDP group,
+and the hooks enqueue each layer's dense weights on the same copy stream two
+layers ahead, and those of the first two layers of the next pass at the end of
+a pass, as the expert prefetch does. `DwdpManager.start_forward` enqueues the
+dense weights of the first two MoE layers before it starts the expert
+prefetch, unless the previous pass already enqueued them; after an aborted
+forward it leaves both to the model's forward entry
+(`DenseDwdpManager.ensure_primed`). That entry does the same in every forward,
+also those the executor loop does not start (warmup, KV-cache estimation);
+after an aborted forward it first resets the dense slots, then the expert
+prefetch restarts its sequence. Without expert DWDP
+(`dwdp_config.enable_experts: false`), dense DWDP runs standalone on an
+attention-DP instance (`tp_size > 1`): the executor creator builds the dense
+manager, which shards over the attention-DP group on its own copy stream. The
+non-overlap executor loop primes it before each forward, and the model's
+forward entry primes any forward the loop did not, so the overlap scheduler,
+whose loop does not prime, is allowed there. In both modes `ConfigurableMoE`
+is unaware of dense DWDP: with expert DWDP it keeps the wait/bind/finish
+protocol above unchanged; standalone it runs without DWDP (expert-parallel
+experts, no wait/bind/finish).
 
 The composite mapping exposes the full expert table through the backend's
 ordinary weight attributes, so DWDP returns `None` from

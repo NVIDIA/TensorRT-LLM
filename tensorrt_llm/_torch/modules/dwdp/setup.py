@@ -22,7 +22,9 @@ after model weight loading and BEFORE any inference forward pass.  It:
    ``layer_indices`` (the Single Source of Truth coming from
    ``DwdpManager._registered_layers``).
 2. Builds per-layer WeightSpecs from the collected parameter shapes.
-3. Computes each rank's local expert range.
+3. Computes the expert partition (``ExpertPartition``), the only source of
+   every rank's expert range, and agrees on it across the DWDP group
+   (``_agree_on_partition``).
 4. Allocates MNNVL fabric handles via ``DWDPTransport.create()``, copying
    local weights into fabric memory and freeing the originals.  Handles
    are exchanged via the DWDP MPI communicator.
@@ -30,10 +32,21 @@ after model weight loading and BEFORE any inference forward pass.  It:
    + page-pool-backed remote prefetch slots).
 6. Fills page-alignment edge bytes at MNNVL region boundaries.
 7. Creates a DWDPWeightManager for runtime P2P prefetch scheduling.
-8. Patches each MoE backend so it sees all ``num_experts`` (ep_size=1) and
-   allgathers small EP-sharded parameters (e.g. e_score_correction_bias,
-   fc31_alpha, fc2_alpha) via MPI.  Large scale params
-   (w3_w1_weight_scale, w2_weight_scale) go through Transport (MNNVL + P2P).
+8. Exchanges the small per-expert parameters (e.g. fc31_alpha, fc2_alpha,
+   an EP-sharded e_score_correction_bias) and checks the per-layer ones in
+   one collective (``_exchange_expert_scalars``), which is also the group's
+   vote on steps 5-7, then patches each MoE backend so it sees all
+   ``num_experts`` (ep_size=1).  Large scale params (w3_w1_weight_scale,
+   w2_weight_scale) go through Transport (MNNVL + P2P).
+
+From the handshake to the vote, every check of the setup is made from data
+the whole group gathered, the same way on every rank: the handshake, each
+transport handle allgather, the transport's import status and the vote.  A
+failure on one rank in that span thus raises on every rank after the same
+collective, instead of leaving its peers blocked in the next one.  The
+backend fixup after the vote is local: it installs the exchanged tensors (a
+few KiB of device memory per MoE layer), and a failure there raises on that
+rank only.
 
 The function is idempotent: calling it a second time on the same model is a
 no-op (returns the existing manager stored on the model).
@@ -41,18 +54,25 @@ no-op (returns the existing manager stored on the model).
 
 from __future__ import annotations
 
+import itertools
 import traceback
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections import Counter
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn
 
 from tensorrt_llm.logger import logger
 
-from .specs import LayerWeightSpecs, PeerRanges, WeightSpec, lookup_owner
-from .transport import DWDPTransport
+from .rendezvous import GroupComm
+from .specs import ExpertPartition, LayerWeightSpecs, PeerRanges, WeightSpec, lookup_owner
+from .transport import DWDPTransport, _allgather_keeping, _describe_error
+from .vmm import get_allocation_granularity
 from .weight_buffer import WeightBuffer
 from .weight_manager import DWDPWeightManager
+
+if TYPE_CHECKING:
+    from tensorrt_llm.mapping import Mapping
 
 # Sentinel attribute to mark idempotent setup completion.
 # Must match the attribute name read in DeepseekV3Model.forward().
@@ -68,8 +88,22 @@ _EXPERT_WEIGHT_NAMES = (
     "w2_weight_scale",
 )
 
+# Name keywords of the small parameters of an experts module that the fixup
+# exchanges (``_exchange_expert_scalars``): fc31_alpha, fc2_alpha, the
+# activation input scales, ... ; names in _EXPERT_WEIGHT_NAMES go through
+# the transport instead.
+_SCALE_KEYWORDS = ("scale", "scaling_factor", "dequant", "alpha")
 
-def _release_during_rollback(resource, what: str) -> None:
+# Small parameters named ``*_act_scale`` are per-layer activation pre-quant scales
+# (``fc31_act_scale``, ``[1, hidden_size]``): the NVFP4 AWQ loader keeps one vector for every
+# expert of a layer, from the first expert it loads.  They are classified by name, before the
+# shape tests, because with one expert per rank a ``[1, ...]`` parameter has a per-expert shape.
+_ACT_SCALE_SUFFIX = "_act_scale"
+
+
+def _release_during_rollback(
+    resource: Union[DWDPTransport, WeightBuffer, DWDPWeightManager], what: str
+) -> None:
     """Release a partially built resource without masking the in-flight error.
 
     Rollback runs while an exception is propagating. A raise from ``release()``
@@ -85,17 +119,68 @@ def _release_during_rollback(resource, what: str) -> None:
         )
 
 
+def _roll_back_setup(
+    transport: DWDPTransport,
+    weight_buffer: Optional[WeightBuffer],
+    weight_manager: Optional[DWDPWeightManager],
+) -> None:
+    """Release what ``setup_dwdp`` built after the transport, without masking the error in flight.
+
+    The weight manager owns the buffer and the transport once it holds the transport.
+    """
+    if weight_manager is not None and weight_manager._transport is transport:
+        _release_during_rollback(weight_manager, "weight manager")
+        return
+    if weight_buffer is not None:
+        _release_during_rollback(weight_buffer, "weight buffer")
+    _release_during_rollback(transport, "transport")
+
+
+def _refuse_reserved_storages(
+    local_params: Dict[Tuple[int, str], torch.Tensor], reserved_storages: frozenset[int]
+) -> None:
+    """Refuse expert weights whose storage another owner holds, before the transport takes them.
+
+    The transport copies each weight into its own handle and then frees the weight's storage.
+    ``DwdpManager.setup`` reserves the slots of the committed attached dense DWDP runtime: a
+    weight there is a view dense DWDP repointed into a slot, which happens only when a dense
+    root reaches a routed-expert weight.  The transport would then take the slot's bytes for the
+    experts and free the slot under the dense runtime.
+
+    Raises:
+        RuntimeError: Expert weights live in reserved storages; the message lists them.
+    """
+    if not reserved_storages:
+        return
+    taken = [
+        f"layers.{layer}.{name}"
+        for (layer, name), tensor in sorted(local_params.items(), key=lambda item: item[0])
+        if tensor.untyped_storage().data_ptr() in reserved_storages
+    ]
+    if taken:
+        listed = ", ".join(taken[:8]) + (f" and {len(taken) - 8} more" if len(taken) > 8 else "")
+        raise RuntimeError(
+            f"[DWDP Setup] Expert weights in reserved storage, which the transport would free: "
+            f"{listed}. They are views of the committed dense DWDP slots: dense DWDP moved them, "
+            f"so the decoder layers' dense_dwdp_roots (or dense_dwdp_attr_allow) reach the routed "
+            f"experts, which expert DWDP owns."
+        )
+
+
 def setup_dwdp(
     model: nn.Module,
-    mapping,
+    mapping: Mapping,
     device_id: int,
-    comm,
+    comm: GroupComm,
     layer_indices: List[int],
     num_experts_per_worker: int,
     num_prefetch_experts: int,
     num_prefetch_slots: int,
     contention_opt: bool = False,
     repeated_layer_indices: Sequence[int] = (),
+    copy_mode: Optional[str] = None,
+    copy_stream: Optional[torch.cuda.Stream] = None,
+    reserved_storages: frozenset[int] = frozenset(),
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -106,24 +191,24 @@ def setup_dwdp(
         model: The top-level causal-LM model (e.g. DeepseekV3ForCausalLM).
         mapping: ``tensorrt_llm.mapping.Mapping`` instance with DWDP fields.
         device_id: CUDA device ordinal for this rank.
-        comm: mpi4py communicator scoped to the DWDP group (owned by
-            DwdpManager; lifetime exceeds setup_dwdp).
+        comm: The DWDP group's communicator, an mpi4py sub-communicator or a
+            ``StoreDwdpGroup`` (owned by DwdpManager; lifetime exceeds
+            setup_dwdp).
         layer_indices: MoE layer indices collected by
             ``DwdpManager._registered_layers`` (SSOT).  Each index must
             correspond to an MoE layer in the model.
-        num_experts_per_worker: Range size — number of experts each rank
-            owns (``DwdpConfig.num_experts_per_worker``).  Used as the local
-            expert range length: ``[start, start + num_experts_per_worker)``.
-            This is also the *uniform storage chunk size* installed on every
-            fused MoE backend by ``_init_dwdp_expert_layout``; the tail
-            rank may have a few padding slots past ``num_experts``.
-        num_prefetch_experts: Stride between consecutive ranks
-            (``DwdpConfig.num_prefetch_experts``).  Used as the rank-to-rank
-            offset: rank ``r`` owns ``[r * num_prefetch_experts, ...)``.
-            For uniform integer-division partitioning these two values are
-            equal (e.g. dwdp=4: 64/64, dwdp=8: 32/32).  Setting
-            ``num_prefetch_experts < num_experts_per_worker`` enables
-            redundancy: adjacent ranks' ranges overlap by
+        num_experts_per_worker: ``DwdpConfig.num_experts_per_worker``: the
+            experts each rank stores in a strided expert partition, or 0
+            (with ``num_prefetch_experts``) for the balanced partition.
+        num_prefetch_experts: ``DwdpConfig.num_prefetch_experts``: the
+            stride between consecutive ranks' first experts in a strided
+            partition, or 0 for the balanced one.  Both go to
+            ``ExpertPartition.from_config`` with the model's expert count,
+            as in ``DwdpManager.expert_partition``, which sized the MoE
+            backends before their weights were created; the handshake checks
+            that every rank computed the same partition and loaded the rows
+            of its range.  Under redundancy (``num_prefetch_experts <
+            num_experts_per_worker``) adjacent ranks' ranges overlap by
             ``num_experts_per_worker - num_prefetch_experts`` experts and
             ``lookup_owner`` resolves the lowest-rank owner.
         num_prefetch_slots: Number of prefetch buffer slots, each holding the
@@ -132,11 +217,32 @@ def setup_dwdp(
             ``cudaMemcpyBatchAsync`` per layer (``DwdpConfig.contention_opt``).
         repeated_layer_indices: Layers of ``layer_indices`` that run several
             times in a row within a forward pass (``DwdpManager.add_repeated_layer``).
+        copy_mode: The prefetch transfer (``DwdpConfig.copy_mode``); None keeps
+            the selection by ``contention_opt`` and ``TRTLLM_DWDP_PREFETCH_GATHER``.
+        copy_stream: The weight manager's copy stream (``DWDPWeightManager``
+            creates one if None); ``DwdpManager.setup`` passes the stream
+            attached dense DWDP was set up with.  A cached manager keeps its own.
+        reserved_storages: ``untyped_storage().data_ptr()`` of storages that
+            another owner holds, which the transport must not take over:
+            ``DwdpManager.setup`` passes the slots of the committed attached
+            dense DWDP runtime.  An expert weight in one of them raises a
+            RuntimeError before the transport starts.
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
         The manager is also stored on ``model.dwdp_weight_manager`` so that
         a second call returns the cached instance (idempotent).
+
+    Raises:
+        RuntimeError: The DWDP group disagrees on the expert partition, a
+            rank failed in the transport or in a later step before the vote,
+            or the ranks' small expert parameters do not fit together.
+            Raised on every rank after the same collective: a rank that
+            failed raises its own error, the others an error naming it.  A
+            failure in the backend fixup after the vote raises on that rank
+            only.
+        ValueError: The config gives no valid partition of the model's
+            experts (raised on every rank alike).
     """
     # --- Guard: DWDP not enabled ---
     if not mapping.dwdp_enabled:
@@ -171,6 +277,7 @@ def setup_dwdp(
 
     # 1. Collect MoE params (SSOT: iterate passed layer_indices only)
     local_params, weight_names = collect_moe_params(model, layer_indices)
+    _refuse_reserved_storages(local_params, reserved_storages)
     logger.info(
         f"[DWDP Setup] Collected params from {len(layer_indices)} MoE layers, "
         f"weight_names={weight_names}"
@@ -178,11 +285,9 @@ def setup_dwdp(
 
     # Query the model's *actual* gate-side num_experts from the first MoE
     # layer.  This is the routing-side expert count (e.g., 72 for DSv3-Lite,
-    # 256 for DeepSeek-V3 / R1).  It is distinct from the per-rank storage
-    # extent (``num_experts_per_worker * dwdp_size``) which may be larger
-    # under non-uniform / redundancy Mode B partitioning.  All Phase 1+2
-    # plumbing — composite VA size, peer_ranges cap, validation — uses
-    # this gate-side count, not storage extent.
+    # 256 for DeepSeek-V3 / R1, 896 for Kimi-K3), the one the expert
+    # partition splits.  All Phase 1+2 plumbing — composite VA size, the
+    # partition, validation — uses this gate-side count.
     num_experts_total = _get_model_num_experts(model, layer_indices)
 
     # 2. Build weight specs (full_shape uses the gate-side num_experts)
@@ -194,21 +299,28 @@ def setup_dwdp(
         f"num_experts={num_experts_total}"
     )
 
-    # 3. Validate partition config against the gate-side expert count.
-    first_spec = _get_first_spec(layer_weight_specs)
-    _validate_partition_config(
+    # 3. The expert partition, from the function _init_dwdp_expert_layout
+    #    sized the backends with, and the group's verdict on it before any
+    #    handle exists: one allgather after which every rank goes on, or
+    #    every rank raises.
+    partition = ExpertPartition.from_config(
+        num_experts=num_experts_total,
+        dwdp_size=mapping.dwdp_size,
         num_experts_per_worker=num_experts_per_worker,
         num_prefetch_experts=num_prefetch_experts,
-        num_experts_total=num_experts_total,
-        dwdp_size=mapping.dwdp_size,
-        loaded_local_experts=first_spec.local_experts,
     )
-    local_start = mapping.dwdp_rank * num_prefetch_experts
-    local_end = local_start + num_experts_per_worker
+    _agree_on_partition(
+        comm,
+        partition,
+        dwdp_rank=mapping.dwdp_rank,
+        granularity=get_allocation_granularity(device_id),
+        layer_weight_specs=layer_weight_specs,
+    )
+    local_start, local_end = partition.range_of(mapping.dwdp_rank)
     logger.info(
-        f"[DWDP Setup] Expert range: local=[{local_start}, {local_end}), "
-        f"total={num_experts_total}, "
-        f"size={num_experts_per_worker}, stride={num_prefetch_experts}"
+        f"[DWDP Setup] Expert range: local=[{local_start}, {local_end}) "
+        f"({local_end - local_start} experts), total={num_experts_total}, "
+        f"partition {partition.describe()}"
     )
 
     # 4. Transport: MNNVL alloc -> copy -> free originals -> exchange handles
@@ -218,24 +330,29 @@ def setup_dwdp(
         local_params=local_params,
         comm=comm,
         dwdp_rank=mapping.dwdp_rank,
-        dwdp_size=mapping.dwdp_size,
         device_id=device_id,
-        local_start=local_start,
-        local_end=local_end,
-        num_experts_per_worker=num_experts_per_worker,
-        num_prefetch_experts=num_prefetch_experts,
+        partition=partition,
     )
     logger.info("[DWDP Setup] Transport created successfully.")
-    free_mem, total_mem = torch.cuda.mem_get_info(device_id)
-    logger.info(
-        f"[DWDP Setup] GPU {device_id} memory after transport: "
-        f"free={free_mem/(1024**3):.2f}GB / total={total_mem/(1024**3):.2f}GB "
-        f"(used={((total_mem-free_mem)/(1024**3)):.2f}GB)"
-    )
 
-    # 5. WeightBuffer: composite VA layout
-    logger.info("[DWDP Setup] Creating weight buffer (composite VA layout)...")
+    # 5-7. Local work: an error here (e.g. this rank's prefetch ring does not
+    # fit) is only recorded, and raised after the vote in step 8, which every
+    # rank enters; the peers then raise there too, instead of waiting for
+    # this rank in a later collective.
+    weight_buffer = None
+    weight_manager = None
+    local_error = None
     try:
+        free_mem, total_mem = torch.cuda.mem_get_info(device_id)
+        logger.info(
+            f"[DWDP Setup] GPU {device_id} memory after transport: "
+            f"free={free_mem / (1024**3):.2f}GB / total={total_mem / (1024**3):.2f}GB "
+            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GB)"
+        )
+        peer_ranges = partition.peer_ranges
+
+        # 5. WeightBuffer: composite VA layout
+        logger.info("[DWDP Setup] Creating weight buffer (composite VA layout)...")
         weight_buffer = WeightBuffer.create(
             layer_weight_specs=layer_weight_specs,
             handles=transport.get_handle_set(),
@@ -245,17 +362,19 @@ def setup_dwdp(
             device_id=device_id,
             num_slots=num_prefetch_slots,
         )
-    except BaseException:
-        _release_during_rollback(transport, "transport")
-        raise
-    logger.info(
-        f"[DWDP Setup] Weight buffer created successfully ({num_prefetch_slots} prefetch slots)."
-    )
+        logger.info(
+            f"[DWDP Setup] Weight buffer created successfully ({num_prefetch_slots} prefetch "
+            f"slots)."
+        )
+        free_mem, total_mem = torch.cuda.mem_get_info(device_id)
+        logger.info(
+            f"[DWDP Setup] GPU {device_id} memory after weight buffer: "
+            f"free={free_mem / (1024**3):.2f}GB / total={total_mem / (1024**3):.2f}GB "
+            f"(used={((total_mem - free_mem) / (1024**3)):.2f}GB)"
+        )
 
-    # 6. Fill edge bytes
-    logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
-    peer_ranges = transport.get_peer_ranges()
-    try:
+        # 6. Fill edge bytes
+        logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
         fill_edge_bytes(
             weight_buffer=weight_buffer,
             peer_views=transport.get_peer_views(),
@@ -263,15 +382,10 @@ def setup_dwdp(
             local_end=local_end,
             peer_ranges=peer_ranges,
         )
-    except BaseException:
-        _release_during_rollback(weight_buffer, "weight buffer")
-        _release_during_rollback(transport, "transport")
-        raise
-    logger.info("[DWDP Setup] Edge bytes filled.")
+        logger.info("[DWDP Setup] Edge bytes filled.")
 
-    # 7. WeightManager
-    logger.info("[DWDP Setup] Creating weight manager...")
-    try:
+        # 7. WeightManager
+        logger.info("[DWDP Setup] Creating weight manager...")
         weight_manager = DWDPWeightManager(
             weight_buffer=weight_buffer,
             peer_views=transport.get_peer_views(),
@@ -282,31 +396,39 @@ def setup_dwdp(
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
             repeated_layer_indices=repeated_layer_indices,
+            copy_mode=copy_mode,
+            copy_stream=copy_stream,
+        )
+        # Transfer resource ownership before backend fixup so every later failure
+        # can be rolled back through one idempotent manager release.
+        weight_manager._transport = transport
+        logger.info("[DWDP Setup] Weight manager created.")
+    except Exception as exc:  # noqa: BLE001 - any failure is this rank's vote below
+        local_error = exc
+        logger.error(
+            f"[DWDP Setup] Rank {mapping.dwdp_rank} failed after the transport with {exc!r}; "
+            f"reporting it to the DWDP group"
         )
     except BaseException:
-        _release_during_rollback(weight_buffer, "weight buffer")
-        _release_during_rollback(transport, "transport")
+        _roll_back_setup(transport, weight_buffer, weight_manager)
         raise
-    # Transfer resource ownership before backend fixup so every later failure
-    # can be rolled back through one idempotent manager release.
-    weight_manager._transport = transport
-    logger.info("[DWDP Setup] Weight manager created.")
 
-    # 8. Patch MoE backends
+    # 8. The vote and the backend fixup: _exchange_expert_scalars is the
+    #    fixup's only collective, entered by every rank; it raises on every
+    #    rank if any rank failed, and otherwise returns the full small
+    #    per-expert tensors, which fixup_moe_backends installs locally.
     logger.info("[DWDP Setup] Patching MoE backends...")
     try:
-        fixup_moe_backends(
+        expert_scalars = _exchange_expert_scalars(
+            comm,
             model,
             layer_indices,
-            num_experts_total,
-            comm,
-            mapping.dwdp_rank,
-            mapping.dwdp_size,
-            num_experts_per_worker=num_experts_per_worker,
-            peer_ranges=peer_ranges,
+            partition,
+            error=local_error,
         )
+        fixup_moe_backends(model, layer_indices, num_experts_total, expert_scalars)
     except BaseException:
-        _release_during_rollback(weight_manager, "weight manager")
+        _roll_back_setup(transport, weight_buffer, weight_manager)
         raise
     logger.info("[DWDP Setup] MoE backends patched.")
 
@@ -442,21 +564,21 @@ def collect_moe_params(
 def build_weight_specs(
     local_params: Dict[Tuple[int, str], torch.Tensor],
     weight_names: List[str],
-    mapping,
+    mapping: Mapping,
     num_experts_total: int,
 ) -> LayerWeightSpecs:
     """Convert collected parameters to ``LayerWeightSpecs``.
 
-    Each local parameter has shape ``(experts_per_rank, ...)`` where
-    ``experts_per_rank`` is the per-rank storage size
-    (``num_experts_per_worker`` from ``DwdpConfig`` after
-    ``_init_dwdp_expert_layout`` runs).  The composite VA's ``full_shape``
-    uses ``num_experts_total`` (gate-side, e.g. 72 for DSv3-Lite) so
-    every expert id in ``[0, num_experts_total)`` is addressable — and
-    *only* those.  Under Mode B redundancy ``experts_per_rank *
-    dwdp_size`` may exceed ``num_experts_total`` (overlap duplicates),
-    but those duplicates live within each peer's MNNVL handle, not in
-    the composite VA.
+    Each local parameter has shape ``(local_experts, ...)`` where
+    ``local_experts`` is the number of experts this rank stores: the length
+    of its range in the expert partition, which ``_init_dwdp_expert_layout``
+    sized the backend with (ranks may differ, e.g. 75 and 74).  The
+    composite VA's ``full_shape`` uses ``num_experts_total`` (gate-side,
+    e.g. 72 for DSv3-Lite) so every expert id in ``[0, num_experts_total)``
+    is addressable — and *only* those.  Under redundancy the ranks' counts
+    add up to more than ``num_experts_total`` (overlap duplicates), but
+    those duplicates live within each peer's MNNVL handle, not in the
+    composite VA.
 
     Args:
         local_params: Dict from ``collect_moe_params``.
@@ -537,6 +659,126 @@ def _get_model_num_experts(model: nn.Module, layer_indices: List[int]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Helper: agree on the expert partition (handshake)
+# ---------------------------------------------------------------------------
+
+
+def _agree_on_partition(
+    comm: GroupComm,
+    partition: ExpertPartition,
+    *,
+    dwdp_rank: int,
+    granularity: int,
+    layer_weight_specs: LayerWeightSpecs,
+) -> None:
+    """One allgather after which every rank of the DWDP group goes on, or every rank raises.
+
+    Each rank reports its DWDP rank, the partition it computed (expert count, every rank's
+    range, kind), its VMM granularity and, for every (layer, weight) expert chunk it loaded,
+    the rows, the shape of one expert and the dtype.  The verdict is a function of the gathered
+    reports only, so it is the same on every rank: the transport after it is entered by every
+    rank or by none.  The transport then maps every peer's handle with the peer's range and its
+    own granularity and bytes per expert, which this makes the same on every rank.
+    Rejected: a rank that sent no handshake (it runs another TensorRT-LLM tree); a rank whose
+    partition (config or model drift), granularity, or loaded (layer, weight) chunks, expert
+    shapes or dtypes differ from the most common report's, so that the ranks named are the
+    ones that differ from the others, rank 0 included; a chunk whose rows are not its rank's
+    expert count (``_init_dwdp_expert_layout`` sized the backend from another partition); and
+    a report out of rank order.
+
+    Raises:
+        RuntimeError: On every rank, naming each offending rank and item (the first 8).
+    """
+    chunks = tuple(
+        (layer_idx, name, tuple(spec.chunk_shape[1:]), str(spec.dtype), spec.local_experts)
+        for layer_idx in sorted(layer_weight_specs)
+        for name, spec in sorted(layer_weight_specs[layer_idx].items())
+    )
+    report = (
+        dwdp_rank,
+        partition.num_experts,
+        partition.ranges,
+        partition.kind,
+        granularity,
+        chunks,
+    )
+    reports = comm.allgather(report)
+    malformed = [
+        rank
+        for rank, rank_report in enumerate(reports)
+        if not (isinstance(rank_report, tuple) and len(rank_report) == len(report))
+    ]
+    if malformed:
+        raise RuntimeError(
+            f"[DWDP Setup] DWDP ranks {malformed} sent no expert partition handshake: every rank "
+            f"of the DWDP group must run the same TensorRT-LLM tree."
+        )
+
+    problems = []
+    if len(reports) != partition.dwdp_size:
+        problems.append(f"{len(reports)} ranks reported, the partition has {partition.dwdp_size}")
+    # The reference is the most common report, rank and rows aside (on a tie, the lowest rank's),
+    # so that the ranks named are the ones that differ from the others, rank 0 included.
+    keys = [
+        (num_experts, ranges, kind, rank_granularity, tuple(chunk[:-1] for chunk in rank_chunks))
+        for _, num_experts, ranges, kind, rank_granularity, rank_chunks in reports
+    ]
+    ref_rank = keys.index(Counter(keys).most_common(1)[0][0])
+    _, ref_experts, ref_ranges, ref_kind, ref_granularity, ref_chunks = reports[ref_rank]
+    # Every rank must load the same (layer, weight) chunks, of the same expert shape and dtype.
+    ref_layout = [chunk[:-1] for chunk in ref_chunks]
+    for rank, rank_report in enumerate(reports):
+        reported_rank, num_experts, ranges, kind, rank_granularity, rank_chunks = rank_report
+        if reported_rank != rank:
+            problems.append(f"position {rank} holds the report of DWDP rank {reported_rank}")
+            continue
+        if (num_experts, ranges, kind) != (ref_experts, ref_ranges, ref_kind):
+            problems.append(
+                f"rank {rank} computed the {kind} partition {list(ranges)} of {num_experts} "
+                f"experts, rank {ref_rank} the {ref_kind} partition {list(ref_ranges)} of "
+                f"{ref_experts}"
+            )
+            continue
+        if rank_granularity != ref_granularity:
+            problems.append(
+                f"rank {rank} maps with a granularity of {rank_granularity} bytes, rank "
+                f"{ref_rank} with {ref_granularity}"
+            )
+        layout = [chunk[:-1] for chunk in rank_chunks]
+        if layout != ref_layout:
+            mine, ref = next(
+                (mine, ref)
+                for mine, ref in itertools.zip_longest(layout, ref_layout)
+                if mine != ref
+            )
+            problems.append(
+                f"rank {rank} loaded other expert chunks than rank {ref_rank}: (layer, weight, "
+                f"expert shape, dtype) {mine}, rank {ref_rank} {ref}"
+            )
+            continue
+        if rank >= len(ranges):
+            continue
+        start, end = ranges[rank]
+        wrong = [(layer_idx, name, n) for layer_idx, name, *_, n in rank_chunks if n != end - start]
+        if wrong:
+            layer_idx, name, n = wrong[0]
+            problems.append(
+                f"rank {rank} stores experts [{start}, {end}) ({end - start} experts) but "
+                f"loaded {len(wrong)} expert chunks with other row counts, e.g. layer "
+                f"{layer_idx} {name} with {n} rows"
+            )
+    if problems:
+        raise RuntimeError(
+            f"[DWDP Setup] The DWDP group does not agree on the expert partition: "
+            f"{'; '.join(problems[:8])}"
+            + (f"; and {len(problems) - 8} more" if len(problems) > 8 else "")
+            + ". Every rank must run the same DwdpConfig and model; "
+            "_init_dwdp_expert_layout sizes the MoE layers DWDP manages from "
+            "DwdpManager.expert_partition()."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helper: fill edge bytes
 # ---------------------------------------------------------------------------
 
@@ -551,9 +793,12 @@ def fill_edge_bytes(
     """Fill page-alignment edge bytes at MNNVL region boundaries.
 
     When local expert data does not align to page boundaries, the MNNVL pages
-    contain edge regions that must be filled with the correct peer data.  This
-    happens at most twice per (layer, weight): a *leading edge* before
-    ``local_start`` and a *trailing edge* after ``local_end``.
+    contain edge regions that hold peer data: per (layer, weight) at most one
+    *leading edge* ``[page_start, local_start * expert_bytes)`` and one
+    *trailing edge* ``[local_end * expert_bytes, page_end)``.  With experts
+    smaller than the granularity an edge holds bytes of several experts; only
+    the experts next to the local range are filled here.  Every prefetch
+    rewrites the remote experts, edges included, before any read.
 
     The data is read from peer MNNVL tensor views and written into the local
     MNNVL handle's mapped VA.  This is a one-time setup operation.
@@ -563,10 +808,11 @@ def fill_edge_bytes(
         peer_views: ``{(peer_rank, layer_idx, name): tensor}`` from Transport.
         local_start: First local expert index (inclusive).
         local_end: Last local expert index (exclusive).
-        peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples.
+        peer_ranges: Every rank's ``(start, end)`` in the expert partition.
             ``lookup_owner`` resolves the owner of ``prev_expert`` /
-            ``next_expert`` here, so non-uniform / redundancy partitions
-            pick the right peer.
+            ``next_expert`` here, and each peer view has that peer's rows,
+            so any partition (balanced, capped, redundant) picks the right
+            peer and row.
     """
     if local_start >= local_end:
         return
@@ -585,12 +831,11 @@ def fill_edge_bytes(
             full_tensor = weight_buffer.get_full_tensor(layer_idx, name)
 
             # Leading edge: bytes in [page_start, local_start_bytes).
-            # These belong to experts just before local_start.
+            # These belong to the experts before local_start (possibly several).
             if edge_info.leading_edge > 0 and local_start > 0:
-                # The leading edge is within the expert just before
-                # local_start.  Use lookup_owner so non-uniform / redundant
-                # partitions pick the lowest-rank peer that owns
-                # ``prev_expert``.
+                # Fill the expert just before local_start.  Use lookup_owner so
+                # non-uniform / redundant partitions pick the lowest-rank peer
+                # that owns ``prev_expert``.
                 prev_expert = local_start - 1
                 peer_rank = lookup_owner(prev_expert, peer_ranges)
                 peer_chunk_start, _ = peer_ranges[peer_rank]
@@ -599,9 +844,8 @@ def fill_edge_bytes(
                 peer_key = (peer_rank, layer_idx, name)
                 if peer_key in peer_views:
                     src = peer_views[peer_key]
-                    # The edge bytes correspond to the tail portion of
-                    # prev_expert's data that spills into our MNNVL page.
-                    # Copy the full expert slice (the composite VA's
+                    # prev_expert's data, or its tail, lies in our MNNVL
+                    # page.  Copy the full expert slice (the composite VA's
                     # expert dimension is page-aligned).
                     full_tensor[prev_expert].copy_(src[peer_local_offset])
                     logger.debug(
@@ -610,7 +854,7 @@ def fill_edge_bytes(
                     )
 
             # Trailing edge: bytes in [local_end_bytes, page_end).
-            # These belong to experts just after local_end.
+            # These belong to the experts from local_end on (possibly several).
             if edge_info.trailing_edge > 0 and local_end < full_tensor.shape[0]:
                 next_expert = local_end
                 peer_rank = lookup_owner(next_expert, peer_ranges)
@@ -630,20 +874,344 @@ def fill_edge_bytes(
 
 
 # ---------------------------------------------------------------------------
-# Helper: fixup MoE backends
+# Helper: exchange the small expert parameters (the vote), fixup MoE backends
 # ---------------------------------------------------------------------------
+
+
+class _ParamReport(NamedTuple):
+    """One small parameter of one layer as a rank reports it to ``_exchange_expert_scalars``.
+
+    Attributes:
+        shape: The parameter's shape on the rank.
+        data: A CPU copy; None when the first dimension is the model's expert count, since a
+            full-sized parameter needs no exchange.
+    """
+
+    shape: Tuple[int, ...]
+    data: Optional[torch.Tensor]
+
+
+class _LayerScalars(NamedTuple):
+    """What ``fixup_moe_backends`` installs on one MoE layer after ``_exchange_expert_scalars``.
+
+    Attributes:
+        params: ``[num_experts, ...]`` CPU tensors of the experts module's per-expert small
+            parameters, by name, put together from every rank's shard.
+        bias: The ``[num_experts]`` CPU gate ``e_score_correction_bias`` put together from every
+            rank's shard, or None when it is full-sized on every rank already, or absent.
+        act_scales: Rank 0's CPU copy of each per-layer activation scale (``*_act_scale``), by
+            name, which every rank copies into its own parameter.
+    """
+
+    params: Dict[str, torch.Tensor]
+    bias: Optional[torch.Tensor]
+    act_scales: Dict[str, torch.Tensor]
+
+
+def _report_param(tensor: torch.Tensor, num_experts: int) -> _ParamReport:
+    """``tensor`` as this rank reports it: its shape, and a CPU copy unless it is full-sized."""
+    shape = tuple(tensor.shape)
+    if shape and shape[0] == num_experts:
+        return _ParamReport(shape, None)
+    return _ParamReport(shape, tensor.detach().cpu().contiguous())
+
+
+def _collect_expert_scalars(
+    model: nn.Module, layer_indices: List[int], num_experts: int
+) -> Dict[int, Tuple[Dict[str, _ParamReport], Optional[_ParamReport]]]:
+    """This rank's small parameters of every MoE layer, as ``_exchange_expert_scalars`` sends them.
+
+    Per layer: the direct parameters of the experts module whose names contain one of
+    ``_SCALE_KEYWORDS`` and are not in ``_EXPERT_WEIGHT_NAMES`` (the transport moves those),
+    and the gate's ``e_score_correction_bias`` (None without one).
+    """
+    layers = _get_decoder_model(model).layers
+    collected = {}
+    for layer_idx in layer_indices:
+        moe_module, experts_module = _get_moe_and_experts(layers[layer_idx])
+        params = {}
+        if experts_module is not None:
+            for pname, param in experts_module.named_parameters(recurse=False):
+                if pname in _EXPERT_WEIGHT_NAMES or not any(kw in pname for kw in _SCALE_KEYWORDS):
+                    continue
+                params[pname] = _report_param(param.data, num_experts)
+        bias = None
+        gate_module = _get_gate_module(moe_module) if moe_module is not None else None
+        bias_param = getattr(gate_module, "e_score_correction_bias", None)
+        if bias_param is not None:
+            bias_data = bias_param.data if isinstance(bias_param, nn.Parameter) else bias_param
+            bias = _report_param(bias_data, num_experts)
+        collected[layer_idx] = (params, bias)
+    return collected
+
+
+def _bitwise_equal(a: Optional[torch.Tensor], b: Optional[torch.Tensor]) -> bool:
+    """Same dtype, shape and bytes (NaN payloads included)."""
+    if a is None or b is None or a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    return torch.equal(a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8))
+
+
+def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Elementwise distance of two 16-bit float tensors in units in the last place.
+
+    The bits are read as integers, with the sign-magnitude encoding made monotonic, so
+    adjacent representable values are 1 apart and ``+0`` and ``-0`` are 0 apart.
+    """
+
+    def ordered(t: torch.Tensor) -> torch.Tensor:
+        bits = t.contiguous().view(torch.int16).to(torch.int32)
+        return torch.where(bits < 0, -(bits & 0x7FFF), bits)
+
+    return (ordered(a) - ordered(b)).abs()
+
+
+def _act_scale_matches(value: Optional[torch.Tensor], reference: Optional[torch.Tensor]) -> bool:
+    """Whether a rank's per-layer activation scale can stand for rank 0's ``reference``.
+
+    The NVFP4 AWQ loader accepts the experts of a layer whose ``pre_quant_scale`` match the
+    first one it loads within ``rtol=1e-5, atol=1e-8``, and casts that first one to the module
+    dtype.  Each rank loads its own experts, so two ranks' values may differ by that tolerance
+    before the cast, which is one unit in the last place of a 16-bit dtype after it.  Other
+    dtypes are compared with the loader's tolerance.
+    """
+    if value is None or reference is None:
+        return False
+    if value.dtype != reference.dtype or value.shape != reference.shape:
+        return False
+    if value.dtype.is_floating_point and value.element_size() == 2:
+        return bool((_ulp_distance(value, reference) <= 1).all())
+    return torch.allclose(value.double(), reference.double(), rtol=1e-5, atol=1e-8)
+
+
+def _agree_on_act_scale(
+    what: str, reports: List[_ParamReport], problems: List[str]
+) -> Optional[torch.Tensor]:
+    """Rank 0's copy of a per-layer activation scale, if every rank's can stand for it.
+
+    Returns:
+        Rank 0's CPU tensor, which every rank installs; None after appending to ``problems``.
+    """
+    reference = reports[0].data
+    differing = [
+        rank
+        for rank, report in enumerate(reports)
+        if not _act_scale_matches(report.data, reference)
+    ]
+    if not differing:
+        return reference
+    dtype = None if reference is None else reference.dtype
+    problems.append(
+        f"{what} is a per-layer activation scale, but ranks {differing} hold values further "
+        f"from rank 0's than one unit in the last place of {dtype} (or another shape or dtype). "
+        f"Each rank takes it from the first expert it loads; a load on one rank would require "
+        f"every expert's pre_quant_scale to match expert 0's within rtol=1e-5, which this check "
+        f"of one value per rank cannot replace"
+    )
+    return None
+
+
+def _merge_shards(
+    what: str,
+    reports: List[_ParamReport],
+    partition: ExpertPartition,
+    problems: List[str],
+    *,
+    allow_per_layer: bool,
+) -> Tuple[str, Optional[torch.Tensor]]:
+    """Classify one parameter from every rank's report and put a per-expert one together.
+
+    Returns:
+        ``(category, full)``: ``"per expert"`` with the ``[num_experts, ...]`` tensor,
+        ``"full"`` (full-sized on every rank, nothing to install), ``"per layer"`` (the same
+        shape on every rank and not per expert; it must be bitwise equal on every rank, nothing
+        to install) or ``"invalid"``; every inconsistency is appended to ``problems``.
+    """
+    num_experts = partition.num_experts
+    shapes = [report.shape for report in reports]
+    counts = [partition.count_of(rank) for rank in range(len(reports))]
+    trailing = {shape[1:] for shape in shapes}
+    if len(trailing) == 1 and all(shape and shape[0] == num_experts for shape in shapes):
+        return "full", None
+    if len(trailing) == 1 and all(
+        shape and shape[0] == count for shape, count in zip(shapes, counts)
+    ):
+        shards = [report.data for report in reports]
+        if len({shard.dtype for shard in shards}) != 1:
+            problems.append(f"{what}: dtypes {[shard.dtype for shard in shards]} per rank")
+            return "invalid", None
+        full = _scatter_shards_to_full(
+            shards=shards,
+            peer_ranges=partition.peer_ranges,
+            num_experts_total=num_experts,
+            ref=shards[0],
+        )
+        # Overlapping ranges store an expert on more than one rank: every copy must agree,
+        # i.e. each rank's shard is what was put together over its range.
+        differing = set()
+        for rank, shard in enumerate(shards):
+            start, end = partition.range_of(rank)
+            if shard.numel() == 0:
+                continue
+            own = shard.reshape(end - start, -1).view(torch.uint8)
+            merged = full[start:end].reshape(end - start, -1).view(torch.uint8)
+            rows = (own != merged).any(dim=1).nonzero().flatten().tolist()
+            differing.update(start + row for row in rows)
+        if differing:
+            problems.append(
+                f"{what}: the ranks storing experts {sorted(differing)[:8]} hold different "
+                f"values for them"
+            )
+        return "per expert", full
+    if allow_per_layer and len(set(shapes)) == 1:
+        differing = [
+            rank
+            for rank, report in enumerate(reports)
+            if not _bitwise_equal(report.data, reports[0].data)
+        ]
+        if differing:
+            problem = f"{what} is per layer, but ranks {differing} hold other values than rank 0"
+            if not shapes[0]:
+                # The activation input scales.
+                problem += (
+                    f" ({[report.data.item() for report in reports]}); a rank reduces it over the "
+                    f"experts it loads (quantization's load_streaming_nvfp4_expert), so all "
+                    f"experts of the checkpoint must have the same one"
+                )
+            problems.append(problem)
+        return "per layer", None
+    problems.append(
+        f"{what}: shapes {shapes} per rank; a per-expert parameter has the rank's expert count "
+        f"{counts} or {num_experts} rows on every rank"
+    )
+    return "invalid", None
+
+
+def _exchange_expert_scalars(
+    comm: GroupComm,
+    model: nn.Module,
+    layer_indices: List[int],
+    partition: ExpertPartition,
+    *,
+    error: Optional[Exception] = None,
+) -> Dict[int, _LayerScalars]:
+    """The fixup's one collective, which is also the group's vote on the setup steps before it.
+
+    Every rank enters it, also after a failure, with its status (``error``, None on success)
+    and its small expert parameters (``_collect_expert_scalars``) of every MoE layer.  The
+    verdict is a function of the gathered reports only, so it is the same on every rank:
+
+    * A rank failed: every rank raises, the failed rank its own error and the others a
+      RuntimeError naming it, and each rolls its setup back.
+    * Each layer's parameter names must match across ranks.  A parameter with ``count_p`` rows
+      on every rank ``p`` (``fc31_alpha``, ``fc2_alpha``) is per expert: the shards are put
+      together into ``[num_experts, ...]`` along the partition (``_scatter_shards_to_full``),
+      and every rank storing an expert (overlapping ranges) must hold the same values for it.
+      One with ``num_experts`` rows on every rank is full-sized already.  A per-layer
+      activation scale (``*_act_scale``, e.g. AWQ's ``fc31_act_scale``), classified by name,
+      must be within one unit in the last place of rank 0's copy (``_act_scale_matches``),
+      which every rank then installs.  A zero-dimensional one (``fc31_input_scale``,
+      ``fc2_input_scale``), which the alphas fold in, or any other one of the same shape on
+      every rank, is per layer and must be bitwise equal on every rank.  Anything else raises.
+    * The gate's ``e_score_correction_bias``: full-sized on every rank (the gate loads it
+      whole under ``moe_ep_size = 1``) stays; ``count_p`` entries on every rank are put
+      together like a per-expert parameter; anything else raises.
+
+    Returns:
+        ``_LayerScalars`` per layer index, for ``fixup_moe_backends``.
+
+    Raises:
+        RuntimeError: As above, on every rank after the same collective.
+    """
+    collected = {}
+    if error is None:
+        try:
+            collected = _collect_expert_scalars(model, layer_indices, partition.num_experts)
+        except Exception as exc:  # noqa: BLE001 - reported to the group below
+            error = exc
+    status = None if error is None else _describe_error(error)
+    reports = _allgather_keeping(comm, (status, collected), error)
+    if error is not None:
+        raise error
+    failed = [
+        f"rank {rank}: {rank_status}"
+        for rank, (rank_status, _) in enumerate(reports)
+        if rank_status is not None
+    ]
+    if failed:
+        raise RuntimeError(
+            f"[DWDP Setup] DWDP setup failed on {'; '.join(failed)}. Every rank of the DWDP "
+            f"group raises this and releases its DWDP resources."
+        )
+
+    problems: List[str] = []
+    categories: Dict[str, set[str]] = {}
+    expert_scalars: Dict[int, _LayerScalars] = {}
+    for layer_idx in layer_indices:
+        per_rank = [layers.get(layer_idx) for _, layers in reports]
+        if any(entry is None for entry in per_rank):
+            problems.append(f"layer {layer_idx} is missing on some ranks")
+            continue
+        names = sorted(per_rank[0][0])
+        if any(sorted(params) != names for params, _ in per_rank):
+            problems.append(
+                f"layer {layer_idx}: the ranks have other small expert parameters "
+                f"({[sorted(params) for params, _ in per_rank]})"
+            )
+            continue
+        params = {}
+        act_scales = {}
+        for pname in names:
+            what = f"layer {layer_idx} {pname}"
+            reports_of_param = [rank_params[pname] for rank_params, _ in per_rank]
+            if pname.endswith(_ACT_SCALE_SUFFIX):
+                categories.setdefault("per layer, rank 0's installed", set()).add(pname)
+                act_scale = _agree_on_act_scale(what, reports_of_param, problems)
+                if act_scale is not None:
+                    act_scales[pname] = act_scale
+                continue
+            category, full = _merge_shards(
+                what, reports_of_param, partition, problems, allow_per_layer=True
+            )
+            categories.setdefault(category, set()).add(pname)
+            if full is not None:
+                params[pname] = full
+        biases = [bias for _, bias in per_rank]
+        bias = None
+        if all(report is None for report in biases):
+            categories.setdefault("absent", set()).add("e_score_correction_bias")
+        elif any(report is None for report in biases):
+            problems.append(f"layer {layer_idx}: only some ranks have an e_score_correction_bias")
+        else:
+            category, bias = _merge_shards(
+                f"layer {layer_idx} e_score_correction_bias",
+                biases,
+                partition,
+                problems,
+                allow_per_layer=False,
+            )
+            categories.setdefault(category, set()).add("e_score_correction_bias")
+        expert_scalars[layer_idx] = _LayerScalars(params, bias, act_scales)
+    if problems:
+        raise RuntimeError(
+            f"[DWDP Setup] The DWDP group's small expert parameters do not fit together: "
+            f"{'; '.join(problems[:8])}"
+            + (f"; and {len(problems) - 8} more" if len(problems) > 8 else "")
+            + ". Every rank of the DWDP group raises this."
+        )
+    summary = "; ".join(f"{kind}: {sorted(names)}" for kind, names in sorted(categories.items()))
+    logger.info(
+        f"[DWDP Setup] Exchanged the small expert parameters of {len(layer_indices)} MoE layers "
+        f"in one allgather (partition {partition.describe()}): {summary}"
+    )
+    return expert_scalars
 
 
 def fixup_moe_backends(
     model: nn.Module,
     moe_layer_indices: List[int],
     num_experts_total: int,
-    comm,
-    dwdp_rank: int,
-    dwdp_size: int,
-    *,
-    num_experts_per_worker: int,
-    peer_ranges: PeerRanges,
+    expert_scalars: Dict[int, _LayerScalars],
 ) -> None:
     """Patch each MoE backend to see all experts (ep_size=1) after DWDP setup.
 
@@ -660,28 +1228,19 @@ def fixup_moe_backends(
     - ``initial_global_assignments = list(range(num_experts))``.
     - ``num_slots = num_experts``.
 
-    Additionally, small EP-sharded scale parameters
-    (``fc31_alpha`` / ``fc2_alpha``) are allgathered to full size.  The
-    gate's ``e_score_correction_bias`` is checked too, but on the
-    Phase-1 ``moe_ep_size = 1`` setup it is already loaded full and the
-    helper short-circuits.
+    Additionally, it installs the full-sized small parameters that
+    ``_exchange_expert_scalars`` put together from every rank's shard
+    (``fc31_alpha`` / ``fc2_alpha``; the gate's ``e_score_correction_bias``
+    only if it was loaded per expert: on the ``moe_ep_size = 1`` setup the
+    gate loads it whole), copies rank 0's per-layer activation scales
+    (``*_act_scale``) into this rank's, and rebuilds the quant scales.  Local
+    only: the exchange was the setup's last collective.
 
     Args:
         model: Top-level CausalLM model.
         moe_layer_indices: MoE layer indices to patch.
         num_experts_total: Total number of experts across all ranks.
-        comm: DWDP MPI communicator used for small tensor allgathers.
-        dwdp_rank: This rank's DWDP rank.
-        dwdp_size: Total DWDP ranks.
-        num_experts_per_worker: Storage chunk size — uniform across ranks.
-            Used as the EP shard size for scale-param detection (the scale
-            params loaded by the fused MoE backend match
-            ``self.expert_size_per_partition`` set by
-            ``_init_dwdp_expert_layout``).
-        peer_ranges: Per-peer ``(local_start, local_end_capped)`` tuples;
-            used to scatter each peer's allgathered shard back into the
-            correct slice of the reconstructed full-size tensor (handles
-            tail-rank padding and redundant overlap).
+        expert_scalars: ``_exchange_expert_scalars``'s result, per layer index.
     """
     decoder_model = _get_decoder_model(model)
     layers = decoder_model.layers
@@ -746,251 +1305,45 @@ def fixup_moe_backends(
             f"slots=[{old_slot_start},{old_slot_end})->[0,{num_experts_total})"
         )
 
-        # --- Allgather e_score_correction_bias ---
-        gate_module = _get_gate_module(moe_module)
-        if gate_module is not None:
-            _allgather_e_score_correction_bias(
-                gate_module, layer_idx, dwdp_rank, dwdp_size,
-                num_experts_total, comm,
-                num_experts_per_worker=num_experts_per_worker,
-                peer_ranges=peer_ranges,
-            )
+        layer_scalars = expert_scalars.get(layer_idx)
+        if layer_scalars is not None:
+            # --- The gate's e_score_correction_bias, if it was per expert ---
+            gate_module = _get_gate_module(moe_module)
+            if layer_scalars.bias is not None and gate_module is not None:
+                bias_param = gate_module.e_score_correction_bias
+                bias_data = bias_param.data if isinstance(bias_param, nn.Parameter) else bias_param
+                full_bias = layer_scalars.bias.to(bias_data.device)
+                if isinstance(bias_param, nn.Parameter):
+                    gate_module.e_score_correction_bias = nn.Parameter(
+                        full_bias, requires_grad=False
+                    )
+                else:
+                    bias_param.data = full_bias
 
-        # --- Allgather small expert scale/dequant parameters via MPI ---
-        # Large scale params (w3_w1_weight_scale, w2_weight_scale) are already
-        # handled by Transport (MNNVL + P2P) — they are in _EXPERT_WEIGHT_NAMES.
-        # Small params (fc31_alpha, fc2_alpha) are allgathered here.
-        # ``num_experts_per_worker`` (uniform storage chunk size across ranks)
-        # is the right shape match for these EP-sharded scale params under the
-        # Phase-1 layout, even when the partition is non-uniform or has
-        # redundancy.
-        _allgather_expert_scales(
-            experts_module, layer_idx, dwdp_rank, dwdp_size, comm,
-            experts_per_rank=num_experts_per_worker,
-            num_experts_total=num_experts_total,
-            peer_ranges=peer_ranges,
-        )
+            # --- Small per-expert scale/dequant parameters ---
+            # Large scale params (w3_w1_weight_scale, w2_weight_scale) are
+            # handled by Transport (MNNVL + P2P) — they are in
+            # _EXPERT_WEIGHT_NAMES.  The small ones (fc31_alpha, fc2_alpha)
+            # replace the rank's shard with the full-sized tensor here.
+            for pname, full in layer_scalars.params.items():
+                device = getattr(experts_module, pname).device
+                setattr(
+                    experts_module,
+                    pname,
+                    nn.Parameter(full.to(device), requires_grad=False),
+                )
+                logger.debug(
+                    f"[DWDP Setup] Layer {layer_idx}: installed the full {pname} "
+                    f"({full.shape[0]} experts)"
+                )
+
+            # --- Per-layer activation scales: rank 0's copy, in place ---
+            # In place, so whatever already holds the parameter sees the same value on
+            # every rank.
+            for pname, value in layer_scalars.act_scales.items():
+                param = getattr(experts_module, pname)
+                param.data.copy_(value.to(device=param.device, dtype=param.dtype))
         _rebuild_quant_scales(experts_module, layer_idx)
-
-
-def _allgather_e_score_correction_bias(
-    gate_module: nn.Module,
-    layer_idx: int,
-    dwdp_rank: int,
-    dwdp_size: int,
-    num_experts_total: int,
-    comm,
-    *,
-    num_experts_per_worker: Optional[int] = None,
-    peer_ranges: Optional[PeerRanges] = None,
-) -> None:
-    """Allgather the EP-sharded e_score_correction_bias to get the full vector.
-
-    Each rank has a shard of size ``num_experts_per_worker`` (the uniform
-    storage chunk set by ``_init_dwdp_expert_layout``).  After allgather
-    each rank holds the full ``(num_experts,)`` bias vector reconstructed
-    via ``peer_ranges`` (so non-uniform tail padding and redundant
-    overlapping ranges are placed at the correct global expert indices).
-
-    If the bias is already full-sized (not EP-sharded), this is a no-op.
-    The gate's e_score_correction_bias covers ALL experts for routing and
-    is typically loaded full when ``moe_ep_size = 1``.
-
-    Args:
-        gate_module: The DeepseekV3Gate (or compatible) module with
-            ``e_score_correction_bias`` parameter.
-        layer_idx: Layer index (for log messages only).
-        dwdp_rank: This rank's DWDP rank.
-        dwdp_size: Total DWDP ranks.
-        num_experts_total: Total number of experts across all ranks.
-        comm: DWDP MPI communicator.
-        num_experts_per_worker: Uniform storage shard size used to detect
-            EP-sharded bias.  Defaults to ``num_experts_total // dwdp_size``
-            (the uniform-partition shard size).
-        peer_ranges: ``(local_start, local_end_capped)`` per peer; used
-            to scatter shards back to the right global expert indices.
-            When ``None`` the function falls back to ``torch.cat`` and
-            truncates to ``num_experts_total`` (uniform / non-divisible
-            tail-padding case).  Required for redundancy.
-    """
-    bias_param = getattr(gate_module, "e_score_correction_bias", None)
-    if bias_param is None:
-        logger.debug(
-            f"[DWDP Setup] Layer {layer_idx}: no e_score_correction_bias found"
-        )
-        return
-
-    bias_data = bias_param.data if isinstance(bias_param, nn.Parameter) else bias_param
-    bias_size = bias_data.shape[0]
-    expected_shard_size = (
-        num_experts_per_worker if num_experts_per_worker is not None
-        else num_experts_total // dwdp_size
-    )
-
-    logger.info(
-        f"[DWDP Setup] Layer {layer_idx}: e_score_correction_bias "
-        f"type={type(bias_param).__name__}, shape={bias_data.shape}, "
-        f"device={bias_data.device}, "
-        f"num_experts_total={num_experts_total}, "
-        f"expected_shard={expected_shard_size}"
-    )
-
-    # The gate's e_score_correction_bias covers ALL experts for routing.
-    # It may or may not be EP-sharded depending on the model.
-    # Only allgather if the bias is actually sharded (size matches shard).
-    if bias_size == num_experts_total:
-        logger.info(
-            f"[DWDP Setup] Layer {layer_idx}: e_score_correction_bias "
-            f"already full-sized ({bias_size}), skipping allgather"
-        )
-        return
-    if bias_size != expected_shard_size:
-        logger.warning(
-            f"[DWDP Setup] Layer {layer_idx}: e_score_correction_bias "
-            f"size={bias_size} doesn't match expected shard size "
-            f"({expected_shard_size}) or full size ({num_experts_total}), "
-            f"skipping allgather"
-        )
-        return
-
-    # Allgather local shards via MPI.  Move to CPU first so the allgather
-    # doesn't require CUDA-aware MPI.
-    local_shard = bias_data.cpu().contiguous()
-    all_shards = comm.allgather(local_shard)
-    if peer_ranges is not None:
-        full_bias = _scatter_shards_to_full(
-            shards=all_shards,
-            peer_ranges=peer_ranges,
-            num_experts_total=num_experts_total,
-            ref=bias_data,
-        )
-    else:
-        # Legacy uniform path: cat then truncate to handle non-divisible
-        # tail padding.  Sufficient for the no-redundancy uniform case.
-        full_bias = torch.cat(all_shards, dim=0).to(bias_data.device)
-        if full_bias.shape[0] > num_experts_total:
-            full_bias = full_bias[:num_experts_total].contiguous()
-
-    if isinstance(bias_param, nn.Parameter):
-        # Re-create parameter with the full size
-        gate_module.e_score_correction_bias = nn.Parameter(
-            full_bias, requires_grad=False
-        )
-    else:
-        bias_param.data = full_bias
-
-    logger.info(
-        f"[DWDP Setup] Layer {layer_idx}: allgathered e_score_correction_bias "
-        f"({expected_shard_size} -> {full_bias.shape[0]})"
-    )
-
-
-def _allgather_expert_scales(
-    experts_module: nn.Module,
-    layer_idx: int,
-    dwdp_rank: int,
-    dwdp_size: int,
-    comm,
-    experts_per_rank: Optional[int] = None,
-    *,
-    num_experts_total: Optional[int] = None,
-    peer_ranges: Optional[PeerRanges] = None,
-) -> None:
-    """Allgather small EP-sharded quantization scale/dequant parameters via MPI.
-
-    Only handles SMALL scale params (e.g. ``fc31_alpha``, ``fc2_alpha``)
-    that are NOT in ``_EXPERT_WEIGHT_NAMES``.  Large scale params
-    (``w3_w1_weight_scale``, ``w2_weight_scale``) are handled by DWDP
-    Transport (MNNVL + P2P).
-
-    Heuristic: any ``nn.Parameter`` on ``experts_module`` whose name contains
-    ``"scale"``, ``"scaling_factor"``, ``"dequant"``, or ``"alpha"``, whose
-    ``shape[0] == experts_per_rank``, and which is NOT in
-    ``_EXPERT_WEIGHT_NAMES``, is treated as a small EP-sharded tensor.
-
-    When ``peer_ranges`` is provided each shard is scattered into the
-    correct global expert slice — this is required for non-uniform /
-    redundant partitions, where naive ``torch.cat`` would mis-place
-    overlapping ranges or include tail-rank padding.  When ``peer_ranges``
-    is ``None`` the function falls back to the simple uniform-partition
-    concat (legacy behavior).
-
-    Args:
-        experts_module: The MoE backend module (e.g. CutlassFusedMoE).
-        layer_idx: Layer index (for log messages only).
-        dwdp_rank: This rank's DWDP rank.
-        dwdp_size: Total DWDP ranks.
-        comm: DWDP MPI communicator.
-        experts_per_rank: Number of experts per DWDP rank — i.e., the
-            uniform storage chunk size.  If None, inferred from
-            ``w3_w1_weight.shape[0]`` (only valid before DWDP weight
-            buffer replaces the original tensor).
-        num_experts_total: Global expert count.  Required when
-            ``peer_ranges`` is provided (for the destination tensor size).
-        peer_ranges: Per-peer ``(local_start, local_end_capped)``; when
-            provided enables scatter-based reconstruction that handles
-            non-uniform / redundant partitions.
-    """
-    _SCALE_KEYWORDS = ("scale", "scaling_factor", "dequant", "alpha")
-
-    # Discover EP-sharded scale parameters.
-    if experts_per_rank is None:
-        # Fallback: infer from main weight (only valid before DWDP buffer swap).
-        ref_param = getattr(experts_module, "w3_w1_weight", None)
-        if ref_param is None:
-            return
-        ref_data = ref_param.data if isinstance(ref_param, nn.Parameter) else ref_param
-        experts_per_rank = ref_data.shape[0]
-    if experts_per_rank == 0:
-        return
-
-    for pname, param in list(experts_module.named_parameters()):
-        # Only look at direct parameters (no '.' in name — skip sub-modules).
-        if "." in pname:
-            continue
-        if not any(kw in pname for kw in _SCALE_KEYWORDS):
-            continue
-        # Large scale params in _EXPERT_WEIGHT_NAMES are handled by Transport
-        # (MNNVL + P2P), not MPI allgather.
-        if pname in _EXPERT_WEIGHT_NAMES:
-            continue
-
-        pdata = param.data
-        if pdata.ndim == 0 or pdata.shape[0] != experts_per_rank:
-            # Scalar or non-EP-sharded — skip.
-            continue
-
-        local_shard = pdata.cpu().contiguous()
-        logger.info(
-            f"[DWDP Setup] Layer {layer_idx}: allgathering {pname} "
-            f"shape={local_shard.shape} dtype={local_shard.dtype} via MPI"
-        )
-
-        all_shards = comm.allgather(local_shard)
-        if peer_ranges is not None:
-            assert num_experts_total is not None, (
-                "num_experts_total must be provided alongside peer_ranges"
-            )
-            full_tensor = _scatter_shards_to_full(
-                shards=all_shards,
-                peer_ranges=peer_ranges,
-                num_experts_total=num_experts_total,
-                ref=pdata,
-            )
-        else:
-            full_tensor = torch.cat(all_shards, dim=0).to(pdata.device)
-
-        # Replace parameter with full-sized version.
-        setattr(
-            experts_module,
-            pname,
-            nn.Parameter(full_tensor, requires_grad=False),
-        )
-
-        logger.info(
-            f"[DWDP Setup] Layer {layer_idx}: allgathered {pname} "
-            f"({experts_per_rank} -> {full_tensor.shape[0]})"
-        )
 
 
 def _scatter_shards_to_full(
@@ -1003,15 +1356,16 @@ def _scatter_shards_to_full(
     """Reconstruct a full ``(num_experts_total, *trailing)`` tensor from
     per-peer shards using ``peer_ranges`` as the index map.
 
-    Each peer's shard has shape ``(num_experts_per_worker, *trailing)``
-    (uniform across ranks).  The valid prefix
-    ``shard[:end_capped - start]`` is placed at ``full[start:end_capped]``.
-    For redundancy (overlapping ranges) writes overwrite — values agree
-    across peers so the result is deterministic.
+    Each peer's shard has shape ``(count, *trailing)``, where ``count`` is
+    at least ``end - start`` of the peer's range; counts may differ between
+    peers (balanced partition, capped last rank).  The prefix
+    ``shard[:end - start]`` is placed at ``full[start:end]``.  For redundancy
+    (overlapping ranges) writes overwrite — ``_exchange_expert_scalars``
+    checks that the values agree, so the result is deterministic.
 
     Args:
         shards: Per-peer tensors as returned by ``comm.allgather``.
-        peer_ranges: Per-peer ``(local_start, local_end_capped)``.
+        peer_ranges: Per-peer ``(start, end)``.
         num_experts_total: Global expert count (= full tensor's first dim).
         ref: Reference tensor for dtype + device.
     """
@@ -1045,9 +1399,10 @@ def _rebuild_quant_scales(experts_module: nn.Module, layer_idx: int) -> None:
         still exist. At runtime, wait_and_bind() does param.data = composite_VA,
         which swaps in the full tensor. The NamedTuple references the same
         Parameter, so it sees the updated data.
-      - fc31_alpha / fc2_alpha: allgathered via MPI. _allgather_expert_scales
-        replaces these with new full-sized Parameter objects via setattr(), so the
-        old NamedTuple references are stale and must be rebuilt.
+      - fc31_alpha / fc2_alpha: put together from every rank's shard by
+        _exchange_expert_scalars; fixup_moe_backends replaces these with new
+        full-sized Parameter objects via setattr(), so the old NamedTuple
+        references are stale and must be rebuilt.
 
     This function reconstructs the NamedTuple from the module's current
     Parameter state so all fields point to the live objects.
@@ -1067,10 +1422,10 @@ def _rebuild_quant_scales(experts_module: nn.Module, layer_idx: int) -> None:
         # FusedMoEQuantScalesNVFP4:
         #   fc1_act_global   = module.fc31_input_scale   (scalar, not EP-sharded)
         #   fc1_weight_block = module.w3_w1_weight_scale (Transport: empty now, filled at runtime)
-        #   fc1_global       = module.fc31_alpha         (MPI allgathered: full-sized)
+        #   fc1_global       = module.fc31_alpha         (exchanged: full-sized)
         #   fc2_act_global   = module.fc2_input_scale    (scalar, not EP-sharded)
         #   fc2_weight_block = module.w2_weight_scale    (Transport: empty now, filled at runtime)
-        #   fc2_global       = module.fc2_alpha          (MPI allgathered: full-sized)
+        #   fc2_global       = module.fc2_alpha          (exchanged: full-sized)
         new_qs = qs_type(
             fc1_act_global=experts_module.fc31_input_scale,
             fc1_weight_block=experts_module.w3_w1_weight_scale,
@@ -1082,7 +1437,7 @@ def _rebuild_quant_scales(experts_module: nn.Module, layer_idx: int) -> None:
         experts_module.quant_scales = new_qs
         logger.info(
             f"[DWDP Setup] Layer {layer_idx}: rebuilt FusedMoEQuantScalesNVFP4 "
-            f"(weight_scale params via Transport, alpha params via MPI allgather)"
+            f"(weight_scale params via Transport, alpha params via the exchange)"
         )
     else:
         logger.debug(
@@ -1198,120 +1553,3 @@ def _get_gate_module(moe_module: nn.Module) -> Optional[nn.Module]:
     if gate is not None and hasattr(gate, "e_score_correction_bias"):
         return gate
     return None
-
-
-def _get_first_spec(layer_weight_specs: LayerWeightSpecs) -> WeightSpec:
-    """Get the first WeightSpec from layer_weight_specs.
-
-    Args:
-        layer_weight_specs: The weight specs dict.
-
-    Returns:
-        First WeightSpec found.
-
-    Raises:
-        ValueError: If specs are empty.
-    """
-    for layer_idx, weight_specs in layer_weight_specs.items():
-        for name, spec in weight_specs.items():
-            return spec
-    raise ValueError("layer_weight_specs is empty")
-
-
-def _validate_partition_config(
-    *,
-    num_experts_per_worker: int,
-    num_prefetch_experts: int,
-    num_experts_total: int,
-    dwdp_size: int,
-    loaded_local_experts: int,
-) -> None:
-    """Validate that the DwdpConfig partition is internally consistent.
-
-    Checks (in order, each independent):
-
-    1. Both ``num_experts_per_worker`` and ``num_prefetch_experts`` are
-       positive integers.
-    2. ``num_prefetch_experts <= num_experts_per_worker`` — stride must
-       not exceed range size, otherwise consecutive ranks leave a gap
-       (some experts owned by no one).  Equality is the no-redundancy
-       case; ``stride < size`` is intentional redundancy where adjacent
-       ranks' ranges overlap by ``size - stride`` experts.
-    3. Strict equality ``(dwdp_size - 1) * stride + size == num_experts``.
-       The last rank's storage must end exactly at ``num_experts``:
-
-       * ``< num_experts``: insufficient coverage — some experts owned
-         by no rank.
-       * ``> num_experts``: tail padding — last rank's storage extends
-         past the final expert, which the GB200 cuMemMap-with-fabric-
-         handle ABI cannot map into a ``num_experts``-sized composite
-         VA (partial mapping returns ``CUDA_ERROR_NOT_SUPPORTED``).
-         Pick a (size, stride) pair satisfying equality instead, e.g.
-         dwdp=3 + 256 experts → ``size=86, stride=85``;
-         dwdp=5 + 256 → ``52, 51``;
-         dwdp=7 + 256 → ``40, 36`` (or any other ``a*stride + b*size``
-         summing to ``num_experts``).
-    4. ``loaded_local_experts == num_experts_per_worker`` — the chunk
-       shape produced by the fused MoE weight loader must match what
-       DwdpConfig declares, so DWDP does not redirect prefetch to a
-       tensor of the wrong size.  ``_init_dwdp_expert_layout`` arranges
-       this by overriding ``expert_size_per_partition`` to
-       ``num_experts_per_worker`` before ``create_weights`` runs.
-
-    Together these guarantee that every expert in
-    ``[0, num_experts_total)`` is owned by at least one rank, that the
-    runtime range computation matches the stored weights, and that
-    every storage slot maps to a valid (in-range) expert id.
-    """
-    if num_experts_per_worker <= 0:
-        raise ValueError(
-            f"[DWDP Setup] num_experts_per_worker must be positive, "
-            f"got {num_experts_per_worker}"
-        )
-    if num_prefetch_experts <= 0:
-        raise ValueError(
-            f"[DWDP Setup] num_prefetch_experts must be positive, "
-            f"got {num_prefetch_experts}"
-        )
-    if num_prefetch_experts > num_experts_per_worker:
-        raise ValueError(
-            f"[DWDP Setup] num_prefetch_experts ({num_prefetch_experts}) "
-            f"must be <= num_experts_per_worker ({num_experts_per_worker}); "
-            f"a stride larger than the range size leaves expert gaps "
-            f"between consecutive ranks."
-        )
-    coverage = (dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker
-    if coverage < num_experts_total:
-        raise ValueError(
-            f"[DWDP Setup] DWDP partition does not cover all experts: "
-            f"(dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker "
-            f"= ({dwdp_size} - 1) * {num_prefetch_experts} + "
-            f"{num_experts_per_worker} = {coverage} < num_experts_total "
-            f"= {num_experts_total}. Increase num_prefetch_experts or "
-            f"num_experts_per_worker so coverage >= num_experts."
-        )
-    if coverage > num_experts_total:
-        raise ValueError(
-            f"[DWDP Setup] DWDP partition exceeds num_experts: "
-            f"(dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker "
-            f"= ({dwdp_size} - 1) * {num_prefetch_experts} + "
-            f"{num_experts_per_worker} = {coverage} > num_experts_total "
-            f"= {num_experts_total}. The last rank's storage extends "
-            f"past the final expert; GB200 fabric handles cannot be "
-            f"partially mapped into the composite VA, so tail padding "
-            f"is unsupported. Pick a (size, stride) pair with "
-            f"(dwdp_size - 1) * stride + size == num_experts (Mode B "
-            f"overlap), e.g. dwdp=3 + 256 -> size=86 stride=85; "
-            f"dwdp=5 + 256 -> 52 / 51; dwdp=7 + 256 -> 40 / 36."
-        )
-    if loaded_local_experts != num_experts_per_worker:
-        raise ValueError(
-            f"[DWDP Setup] DwdpConfig.num_experts_per_worker="
-            f"{num_experts_per_worker} does not match the fused MoE chunk "
-            f"shape ({loaded_local_experts}). _init_dwdp_expert_layout is "
-            f"expected to set expert_size_per_partition = "
-            f"num_experts_per_worker before create_weights() runs; check "
-            f"that get_global_dwdp_manager() is set during model "
-            f"construction (it is set by py_executor_creator before "
-            f"model loading)."
-        )

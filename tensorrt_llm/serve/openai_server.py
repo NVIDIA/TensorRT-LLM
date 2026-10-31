@@ -608,7 +608,15 @@ class OpenAIServer(_VideoRoutesMixin):
             rl_control_api_key: Optional[str] = None,
             enable_runtime_control_endpoints: bool = False,
             runtime_control_api_key: Optional[str] = None,
-            multi_frontend_serving: Optional[MultiFrontendServing] = None):
+            multi_frontend_serving: Optional[MultiFrontendServing] = None,
+            graceful_shutdown_timeout: Optional[int] = None):
+        if graceful_shutdown_timeout is not None and graceful_shutdown_timeout <= 0:
+            raise ValueError(
+                "graceful_shutdown_timeout must be a positive number of "
+                f"seconds, got {graceful_shutdown_timeout}")
+        # Seconds uvicorn waits after a shutdown signal for request handlers
+        # still running before it cancels them; None waits for every handler.
+        self.graceful_shutdown_timeout = graceful_shutdown_timeout
         if enable_rl_control_endpoints:
             logger.warning(
                 "RL control endpoints are deprecated; use generic runtime "
@@ -4227,18 +4235,28 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
     async def __call__(self,
-                       host,
-                       port,
-                       sockets: list[socket.socket] | None = None):
+                       host: str,
+                       port: int,
+                       sockets: list[socket.socket] | None = None) -> None:
         # Store the binding address for server registration
         self.binding_addr = f"http://{host}:{port}"
         self.host = host
         self.port = port
+        # Without graceful_shutdown_timeout, uvicorn keeps its default and
+        # waits for every request handler during graceful shutdown.
+        config_kwargs = {}
+        shutdown_timeout = self.graceful_shutdown_timeout
+        if shutdown_timeout is not None:
+            config_kwargs["timeout_graceful_shutdown"] = shutdown_timeout
+            logger.info(f"graceful_shutdown_timeout={shutdown_timeout}: "
+                        "uvicorn graceful shutdown cancels request handlers "
+                        f"still running after {shutdown_timeout}s")
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level="info",
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
+                                **config_kwargs)
         server = create_uvicorn_server(config)
 
         async def _register_after_serving():

@@ -109,17 +109,29 @@ def available() -> bool:
     return is_enabled() and gather_op() is not None
 
 
-def resident_sms() -> int:
-    """SMs the persistent compute grids leave to the gather; read once, by ``DwdpManager``.
+def env_request() -> Optional[bool]:
+    """What ``TRTLLM_DWDP_PREFETCH_GATHER`` asks for: None when it is unset or empty."""
+    if not os.environ.get(_ENABLE_ENV):
+        return None
+    return is_enabled()
+
+
+def resident_sms(gather: Optional[bool] = None) -> int:
+    """SMs the persistent compute grids leave to the gather; read once, by the DWDP managers.
 
     ``TRTLLM_CUTEDSL_SM_RESERVE`` pins the count.  Otherwise it is the gather's block count where
     the gather is the transport and one block of ``THREADS >= 512`` fills an SM; smaller blocks
     share SMs with the compute kernels and reserve none.
+
+    Args:
+        gather: Whether the gather is the transport; None means :func:`available`, the expert
+            DWDP choice (``DwdpManager``).  Standalone dense DWDP passes its own choice.
     """
     pinned = _int_env(_SM_RESERVE_ENV, -1)
     if pinned >= 0:
         return pinned
-    if not available() or THREADS < 512:
+    uses_gather = available() if gather is None else gather
+    if not uses_gather or THREADS < 512:
         return 0
     return total_blocks()
 

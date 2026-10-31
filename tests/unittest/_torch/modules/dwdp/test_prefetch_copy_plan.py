@@ -17,15 +17,19 @@
 ``_build_peer_descriptor_groups`` (one coalesced group per peer, consumed by the SM gather) and
 ``_build_batched_prefetch_copy_plan`` (the same bytes re-sliced and interleaved for
 ``cudaMemcpyBatchAsync``) must move identical bytes, so each plan is reduced to a canonical
-interval set and compared across slice geometries, ranks and slice sizes.
+interval set and compared across slice geometries, ranks and slice sizes, also with the unequal
+peer views of the balanced expert partition.
 """
 
+import itertools
 from typing import Dict, List, Tuple
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.dwdp import fabric_gather
 from tensorrt_llm._torch.modules.dwdp import weight_manager as wm
+from tensorrt_llm._torch.modules.dwdp.specs import ExpertPartition, PeerRanges
 
 pytestmark = pytest.mark.cpu_only
 
@@ -38,7 +42,8 @@ EXPERT_ELEMS = 1024
 DTYPE = torch.bfloat16
 ELEM_BYTES = DTYPE.itemsize
 LAYER_BYTES = len(WEIGHT_NAMES) * TOTAL_EXPERTS * EXPERT_ELEMS * ELEM_BYTES
-PEER_WEIGHT_BYTES = EXPERTS_PER_PEER * EXPERT_ELEMS * ELEM_BYTES
+EXPERT_BYTES = EXPERT_ELEMS * ELEM_BYTES
+PEER_WEIGHT_BYTES = EXPERTS_PER_PEER * EXPERT_BYTES
 
 PRODUCTION_BOUNDS = [0, TOTAL_EXPERTS]
 FRAGMENTED_BOUNDS = [0, 10, 100, 101, 200, 373, TOTAL_EXPERTS]  # straddles peer boundaries
@@ -60,35 +65,44 @@ class _FakeWeightBuffer:
         return self._slices[(layer_idx, name)]
 
 
-def _make_manager(slice_bounds: List[int], dwdp_rank: int = 0):
-    """Return (manager, backings, src_ptr_to_peer); keep backings alive while a plan is in use."""
+def _make_manager(
+    slice_bounds: List[int], dwdp_rank: int = 0
+) -> Tuple[wm.DWDPWeightManager, List[torch.Tensor], Dict[int, int]]:
+    """``_make_manager_over`` with equal peers and consecutive remote slices at ``slice_bounds``."""
     assert slice_bounds[0] == 0 and slice_bounds[-1] == TOTAL_EXPERTS
+    peer_ranges = [(p * EXPERTS_PER_PEER, (p + 1) * EXPERTS_PER_PEER) for p in range(DWDP_SIZE)]
+    return _make_manager_over(peer_ranges, list(zip(slice_bounds, slice_bounds[1:])), dwdp_rank)
 
+
+def _make_manager_over(
+    peer_ranges: PeerRanges, remote: List[Tuple[int, int]], dwdp_rank: int
+) -> Tuple[wm.DWDPWeightManager, List[torch.Tensor], Dict[int, int]]:
+    """Return (manager, backings, src_ptr_to_peer); keep backings alive while a plan is in use.
+
+    Peer ``p``'s views have the rows of ``peer_ranges[p]``; ``remote`` holds the ``(start, end)``
+    of each remote slice of the layer.
+    """
     peer_views: Dict[Tuple[int, int, str], torch.Tensor] = {}
     src_ptr_to_peer: Dict[int, int] = {}
-    for peer in range(DWDP_SIZE):
+    for peer, (start, end) in enumerate(peer_ranges):
         for name in WEIGHT_NAMES:
-            t = torch.empty((EXPERTS_PER_PEER, EXPERT_ELEMS), dtype=DTYPE)
+            t = torch.empty((end - start, EXPERT_ELEMS), dtype=DTYPE)
             peer_views[(peer, LAYER, name)] = t
             src_ptr_to_peer[t.data_ptr()] = peer
 
     slices, backings = {}, []
     for name in WEIGHT_NAMES:
-        backing = torch.empty((TOTAL_EXPERTS, EXPERT_ELEMS), dtype=DTYPE)
+        backing = torch.empty((peer_ranges[-1][1], EXPERT_ELEMS), dtype=DTYPE)
         backings.append(backing)
-        slices[(LAYER, name)] = [
-            (backing[a:b], a, b) for a, b in zip(slice_bounds, slice_bounds[1:])
-        ]
+        slices[(LAYER, name)] = [(backing[a:b], a, b) for a, b in remote]
 
     mgr = object.__new__(wm.DWDPWeightManager)
     mgr._weight_names = WEIGHT_NAMES
     mgr._weight_buffer = _FakeWeightBuffer(slices)
     mgr._peer_views = peer_views
-    mgr._peer_ranges = [
-        (p * EXPERTS_PER_PEER, (p + 1) * EXPERTS_PER_PEER) for p in range(DWDP_SIZE)
-    ]
+    mgr._peer_ranges = list(peer_ranges)
     mgr._dwdp_rank = dwdp_rank
-    mgr._dwdp_size = DWDP_SIZE
+    mgr._dwdp_size = len(peer_ranges)
     return mgr, backings, src_ptr_to_peer
 
 
@@ -168,3 +182,33 @@ def test_batch_interleaves_peers_round_robin(monkeypatch):
     assert len(src) > DWDP_SIZE
     first_round = [_peer_of(s, ptrs) for s in src[:DWDP_SIZE]]
     assert sorted(first_round) == list(range(DWDP_SIZE)), first_round
+
+
+@pytest.mark.parametrize("dwdp_size", [12, 20, 24], ids=["75-74", "45-44", "38-37"])
+def test_unequal_peer_views_read_each_remote_expert_from_its_owner(
+    dwdp_size: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every rank: each descriptor copies its experts' rows from their owner, each remote once."""
+    partition = ExpertPartition.balanced(num_experts=896, dwdp_size=dwdp_size)
+    for rank, (start, end) in enumerate(partition.ranges):
+        remote = [(a, b) for a, b in ((0, start), (end, 896)) if a < b]
+        mgr, backings, _ptrs = _make_manager_over(partition.peer_ranges, remote, rank)
+        groups = _groups(mgr)
+        flat = _flat_groups(groups)
+        for dst, src, size in zip(*flat):
+            (peer, _layer, name), view = next(
+                (key, view)
+                for key, view in mgr._peer_views.items()
+                if view.data_ptr() <= src and src + size <= view.data_ptr() + view.nbytes
+            )
+            # Row i of peer p's view is expert start_p + i of the same weight.
+            dst_offset = dst - backings[WEIGHT_NAMES.index(name)].data_ptr()
+            src_offset = src - view.data_ptr()
+            assert peer != rank
+            assert dst_offset == src_offset + partition.range_of(peer)[0] * EXPERT_BYTES
+        assert sum(flat[2]) == len(WEIGHT_NAMES) * (896 - (end - start)) * EXPERT_BYTES
+        assert _overlap_count(flat) == 0
+        assert _canonical(_plan(mgr, wm.MEMCPY_BATCH_SLICE_BYTES, monkeypatch)) == _canonical(flat)
+        _dst, _src, lines, row_starts, _ = fabric_gather.build_plan(groups, torch.device("cpu"))
+        assert row_starts.tolist() == [0, *itertools.accumulate(len(group) for group in groups)]
+        assert lines.sum().item() * fabric_gather.LINE_BYTES == sum(flat[2])

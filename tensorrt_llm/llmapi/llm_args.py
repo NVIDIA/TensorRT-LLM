@@ -5779,17 +5779,79 @@ class DwdpConfig(StrictBaseModel):
 
     Currently supported with the CuteDSL MoE backend and NVFP4 quantization
     on MNNVL-connected multi-GPU systems (e.g., GB200).
+
+    Dense DWDP (enable_dense) also shards the replicated dense weights of the
+    MoE decoder layers, over the DWDP group or, without expert DWDP
+    (enable_experts=False), over the attention-DP ranks of one instance.
     """
+    enable_experts: bool = Field(
+        default=True,
+        description=
+        "Expert DWDP: each worker of the DWDP group stores a range of the "
+        "routed experts and prefetches the others from its peers. Set it to "
+        "False, with enable_dense, for dense DWDP alone on one attention-DP "
+        "instance (enable_attention_dp with tensor_parallel_size > 1), whose "
+        "dense weights are then sharded over the instance's attention-DP "
+        "ranks; the expert DWDP fields (dwdp_size, num_groups, "
+        "num_experts_per_worker, num_prefetch_experts, contention_opt, "
+        "num_prefetch_slots) must then keep their defaults.",
+        status="prototype")
+    enable_dense: bool = Field(
+        default=False,
+        description=
+        "Dense DWDP: row-shard the replicated dense weights of the MoE decoder "
+        "layers (attention, shared expert, router and the other dense weights "
+        "of the MoE block) over the DWDP group, or without expert DWDP over the "
+        "attention-DP ranks of the instance, and gather each layer into small "
+        "staging slots two layers ahead of its use, which frees most of them "
+        "for the KV cache. Only for models whose decoder layers provide dense "
+        "DWDP roots (Kimi-K3), on context servers: trtllm-serve refuses it on a "
+        "server launched with --server_role GENERATION or as a generation "
+        "server of a disaggregated MPI launch, and warns on any other server "
+        "without the context role, so launch context servers with "
+        "--server_role CONTEXT. Every server of the DWDP group must set the "
+        "same value. It needs eager execution "
+        "(no CUDA graphs, torch.compile or prefill CUDA graphs), no sleep, LoRA "
+        "or speculative config, locality domains off, pipeline and context "
+        "parallel size 1 and FABRIC peer handles; with expert DWDP also tensor "
+        "parallel size 1 and disable_overlap_scheduler=True, without it "
+        "enable_attention_dp with tensor_parallel_size > 1.",
+        status="prototype")
+    copy_mode: Optional[Literal["per_slice", "batched", "gather"]] = Field(
+        default=None,
+        description=
+        "The transfer of every DWDP copy, the expert prefetch and the dense "
+        "gathers alike: per_slice (one copy-engine copy per slice), batched "
+        "(one batched copy-engine copy per layer) or gather (the SM fabric "
+        "gather kernel, which keeps SMs from the compute kernels while it "
+        "runs). None keeps the default selection: the expert prefetch uses "
+        "per_slice, batched with contention_opt, or gather when the "
+        "TRTLLM_DWDP_PREFETCH_GATHER environment variable is set; dense copies "
+        "follow the expert transfer, and dense DWDP without expert DWDP uses "
+        "batched. contention_opt requires batched or None.",
+        status="prototype")
     dwdp_size: int = Field(default=1,
                            description="The number of GPUs per DWDP group.")
     num_groups: int = Field(
         default=1,
         description=
         "The number of DWDP groups. Total workers = num_groups * dwdp_size.")
-    num_experts_per_worker: int = Field(
-        default=0, description="The number of experts per worker.")
-    num_prefetch_experts: int = Field(
-        default=0, description="The number of prefetch experts per worker.")
+    num_experts_per_worker: NonNegativeInt = Field(
+        default=0,
+        description=
+        "The number of routed experts each worker stores in a strided expert "
+        "partition, where worker r stores the experts from "
+        "r * num_prefetch_experts. Leave both fields at 0 (the default) for "
+        "the balanced partition: every worker stores floor or ceil of "
+        "num_experts / dwdp_size contiguous experts, and no expert is stored "
+        "twice.")
+    num_prefetch_experts: NonNegativeInt = Field(
+        default=0,
+        description=
+        "The stride between the first experts of consecutive workers in a "
+        "strided expert partition (not a number of prefetched experts). Equal "
+        "to num_experts_per_worker for disjoint ranges, smaller for ranges "
+        "that overlap. Leave both fields at 0 for the balanced partition.")
     contention_opt: bool = Field(
         default=False,
         description=
@@ -5804,6 +5866,57 @@ class DwdpConfig(StrictBaseModel):
         "remote experts of one MoE layer; more slots let the prefetch run "
         "further ahead of the MoE compute, at the cost of device memory that "
         "is then not available to the KV cache.")
+
+    @model_validator(mode="after")
+    def _validate_modes(self) -> 'DwdpConfig':
+        """Expert DWDP, dense DWDP or both, and settings that fit the choice.
+
+        Without expert DWDP the expert fields keep their defaults, and
+        contention_opt, which selects batched copies, rules out another
+        copy_mode.
+        """
+        if not self.enable_experts and not self.enable_dense:
+            raise ValueError(
+                "DwdpConfig: enable_experts and enable_dense are both False, so "
+                "DWDP has nothing to distribute; enable either or remove "
+                "dwdp_config.")
+        if not self.enable_experts:
+            expert_fields = ("dwdp_size", "num_groups",
+                             "num_experts_per_worker", "num_prefetch_experts",
+                             "contention_opt", "num_prefetch_slots")
+            changed = [
+                f"{name}={getattr(self, name)!r}" for name in expert_fields
+                if getattr(self, name) != type(self).model_fields[name].default
+            ]
+            if changed:
+                raise ValueError(
+                    f"DwdpConfig: {', '.join(changed)} configure expert DWDP, "
+                    "but enable_experts=False turns it off; leave them at "
+                    "their defaults (dense DWDP alone shards over the "
+                    "attention-DP ranks of the instance) or set "
+                    "enable_experts=True.")
+        if self.contention_opt and self.copy_mode not in (None, "batched"):
+            raise ValueError(
+                "DwdpConfig: contention_opt=True selects batched copies, but "
+                f"copy_mode={self.copy_mode!r}; set copy_mode='batched' or "
+                "leave contention_opt off.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_expert_partition(self) -> 'DwdpConfig':
+        """Both partition fields 0 (balanced) or both positive (strided).
+
+        Whether a strided pair fits the model's routed experts is checked
+        when the model is built, where their count is known.
+        """
+        size = self.num_experts_per_worker
+        stride = self.num_prefetch_experts
+        if (size == 0) != (stride == 0):
+            raise ValueError(
+                f"DwdpConfig: num_experts_per_worker={size} and "
+                f"num_prefetch_experts={stride}: set both (a strided expert "
+                f"partition) or leave both at 0 (the balanced partition).")
+        return self
 
 
 class BaseLlmArgs(StrictBaseModel):
@@ -6055,6 +6168,18 @@ class BaseLlmArgs(StrictBaseModel):
         "trtllm-serve: values > 1 run additional attached frontend processes "
         "that share the serving port via SO_REUSEPORT (classic IPC executor "
         "path only).",
+        status="prototype")
+
+    serve_graceful_shutdown_timeout_s: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Used by trtllm-serve: how many seconds the OpenAI HTTP server of an "
+        "LLM, embedding or multimodal-encoder server waits after a shutdown "
+        "signal for request handlers that are still running (uvicorn's "
+        "timeout_graceful_shutdown), in every frontend process. Handlers "
+        "still running then are cancelled and the server shuts down as "
+        "usual, so a handler waiting for a request the executor dropped "
+        "cannot hold the shutdown up. None waits for every handler.",
         status="prototype")
 
     reasoning_parser: Optional[str] = Field(
@@ -6655,6 +6780,24 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description="Disable the overlap scheduler.",
         status="beta")
+
+    drop_inflight_requests_on_shutdown: bool = Field(
+        default=False,
+        description=
+        "Once shutdown is requested, stop the executor with requests still "
+        "active or queued instead of finishing them first; they get no final "
+        "response. A pending KV connector load or transfer is still waited "
+        "for. Meant for the context servers of disaggregated serving, whose "
+        "clients are gone when they shut down; on a generation server, a "
+        "request still receiving its KV cache would have that cache freed "
+        "under the transfer. trtllm-serve refuses it on a server launched "
+        "with --server_role GENERATION or as a generation server of a "
+        "disaggregated MPI launch. It cannot check a server without a role "
+        "and warns when such a server has a cache transceiver, so launch "
+        "context servers with --server_role CONTEXT. Requires the overlap "
+        "scheduler off (disable_overlap_scheduler=True) and "
+        "pipeline_parallel_size=1.",
+        status="prototype")
 
     enable_return_routed_experts: bool = Field(
         default=False,
@@ -7838,6 +7981,28 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_drop_inflight_requests_on_shutdown(self) -> 'TorchLlmArgs':
+        """Accept drop_inflight_requests_on_shutdown only where it is safe.
+
+        Only the executor loop without the overlap scheduler and pipeline
+        parallelism may stop with requests in flight: the overlap loop still
+        owes the previous batch its processing, and a pipeline-parallel loop
+        can have microbatches travelling between ranks. The check follows
+        validate_speculative_config, which may turn the overlap scheduler off.
+        """
+        if not self.drop_inflight_requests_on_shutdown:
+            return self
+        if (not self.disable_overlap_scheduler
+                or self.pipeline_parallel_size != 1):
+            raise ValueError(
+                "drop_inflight_requests_on_shutdown requires the overlap "
+                "scheduler off (disable_overlap_scheduler=True) and "
+                "pipeline_parallel_size=1, but got disable_overlap_scheduler="
+                f"{self.disable_overlap_scheduler} and pipeline_parallel_size="
+                f"{self.pipeline_parallel_size}.")
         return self
 
     @model_validator(mode="after")

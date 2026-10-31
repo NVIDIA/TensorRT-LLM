@@ -50,6 +50,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
@@ -4068,6 +4069,7 @@ def create_py_executor_resources(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
 ) -> PyExecutorResources:
     """Build the resource graph shared by initial execution and rebinding."""
@@ -4456,6 +4458,7 @@ def create_py_executor_resources(
         virtual_memory_pools=virtual_memory_pools,
         kv_connector_manager=kv_connector_manager,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_seq_len=executor_max_seq_len,
         max_num_sequences=max_num_sequences,
         waiting_queue_policy=waiting_queue_policy,
@@ -4488,6 +4491,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
 ) -> PyExecutor:
     execution_resources = create_py_executor_resources(
@@ -4509,6 +4513,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
     spec_config = model_engine.spec_config
@@ -4542,6 +4547,7 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=execution_resources.waiting_queue_policy,
         dwdp_manager=execution_resources.dwdp_manager,
+        dense_dwdp_manager=execution_resources.dense_dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.

@@ -47,7 +47,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
                                           DFlashDecodingConfig,
-                                          DSparkDecodingConfig,
+                                          DSparkDecodingConfig, DwdpConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -5677,3 +5677,119 @@ class TestDeepseekRuntimePreferences:
         cfg = self._pretrained_config(["DeepseekV3ForCausalLM"], "deepseek_v3")
         _resolve_transceiver_runtime_auto(args, DeepseekV3ForCausalLM, cfg)
         assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+
+@pytest.mark.cpu_only
+class TestContextServerShutdownSettings:
+    """drop_inflight_requests_on_shutdown and serve_graceful_shutdown_timeout_s."""
+
+    def test_defaults_drain_and_wait_for_every_handler(self) -> None:
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert args.drop_inflight_requests_on_shutdown is False
+        assert args.serve_graceful_shutdown_timeout_s is None
+
+    @pytest.mark.parametrize(
+        "disable_overlap_scheduler,pipeline_parallel_size,accepted",
+        [(True, 1, True), (False, 1, False), (True, 2, False)],
+        ids=["no-overlap-one-stage", "overlap", "two-stages"])
+    def test_dropping_in_flight_requests_needs_the_plain_loop(
+            self, disable_overlap_scheduler: bool, pipeline_parallel_size: int,
+            accepted: bool) -> None:
+        """Only one pipeline stage without the overlap scheduler may drop."""
+        kwargs = dict(model="/tmp/dummy_model",
+                      drop_inflight_requests_on_shutdown=True,
+                      disable_overlap_scheduler=disable_overlap_scheduler,
+                      pipeline_parallel_size=pipeline_parallel_size,
+                      gpus_per_node=pipeline_parallel_size)
+        if accepted:
+            assert TorchLlmArgs(**kwargs).drop_inflight_requests_on_shutdown
+            return
+        with pytest.raises(ValidationError,
+                           match=r"drop_inflight_requests_on_shutdown requires "
+                           r"the overlap scheduler off \(disable_overlap_"
+                           r"scheduler=True\) and pipeline_parallel_size=1"):
+            TorchLlmArgs(**kwargs)
+
+    def test_the_speculative_config_may_turn_the_overlap_scheduler_off(
+            self, tmp_path: Path) -> None:
+        """The overlap scheduler may be turned off by the configuration.
+
+        The check reads the final setting, which validate_speculative_config
+        turns off for SaveHiddenStatesDecodingConfig.
+        """
+        from tensorrt_llm.llmapi.llm_args import SaveHiddenStatesDecodingConfig
+
+        args = TorchLlmArgs(model="/tmp/dummy_model",
+                            drop_inflight_requests_on_shutdown=True,
+                            speculative_config=SaveHiddenStatesDecodingConfig(
+                                output_directory=str(tmp_path)))
+        assert args.disable_overlap_scheduler
+        assert args.drop_inflight_requests_on_shutdown
+
+    @pytest.mark.parametrize("timeout,accepted", [(30, True), (0, False),
+                                                  (-1, False)])
+    def test_the_graceful_shutdown_timeout_is_positive(self, timeout: int,
+                                                       accepted: bool) -> None:
+        if accepted:
+            args = TorchLlmArgs(model="/tmp/dummy_model",
+                                serve_graceful_shutdown_timeout_s=timeout)
+            assert args.serve_graceful_shutdown_timeout_s == timeout
+            return
+        with pytest.raises(ValidationError,
+                           match="serve_graceful_shutdown_timeout_s"):
+            TorchLlmArgs(model="/tmp/dummy_model",
+                         serve_graceful_shutdown_timeout_s=timeout)
+
+
+@pytest.mark.cpu_only
+class TestDwdpConfigModes:
+    """DwdpConfig: expert DWDP, dense DWDP or both, and the settings that fit the choice."""
+
+    def test_the_defaults_keep_expert_dwdp_alone(self) -> None:
+        config = DwdpConfig()
+        assert (config.enable_experts, config.enable_dense,
+                config.copy_mode) == (True, False, None)
+
+    @pytest.mark.parametrize("fields", [
+        dict(enable_dense=True),
+        dict(enable_experts=False, enable_dense=True),
+        dict(enable_experts=False, enable_dense=True, copy_mode="gather"),
+        dict(contention_opt=True, copy_mode="batched"),
+    ],
+                             ids=[
+                                 "expert+dense", "dense-only",
+                                 "dense-only-gather", "contention-opt-batched"
+                             ])
+    def test_accepted_combinations(self, fields: dict) -> None:
+        DwdpConfig(**fields)
+
+    def test_nothing_to_distribute_is_rejected(self) -> None:
+        with pytest.raises(ValidationError,
+                           match="enable_experts and enable_dense are both"):
+            DwdpConfig(enable_experts=False)
+
+    @pytest.mark.parametrize("fields", [
+        dict(dwdp_size=4),
+        dict(num_groups=2),
+        dict(num_experts_per_worker=8, num_prefetch_experts=8),
+        dict(contention_opt=True),
+        dict(num_prefetch_slots=3),
+    ],
+                             ids=lambda fields: ",".join(fields))
+    def test_expert_fields_need_expert_dwdp(self, fields: dict) -> None:
+        """Without expert DWDP the expert fields keep their defaults."""
+        with pytest.raises(
+                ValidationError,
+                match=f"{next(iter(fields))}=.* configure expert DWDP, but "
+                "enable_experts=False turns it off"):
+            DwdpConfig(enable_experts=False, enable_dense=True, **fields)
+
+    @pytest.mark.parametrize("copy_mode", ["per_slice", "gather"])
+    def test_contention_opt_needs_batched_copies(self, copy_mode: str) -> None:
+        with pytest.raises(ValidationError,
+                           match="contention_opt=True selects batched copies"):
+            DwdpConfig(contention_opt=True, copy_mode=copy_mode)
+
+    def test_copy_mode_takes_the_three_transfers_only(self) -> None:
+        with pytest.raises(ValidationError, match="copy_mode"):
+            DwdpConfig(copy_mode="fast")

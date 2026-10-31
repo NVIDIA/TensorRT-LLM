@@ -143,6 +143,7 @@ def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_gra
     executor.virtual_memory_pools = None
     executor.sampler = object()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
     executor._profile_manager = Mock()
 
     with patch("torch.cuda.is_available", return_value=False):

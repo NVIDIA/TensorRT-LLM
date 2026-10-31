@@ -280,6 +280,11 @@
       "path": "disable_overlap_scheduler"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "drop_inflight_requests_on_shutdown"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",
@@ -296,9 +301,29 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
     },
     {
       "capture_policy": "int",
@@ -1444,6 +1469,11 @@
       "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",
       "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
     },
     {
       "capture_policy": "bool",

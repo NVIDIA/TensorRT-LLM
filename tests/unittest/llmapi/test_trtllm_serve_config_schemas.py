@@ -146,6 +146,13 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (
+            generator.SERVE_SCHEMA,
+            {"dwdp_config": {"num_experts_per_worker": 0, "num_prefetch_experts": 0}},
+            True,
+        ),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_experts_per_worker": -1}}, False),
+        (generator.SERVE_SCHEMA, {"dwdp_config": {"num_prefetch_experts": -1}}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -157,6 +164,11 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             True,
         ),
         (generator.DISAGG_SCHEMA, {"context_servers": {"env_overrides": {"FLAG": 1}}}, True),
+        (
+            generator.DISAGG_SCHEMA,
+            {"context_servers": {"dwdp_config": {"dwdp_size": 12, "num_experts_per_worker": -1}}},
+            False,
+        ),
         (
             generator.DISAGG_SCHEMA,
             {"context_servers": {"moe_config": {"backend_typo": "CUTLASS"}}},
@@ -288,6 +300,105 @@ def test_load_balancer_schema_matches_runtime(
     else:
         with pytest.raises(ValueError):
             MoeConfig(load_balancer=load_balancer)
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("settings", "valid"),
+    [
+        ({"drop_inflight_requests_on_shutdown": True, "disable_overlap_scheduler": True}, True),
+        ({"drop_inflight_requests_on_shutdown": "always"}, False),
+        ({"serve_graceful_shutdown_timeout_s": 30}, True),
+        ({"serve_graceful_shutdown_timeout_s": None}, True),
+        ({"serve_graceful_shutdown_timeout_s": 0}, False),
+        ({"serve_graceful_shutdown_timeout_s": 1.5}, False),
+    ],
+)
+def test_shutdown_settings(
+    schemas: dict[str, dict], filename: str, settings: dict, valid: bool
+) -> None:
+    """The shutdown settings of a context server, at the top level or under context_servers."""
+    config = settings if filename == generator.SERVE_SCHEMA else {"context_servers": settings}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("dwdp_config", "valid"),
+    [
+        ({"enable_dense": True, "dwdp_size": 16}, True),
+        ({"enable_dense": False}, True),
+        ({"enable_dense": "always"}, False),
+        ({"enable_dense_dwdp": True}, False),
+        ({"enable_experts": False, "enable_dense": True}, True),
+        ({"enable_experts": "no"}, False),
+        ({"copy_mode": "gather"}, True),
+        ({"copy_mode": "per_slice"}, True),
+        ({"copy_mode": None}, True),
+        ({"copy_mode": "fast"}, False),
+    ],
+)
+def test_dense_dwdp_setting(
+    schemas: dict[str, dict], filename: str, dwdp_config: dict, valid: bool
+) -> None:
+    """enable_experts, enable_dense and copy_mode of dwdp_config, also under context_servers."""
+    config = {"dwdp_config": dwdp_config}
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"context_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+_DENSE_ONLY = {"enable_experts": False, "enable_dense": True}
+
+
+@pytest.mark.parametrize(
+    ("dwdp_config", "error"),
+    [
+        ({}, None),
+        ({"enable_dense": True}, None),
+        ({"enable_experts": True, "enable_dense": False}, None),
+        (_DENSE_ONLY, None),
+        ({**_DENSE_ONLY, "dwdp_size": 1, "contention_opt": False}, None),
+        ({**_DENSE_ONLY, "copy_mode": "gather"}, None),
+        ({"enable_experts": False}, "nothing to distribute"),
+        ({"enable_experts": False, "enable_dense": False}, "nothing to distribute"),
+        ({**_DENSE_ONLY, "dwdp_size": 4}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_groups": 2}, "configure expert DWDP"),
+        (
+            {**_DENSE_ONLY, "num_experts_per_worker": 1, "num_prefetch_experts": 1},
+            "configure expert DWDP",
+        ),
+        ({**_DENSE_ONLY, "contention_opt": True}, "configure expert DWDP"),
+        ({**_DENSE_ONLY, "num_prefetch_slots": 3}, "configure expert DWDP"),
+        ({"contention_opt": True}, None),
+        ({"contention_opt": True, "copy_mode": None}, None),
+        ({"contention_opt": True, "copy_mode": "batched"}, None),
+        ({"contention_opt": True, "copy_mode": "gather"}, "selects batched copies"),
+        ({"contention_opt": True, "copy_mode": "per_slice"}, "selects batched copies"),
+        ({"contention_opt": False, "copy_mode": "gather"}, None),
+    ],
+)
+def test_dwdp_modes_match_runtime(
+    schemas: dict[str, dict], dwdp_config: dict[str, object], error: str | None
+) -> None:
+    """Both schemas accept a DwdpConfig mode combination exactly when DwdpConfig does."""
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if error is None:
+        DwdpConfig(**dwdp_config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            DwdpConfig(**dwdp_config)
+
+    config = {"dwdp_config": dwdp_config}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == (error is None), filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == (error is None), section
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
@@ -572,6 +683,39 @@ def test_disagg_node_id_matches_runtime(schemas: dict[str, dict]) -> None:
         validator.validate({"node_id": value})
     for value in (-1, maximum + 1):
         assert not validator.is_valid({"node_id": value})
+
+
+@pytest.mark.parametrize(
+    ("partition", "valid"),
+    [
+        ({}, True),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 0}, True),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 2, "num_prefetch_experts": 1}, True),
+        ({"num_experts_per_worker": 1}, False),
+        ({"num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 0, "num_prefetch_experts": 1}, False),
+        ({"num_experts_per_worker": 1, "num_prefetch_experts": 0}, False),
+    ],
+)
+def test_dwdp_expert_partition_matches_runtime(
+    schemas: dict[str, dict], partition: dict[str, int], valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import DwdpConfig
+
+    if valid:
+        DwdpConfig(**partition)
+    else:
+        with pytest.raises(ValueError, match="set both"):
+            DwdpConfig(**partition)
+
+    config = {"dwdp_config": partition}
+    for filename in (generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA):
+        validator = Draft202012Validator(schemas[filename])
+        assert validator.is_valid(config) == valid, filename
+        if filename == generator.DISAGG_SCHEMA:
+            for section in ("context_servers", "generation_servers"):
+                assert validator.is_valid({section: config}) == valid, section
 
 
 def test_runtime_only_union_does_not_disable_validation() -> None:

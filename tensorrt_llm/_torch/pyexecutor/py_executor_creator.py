@@ -19,6 +19,11 @@ from strenum import StrEnum
 import tensorrt_llm
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._torch.modules.dwdp import dwdp_global_rank
+from tensorrt_llm._torch.modules.dwdp.dense.config import DenseConfig
+from tensorrt_llm._torch.modules.dwdp.dense.gate import validate_dense_gate
+from tensorrt_llm._torch.modules.dwdp.dense.manager import (
+    DenseDwdpManager, get_global_dense_dwdp_manager)
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, ResourceManagerType)
 from tensorrt_llm._utils import get_sm_version
@@ -250,6 +255,29 @@ class _ExecutorMemoryMonitor:
                     free_gpu_memory_bytes_pre=free_gpu_memory_bytes_pre,
                     free_gpu_memory_bytes_post=free_gpu_memory_bytes_post,
                 ))
+
+
+def _check_dense_dwdp_launch(llm_args: TorchLlmArgs,
+                             mapping: Mapping) -> Optional[DenseMode]:
+    """Run the dense DWDP launch gate if ``dwdp_config.enable_dense`` asks for it.
+
+    It runs before the DWDP manager, the standalone dense DWDP manager and the
+    model are built, so a launch that dense DWDP cannot serve fails before the
+    weights load.
+
+    Returns:
+        The mode dense DWDP runs in: attached to expert DWDP
+        (``dwdp_config.enable_experts``) or standalone on an attention-DP
+        instance. None when dense DWDP is not requested.
+
+    Raises:
+        ValueError: Dense DWDP is requested and the launch violates one of its
+            requirements (see ``validate_dense_gate``).
+    """
+    dwdp_config = llm_args.dwdp_config
+    if dwdp_config is not None and dwdp_config.enable_dense:
+        return validate_dense_gate(llm_args, mapping)
+    return None
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -708,8 +736,13 @@ def _create_py_executor(
     # with mapping.rank=0, so `mapping.rank % dwdp_size` would make every
     # worker think it is DWDP rank 0 (causing e.g. cuMemMap to self-import a
     # peer handle and fail with CUDA_ERROR_NOT_SUPPORTED).
-    if llm_args.dwdp_config is not None and llm_args.dwdp_config.dwdp_size > 1:
-        dwdp_size = llm_args.dwdp_config.dwdp_size
+    #
+    # Dense DWDP without expert DWDP (enable_experts=False) has no DWDP group:
+    # the mapping keeps dwdp_size 0.
+    dwdp_config = llm_args.dwdp_config
+    expert_dwdp = dwdp_config is not None and dwdp_config.enable_experts
+    if expert_dwdp and dwdp_config.dwdp_size > 1:
+        dwdp_size = dwdp_config.dwdp_size
         dwdp_rank = dwdp_global_rank() % dwdp_size
         mapping = Mapping(**{
             **mapping.to_dict(), "dwdp_size": dwdp_size,
@@ -778,6 +811,11 @@ def _create_py_executor(
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
+    # The dense DWDP gate runs before the DWDP block below: it picks the dense
+    # DWDP mode, attached to expert DWDP or standalone without it, and rejects
+    # a launch that neither mode serves.
+    dense_mode = _check_dense_dwdp_launch(llm_args, mapping)
+
     # Initialize DWDP Manager.
     #
     # DWDP needs every global DWDP rank to be a complete, unsharded model replica
@@ -790,11 +828,10 @@ def _create_py_executor(
     # error. The TP check tests `dp_size == tp_size` rather than
     # `enable_attention_dp` so a future partial attention DP cannot slip through.
     dwdp_manager: Optional[DwdpManager] = None
-    if llm_args.dwdp_config is not None:
-        if llm_args.dwdp_config.dwdp_size <= 1:
+    if expert_dwdp:
+        if dwdp_config.dwdp_size <= 1:
             raise ValueError(
-                f"DWDP requires dwdp_size > 1, got {llm_args.dwdp_config.dwdp_size}."
-            )
+                f"DWDP requires dwdp_size > 1, got {dwdp_config.dwdp_size}.")
         if mapping.pp_size > 1 or mapping.cp_size > 1:
             raise ValueError(
                 "DWDP requires each rank to be a complete model replica, so "
@@ -813,11 +850,26 @@ def _create_py_executor(
             raise ValueError(
                 "DWDP does not support CUDA graphs; set cuda_graph_config=None."
             )
-        dwdp_manager = DwdpManager(config=llm_args.dwdp_config,
+        dwdp_manager = DwdpManager(config=dwdp_config,
                                    dist=dist,
                                    mapping=mapping)
         dwdp_manager.__enter__()
-        logger.info(f"Dwdp Manager initialized. Config: {llm_args.dwdp_config}")
+        logger.info(f"Dwdp Manager initialized. Config: {dwdp_config}")
+
+    # Standalone dense DWDP shards the dense weights over the attention-DP
+    # group. Its manager is registered before the model is built, because the
+    # model's layers capture it then; with expert DWDP, DwdpManager creates and
+    # registers the dense manager itself.
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None
+    if dense_mode is DenseMode.STANDALONE:
+        dense_dwdp_manager = DenseDwdpManager(
+            DenseMode.STANDALONE,
+            mapping=mapping,
+            config=DenseConfig.from_dwdp_config(dwdp_config))
+        dense_dwdp_manager.__enter__()
+        logger.info(
+            "Dense DWDP manager initialized (standalone): attention-DP group "
+            f"of {mapping.tp_size} ranks")
 
     _startup_timer.mark_initialization("configuration_and_distributed_init")
     mem_monitor = _ExecutorMemoryMonitor()
@@ -1181,6 +1233,8 @@ def _create_py_executor(
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
+    # Whether DWDP was set up before the KV caches (below).
+    dwdp_set_up = False
 
     # Create the execution stream for model forward operations
     # for proper synchronization with KVCacheTransferManager's onboard/offload operations.
@@ -1237,15 +1291,32 @@ def _create_py_executor(
 
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
+        # Without the estimation, build_managers sizes the final KV cache from
+        # the device memory free now, so dense DWDP is set up first, standalone
+        # or attached with the expert setup: the replicated dense weights it
+        # frees then go to the KV cache. With the estimation, it is set up
+        # below, before the estimation run measures the memory. Expert DWDP
+        # without a dense request keeps its place after the KV cache.
+        if dense_mode is not None and not estimating_kv_cache:
+            manager = (dwdp_manager
+                       if dwdp_manager is not None else dense_dwdp_manager)
+            manager.setup(model_engine.model)
+            dwdp_set_up = True
+
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE
                 if estimating_kv_cache else ExecutorMemoryType.KV_CACHE):
             kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
     # DWDP setup: MNNVL handle exchange + composite VA weight buffer +
-    # weight manager + MoE backend fixup (single entry point).
-    if dwdp_manager is not None:
-        dwdp_manager.setup(model_engine.model)
+    # weight manager + MoE backend fixup (single entry point). Dense DWDP is set
+    # up there with expert DWDP, else here when it runs standalone. A launch
+    # with dense DWDP and without the estimation was set up above instead.
+    if not dwdp_set_up:
+        if dwdp_manager is not None:
+            dwdp_manager.setup(model_engine.model)
+        elif dense_dwdp_manager is not None:
+            dense_dwdp_manager.setup(model_engine.model)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -1298,6 +1369,15 @@ def _create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            # Without the KV-cache estimation the executor serves from its
+            # construction: it gets the DWDP manager or the standalone dense
+            # DWDP manager now, primes it and exits it at shutdown. With the
+            # estimation only the serving phase gets it (rebind_resources
+            # below), since release_resources() exits the managers the
+            # executor holds.
+            dwdp_manager=dwdp_manager if not estimating_kv_cache else None,
+            dense_dwdp_manager=dense_dwdp_manager
+            if not estimating_kv_cache else None,
             max_num_sequences=max_num_seq_slots,
         )
 
@@ -1356,6 +1436,7 @@ def _create_py_executor(
                     virtual_memory_pools=vm_pools,
                     execution_stream=execution_stream,
                     dwdp_manager=dwdp_manager,
+                    dense_dwdp_manager=dense_dwdp_manager,
                     max_num_sequences=max_num_seq_slots,
                 )
                 py_executor.rebind_resources(execution_resources)
@@ -1399,8 +1480,15 @@ def create_py_executor(
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
 ) -> PyExecutor:
-    """Create a PyExecutor and roll back a partially initialized DWDP runtime."""
+    """Create a PyExecutor and roll back a partially initialized DWDP runtime.
+
+    On an error, a DWDP manager and a dense DWDP manager registered during the
+    construction are exited, in that order; managers registered before it are
+    left alone. Exiting the DWDP manager also exits the dense manager it
+    registered, so the second rollback finds a standalone one only.
+    """
     previous_dwdp_manager = get_global_dwdp_manager()
+    previous_dense_manager = get_global_dense_dwdp_manager()
     try:
         with monitor_executor_initialization(), _StartupTimer(
                 "executor_creation") as startup_timer:
@@ -1422,4 +1510,13 @@ def create_py_executor(
                 logger.error(
                     "Failed to roll back DWDP after PyExecutor construction error\n"
                     f"{traceback.format_exc()}")
+        current_dense_manager = get_global_dense_dwdp_manager()
+        if (current_dense_manager is not None
+                and current_dense_manager is not previous_dense_manager):
+            try:
+                current_dense_manager.__exit__(None, None, None)
+            except BaseException:
+                logger.error(
+                    "Failed to roll back dense DWDP after PyExecutor construction "
+                    f"error\n{traceback.format_exc()}")
         raise

@@ -30,6 +30,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.modules.dwdp import fabric_gather
+from tensorrt_llm._torch.modules.dwdp.dense.manager import DenseDwdpManager
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
 
@@ -115,6 +117,8 @@ class _Harness:
         )
         self.mgr = object.__new__(DwdpManager)
         self.mgr._weight_manager = self.wm
+        # Expert DWDP alone: the attached dense manager has no runtime.
+        self.mgr._dense_manager = DenseDwdpManager(DenseMode.ATTACHED)
         self.backend = _Backend()
         self.compute_stream = torch.cuda.Stream()
         self.copies: List[int] = []

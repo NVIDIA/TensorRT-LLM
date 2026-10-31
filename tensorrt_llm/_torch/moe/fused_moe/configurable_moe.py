@@ -29,7 +29,7 @@ Design Principles:
 
 import copy
 from contextlib import contextmanager
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import torch
 
@@ -41,7 +41,12 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEProblem,
     MoERejectReason,
 )
-from tensorrt_llm._torch.moe.fused_moe.interface import MoE, MoESchedulerKind, _reject
+from tensorrt_llm._torch.moe.fused_moe.interface import (
+    MoE,
+    MoESchedulerKind,
+    MoEWeightLoadingMode,
+    _reject,
+)
 from tensorrt_llm._torch.moe.fused_moe.routing import BaseMoeRoutingMethod
 from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 from tensorrt_llm._torch.utils import AuxStreamType, EventType, Fp4QuantizedTensor
@@ -70,6 +75,28 @@ _BACKEND_SYNC_ATTRS = (
     "slot_end",
     "expert_size_per_partition",
 )
+
+
+def _dwdp_ineligibility(moe: "ConfigurableMoE") -> Optional[str]:
+    """Why DWDP cannot manage ``moe``'s layer, or None when it can.
+
+    DWDP is supported only by CuteDSL backends, and only with NVFP4
+    quantization. A locality-domain backend is left out: DWDP rebinds the
+    backend parameters, which would strand the localized weight shards. Not
+    managing such a layer is the correct outcome, not an error.
+    """
+    backend = moe.backend
+    if not backend.capabilities.supports_dwdp:
+        return f"{type(backend).__name__} does not support DWDP"
+    if backend.uses_locality_domain:
+        return "its backend uses locality domains, whose weight shards DWDP cannot rebind"
+    quant_config = getattr(backend, "quant_config", None)
+    if quant_config is None:
+        quant_config = getattr(moe.model_config, "quant_config", None)
+    quant_mode = getattr(quant_config, "layer_quant_mode", None)
+    if quant_mode is None or not hasattr(quant_mode, "has_nvfp4") or not quant_mode.has_nvfp4():
+        return "it is not NVFP4-quantized"
+    return None
 
 
 class ConfigurableMoE(MoE):
@@ -159,7 +186,7 @@ class ConfigurableMoE(MoE):
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
         aux_stream_dict: Optional[Dict[AuxStreamType, torch.cuda.Stream]] = None,
-        weight_loading_mode=None,
+        weight_loading_mode: Optional[MoEWeightLoadingMode] = None,
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
@@ -167,8 +194,8 @@ class ConfigurableMoE(MoE):
         communication_method: Optional[str] = None,
         unfinalized_combine_fn: Optional[Callable[..., torch.Tensor]] = None,
         accepts_global_routed_output: bool = False,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -204,14 +231,11 @@ class ConfigurableMoE(MoE):
         )
 
         # ========== Optional DWDP integration ==========
-        # Must run BEFORE _create_comm_strategy_auto so the factory can skip
-        # alltoall strategies for DWDP (VA path swaps param.data; the backend
-        # reads from its own weight attrs, no comm strategy needed).
-        self.dwdp_manager = get_global_dwdp_manager()
-        self.enable_dwdp = False
-        if self.dwdp_manager is not None and self._should_enable_dwdp():
-            self.enable_dwdp = True
-            self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
+        # _create_and_sync_backend decided whether DWDP manages this layer, and
+        # sized and registered it (_decide_dwdp), before
+        # _create_comm_strategy_auto, so the factory can skip alltoall
+        # strategies for DWDP (VA path swaps param.data; the backend reads from
+        # its own weight attrs, no comm strategy needed).
 
         # ========== Create Communication Strategy ==========
         self.comm = self._create_comm_strategy_auto()
@@ -312,7 +336,7 @@ class ConfigurableMoE(MoE):
         routing_method: BaseMoeRoutingMethod,
         override_quant_config: Optional["QuantConfig"],
         moe_cls: Optional[Type] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> ModelConfig:
         """Build the MoE backend, mirror EPLB attrs, then create weights.
 
@@ -389,6 +413,11 @@ class ConfigurableMoE(MoE):
         self.backend = backend
         self._reject_non_divisible_ep_backend()
         self.use_flashinfer = getattr(self.backend, "use_flashinfer", False)
+
+        # DWDP eligibility needs the backend; a layer DWDP manages stores only
+        # this rank's experts, so it is sized here, before the sync below
+        # mirrors the layout onto the backend and before its weights exist.
+        self._decide_dwdp()
 
         # Mirror wrapper-owned EPLB / layer-id state onto the backend so any
         # backend code path that reads e.g. ``self.layer_load_balancer`` or
@@ -487,27 +516,39 @@ class ConfigurableMoE(MoE):
                 "apply_router_weight_on_input only supports top-1 routing"
             )
 
+    def _decide_dwdp(self) -> None:
+        """Decide whether DWDP manages this layer, and size a layer it manages.
+
+        Without a registered ``DwdpManager`` nothing changes.  With one, an
+        eligible layer (``_should_enable_dwdp``) stores only this rank's range
+        of the expert partition (``MoE._init_dwdp_expert_layout``) and is
+        registered with the manager (``add_layer``).  An ineligible layer
+        keeps all ``num_experts`` experts on every rank, as without DWDP, and
+        logs one warning naming the layer, its backend and the reason.
+
+        Raises:
+            ValueError: The DwdpConfig gives no valid partition of the layer's
+                experts (``MoE._init_dwdp_expert_layout``).
+        """
+        self.dwdp_manager = get_global_dwdp_manager()
+        self.enable_dwdp = False
+        if self.dwdp_manager is None:
+            return
+        reason = _dwdp_ineligibility(self)
+        if reason is not None:
+            logger.warning(
+                f"[DWDP] MoE layer {self.layer_idx} ({type(self.backend).__name__}) keeps all "
+                f"{self.num_experts} experts on every rank: DWDP does not manage it, since "
+                f"{reason}."
+            )
+            return
+        self._init_dwdp_expert_layout()
+        self.enable_dwdp = True
+        self.dwdp_manager.add_layer(layer_idx=self.layer_idx)
+
     def _should_enable_dwdp(self) -> bool:
-        # DWDP is currently supported only by CuteDSL backends, and only with
-        # NVFP4 quantization.
-        if not self.backend.capabilities.supports_dwdp:
-            return False
-
-        # DWDP rebinds the backend parameters, which would strand the localized
-        # weight shards. Not enabling it is the correct outcome, not an error.
-        if self.backend.uses_locality_domain:
-            return False
-
-        quant_config = getattr(self.backend, "quant_config", None)
-        if quant_config is None:
-            quant_config = getattr(self.model_config, "quant_config", None)
-        if quant_config is None:
-            return False
-
-        quant_mode = getattr(quant_config, "layer_quant_mode", None)
-        return bool(
-            quant_mode is not None and hasattr(quant_mode, "has_nvfp4") and quant_mode.has_nvfp4()
-        )
+        """Whether DWDP can manage this layer (see ``_dwdp_ineligibility``)."""
+        return _dwdp_ineligibility(self) is None
 
     def _get_quant_config_dict(self, model_config: ModelConfig) -> Optional[Dict]:
         """
