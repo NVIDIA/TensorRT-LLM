@@ -912,6 +912,49 @@ private:
             info);
     }
 
+    // The trtllm-gen JIT runs `nvcc --version`, even when it compiles with NVRTC, and otherwise
+    // uses /usr/local/cuda/bin/nvcc. Resolve nvcc from CUDA_HOME, CUDA_PATH, then PATH instead.
+    // Returns an empty string when none of them has one, which keeps the JIT default.
+    static std::string const& getNvccPath()
+    {
+        static std::string const nvccPath = []() -> std::string
+        {
+#ifndef _MSC_VER
+            auto isExecutable = [](std::string const& path)
+            {
+                std::error_code ec;
+                return std::filesystem::is_regular_file(path, ec) && access(path.c_str(), X_OK) == 0;
+            };
+            for (char const* rootVar : {"CUDA_HOME", "CUDA_PATH"})
+            {
+                char const* root = std::getenv(rootVar);
+                if (root != nullptr && root[0] != '\0')
+                {
+                    std::string const candidate = std::string(root) + "/bin/nvcc";
+                    if (isExecutable(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+            if (char const* pathVar = std::getenv("PATH"))
+            {
+                std::istringstream dirs(pathVar);
+                std::string dir;
+                while (std::getline(dirs, dir, ':'))
+                {
+                    if (!dir.empty() && isExecutable(dir + "/nvcc"))
+                    {
+                        return dir + "/nvcc";
+                    }
+                }
+            }
+#endif
+            return {};
+        }();
+        return nvccPath;
+    }
+
     std::string const& getExecPath() const
     {
         static std::string execPathStr;
@@ -1366,6 +1409,12 @@ private:
         if (options.mTileScheduler == TileScheduler::Persistent)
         {
             sstream << "\"skipsFirstProdAcquiresLastConsReleases\": false,\n";
+        }
+
+        if (std::string const& nvccPath = getNvccPath();
+            !nvccPath.empty() && nvccPath.find_first_of("\"\\") == std::string::npos)
+        {
+            sstream << "\"nvccPath\": \"" << nvccPath << "\",\n";
         }
 
         sstream << "\"usesNvRtc\": "
