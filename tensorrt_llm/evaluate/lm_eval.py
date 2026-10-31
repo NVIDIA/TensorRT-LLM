@@ -317,11 +317,17 @@ class LmEvalWrapper(TemplateLM):
                 # a default budget (e.g. 512 for MMMU) which is too small when
                 # thinking mode produces long chain-of-thought output. Default
                 # OFF to preserve behavior for non-thinking models.
-                if (trtllm_key == "max_tokens"
-                        and self.preserve_caller_max_tokens):
+                if trtllm_key == "max_tokens":
                     current = getattr(sampling_params, trtllm_key, None)
                     if current is not None and current > value:
-                        continue
+                        if self.preserve_caller_max_tokens:
+                            continue
+                        logger.warning_once(
+                            f"The task's max_gen_toks ({value}) replaces the "
+                            f"requested max_tokens ({current}); pass "
+                            "--preserve_caller_max_tokens to keep the larger "
+                            "value.",
+                            key=f"lm_eval_max_gen_toks_{current}_{value}")
                 setattr(sampling_params, trtllm_key, value)
         if self.spec_stats:
             # The AR line in _log_spec_stats reads per-request
@@ -1025,15 +1031,14 @@ class LmEvalEvaluator(Evaluator):
             is_force_single_image=is_force_single_image,
             output_dir=self.output_dir,
             sampling_override=sampling_override,
+            preserve_caller_max_tokens=self.preserve_caller_max_tokens,
             partial_scores_every=partial_scores_every,
             partial_scoring_task_dict=self.task_dict
             if partial_scores_every else None,
         )
-        # post_process_fn / preserve_caller_max_tokens only consumed by multimodal.
+        # post_process_fn is only consumed by the multimodal wrapper.
         if self.MULTIMODAL:
             lm_kwargs["post_process_fn"] = self.post_process_fn
-            lm_kwargs[
-                "preserve_caller_max_tokens"] = self.preserve_caller_max_tokens
 
         results = lm_eval.evaluate(
             lm=lm_cls(llm, **lm_kwargs),
@@ -2118,6 +2123,13 @@ class AIME2026(LmEvalEvaluator):
         "tensorrt_llm/evaluate/lm_eval_tasks/aime/. AIME is long-CoT; must "
         "fit within ``--max_seq_len = max_input_length + max_output_length``.")
     @click.option(
+        "--preserve_caller_max_tokens",
+        is_flag=True,
+        default=False,
+        help="Keep ``--max_output_length`` when it is larger than the task "
+        "yaml's ``max_gen_toks`` (32768), e.g. for thinking models whose "
+        "chain-of-thought needs a larger output budget.")
+    @click.option(
         "--temperature",
         type=float,
         default=None,
@@ -2234,6 +2246,13 @@ class AIME2025(LmEvalEvaluator):
         "(``max_gen_toks: 32768``) under "
         "tensorrt_llm/evaluate/lm_eval_tasks/aime/. AIME is long-CoT; must "
         "fit within ``--max_seq_len = max_input_length + max_output_length``.")
+    @click.option(
+        "--preserve_caller_max_tokens",
+        is_flag=True,
+        default=False,
+        help="Keep ``--max_output_length`` when it is larger than the task "
+        "yaml's ``max_gen_toks`` (32768), e.g. for thinking models whose "
+        "chain-of-thought needs a larger output budget.")
     @click.option(
         "--temperature",
         type=float,
