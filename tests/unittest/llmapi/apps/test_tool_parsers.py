@@ -3267,9 +3267,8 @@ def test_deepseek_finish_completes_a_call_from_the_last_delta(
     assert [
         (name, json.loads(arguments)) for name, arguments in streamed.values()
     ] == [(call.name, json.loads(call.parameters)) for call in whole.calls]
-    for call in results[-1].calls:
-        assert parser.prev_tool_call_arr[call.tool_index]["arguments"] == json.loads(
-            streamed[call.tool_index][1])
+    assert [call["arguments"] for call in parser.prev_tool_call_arr
+            ] == [json.loads(call.parameters) for call in whole.calls]
 
 
 @pytest.mark.parametrize(
@@ -3500,6 +3499,32 @@ def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
     assert arguments == {i: args for i, (_, args) in enumerate(calls)}
     assert [call["arguments"] for call in parser.prev_tool_call_arr
             ] == [json.loads(args) for _, args in calls]
+
+
+@pytest.mark.parametrize("after_call", ["", " done"])
+def test_deepseek_v31_end_token_split_after_complete_json(
+        sample_tools: list[ChatCompletionToolsParam], after_call: str) -> None:
+    """The delta that completes the JSON ends inside the call end token.
+
+    The rest of the token arrives over two more deltas and is markup, so it
+    must not reach the content.
+    """
+    parser = DeepSeekV31Parser()
+    deltas = [
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+        '{"location": "Paris"}<｜tool▁call▁', "end", "｜>", after_call
+    ]
+    results = [
+        parser.parse_streaming_increment(delta, sample_tools)
+        for delta in deltas
+    ]
+    results.append(parser.finish(sample_tools))
+
+    calls = [call for result in results for call in result.calls]
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert "".join(call.parameters for call in calls) == '{"location": "Paris"}'
+    assert "".join(result.normal_text for result in results) == after_call
+    assert parser.prev_tool_call_arr[0]["arguments"] == {"location": "Paris"}
 
 
 @pytest.mark.parametrize("partial_token",
