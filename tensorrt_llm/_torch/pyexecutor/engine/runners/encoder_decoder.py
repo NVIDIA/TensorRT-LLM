@@ -85,8 +85,14 @@ class EncoderStage(EncoderMixin):
             moe_load_balancer=moe_load_balancer,
             attention_runtime_features=attention_runtime_features,
         )
-        self._feature_staging: torch.Tensor | None = None
-        self._feature_staging_event: torch.cuda.Event | None = None
+        # Pinned host staging for feature rows, one buffer (with the event of
+        # its last H2D) per row shape and dtype: a model whose requests arrive
+        # in more than one form (Whisper's waveform and spectrogram rows)
+        # alternates shapes between eager batches, and one shared buffer
+        # would be reallocated behind a sync on every switch.
+        self._feature_stagings: dict[
+            tuple[tuple[int, ...], torch.dtype], tuple[torch.Tensor, torch.cuda.Event]
+        ] = {}
         self._feature_copy_stream: torch.cuda.Stream | None = None
 
     def _build_attention_metadata(
@@ -200,6 +206,7 @@ class EncoderStage(EncoderMixin):
             features.append(request_features)
             sequence_lengths.append(int(request.encoder_output_len))
             request_ids.append(request.py_request_id)
+        features = self._normalize_features(features)
 
         num_tokens = sum(sequence_lengths)
         if num_tokens > self._config.max_num_tokens:
@@ -226,6 +233,22 @@ class EncoderStage(EncoderMixin):
             sequence_lengths=sequence_lengths,
         )
 
+    def _normalize_features(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Let the model bring per-request feature rows to its one encoder input shape.
+
+        A model whose requests may arrive in more than one form (Whisper takes
+        a waveform or a precomputed spectrogram per request) exposes
+        ``normalize_encoder_features(features, upload)``, which returns rows
+        of the shape ``encoder_graph_spec`` promises, converting on the GPU
+        where needed; ``upload`` is this runner's packed host-to-device copy.
+        Other models' rows pass through.
+        """
+        model = getattr(self._model, "_orig_mod", self._model)
+        normalize = getattr(model, "normalize_encoder_features", None)
+        if normalize is None:
+            return features
+        return normalize(features, self._pack_features)
+
     def _pack_features(self, features: list[torch.Tensor]) -> torch.Tensor:
         first = features[0]
         uniform = first.device.type == "cpu" and all(
@@ -235,31 +258,30 @@ class EncoderStage(EncoderMixin):
             for feature in features
         )
         if not uniform:
-            return torch.cat(features, dim=0).to("cuda", non_blocking=True)
+            # Rows already on the device (a client's CUDA spectrogram, or rows
+            # the model normalized on the GPU) stay there; host rows join them.
+            return torch.cat([feature.to("cuda", non_blocking=True) for feature in features], dim=0)
 
         rows = sum(feature.shape[0] for feature in features)
-        staging = self._feature_staging
-        if (
-            staging is None
-            or staging.dtype != first.dtype
-            or staging.shape[1:] != first.shape[1:]
-            or staging.shape[0] < rows
-        ):
-            if staging is not None:
-                assert self._feature_staging_event is not None
-                self._feature_staging_event.synchronize()
-            staging = torch.empty(
-                (rows, *first.shape[1:]),
-                dtype=first.dtype,
-                pin_memory=prefer_pinned(),
+        key = (tuple(first.shape[1:]), first.dtype)
+        staged = self._feature_stagings.get(key)
+        if staged is None or staged[0].shape[0] < rows:
+            if staged is not None:
+                staged[1].synchronize()
+            staged = (
+                torch.empty(
+                    (rows, *first.shape[1:]),
+                    dtype=first.dtype,
+                    pin_memory=prefer_pinned(),
+                ),
+                torch.cuda.Event(),
             )
-            self._feature_staging = staging
-            self._feature_staging_event = torch.cuda.Event()
+            self._feature_stagings[key] = staged
             if self._feature_copy_stream is None:
                 self._feature_copy_stream = torch.cuda.Stream()
         else:
-            assert self._feature_staging_event is not None
-            self._feature_staging_event.synchronize()
+            staged[1].synchronize()
+        staging, staging_event = staged
 
         offset = 0
         for feature in features:
@@ -267,12 +289,11 @@ class EncoderStage(EncoderMixin):
             offset += feature.shape[0]
 
         assert self._feature_copy_stream is not None
-        assert self._feature_staging_event is not None
         consumer_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self._feature_copy_stream):
             packed = staging[:rows].to("cuda", non_blocking=True)
-            self._feature_staging_event.record()
-        consumer_stream.wait_event(self._feature_staging_event)
+            staging_event.record()
+        consumer_stream.wait_event(staging_event)
         packed.record_stream(consumer_stream)
         return packed
 

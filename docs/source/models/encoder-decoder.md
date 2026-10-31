@@ -264,6 +264,44 @@ longer clips and other sampling rates are rejected rather than silently
 truncated or resampled. Long-form chunked transcription is not part of this
 path.
 
+A request can carry the log-mel spectrogram instead of the audio, for a
+pipeline that already runs feature extraction elsewhere. Pass the clip as
+`{"input_features": ...}`: the array the checkpoint's `WhisperFeatureExtractor`
+returns for one 30-second window, shaped `(num_mel_bins, 3000)` with or without
+its leading batch axis of 1, as numpy or torch. Other shapes are rejected. Each
+request picks its form by its item, so audio and spectrogram requests share one
+instance and one batch: the engine runs its log-mel front-end on the audio rows
+and feeds every row to the encoder as a spectrogram, and encoder CUDA graphs,
+the decoder prompt, the `max_tokens` cap and every other setting work the same
+way for both. With a single rank, a torch tensor on a GPU is copied on that device, not
+through the host. The spectrogram must come from the same extractor configuration as the
+checkpoint, since nothing can check that on the server side, and it must have
+`config.num_mel_bins` bins. The length check moves to the client as well: the
+extractor truncates longer audio to one window by default, so pass
+`truncation=False` (a longer clip then yields more frames and is rejected) or
+check the duration yourself. `trtllm-serve` has no request field for a
+spectrogram; this is a Python API input.
+
+```python
+from transformers import WhisperFeatureExtractor
+
+extractor = WhisperFeatureExtractor.from_pretrained(model)
+mel = extractor(
+    wave, sampling_rate=sample_rate, truncation=False, return_tensors="np"
+)["input_features"]
+
+# Inside the `with LLM(...) as llm:` block above; one instance serves both forms.
+results = llm.generate(
+    [
+        {"prompt": "", "multi_modal_data": {"audio": [(wave, sample_rate)]}},
+        {"prompt": "", "multi_modal_data": {"audio": {"input_features": mel}}},
+    ],
+    sampling_params=SamplingParams(max_tokens=96, temperature=0.0),
+    use_tqdm=False,
+)
+print([result.outputs[0].text for result in results])
+```
+
 ### Select the language and task
 
 An empty text prompt selects the checkpoint default, which is English
@@ -449,13 +487,14 @@ such as BART or T5, packs a variable number of tokens per request, so
 either unset is rejected at `LLM(...)` for any architecture TensorRT-LLM
 recognizes, and at model engine initialization otherwise, since only the loaded
 model states with certainty which kind of encoder it has. An encoder whose input is a
-fixed-shape per-request feature tensor, such as Whisper's fixed 30-second
-zero-padded audio waveform (the mel transform runs inside the encoder, so the
-per-request input is the waveform itself, not a spectrogram), produces the same
+fixed-shape per-request feature tensor, such as Whisper's log-mel spectrogram
+of one fixed 30-second window, produces the same
 number of encoder positions for every request, so both lists follow from the
 model and are derived rather than configured. For those models
 `batch_sizes` alone enables capture, and any `num_tokens` or `seq_lens` you set
-is ignored.
+is ignored. Whisper's captured input is the spectrogram: an audio request is
+converted on the GPU just before the graph input is filled, so audio and
+spectrogram requests replay the same graphs.
 
 Batch sizes that do not fit `encoder_max_num_tokens` divided by the model's
 encoder output length are dropped, and the encoder stays eager when none fit.

@@ -41,8 +41,9 @@ from ..bindings import steady_clock_now
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
-                        GenerationResult, IterationResult, LoRARequest,
-                        PostprocWorkerConfig, PromptAdapterRequest)
+                        GenerationExecutorWorker, GenerationResult,
+                        IterationResult, LoRARequest, PostprocWorkerConfig,
+                        PromptAdapterRequest)
 from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
@@ -1094,8 +1095,14 @@ class BaseLLM:
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
-                    # Convert to shared tensor handle to reduce IPC overhead
-                    multimodal_params.to_handle("multimodal_data")
+                    # Convert to shared tensor handle to reduce IPC overhead.
+                    # An in-process worker reads CUDA tensors from this
+                    # process, where a CUDA IPC handle cannot be reopened,
+                    # so they stay as they are.
+                    multimodal_params.to_handle("multimodal_data",
+                                                local=isinstance(
+                                                    self._executor,
+                                                    GenerationExecutorWorker))
                     if (disaggregated_params is not None) and (
                             "mrope_config"
                             in multimodal_params.multimodal_data):

@@ -1082,6 +1082,11 @@ class MultimodalParams:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
                         SharedTensorContainer
+                    if kwargs.get("local", False) and input_data.is_cuda:
+                        # The consumer reads it from this process; a CUDA
+                        # IPC handle cannot be reopened here, and no handle
+                        # is needed. to_tensor leaves tensors as they are.
+                        return input_data
                     return SharedTensorContainer.from_tensor(
                         input_data).dump_to_dict()
                 except Exception as e:
@@ -1112,11 +1117,16 @@ class MultimodalParams:
         self.multimodal_data = self._apply_tensor_operation(
             self.multimodal_data, "release_handles")
 
-    def to_handle(self, element: str) -> None:
+    def to_handle(self, element: str, local: bool = False) -> None:
         """Move specified multimodal data element to shared tensor.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
+            local: The consumer runs in this process (an in-process executor
+                worker). CUDA tensors are then left in place, since a CUDA
+                IPC handle cannot be reopened in the exporting process and
+                the request itself keeps the tensor alive. CPU tensors
+                still use shared-memory handles, which work in any process.
 
         Raises:
             ValueError: If element is not "multimodal_data"
@@ -1131,7 +1141,9 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to convert
 
-        transformed_data = self._apply_tensor_operation(data, "to_handle")
+        transformed_data = self._apply_tensor_operation(data,
+                                                        "to_handle",
+                                                        local=local)
         setattr(self, element, transformed_data)
 
     def to_tensor(self, element: str) -> None:

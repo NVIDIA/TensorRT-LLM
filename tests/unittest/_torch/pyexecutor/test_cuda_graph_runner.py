@@ -397,6 +397,34 @@ def test_token_encoder_padding_survives_context_exit_without_mutating_inputs() -
     assert inputs["seq_lens"] == [2]
 
 
+def test_feature_replay_stages_host_rows_and_zero_fills_padding() -> None:
+    """Host rows reach the static buffer through the mirror, padding rows are
+    zero-filled, and the graph replays afterwards with the mirror rotated."""
+    fixed_seq_len = 1_500
+    runner = _feature_encoder_runner([1, 2, 4], fixed_seq_len)
+    key = (4, 4 * fixed_seq_len, fixed_seq_len)
+    metadata = object()
+    runner.graph_metadata[key] = {"attn_metadata": metadata}
+    runner.shared_static_tensors = {"input_features": torch.full((4, 480_000), -1.0)}
+    runner._feature_mirrors = [torch.full((4, 480_000), 7.0) for _ in range(2)]
+    runner._feature_h2d_events = [Mock(), Mock()]
+    runner._feature_mirror_slot = 0
+    runner.graphs[key] = Mock()
+    runner.graph_outputs[key] = "output"
+    runner.num_feature_replays = 0
+    rows = [torch.full((1, 480_000), 1.0), torch.full((2, 480_000), 2.0)]
+
+    output = runner._replay_features(key, {"attn_metadata": metadata, "input_features": rows})
+
+    assert output == "output"
+    static = runner.shared_static_tensors["input_features"]
+    assert static[0].eq(1.0).all() and static[1:3].eq(2.0).all() and static[3].eq(0.0).all()
+    runner.graphs[key].replay.assert_called_once_with()
+    runner._feature_h2d_events[0].synchronize.assert_called_once_with()
+    runner._feature_h2d_events[0].record.assert_called_once_with()
+    assert runner._feature_mirror_slot == 1 and runner.num_feature_replays == 1
+
+
 def test_captured_feature_metadata_avoids_eager_metadata_build() -> None:
     fixed_seq_len = 1_500
     runner = _feature_encoder_runner([1, 2], fixed_seq_len)
