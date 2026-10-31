@@ -1175,7 +1175,14 @@ class PyExecutor:
             is_kv_cache_manager_v2 = isinstance(self.kv_cache_manager,
                                                 KVCacheManagerV2)
 
-            if is_kv_cache_manager_v2 and self.max_draft_len > 0:
+            from .connectors.registry import uses_connector
+
+            # mooncake-store saves only prompt blocks under speculative
+            # decoding, which are filled before the first draft.
+            if (is_kv_cache_manager_v2 and self.max_draft_len > 0
+                    and not uses_connector(
+                        getattr(self.llm_args, "kv_connector_config", None),
+                        "mooncake-store")):
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with speculative "
                     "decoding. Rejected draft tokens "
