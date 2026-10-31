@@ -20,6 +20,8 @@
 #include "tensorrt_llm/kernels/moe/communication/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
+#include <map>
+#include <utility>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -713,6 +715,29 @@ void moefinalize_allreduce_fusion_kernel_launcher(MoeFinalizeAllReduceFusionPara
     while (warps_per_token % cluster_size != 0)
     {
         cluster_size /= 2;
+    }
+    if (tensorrt_llm::common::getBoolEnv("TRTLLM_MOE_FINALIZE_CTA1") && token_num > 0 && cluster_size > 1
+        && threads_per_token % 32 == 0 && threads_per_token <= 1024)
+    {
+        // No masked tail exists in the collective/norm epilogue: a token must
+        // fit exactly in one CTA. Reuse the same arithmetic and Lamport workspace.
+        int device;
+        TLLM_CUDA_CHECK(cudaGetDevice(&device));
+        static thread_local std::map<std::pair<int, int>, bool> supported;
+        auto [entry, inserted] = supported.try_emplace(std::make_pair(device, threads_per_token), false);
+        if (inserted)
+        {
+            int activeBlocks;
+            TLLM_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&activeBlocks,
+                moefinalize_allreduce_fusion_kernel_oneshot_lamport<DType, NRanks, ResidualOut, NormOut, QuantOut,
+                    ScaleType>,
+                threads_per_token, 0));
+            entry->second = activeBlocks > 0;
+        }
+        if (entry->second)
+        {
+            cluster_size = 1;
+        }
     }
     int block_size = warps_per_token / cluster_size * 32;
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
