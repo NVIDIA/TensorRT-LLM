@@ -10,7 +10,7 @@ Covers the SiTU cubin integration behavior:
   ``siTuGlu``, and from the expected cubin family -- ``MxE4m3_MxE2m1`` for
   the MXFP4 drop, ``E2m1_E2m1E2m1`` for the NVFP4 one (tactic availability
   for both families is pinned at the op level in
-  tests/unittest/_torch/thop/serial/test_moe.py);
+  tests/unittest/_torch/moe/kernels/serial/test_moe.py);
 * fused output matches the Python ``SituAndMul`` reference within
   MXFP8/MXFP4 quantization tolerance, for the default AND asymmetric
   non-default ``activation_situ_beta`` / ``activation_situ_linear_beta``;
@@ -143,7 +143,7 @@ def test_cutedsl_kernel_rejects_unusable_situ_betas(situ_beta, situ_linear_beta)
     against NaN is false, and an infinity is positive.
     """
     pytest.importorskip("cutlass")
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+    from tensorrt_llm._torch.moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
         BlockScaledContiguousGatherGroupedGemmKernel,
     )
     from tensorrt_llm._torch.utils import ActivationType
@@ -638,8 +638,9 @@ def test_kimi_k3_allow_list_matches_what_the_backends_declare():
 
     ``any`` rather than ``all`` over a family: resolution walks family members
     in ``IMPL_PRIORITY`` order, so a family serves SiTU when one member does.
-    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` does not
-    declare it, ``CuteDslFusedMoE`` does.
+    ``CUTEDSL`` is exactly that case -- ``CuteDslB12xFusedMoE`` and the BF16
+    grouped-GEMM leaf do not declare it, ``TrtllmCutedslGroupedGemmNvfp4Impl``
+    does.
     """
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import BACKEND_FAMILY
     from tensorrt_llm._torch.utils import ActivationType
@@ -677,8 +678,8 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
     """K3 must propagate strict backend selection through create_moe."""
     from transformers.configuration_utils import PretrainedConfig
 
-    from tensorrt_llm._torch.moe.fused_moe import CutlassFusedMoE
     from tensorrt_llm._torch.moe.fused_moe.activation import SiTuActivation
+    from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassNvfp4Impl
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEEligibility, MoERejectReason
     from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
         BACKEND_FAMILY,
@@ -699,7 +700,9 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
             ),
         )
     monkeypatch.setattr(
-        CutlassFusedMoE, "can_implement", classmethod(lambda cls, p, d: MoEEligibility.ok())
+        TrtllmCutlassNvfp4Impl,
+        "can_implement",
+        classmethod(lambda cls, p, d: MoEEligibility.ok()),
     )
     quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4, group_size=16)
     pretrained_config = PretrainedConfig()
@@ -724,7 +727,7 @@ def test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass(monkeypatch):
         allow_degradation=True,
     )
     assert report.degraded
-    assert impl_class_for(report) is CutlassFusedMoE
+    assert impl_class_for(report) is TrtllmCutlassNvfp4Impl
 
     # Removing CUTEDSL from K3's no-degradation list must fail this assertion.
     with pytest.raises(ValueError, match="CUTEDSL.*degradation disallowed") as excinfo:
@@ -1178,16 +1181,17 @@ def test_tp_shard_loader_matches_manual_slice(tp_size):
 
 
 @situ_supported
+@pytest.mark.parametrize("tp_size", [8, 16], ids=lambda n: f"tp{n}")
 @pytest.mark.parametrize("num_tokens", [1, 16], ids=lambda n: f"tokens{n}")
-def test_tp8_sharded_forward_matches_whole_expert(num_tokens):
-    """Sum of 8 TP-shard partial outputs == whole-expert reference.
+def test_tp_sharded_forward_matches_whole_expert(num_tokens, tp_size):
+    """Sum of the TP-shard partial outputs == whole-expert reference.
 
     Per-element MXFP4/MXFP8 numerics are identical between the two layouts
-    (group-32 boundaries align: 384 % 32 == 0), so the only expected error
-    is bf16 rounding of the per-shard FC2 partial sums.
+    (group-32 boundaries align: 384 and 192 are multiples of 32), so the only
+    expected error is bf16 rounding of the per-shard FC2 partial sums. At TP16
+    each shard's 192-wide slice is zero-padded to 256 and run as valid 192.
     """
-    tp_size = 8
-    ipp = _TP_INTERMEDIATE // tp_size  # 384 — the production TP8 shard size
+    ipp = _TP_INTERMEDIATE // tp_size  # 384 at TP8; 192 at TP16 (the no-spec layout)
     bank = _make_packed_expert_bank(_TP_EXPERTS, _TP_INTERMEDIATE, _TP_HIDDEN)
     gate = _make_test_gate()
 
@@ -1851,7 +1855,7 @@ def _dequantize_expert_bank(bank):
     meaningful.
 
     This mirrors ``e2m1_and_ufp8_scale_batches`` in
-    ``tests/unittest/_torch/thop/serial/test_moe.py``; the layout arguments
+    ``tests/unittest/_torch/moe/kernels/serial/test_moe.py``; the layout arguments
     follow ``_quantize_expert_to_nvfp4``, which stores UE4M3 block scales
     (``sfUseUE8M0=False`` -> ``sfType=1``) already de-swizzled by
     ``block_scale_interleave_reverse`` (-> ``isSfSwizzledLayout=False``).
@@ -2540,6 +2544,25 @@ def test_mega_format_transform_is_slot_blockwise() -> None:
         )
 
     whole = _run(0, num_slots)
+    bundle = method._live_weight_bundle_layout(hidden, intermediate, expand_intermediate)
+    planes = {plane.name: plane for plane in bundle.planes}
+    for tensor, name in zip(
+        whole,
+        (
+            "mega_fc1_weight",
+            "mega_fc1_weight_sf",
+            "mega_fc2_weight",
+            "mega_fc2_weight_sf",
+        ),
+    ):
+        shape, stride, dtype_name, element_size, pointer_alignment = planes[name].storage_metadata(
+            num_slots
+        )
+        assert tuple(tensor.shape) == shape
+        assert tuple(tensor.stride()) == stride
+        assert tensor.dtype == getattr(torch, dtype_name)
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
 
     for chunk in (1, 3, 16):  # 16 > num_slots: the single-call degenerate case
         pieces = [_run(lo, min(lo + chunk, num_slots)) for lo in range(0, num_slots, chunk)]

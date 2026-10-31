@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import platform
 import sys
 import types
@@ -73,3 +74,84 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+
+
+# SMs that a kernel resident for the whole step holds (the DWDP fabric gather;
+# ``DwdpManager`` sets it once, before the model is built). Persistent grids
+# leave them out, so CTAs that would land on those SMs do not run their static
+# tile share as a second wave. The hook below wraps
+# ``HardwareInfo.get_max_active_clusters`` on the class (installed when this
+# module is imported, before any kernel queries occupancy) so every CuTeDSL
+# persistent grid honors the reserve. Kernels that size their own persistent
+# grids take the reserve as an argument from their module, which reads
+# ``sm_reserve()`` (the KDA mixer reads it at construction). Callers that
+# memoize the occupancy key it on ``sm_reserve()`` (the dense GEMM custom op
+# does).
+_sm_reserve = 0
+
+
+def set_sm_reserve(reserve: int) -> None:
+    """Keep ``reserve`` SMs out of persistent grids from now on (0 = none).
+
+    A nonzero ``reserve`` must leave at least one SM of the current device.
+    """
+    global _sm_reserve
+    if reserve < 0:
+        raise ValueError(f"SM reserve must be non-negative, got {reserve}")
+    if reserve:
+        import torch
+
+        if torch.cuda.is_available():
+            sm_count = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            if reserve >= sm_count:
+                raise ValueError(
+                    f"SM reserve {reserve} must leave at least one of "
+                    f"{sm_count} SMs")
+    if reserve and reserve != _sm_reserve:
+        logger.info(
+            f"[cute_dsl_utils] persistent grids launch with {reserve} SMs reserved"
+        )
+    _sm_reserve = reserve
+
+
+def sm_reserve() -> int:
+    """SMs kept out of persistent grids (see :func:`set_sm_reserve`)."""
+    return _sm_reserve
+
+
+def reserved_max_active_clusters(full: int, cluster_size: int,
+                                 reserve: int) -> int:
+    """``full`` clusters less enough to free ``reserve`` SMs, never below one.
+
+    A non-positive ``full`` means the device cannot host the cluster shape and
+    is returned unchanged, so callers' "unsupported" checks still fire.
+    """
+    if reserve <= 0 or full <= 0:
+        return full
+    # One cluster occupies cluster_size SMs.
+    return max(1, full - math.ceil(reserve / max(1, cluster_size)))
+
+
+def _install_sm_reserve() -> None:
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        return
+    try:
+        from cutlass.utils import HardwareInfo
+    except ImportError:
+        return
+    if getattr(HardwareInfo.get_max_active_clusters, "_trtllm_sm_reserve_hook",
+               False):
+        return
+    original = HardwareInfo.get_max_active_clusters
+
+    def get_max_active_clusters(self, cluster_size: int, *args,
+                                **kwargs) -> int:
+        full = original(self, cluster_size, *args, **kwargs)
+        return reserved_max_active_clusters(full, cluster_size, sm_reserve())
+
+    get_max_active_clusters._trtllm_sm_reserve_hook = True
+    HardwareInfo.get_max_active_clusters = get_max_active_clusters
+
+
+_install_sm_reserve()

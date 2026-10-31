@@ -51,6 +51,17 @@ def is_gdn_replay_enabled() -> bool:
     return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
 
 
+def is_gdn_flashinfer_replay_enabled() -> bool:
+    """Return whether GDN replay may use the FlashInfer ring kernel (default: disabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY",
+                          "0") in ("1", "force")
+
+
+def is_gdn_flashinfer_replay_required() -> bool:
+    """Return whether ineligible FlashInfer GDN replay must raise instead of falling back."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
+
+
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
 # cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
 class ActivationType(IntEnum):

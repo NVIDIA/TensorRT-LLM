@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, FrozenSet, Iterator,
                     List, Optional, Tuple)
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
@@ -32,18 +33,27 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
     from .sparse.dsa.metadata import TokenMajorGenView
 
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
+                                 maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings.internal import thop
-from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
+                                     RotaryScalingType)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantMode
 
+from ...kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids, is_kimi_k3
+from ...pyexecutor import step_inputs
 from ...pyexecutor.config_utils import is_mla
+from ...pyexecutor.h2d_cache import copy_h2d_if_changed
 from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
                       get_model_extra_attrs, helix_local_len_tensor)
+from ..kernels.sage_quant import SageQuantized, sage_quantize
+from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
-from .fp4_mla import can_fuse_fp4_mla_q_quant, scatter_fp4_mla_kv_cache
+from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
+                      populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMask, AttentionMetadata,
@@ -137,6 +147,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
+    # Block offsets of the mixed-precision staging cache, swapped in for
+    # kv_cache_block_offsets while a mixed-precision layer runs.
+    _mixed_precision_block_offsets: Optional[torch.Tensor] = field(
+        init=False, default=None, repr=False, compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -182,11 +196,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # parameters required for spec-dec mode
     max_total_draft_tokens: Optional[int] = None
     spec_decoding_position_offsets: Optional[torch.Tensor] = None
-    # C++ attention op requires a 2-D position_offsets tensor and reads
-    # sizes()[1] as the generation length / packed-mask row stride.
-    spec_decoding_position_offsets_cpp: Optional[torch.Tensor] = None
-    # Compact Hopper C++ row stride for 1D dynamic-tree offsets.
-    position_offsets_stride: int = 0
+    # Current query width of the compact prefix in a 1-D dynamic-tree offsets buffer.
+    spec_decoding_query_len: int = 0
     spec_decoding_packed_mask: Optional[torch.Tensor] = None
     spec_decoding_generation_lengths: Optional[torch.Tensor] = None
     spec_decoding_bl_tree_mask_offset: Optional[torch.Tensor] = None
@@ -288,19 +299,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return self.cuda_graph_workspace if self.is_cuda_graph else self.workspace
 
     @property
-    def spec_decoding_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
-        """``spec_decoding_position_offsets`` reshaped to the 2D layout the C++
-        kernel expects."""
-        offsets = self.spec_decoding_position_offsets
-        if offsets is not None and offsets.dim() == 1:
-            if (self.spec_decoding_position_offsets_cpp is not None
-                    and not self.is_sm_version_trtllm_gen_kernel(
-                        sm=get_sm_version())):
-                return self.spec_decoding_position_offsets_cpp
-            return offsets.view(self.max_num_requests, -1)
-        return offsets
-
-    @property
     def max_context_length(self) -> int:
         """
         Upper bound for a single context window.
@@ -379,23 +377,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
-
-    def update_position_offsets_for_cpp(self, query_len: int) -> None:
-        """Refresh the C++ view of spec-dec position offsets."""
-        offsets = self.spec_decoding_position_offsets
-        if offsets is None or offsets.dim() != 1:
-            self.spec_decoding_position_offsets_cpp = offsets
-            self.position_offsets_stride = 0
-            return
-
-        if self.max_num_requests > 0 and query_len > 0:
-            self.position_offsets_stride = query_len
-            total = self.max_num_requests * query_len
-            self.spec_decoding_position_offsets_cpp = offsets[:total].view(
-                self.max_num_requests, query_len)
-        else:
-            self.spec_decoding_position_offsets_cpp = offsets
-            self.position_offsets_stride = 0
 
     def _post_init_with_buffers(self, buffers) -> None:
 
@@ -783,21 +764,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
           * kv_lens_cuda is BATCH-indexed, hence the num_contexts offset on
             the write below.
         """
-        pos = self.helix_position_offsets[:num_gen_tokens]
-        phys = self.kv_cache_manager.tokens_per_block
-        cp_rank = self.mapping.cp_rank
-        cp_size = self.mapping.cp_size
-        owner = torch.div(pos, phys, rounding_mode='floor') % cp_size
-        active = owner == cp_rank
-        local_before = self.helix_local_len_vec(pos)
-        # Scalar overload: no per-step allocation (CUDA-graph capture treats
-        # these ops as part of the graph; keep them allocation-free).
-        self.helix_local_slots[:num_gen_tokens].copy_(
-            torch.where(active, local_before, -1))
-        self.helix_kv_bounds[:num_gen_tokens].copy_(
-            self.helix_local_len_vec(pos + 1))
-        # Per-sequence rank-local kv length = bound of the sequence's last
-        # token (attention over committed + owned in-flight tokens).
         assert num_gen_tokens % tokens_per_gen_seq == 0, (
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens not divisible by group size {tokens_per_gen_seq}")
@@ -809,10 +775,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"helix spec expects uniform verify groups: {num_gen_tokens} gen "
             f"tokens over {self.num_generations} generation rows do not all "
             f"have width {tokens_per_gen_seq}")
-        last_bounds = self.helix_kv_bounds[:num_gen_tokens].view(
-            num_gen_seqs, tokens_per_gen_seq)[:, -1]
-        self.kv_lens_cuda[self.num_contexts:self.num_contexts +
-                          num_gen_seqs].copy_(last_bounds)
+        # One launch derives the write slots, the attention bounds and the
+        # per-sequence rank-local kv length (the bound of the sequence's last
+        # token: committed + owned in-flight tokens) from the positions; it
+        # replaces a chain of elementwise ops on the step's critical path.
+        # Static shapes and allocation-free, so it is safe under CUDA graph
+        # capture.
+        populate_helix_spec_buffers(
+            self.helix_position_offsets[:num_gen_tokens],
+            self.helix_local_slots[:num_gen_tokens],
+            self.helix_kv_bounds[:num_gen_tokens],
+            self.kv_lens_cuda[self.num_contexts:self.num_contexts +
+                              num_gen_seqs],
+            num_tokens=num_gen_tokens,
+            tokens_per_seq=tokens_per_gen_seq,
+            tokens_per_block=self.kv_cache_manager.tokens_per_block,
+            cp_size=self.mapping.cp_size,
+            cp_rank=self.mapping.cp_rank)
 
     def _bind_runtime_views(
         self,
@@ -829,9 +808,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         graph binding so the set of runtime views stays in sync across paths.
         """
         self.kv_lens_cuda_runtime = kv_lens_cuda
-        self.kv_lens_runtime = kv_lens
-        self.prompt_lens_cuda_runtime = prompt_lens_cuda
-        self.prompt_lens_cpu_runtime = prompt_lens_cpu
+        self.kv_lens_runtime: torch.Tensor = kv_lens
+        self.prompt_lens_cuda_runtime: torch.Tensor = prompt_lens_cuda
+        self.prompt_lens_cpu_runtime: torch.Tensor = prompt_lens_cpu
         self.host_request_types_runtime = host_request_types
 
     def mla_prepare_scheduler_buffers(
@@ -946,26 +925,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         saved = (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
                  self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
                  self.max_num_requests, self.prompt_lens_cuda_runtime,
-                 self.host_request_types_runtime)
+                 self.host_request_types_runtime, self._num_generations,
+                 self.max_num_sequences)
         try:
             self.kv_lens_cuda_runtime = view.sequence_length
             self.kv_lens_runtime = view.host_past_key_value_lengths
             self.prompt_lens_cpu_runtime = view.host_context_lengths
             self.kv_cache_block_offsets = view.kv_cache_block_offsets
-            # The op reserves its multi-CTA-KV counter as
-            # `num_heads * max_num_requests` and sizes its generation workspace
-            # from the same number. Under this presentation the batch dimension
-            # the kernels see is the ROW count, which is larger. Passing the
-            # static ceiling grows the reservation to cover it while keeping the
-            # op's (beam_width, max_num_requests, window) cache key constant.
-            # This is only a capacity input -- the op's own mMaxNumRequests is a
-            # JIT-warmup hint, and the per-step request count comes from the
-            # batch, not from here.
-            #
-            # The attention workspace is sized from the same number, so it
-            # grows with the row ceiling; that memory would otherwise hold
-            # KV cache.
+            # The multi-CTA-KV counter and generation workspace must cover
+            # token rows, which can outnumber requests. Use the static row
+            # ceiling so the allocation remains stable across steps.
             self.max_num_requests = view.max_num_rows
+            self.max_num_sequences = view.max_num_rows
+            # Phased FMHA reads this count directly. Its public setter calls
+            # on_update(), which would recompute the request count from seq_lens.
+            self._num_generations = view.num_rows - self.num_contexts
             # Every runtime view has to agree on batch_size with
             # kv_lens_cuda_runtime, and the op reads request_types over all of
             # num_seqs -- both are the row count here, not the request count.
@@ -976,7 +950,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             (self.kv_lens_cuda_runtime, self.kv_lens_runtime,
              self.prompt_lens_cpu_runtime, self.kv_cache_block_offsets,
              self.max_num_requests, self.prompt_lens_cuda_runtime,
-             self.host_request_types_runtime) = saved
+             self.host_request_types_runtime, self._num_generations,
+             self.max_num_sequences) = saved
 
     def prepare(self) -> None:
         super().prepare()
@@ -1006,8 +981,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             device='cpu',
         )
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
-        self.prompt_lens_cuda[:self.num_seqs].copy_(
-            self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
+        copy_h2d_if_changed(self.prompt_lens_cuda[:self.num_seqs],
+                            self.prompt_lens_cpu[:self.num_seqs])
 
         # number of tokens in the kv cache for each sequence in the batch
         cached_token_lens = torch.tensor(
@@ -1060,9 +1035,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # the sequence length including the cached tokens and the input tokens.
         self.kv_lens[:self.num_seqs].copy_(
             kv_lens + self.kv_cache_params.num_extra_kv_tokens)
-        self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
-            kv_lens[:self.num_seqs]),
-                                                non_blocking=True)
+        step_inputs.copy_(self.kv_lens_cuda[:self.num_seqs],
+                          maybe_pin_memory(kv_lens[:self.num_seqs]))
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
@@ -1145,6 +1119,48 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
+        if self._has_mixed_precision_kv():
+            # Native BF16 paged-context FMHA reads 32-token pages.
+            self.prepare_mixed_precision_kv(
+                "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+
+    def _on_mixed_precision_kv_prepared(self, view) -> None:
+        """Lay out the staging pages as TRTLLM block offsets for this batch."""
+        batch = len(view.page_counts)
+        # Filled with numpy on a pinned host table: per-step torch CPU ops
+        # each open an OpenMP parallel region, which stalls on a busy host.
+        host = torch.full((1, batch, 2, view.max_blocks_per_seq),
+                          -1,
+                          dtype=torch.int32,
+                          pin_memory=prefer_pinned())
+        table = host.numpy()
+        for row, (start,
+                  count) in enumerate(zip(view.page_starts, view.page_counts)):
+            pages = np.arange(start, start + count,
+                              dtype=np.int32) * view.kv_factor
+            table[0, row, 0, :count] = pages
+            table[0, row, 1, :count] = pages + view.kv_factor - 1
+        block_offsets = view.buffers.get_buffer(
+            (1, view.rows, 2, view.max_blocks_per_seq),
+            torch.int32,
+            "mixed_block_offsets",
+            self.is_cuda_graph,
+        )[:, :batch]
+        block_offsets.copy_(host, non_blocking=True)
+        self._mixed_precision_block_offsets = block_offsets
+
+    def _swap_mixed_precision_kv(self, view) -> tuple:
+        """Also point the block offsets at the staging pages."""
+        saved = (*super()._swap_mixed_precision_kv(view),
+                 self.kv_cache_block_offsets)
+        self.kv_cache_block_offsets = self._mixed_precision_block_offsets
+        return saved
+
+    def _restore_mixed_precision_kv(self, saved: tuple) -> None:
+        """Undo _swap_mixed_precision_kv, block offsets included."""
+        super()._restore_mixed_precision_kv(saved[:2])
+        self.kv_cache_block_offsets = saved[2]
+
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
             context_kv_tokens: int, generation_kv_tokens: int,
@@ -1169,7 +1185,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             f"({self.kv_cache_manager.max_seq_len}).")
 
         num_seqs = self.num_seqs
-        self.prompt_lens_cuda[:num_seqs].copy_(prompt_lens, non_blocking=True)
+        copy_h2d_if_changed(self.prompt_lens_cuda[:num_seqs], prompt_lens)
         self.kv_lens_cuda[:num_seqs].copy_(kv_lens, non_blocking=True)
         self.host_total_kv_lens[0] = context_kv_tokens
         self.host_total_kv_lens[1] = generation_kv_tokens
@@ -1424,6 +1440,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.max_ctx_cached_token_len = 0
             self.max_ctx_kv_len = 0
             self.max_ctx_seq_len = 0
+            # The indptrs below are read only by the context MLA kernels, and
+            # every batch with context requests rewrites them.
+            return
         torch.cumsum(cached_token_lens[:self.num_contexts],
                      dim=0,
                      dtype=torch.int64,
@@ -1470,7 +1489,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             seqLenQ = self.spec_decoding_packed_mask.shape[
                 1] if self.spec_decoding_packed_mask is not None else 1
             mask_size = torch.ops.trtllm.spec_dec_tree_custom_mask_capacity(
-                self.max_num_requests, seqLenQ, self.num_heads_per_kv)
+                self.max_num_requests, seqLenQ, self.max_num_heads_per_kv)
             self.spec_decoding_bl_tree_mask = torch.zeros(
                 mask_size,
                 dtype=torch.uint32,
@@ -1578,8 +1597,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.spec_decoding_bl_tree_mask = None
                 self.spec_bl_tree_first_sparse_mask_offset_kv = None
 
-            cpp_query_len = 0
-
             # Case 1: dynamic tree — copy per-request params from spec_tree_manager.
             if self.is_spec_dec_dynamic_tree:
                 assert spec_tree_manager is not None, "spec_tree_manager is required for dynamic tree"
@@ -1622,7 +1639,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                             mask_src.reshape(-1), non_blocking=True)
 
                 self.spec_decoding_generation_lengths[:batch_size].fill_(n_dt)
-                cpp_query_len = n_dt
+                self.spec_decoding_query_len = n_dt
 
             # Case 2: linear tree
             else:
@@ -1640,24 +1657,47 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.max_num_requests, runtime_draft_token_buffer_width)
                 self.spec_decoding_packed_mask = generate_spec_decoding_packed_mask(
                     self.max_num_requests, runtime_draft_token_buffer_width)
-
-            self.update_position_offsets_for_cpp(cpp_query_len)
+                self.spec_decoding_query_len = runtime_draft_token_buffer_width + 1
 
     def generate_spec_decoding_generation_length(self, runtime_draft_len):
         self.spec_decoding_generation_lengths[:self.max_num_requests].fill_(
             runtime_draft_len + 1)
 
     def is_sm_version_trtllm_gen_kernel(self, sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
 
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # FMHA library classes this instance tries before the registry's libraries.
+    prepended_fmha_lib_classes: tuple = ()
+
+    # Layer state the native attention op reads through FmhaParams.attn. The
+    # generator (scripts/generate_fmha_params.py) collects these annotations;
+    # attributes assigned from an annotated __init__ parameter need none.
+    num_kv_heads: int
+    is_mla_enable: bool
+    v_head_dim: int
+    rope_params: RopeParams
+    q_scaling: float
+    predicted_tokens_per_seq: int
+    skip_correction_threshold: float
+    uses_spcompress: bool
+    q_lora_rank: Optional[int]
+    kv_lora_rank: Optional[int]
+    qk_nope_head_dim: Optional[int]
+    qk_rope_head_dim: Optional[int]
+    rope_append: Optional[bool]
+    rotary_inv_freq: Optional[torch.Tensor]
+    rotary_cos_sin: Optional[torch.Tensor]
+    position_embedding_type: PositionEmbeddingType
+    skip_softmax_stat: torch.Tensor
+    quant_mode: QuantMode
 
     @staticmethod
     def is_sm_version_trtllm_gen_kernel(sm):
-        return not (sm < 100 or sm in [120, 121])
+        return is_sm_100f(sm)
 
     def __init__(
         self,
@@ -1707,8 +1747,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.is_mla_enable = mla_params is not None
         sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
         if (self.is_mla_enable and sparse_algorithm in ("deepseek_v4", "dsa")
-                and get_sm_version() in (120, 121)
-                and self.kv_cache_dtype != "fp8_ds_mla"):
+                and is_sm_120f() and self.kv_cache_dtype != "fp8_ds_mla"):
             raise ValueError(
                 "DeepSeek-V4/DSA sparse MLA on SM120/SM121 requires "
                 "kv_cache_config.dtype='fp8_ds_mla'.")
@@ -1745,8 +1784,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
-        self.position_embedding_type = int(
-            pos_embd_params.type) if pos_embd_params is not None else 0
+        self.position_embedding_type = (pos_embd_params.type
+                                        if pos_embd_params is not None else
+                                        PositionEmbeddingType.learned_absolute)
         self.skip_softmax_stat = torch.zeros(2,
                                              dtype=torch.uint32,
                                              device='cuda')
@@ -1769,7 +1809,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.kv_scale_orig_quant = 1.0 / self.kv_cache_scaling_factor
 
         self.local_layer_idx: Optional[int] = None
-        self._fmha_manager: FmhaManager
+        self._fmha_manager: Optional[FmhaManager] = None
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1781,8 +1821,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
-        self.quant_mode = int(self.quant_config.layer_quant_mode)
-
+        self.quant_mode = self.quant_config.layer_quant_mode
         self.has_fp8_qdq = self.has_fp8_kv_cache = self.has_nvfp4 = False
         if self.quant_config is not None:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
@@ -1856,9 +1895,28 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return CSA2TrtllmAttention.runtime_workspace_bytes_per_token(
                 model_config, mapping)
 
-        fp8_context_mla = (quant_config is not None
-                           and quant_config.quant_mode.has_fp8_kv_cache()
-                           and get_sm_version() in (90, 100, 103, 107, 120))
+        has_fp4_kv_cache = (quant_mode is not None and getattr(
+            quant_mode, "has_fp4_kv_cache", lambda: False)())
+        # Dense FP4 MLA attends the current chunk and every cached-prefix
+        # partition through the FP8 context kernel, even though the
+        # model-wide cache quantization is NVFP4.
+        nvfp4_uses_fp8_context = (has_fp4_kv_cache and
+                                  model_config.sparse_attention_config is None)
+        if has_fp4_kv_cache and is_kimi_k3(config):
+            # Kimi K3 with an NVFP4 KV cache keeps FP8 fallback MLA layers,
+            # which stage the same context buffers as an all-FP8 model when
+            # this pipeline stage holds one of them.
+            fp8_fallback_layers = get_kimi_k3_fp8_kv_layer_ids(
+                config, nvfp4_enabled=True, mapping=mapping)
+            if fp8_fallback_layers and fp8_fallback_layers.intersection(
+                    mapping.pp_layers(config.num_hidden_layers)):
+                nvfp4_uses_fp8_context = True
+        sm_version = get_sm_version()
+        fp8_context_mla = (quant_mode is not None
+                           and (quant_mode.has_fp8_kv_cache()
+                                or nvfp4_uses_fp8_context)
+                           and (sm_version == 90 or is_sm_100f(sm_version)
+                                or is_sm_120f(sm_version)))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -1870,12 +1928,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
         #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
         #     reserve.
-        #   * SM 100 / 103 / 107 -- mUseTllmGen is `sm >= 100 && sm != 120 && sm != 121`.
+        #   * SM 100 family -- where mUseTllmGen is true.
         #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
         # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
         # under-reserving OOMs mid-forward.
         sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                      and get_sm_version() in (100, 103, 107))
+                      and is_sm_100f())
         short_seq_mha_enabled = int(
             os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
         stages_no_buffer = sparse_mla and not short_seq_mha_enabled
@@ -2014,6 +2072,74 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.kv_lora_rank,
         )
 
+    def _quantize_sage_inputs(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> Optional[SageQuantized]:
+        """Quantize the Sage inputs of block-sparse and V-smoothing calls.
+
+        The attention op quantizes dense SageAttention inside its kernels and
+        cannot add a V mean back, so only block-sparse calls and calls with V
+        smoothing are quantized here, given separate Q, K, and V without a KV
+        cache. Each FMHA library decides whether it takes the quantized inputs;
+        the attention op ignores them.
+        """
+        qk_quant_dtype = forward_args.sage_attn_qk_dtype
+        if (qk_quant_dtype is None or k is None or v is None
+                or metadata.kv_cache_manager is not None):
+            return None
+        inputs = forward_args.sparse_runtime_params.block_sparse_inputs
+        if inputs is None and not forward_args.sage_attn_smooth_v:
+            return None
+        num_seqs = metadata.num_contexts
+        # Device lengths add no host-to-device copy during CUDA Graph capture.
+        cu_seqlens_q = torch.zeros(num_seqs + 1,
+                                   dtype=torch.int32,
+                                   device=q.device)
+        cu_seqlens_kv = torch.zeros_like(cu_seqlens_q)
+        cu_seqlens_q[1:] = metadata.seq_lens_cuda[:num_seqs].cumsum(
+            0, dtype=torch.int32)
+        cu_seqlens_kv[1:] = metadata.seq_lens_kv_cuda[:num_seqs].cumsum(
+            0, dtype=torch.int32)
+        quantized = sage_quantize(
+            q.view(-1, self.num_heads, self.head_dim),
+            k.view(-1, self.num_kv_heads, self.head_dim),
+            v.view(-1, self.num_kv_heads, self.head_dim),
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            q_block_size=forward_args.sage_attn_num_elts_per_blk_q,
+            k_block_size=forward_args.sage_attn_num_elts_per_blk_k,
+            qk_quant_dtype=qk_quant_dtype,
+            smooth_k=forward_args.sage_attn_smooth_k,
+            smooth_v=forward_args.sage_attn_smooth_v,
+        )
+        if inputs is None or not inputs.use_proxy_routes:
+            return quantized
+        # The K/V block means of proxy routes dequantize like the keys and
+        # values they stand for: every mean is a key of its sequence with a
+        # scale of its own, and reuses the V scales and means of this call.
+        batch, blocks = inputs.k_summary.shape[:2]
+        cu_seqlens_blocks = torch.arange(0, (batch + 1) * blocks,
+                                         blocks,
+                                         dtype=torch.int32,
+                                         device=q.device)
+        summary = sage_quantize(None,
+                                inputs.k_summary.flatten(0, 1),
+                                inputs.v_summary.flatten(0, 1),
+                                None,
+                                cu_seqlens_blocks,
+                                k_block_size=1,
+                                qk_quant_dtype=qk_quant_dtype,
+                                stats=quantized)
+        return quantized._replace(
+            k_summary=summary.k.view(inputs.k_summary.shape),
+            v_summary=summary.v.view(inputs.v_summary.shape),
+            k_summary_scale=summary.k_scale)
+
     def _ensure_rope_table_size(self, required_max_positions: int) -> None:
         floats_per_position = self.rope_params.dim * (
             2 if self.rope_params.duplicate_data else 1)
@@ -2054,6 +2180,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             is_mla_enable,
         )
 
+    def out_head_size(self, is_gen_only: bool) -> int:
+        """Per-head width of the attention output for this phase.
+
+        Single source of truth for the output buffer `create_output` allocates and
+        the view a phased FMHA library takes over it; the two must not drift. MLA
+        generation writes the latent (plus the rope part when it is not appended in
+        place), while MLA context writes the already-projected V head.
+        """
+        if not self.is_mla_enable:
+            return self.head_dim
+        if not is_gen_only:
+            return self.v_head_dim
+        return (self.kv_lora_rank if self.rope_append else self.kv_lora_rank +
+                self.qk_rope_head_dim)
+
     def create_output(self, q, *, is_quantize_output: bool,
                       metadata: TrtllmAttentionMetadata,
                       attention_mask: AttentionMask, is_gen_only: bool,
@@ -2067,13 +2208,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         num_tokens = q.size(0)
         if out_dtype is None:
             out_dtype = q.dtype
-        v_head_size = self.head_dim
-        if self.is_mla_enable:
-            if is_gen_only:
-                v_head_size = self.kv_lora_rank if self.rope_append else (
-                    self.kv_lora_rank + self.qk_rope_head_dim)
-            else:
-                v_head_size = self.v_head_dim
+        v_head_size = self.out_head_size(is_gen_only)
         if use_nvfp4_output:
             num_nvfp4_elements_per_container = 2
             scaling_vector_size = 16
@@ -2100,8 +2235,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return self.rope_params.theta
 
     @property
-    def rope_scale_type(self) -> int:
-        return int(self.rope_params.scale_type)
+    def rope_scale_type(self) -> RotaryScalingType:
+        return self.rope_params.scale_type
 
     @property
     def rope_scale(self) -> float:
@@ -2431,6 +2566,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             assert metadata.kv_cache_manager is None
             assert metadata.num_contexts == metadata.num_seqs
 
+        assert self._fmha_manager is not None
+        # Sparse prediction has read the unquantized inputs; FMHA support checks
+        # see the quantized ones.
+        forward_args.sage_quantized = self._quantize_sage_inputs(
+            q, k, v, metadata, forward_args)
+
         # On a ragged generation step the attention op is handed
         # one row per query token so its `num_tokens % num_seqs == 0` check
         # passes with seq_len == 1. Keep the presentation scoped around both
@@ -2563,6 +2704,19 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
+        if self.uses_fp4_mla_attention:
+            return load_fp4_mla_chunked_kv_cache(
+                metadata,
+                self.layer_idx,
+                num_ctx_cached_tokens=num_ctx_cached_tokens,
+                cu_chunked_seq_len=cu_chunked_seq_len,
+                chunked_global_offset=chunked_global_offset,
+                chunked_max_seq_len=chunked_max_seq_len,
+                out_dtype=out_dtype,
+                kv_lora_rank=self.mla_params.kv_lora_rank,
+                qk_rope_head_dim=self.mla_params.qk_rope_head_dim,
+            )
+
         if metadata.max_ctx_cached_token_len == 0:
             empty_kv = torch.empty((0, self.mla_params.kv_lora_rank),
                                    dtype=out_dtype,
@@ -2594,6 +2748,70 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.quant_mode,
         )
         return output_kv, output_k_pe
+
+    def append_fp4_mla_context_cache(
+        self,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+    ) -> None:
+        """Apply Q/K RoPE and append one context chunk to FP4 MLA V2 storage."""
+        if not self.uses_fp4_mla_attention or self.mla_params is None:
+            raise RuntimeError(
+                "FP4 MLA context append requires dense FP4 MLA attention.")
+        if (metadata.fp4_mla_state is None
+                or metadata.fp4_mla_state.positions is None):
+            raise RuntimeError(
+                "FP4 MLA context append requires token positions.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache[:metadata.num_ctx_tokens],
+            self.layer_idx,
+            token_offset=0,
+            phase="context",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.mla_params.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            q_context=q,
+            q_nope_head_dim=self.mla_params.qk_nope_head_dim,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "Fused FP4 MLA context scatter did not update the HP pool.")
+
+    def forward_fp4_mla_context_partition(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+        *,
+        kv_lens_cuda: torch.Tensor,
+        kv_lens_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one explicit-KV chunked-prefill partition of dense FP4 MLA.
+
+        The partition attends through the FP8 MLA context kernel. Returns the
+        attention output of the partition.
+        """
+        for fmha in self._fmha_manager.fmha_libs:
+            if isinstance(fmha, Fp4MlaFmha):
+                output = fmha.forward_context_partition(
+                    q,
+                    k,
+                    v,
+                    metadata,
+                    forward_args,
+                    kv_lens_cuda=kv_lens_cuda,
+                    kv_lens_cpu=kv_lens_cpu,
+                )
+                if isinstance(output, tuple):
+                    output = output[0]
+                return output
+        raise RuntimeError(
+            "Dense FP4 MLA FMHA is unavailable for chunked prefill.")
 
     def mla_rope_append_paged_kv_assign_q(
         self,
@@ -2721,6 +2939,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_done_elsewhere: bool = False,
         quant_scale_qkv: Optional[torch.Tensor] = None,
         fuse_fp4_q_quant: bool = False,
+        q_rope_applied: bool = False,
     ) -> None:
         """
             fused_q (torch.Tensor): The tensor to store the fused q, with shape (num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim) on GPU.
@@ -2742,6 +2961,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_done_elsewhere (bool): Run the Q half only; the KV half already ran, hoisted onto an aux stream. Mutually exclusive with kv_only. With both halves done, do not call this at all.
             quant_scale_qkv (torch.Tensor): Non-None means q_nope in quant_q_buffer is already FP8, so the kernel drops the q_nope quantize rows from its grid.
             fuse_fp4_q_quant (bool): Quantize Q in the fused FP4 RoPE/cache update.
+            q_rope_applied (bool): quant_q_buffer already holds the complete rotated FP8 Q (the DSv4 q_b GEMM fusion wrote it), so the Q half must not rewrite the rope segment.
         """
 
         assert self.is_mla_enable and self.mla_params is not None
@@ -2781,7 +3001,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 mla_bmm2_scale, quant_q_buffer, out_scale, helix_tensor_params,
                 kv_norm_weight, kv_norm_eps, precomputed_cu_seqlens,
                 precomputed_fmha_scheduler, kv_only, kv_done_elsewhere,
-                quant_scale_qkv)
+                quant_scale_qkv, q_rope_applied)
 
     @contextlib.contextmanager
     def presented_token_major_for(
@@ -2810,6 +3030,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         kv_only: bool,
         kv_done_elsewhere: bool,
         quant_scale_qkv: Optional[torch.Tensor],
+        q_rope_applied: bool,
     ) -> None:
         torch.ops.trtllm.mla_rope_generation(
             fused_q,
@@ -2859,6 +3080,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             kv_only,
             kv_done_elsewhere,
             quant_scale_qkv,
+            q_rope_applied,
         )
 
     def _fp4_mla_rope_generation(

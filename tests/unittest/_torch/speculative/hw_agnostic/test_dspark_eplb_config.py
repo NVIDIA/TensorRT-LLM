@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_dspark import (
 from tensorrt_llm._torch.models.modeling_speculative import external_drafter_config_kwargs
 from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
+from tensorrt_llm.mapping import Mapping
 
 NUM_HIDDEN_LAYERS = 61
 NUM_STAGES = 3
@@ -61,7 +62,7 @@ def _model_config(lb_config=None, num_hidden_layers=NUM_HIDDEN_LAYERS):
         moe_load_balancer=lb_config,
         attn_backend="TRTLLM",
         moe_backend="CUTLASS",
-        mapping=object(),
+        mapping=Mapping(),
         max_num_tokens=8192,
         moe_max_num_tokens=8192,
         # Forwarded to the drafter so its position table is sized by what the

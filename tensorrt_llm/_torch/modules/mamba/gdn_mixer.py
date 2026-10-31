@@ -18,12 +18,14 @@ from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
+from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import flashinfer_cached_replay_update
 from tensorrt_llm._torch.modules.fla.fused_recurrent import fused_recurrent_gated_delta_rule_update
 from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _can_use_flashinfer_gdn_verify,
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
+from tensorrt_llm._torch.modules.fla.utils import tensor_cache
 from tensorrt_llm._utils import is_flashinfer_gdn_prefill_supported_arch, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -82,6 +84,13 @@ def chunk_gated_delta_rule(
     if state_workspace is not None:
         kwargs["state_workspace"] = state_workspace
     return _resolve_chunk_gated_delta_rule()(*args, **kwargs)
+
+
+@tensor_cache
+def _prefill_query_start_loc(query_start_loc: torch.Tensor, num_prefill: int) -> torch.Tensor:
+    # FLA caches chunk metadata by tensor identity. Keep this view stable across
+    # warmup and CUDA graph capture so preparing the metadata needs no host copy.
+    return query_start_loc[: num_prefill + 1]
 
 
 def _extract_gdn_extra_attrs(layer_idx: str):
@@ -462,6 +471,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         are deferred via the compact history cache. Cached replay reuses the
         Mamba2 fields as old_x<->U, old_B<->normalized k, and
         old_dt<->cumulative G.
+        With FlashInfer ring replay, the history lives in per-layer rings and
+        each slot's ring start (cache_base) instead.
         """
         assert replay_metadata is not None, (
             "GDN replay enabled but replay metadata was not allocated."
@@ -474,6 +485,28 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             raise RuntimeError(
                 "GDN cached replay requires draft_token_num <= 8 and replay_history_size <= 16."
             )
+        state_indices = state_indices_d[:num_decodes]
+        if layer_cache.cache_base is not None:
+            # FlashInfer reads the history length and ring start per batch row.
+            slots = state_indices.long()
+            return flashinfer_cached_replay_update(
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                ssm_states=ssm_states,
+                state_indices=state_indices,
+                k_ring=layer_cache.k_ring,
+                u_ring=layer_cache.u_ring,
+                g_ring=layer_cache.g_ring,
+                hist_len=layer_cache.prev_num_accepted_tokens[slots],
+                cache_base=layer_cache.cache_base[slots],
+                history_size=replay_metadata.replay_history_size,
+                output=output_d,
+            )
         return fused_recurrent_gated_delta_rule_cached_replay_update(
             q=query,
             k=key,
@@ -484,7 +517,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             dt_bias=self.dt_bias,
             launch_with_pdl=True,
             ssm_states=ssm_states,
-            state_indices=state_indices_d[:num_decodes],
+            state_indices=state_indices,
             old_u=layer_cache.old_x,
             old_k=layer_cache.old_B,
             old_G=layer_cache.old_dt,
@@ -693,6 +726,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             conv_state_indices=cache_indices,
         )
 
+        return self._recurrent_update(
+            mixed_qkv, a, b, ssm_states, cache_indices, query_start_loc_long, output
+        )
+
+    def _recurrent_update(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc_long: torch.Tensor,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # Keep q/k/v as views over mixed_qkv so the fused decode kernel can
         # consume their native strides without forcing packed copies.
         query = mixed_qkv[..., : self.key_dim_per_tp]
@@ -747,6 +794,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         state_indices_d = kwargs["state_indices_d"]
         num_prefill = kwargs["num_prefill"]
         num_decodes = kwargs["num_decodes"]
+        split_decode = (
+            num_decode_tokens > 0
+            and not is_target_verify
+            and os.getenv("FORCE_DETERMINISTIC", "0") == "1"
+        )
 
         conv_states_to_use = conv_states
 
@@ -823,19 +875,33 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                         self.head_v_dim,
                         beta_dtype=b.dtype,
                     )
-                query_d, key_d, value_d = pack_gdn_decode_qkv(
-                    mixed_qkv_d,
-                    self.num_k_heads_per_tp,
-                    self.head_k_dim,
-                    self.num_v_heads_per_tp,
-                    self.head_v_dim,
-                )
+                layer_cache = kwargs.get("layer_cache")
+                if (
+                    kwargs.get("use_replay", False)
+                    and layer_cache is not None
+                    and layer_cache.cache_base is not None
+                ):
+                    # FlashInfer ring replay needs q/k/v as slices of one buffer
+                    # (strided mode), so slice the conv output like forward_decode.
+                    key_size = self.key_dim // self.attn_tp_size
+                    query_d = mixed_qkv_d[..., :key_size]
+                    key_d = mixed_qkv_d[..., key_size : key_size * 2]
+                    value_d = mixed_qkv_d[..., key_size * 2 :]
+                else:
+                    # Copies q/k/v into separate contiguous tensors.
+                    query_d, key_d, value_d = pack_gdn_decode_qkv(
+                        mixed_qkv_d,
+                        self.num_k_heads_per_tp,
+                        self.head_k_dim,
+                        self.num_v_heads_per_tp,
+                        self.head_v_dim,
+                    )
             else:
                 query, key, value, g, beta = fused_gdn_post_conv(
                     mixed_qkv_p_t,
-                    mixed_qkv_d,
-                    a,
-                    b,
+                    None if split_decode else mixed_qkv_d,
+                    a[:num_prefill_tokens] if split_decode else a,
+                    b[:num_prefill_tokens] if split_decode else b,
                     self.A_log,
                     self.dt_bias,
                     self.num_k_heads_per_tp,
@@ -1005,17 +1071,38 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             g=g,
             beta=beta,
             initial_state=ssm_states,
-            initial_state_indices=cache_indices,
+            initial_state_indices=state_indices_p if split_decode else cache_indices,
             # This path writes recurrent state directly back into the shared
             # pool; callers **must** ensure cache_indices do not alias live slots.
             inplace_indexed_state_update=True,
             output_final_state=False,
-            cu_seqlens=query_start_loc_long,
+            cu_seqlens=_prefill_query_start_loc(query_start_loc_long, num_prefill)
+            if split_decode
+            else query_start_loc_long,
             head_first=False,
             use_qk_l2norm_in_kernel=False,
-            output=output,
+            output=output[:, :num_prefill_tokens]
+            if split_decode and output is not None
+            else output,
             state_workspace=kwargs.get("state_workspace"),
         )
+
+        if split_decode:
+            # Decode retains the same normalization precision and state update
+            # kernel when prefill requests share its batch.
+            output_d = output[:, num_prefill_tokens:] if output is not None else None
+            decode_out = self._recurrent_update(
+                mixed_qkv_d,
+                a[num_prefill_tokens:],
+                b[num_prefill_tokens:],
+                ssm_states,
+                state_indices_d,
+                query_start_loc_long[num_prefill:] - num_prefill_tokens,
+                output_d,
+            )
+            if output is not None:
+                return output
+            return torch.cat((core_attn_out, decode_out), dim=1)
 
         return core_attn_out
 
@@ -1051,12 +1138,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states)
+        # Have prefill and decode write into disjoint slices of the same buffer, avoiding
+        # concatenation when eager execution mixes both kinds of requests.
+        attn_out = mixed_qkv.new_empty(
+            (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
+        )
 
         use_breakable_cuda_graph = not is_torch_compiling() and is_in_breakable_cuda_graph()
         if self.register_to_config and (is_torch_compiling() or use_breakable_cuda_graph):
-            attn_out = mixed_qkv.new_empty(
-                (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
-            )
             maybe_bcg_gdn_custom_op_inplace(mixed_qkv, a, b, self.layer_idx_str, attn_out)
         else:
             attn_out = self.forward_core(
@@ -1066,6 +1155,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 attn_metadata,
                 mamba_metadata,
                 spec_metadata=spec_metadata,
+                output=attn_out,
             )
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)
@@ -1126,13 +1216,18 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             if is_target_verify
             else None
         )
-        use_replay = is_target_verify and getattr(
-            attn_metadata.kv_cache_manager, "use_replay_state_update", False
-        )
         replay_metadata = (
             attn_metadata.kv_cache_manager.get_replay_state_update_metadata()
-            if use_replay
+            if is_target_verify
             else None
+        )
+        use_replay = replay_metadata is not None
+        # Work items only feed Triton's large-batch replay + all-layer commit;
+        # the FlashInfer ring kernel always folds in-kernel.
+        pass_replay_work_items = (
+            use_replay
+            and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+            and not getattr(attn_metadata.kv_cache_manager, "use_gdn_flashinfer_ring_replay", False)
         )
 
         use_cached_replay_all_layer_commit = (
@@ -1163,11 +1258,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             "replay_metadata": replay_metadata,
             "layer_cache": layer_cache,
             "replay_work_items": mamba_metadata.replay_work_items[:num_decodes]
-            if use_replay and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+            if pass_replay_work_items
             else None,
-            "replay_n_writes": mamba_metadata.replay_n_writes
-            if use_replay and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
-            else None,
+            "replay_n_writes": mamba_metadata.replay_n_writes if pass_replay_work_items else None,
             "use_cached_replay_all_layer_commit": use_cached_replay_all_layer_commit,
         }
         if num_prefills > 0:

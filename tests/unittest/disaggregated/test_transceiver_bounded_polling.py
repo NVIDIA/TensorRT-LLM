@@ -39,6 +39,7 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     _LogicalOutcomes,
 )
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import LlmRequestState
 
 
@@ -847,7 +848,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     KvCacheTransceiverV2(
         mapping=mapping,
         dist=Mock(),
-        kv_cache_manager=SimpleNamespace(max_batch_size=4),
+        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4),
         cache_transceiver_config=cache_config,
     )
 
@@ -954,7 +955,7 @@ def test_transceiver_rejects_unset_transfer_timeout() -> None:
         KvCacheTransceiverV2(
             mapping=Mock(),
             dist=Mock(),
-            kv_cache_manager=Mock(),
+            kv_cache_manager=Mock(spec=KVCacheManagerV2),
             cache_transceiver_config=cache_config,
         )
 

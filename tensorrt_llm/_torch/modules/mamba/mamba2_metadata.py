@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._device_copy import DeviceCopyBuffer
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
@@ -102,6 +103,7 @@ def _build_replay_work_items_triton(state_indices, prev_num_accepted_tokens,
     )
 
 
+@torch.compile(dynamic=True, fullgraph=True)
 def _build_replay_work_items_torch(state_indices, prev_num_accepted_tokens,
                                    cache_buf_idx, work_items, n_writes,
                                    replay_step_width, replay_history_size):
@@ -374,6 +376,8 @@ class Mamba2Metadata:
         self.state_indices = torch.zeros(max_batch_size,
                                          dtype=torch.int32,
                                          device="cuda")
+        self._state_indices_buffer = DeviceCopyBuffer(
+            self.state_indices, pin_memory=prefer_pinned())
         # Stable data_ptr() of the CUDA tensor we alias (if any) — used to
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
@@ -398,11 +402,18 @@ class Mamba2Metadata:
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
         self.replay_num_decodes = 0
-        if not getattr(kv_cache_manager, 'use_replay_state_update', False):
+        get_replay_metadata = getattr(kv_cache_manager,
+                                      'get_replay_state_update_metadata', None)
+        replay_metadata = get_replay_metadata(
+        ) if get_replay_metadata is not None else None
+        if replay_metadata is None:
             return
         num_decodes = batch_size - num_contexts
         self.replay_num_decodes = num_decodes
         if num_decodes == 0:
+            return
+        # FlashInfer ring replay folds in-kernel and never reads work items.
+        if getattr(kv_cache_manager, "use_gdn_flashinfer_ring_replay", False):
             return
         use_gdn_all_layer_commit = getattr(
             kv_cache_manager, "use_gdn_cached_replay_all_layer_commit", False)
@@ -415,17 +426,6 @@ class Mamba2Metadata:
             # by the partitioned replay + all-layer commit path.
             if num_decodes < CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
                 return
-
-        if not hasattr(kv_cache_manager, 'get_replay_state_update_metadata'):
-            raise RuntimeError(
-                "Replay state update is enabled, but the KV cache manager "
-                "does not expose replay state update metadata.")
-
-        replay_metadata = kv_cache_manager.get_replay_state_update_metadata()
-        if replay_metadata is None:
-            raise RuntimeError(
-                "Replay state update is enabled for a decode batch, but the "
-                "KV cache manager returned no replay state update metadata.")
 
         prev_num_accepted_tokens = replay_metadata.prev_num_accepted_tokens
         cache_buf_idx = replay_metadata.cache_buf_idx
@@ -490,11 +490,12 @@ class Mamba2Metadata:
                         "are used; got a different address than the first "
                         "call.")
                 self.state_indices = indices
+                self._state_indices_buffer = kv_cache_manager._state_indices_buffer
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -505,8 +506,8 @@ class Mamba2Metadata:
                 self.state_indices_cpu[:batch_size].copy_(
                     torch.as_tensor(indices,
                                     dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._state_indices_buffer.update(
+                    self.state_indices_cpu[:batch_size])
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

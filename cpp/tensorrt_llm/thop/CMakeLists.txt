@@ -67,14 +67,18 @@ add_th_common_family(
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   sparseKvCacheCompactOp.cpp
-  minimaxM3Fp8IndexerOp.cpp
-  minimaxM3SelectBlocksOp.cpp
   mlaRopeInplaceOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RopeOp.cpp
   convertReqIndexToGlobalOp.cpp
   nvfp4MlaKvCacheGatherOp.cpp
   trtllmGenQKVProcessOp.cpp)
+target_include_directories(th_common_attention
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
+
+# MiniMax-M3 torch ops live in minimaxM3/; that directory adds them to
+# th_common_attention with target_sources() so the list stays next to the files.
+add_subdirectory(minimaxM3)
 
 add_th_common_family(
   th_common_gemm_quant
@@ -139,15 +143,23 @@ add_th_common_family(
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
   virtualMemoryAllocator.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  dwdpFabricGatherOp.cpp)
 
 add_th_common_family(th_common_sequence causalConv1dOp.cpp mambaConv1dOp.cpp
                      mamba2MTPSSMCacheOp.cpp selectiveScanOp.cpp)
 
 add_th_common_family(
-  th_common_visual_gen fusedAdaptiveLayerNormOp.cpp fusedDiTQKNormRopeOp.cpp
-  fusedDiTSplitQKNormRopeOp.cpp fusedDiTSplitNormOp.cpp
-  fusedDiTGateResidNormShiftScaleOp.cpp)
+  th_common_visual_gen
+  fusedAdaptiveLayerNormOp.cpp
+  fusedDiTQKNormRopeOp.cpp
+  fusedDiTSplitQKNormRopeOp.cpp
+  fusedDiTSplitNormOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
+  sageQuantizeOp.cpp
+  blockCausalLayoutOp.cpp
+  rotateRowsOp.cpp
+  scatterKvSlotsOp.cpp)
 
 add_th_common_family(
   th_common_decoding
@@ -161,6 +173,10 @@ add_th_common_family(
   inplaceSliceCopyOp.cpp
   mhcOp.cpp
   compressorOp.cpp)
+
+# GLM bindings keep their existing family targets; source lists live with the
+# model.
+add_subdirectory(glmMoeDsa)
 
 add_library(
   th_common SHARED

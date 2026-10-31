@@ -12,13 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import List, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from torch import nn
 
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from .backends.interface import RopeParams
+
+if TYPE_CHECKING:
+    # Annotation-only: a runtime import would load the whole backends
+    # package and let any backend that imports this module back close a cycle.
+    from .backends.interface import RopeParams
 
 
 class RotaryEmbedding(nn.Module):

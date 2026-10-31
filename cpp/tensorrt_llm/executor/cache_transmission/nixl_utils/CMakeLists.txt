@@ -13,6 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+add_subdirectory(bounce)
+
 # ============================================================================
 # NIXL Wrapper Library
 # ============================================================================
@@ -37,7 +39,10 @@ if(NIXL_ROOT)
                              PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against all NIXL libraries
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE NIXL::nixl tllm::common_environment tllm::executor_transfer_agent
+            tllm::kv_cache_legacy tllm::runtime_distributed)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
@@ -51,37 +56,22 @@ if(NIXL_ROOT)
   # CacheTransceiverConfig (agent_bounce_buffer_enable +
   # kv_cache_bounce_size_mb, Python (v2) transceiver only).
   # ------------------------------------------------------------------------
-  find_package(PkgConfig)
-  if(PKG_CONFIG_FOUND)
-    pkg_check_modules(ZMQ libzmq) # optional: bounce is skipped if libzmq is
-                                  # absent
-  endif()
-  if(ZMQ_FOUND)
-    target_sources(
+  if(TARGET tllm_executor_bounce_control)
+    target_sources(${NIXL_WRAPPER_TARGET} PRIVATE bounce/BounceTransport.cpp)
+    target_link_libraries(
       ${NIXL_WRAPPER_TARGET}
-      PRIVATE bounce/BounceTransferPlan.cpp
-              bounce/BuddyAllocator.cpp
-              bounce/CreditScheduler.cpp
-              bounce/BounceMessage.cpp
-              bounce/BounceArena.cpp
-              bounce/ExecPool.cpp
-              bounce/GatherScatterKernel.cu
-              bounce/ZmqControlChannel.cpp
-              bounce/BounceTransport.cpp)
-    target_include_directories(
-      ${NIXL_WRAPPER_TARGET} PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
-                                     ${ZMQ_INCLUDE_DIRS})
-    target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES}
-                                                         ${NIXL_BUILD_LIBRARY})
+      PRIVATE
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena,tllm_executor_bounce_control>
+        ${NIXL_BUILD_LIBRARY})
     target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
     # The .cu device symbols must resolve into this shared lib.
     set_target_properties(${NIXL_WRAPPER_TARGET}
                           PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-    message(STATUS "NIXL bounce v2: enabled (libzmq found)")
+    message(STATUS "NIXL bounce v2: enabled (libzmq and cppzmq found)")
   else()
     message(
       STATUS
-        "NIXL bounce v2: disabled - libzmq/pkg-config not found; an explicit agent_bounce_buffer_enable opt-in fails at agent construction (on a bounce build, runtime setup failures degrade to standard NIXL with a WARNING)"
+        "NIXL bounce v2: disabled - libzmq or cppzmq unavailable; an explicit agent_bounce_buffer_enable opt-in fails at agent construction (on a bounce build, runtime setup failures degrade to standard NIXL with a WARNING)"
     )
   endif()
 

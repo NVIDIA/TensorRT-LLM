@@ -17,6 +17,7 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..pyexecutor.h2d_cache import copy_h2d_if_changed
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -40,9 +41,8 @@ def _reset_mtp_index_share(attn_metadata: MTPIndexShareMetadata) -> None:
 
 class Eagle3ResourceManager(BaseResourceManager):
     """
-    Eagle3 needs to save the hidden states for the draft model. When using
-    Eagle3TwoModel, there will be two model engines, one for the target model
-    and one for the draft model. Use this class to manage the hidden states.
+    Eagle3 needs to save the hidden states for the draft model. Use this class
+    to manage the hidden states.
     """
 
     def __init__(self,
@@ -144,11 +144,10 @@ class Eagle3ResourceManager(BaseResourceManager):
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
-            # In two-model speculation the target and draft engines share this
-            # resource manager, and each registers its own padding dummy under
-            # the same draft-length-derived request ID. Reserve the slot once
-            # and share it between them; dummy outputs are discarded, so the
-            # slot contents never matter (mirrors SuffixAutomatonManager).
+            # A padding dummy can be registered more than once under the same
+            # draft-length-derived request ID. Reserve the slot once and share
+            # it; dummy outputs are discarded, so the slot contents never
+            # matter (mirrors SuffixAutomatonManager).
             if self.slot_manager.get_slot(rid) is None:
                 self.slot_manager.add_slot(rid)
         if self.sa_manager is not None:
@@ -348,8 +347,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      dtype=torch.int,
                                      device='cpu',
                                      pin_memory=prefer_pinned())
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
-                                                 non_blocking=True)
+        copy_h2d_if_changed(self.batch_indices_cuda[:num_seqs], batch_indices)
         # Snapshot the real (unpadded) scheduled token count before the decrement
         # below. maybe_capture_hidden_states runs during the target forward and
         # must bound the capture by this count; self.num_tokens is about to be
@@ -370,8 +368,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             eagle_slot_ids_tensor = torch.tensor(eagle_slot_ids,
                                                  dtype=torch.int,
                                                  pin_memory=prefer_pinned())
-            self.slot_ids[:num_seqs].copy_(eagle_slot_ids_tensor,
-                                           non_blocking=True)
+            copy_h2d_if_changed(self.slot_ids[:num_seqs], eagle_slot_ids_tensor)
 
         sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
         if sa_manager is not None:
@@ -481,7 +478,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # clone calls) cannot turn the cleanup restore into AttributeError.
         self._saved_packed_mask = None
         self._saved_position_offsets = None
-        self._saved_position_offsets_cpp = None
+        self._saved_spec_decoding_query_len = None
         self._saved_generation_lengths = None
 
     @property
@@ -505,11 +502,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if attn_metadata.spec_decoding_position_offsets is not None:
             self._saved_position_offsets = attn_metadata.spec_decoding_position_offsets.clone(
             )
-            self._saved_position_offsets_cpp = (
-                attn_metadata.spec_decoding_position_offsets_cpp)
+            self._saved_spec_decoding_query_len = (
+                attn_metadata.spec_decoding_query_len)
         else:
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if attn_metadata.spec_decoding_generation_lengths is not None:
             self._saved_generation_lengths = attn_metadata.spec_decoding_generation_lengths[:batch_size].clone(
             )
@@ -526,10 +523,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         if self._saved_position_offsets is not None:
             attn_metadata.spec_decoding_position_offsets.copy_(
                 self._saved_position_offsets)
-            attn_metadata.spec_decoding_position_offsets_cpp = (
-                self._saved_position_offsets_cpp)
+            attn_metadata.spec_decoding_query_len = (
+                self._saved_spec_decoding_query_len)
             self._saved_position_offsets = None
-            self._saved_position_offsets_cpp = None
+            self._saved_spec_decoding_query_len = None
         if self._saved_generation_lengths is not None:
             batch_size = self._saved_generation_lengths.shape[0]
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(

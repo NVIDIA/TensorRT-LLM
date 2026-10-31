@@ -25,33 +25,18 @@ class FlashinferRmsnorm(OpWrapper):
     (`flashinfer_gemma_rmsnorm`), no quantization. `x` is not mutated.
     """
 
-    ARCHS = frozenset({Arch.SM_103})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # The widths the shipped targets normalize over. gpt-oss reaches this op
-    # only on its residual stream; deepseek reaches it there and on the two
-    # lora ranks its MLA projects through, which is why the narrow cells are
-    # here at all -- a 512-wide row is one 128-bit vector per lane and takes a
-    # different path through the kernel than a 7168-wide one.
+    # The widths the shipped targets normalize over are in this entry's test.
+    # gpt-oss reaches this op only on its residual stream; deepseek reaches it
+    # there and on the two lora ranks its MLA projects through, which is why
+    # narrow rows are certified at all -- a 512-wide row is one 128-bit vector
+    # per lane and takes a different path through the kernel than a 7168-wide
+    # one.
     CELLS: tuple[Cell, ...] = (
-        Cell(
-            why="decode-shaped, gpt-oss-120b hidden 2880",
-            spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
-        ),
-        Cell(
-            why="decode-shaped, deepseek-r1 hidden 7168",
-            spec=dict(shape=(1, 7168), dtype=torch.bfloat16, eps=1e-6),
-        ),
         Cell(
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="deepseek q_lora rank 1536, the q_norm this op is called on",
-            spec=dict(shape=(16, 1536), dtype=torch.bfloat16, eps=1e-6),
-        ),
-        Cell(
-            why="deepseek kv_lora rank 512, the narrowest row any target asks for",
-            spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
         ),
     )
 

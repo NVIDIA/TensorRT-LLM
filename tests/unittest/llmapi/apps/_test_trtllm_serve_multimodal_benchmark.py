@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import re
 import subprocess
 import tempfile
 
@@ -140,3 +141,8 @@ def test_trtllm_serve_multimodal_benchmark(server: RemoteOpenAIServer,
     # Basic validation that the benchmark ran successfully
     assert result.returncode == 0
     assert "Serving Benchmark Result" in result.stdout
+    # The exit code alone passes when --num-prompts is ignored.
+    completed = re.search(r"^Successful requests:\s+(\d+)\s*$", result.stdout,
+                          re.MULTILINE)
+    assert completed is not None, result.stdout
+    assert int(completed.group(1)) == 10

@@ -10,7 +10,7 @@ import cutlass.cute as cute
 import torch
 
 from ..._utils import get_sm_version
-from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import (
+from ..attention.kernels.blackwell.dspark_rmsnorm_rope import (
     DSparkRMSNormRoPECacheWriteKernel,
     DSparkRMSNormRoPEDraftBlockKernel,
     DSparkRMSNormRoPEKernel,
@@ -25,6 +25,10 @@ _DSV4_DSPARK_ARCH_BY_SM = {
     100: "sm_100",
     103: "sm_103",
 }
+# The RMSNorm/RoPE kernels are plain SIMT CuTe kernels with no architecture-specific
+# instructions, so they run on more GPUs than the DSV4 DSpark attention kernel gated
+# by _DSV4_DSPARK_ARCH_BY_SM.
+_DSPARK_RMSNORM_ROPE_SM_VERSIONS = frozenset((100, 103, 107))
 
 
 @functools.cache
@@ -33,6 +37,14 @@ def _get_dspark_arch_str(sm_version: int | None = None) -> str | None:
     if sm_version is None:
         sm_version = get_sm_version()
     return _DSV4_DSPARK_ARCH_BY_SM.get(sm_version)
+
+
+@functools.cache
+def _is_dspark_rmsnorm_rope_sm_supported(sm_version: int | None = None) -> bool:
+    """Return whether the fused RMSNorm/RoPE kernels support this GPU."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in _DSPARK_RMSNORM_ROPE_SM_VERSIONS
 
 
 def _has_regular_row_stride(x: torch.Tensor) -> bool:
@@ -70,7 +82,7 @@ def is_fused_dspark_rmsnorm_rope_supported(
     caller has no tensor to offer in the first place.
     """
     operands = (x, freqs) if weight is None else (x, weight, freqs)
-    if _get_dspark_arch_str() is None or not all(t.is_cuda for t in operands):
+    if not _is_dspark_rmsnorm_rope_sm_supported() or not all(t.is_cuda for t in operands):
         return False
     if x.dtype != torch.bfloat16 or (weight is not None and weight.dtype != torch.bfloat16):
         return False

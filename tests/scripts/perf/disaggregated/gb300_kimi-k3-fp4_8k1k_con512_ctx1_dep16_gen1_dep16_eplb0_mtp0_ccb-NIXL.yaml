@@ -96,7 +96,6 @@ worker_config:
       # PYTHON is mandatory: the C++ transceiver throws at construction for
       # K3's MixedMambaHybridCacheManager.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
       # Shared C++ agent arena for chunked gather/write/scatter transfers.
       kv_cache_bounce_size_mb: 1024
       agent_bounce_buffer_enable: true
@@ -124,7 +123,6 @@ worker_config:
     cache_transceiver_config:
       backend: NIXL
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
       kv_cache_bounce_size_mb: 1024
       agent_bounce_buffer_enable: true
     disable_overlap_scheduler: true

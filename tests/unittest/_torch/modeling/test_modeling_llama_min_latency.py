@@ -23,6 +23,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.llama4_weight_mapper import \
     Llama4HfWeightMapper
 from tensorrt_llm._torch.models.modeling_llama import \
     Llama4ForConditionalGeneration
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -425,7 +426,7 @@ class TestLlama4MinLatency(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key,
                                      lambda inputs: llama.forward(**inputs),
                                      inputs)
