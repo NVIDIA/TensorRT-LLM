@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import sys
+
 import pytest
 import torch
 import triton
@@ -47,6 +49,7 @@ def reference_rmsnorm_gated(
     eps: float = 1e-5,
     norm_before_gate: bool = True,
     group_size: int | None = None,
+    gate_activation: str = "silu",
 ) -> torch.Tensor:
     """Reference implementation of gated RMSNorm."""
 
@@ -67,7 +70,7 @@ def reference_rmsnorm_gated(
             x_norm = x_norm.reshape(*x.shape[:-1], hidden_size)
             return weight * x_norm
     else:
-        z_activated = silu(z)
+        z_activated = silu(z) if gate_activation == "silu" else torch.sigmoid(z)
         if norm_before_gate:
             if group_size is None or group_size == x.shape[-1]:
                 variance = x.pow(2).mean(-1, keepdim=True)
@@ -93,6 +96,18 @@ def reference_rmsnorm_gated(
                 x_norm = x_reshaped * torch.rsqrt(variance + eps)
                 x_norm = x_norm.reshape(*x.shape[:-1], hidden_size)
             return weight * x_norm
+
+
+def max_ulp_distance(a: torch.Tensor, b: torch.Tensor) -> int:
+    """Largest distance between two same-dtype float tensors, in units in the last place."""
+    int_dtype = {2: torch.int16, 4: torch.int32}[a.element_size()]
+    sign_bit = 1 << (8 * a.element_size() - 1)
+
+    def ordered(t: torch.Tensor) -> torch.Tensor:
+        bits = t.view(int_dtype).to(torch.int64)
+        return torch.where(bits < 0, -(bits + sign_bit), bits)
+
+    return (ordered(a) - ordered(b)).abs().max().item()
 
 
 @skip_no_cuda
@@ -155,10 +170,10 @@ class TestRMSNormBasic:
 
         torch.testing.assert_close(output_triton, output_ref, rtol=1e-2, atol=1e-2)
 
+    @pytest.mark.parametrize("batch_size", [32, layernorm_gated._MULTIROW_LARGE_TILE_MIN_ROWS + 32])
     @pytest.mark.parametrize("scale", [32.0, 0.13])
-    def test_fp8_matches_separate_static_quantization(self, scale):
+    def test_fp8_matches_separate_static_quantization(self, scale, batch_size):
         hidden_size = 128
-        batch_size = 32
         device = "cuda"
         dtype = torch.bfloat16
 
@@ -225,14 +240,16 @@ class TestRMSNormBasic:
         assert not torch.allclose(plain_output, delta_output, rtol=1e-2, atol=1e-2)
 
     @pytest.mark.parametrize("scale", [32.0, 0.13])
-    @pytest.mark.parametrize("num_tokens,heads,N", [(64, 8, 128), (33, 4, 512)])
+    @pytest.mark.parametrize(
+        "num_tokens,heads,N", [(64, 8, 128), (33, 4, 512), (1025, 32, 128), (1025, 32, 64)]
+    )
     @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
     def test_token_major_fp8_matches_separate_static_quantization(
         self, scale, num_tokens, heads, N, gate_activation
     ):
-        """Both the multi-row (N<=256) and generic-fallback (N>256) paths of
-        rms_norm_gated_token_major must quantize identically to norm-then-
-        static-quantize."""
+        """Both the multi-row (N<=256, 4-row and large-tile launches) and
+        generic-fallback (N>256) paths of rms_norm_gated_token_major must
+        quantize identically to norm-then-static-quantize."""
         from tensorrt_llm._torch.modules.mamba.layernorm_gated import rms_norm_gated_token_major
 
         device = "cuda"
@@ -261,6 +278,77 @@ class TestRMSNormBasic:
 
         assert actual.dtype == torch.float8_e4m3fn
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+    @pytest.mark.parametrize(
+        "num_rows,N,dtype,expected_rows",
+        [
+            (1, 128, torch.bfloat16, 4),
+            (32767, 128, torch.bfloat16, 4),
+            (32768, 128, torch.bfloat16, 8),
+            (32768, 128, torch.float16, 8),
+            (32768, 64, torch.bfloat16, 16),
+            (32768, 256, torch.bfloat16, 4),
+            (32768, 128, torch.float32, 4),
+            (32768, 64, torch.float32, 8),
+        ],
+    )
+    def test_multirow_rows_per_program(self, num_rows, N, dtype, expected_rows):
+        """Large launches take enough rows per program for whole 16-byte loads."""
+        assert layernorm_gated._multirow_rows(num_rows, N, dtype.itemsize) == expected_rows
+
+    @pytest.mark.parametrize("gate_activation", ["silu", "sigmoid"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+    @pytest.mark.parametrize("N", [64, 128, 256])
+    @pytest.mark.parametrize("num_tokens", [1023, 1025])
+    def test_multirow_launch_shapes_match_reference(
+        self, num_tokens, N, dtype, gate_activation, monkeypatch
+    ):
+        """Launches just below and above the large-tile threshold (32 heads:
+        32736 and 32800 rows) match the reference, agree bitwise between the
+        token-major and dense entry points, and differ from the 4-row launch
+        only by rounding."""
+        device = "cuda"
+        heads = 32
+        num_rows = num_tokens * heads
+
+        torch.manual_seed(5)
+        x = torch.randn(num_rows, N, device=device, dtype=dtype)
+        weight = torch.rand(N, device=device, dtype=dtype) + 0.5
+        wide = torch.randn(num_tokens, heads * N + 64, device=device, dtype=dtype)
+        z = wide[:, 64:].view(num_tokens, heads, N)
+        z_rows = z.reshape(num_rows, N)
+
+        output = layernorm_gated.rms_norm_gated_token_major(
+            x, z, weight, 1e-6, gate_activation=gate_activation
+        )
+        dense_output, _, _ = layernorm_gated._layer_norm_fwd(
+            x,
+            weight,
+            None,
+            1e-6,
+            z=z_rows.contiguous(),
+            norm_before_gate=True,
+            is_rms_norm=True,
+            gate_activation=gate_activation,
+        )
+        assert torch.equal(output, dense_output)
+
+        expected = reference_rmsnorm_gated(
+            x.float(), weight.float(), z_rows.float(), eps=1e-6, gate_activation=gate_activation
+        )
+        torch.testing.assert_close(output, expected.to(dtype), rtol=1e-2, atol=1e-2)
+
+        rows = layernorm_gated._multirow_rows(num_rows, N, x.element_size())
+        monkeypatch.setattr(layernorm_gated, "_MULTIROW_LARGE_TILE_MIN_ROWS", sys.maxsize)
+        four_row_output = layernorm_gated.rms_norm_gated_token_major(
+            x, z, weight, 1e-6, gate_activation=gate_activation
+        )
+        if rows == layernorm_gated._MULTIROW_ROWS:
+            assert torch.equal(output, four_row_output)
+        elif dtype == torch.float32:
+            torch.testing.assert_close(output, four_row_output, rtol=1e-5, atol=0)
+        else:
+            assert max_ulp_distance(output, four_row_output) <= 1
 
     @pytest.mark.skipif(getSMVersion() < 90, reason="PDL requires SM90+")
     @pytest.mark.parametrize("num_tokens,heads,N", [(1, 47, 128), (7, 8, 256), (2048, 48, 128)])
