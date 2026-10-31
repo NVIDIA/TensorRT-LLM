@@ -253,3 +253,82 @@ def test_build_dead_end_isolates_the_failing_request(monkeypatch):
     assert decoder.token_mask_host[1].item() == 1
     assert decoder.num_guided_tokens[1] == 1
     assert decoder.num_advanced_tokens[1] == 1
+
+
+# --- disagg generation matcher initialization --------------------------------
+
+_INVALID_PARAMS = object()
+
+
+class _MatcherFactory:
+    """Creates scripted matchers and rejects `_INVALID_PARAMS` like a compile error."""
+
+    def create(self, guided_decoding_params):
+        if guided_decoding_params is _INVALID_PARAMS:
+            raise ValueError("matcher compile error")
+        return _ScriptedMatcher([True])
+
+
+def _disagg_generation_request(guided_decoding_params, request_id: int, seq_slot: int):
+    request = _generation_request(
+        is_draft=False, draft_tokens=[], request_id=request_id, seq_slot=seq_slot
+    )
+    request.guided_decoding_params = guided_decoding_params
+    request.is_generation_only_first_iteration = True
+    return request
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_disagg_init_failure_fails_only_that_request(monkeypatch):
+    """A matcher that cannot be created fails its request at the next build.
+
+    The other request of the batch gets its matcher and stays guided.
+    """
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=0)
+    decoder.grammar_matcher_factory = _MatcherFactory()
+    # A matcher left in the slot by an earlier request must not be reused.
+    decoder.grammar_matchers[0] = _ScriptedMatcher([True])
+    requests = GuidedRequests(
+        [
+            _disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0),
+            _disagg_generation_request(_GUIDED_PARAMS, request_id=8, seq_slot=1),
+        ],
+        num_contexts=0,
+        num_generations=2,
+        max_num_draft_tokens=0,
+    )
+
+    decoder._init_disagg_gen_requests(requests)
+
+    assert decoder.grammar_matchers[0] is None
+    assert decoder.grammar_matchers[1] is not None
+
+    failed_requests = decoder._build(requests)
+
+    assert [req_id for req_id, _ in failed_requests] == [7]
+    assert "matcher compile error" in failed_requests[0][1]
+    assert decoder.token_mask_host[0].item() == 0
+    assert decoder.token_mask_host[1].item() == 1
+    # Reported once: the following build has nothing left to report.
+    assert decoder._build(requests) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_disagg_init_failure_is_skipped_by_rollback(monkeypatch):
+    """Rollback passes after a failed matcher creation do not touch the slot."""
+    decoder = _make_decoder(monkeypatch, max_num_draft_tokens=2)
+    decoder.grammar_matcher_factory = _MatcherFactory()
+    decoder.num_advanced_tokens[0] = 3
+    decoder.num_advanced_draft_tokens[0] = 2
+    requests = GuidedRequests(
+        [_disagg_generation_request(_INVALID_PARAMS, request_id=7, seq_slot=0)],
+        num_contexts=0,
+        num_generations=1,
+        max_num_draft_tokens=2,
+    )
+
+    decoder._init_disagg_gen_requests(requests)
+    decoder._rollback_rejected_tokens(requests)
+    decoder._rollback_draft_tokens(requests)
+
+    assert decoder.grammar_matchers[0] is None
