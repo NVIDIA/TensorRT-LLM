@@ -56,6 +56,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 from cutlass.experimental.task_scheduling.enums import WorkAttr
 from ...mask import kv_tile_needs_right_mask
+from ...task_compat import TS_TREE_WALKING_TASK
 from ...tensor_map import transform_ragged_coords
 
 from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
@@ -416,10 +417,31 @@ class MlaWorkQueue(WorkQueue):
 
     @cute.jit
     def initial_work_tile_info(self):
+        if cutlass.const_expr(TS_TREE_WALKING_TASK and not self.use_clc_dynamic):
+            # The tree-walking work-tile loop starts from the real first tile;
+            # older tasks computed it themselves.
+            return self._initial_static_work_tile()
         work_tile = self.tile_scheduler.initial_work_tile_info()
         if cutlass.const_expr(self.use_clc_dynamic):
             return self._work_tile_from_clc_tile(work_tile)
         return self.wrap_work_tile(work_tile)
+
+    @cute.jit
+    def _initial_static_work_tile(self):
+        """First tile of a static launch: this CTA's block, or grid-stride lane."""
+        if cutlass.const_expr(self.tile_sched_params.is_persistent):
+            return self._work_tile_from_linear_idx(cute.arch.block_idx()[0])
+        return self._work_tile_from_block_idx(cute.arch.block_idx())
+
+    @cute.jit
+    def _next_static_work_tile(self, work_tile):
+        """Grid-stride to the next tile; a non-persistent launch has only one."""
+        if cutlass.const_expr(self.tile_sched_params.is_persistent):
+            return self._work_tile_from_linear_idx(
+                self._linear_idx_from_tile(work_tile.tile_idx)
+                + cute.size(cute.arch.grid_dim())
+            )
+        return MlaTsWorkTileInfo(work_tile.tile_idx, Boolean(False))
 
     @cute.jit
     def wrap_work_tile(self, work_tile):
@@ -610,10 +632,13 @@ class MlaWorkQueue(WorkQueue):
         """Seed captured schedules from the current custom MLA work tile."""
         return stage_info.work_tile, Boolean(False)
 
-    @consumer_work(returns=work_tile)
     @cute.jit
-    def advance_tile(self, stage_info: StageInfo):
-        """Advance CLC through its response pipeline; static is task-owned."""
+    def _get_and_advance_work_tile_impl(self, stage_info: StageInfo):
+        """Return the next tile: from the CLC response, or by static grid-stride.
+
+        The tree-walking work-tile loop calls this directly and carries its
+        ``MlaTsWorkTileInfo`` result as the loop's next tile.
+        """
         if cutlass.const_expr(self.use_clc_dynamic):
             # Decode through the public scheduler/config surfaces so the
             # task-local value keeps its MLA type and cached runtime K-domain
@@ -629,6 +654,14 @@ class MlaWorkQueue(WorkQueue):
                 stage_response_ptr
             )
             return self._work_tile_from_clc_tile(work_tile)
+        return self._next_static_work_tile(stage_info.work_tile)
+
+    @consumer_work(returns=work_tile)
+    @cute.jit
+    def advance_tile(self, stage_info: StageInfo):
+        """Advance CLC through its response pipeline; static is task-owned."""
+        if cutlass.const_expr(self.use_clc_dynamic or TS_TREE_WALKING_TASK):
+            return self._get_and_advance_work_tile_impl(stage_info)
         return stage_info.work_tile
 
 

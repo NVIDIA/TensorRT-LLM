@@ -62,6 +62,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import consumer_work_stage
 from ...._block_sparse.prepared import (
     _PREPARED_ROUTE_IS_PROXY_FLAG,
     _BlockSparseRouteLayout,
@@ -674,7 +675,7 @@ class SageKScalesResource(DecodeGenResourceBase):
     @cute.jit
     def open_stage(self, stage_info: StageInfo) -> Int32:
         """Publish the waited stage's shared-memory offset for the passes that read it."""
-        return Int32(self._alloc.offset) + Int32(self.consumer_work_stage) * Int32(
+        return Int32(self._alloc.offset) + Int32(consumer_work_stage(self)) * Int32(
             self.tile_words * 4
         )
 

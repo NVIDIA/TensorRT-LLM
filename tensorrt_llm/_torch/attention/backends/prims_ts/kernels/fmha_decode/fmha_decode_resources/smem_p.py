@@ -41,6 +41,7 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
+from ...task_compat import RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
     INT32_SCORE_BIAS,
@@ -230,7 +231,10 @@ class SmemPResource(DecodeGenResourceBase):
         captured_schedule: bool = False,
     ) -> None:
         """Initialize generic resource state and bind fragment barriers."""
-        super().initialize_runtime_state_internal(context, captured_schedule)
+        if cutlass.const_expr(RESOURCE_INIT_TAKES_CAPTURED_SCHEDULE):
+            super().initialize_runtime_state_internal(context, captured_schedule)
+        else:
+            super().initialize_runtime_state_internal(context)
         self._bind_fragment_ready(context)
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:

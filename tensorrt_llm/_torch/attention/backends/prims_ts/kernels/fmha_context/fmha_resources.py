@@ -69,6 +69,7 @@ from typing import Any, Optional, TypeAlias
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32
+from ..task_compat import consumer_work_stage
 from ..tensor_map import transform_ragged_coords
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -1715,7 +1716,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
         cfg = self.cfg
         pages_per_tile = cfg.kv_tile_n // cfg.num_tokens_per_page
         window_entries = cfg.page_table_window_entries
-        stage_idx = self.state_src.consumer_work_stage
+        stage_idx = consumer_work_stage(self)
         group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(window_entries - 1)
         offset = stage_idx * Int32(window_entries) + group_page_idx
         if cutlass.const_expr(pages_per_tile == 8):
