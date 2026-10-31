@@ -24,6 +24,7 @@ from tensorrt_llm._torch.models.modeling_dflash import (
     dflash2_grouped_conv,
     dflash2_score_edges,
     dflash2_walk_candidate_paths,
+    resolve_draft_logit_transform,
 )
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint
@@ -714,6 +715,71 @@ def test_trtllm_window_check_reads_the_use_swa_override():
 
 
 # ---------------------------------------------------------------------------
+# Drafter logit transform: dflash_config's output_multiplier, then
+# final_logit_softcapping, as the target applies to its own logits
+# ---------------------------------------------------------------------------
+
+# The transform of a target that scales and soft-caps its logits (Muse Spark
+# Open's), which its DFlash 2 drafters repeat in their dflash_config.
+DECLARED_LOGIT_TRANSFORM = {
+    "output_multiplier": 0.17677669529663687,
+    "final_logit_softcapping": 20.0,
+}
+
+
+def _transform_wrapper(dflash_config):
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.logit_multiplier, wrapper.logit_softcap = resolve_draft_logit_transform(dflash_config)
+    return wrapper
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_is_off_unless_the_config_declares_it():
+    assert resolve_draft_logit_transform({}) == (1.0, None)
+    assert resolve_draft_logit_transform({"final_logit_softcapping": 0}) == (1.0, None)
+    logits = torch.randn(3, VOCAB)
+    assert _transform_wrapper({}).apply_draft_logit_transform(logits) is logits
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_scales_then_soft_caps_in_fp32():
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], dtype=torch.bfloat16)
+    transformed = _transform_wrapper(DECLARED_LOGIT_TRANSFORM).apply_draft_logit_transform(logits)
+    expected = 20.0 * torch.tanh(logits.float() * 0.17677669529663687 / 20.0)
+    assert transformed.dtype == torch.float32
+    torch.testing.assert_close(transformed, expected)
+    assert transformed.abs().max() < 20.0
+
+
+@pytest.mark.cpu_only
+def test_logit_transform_decides_the_selector_walk():
+    """The transform keeps every position's argmax, but the selector adds the
+    drafter logits to its pairwise scores, so their scale picks the path."""
+    # One request, one position, two candidates. The unary logits prefer
+    # candidate 0 by 2.0; the pairwise term favors candidate 1 by 1.0.
+    candidate_ids = torch.tensor([[[0, 1]]])
+    anchor = torch.tensor([2])
+    predecessor = torch.zeros(VOCAB, 1)
+    predecessor[2] = 1.0
+    successor = torch.zeros(VOCAB, 1)
+    successor[1] = 1.0
+    gate = torch.ones(1, 1, 1)
+    raw_unary = torch.tensor([[[10.0, 8.0]]])
+
+    def walk(unary):
+        scores = dflash2_score_edges(predecessor, successor, candidate_ids, unary, gate, anchor)
+        return int(dflash2_walk_candidate_paths(candidate_ids, scores)[0, 0].argmax())
+
+    transformed = _transform_wrapper(DECLARED_LOGIT_TRANSFORM).apply_draft_logit_transform(
+        raw_unary.clone()
+    )
+    assert int(transformed[0, 0].argmax()) == int(raw_unary[0, 0].argmax()) == 0
+    assert walk(raw_unary) == 0
+    assert walk(transformed) == 1
+
+
+# ---------------------------------------------------------------------------
 # Tiny end-to-end drafter: config parsing, weight loading, block-decode
 # parity vs an fp32 eager oracle (needs CUDA + flash_attn).
 # ---------------------------------------------------------------------------
@@ -754,11 +820,11 @@ CTX_LEN = 24
 NUM_CAPTURE = 2
 
 
-def _tiny_config(dflash2: bool):
+def _tiny_config(dflash2: bool, dflash_overrides=None):
     from transformers import Qwen3Config
 
     config = dict(TINY)
-    dflash_config = dict(RELEASED_DFLASH_CONFIG)
+    dflash_config = dict(RELEASED_DFLASH_CONFIG, **(dflash_overrides or {}))
     if not dflash2:
         for key in ("conv_group_size", "conv_kernel_size", "selector_rank", "selector_top_k"):
             del dflash_config[key]
@@ -813,10 +879,12 @@ def _tiny_weights(dflash2: bool, seed=7):
     return weights
 
 
-def _build_drafter(dflash2: bool, weights):
+def _build_drafter(dflash2: bool, weights, dflash_overrides=None):
     from tensorrt_llm._torch.model_config import ModelConfig
 
-    model_config = ModelConfig(pretrained_config=_tiny_config(dflash2), attn_backend="TRTLLM")
+    model_config = ModelConfig(
+        pretrained_config=_tiny_config(dflash2, dflash_overrides), attn_backend="TRTLLM"
+    )
     drafter = DFlashForCausalLM(model_config).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -992,6 +1060,21 @@ def test_dflash2_drafter_parses_config_and_loads_checkpoint_weights():
         weights["candidate_selector.successor_codebook"],
     )
     assert drafter.candidate_selector.top_k == TOP_K
+
+
+@needs_gpu
+def test_drafter_reads_its_logit_transform_from_dflash_config():
+    weights = _tiny_weights(True)
+    plain = _build_drafter(True, weights)
+    assert (plain.logit_multiplier, plain.logit_softcap) == (1.0, None)
+
+    declared = _build_drafter(True, weights, dflash_overrides=DECLARED_LOGIT_TRANSFORM)
+    assert (declared.logit_multiplier, declared.logit_softcap) == (0.17677669529663687, 20.0)
+    logits = torch.tensor([[-400.0, -30.0, 0.0, 30.0, 400.0]], device="cuda")
+    torch.testing.assert_close(
+        declared.apply_draft_logit_transform(logits.clone()),
+        20.0 * torch.tanh(logits * 0.17677669529663687 / 20.0),
+    )
 
 
 @needs_gpu
