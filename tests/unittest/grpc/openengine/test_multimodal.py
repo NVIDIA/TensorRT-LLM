@@ -426,6 +426,43 @@ def test_media_capability_rejects_a_registered_non_callable_processor(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("compatible", [False, True])
+async def test_prompt_validation_token_ids_are_reused_only_on_compatible_paths(
+    image_llm, monkeypatch, compatible
+):
+    capability_llm, _ = image_llm
+    llm = _ImageLlm(capability_llm.input_processor, capability_llm._hf_model_config)
+    monkeypatch.setattr(llm.input_processor, "supports_token_id_mm_expansion", compatible)
+
+    class ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", ImageIo)
+    request = generation_pb2.GenerateRequest(
+        request_id="reuse-validation",
+        model="image-model",
+        prompt="<image_1> describe",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+    )
+    service = OpenEngineInferenceServicer(llm, "image-model")
+    assert [item async for item in service.Generate(request, FakeServicerContext())]
+    prepared = llm.generate_kwargs["inputs"]
+    if compatible:
+        assert "prompt" not in prepared
+        assert prepared["prompt_token_ids"] == llm.tokenizer.encode(request.prompt)
+    else:
+        assert prepared["prompt"] == request.prompt
+        assert "prompt_token_ids" not in prepared
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("disabled", [False, True])
 async def test_disabled_mm_encoder_agrees_between_discovery_and_generate(image_llm, disabled):
     capability_llm, _ = image_llm

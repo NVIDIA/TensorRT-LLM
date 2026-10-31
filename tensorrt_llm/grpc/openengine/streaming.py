@@ -35,6 +35,7 @@ class _OpenEngineFormatState:
     sampling_params: Any = None
     is_context_only: bool = False
     kv_transfer_backend: str = ""
+    decode_preparation: str | None = None
     # None until first use: _token_holdback needs sampling_params._stop_word_ids,
     # which generate_async only populates after the request is submitted, so it is
     # computed lazily on the first _format_result call (inline or in a worker).
@@ -163,6 +164,7 @@ def _format_result(
                         out_disagg,
                         args.kv_transfer_backend,
                         usage=_usage(result),
+                        decode_preparation=args.decode_preparation,
                     )
                 )
 

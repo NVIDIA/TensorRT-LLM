@@ -19,9 +19,11 @@ import enum
 import importlib
 import traceback
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import (Any, Callable, ClassVar, Dict, List, Mapping, Optional,
-                    Protocol, Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, Iterator, List, Mapping,
+                    Optional, Protocol, Tuple, Type, TypeVar, Union)
 
 import numpy as np
 import torch
@@ -191,6 +193,33 @@ class BaseMultimodalInputProcessor(ABC):
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
 
+    _decode_state_capture: ClassVar[ContextVar] = ContextVar(
+        "multimodal_decode_state_capture", default=None)
+
+    @contextmanager
+    def capture_decode_state(self) -> Iterator[Dict[str, Any]]:
+        """Collect portable decode metadata before tensor transport exports."""
+        capture = {}
+        token = self._decode_state_capture.set((self, capture))
+        try:
+            yield capture
+        finally:
+            self._decode_state_capture.reset(token)
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return portable model metadata, or None when preparation cannot be reused."""
+        return None
+
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        """Restore metadata, validating positions through max_length tokens if set."""
+        raise ValueError(
+            "This processor does not support prepared decode inputs")
+
     def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
         """Return per-modality decode defaults, below server and request overrides."""
         return {}
@@ -348,11 +377,24 @@ class BaseMultimodalInputProcessor(ABC):
                 and inputs.get("multi_modal_data") is not None
                 and inputs.get("prompt") is None):
             if self.supports_token_id_mm_expansion:
-                return self.call_with_token_ids(inputs, sampling_params)
+                result = self.call_with_token_ids(inputs, sampling_params)
+                return self._capture_prepared_decode(result)
             # Fast path not supported by this VLM — detokenize and fall through
             # to the text-prompt path.
             inputs = self._detokenize_to_text_prompt(inputs, sampling_params)
-        return self.call_with_text_prompt(inputs, sampling_params)
+        return self._capture_prepared_decode(
+            self.call_with_text_prompt(inputs, sampling_params))
+
+    def _capture_prepared_decode(
+        self, result: Tuple[List[int], Optional[ExtraProcessedInputs]]
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        capture = self._decode_state_capture.get()
+        if capture is not None and capture[0] is self and result[1] is not None:
+            state = self.export_decode_state(result[1].get(
+                "multimodal_data", {}))
+            if state is not None:
+                capture[1].update(prompt_token_ids=list(result[0]), state=state)
+        return result
 
     @abstractmethod
     def call_with_text_prompt(

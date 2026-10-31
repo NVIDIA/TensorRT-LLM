@@ -33,6 +33,7 @@ from .disagg import disaggregated_params_from_request
 from .errors import AbortFailedError, MediaUnavailableError, UnsupportedFeatureError
 from .formatting import _engine_error_response, _stop_texts
 from .metrics import OpenEngineMetrics, RequestMetrics
+from .preparation import _decode_preparation, _prepared_decode_from_request
 from .request_mapping import (
     _load_prepared_input,
     _metadata_from_context,
@@ -89,6 +90,40 @@ class _PreprocessingWork:
         self._release(result)
 
 
+class _PreparationLease:
+    """Retain admission until cancelled executor work actually completes."""
+
+    def __init__(self, admission: asyncio.Semaphore) -> None:
+        self._admission = admission
+        self._pending = 0
+        self._closed = False
+        self._released = False
+
+    def track(self, future: asyncio.Future) -> None:
+        self._pending += 1
+        future.add_done_callback(self._completed)
+
+    def _completed(self, future: asyncio.Future) -> None:
+        if not future.cancelled():
+            future.exception()
+        self._pending -= 1
+        self._release_if_idle()
+
+    def close(self) -> None:
+        self._closed = True
+        self._release_if_idle()
+
+    def _release_if_idle(self) -> None:
+        if self._closed and not self._released and self._pending == 0:
+            self._released = True
+            self._admission.release()
+
+    async def run(self, executor: Executor | None, fn: Callable, *args: Any) -> Any:
+        future = asyncio.get_running_loop().run_in_executor(executor, copy_context().run, fn, *args)
+        self.track(future)
+        return await asyncio.shield(future)
+
+
 class _LocalRequest:
     """Abort-aware local request state spanning mapping and generation."""
 
@@ -97,6 +132,7 @@ class _LocalRequest:
         self.engine_handle: Any = None
         self.aborted = False
         self.preprocessing: _PreprocessingWork | None = None
+        self.decode_preparation: str | None = None
 
     def bind_mapping(self, task: asyncio.Task[Any]) -> None:
         self.mapping_task = task
@@ -135,10 +171,14 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
         metrics: OpenEngineMetrics | None = None,
         input_executor: Executor | None = None,
         media_executor: Executor | None = None,
+        max_media_preparations: int = 4,
     ) -> None:
+        if type(max_media_preparations) is not int or max_media_preparations < 1:
+            raise ValueError("max_media_preparations must be a positive integer")
         self._frontend = frontend
         self._input_executor = input_executor
         self._media_executor = media_executor
+        self._media_admission = asyncio.Semaphore(max_media_preparations)
         self._llm = llm
         self._model = model
         # Informational label placed in the KvSessionRef of PrefillReady events so
@@ -361,28 +401,72 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             )
 
             async def prepare_inputs() -> Any:
-                loop = asyncio.get_running_loop()
-                if prepared_input.media:
-                    await loop.run_in_executor(
+                if not prepared_input.media:
+                    return await _load_prepared_input(prepared_input, self._llm)
+                await self._media_admission.acquire()
+                lease = _PreparationLease(self._media_admission)
+                try:
+                    if (
+                        disaggregated_params is not None
+                        and disaggregated_params.request_type == "generation_only"
+                    ):
+                        work = local_request.preprocessing = _PreprocessingWork()
+                        reused = await lease.run(
+                            self._input_executor,
+                            work.run,
+                            partial(_prepared_decode_from_request, request, self._llm),
+                        )
+                        if reused is not None:
+                            return reused
+                    validated_ids = await lease.run(
                         self._input_executor,
-                        copy_context().run,
-                        _validate_media_placeholders,
+                        partial(
+                            _validate_media_placeholders,
+                            add_special_tokens=(
+                                sampling_params.add_special_tokens
+                                and self._llm.input_processor.supports_token_id_mm_expansion
+                            ),
+                        ),
                         prepared_input,
                         self._llm,
                     )
-                with BaseMediaIO.use_executor(self._media_executor):
-                    inputs = await _load_prepared_input(prepared_input, self._llm)
-                if prepared_input.media:
+                    with BaseMediaIO.use_executor(self._media_executor, on_submit=lease.track):
+                        inputs = await _load_prepared_input(prepared_input, self._llm)
+                    if (
+                        validated_ids is not None
+                        and isinstance(prepared_input.inputs, str)
+                        and self._llm.input_processor.supports_token_id_mm_expansion
+                    ):
+                        inputs.pop("prompt")
+                        inputs["prompt_token_ids"] = validated_ids
                     work = local_request.preprocessing = _PreprocessingWork()
-                    return await loop.run_in_executor(
+
+                    def preprocess() -> Any:
+                        if (
+                            disaggregated_params is not None
+                            and disaggregated_params.request_type == "context_only"
+                        ):
+                            with self._llm.input_processor.capture_decode_state() as capture:
+                                result = self._llm.preprocess(
+                                    inputs, sampling_params, disaggregated_params
+                                )
+                            try:
+                                local_request.decode_preparation = _decode_preparation(
+                                    request, self._llm, capture, result
+                                )
+                            except Exception:
+                                _PreprocessingWork._release(result)
+                                raise
+                            return result
+                        return self._llm.preprocess(inputs, sampling_params, disaggregated_params)
+
+                    return await lease.run(
                         self._input_executor,
-                        copy_context().run,
                         work.run,
-                        partial(
-                            self._llm.preprocess, inputs, sampling_params, disaggregated_params
-                        ),
+                        preprocess,
                     )
-                return inputs
+                finally:
+                    lease.close()
 
             mapping_task = asyncio.create_task(prepare_inputs())
             local_request.bind_mapping(mapping_task)
@@ -433,6 +517,7 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             stop_texts=_stop_texts(sampling_params),
             exclude_stop=not sampling_params.include_stop_str_in_output,
             tokenizer=self._llm.tokenizer,
+            decode_preparation=local_request.decode_preparation,
         )
 
         if local_request.aborted or (reservation is not None and reservation.aborted):

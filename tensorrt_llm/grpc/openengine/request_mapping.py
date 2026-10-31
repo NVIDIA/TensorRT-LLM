@@ -676,7 +676,9 @@ def _count_token_sequences(
     return counts
 
 
-def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
+def _validate_media_placeholders(
+    prepared: _PreparedInput, llm: Any, *, add_special_tokens: bool = False
+) -> list[int] | None:
     """Reject placeholder mismatches before probing the stateful MM processor."""
     if not prepared.media or prepared.capabilities is None:
         return
@@ -687,7 +689,7 @@ def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
         return
     tokenizer = llm.tokenizer
     prompt_ids = (
-        tokenizer.encode(prepared.inputs, add_special_tokens=False)
+        tokenizer.encode(prepared.inputs, add_special_tokens=add_special_tokens)
         if isinstance(prepared.inputs, str)
         else prepared.inputs["prompt_token_ids"]
     )
@@ -724,6 +726,7 @@ def _validate_media_placeholders(prepared: _PreparedInput, llm: Any) -> None:
         actual_tokens = Counter(token_id for token_id in prompt_ids if token_id in content_ids)
         if actual_tokens != expected_tokens:
             raise ValueError("multimodal placeholder token counts do not match media items")
+    return prompt_ids
 
 
 async def _load_prepared_input(prepared: _PreparedInput, llm: Any) -> str | dict[str, Any]:

@@ -221,6 +221,7 @@ l0_cpu:
   - unittest/grpc/openengine/test_control.py
   - unittest/grpc/openengine/test_image_routing.py
   - unittest/grpc/openengine/test_multimodal.py
+  - unittest/grpc/openengine/test_preparation.py
   - unittest/grpc/openengine/test_node.py
   - unittest/grpc/openengine/test_openengine.py
   - unittest/grpc/openengine/test_metrics.py

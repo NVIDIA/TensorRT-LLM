@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import base64
 import copy
 import math
 import re
@@ -144,6 +145,89 @@ def _prepare_qwen_vl_mrope_config(
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
+
+    def export_decode_state(
+            self, multimodal_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        config = multimodal_data.get("mrope_config")
+        if config is None:
+            return None
+        return {
+            "mrope_config": {
+                name: {
+                    "shape":
+                    list(config[name].shape),
+                    "data":
+                    base64.b64encode(config[name].detach().cpu().numpy().astype(
+                        "<i8").tobytes()).decode("ascii"),
+                }
+                for name in ("mrope_position_ids", "mrope_position_deltas")
+            }
+        }
+
+    def restore_decode_state(
+            self,
+            state: Dict[str, Any],
+            prompt_length: int,
+            max_length: Optional[int] = None) -> Dict[str, Any]:
+        if set(state) != {"mrope_config"}:
+            raise ValueError("invalid Qwen decode state")
+        config = state["mrope_config"]
+        if not isinstance(config, dict) or set(config) != {
+                "mrope_position_ids", "mrope_position_deltas"
+        }:
+            raise ValueError("invalid Qwen mRoPE fields")
+        arrays = {}
+
+        for name, value in config.items():
+            expected_shape = (
+                3, 1, prompt_length) if name == "mrope_position_ids" else (1, 1)
+            if not isinstance(value, dict) or set(value) != {"shape", "data"}:
+                raise ValueError(f"invalid Qwen {name} descriptor")
+            shape = value["shape"]
+            if (not isinstance(shape, list)
+                    or any(type(size) not in (int, float) for size in shape)
+                    or shape != list(expected_shape)):
+                raise ValueError(f"invalid Qwen {name} shape")
+            expected_bytes = math.prod(expected_shape) * 8
+            encoded = value["data"]
+            if (not isinstance(encoded, str)
+                    or len(encoded) > ((expected_bytes + 2) // 3) * 4):
+                raise ValueError(f"invalid Qwen {name} encoded length")
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError(f"invalid Qwen {name} encoding") from error
+            if len(raw) != expected_bytes:
+                raise ValueError(f"invalid Qwen {name} byte length")
+            array = np.frombuffer(raw, dtype="<i8").astype(
+                np.int64).reshape(expected_shape)
+            arrays[name] = array
+        text_config = getattr(self.config, "text_config", self.config)
+        max_positions = getattr(text_config, "max_position_embeddings", None)
+        if type(max_positions) is not int or not 0 < max_positions <= 2**31:
+            raise ValueError("invalid Qwen mRoPE model position bound")
+        if max_length is None:
+            max_length = max_positions
+        if prompt_length <= 0 or max_length < prompt_length:
+            raise ValueError("invalid Qwen mRoPE prompt length")
+        positions = arrays["mrope_position_ids"]
+        if np.any(positions < 0) or np.any(positions >= max_positions):
+            raise ValueError("Qwen mRoPE positions exceed model bounds")
+        delta = int(arrays["mrope_position_deltas"][0, 0])
+        if delta != int(positions.max()) + 1 - prompt_length:
+            raise ValueError("inconsistent Qwen mRoPE position delta")
+        # Include every possible decode position before handing state to the GPU.
+        last_position = max_length - 1 + delta
+        if not 0 <= last_position < max_positions:
+            raise ValueError("Qwen mRoPE decode positions exceed model bounds")
+        arrays["mrope_position_deltas"] = arrays[
+            "mrope_position_deltas"].astype(np.int32)
+        return {
+            "mrope_config": {
+                name: torch.from_numpy(array)
+                for name, array in arrays.items()
+            }
+        }
 
     def __init__(self,
                  model_path: str,
