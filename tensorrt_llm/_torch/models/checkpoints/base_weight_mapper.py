@@ -361,11 +361,3 @@ class BaseWeightMapper(ABC):
         if self._model is None:
             raise RuntimeError("Weight mapper is not initialized")
         return self._model
-
-    @property
-    def _head_dim(self) -> int:
-        model = self.model
-        head_dim = model.config.head_dim if hasattr(
-            model.config, 'head_dim'
-        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
-        return head_dim
