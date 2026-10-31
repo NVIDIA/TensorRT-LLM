@@ -756,7 +756,17 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:
         state = self._speculative_state
-        return isinstance(state, GDNReplayState) and state.has_bound_states
+        return (
+            isinstance(state, GDNReplayState)
+            and state.has_bound_states
+            and state.all_layer_commit_enabled
+        )
+
+    def disable_gdn_cached_replay_all_layer_commit(self) -> None:
+        """Use when the model's replay kernel commits checkpoints itself."""
+        state = self._speculative_state
+        if isinstance(state, GDNReplayState):
+            state.all_layer_commit_enabled = False
 
 
 def get_qwen4_exp_ple_cache_params(config, *, total_layers: int, is_draft: bool):

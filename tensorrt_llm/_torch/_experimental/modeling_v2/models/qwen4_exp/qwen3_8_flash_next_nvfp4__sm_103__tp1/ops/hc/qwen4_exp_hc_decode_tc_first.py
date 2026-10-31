@@ -1,13 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Hyper-connection mixer first half at decode row counts (2..128 rows) as one
+"""Hyper-connection mixer first half at decode row counts (2..256 rows) as one
 tcgen05 split-K GEMM: the first projection `normed @ [down; block_inject]^T`
 with the SiLU and injection activations in its epilogue, so neither the fp32
 logits nor a split-K reduce kernel nor `qwen4_exp_hc_lowrank_act` exists.
 
 Tier 6 (CuTe DSL written for this target). One CTA computes one
-`[128 rows, BN columns]` partial over `K / KS` of the 10240-wide stream: a TMA
-warp streams the normed rows (rows past `T` zero-filled by TMA, never read)
+`[128 rows, BN columns]` partial over `K / KS` of the 10240-wide stream (grid z
+is the 128-row M tile): a TMA warp streams the normed rows (rows past `T`
+zero-filled by TMA, never read)
 and the weight rows (only the `n_cols` real ones; the load-time zero padding
 to 384 rows is never read), one MMA warp accumulates in tensor memory, four
 epilogue warps move the fp32 partial into shared memory. The `KS` CTAs of one
@@ -41,8 +42,8 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
 
-#: Largest row count this entry is certified for: one 128-row MMA tile.
-MAX_ROWS = 128
+#: Largest row count this entry is certified for: two 128-row MMA tiles.
+MAX_ROWS = 256
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0. Without it
 #: the grid-dependency wait and the dependents trigger are no-ops.
@@ -101,7 +102,7 @@ class HcDecodeTcFirstKernel:
 
     Compile-time: `bn` (MMA N, a multiple of 16), `ks` (K split = cluster
     size), `hc`, `rank`, `n_cols`, `k`, `with_inject`. Runtime: the row count
-    (<= 128) and the pointers.
+    (one grid-z M tile per 128 rows) and the pointers.
     """
 
     def __init__(self, bn, ks, hc, rank, n_cols, k, with_inject, epi_cols=16):
@@ -210,7 +211,7 @@ class HcDecodeTcFirstKernel:
             self.b_smem_layout_staged,
             self.epi_tile,
         ).launch(
-            grid=[ks, self.n_tiles, 1],
+            grid=[ks, self.n_tiles, (m + 127) // 128],
             block=[self.threads_per_cta, 1, 1],
             cluster=[ks, 1, 1],
             stream=stream,
@@ -241,9 +242,10 @@ class HcDecodeTcFirstKernel:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, _ = cute.arch.block_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         kr = bidx  # K slice == rank in the (KS, 1, 1) cluster
         nt = bidy  # column tile
+        mt = bidz  # 128-row M tile
 
         @cute.struct
         class SharedStorage:
@@ -335,7 +337,7 @@ class HcDecodeTcFirstKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         if warp_idx == self.tma_warp_id:
-            tAgA_slice = tAgA[(None, 0, None, 0)]
+            tAgA_slice = tAgA[(None, mt, None, 0)]
             tBgB_slice = tBgB[(None, nt, None, 0)]
             ab_producer.reset()
             # The weight does not depend on the previous kernel: the first stages' weight
@@ -448,10 +450,12 @@ class HcDecodeTcFirstKernel:
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
-        # This CTA's share of the tile's `m * BN` outputs, all 6 warps. Every load is
-        # issued before any sum (indices clamped in bounds, so no branch separates
-        # them); the `KS` partials are summed in slice order (deterministic).
-        total = m * self.bn
+        # This CTA's share of the tile's `rows * BN` outputs (`rows` of this M tile),
+        # all 6 warps. Every load is issued before any sum (indices clamped in bounds,
+        # so no branch separates them); the `KS` partials are summed in slice order
+        # (deterministic).
+        row0 = mt * 128
+        total = cutlass.min(m - row0, 128) * self.bn
         per = (total + self.ks - 1) // self.ks
         base = kr * per
         nthr = self.threads_per_cta
@@ -479,10 +483,12 @@ class HcDecodeTcFirstKernel:
                 z = acc * inv_hc
                 sg = cutlass.Float32(1.0) / (cutlass.Float32(1.0) + cute.math.exp(-z))
                 if n < self.rank:
-                    mLow[(row, n)] = (z * sg).to(self.io_dtype)
+                    mLow[(row0 + row, n)] = (z * sg).to(self.io_dtype)
                 if cutlass.const_expr(self.with_inject):
                     if n >= self.rank and n < self.rank + self.hc:
-                        mInj[(row, n - self.rank)] = (cutlass.Float32(2.0) * sg).to(self.io_dtype)
+                        mInj[(row0 + row, n - self.rank)] = (cutlass.Float32(2.0) * sg).to(
+                            self.io_dtype
+                        )
 
         # No CTA may exit (releasing its shared memory) while a peer still reads it.
         cute.arch.cluster_arrive_relaxed()
@@ -538,10 +544,32 @@ def hc_decode_tc_first(normed, first, rank, hc_count, with_inject, bn, ks):
     return low, inject
 
 
-#: Tile: `_BN` weight rows per CTA (7 tiles cover the 324 real rows of 336) and
-#: a `_KS`-way K split, one cluster per column tile.
-_BN = 48
-_KS = 16
+#: Tile `(BN, KS)` by row count: `BN` weight rows per CTA (48: 7 tiles cover the
+#: 324 real rows of 336) and a `KS`-way K split, one cluster per column tile. One
+#: M tile (<= 128 rows) runs 16-way (7 x 16 = 112 CTAs); two M tiles run 8-way, so
+#: the grid (7 x 8 x 2 = 112 CTAs) stays one wave of one CTA an SM.
+_TILES = ((128, (48, 16)), (MAX_ROWS, (48, 8)))
+#: Every K split `_TILES` uses divides K into 64-wide tiles per CTA when K does by this.
+_K_ALIGN = 64 * 16
+
+
+def _tile(rows: int) -> tuple[int, int]:
+    return next(t for hi, t in _TILES if rows <= hi)
+
+
+def precompile(k: int, rank: int, hc_count: int, device) -> None:
+    """Compile every `(tile, with_inject)` variant `Qwen4ExpHcDecodeTcFirst` can launch
+    for a `[*, k]` stream, without launching: a variant first met by a serving step would
+    stall it for the compile. Placeholder operands (the compile reads only their
+    addresses and the `low` layout)."""
+    normed = torch.empty((MAX_ROWS, k), dtype=torch.bfloat16, device=device)
+    first = torch.empty((rank + hc_count, k), dtype=torch.bfloat16, device=device)
+    low = torch.empty((MAX_ROWS, rank), dtype=torch.bfloat16, device=device)
+    ptrs = (normed.data_ptr(), first.data_ptr(), low, low.data_ptr())
+    for _, (bn, ks) in _TILES:
+        for with_inject in (True, False):
+            n_cols = rank + (hc_count if with_inject else 0)
+            _launcher(bn, ks, hc_count, rank, n_cols, k, with_inject, ptrs)
 
 
 class Qwen4ExpHcDecodeTcFirst(OpWrapper):
@@ -565,8 +593,20 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     # rank 320, hidden 2560, the padded [384, K] weight, bf16.
     CELLS: tuple[Cell, ...] = (
         Cell(
-            why="checkpoint 4x2560, 324 cols of 384, inject, decode 128 rows (MAX_ROWS)",
+            why="checkpoint 4x2560, 324 cols of 384, inject, decode 128 rows (one M tile)",
             spec=dict(rows=128),
+        ),
+        Cell(
+            why="checkpoint 4x2560, 324 cols of 384, inject, 256 rows (MAX_ROWS, two M tiles)",
+            spec=dict(rows=256),
+        ),
+        Cell(
+            why="checkpoint 4x2560, 324 cols of 384, inject, 129 rows (a 1-row second M tile)",
+            spec=dict(rows=129),
+        ),
+        Cell(
+            why="stack-final mixer: 320 cols, no inject, 200 rows (two M tiles)",
+            spec=dict(rows=200, inject=False),
         ),
         Cell(
             why="stack-final mixer: 320 cols, no inject, 128 rows",
@@ -586,25 +626,29 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
     `_HC_TC_FIRST_MAX_ROWS` (= MAX_ROWS) rows, 97 per forward, between
     `qwen4_exp_hc_inject_norm` (or the PLE tail) and
     `qwen4_exp_hc_up_gate_mean(_fp4)`. Preconditions (bf16): `normed`
-    `[T, K]` contiguous, T <= 128; `first` the `.t()` view of a row-major
+    `[T, K]` contiguous, T <= 256; `first` the `.t()` view of a row-major
     `[N, K]` weight with N >= R (+ C); 16-byte aligned; K a multiple of
-    64 * KS. Only the R (+ C) real weight rows are read (TMA zero-fills
+    64 * 16. Only the R (+ C) real weight rows are read (TMA zero-fills
     the tile past them), never the load-time padding.
-    Launch: grid (KS, cdiv(R + C, BN)) = (16, 7) CTAs of 6 warps, cluster
-    (KS, 1, 1), one CTA per SM (~227 KB shared memory: every K tile of the
-    slice in flight plus the padded fp32 partial). The partials are reduced
-    through distributed shared memory between two cluster barriers; no
-    global workspace. Deterministic (fixed K-slice order). Programmatic
-    dependent launch (TRTLLM_ENABLE_PDL=0 turns it off): weight stages
-    before `griddepcontrol.wait`, `normed` after it; dependents released
-    at kernel start. Graph-capturable (current stream, no host sync, no
-    persistent state). Compiles once per (BN, KS, C, R, N, K, inject).
-    Measured on GB300 (graph replay, 24 cold weights): 6.4 us at 128 rows
-    against 8.6 us for cuBLAS split-K + reduce + lowrank_act; tile sweep
-    BN 32 / 48 / 64 / 112 x KS 8 / 10 / 16, 48 x 16 fastest at every row
-    count.
-    Certified: bf16, 324 columns with the injection at 2 and 128 rows, 320
-    columns without it at 128 rows; graph replay.
+    Launch: grid (KS, cdiv(R + C, BN), cdiv(T, 128)) CTAs of 6 warps,
+    cluster (KS, 1, 1), one CTA per SM (~227 KB shared memory: the K tiles
+    of the slice in flight, as many as fit, plus the padded fp32 partial);
+    `(BN, KS)` = (48, 16) up to 128 rows (16 x 7 = 112 CTAs), (48, 8) above
+    (8 x 7 x 2 = 112 CTAs). The partials are reduced through distributed
+    shared memory between two cluster barriers; no global workspace.
+    Deterministic (fixed K-slice order). Programmatic dependent launch
+    (TRTLLM_ENABLE_PDL=0 turns it off): weight stages before
+    `griddepcontrol.wait`, `normed` after it; dependents released at kernel
+    start. Graph-capturable (current stream, no host sync, no persistent
+    state). Compiles once per (BN, KS, C, R, N, K, inject); `precompile`
+    builds every variant at load.
+    Measured on GB300 (graph replay, 96 cold weights, us a site, first half
+    alone): 128 rows 5.5 (48 x 16) against 7.9 for cuBLAS split-K + reduce
+    + lowrank_act; 256 rows 6.5 (48 x 8) against 9.2. Tile sweep at 129-256
+    rows: 48 x 16 (224 CTAs, two waves) 9.6-10.4, 48 x 10 9.5-11.6, 64 x 8
+    6.6-7.4, 112 x 16 7.4-7.9, 32 x 16 16-18; 48 x 8 fastest.
+    Certified: bf16, 324 columns with the injection at 2, 128, 129 and 256
+    rows, 320 columns without it at 128 and 200 rows; graph replay.
     Not certified: hc_count other than 4, an unpadded weight (N = R + C), zero
     rows, a single row (below the dispatch range; accepted, no cell drives
     them), other row counts without the injection.
@@ -618,7 +662,9 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         hc_count: int,
         with_inject: bool,
     ):
-        return hc_decode_tc_first(normed, first, rank, hc_count, with_inject, _BN, _KS)
+        return hc_decode_tc_first(
+            normed, first, rank, hc_count, with_inject, *_tile(normed.shape[0])
+        )
 
     def reference(
         self,
@@ -648,11 +694,11 @@ class Qwen4ExpHcDecodeTcFirst(OpWrapper):
         rows, k = normed.shape
         n_cols = rank + (hc_count if with_inject else 0)
         assert normed.dtype == first.dtype == torch.bfloat16, "bf16 operands"
-        assert rows <= MAX_ROWS, f"at most {MAX_ROWS} rows (one MMA tile)"
+        assert rows <= MAX_ROWS, f"at most {MAX_ROWS} rows (two MMA tiles)"
         assert normed.stride() == (k, 1), "normed contiguous [T, K]"
         assert first.shape[0] == k and first.shape[1] >= n_cols, "first [K, >= n_cols]"
         assert first.stride() == (1, k), "first must be the .t() view of a row-major [N, K] weight"
-        assert k % (64 * _KS) == 0, f"K must be a multiple of {64 * _KS}"
+        assert k % _K_ALIGN == 0, f"K must be a multiple of {_K_ALIGN}"
         for t in (normed, first):
             assert t.data_ptr() % 16 == 0, "16-byte aligned operands"
 

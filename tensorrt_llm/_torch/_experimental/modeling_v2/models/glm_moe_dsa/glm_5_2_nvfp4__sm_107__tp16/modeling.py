@@ -1591,6 +1591,7 @@ class MTPDraftWorker(MTPEagleWorker):
         batch_indices_cuda,
         batch_size,
         num_accepted_tokens,
+        fused: bool = False,
     ):
         """The rows the last draft-step kernel wrote when these draft tokens are that loop's."""
         drafted, self._drafted_rows = self._drafted_rows, None
@@ -1602,6 +1603,7 @@ class MTPDraftWorker(MTPEagleWorker):
             batch_indices_cuda,
             batch_size,
             num_accepted_tokens,
+            fused=fused,
         )
 
     def _sample_and_accept_draft_tokens_base(

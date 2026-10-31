@@ -68,14 +68,15 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     _compare((low, inject), op.reference(*args))
 
 
-def test_guard_refuses_more_than_one_tile_of_rows() -> None:
-    normed, first, rank, c, wi = _build(dict(rows=129), seed=4)
+def test_guard_refuses_more_than_two_tiles_of_rows() -> None:
+    normed, first, rank, c, wi = _build(dict(rows=257), seed=4)
     with validating(op), pytest.raises(AssertionError):
         op(normed, first, rank, c, wi)
 
 
-def test_cuda_graph_capture_and_replay() -> None:
-    normed, first, rank, c, wi = _build(dict(rows=8), seed=5)
+@pytest.mark.parametrize("rows", [8, 256])
+def test_cuda_graph_capture_and_replay(rows) -> None:
+    normed, first, rank, c, wi = _build(dict(rows=rows), seed=5)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -84,7 +85,7 @@ def test_cuda_graph_capture_and_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         g_low, g_inject = op(normed, first, rank, c, wi)
-    fresh = _build(dict(rows=8), seed=6)[0]
+    fresh = _build(dict(rows=rows), seed=6)[0]
     normed.copy_(fresh)
     graph.replay()
     torch.cuda.synchronize()

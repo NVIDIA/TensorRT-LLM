@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import functools
 import os
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -33,6 +34,8 @@ from ..attention.backends.trtllm import (AttentionBackend, TrtllmAttention,
                                          TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..pyexecutor.resource_manager import ResourceManagerType
+from . import draft_loop_ops, fused_accept
+from .greedy_argmax import greedy_argmax
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -454,6 +457,53 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 # flashinfer ops read a single offset and draw several values per row from it,
 # so each slot leaves them room before the next one starts.
 _RNG_SLOT_SPAN = 32
+
+
+@functools.lru_cache(maxsize=4096)
+def _normalize_one_model_sampling_params(
+    *,
+    temperature: Optional[float],
+    top_k: Optional[int],
+    top_p: Optional[float],
+    min_p: Optional[float],
+) -> tuple[float, int, float, float, bool]:
+    """Convert request sampling params into normalized per-request scalars.
+
+    Interpreted as TorchSampler does (resolve_row_params); greedy rows take
+    DISABLE_TEMP_VAL, and a disabled top_k takes DISABLE_TOPK_VAL rather than 0.
+    A pure function of its arguments, so batches re-scanned every step look the
+    distinct parameter sets up instead of resolving them again.
+    """
+    from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
+        GREEDY_TEMPERATURE_THRESHOLD
+    from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
+        SamplingMode, resolve_row_params)
+
+    # Sentinel temperature for greedy / temperature-disabled rows. Must stay
+    # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
+    # recognize these rows as greedy; small enough that even if a row were
+    # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
+    # and non-zero to avoid division by 0.
+    DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
+    # Very large values disable topk.
+    DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
+
+    row = resolve_row_params(temperature=temperature,
+                             top_k=top_k,
+                             top_p=top_p,
+                             min_p=min_p)
+    is_greedy = row.mode is SamplingMode.GREEDY
+    # The sentinel is one-hot under softmax, so it must not reach a non-greedy
+    # row.
+    normalized_temperature = DISABLE_TEMP_VAL if is_greedy else row.temperature
+    normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
+    return (
+        normalized_temperature,
+        normalized_top_k,
+        row.top_p,
+        row.min_p,
+        is_greedy,
+    )
 
 
 @dataclass
@@ -880,21 +930,24 @@ class SpecMetadata:
                                        dtype=torch.int64,
                                        device='cuda')
 
-        def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            dst[:len(values)].copy_(torch.tensor(values,
-                                                 dtype=torch.int64,
-                                                 pin_memory=prefer_pinned()),
-                                    non_blocking=True)
-
         # An all-greedy batch runs the argmax graph, which reads none of these
         # buffers. The offset windows above still advance, so skipping the
         # copies changes no later batch's streams.
         if self.is_all_greedy_sample:
             return
-        _upload(self.request_seeds, request_seeds)
-        _upload(self.request_offsets, request_offsets)
-        _upload(self.seeds, flat_seeds)
-        _upload(self.offsets, flat_offsets)
+        # One pinned staging tensor holds all four lists; each buffer is
+        # filled from its own slice.
+        dsts = (self.request_seeds, self.request_offsets, self.seeds,
+                self.offsets)
+        lists = (request_seeds, request_offsets, flat_seeds, flat_offsets)
+        staging = torch.tensor(sum(lists, []),
+                               dtype=torch.int64,
+                               pin_memory=prefer_pinned())
+        start = 0
+        for dst, values in zip(dsts, lists):
+            end = start + len(values)
+            dst[:len(values)].copy_(staging[start:end], non_blocking=True)
+            start = end
 
     def prepare_rejection_sampling_buffers(self):
         """
@@ -1207,53 +1260,6 @@ class SpecMetadata:
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import (
             LlmRequestState, get_request_tokens_per_gen_step)
-        from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import \
-            GREEDY_TEMPERATURE_THRESHOLD
-        from tensorrt_llm._torch.pyexecutor.sampler.sampling_resolution import (
-            SamplingMode, resolve_row_params)
-
-        # Sentinel temperature for greedy / temperature-disabled rows. Must stay
-        # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
-        # recognize these rows as greedy; small enough that even if a row were
-        # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
-        # and non-zero to avoid division by 0.
-        DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
-        # Very large values disable topk.
-        DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
-
-        def _normalize_request_sampling_params(
-            *,
-            temperature: Optional[float],
-            top_k: Optional[int],
-            top_p: Optional[float],
-            min_p: Optional[float],
-        ) -> tuple[float, int, float, float, bool]:
-            """Convert request sampling params into normalized per-request scalars.
-
-            Interpreted as TorchSampler does (resolve_row_params); greedy rows
-            take the sentinels above, and a disabled top_k takes
-            DISABLE_TOPK_VAL rather than 0.
-            """
-            row = resolve_row_params(temperature=temperature,
-                                     top_k=top_k,
-                                     top_p=top_p,
-                                     min_p=min_p)
-            is_greedy = row.mode is SamplingMode.GREEDY
-            # The sentinel is one-hot under softmax, so it must not reach a
-            # non-greedy row.
-            normalized_temperature = (DISABLE_TEMP_VAL
-                                      if is_greedy else row.temperature)
-            normalized_top_k = row.top_k if row.top_k > 0 else DISABLE_TOPK_VAL
-            normalized_top_p = row.top_p
-            normalized_min_p = row.min_p
-
-            return (
-                normalized_temperature,
-                normalized_top_k,
-                normalized_top_p,
-                normalized_min_p,
-                is_greedy,
-            )
 
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, float, int]] = []
@@ -1286,7 +1292,7 @@ class SpecMetadata:
                 tp_val,
                 mp_val,
                 is_greedy,
-            ) = _normalize_request_sampling_params(
+            ) = _normalize_one_model_sampling_params(
                 temperature=temp_val,
                 top_k=tk_val,
                 top_p=tp_val,
@@ -1953,6 +1959,38 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
+    def _force_accept_plan(self, runtime_draft_len: int, spec_metadata=None):
+        """``(mode, base_total, frac_part)`` of the synthetic acceptance this
+        step applies (see :meth:`_apply_force_accepted_tokens`): mode
+        ``FORCE_NONE`` keeps the verified counts (no override configured, or
+        the eager CUDA-graph warmup), ``FORCE_BASE`` sets every generation
+        request to ``base_total``, ``FORCE_RANDOM`` adds one token with
+        probability ``frac_part``.
+        """
+        if self.force_num_accepted_tokens == 0.0:
+            return fused_accept.FORCE_NONE, 0, 0.0
+
+        if spec_metadata is not None:
+            is_warmup = (spec_metadata.is_cuda_graph
+                         and not torch.cuda.is_current_stream_capturing())
+            if is_warmup:
+                return fused_accept.FORCE_NONE, 0, 0.0
+
+        # Decompose into a deterministic integer part (always accepted) and a
+        # probabilistic fractional part. ``int(...)`` truncates toward zero,
+        # which matches floor for the supported non-negative range.
+        int_part = int(self.force_num_accepted_tokens)
+        frac_part = self.force_num_accepted_tokens - int_part
+
+        # ``num_accepted_tokens`` counts the target token + accepted draft
+        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
+        max_total = runtime_draft_len + 1
+        base_total = min(int_part + 1, max_total)
+
+        if frac_part > 0.0 and base_total < max_total:
+            return fused_accept.FORCE_RANDOM, base_total, frac_part
+        return fused_accept.FORCE_BASE, base_total, frac_part
+
     def _apply_force_accepted_tokens(self,
                                      num_accepted_tokens,
                                      num_contexts,
@@ -1993,27 +2031,13 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             Modified num_accepted_tokens tensor.
         """
-        if self.force_num_accepted_tokens == 0.0:
+        force_mode, base_total, frac_part = self._force_accept_plan(
+            runtime_draft_len, spec_metadata)
+        if force_mode == fused_accept.FORCE_NONE:
             return num_accepted_tokens
-
-        if spec_metadata is not None:
-            is_warmup = (spec_metadata.is_cuda_graph
-                         and not torch.cuda.is_current_stream_capturing())
-            if is_warmup:
-                return num_accepted_tokens
-
-        # Decompose into a deterministic integer part (always accepted) and a
-        # probabilistic fractional part. ``int(...)`` truncates toward zero,
-        # which matches floor for the supported non-negative range.
-        int_part = int(self.force_num_accepted_tokens)
-        frac_part = self.force_num_accepted_tokens - int_part
-
-        # ``num_accepted_tokens`` counts the target token + accepted draft
-        # tokens, so the maximum reachable value is ``runtime_draft_len + 1``.
         max_total = runtime_draft_len + 1
-        base_total = min(int_part + 1, max_total)
 
-        if frac_part > 0.0 and base_total < max_total:
+        if force_mode == fused_accept.FORCE_RANDOM:
             self._ensure_force_accept_rng_state(num_accepted_tokens.device)
 
             # ``num_gens`` is fixed at CUDA-graph capture time (graphs are
@@ -2083,6 +2107,12 @@ class SpecWorkerBase(nn.Module, ABC):
         if isinstance(logits, torch.Tensor) and logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
+        num_gens = batch_size - num_contexts
+        if self._can_use_fused_strict_accept(logits, num_contexts, num_gens,
+                                             runtime_draft_len, spec_metadata):
+            return self._fused_strict_accept(logits, draft_tokens, num_gens,
+                                             runtime_draft_len, spec_metadata)
+
         # Sample tokens using per-request sampling parameters
         target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
                                                       num_contexts, batch_size)
@@ -2147,6 +2177,44 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens[num_contexts:],
             spec_metadata.verify_lens.to(num_accepted_tokens.dtype))
         return accepted_tokens, num_accepted_tokens
+
+    @staticmethod
+    def _can_use_fused_strict_accept(logits, num_contexts, num_gens,
+                                     runtime_draft_len, spec_metadata) -> bool:
+        """Whether a strict acceptance runs as ``fused_accept.strict_accept``:
+        a greedy, generation-only, uniform verify step of a CUDA-graph batch
+        (eager steps keep the composed ops and their fewer host launches)."""
+        return (spec_metadata is not None and spec_metadata.is_cuda_graph
+                and spec_metadata.is_all_greedy_sample
+                and not spec_metadata.is_ragged_verify and num_contexts == 0
+                and 0 < num_gens <= fused_accept.MAX_REQUESTS
+                and isinstance(logits, torch.Tensor) and logits.dim() == 2
+                and logits.shape[0] == num_gens * (runtime_draft_len + 1))
+
+    def _fused_strict_accept(self, logits, draft_tokens, num_gens,
+                             runtime_draft_len, spec_metadata):
+        """The strict acceptance of `_sample_and_accept_draft_tokens_base`
+        for the steps `_can_use_fused_strict_accept` admits: the greedy target
+        tokens, then one launch for the accepted tokens and counts, including
+        the synthetic acceptance override."""
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata, 0,
+                                                      num_gens)
+        force_mode, base_total, frac_part = self._force_accept_plan(
+            runtime_draft_len, spec_metadata)
+        if force_mode == fused_accept.FORCE_RANDOM:
+            self._ensure_force_accept_rng_state(logits.device)
+        return fused_accept.strict_accept(
+            target_tokens,
+            draft_tokens.contiguous(),
+            num_gens,
+            runtime_draft_len,
+            force_mode=force_mode,
+            force_base=base_total,
+            force_frac=frac_part,
+            counter=self._force_accept_rng_counter,
+            pool=self._force_accept_rng_pool,
+            counter_stride=_FORCE_ACCEPT_RNG_COUNTER_STRIDE,
+            slot_stride=_FORCE_ACCEPT_RNG_SLOT_STRIDE)
 
     def _apply_occurrence_penalties(
             self, logits: torch.Tensor, draft_tokens: torch.Tensor,
@@ -2950,7 +3018,10 @@ class SpecWorkerBase(nn.Module, ABC):
         # requests with replicated full-vocab logits, so a per-rank argmax is
         # the correct proposal and a gather would desync the ranks (see
         # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
-        return torch.argmax(logits, dim=-1).type(torch.int32)
+        return greedy_argmax(logits,
+                             torch.int32,
+                             small_rows=spec_metadata is not None
+                             and spec_metadata.is_cuda_graph)
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
                                     spec_metadata: "SpecMetadata",
@@ -3167,9 +3238,13 @@ class SpecWorkerBase(nn.Module, ABC):
         if self.guided_decoder is not None:
             self.guided_decoder.rollback_rejected_batch(num_accepted_tokens)
 
-    def _prepare_next_new_tokens(self, accepted_tokens, next_draft_tokens,
-                                 batch_indices_cuda, batch_size,
-                                 num_accepted_tokens):
+    def _prepare_next_new_tokens(self,
+                                 accepted_tokens,
+                                 next_draft_tokens,
+                                 batch_indices_cuda,
+                                 batch_size,
+                                 num_accepted_tokens,
+                                 fused: bool = False):
         """
         Prepare next_new_tokens for overlap scheduler support.
 
@@ -3179,10 +3254,21 @@ class SpecWorkerBase(nn.Module, ABC):
             batch_indices_cuda: Batch indices tensor
             batch_size: Number of requests
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
+            fused: One launch (``draft_loop_ops.next_new_tokens``) for a step
+                a CUDA graph captures; same values.
 
         Returns:
             next_new_tokens: [batch_size, runtime_draft_len + 1] - Input tokens for next iteration
         """
+        if (fused and next_draft_tokens.dim() == 2
+                and 0 < batch_size <= draft_loop_ops.MAX_REQUESTS
+                and num_accepted_tokens.shape[0] == batch_size
+                and accepted_tokens.dtype == next_draft_tokens.dtype
+                and accepted_tokens.stride(1) == 1
+                and next_draft_tokens.stride(1) == 1):
+            return draft_loop_ops.next_new_tokens(
+                accepted_tokens, next_draft_tokens,
+                batch_indices_cuda[:batch_size], num_accepted_tokens)
         next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
                                           num_accepted_tokens - 1].unsqueeze(1)
         next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
@@ -3334,6 +3420,7 @@ class SpecWorkerBase(nn.Module, ABC):
                 seed=seed,
                 offset=offset)
         else:
-            sampled_tokens = torch.argmax(logits, dim=-1)
+            sampled_tokens = greedy_argmax(
+                logits, small_rows=spec_metadata.is_cuda_graph)
 
         return sampled_tokens

@@ -280,6 +280,7 @@ class GDNReplayState:
         self._seed_request_counter = 0
         self._seed_rank_offset = 0
         self.use_flashinfer_ring = use_flashinfer_ring
+        self.all_layer_commit_enabled = True
         self.replay_step_width = tokens_per_gen_step
         self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, tokens_per_gen_step)
         self.prev_num_accepted_tokens: torch.Tensor | None = None
@@ -504,7 +505,11 @@ class GDNReplayState:
 
     def update(self, batch: MambaAcceptanceBatch) -> None:
         num_decodes = batch.num_generations
-        if not self.use_flashinfer_ring and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE:
+        if (
+            self.all_layer_commit_enabled
+            and not self.use_flashinfer_ring
+            and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
+        ):
             self.commit_all_layers(batch.attention_metadata, num_decodes)
         metadata = self.get_replay_metadata()
         if metadata is None:
