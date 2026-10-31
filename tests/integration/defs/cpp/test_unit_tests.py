@@ -70,3 +70,21 @@ def test_kv_cache_compression_unit_tests(build_kv_cache_compression_tests,
         env={**_os.environ},
         timeout=2700,
     )
+
+
+# HALO-Q runs on Blackwell and Rubin only; the gtest skips other GPUs.
+@pytest.mark.parametrize("build_haloq_planner_tests", ["100", "107"],
+                         indirect=True)
+def test_haloq_planner_unit_tests(build_haloq_planner_tests, build_dir):
+
+    xml_name = "results-unit-tests-haloq_planner.xml"
+
+    _cpp.run_command(
+        [
+            f"{build_dir}/tests/unit_tests/kernels/moeRebalanceHaloQTest",
+            f"--gtest_output=xml:{build_dir}/{xml_name}",
+        ],
+        cwd=build_dir,
+        env={**_os.environ},
+        timeout=600,
+    )
