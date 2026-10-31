@@ -394,12 +394,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def post_load_weights(self) -> None:
         self.cache_derived_state()
 
-    def _compute_tokenwise_inputs(self, hidden_states: torch.Tensor):
+    def _compute_tokenwise_inputs(
+        self, hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+    ):
+        # An (fp8, bf16) pair carries in_proj_qkvz's pre-quantized input.
+        qkvz_input = ba_input = hidden_states
+        if isinstance(hidden_states, tuple):
+            qkvz_input, ba_input = hidden_states
+
         def _compute_projected_states_qkvz():
-            return self.in_proj_qkvz(hidden_states)
+            return self.in_proj_qkvz(qkvz_input)
 
         def _compute_projected_states_ba():
-            return self.in_proj_ba(hidden_states)
+            return self.in_proj_ba(ba_input)
 
         projected_states_qkvz, projected_states_ba = maybe_execute_in_parallel(
             _compute_projected_states_qkvz,
@@ -1131,7 +1138,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
         spec_metadata: Optional[SpecMetadata] = None,
