@@ -17,6 +17,7 @@ l0_rtx_pro_6000:
   - unittest/_torch/modeling -k "modeling_out_of_tree"
   # NCCL-EP v0.2 owns LL shared-memory sizing; cover the factory regression on SM120.
   - unittest/_torch/moe/test_communication_factory.py
+  - unittest/_torch/moe/test_nccl_ep_utils.py
   - unittest/_torch/modeling/test_modeling_deepseekv4.py::test_deepseek_v4_sanity[fp8-ds-mla]
   - unittest/_torch/attention/sparse/test_flashinfer_utils.py
   # DeepSeek-V4.1 on SM120: CSA2 FlashInfer helper, MXFP8 projections and model loading.

@@ -156,7 +156,7 @@ class NcclEpContext:
             Tensor,
         )
 
-        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm._utils import mpi_comm, mpi_disabled
 
         self.mapping = mapping
         self.ep_size = mapping.moe_ep_size
@@ -216,23 +216,32 @@ class NcclEpContext:
             use_internal_fp8_dispatch or external_fp8 or external_nvfp4
         ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
 
-        # MPI sub-communicator scoped to the EP group. Mirrors the
-        # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
-        # MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
-        # comm, keyed by moe_ep_rank. Avoids the wheel's
-        # nccl.ep.get_nccl_comm_from_group() helper which requires
-        # torch.distributed.init_process_group() -- the test infrastructure
-        # (mpi_pool_executor) and microbenchmarks use MPI4PY only.
-        self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
-        ep_world_rank = self._ep_mpi_comm.Get_rank()
-        ep_world_size = self._ep_mpi_comm.Get_size()
-        unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
-        unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
-        self.comm = nccl_core.Communicator.init(
-            nranks=ep_world_size,
-            rank=ep_world_rank,
-            unique_id=unique_id,
-        )
+        # EP communicator bootstrap. Under the MPI orchestrator, and in the
+        # MPI-based test infrastructure (mpi_pool_executor) and microbenchmarks,
+        # split MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
+        # comm, keyed by moe_ep_rank (mirrors the DeepEPLowLatency pattern in
+        # deep_ep_utils.py). Under the Ray orchestrator (TLLM_DISABLE_MPI=1)
+        # every GPU actor is an MPI singleton, so that Split() yields a 1-rank
+        # communicator while the receive buffers are sized by
+        # mapping.moe_ep_size. The Ray worker has already initialized
+        # torch.distributed and the DeviceMesh mapping exposes the EP process
+        # group, so seed the communicator from that group instead.
+        if mpi_disabled():
+            from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+            self._ep_mpi_comm = None
+            self.comm = get_nccl_comm_from_group(mapping.moe_ep_group_pg)
+        else:
+            self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+            ep_world_rank = self._ep_mpi_comm.Get_rank()
+            ep_world_size = self._ep_mpi_comm.Get_size()
+            unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
+            unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
+            self.comm = nccl_core.Communicator.init(
+                nranks=ep_world_size,
+                rank=ep_world_rank,
+                unique_id=unique_id,
+            )
 
         dispatch_token_bytes = (
             hidden_size * 2
