@@ -16,13 +16,15 @@
 import abc
 import functools
 import json
+import random
 import time
 from contextlib import AbstractContextManager
 from typing import Callable, Iterator, NamedTuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionToolsParam,
                                                 FunctionDefinition)
@@ -5947,7 +5949,7 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
                 ),
                 ("get_weather", "search_web"),
             ),
-            # A call without the mandatory tool="..." attribute is skipped.
+            # A call without the mandatory tool="..." attribute is not a call.
             detect_and_parse_malformed_tool=self._section(
                 '<|open|>call index="1"<|sep|>'
                 '<|open|>argument key="location" type="string"<|sep|>NYC'
@@ -6199,11 +6201,9 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
                                                         parser, residue):
         """Structural framing after the section is stripped, not streamed.
 
-        ``parse_streaming_increment`` leaves post-section residue in the
-        buffer; if it arrives in a later increment the no-``bot_token`` path
-        must not emit it as content. Streaming must match non-streaming, which
-        strips the same residue via ``_trailing_structural``. Regression:
-        without the ``_section_done`` guard the residue leaked as ``content``.
+        Framing that may still end the generation is held back while it
+        arrives, and stripped once the stream ends there. Streaming must match
+        non-streaming, which strips the same framing.
         """
         preamble = "Sure. "
         section = self._section(
@@ -6282,6 +6282,970 @@ class TestKimiK3ToolParser(BaseToolParserTestClass):
 
         assert [call.name for call in result.calls] == ["a<b", "get_weather"]
         assert json.loads(result.calls[1].parameters) == {"k<ey": "v"}
+
+
+# ============================================================================
+# Kimi-K3 parsers: the stream and the whole-text parse read a generation alike
+# ============================================================================
+#
+# Serving reads a K3 generation twice. The stream runs
+# KimiK3ReasoningParser.parse_delta + finish and feeds the content it yields to
+# KimiK3ToolParser.parse_streaming_increment + finish; the final response
+# re-reads the whole text with KimiK3ReasoningParser.parse and
+# KimiK3ToolParser.detect_and_parse. The client already holds what the stream
+# sent, so both readings must agree under every chunking, and neither may drop
+# anything the model generated.
+
+K3_OPEN, K3_CLOSE, K3_SEP, K3_EOM = ("<|open|>", "<|close|>", "<|sep|>",
+                                     "<|end_of_msg|>")
+K3_BOT = f"{K3_OPEN}tools{K3_SEP}"
+K3_EOT = f"{K3_CLOSE}tools{K3_SEP}"
+K3_MESSAGE_END = f"{K3_CLOSE}message{K3_SEP}"
+
+
+def _k3_think(text):
+    """A think body; the generation prompt already opened the channel."""
+    return f"{text}{K3_CLOSE}think{K3_SEP}"
+
+
+def _k3_response(text):
+    return f"{K3_OPEN}response{K3_SEP}{text}{K3_CLOSE}response{K3_SEP}"
+
+
+def _k3_argument(key, type_, value):
+    return (f'{K3_OPEN}argument key="{key}" type="{type_}"{K3_SEP}{value}'
+            f'{K3_CLOSE}argument{K3_SEP}')
+
+
+def _k3_call(name, index, body):
+    return (f'{K3_OPEN}call tool="{name}" index="{index}"{K3_SEP}{body}'
+            f'{K3_CLOSE}call{K3_SEP}')
+
+
+def _k3_section(*parts):
+    return K3_BOT + "".join(parts) + K3_EOT
+
+
+def _k3_exec(index, command):
+    return _k3_call("exec", index, _k3_argument("input", "string", command))
+
+
+def _k3_exec_args(command):
+    return json.dumps({"input": command}, ensure_ascii=False)
+
+
+_K3_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "input": {
+            "type": "string"
+        }
+    }
+}
+K3_TOOLS = [
+    ChatCompletionToolsParam(type="function",
+                             function=FunctionDefinition(
+                                 name=name, parameters=_K3_INPUT_SCHEMA))
+    for name in ("exec", "functions.exec", "functions.update_plan",
+                 "collaboration.spawn_agent")
+]
+
+# name -> (generation, thinking, reasoning, visible text, delivered calls).
+#
+# The generation is everything after the generation prompt, which ends inside
+# `<|open|>think<|sep|>` (or `<|open|>response<|sep|>` with thinking off). The
+# reading is what a client gets from the two parsers chained the way serving
+# chains them.
+K3_CORPUS = {
+    "single_call": (
+        _k3_think("I will list.") + _k3_response("Listing.") + _k3_section(
+            _k3_call("functions.exec", 1,
+                     _k3_argument("input", "string", "ls -la"))) +
+        K3_MESSAGE_END,
+        True,
+        "I will list.",
+        "Listing.",
+        [("functions.exec", '{"input": "ls -la"}')],
+    ),
+    "single_call_with_eom": (
+        _k3_think("I will list.") + _k3_response("Listing.") +
+        _k3_section(_k3_exec(1, "ls -la")) + K3_MESSAGE_END + K3_EOM,
+        True,
+        "I will list.",
+        "Listing.",
+        [("exec", '{"input": "ls -la"}')],
+    ),
+    "multi_call_types": (
+        _k3_think("plan") + _k3_response("") + _k3_section(
+            _k3_exec(1, "cat a.py"),
+            _k3_call(
+                "functions.update_plan", 2,
+                _k3_argument("plan", "array", '[{"step": "x", "done": false}]')
+                + _k3_argument("n", "number", "3") +
+                _k3_argument("ok", "boolean", "true") +
+                _k3_argument("z", "null", "null")),
+            _k3_call(
+                "collaboration.spawn_agent", 3,
+                _k3_argument("task", "object",
+                             '{"a": {"b": [1, "x\\"y"]}, "u": "日本 ü"}')),
+        ) + K3_MESSAGE_END,
+        True,
+        "plan",
+        "",
+        [
+            ("exec", '{"input": "cat a.py"}'),
+            (
+                "functions.update_plan",
+                '{"plan": [{"step": "x", "done": false}], "n": 3, "ok": true, '
+                '"z": null}',
+            ),
+            ("collaboration.spawn_agent",
+             '{"task": {"a": {"b": [1, "x\\"y"]}, "u": "日本 ü"}}'),
+        ],
+    ),
+    "prose_only": (
+        _k3_think("hmm") +
+        _k3_response("Here is the answer:\n\n```py\nx = 1 < 2\n```\n") +
+        K3_MESSAGE_END,
+        True,
+        "hmm",
+        "Here is the answer:\n\n```py\nx = 1 < 2\n```\n",
+        [],
+    ),
+    "non_thinking_call": (
+        f"Sure.{K3_CLOSE}response{K3_SEP}" + _k3_section(_k3_exec(1, "pwd")) +
+        K3_MESSAGE_END + K3_EOM,
+        False,
+        "",
+        "Sure.",
+        [("exec", '{"input": "pwd"}')],
+    ),
+    # Text after a section is the model's, on both views.
+    "prose_after_tools": (
+        _k3_think("t") + _k3_response("Before.") +
+        _k3_section(_k3_exec(1, "pwd")) + _k3_response("After the call.") +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "Before.After the call.",
+        [("exec", '{"input": "pwd"}')],
+    ),
+    "junk_after_tools": (
+        _k3_think("t") + _k3_response("") + _k3_section(_k3_exec(1, "ls")) +
+        "\n trailing junk " + K3_MESSAGE_END,
+        True,
+        "t",
+        "\n trailing junk ",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # The calls of a second section continue the first section's numbering.
+    "second_tools_section": (
+        _k3_think("t") + _k3_response("") + _k3_section(_k3_exec(1, "ls")) +
+        f"{K3_OPEN}think{K3_SEP}" + _k3_think("more thinking") +
+        _k3_section(_k3_exec(1, "pwd")) + K3_MESSAGE_END,
+        True,
+        "tmore thinking",
+        "",
+        [("exec", '{"input": "ls"}'), ("exec", '{"input": "pwd"}')],
+    ),
+    "section_reopened_without_close": (
+        _k3_think("t") + _k3_response("") + K3_BOT + _k3_exec(1, "ls") +
+        _k3_section(_k3_exec(2, "pwd")) + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}'), ("exec", '{"input": "pwd"}')],
+    ),
+    # A call cut off mid-block is model output and is released as text.
+    "unterminated_call_eos": (
+        _k3_think("t") + _k3_response("Running:") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls -l',
+        True,
+        "t",
+        "Running:" + K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls -l',
+        [],
+    ),
+    "unterminated_section_two_calls": (
+        _k3_think("t") + _k3_response("") + K3_BOT + _k3_exec(1, "ls") +
+        f'{K3_OPEN}call tool="exec" index="2"{K3_SEP}'
+        f'{K3_OPEN}argument key="input"',
+        True,
+        "t",
+        f'{K3_OPEN}call tool="exec" index="2"{K3_SEP}'
+        f'{K3_OPEN}argument key="input"',
+        [("exec", '{"input": "ls"}')],
+    ),
+    # The call's close tag is missing, but its argument is complete and the
+    # section closes right after it: the model cannot have meant anything
+    # else, so it is the call.
+    "call_missing_close_call": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        _k3_argument("input", "string", "ls") + K3_EOT + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # More close tags the model left out where its intent is not in doubt.
+    # A value followed straight by the call's close tag, where the
+    # generation ends.
+    "argument_missing_close_at_the_call_close": (
+        _k3_think("t") + _k3_response("Checking:") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}const r = 1;' +
+        f"{K3_CLOSE}call{K3_SEP}",
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 1;"}')],
+    ),
+    "argument_missing_close_before_the_next_call": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}pwd'
+        f'{K3_CLOSE}call{K3_SEP}' + _k3_exec(2, "ls") + K3_EOT + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "pwd"}'), ("exec", '{"input": "ls"}')],
+    ),
+    # The model closed its response and its message with a value still open.
+    "message_closed_inside_a_value": (
+        _k3_think("t") + _k3_response("Checking:") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}const r = 2;' +
+        f"{K3_CLOSE}response{K3_SEP}" + K3_MESSAGE_END + K3_EOM,
+        True,
+        "t",
+        "Checking:",
+        [("exec", '{"input": "const r = 2;"}')],
+    ),
+    "call_missing_close_before_the_next_call": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        _k3_argument("input", "string", "ls") +
+        _k3_call("write_stdin", 2, _k3_argument("session_id", "number", "5")) +
+        K3_EOT + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}'), ("write_stdin", '{"session_id": 5}')],
+    ),
+    "call_left_open_by_a_response_close": (
+        _k3_think("t") + _k3_response("") + K3_BOT +
+        f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        _k3_argument("input", "string", "ls") + f"{K3_CLOSE}response{K3_SEP}" +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # The message framing alone does not end a value: the generation stopped
+    # inside the call, which stays in the channel it was written in.
+    "framing_after_an_open_value_in_think": (
+        "reasoning" + K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls' +
+        K3_MESSAGE_END + K3_EOM,
+        True,
+        "reasoning" + K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+        f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls',
+        "",
+        [],
+    ),
+    "call_without_tool_attr": (
+        _k3_think("t") + _k3_response("") +
+        _k3_section(f'{K3_OPEN}call index="1"{K3_SEP}' +
+                    _k3_argument("input", "string", "ls") +
+                    f"{K3_CLOSE}call{K3_SEP}") + K3_MESSAGE_END,
+        True,
+        "t",
+        _k3_section(f'{K3_OPEN}call index="1"{K3_SEP}' +
+                    _k3_argument("input", "string", "ls") +
+                    f"{K3_CLOSE}call{K3_SEP}"),
+        [],
+    ),
+    "missing_section_close_before_message_close": (
+        _k3_think("t") + _k3_response("") + K3_BOT + _k3_exec(1, "ls") +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # A generation that ends right after a complete call, its section open.
+    "section_cut_after_a_complete_call": (
+        _k3_think("Plan the listing.") + K3_BOT + _k3_exec(1, "ls -la"),
+        True,
+        "Plan the listing.",
+        "",
+        [("exec", '{"input": "ls -la"}')],
+    ),
+    # A literal close tag inside a value, and the model's own JSON text.
+    "value_contains_close_argument": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_exec(1, f"grep -n '{K3_CLOSE}argument{K3_SEP}' parser.py")) +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec",
+          _k3_exec_args(f"grep -n '{K3_CLOSE}argument{K3_SEP}' parser.py"))],
+    ),
+    "value_contains_section_close": (
+        _k3_think("t") + _k3_response("") +
+        _k3_section(_k3_exec(1, f"echo '{K3_EOT}' done")) + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", _k3_exec_args(f"echo '{K3_EOT}' done"))],
+    ),
+    "typed_values_raw_json": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_call(
+                "functions.update_plan", 1,
+                _k3_argument("n", "number", "1e3") + _k3_argument(
+                    "big", "number", "123456789012345678901234567890") +
+                _k3_argument("f", "number", "1.10") +
+                _k3_argument("obj", "object", '{"a" : 1}'))) + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [(
+            "functions.update_plan",
+            '{"n": 1e3, "big": 123456789012345678901234567890, "f": 1.10, '
+            '"obj": {"a" : 1}}',
+        )],
+    ),
+    "json_block": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_call(
+                "functions.update_plan", 1,
+                f'{K3_OPEN}json type="object"{K3_SEP}'
+                f'{{"plan": "a \\"quoted\\" plan", "n": 1e3}}'
+                f"{K3_CLOSE}json{K3_SEP}")) + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("functions.update_plan", '{"plan": "a \\"quoted\\" plan", "n": 1e3}')
+         ],
+    ),
+    "json_block_invalid": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_call(
+                "functions.update_plan", 1,
+                f'{K3_OPEN}json type="object"{K3_SEP}{{"plan": oops}}'
+                f'{K3_CLOSE}json{K3_SEP}')) + K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("functions.update_plan", '{"plan": oops}')],
+    ),
+    "escaped_attr_and_unicode": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_call(
+                "exec", 1, f'{K3_OPEN}argument key="in&quot;put" type="string"'
+                f'{K3_SEP}echo "é\U0001f600" && x{K3_CLOSE}argument{K3_SEP}')) +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "",
+        [("exec", '{"in\\"put": "echo \\"é\U0001f600\\" && x"}')],
+    ),
+    # Literal markup in prose is text, not structure.
+    "prose_with_tool_tokens": (
+        _k3_think("t") + _k3_response(
+            f"K3 tool calls start with {K3_BOT} and end with {K3_EOT}; that is "
+            "the format.") + K3_MESSAGE_END,
+        True,
+        "t",
+        f"K3 tool calls start with {K3_BOT} and end with {K3_EOT}; that is the "
+        "format.",
+        [],
+    ),
+    "prose_with_open_no_sep": (
+        _k3_think("t") + _k3_response(
+            f"A literal {K3_OPEN} marker, then more prose that matters.") +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        f"A literal {K3_OPEN} marker, then more prose that matters.",
+        [],
+    ),
+    "prose_with_eom": (
+        _k3_think("t") + _k3_response(
+            f"The stop token is {K3_EOM} and after it comes more text.") +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        f"The stop token is {K3_EOM} and after it comes more text.",
+        [],
+    ),
+    "prose_with_message_close": (
+        _k3_think("t") +
+        _k3_response(f"Messages end with {K3_MESSAGE_END} and then more.") +
+        K3_MESSAGE_END + K3_EOM,
+        True,
+        "t",
+        f"Messages end with {K3_MESSAGE_END} and then more.",
+        [],
+    ),
+    "reasoning_with_markup": (
+        _k3_think(f"Recall the format {K3_BOT}...{K3_EOT} - ok.") +
+        _k3_response("Done.") + K3_MESSAGE_END,
+        True,
+        f"Recall the format {K3_BOT}...{K3_EOT} - ok.",
+        "Done.",
+        [],
+    ),
+    "reasoning_quotes_unclosed_call": (
+        _k3_think(f'I could emit {K3_BOT}{K3_OPEN}call tool="exec" index="1"'
+                  f'{K3_SEP}... but no.') + _k3_response("Answer.") +
+        K3_MESSAGE_END,
+        True,
+        f'I could emit {K3_BOT}{K3_OPEN}call tool="exec" index="1"{K3_SEP}... '
+        'but no.',
+        "Answer.",
+        [],
+    ),
+    # Text outside any channel, and reasoning inside a section, are kept.
+    "no_response_channel_after_think": (
+        _k3_think("t") + "Answer written without a response tag." +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "Answer written without a response tag.",
+        [],
+    ),
+    "think_inside_tools_section": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_exec(1, "ls"),
+            f"{K3_OPEN}think{K3_SEP}reconsidering{K3_CLOSE}think{K3_SEP}",
+            _k3_exec(2, "pwd")) + K3_MESSAGE_END,
+        True,
+        "treconsidering",
+        "",
+        [("exec", '{"input": "ls"}'), ("exec", '{"input": "pwd"}')],
+    ),
+    "prose_between_calls": (
+        _k3_think("t") + _k3_response("") + _k3_section(
+            _k3_exec(1, "ls"), "\nNow the second call:\n", _k3_exec(2, "pwd")) +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        "\nNow the second call:\n",
+        [("exec", '{"input": "ls"}'), ("exec", '{"input": "pwd"}')],
+    ),
+    "section_inside_unclosed_think": (
+        "reasoning" + _k3_section(_k3_exec(1, "ls")) + "more reasoning" +
+        f"{K3_CLOSE}think{K3_SEP}" + _k3_response("ok") + K3_MESSAGE_END,
+        True,
+        "reasoningmore reasoning",
+        "ok",
+        [("exec", '{"input": "ls"}')],
+    ),
+    # A stray close is not a channel transition; it stays in the text.
+    "double_think_close": (
+        _k3_think("t") + f"{K3_CLOSE}think{K3_SEP}" + _k3_response("Visible.") +
+        K3_MESSAGE_END,
+        True,
+        "t",
+        f"{K3_CLOSE}think{K3_SEP}Visible.",
+        [],
+    ),
+    # Whitespace between two structural tags is formatting, consumed with them.
+    "newlines_between_tags": (
+        _k3_think("t") + "\n" + _k3_response("Hi.") + "\n" +
+        _k3_section("\n" + _k3_call(
+            "exec", 1, "\n" + _k3_argument("input", "string", "ls") + "\n") +
+                    "\n") + "\n" + K3_MESSAGE_END + "\n" + K3_EOM,
+        True,
+        "t",
+        "Hi.",
+        [("exec", '{"input": "ls"}')],
+    ),
+    "content_ends_partial_lt": (
+        _k3_think("t") + _k3_response("compare a <") + K3_MESSAGE_END,
+        True,
+        "t",
+        "compare a <",
+        [],
+    ),
+    "content_ends_partial_opener_eos": (
+        _k3_think("t") + f"{K3_OPEN}response{K3_SEP}compare a <|op",
+        True,
+        "t",
+        "compare a <|op",
+        [],
+    ),
+}
+
+
+def _k3_chunkings(text, seed):
+    """(label, chunks) for every way the K3 tests split one text into deltas.
+
+    Whole, per character, fixed sizes, every two-way split, and seeded random
+    splits interleaved with the empty increments an end-of-stream drain sends.
+    """
+    n = len(text)
+    yield "whole", [text]
+    yield "per character", list(text)
+    for size in (2, 3, 5, 7, 11, 16):
+        yield f"{size} per delta", [text[i:i + size] for i in range(0, n, size)]
+    for cut in range(1, n):
+        yield f"split at {cut}", [text[:cut], text[cut:]]
+    rng = random.Random(seed)
+    for k in range(20):
+        cuts = sorted(rng.sample(range(1, n), min(n - 1, rng.randint(
+            1, 8)))) if n > 1 else []
+        bounds = [0, *cuts, n]
+        chunks = [text[a:b] for a, b in zip(bounds, bounds[1:])]
+        yield f"random split {k}", [
+            piece for chunk in chunks for piece in (chunk, "")
+        ]
+
+
+def _k3_reasoning_parser(thinking):
+    kwargs = None if thinking else {"thinking": False}
+    return ReasoningParserFactory.create_reasoning_parser("kimi_k3", kwargs)
+
+
+def _k3_calls(items):
+    return [(item.tool_index, item.name, item.parameters) for item in items]
+
+
+def _k3_tool_stream(chunks):
+    """(text, calls) the tool parser streams for `chunks`, then `finish`."""
+    parser = KimiK3ToolParser()
+    text, calls = [], []
+    for chunk in chunks:
+        result = parser.parse_streaming_increment(chunk, K3_TOOLS)
+        text.append(result.normal_text)
+        calls.extend(result.calls)
+    result = parser.finish(K3_TOOLS)
+    text.append(result.normal_text)
+    calls.extend(result.calls)
+    # Whatever the parser still holds after finish() reaches neither view.
+    assert parser._buffer == ""
+    return "".join(text), _k3_calls(calls)
+
+
+def _k3_tool_whole(text):
+    result = KimiK3ToolParser().detect_and_parse(text, K3_TOOLS)
+    return result.normal_text, _k3_calls(result.calls)
+
+
+def _k3_tool_parity(text, seed=0):
+    """Check that every chunking streams detect_and_parse's reading; return it."""
+    whole = _k3_tool_whole(text)
+    for label, chunks in _k3_chunkings(text, seed):
+        assert _k3_tool_stream(chunks) == whole, label
+    return whole
+
+
+def _k3_reasoning_stream(chunks, thinking):
+    parser = _k3_reasoning_parser(thinking)
+    content, reasoning = [], []
+    for chunk in chunks:
+        result = parser.parse_delta(chunk)
+        content.append(result.content)
+        reasoning.append(result.reasoning_content)
+    result = parser.finish()
+    content.append(result.content)
+    reasoning.append(result.reasoning_content)
+    return "".join(content), "".join(reasoning)
+
+
+def _k3_pipeline_stream(chunks, thinking):
+    """The streaming path: reasoning deltas feed the tool parser as they come."""
+    reasoning_parser = _k3_reasoning_parser(thinking)
+    tool_parser = KimiK3ToolParser()
+    reasoning, text, calls = [], [], []
+
+    def feed(content):
+        result = tool_parser.parse_streaming_increment(content or "", K3_TOOLS)
+        text.append(result.normal_text)
+        calls.extend(result.calls)
+
+    for chunk in chunks:
+        result = reasoning_parser.parse_delta(chunk)
+        reasoning.append(result.reasoning_content)
+        feed(result.content)
+    result = reasoning_parser.finish()
+    reasoning.append(result.reasoning_content)
+    feed(result.content)
+    result = tool_parser.finish(K3_TOOLS)
+    text.append(result.normal_text)
+    calls.extend(result.calls)
+    return "".join(reasoning), "".join(text), _k3_calls(calls)
+
+
+def _k3_pipeline_whole(generation, thinking):
+    """The final response: a one-shot reasoning parse, then detect_and_parse."""
+    parsed = _k3_reasoning_parser(thinking).parse(generation)
+    result = KimiK3ToolParser().detect_and_parse(parsed.content, K3_TOOLS)
+    return parsed.reasoning_content, result.normal_text, _k3_calls(result.calls)
+
+
+def _k3_pipeline_events(chunks, thinking):
+    """The stream as a client sees it: ordered reasoning runs, text runs, calls.
+
+    A parser result does not say how its parts interleave; serving places
+    reasoning before content and text before calls, so each result must read
+    in that order. Both parsers defer whatever would break it (reasoning after
+    content, text after calls) to their next increment, and an order-keeping
+    consumer drains that with empty increments before ``finish``.
+    """
+    reasoning_parser = _k3_reasoning_parser(thinking)
+    tool_parser = KimiK3ToolParser()
+    events = []
+
+    def add(kind, value):
+        if kind != "call" and not value:
+            return
+        if kind != "call" and events and events[-1][0] == kind:
+            events[-1] = (kind, events[-1][1] + value)
+        else:
+            events.append((kind, value))
+
+    def feed_tool(result):
+        add("text", result.normal_text)
+        for call in result.calls:
+            add("call", (call.name, call.parameters))
+
+    def feed_reasoning(result):
+        add("reasoning", result.reasoning_content)
+        feed_tool(
+            tool_parser.parse_streaming_increment(result.content, K3_TOOLS))
+        return bool(result.content or result.reasoning_content)
+
+    for chunk in chunks:
+        feed_reasoning(reasoning_parser.parse_delta(chunk))
+    while feed_reasoning(reasoning_parser.parse_delta("")):
+        pass
+    feed_reasoning(reasoning_parser.finish())
+    while tool_parser.has_tool_call(tool_parser._buffer):
+        held = len(tool_parser._buffer)
+        feed_tool(tool_parser.parse_streaming_increment("", K3_TOOLS))
+        if len(tool_parser._buffer) >= held:
+            break
+    feed_tool(tool_parser.finish(K3_TOOLS))
+    return events
+
+
+# Pieces the fuzzed generations are assembled from: every tag of the grammar,
+# broken and attribute-less variants, and text that collides with marker
+# prefixes.
+_K3_FUZZ_PIECES = [
+    K3_OPEN,
+    K3_CLOSE,
+    K3_SEP,
+    K3_EOM,
+    f"{K3_OPEN}think{K3_SEP}",
+    f"{K3_CLOSE}think{K3_SEP}",
+    f"{K3_OPEN}response{K3_SEP}",
+    f"{K3_CLOSE}response{K3_SEP}",
+    K3_BOT,
+    K3_EOT,
+    f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}',
+    f'{K3_OPEN}call index="2"{K3_SEP}',
+    f'{K3_OPEN}argument key="input" type="string"{K3_SEP}',
+    f'{K3_OPEN}argument key="n" type="number"{K3_SEP}',
+    f'{K3_OPEN}argument type="string"{K3_SEP}',
+    f'{K3_OPEN}json type="object"{K3_SEP}',
+    f"{K3_CLOSE}argument{K3_SEP}",
+    f"{K3_CLOSE}json{K3_SEP}",
+    f"{K3_CLOSE}call{K3_SEP}",
+    K3_MESSAGE_END,
+    "tools",
+    "x",
+    "ls -la",
+    " ",
+    "\n",
+    "1e3",
+    '{"a": 1}',
+    "<",
+    "<|",
+    ">",
+    "&quot;",
+]
+_K3_FUZZ_RNG = random.Random(2026)
+K3_FUZZED = [(
+    "".join(
+        _K3_FUZZ_RNG.choice(_K3_FUZZ_PIECES)
+        for _ in range(_K3_FUZZ_RNG.randint(1, 24))),
+    _K3_FUZZ_RNG.random() < 0.8,
+) for _ in range(40)]
+
+
+class TestKimiK3StreamingMatchesWholeParse:
+    """Every chunking of a K3 generation reads like the whole text."""
+
+    @pytest.mark.parametrize("name", list(K3_CORPUS))
+    def test_reading(self, name):
+        """The whole-text reading: nothing dropped, calls numbered in order."""
+        generation, thinking, reasoning, text, calls = K3_CORPUS[name]
+
+        got_reasoning, got_text, got_calls = _k3_pipeline_whole(
+            generation, thinking)
+
+        assert got_reasoning == reasoning
+        assert got_text == text
+        assert [(call_name, params)
+                for _, call_name, params in got_calls] == calls
+        # Indices number the calls across the whole generation, every section
+        # included: the streaming assembly keys call fragments by tool_index,
+        # so a repeated index merges two calls into one.
+        assert [index for index, _, _ in got_calls] == list(range(len(calls)))
+        for _, _, params in got_calls:
+            if params != '{"plan": oops}':  # the one invalid JSON block
+                json.loads(params)
+
+    @pytest.mark.parametrize("name", list(K3_CORPUS))
+    def test_tool_parser_stream_matches_detect_and_parse(self, name):
+        """Every chunking of the tool parser's input reproduces detect_and_parse.
+
+        Checked on the content the reasoning parser hands over (the serving
+        chain) and on the raw generation (a tool parser without the reasoning
+        parser in front).
+        """
+        generation, thinking, *_ = K3_CORPUS[name]
+        content = _k3_reasoning_parser(thinking).parse(generation).content
+        for source in (content, generation):
+            whole = _k3_tool_whole(source)
+            for label, chunks in _k3_chunkings(source, seed=len(source)):
+                assert _k3_tool_stream(chunks) == whole, f"{name} @ {label}"
+
+    @pytest.mark.parametrize("name", list(K3_CORPUS))
+    def test_reasoning_parser_stream_matches_parse(self, name):
+        generation, thinking, *_ = K3_CORPUS[name]
+        parsed = _k3_reasoning_parser(thinking).parse(generation)
+        whole = (parsed.content, parsed.reasoning_content)
+        for label, chunks in _k3_chunkings(generation, seed=len(generation)):
+            assert _k3_reasoning_stream(chunks,
+                                        thinking) == whole, f"{name} @ {label}"
+
+    @pytest.mark.parametrize("name", list(K3_CORPUS))
+    def test_pipeline_stream_matches_snapshot(self, name):
+        """The chained stream, chunked every way, equals the chained snapshot."""
+        generation, thinking, *_ = K3_CORPUS[name]
+        whole = _k3_pipeline_whole(generation, thinking)
+        for label, chunks in _k3_chunkings(generation,
+                                           seed=7 * len(generation)):
+            assert _k3_pipeline_stream(chunks,
+                                       thinking) == whole, f"{name} @ {label}"
+
+    @pytest.mark.parametrize("name", list(K3_CORPUS))
+    def test_pipeline_event_order_is_chunking_invariant(self, name):
+        """Where a reasoning, text or call item ends does not depend on chunking."""
+        generation, thinking, *_ = K3_CORPUS[name]
+        whole = _k3_pipeline_events([generation], thinking)
+        for label, chunks in _k3_chunkings(generation,
+                                           seed=3 * len(generation)):
+            assert _k3_pipeline_events(chunks,
+                                       thinking) == whole, f"{name} @ {label}"
+
+    @pytest.mark.parametrize(("name", "events"), [
+        (
+            "prose_after_tools",
+            [
+                ("reasoning", "t"),
+                ("text", "Before."),
+                ("call", ("exec", '{"input": "pwd"}')),
+                ("text", "After the call."),
+            ],
+        ),
+        (
+            "second_tools_section",
+            [
+                ("reasoning", "t"),
+                ("call", ("exec", '{"input": "ls"}')),
+                ("reasoning", "more thinking"),
+                ("call", ("exec", '{"input": "pwd"}')),
+            ],
+        ),
+    ])
+    def test_pipeline_events_follow_the_generation(self, name, events):
+        generation, thinking, *_ = K3_CORPUS[name]
+        assert _k3_pipeline_events([generation], thinking) == events
+
+    @pytest.mark.parametrize("case", range(len(K3_FUZZED)))
+    def test_fuzzed_generations_read_the_same_under_every_chunking(self, case):
+        """The corpus properties, on random tag soups the corpus does not hold."""
+        generation, thinking = K3_FUZZED[case]
+        parsed = _k3_reasoning_parser(thinking).parse(generation)
+        reasoning_whole = (parsed.content, parsed.reasoning_content)
+        pipeline_whole = _k3_pipeline_whole(generation, thinking)
+        events_whole = _k3_pipeline_events([generation], thinking)
+        for label, chunks in _k3_chunkings(generation, seed=case):
+            context = f"{generation!r} @ {label}"
+            assert _k3_reasoning_stream(chunks,
+                                        thinking) == reasoning_whole, context
+            assert _k3_pipeline_stream(chunks,
+                                       thinking) == pipeline_whole, context
+            assert _k3_pipeline_events(chunks,
+                                       thinking) == events_whole, context
+        for source in (parsed.content, generation):
+            whole = _k3_tool_whole(source)
+            for label, chunks in _k3_chunkings(source, seed=case):
+                assert _k3_tool_stream(chunks) == whole, f"{source!r} @ {label}"
+
+    def test_text_after_a_section_is_kept_by_both_views(self):
+        content = ("Before." + _k3_section(_k3_exec(1, "pwd")) +
+                   "After the call.")
+
+        assert _k3_tool_parity(content) == ("Before.After the call.",
+                                            [(0, "exec", '{"input": "pwd"}')])
+
+    def test_calls_are_numbered_across_sections(self):
+        """A second section continues the first section's call numbering.
+
+        The streaming assembly keys call fragments by tool_index: a second
+        section numbered from 0 again would stream its arguments into the
+        first call.
+        """
+        content = (_k3_section(_k3_exec(1, "ls")) +
+                   _k3_section(_k3_exec(1, "pwd")))
+
+        assert _k3_tool_parity(content) == ("", [
+            (0, "exec", '{"input": "ls"}'),
+            (1, "exec", '{"input": "pwd"}'),
+        ])
+
+    @pytest.mark.parametrize("held",
+                             [K3_BOT[:k] for k in range(1, len(K3_BOT))])
+    def test_every_partial_section_opener_is_held(self, held):
+        """The longest suffix that can still open a section is held back.
+
+        ``Hi<|open|>tools<`` ends with ``<`` and with ``<|open|>tools<``, both
+        prefixes of the opener; holding only the shorter one would release
+        ``<|open|>tools`` as text one character before the opener completes.
+        """
+        parser = KimiK3ToolParser()
+
+        result = parser.parse_streaming_increment("Hi" + held, K3_TOOLS)
+
+        assert result.normal_text == "Hi"
+        assert parser._buffer == held
+        assert parser.finish(K3_TOOLS).normal_text == held
+
+    def test_truncated_call_is_released_as_text(self):
+        """A call cut off mid-value is model output, not a call to run."""
+        content = ("Running:" + K3_BOT +
+                   f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}'
+                   f'{K3_OPEN}argument key="input" type="string"{K3_SEP}ls -l')
+
+        assert _k3_tool_parity(content) == (content, [])
+
+    def test_complete_calls_are_delivered_before_a_truncated_one(self):
+        tail = (f'{K3_OPEN}call tool="exec" index="2"{K3_SEP}'
+                f'{K3_OPEN}argument key="input" type="str')
+        content = K3_BOT + _k3_exec(1, "ls") + tail
+
+        assert _k3_tool_parity(content) == (tail, [(0, "exec",
+                                                    '{"input": "ls"}')])
+
+    @pytest.mark.parametrize("tail", ["", "and then I"])
+    def test_a_section_left_open_delivers_its_complete_calls(self, tail):
+        content = "Running it:" + K3_BOT + _k3_exec(1, "ls -la") + tail
+
+        with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger"
+                   ) as log:
+            reading = _k3_tool_parity(content)
+
+        assert reading == ("Running it:" + tail, [(0, "exec",
+                                                   _k3_exec_args("ls -la"))])
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        assert any("never closed" in message for message in warnings)
+
+    def test_a_call_read_without_its_close_tags_is_logged(self):
+        content = (K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+                   _k3_argument("input", "string", "ls") + K3_EOT)
+
+        with patch("tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser.logger"
+                   ) as log:
+            reading = _k3_tool_parity(content)
+
+        assert reading == ("", [(0, "exec", '{"input": "ls"}')])
+        warnings = [str(call.args[0]) for call in log.warning.call_args_list]
+        assert any("read without its close tags" in message
+                   for message in warnings)
+
+    @pytest.mark.parametrize(
+        "tail",
+        [
+            # The generation stops inside the value: it may be incomplete.
+            "",
+            # A call close tag followed by prose is part of the value.
+            f"{K3_CLOSE}call{K3_SEP} and then more",
+        ])
+    def test_a_value_cut_off_or_followed_by_prose_is_not_a_call(self, tail):
+        content = (K3_BOT + f'{K3_OPEN}call tool="exec" index="1"{K3_SEP}' +
+                   f'{K3_OPEN}argument key="input" type="string"{K3_SEP}rm -r' +
+                   tail)
+
+        assert _k3_tool_parity(content) == (content, [])
+
+    def test_literal_argument_close_inside_a_value_does_not_cut_it(self):
+        """A value's own close tag ends it only where more structure follows."""
+        command = f"grep -n '{K3_CLOSE}argument{K3_SEP}' parser.py"
+
+        assert _k3_tool_parity(_k3_section(_k3_exec(1, command))) == ("", [
+            (0, "exec", _k3_exec_args(command))
+        ])
+
+    def test_typed_values_keep_the_model_json_text(self):
+        """A typed value is delivered as written: ``1e3`` stays ``1e3``."""
+        content = _k3_section(
+            _k3_call(
+                "functions.update_plan", 1,
+                _k3_argument("n", "number", "1e3") +
+                _k3_argument("f", "number", "-0.50")))
+
+        _, calls = _k3_tool_parity(content)
+
+        assert calls == [(0, "functions.update_plan", '{"n": 1e3, "f": -0.50}')]
+
+    @pytest.mark.parametrize("body",
+                             ["NaN", "Infinity", "-Infinity", "1e3 x", "[1,"])
+    def test_typed_value_that_is_not_json_is_delivered_as_a_string(self, body):
+        """Arguments stay JSON: Python's json reads NaN and Infinity, JSON does not."""
+        content = _k3_section(
+            _k3_call("functions.update_plan", 1,
+                     _k3_argument("n", "number", body)))
+
+        _, calls = _k3_tool_parity(content)
+
+        assert calls == [(0, "functions.update_plan", json.dumps({"n": body}))]
+
+    def test_json_block_keeps_the_model_json_text(self):
+        body = '{"plan": "x",  "n": 1e3}'
+        content = _k3_section(
+            _k3_call(
+                "functions.update_plan", 1,
+                f'{K3_OPEN}json type="object"{K3_SEP}{body}'
+                f'{K3_CLOSE}json{K3_SEP}'))
+
+        assert _k3_tool_parity(content) == ("", [(0, "functions.update_plan",
+                                                  body)])
+
+    def test_trailing_framing_is_stripped_by_both_views(self):
+        """Message framing that ends the generation is not text.
+
+        Without the reasoning parser in front, ``<|close|>message<|sep|>``
+        reaches the tool parser; the stream must hold it back, not emit it.
+        """
+        text = f"The answer is 4.{K3_MESSAGE_END}\n{K3_EOM}"
+
+        assert _k3_tool_parity(text) == ("The answer is 4.", [])
+
+    def test_framing_followed_by_text_is_literal(self):
+        text = f"Messages end with {K3_MESSAGE_END} and {K3_EOM} tokens."
+
+        assert _k3_tool_parity(text) == (text, [])
 
 
 class TestForcedToolChoicePostprocessing:
