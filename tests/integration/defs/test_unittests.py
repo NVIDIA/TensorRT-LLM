@@ -162,6 +162,17 @@ def _fail_unittests(reason: str, output_xml: str, output_dir: str,
     raise AssertionError(reason)
 
 
+def _parallel_config_key(case: str) -> str:
+    """The agg_unit_mem_df.csv lookup key for a unittest case.
+
+    ``--ignore=<path>`` arguments only drop tests from a case, so they do not
+    change its parallel factor. Stripping them keeps a CSV row matching when a
+    test list adds or removes ignored paths. Other arguments, such as quoted
+    ``-k`` expressions, are kept as they are.
+    """
+    return re.sub(r'\s+--ignore=\S+', '', case).strip()
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -204,12 +215,12 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     parallel_dict = {}
     for _, row in agg_unit_mem_df.iterrows():
-        key = (row['gpu'], row['unittest_case_name'])
+        key = (row['gpu'], _parallel_config_key(row['unittest_case_name']))
         parallel_dict[key] = row['parallel_factor']
 
     print(parallel_dict)
 
-    cur_key = (gpu_name, case)
+    cur_key = (gpu_name, _parallel_config_key(case))
     print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]

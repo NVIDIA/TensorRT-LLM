@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for culprit attribution in the unittest integration wrapper."""
+"""Tests for culprit attribution and parallel-config lookup in the unittest integration wrapper."""
 
 import importlib.util
 import sys
@@ -60,6 +60,7 @@ def _load_test_unittests_module() -> types.ModuleType:
 _TEST_UNITTESTS = _load_test_unittests_module()
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
+_parallel_config_key = _TEST_UNITTESTS._parallel_config_key
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
@@ -214,3 +215,26 @@ def test_fail_unittests_prioritizes_and_deduplicates_in_flight_culprits(
     assert "FAILED pkg::test_18" in message
     assert "FAILED pkg::test_19" not in message
     assert message.endswith("(+3 more)")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    [
+        ("unittest/_torch/attention", "unittest/_torch/attention"),
+        (
+            "unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_a.py"
+            " --ignore=unittest/_torch/attention/sparse/msa/test_b.py",
+            "unittest/_torch/attention",
+        ),
+        (
+            "unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm -k gpu",
+            "unittest/_torch/modeling_v2 -k gpu",
+        ),
+        (
+            'unittest/trt/attention/test_gpt_attention.py -k "partition0"',
+            'unittest/trt/attention/test_gpt_attention.py -k "partition0"',
+        ),
+    ],
+)
+def test_parallel_config_key_strips_only_ignore_arguments(case: str, expected: str) -> None:
+    assert _parallel_config_key(case) == expected
