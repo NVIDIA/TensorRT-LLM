@@ -113,6 +113,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             get_from_waiting_queue, merge_requests)
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
+from .runtime_hooks import runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -5441,6 +5442,23 @@ class PyExecutor:
         if wait_for_input_copy is not None:
             wait_for_input_copy()
 
+    def _step_loop_stream(self):
+        """The stream the overlap loop's thread makes current.
+
+        ``nullcontext()`` (the thread's own current stream) unless the model's
+        runtime hooks declare ``step_loop_on_execution_stream``; then the
+        execution stream, so the sampler and the next step's input preparation
+        queue behind the forward on one stream (see ``RuntimeHooks``).
+        """
+        model = getattr(self.model_engine, "model", None)
+        if model is not None and runtime_hooks_of(
+                model).step_loop_on_execution_stream:
+            logger.info(
+                "[PyExecutor] overlap loop runs on the execution stream "
+                f"{self.execution_stream} (runtime hook).")
+            return torch.cuda.stream(self.execution_stream)
+        return nullcontext()
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -5448,7 +5466,8 @@ class PyExecutor:
         self._kv_defer_close_armed = (
             self._is_kv_manager_v2
             and self.kv_cache_manager.arm_deferred_close(True))
-        with self._profiler() as profile_step, self.hang_detector:
+        with self._step_loop_stream(), self._profiler(
+        ) as profile_step, self.hang_detector:
             iter_start_time = time.time()
             iter_stats = None
             target_inputs = None
