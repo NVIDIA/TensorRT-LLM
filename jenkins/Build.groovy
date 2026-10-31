@@ -572,7 +572,7 @@ def runLLMBuild(
         withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
             trtllm_utils.llmExecStepWithRetry(
                 pipeline,
-                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
+                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh --full-project && cat mypy_final_report.txt",
                 shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
             )
         }
