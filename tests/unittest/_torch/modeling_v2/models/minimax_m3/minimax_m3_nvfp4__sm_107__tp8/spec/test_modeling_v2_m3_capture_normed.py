@@ -30,7 +30,13 @@ def _worker(normed):
 def _scaling_norm(monkeypatch):
     """The RMSNorm the worker applies, as ``x * w`` (CPU): enough to tell which blocks were normalized here."""
     monkeypatch.setattr(modeling, "flashinfer_rmsnorm", lambda x, w, eps: x * w)
+    require = modeling.require_mode()
+    monkeypatch.setattr(modeling, "_logged", set())
     modeling.set_require(False)
+    try:
+        yield
+    finally:
+        modeling.set_require(require)
 
 
 def _drafter():

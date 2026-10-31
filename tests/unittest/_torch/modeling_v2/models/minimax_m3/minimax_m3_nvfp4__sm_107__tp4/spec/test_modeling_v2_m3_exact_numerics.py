@@ -55,7 +55,8 @@ from _m3_spec_inputs import (  # noqa: E402
     seed_of,
 )
 
-assert torch.cuda.is_available(), "the exact-numerics checks require a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the exact-numerics checks require a CUDA device", allow_module_level=True)
 
 DRAFT_LEN = 3
 CAPTURED_LAYERS = 3
@@ -255,6 +256,8 @@ def test_draft_tokens_through_the_full_vocab_head(rows) -> None:
     top2 = stock_logits.topk(2, dim=-1).values
     decidable = (top2[:, 0] - top2[:, 1]) > 2 * perturb
     stock_tok, ours_tok = stock_logits.argmax(-1), ours_logits.argmax(-1)
+    assert torch.isfinite(ours_logits).all()
+    assert bool(decidable.any()), "no draft-token rows satisfy the reference margin"
     assert torch.equal(ours_tok[decidable], stock_tok[decidable])
     print(
         f"[exact-numerics] rows={rows} draft head: {int((ours_tok == stock_tok).sum())}/{rows} tokens equal, "

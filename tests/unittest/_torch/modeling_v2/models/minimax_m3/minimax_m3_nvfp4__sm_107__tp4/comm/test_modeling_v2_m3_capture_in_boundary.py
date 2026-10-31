@@ -12,7 +12,8 @@ import _rank_job
 import pytest
 import torch
 
-assert torch.cuda.is_available(), "the multicast all-reduce requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("the multicast all-reduce requires CUDA devices", allow_module_level=True)
 
 
 # Spawns 4 rank processes over the visible devices; under xdist workers would fight for them.

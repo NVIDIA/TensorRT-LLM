@@ -18,7 +18,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     run_splitk_dense_swiglu,
 )
 
-assert torch.cuda.is_available(), "m3_lowm_splitk requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_lowm_splitk requires a CUDA device", allow_module_level=True)
 
 # Every split-K cell of the TP8 drafter table: (N, K, max rows, tactic) for kind "s".
 CELLS = [

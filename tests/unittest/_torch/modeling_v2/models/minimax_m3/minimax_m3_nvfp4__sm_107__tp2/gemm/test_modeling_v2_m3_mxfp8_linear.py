@@ -16,7 +16,8 @@ __extra_import_path__ = ["../../../..", "."]
 from _m3_mxfp8_operands import mxfp8  # noqa: E402
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_mxfp8_linear requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_mxfp8_linear requires a CUDA device", allow_module_level=True)
 
 _FLAGS = {
     "native": (False, False, False, False),

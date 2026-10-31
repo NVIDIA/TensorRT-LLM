@@ -28,7 +28,8 @@ from tensorrt_llm._torch.attention.backends.fmha.utils import (
 )
 from tensorrt_llm.bindings.internal import thop
 
-assert torch.cuda.is_available(), "the drafter preprocess op requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the drafter preprocess op requires a CUDA device", allow_module_level=True)
 if torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the tp4 target is certified on SM 10.7 only", allow_module_level=True)
 if not hasattr(torch.ops.trtllm, "minimax_m3_sm107tp4_drafter_rope_fp8_kv"):

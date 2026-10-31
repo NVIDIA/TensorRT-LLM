@@ -20,7 +20,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_mx_gemv requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_mx_gemv requires a CUDA device", allow_module_level=True)
 
 
 # Element band, in ULP units of the row scale: see compare.

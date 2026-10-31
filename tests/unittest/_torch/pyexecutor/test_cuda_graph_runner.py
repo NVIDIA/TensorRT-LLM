@@ -643,3 +643,51 @@ def test_identity_short_mode_keeps_every_attended_token_within_the_topk_span(max
         short(span, t) and worst_attended(t) > span
         for t in range(span - 4 * tokens_per_step, span + 1)
     )
+
+
+@pytest.mark.parametrize("same_pack", [False, True])
+@pytest.mark.parametrize("replay_fails", [False, True])
+def test_replay_defers_copies_only_to_its_captured_pack(monkeypatch, same_pack, replay_fails):
+    key = KeyType(batch_size=1, draft_len=0)
+    captured = Mock()
+    active = captured if same_pack else Mock()
+    queued = []
+    metadata = object()
+    inputs = {
+        "attn_metadata": metadata,
+        "input_ids": torch.zeros(1),
+        "position_ids": torch.zeros(1, 1),
+    }
+    runner = object.__new__(CUDAGraphRunner)
+    runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
+    runner.shared_static_tensors = inputs
+    runner.config = SimpleNamespace(use_mrope=False)
+    runner._check_strict_buffer_stability = lambda meta: None
+    runner._get_num_tokens_for_key = lambda key: 1
+    runner._step_input_prologue_keys = {key: captured}
+    runner._pre_replay_hooks = []
+
+    def replay():
+        queued.append("replay")
+        if replay_fails:
+            raise RuntimeError("replay failed")
+
+    runner.graphs = {key: SimpleNamespace(replay=replay)}
+    runner.graph_outputs = {key: None}
+    captured.on_graph_replay.side_effect = lambda: queued.append("release")
+    monkeypatch.setattr(
+        cuda_graph_runner_module.step_inputs, "is_active", lambda pack: pack is active
+    )
+    monkeypatch.setattr(
+        cuda_graph_runner_module.step_inputs, "flush", lambda *, in_graph: queued.append(in_graph)
+    )
+    if replay_fails:
+        with pytest.raises(RuntimeError, match="replay failed"):
+            runner.replay(key, inputs)
+    else:
+        runner.replay(key, inputs)
+    assert queued == [same_pack, "replay", "release"]
+    if same_pack:
+        captured.quiesce_graph_window.assert_not_called()
+    else:
+        captured.quiesce_graph_window.assert_called_once_with()

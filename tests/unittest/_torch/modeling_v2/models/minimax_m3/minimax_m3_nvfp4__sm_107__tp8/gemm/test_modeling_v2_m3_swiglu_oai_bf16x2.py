@@ -16,7 +16,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     _swiglu_oai_bf16x2,
 )
 
-assert torch.cuda.is_available(), "the swigluoai prologue oracle requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the swigluoai prologue oracle requires a CUDA device", allow_module_level=True)
 
 THREADS = 256
 

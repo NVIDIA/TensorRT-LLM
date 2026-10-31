@@ -19,6 +19,9 @@
 
 #include "tensorrt_llm/common/assert.h"
 
+#include <mutex>
+#include <unordered_map>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -874,7 +877,13 @@ __global__ void __launch_bounds__(kThreads, 2) sampled_accept_kernel(Args const 
 template <int kSplits, int kTopK, bool kIlpWalk>
 cudaError_t launch(Args const& a, bool use_pdl, cudaStream_t stream)
 {
-    static int max_clusters = 0;
+    int device;
+    cudaError_t const deviceStatus = cudaGetDevice(&device);
+    if (deviceStatus != cudaSuccess)
+        return deviceStatus;
+    static std::mutex configMutex;
+    static std::unordered_map<int, int> deviceClusters;
+    int max_clusters = 0;
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3(a.rows * kSplits);
     cfg.blockDim = dim3(kThreads);
@@ -889,18 +898,24 @@ cudaError_t launch(Args const& a, bool use_pdl, cudaStream_t stream)
     attrs[1].val.programmaticStreamSerializationAllowed = use_pdl ? 1 : 0;
     cfg.attrs = attrs;
     cfg.numAttrs = 2;
-    if (max_clusters == 0)
     {
-        cudaError_t err = cudaFuncSetAttribute(sampled_accept_kernel<kSplits, kTopK, kIlpWalk>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sizeof(Shared<kSplits, kTopK>)));
-        if (err == cudaSuccess)
+        std::lock_guard<std::mutex> lock(configMutex);
+        max_clusters = deviceClusters[device];
+        if (max_clusters == 0)
         {
-            err = cudaOccupancyMaxActiveClusters(&max_clusters, sampled_accept_kernel<kSplits, kTopK, kIlpWalk>, &cfg);
+            cudaError_t err = cudaFuncSetAttribute(sampled_accept_kernel<kSplits, kTopK, kIlpWalk>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sizeof(Shared<kSplits, kTopK>)));
+            if (err == cudaSuccess)
+            {
+                err = cudaOccupancyMaxActiveClusters(
+                    &max_clusters, sampled_accept_kernel<kSplits, kTopK, kIlpWalk>, &cfg);
+            }
+            if (err != cudaSuccess)
+            {
+                return err;
+            }
         }
-        if (err != cudaSuccess)
-        {
-            return err;
-        }
+        deviceClusters[device] = max_clusters;
     }
     TLLM_CHECK_WITH_INFO(max_clusters >= 1, "m3_sampled_accept: a %d-CTA cluster does not fit on one GPC", kSplits);
     return cudaLaunchKernelEx(&cfg, sampled_accept_kernel<kSplits, kTopK, kIlpWalk>, a);

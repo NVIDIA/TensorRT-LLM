@@ -18,7 +18,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_qkv_insert requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_qkv_insert requires a CUDA device", allow_module_level=True)
 
 PAGES, PAGE, HEADS, KV, INDEX, D, ROTARY = 256, 128, 8, 1, 1, 128, 64
 MAX_POSITIONS = 262144

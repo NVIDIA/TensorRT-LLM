@@ -17,7 +17,8 @@ __extra_import_path__ = ["../../../..", "."]
 from _m3_spec_inputs import gen, seed_of  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_step_prologue requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_step_prologue requires a CUDA device", allow_module_level=True)
 # The reference and the pack tests run this branch's step_inputs (the step epoch, prologue_op): a run that mounts only
 # the target's files gets the image's older module, whose graph scatter has no epoch argument.
 assert "epoch" in step_inputs._graph_scatter_kernel.arg_names, (

@@ -23,7 +23,8 @@ __extra_import_path__ = ["../../../..", "."]
 import _m3_attn_runtime_tp4 as rt  # noqa: E402 — needs the path declared above
 from _validating import ULP, assert_within_ulp, certifying  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_draft_attention requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_draft_attention requires a CUDA device", allow_module_level=True)
 
 # Band, in BF16 ulps (2^-8) of each token's [heads x 128] row's largest magnitude (element) and of the relative RMS.
 # The reference reads the same FP8 cache rows the call attends, so what is left is the FP8 FMHA's own arithmetic:

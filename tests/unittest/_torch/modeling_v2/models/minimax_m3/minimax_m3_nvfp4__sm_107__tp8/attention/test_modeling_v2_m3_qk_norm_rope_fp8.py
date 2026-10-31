@@ -17,7 +17,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_qk_norm_rope_fp8 requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_qk_norm_rope_fp8 requires a CUDA device", allow_module_level=True)
 
 HEAD_DIM, ROTARY_DIM, EPS, THETA = 128, 64, 1e-6, 5e6
 

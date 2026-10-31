@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/sparseDecodeLc4.h"
 
+#include <limits>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <optional>
@@ -111,6 +113,12 @@ void minimaxM3Sm107Tp4SparseDecodeLc(torch::Tensor const& q, torch::Tensor const
     prm.block_table = blockTable.data_ptr<int>();
     prm.bt_stride = blockTable.stride(0);
     prm.seq_lens = seqLens.data_ptr<int>();
+    TORCH_CHECK(
+        decodeQueryLen > 0 && decodeQueryLen <= std::numeric_limits<int>::max() && q.size(0) % decodeQueryLen == 0,
+        "sparse_decode: decode_query_len must be positive and divide the query token count");
+    TORCH_CHECK(
+        seqLens.device() == q.device() && seqLens.is_contiguous() && seqLens.numel() >= q.size(0) / decodeQueryLen,
+        "sparse_decode: seq_lens must be contiguous and hold every request");
     prm.dql = static_cast<int>(decodeQueryLen);
     prm.sm_scale = static_cast<float>(smScale);
     prm.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());

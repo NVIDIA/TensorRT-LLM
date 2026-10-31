@@ -39,10 +39,14 @@ torch::Tensor minimaxM3Sm107Tp4DenseQkNormRopeFp8(torch::Tensor const& qkv, int6
     TORCH_CHECK(qkv.is_cuda() && qkv.is_contiguous() && qkv.dim() == 2 && qkv.scalar_type() == at::kBFloat16);
     TORCH_CHECK(qkv.size(1) == (numHeadsQ + numHeadsK + numHeadsV) * dqk::kHeadDim);
     TORCH_CHECK(qWeight.scalar_type() == at::kBFloat16 && kWeight.scalar_type() == at::kBFloat16);
+    TORCH_CHECK(qWeight.device() == qkv.device() && kWeight.device() == qkv.device() && qWeight.is_contiguous()
+        && kWeight.is_contiguous());
+    TORCH_CHECK(positionIds.device() == qkv.device() && positionIds.is_contiguous());
     TORCH_CHECK(qWeight.numel() == dqk::kHeadDim && kWeight.numel() == dqk::kHeadDim);
     TORCH_CHECK(positionIds.scalar_type() == at::kInt && positionIds.numel() == qkv.size(0));
     TORCH_CHECK(rotaryDim > 0 && rotaryDim <= dqk::kHeadDim && rotaryDim % 2 == 0, "unsupported rotary_dim");
-    TORCH_CHECK(!isNeox || (rotaryDim * 16) % dqk::kHeadDim == 0, "unsupported rotary_dim for the NeoX pairing");
+    TORCH_CHECK(!isNeox || (rotaryDim >= 8 && (rotaryDim & (rotaryDim - 1)) == 0),
+        "unsupported rotary_dim for the NeoX pairing");
     at::cuda::CUDAGuard guard(qkv.device());
     auto out = torch::empty_like(qkv, qkv.options().dtype(torch::kFloat8_e4m3fn));
     cudaError_t const err
@@ -66,15 +70,20 @@ torch::Tensor minimaxM3Sm107Tp4DenseQkNormRopeFp8Kv(torch::Tensor const& qkv, in
     TORCH_CHECK(qkv.size(1) == (numHeadsQ + numHeadsK + numHeadsV) * dqk::kHeadDim);
     TORCH_CHECK(numHeadsK == numHeadsV, "the pool keeps one head count for K and V");
     TORCH_CHECK(qWeight.scalar_type() == at::kBFloat16 && kWeight.scalar_type() == at::kBFloat16);
+    TORCH_CHECK(qWeight.device() == qkv.device() && kWeight.device() == qkv.device() && qWeight.is_contiguous()
+        && kWeight.is_contiguous());
+    TORCH_CHECK(positionIds.device() == qkv.device() && positionIds.is_contiguous());
     TORCH_CHECK(qWeight.numel() == dqk::kHeadDim && kWeight.numel() == dqk::kHeadDim);
     TORCH_CHECK(positionIds.scalar_type() == at::kInt && positionIds.numel() == qkv.size(0));
     TORCH_CHECK(rotaryDim > 0 && rotaryDim <= dqk::kHeadDim && rotaryDim % 2 == 0, "unsupported rotary_dim");
-    TORCH_CHECK(!isNeox || (rotaryDim * 16) % dqk::kHeadDim == 0, "unsupported rotary_dim for the NeoX pairing");
+    TORCH_CHECK(!isNeox || (rotaryDim >= 8 && (rotaryDim & (rotaryDim - 1)) == 0),
+        "unsupported rotary_dim for the NeoX pairing");
     TORCH_CHECK(kvBuffers.is_cuda() && kvBuffers.scalar_type() == at::kFloat8_e4m3fn && kvBuffers.dim() == 5);
     TORCH_CHECK(kvBuffers.size(1) == 2 && kvBuffers.size(2) == numHeadsK && kvBuffers.size(4) == dqk::kHeadDim
             && kvBuffers.stride(4) == 1,
         "kv_buffers must be the HND pool view [pages, 2, kv heads, tokens per block, 128]");
     TORCH_CHECK(outCacheLoc.is_cuda() && outCacheLoc.scalar_type() == at::kInt && outCacheLoc.is_contiguous());
+    TORCH_CHECK(kvBuffers.device() == qkv.device() && outCacheLoc.device() == qkv.device());
     TORCH_CHECK(numLiveTokens >= 0 && numLiveTokens <= qkv.size(0) && numLiveTokens <= outCacheLoc.numel());
     at::cuda::CUDAGuard guard(qkv.device());
     auto out = torch::empty_like(qkv, qkv.options().dtype(torch::kFloat8_e4m3fn));
@@ -89,7 +98,8 @@ torch::Tensor minimaxM3Sm107Tp4DenseQkNormRopeFp8Kv(torch::Tensor const& qkv, in
     view.numLiveTokens = static_cast<int>(numLiveTokens);
     if (qCompact.has_value())
     {
-        TORCH_CHECK(qCompact->is_cuda() && qCompact->is_contiguous() && qCompact->scalar_type() == at::kFloat8_e4m3fn
+        TORCH_CHECK(qCompact->device() == qkv.device() && qCompact->is_contiguous()
+                && qCompact->scalar_type() == at::kFloat8_e4m3fn
                 && qCompact->numel() == qkv.size(0) * numHeadsQ * dqk::kHeadDim,
             "q_compact must be a contiguous FP8 [tokens, q heads, 128] tensor");
         view.qCompact = static_cast<__nv_fp8_e4m3*>(qCompact->data_ptr());

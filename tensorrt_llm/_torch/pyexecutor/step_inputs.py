@@ -215,6 +215,7 @@ class StepInputPack:
         self.d2d: list[tuple[int, int, int]] = []
         # Every tensor a staged copy reads or writes, kept alive until the pack is issued.
         self.staged: list[torch.Tensor] = []
+        self._graph_staged: list[torch.Tensor] = []
         self.used = self.data_start
         if parallel_scatter:
             self._warm_up(device)
@@ -362,6 +363,7 @@ class StepInputPack:
             if self._fill_graph_window():
                 if self.early_copy:
                     self._upload_window(self.used)
+                self._graph_staged.extend(self.staged)
                 self._clear()
                 return
             self.quiesce_graph_window()
@@ -391,8 +393,19 @@ class StepInputPack:
             event = self.events[self.parity] = torch.cuda.Event()
         event.record()
         self.parity = (self.parity + 1) % self.RING
-        # The scatter is queued on the current stream: the caching allocator keeps the staged tensors' memory for it.
+        self._release_after_submission(self.staged)
         self._clear()
+
+    def _release_after_submission(self, tensors: list[torch.Tensor]) -> None:
+        if tensors:
+            stream = torch.cuda.current_stream(self.dev.device)
+            for tensor in tensors:
+                tensor.record_stream(stream)
+            tensors.clear()
+
+    def on_graph_replay(self) -> None:
+        """Release window operands after the graph reading their addresses has been queued."""
+        self._release_after_submission(self._graph_staged)
 
     def _fill_graph_window(self) -> bool:
         """Write the pack into the pinned window the replay's prologue issues; False when it does not fit or is not

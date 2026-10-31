@@ -16,7 +16,8 @@ import _rank_job
 import pytest
 import torch
 
-assert torch.cuda.is_available(), "the fused all-reduce + RMSNorm requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("the fused all-reduce + RMSNorm requires CUDA devices", allow_module_level=True)
 
 _RESULT_TAG = "[ulp]"
 

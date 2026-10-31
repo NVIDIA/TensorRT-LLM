@@ -23,7 +23,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_index_score requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_index_score requires a CUDA device", allow_module_level=True)
 
 HEADS = 1  # index heads per rank at TP8 (4 over 4 KV groups, each group on a rank pair)
 HEAD_DIM = 128
@@ -96,7 +97,7 @@ def test_prestaged_blocks_at_the_stable_edge_are_the_in_tree_scorer(qlen) -> Non
             ):
                 idx_q, index_k, block_table, seq, stride = _inputs(seq_lens, qlen, 31 + length)
                 score, stock = _score(stride, idx_q.shape[0]), _score(stride, idx_q.shape[0])
-                op(idx_q, index_k, block_table, seq, score, 4, split, True)
+                op(idx_q, index_k, block_table, seq, score, qlen, split, True)
                 torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
                     idx_q, index_k, block_table, seq, stock, qlen
                 )

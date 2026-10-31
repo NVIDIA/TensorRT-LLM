@@ -36,7 +36,9 @@ def arg(tensor):
 def _check(ids, table, weight, raw, out) -> None:
     rows = ids.shape[0] if ids.dim() == 1 else 0
     if not (
-        1 <= rows <= MAX_ROWS
+        all(t.is_cuda and t.device == ids.device for t in (ids, table, weight, raw, out))
+        and all(t.data_ptr() % 16 == 0 for t in (table, weight, raw, out))
+        and 1 <= rows <= MAX_ROWS
         and ids.dtype in (torch.int32, torch.int64)
         and ids.is_contiguous()
         and table.dtype == torch.bfloat16
@@ -45,6 +47,7 @@ def _check(ids, table, weight, raw, out) -> None:
         and table.is_contiguous()
         and weight.dtype == torch.bfloat16
         and tuple(weight.shape) == (HIDDEN,)
+        and weight.is_contiguous()
         and all(
             t.dtype == torch.bfloat16 and tuple(t.shape) == (rows, HIDDEN) and t.is_contiguous()
             for t in (raw, out)
@@ -52,7 +55,7 @@ def _check(ids, table, weight, raw, out) -> None:
     ):
         raise ValueError(
             "m3_embed_norm: expects ids int32/int64 [1..8], a contiguous bf16 table [V, 6144], bf16 weight [6144] "
-            "and contiguous bf16 raw / out [rows, 6144]"
+            "and contiguous bf16 raw / out [rows, 6144], all on one CUDA device with 16-byte aligned bf16 pointers"
         )
 
 
@@ -137,6 +140,7 @@ class DecodeEmbedding:
         self.raw = torch.empty(rows, HIDDEN, device=table.device, dtype=torch.bfloat16)
         self.output = torch.empty_like(self.raw)
         ids = torch.empty(rows, device=table.device, dtype=id_dtype)
+        _check(ids, table, norm.weight, self.raw, self.output)
         _compile(ids, table, norm.weight, self.eps, self.raw, self.output, use_pdl)
 
     def __call__(self, ids):

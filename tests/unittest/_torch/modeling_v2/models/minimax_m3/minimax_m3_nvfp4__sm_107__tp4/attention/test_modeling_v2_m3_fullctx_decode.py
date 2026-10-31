@@ -29,7 +29,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_fullctx_decode requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_fullctx_decode requires a CUDA device", allow_module_level=True)
 if torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the tp4 target is certified on SM 10.7 only", allow_module_level=True)
 

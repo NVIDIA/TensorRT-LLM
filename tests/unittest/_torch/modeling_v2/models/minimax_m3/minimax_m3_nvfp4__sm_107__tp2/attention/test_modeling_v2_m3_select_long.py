@@ -20,7 +20,8 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_select_long requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_select_long requires a CUDA device", allow_module_level=True)
 
 # Valid-block counts that land a row on each of the kernel's paths: <= 16 (all picked), the 2-, 4- and 9-key
 # widths, past the row (clamped), and zero (a CUDA-graph padding row).

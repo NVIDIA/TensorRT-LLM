@@ -1049,9 +1049,10 @@ class CUDAGraphRunner:
         # anything below reads the static inputs on the device; a graph captured
         # with the pack's prologue issues them itself at the start of the replay.
         prologue_pack = self._step_input_prologue_keys.get(key)
-        step_inputs.flush(in_graph=prologue_pack is not None)
-        if prologue_pack is not None and not step_inputs.is_active(
-                prologue_pack):
+        captured_pack_active = (prologue_pack is not None
+                                and step_inputs.is_active(prologue_pack))
+        step_inputs.flush(in_graph=captured_pack_active)
+        if prologue_pack is not None and not captured_pack_active:
             # Replayed outside the pack's context: nothing filled its window.
             prologue_pack.quiesce_graph_window()
         if self._pre_replay_hooks:
@@ -1072,7 +1073,11 @@ class CUDAGraphRunner:
             for hook in self._pre_replay_hooks:
                 hook(key, seqlen, hook_tensors, current_inputs)
 
-        self.graphs[key].replay()
+        try:
+            self.graphs[key].replay()
+        finally:
+            if prologue_pack is not None:
+                prologue_pack.on_graph_replay()
         output_ref = self.graph_outputs[key]
 
         return output_ref

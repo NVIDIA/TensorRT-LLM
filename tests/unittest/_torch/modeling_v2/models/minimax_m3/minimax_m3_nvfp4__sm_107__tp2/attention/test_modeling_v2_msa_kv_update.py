@@ -20,7 +20,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401 — needs the path declared above
 
-assert torch.cuda.is_available(), "msa_kv_update requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("msa_kv_update requires a CUDA device", allow_module_level=True)
 
 #: Spare capacity past the live rows, as the metadata's buffers have: the op must leave it alone.
 _SPARE = 3

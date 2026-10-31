@@ -29,7 +29,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_index_score requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_index_score requires a CUDA device", allow_module_level=True)
 
 HEADS = 1  # index heads per rank at TP4
 HEAD_DIM = 128

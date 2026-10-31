@@ -32,7 +32,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP8 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_producer requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_producer requires a CUDA device", allow_module_level=True)
 
 PAGES = 1024
 MAX_POSITIONS = 262144

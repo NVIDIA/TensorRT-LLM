@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_sparse_decode_lc requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_sparse_decode_lc requires a CUDA device", allow_module_level=True)
 
 #: Hand-off buffers are sized as MERGE_MXFP8 sizes them.
 _HANDOFF_ROWS = 128

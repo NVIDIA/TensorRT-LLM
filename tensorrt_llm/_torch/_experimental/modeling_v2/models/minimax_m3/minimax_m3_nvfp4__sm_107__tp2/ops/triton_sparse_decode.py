@@ -1213,6 +1213,8 @@ def _check_nvfp4_inputs(
         )
     if head_dim != triton.next_power_of_2(head_dim):
         raise ValueError(f"NVFP4 sparse decode requires a power-of-two head_dim; got {head_dim}.")
+    if v_paged.shape[:3] != k_paged.shape[:3]:
+        raise ValueError("NVFP4 K and V caches must have matching page, head and token extents.")
     for name, data in (("k_paged", k_paged), ("v_paged", v_paged)):
         if int(data.shape[3]) * 2 != head_dim:
             raise ValueError(
@@ -1470,8 +1472,8 @@ def minimax_m3_sparse_attn_decode(
             if measured_chunks is not None
             else resolve_num_topk_chunks(total_q, num_kv_heads, max_topk)
         )
-    elif num_topk_chunks & (num_topk_chunks - 1):
-        raise ValueError(f"num_topk_chunks must be a power of two; got {num_topk_chunks}.")
+    elif num_topk_chunks <= 0 or num_topk_chunks & (num_topk_chunks - 1):
+        raise ValueError(f"num_topk_chunks must be a positive power of two; got {num_topk_chunks}.")
 
     # Every query token of a request reads the same blocks under identity selection (short-sequence mode): one
     # program per (request, block) covers all of them and dequantizes each block once.

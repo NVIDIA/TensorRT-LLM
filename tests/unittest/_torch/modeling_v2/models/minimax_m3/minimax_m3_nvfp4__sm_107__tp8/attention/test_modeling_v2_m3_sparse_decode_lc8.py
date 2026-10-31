@@ -32,7 +32,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP8 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_sparse_decode_lc8 requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_sparse_decode_lc8 requires a CUDA device", allow_module_level=True)
 
 #: Hand-off buffers are sized as MERGE_MXFP8 sizes them.
 _HANDOFF_ROWS = 128
@@ -328,7 +329,7 @@ def test_one_div_merge_is_deterministic_and_in_band(
 
     def run(out, q8, sf, use_pdl, one_div):
         args = list(_args(case, out, q8, sf, linear, prewait))
-        args[18] = use_pdl
+        args[17] = use_pdl
         op(*args, merge_once=True, one_div=one_div)
 
     runs = []

@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp2/sparseDecodeLc2.h"
 
+#include <limits>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <optional>
@@ -71,7 +73,7 @@ void minimaxM3Sm107Tp2SparseDecodeLc(torch::Tensor const& q, torch::Tensor const
     checkBytes(kBlockScale, "k_block_scale");
     checkBytes(vBlockScale, "v_block_scale");
     TORCH_CHECK(k.dim() == 4 && k.size(2) == 128 && k.size(3) == kHeadDim / 2 && k.stride(3) == 1
-            && v.sizes() == k.sizes() && v.strides() == k.strides(),
+            && k.stride(2) == kHeadDim / 2 && v.sizes() == k.sizes() && v.strides() == k.strides(),
         "minimax_m3_sm107_tp2_sparse_decode_lc: k and v must be [pages, H, 128, 64] with matching strides");
     int64_t const kvHeads = k.size(1);
     TORCH_CHECK(kBlockScale.dim() == 4 && kBlockScale.size(1) == kvHeads && kBlockScale.size(3) == 8
@@ -124,6 +126,12 @@ void minimaxM3Sm107Tp2SparseDecodeLc(torch::Tensor const& q, torch::Tensor const
     prm.block_table = blockTable.data_ptr<int>();
     prm.bt_stride = blockTable.stride(0);
     prm.seq_lens = seqLens.data_ptr<int>();
+    TORCH_CHECK(
+        decodeQueryLen > 0 && decodeQueryLen <= std::numeric_limits<int>::max() && q.size(0) % decodeQueryLen == 0,
+        "sparse_decode: decode_query_len must be positive and divide the query token count");
+    TORCH_CHECK(
+        seqLens.device() == q.device() && seqLens.is_contiguous() && seqLens.numel() >= q.size(0) / decodeQueryLen,
+        "sparse_decode: seq_lens must be contiguous and hold every request");
     prm.dql = static_cast<int>(decodeQueryLen);
     prm.sm_scale = static_cast<float>(smScale);
     prm.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());

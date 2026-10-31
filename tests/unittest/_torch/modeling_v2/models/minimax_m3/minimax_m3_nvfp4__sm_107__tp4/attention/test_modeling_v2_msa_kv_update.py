@@ -25,7 +25,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "msa_kv_update requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("msa_kv_update requires a CUDA device", allow_module_level=True)
 
 #: Spare capacity past the live rows, as the metadata's buffers have: the op must leave it alone.
 _SPARE = 3

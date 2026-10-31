@@ -47,6 +47,7 @@ from .op import (
     _compiled,
     _kernel_module,
     _shared_views,
+    _validate_output,
     _view,
     is_supported,
 )
@@ -229,6 +230,8 @@ class M3Moe16State:
 
     def run(self, layer, hidden, out=None, arp=None) -> torch.Tensor:
         m = self.m
+        if out is not None:
+            _validate_output(out, m, self.device)
         if (
             hidden is None
             or hidden.dtype != torch.bfloat16

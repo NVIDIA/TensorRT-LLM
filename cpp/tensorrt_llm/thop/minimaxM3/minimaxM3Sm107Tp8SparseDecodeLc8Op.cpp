@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp8/sparseDecodeLc8m.h"
 
+#include <limits>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <optional>
@@ -89,6 +91,11 @@ void minimaxM3Sm107Tp8SparseDecodeLc8(torch::Tensor const& q, torch::Tensor cons
     {
         checkBytes(*q8, "q8");
         checkBytes(*sf, "sf");
+        int64_t const tokens = q.size(0);
+        TORCH_CHECK(numSfKTiles == 8 && q8->is_contiguous() && q8->numel() >= tokens * 1024,
+            "sparse_decode_lc8: q8 must hold contiguous T * 1024 bytes with num_sf_k_tiles=8");
+        TORCH_CHECK(sf->is_contiguous() && sf->numel() >= ((tokens + 127) / 128) * 128 * 32,
+            "sparse_decode_lc8: sf must hold the padded 128-row MXFP8 scale tiles");
     }
 
     tensorrt_llm::kernels::minimaxM3Sm107Tp8::MinimaxM3Tp8SparseDecodeLc8Params prm{};
@@ -111,6 +118,12 @@ void minimaxM3Sm107Tp8SparseDecodeLc8(torch::Tensor const& q, torch::Tensor cons
     prm.block_table = blockTable.data_ptr<int>();
     prm.bt_stride = blockTable.stride(0);
     prm.seq_lens = seqLens.data_ptr<int>();
+    TORCH_CHECK(
+        decodeQueryLen > 0 && decodeQueryLen <= std::numeric_limits<int>::max() && q.size(0) % decodeQueryLen == 0,
+        "sparse_decode: decode_query_len must be positive and divide the query token count");
+    TORCH_CHECK(
+        seqLens.device() == q.device() && seqLens.is_contiguous() && seqLens.numel() >= q.size(0) / decodeQueryLen,
+        "sparse_decode: seq_lens must be contiguous and hold every request");
     prm.dql = static_cast<int>(decodeQueryLen);
     prm.sm_scale = static_cast<float>(smScale);
     prm.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());

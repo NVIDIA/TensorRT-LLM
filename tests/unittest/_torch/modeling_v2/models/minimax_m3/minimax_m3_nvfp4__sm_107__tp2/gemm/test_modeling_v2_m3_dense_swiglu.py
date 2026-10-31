@@ -20,7 +20,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     m3_dense_swiglu,
 )
 
-assert torch.cuda.is_available(), "the dense swigluoai op requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the dense swigluoai op requires a CUDA device", allow_module_level=True)
 if not hasattr(torch.ops.trtllm, "minimax_m3_sm107_tp2_swiglu_oai"):
     pytest.skip(
         "needs the TP2 op library with minimax_m3_sm107_tp2_swiglu_oai", allow_module_level=True

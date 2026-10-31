@@ -10,7 +10,8 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers the trtllm ops)
 
-assert torch.cuda.is_available(), "the dense FP8 q/k/v op requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the dense FP8 q/k/v op requires a CUDA device", allow_module_level=True)
 if torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the tp8 target is certified on SM 10.7 only", allow_module_level=True)
 

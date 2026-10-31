@@ -20,7 +20,8 @@ from tensorrt_llm._torch.custom_ops.torch_custom_ops import MXFP8QuantizeRunner
 __extra_import_path__ = ["../../../.."]
 from _validating import validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_mxfp8_pinned_quantize requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_mxfp8_pinned_quantize requires a CUDA device", allow_module_level=True)
 
 TACTIC = modeling.MXFP8_DECODE_QUANT_TACTIC
 

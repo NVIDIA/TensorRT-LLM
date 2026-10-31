@@ -428,7 +428,10 @@ class M3MoeState:
                 "M3MoeState allocates and compiles: build it before CUDA-graph capture"
             )
         sms_all = torch.cuda.get_device_properties(device).multi_processor_count
-        if shared and (num_ctas or sms_all) + SHARED_CTAS > sms_all:
+        resolved_ctas = (
+            (sms_all - SHARED_CTAS if shared else sms_all) if num_ctas is None else num_ctas
+        )
+        if shared and resolved_ctas + SHARED_CTAS > sms_all:
             raise ValueError(
                 f"m3_moe (shared): num_ctas + {SHARED_CTAS} shared-expert CTAs must fit the {sms_all} SMs "
                 f"(all resident at once)"
@@ -440,7 +443,7 @@ class M3MoeState:
         if not ok:
             raise RuntimeError(f"m3_moe: {why}")
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        self.num_ctas = num_ctas or sms
+        self.num_ctas = resolved_ctas
         if not MIN_CTAS <= self.num_ctas <= sms:
             raise ValueError(
                 f"m3_moe runs {MIN_CTAS} .. {sms} CTAs (all resident at once), not {self.num_ctas}"

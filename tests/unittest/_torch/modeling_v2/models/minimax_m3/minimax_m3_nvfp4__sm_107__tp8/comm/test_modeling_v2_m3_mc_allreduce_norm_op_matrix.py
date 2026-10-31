@@ -22,7 +22,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     finalize_partial,
 )
 
-assert torch.cuda.is_available(), "m3_mc_allreduce_norm requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("m3_mc_allreduce_norm requires CUDA devices", allow_module_level=True)
 
 
 # Spawns one rank process per device of the world size; under xdist workers would fight for them.

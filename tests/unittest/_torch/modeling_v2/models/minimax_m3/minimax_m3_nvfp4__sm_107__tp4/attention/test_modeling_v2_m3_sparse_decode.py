@@ -31,7 +31,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_sparse_decode requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_sparse_decode requires a CUDA device", allow_module_level=True)
 
 # Band, in BF16 ulps (2^-8) of each [16, 128] head row's largest magnitude, and of the relative RMS. Every route
 # computes from exact operands (E4M3 q and E2M1 x E4M3 K/V are exact in FP16), so the gap to the float64 reference

@@ -32,10 +32,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import pytest
 import torch
 import torch.distributed as dist
 
-assert torch.cuda.is_available(), "m3_moe_engine requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("m3_moe_engine requires CUDA devices", allow_module_level=True)
 
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 1200

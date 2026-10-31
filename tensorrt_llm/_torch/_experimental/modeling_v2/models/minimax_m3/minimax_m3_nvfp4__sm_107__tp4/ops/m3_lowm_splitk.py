@@ -636,6 +636,7 @@ class SplitKDenseGemmKernel:
                 split_rank,
                 sD,
                 bidx,
+                n_idx * self.cta_n,
                 ar_ws,
                 ar_flags,
                 ar_rank,
@@ -774,6 +775,7 @@ class SplitKDenseGemmKernel:
         split_rank: cutlass.Int32,
         sD: cute.Tensor,
         bidx: cutlass.Int32,
+        row_offset: cutlass.Int32,
         ar_ws: cutlass.Int64,
         ar_flags: cutlass.Int64,
         ar_rank: cutlass.Int32,
@@ -900,6 +902,7 @@ class SplitKDenseGemmKernel:
                     sD,
                     epi_tid,
                     bidx,
+                    row_offset,
                     ar_ws,
                     ar_flags,
                     ar_rank,
@@ -926,6 +929,7 @@ class SplitKDenseGemmKernel:
         sD,
         epi_tid: cutlass.Int32,
         bidx: cutlass.Int32,
+        row_offset: cutlass.Int32,
         ar_ws: cutlass.Int64,
         ar_flags: cutlass.Int64,
         ar_rank: cutlass.Int32,
@@ -946,7 +950,8 @@ class SplitKDenseGemmKernel:
         half = cutlass.Int64(ar_maxt) * cutlass.Int64(ar_world) * cutlass.Int64(ar_n // 2)
         for w0 in cutlass.range_constexpr(0, pairs * self.cta_n, self.epilog_threads):
             word = epi_tid + w0
-            t = word // pairs
+            local_t = word // pairs
+            t = row_offset + local_t
             p = word % pairs
             if t < ar_tokens:
                 n = col0 + 2 * p
@@ -961,7 +966,8 @@ class SplitKDenseGemmKernel:
                 _st_global_b32(
                     ar_ws + off * cutlass.Int64(4),
                     _bf16x2_word(
-                        sD[2 * p, t].to(cutlass.Float32), sD[2 * p + 1, t].to(cutlass.Float32)
+                        sD[2 * p, local_t].to(cutlass.Float32),
+                        sD[2 * p + 1, local_t].to(cutlass.Float32),
                     ),
                 )
         if cutlass.const_expr(self.use_pdl):

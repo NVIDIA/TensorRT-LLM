@@ -109,6 +109,7 @@ def sparse_attention_reference(
         valid = ((blocks[:, None] * PAGE + positions[None, :]) < kv_len).reshape(-1)
         logits = (q64[tok] @ keys.T) * sm_scale
         logits = logits.masked_fill(~valid[None, :], float("-inf"))
+        values = values.masked_fill(~valid[:, None], 0)
         out[tok] = torch.softmax(logits, dim=-1) @ values
     return out
 
@@ -327,6 +328,8 @@ class M3SparseDecodeLc(OpWrapper):
         rounded once. ``linear_softmax``, ``use_pdl``, ``early_trigger``, ``one_div`` and ``bt_prewait`` do not change
         what is computed; the hand-off buffers are checked separately with ``mxfp8_handoff_reference``.
         """
+        if identity:
+            topk = _identity_table(seq_lens, decode_query_len, int(q.shape[0]), topk.device)
         attn = sparse_attention_reference(
             q.view(-1, NUM_HEADS, HEAD_DIM),
             k,
@@ -416,7 +419,11 @@ class M3SparseDecodeLc(OpWrapper):
             req, offset = divmod(tok, decode_query_len)
             kv_len = max(seq[req] - decode_query_len + offset + 1, 0)
             nblocks = (kv_len + PAGE - 1) // PAGE
-            ids = topk[tok, : min(TOPK, nblocks)]
+            ids = (
+                torch.arange(min(TOPK, nblocks), device=topk.device)
+                if identity
+                else topk[tok, : min(TOPK, nblocks)]
+            )
             assert bool(((ids >= -1) & (ids < min(nblocks, num_cols))).all()), (
                 f"token {tok}: selected block ids must be -1 or below the request's block count; the block "
                 "table is indexed with them unchecked"
@@ -434,3 +441,14 @@ class M3SparseDecodeLc(OpWrapper):
 
 
 m3_sparse_decode_lc = M3SparseDecodeLc()
+
+
+def _identity_table(seq_lens, decode_query_len, total_q, device):
+    """[T, 16] ids (i < min(16, blocks of the token's causal length) ? i : -1), the selection identity mode reads."""
+    ids = torch.full((total_q, 16), -1, dtype=torch.int32, device=device)
+    for tok in range(total_q):
+        req, qoff = divmod(tok, decode_query_len)
+        kv_len = max(int(seq_lens[req]) - decode_query_len + qoff + 1, 0)
+        n = min(16, (kv_len + PAGE - 1) // PAGE)
+        ids[tok, :n] = torch.arange(n, dtype=torch.int32, device=device)
+    return ids

@@ -27,7 +27,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_moe16_engine requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_moe16_engine requires a CUDA device", allow_module_level=True)
 
 # As test_modeling_v2_m3_moe_engine.compare (same arithmetic, same quantization boundaries).
 BAND_ELEMENT = 4.0

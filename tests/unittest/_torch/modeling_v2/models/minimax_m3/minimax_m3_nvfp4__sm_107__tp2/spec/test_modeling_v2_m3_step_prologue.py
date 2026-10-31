@@ -17,7 +17,8 @@ from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_step_prologue requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_step_prologue requires a CUDA device", allow_module_level=True)
 
 MAX_DESC = StepInputPack.MAX_DESC
 WINDOW = StepInputPack.GRAPH_WINDOW

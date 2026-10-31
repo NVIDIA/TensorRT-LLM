@@ -13,7 +13,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 
-assert torch.cuda.is_available(), "MX-TAC requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("MX-TAC requires a CUDA device", allow_module_level=True)
 
 # The TP2 projections at decode rows the GEMVs do not serve (12, 16) and a few beyond.
 CASES = [

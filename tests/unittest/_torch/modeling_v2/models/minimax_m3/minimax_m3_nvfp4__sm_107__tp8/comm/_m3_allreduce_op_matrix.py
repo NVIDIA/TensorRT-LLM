@@ -34,10 +34,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
+import pytest
 import torch
 import torch.distributed as dist
 
-assert torch.cuda.is_available(), "the fused all-reduce + RMSNorm requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("the fused all-reduce + RMSNorm requires CUDA devices", allow_module_level=True)
 
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 900

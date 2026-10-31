@@ -30,7 +30,8 @@ from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_draft_lowm requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_draft_lowm requires a CUDA device", allow_module_level=True)
 
 # Element band, in BF16 ulps of the row scale, and the relative RMS (``assert_within_ulp``).
 #

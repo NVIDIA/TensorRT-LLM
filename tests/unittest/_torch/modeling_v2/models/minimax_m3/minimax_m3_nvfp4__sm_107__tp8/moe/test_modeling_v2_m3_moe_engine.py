@@ -33,7 +33,8 @@ from _m3_moe_operands import (  # noqa: E402
 )
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_moe_engine requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_moe_engine requires a CUDA device", allow_module_level=True)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),

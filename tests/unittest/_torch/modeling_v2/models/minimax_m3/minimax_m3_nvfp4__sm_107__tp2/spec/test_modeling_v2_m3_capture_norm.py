@@ -20,7 +20,8 @@ from _m3_spec_inputs import (  # noqa: E402 — needs the path declared above
 )
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_capture_norm requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_capture_norm requires a CUDA device", allow_module_level=True)
 
 LAYERS = 3
 

@@ -19,7 +19,7 @@ Its own launcher, as ``_m3_mc_allreduce_norm_op_matrix.py`` is: run plainly it s
 in CUDA_VISIBLE_DEVICES and kills them all on the first failure or on the deadline (a rank whose peer never pushes
 polls forever). The collected entry point is ``test_modeling_v2_m3_moe_push_op_matrix.py``.
 
-    CUDA_VISIBLE_DEVICES=0,1 python _m3_moe_push_op_matrix.py
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python _m3_moe_push_op_matrix.py
 """
 
 import os
@@ -31,10 +31,12 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import pytest
 import torch
 import torch.distributed as dist
 
-assert torch.cuda.is_available(), "m3_moe_engine requires CUDA devices"
+if not torch.cuda.is_available():
+    pytest.skip("m3_moe_engine requires CUDA devices", allow_module_level=True)
 
 _WORKER_FLAG = "--rank-worker"
 DEADLINE_S = 1200
@@ -324,10 +326,10 @@ def _spawn_ranks() -> None:
     """One worker process per claimed device, each in its own session; on the first nonzero exit or on the
     deadline every session is killed."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    assert visible, "set CUDA_VISIBLE_DEVICES to the 2 devices this run owns"
+    assert visible, "set CUDA_VISIBLE_DEVICES to the 8 devices this run owns"
     world_size = len([d for d in visible.split(",") if d.strip()])
-    assert world_size == 2, (
-        f"CUDA_VISIBLE_DEVICES names {world_size} device(s); the matrix runs at 2"
+    assert world_size == 8, (
+        f"CUDA_VISIBLE_DEVICES names {world_size} device(s); the matrix runs at 8"
     )
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))

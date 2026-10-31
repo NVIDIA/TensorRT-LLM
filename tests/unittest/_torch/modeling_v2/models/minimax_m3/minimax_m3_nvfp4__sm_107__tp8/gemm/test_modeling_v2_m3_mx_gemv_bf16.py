@@ -23,7 +23,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
-assert torch.cuda.is_available(), "m3_mx_gemv_bf16 requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_mx_gemv_bf16 requires a CUDA device", allow_module_level=True)
 
 # The element band of test_modeling_v2_m3_mx_gemv.compare (derived there): the same fp32 sums against fp64.
 ELEMENT_ULP = 1.5

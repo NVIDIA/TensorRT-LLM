@@ -29,6 +29,7 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <limits>
 #include <math_constants.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -56,14 +57,14 @@ __device__ int activeSplits(Params const& p, int b, int row)
     {
         int const token = row / p.headsPerKv;
         int const base = (token / p.qTokensPerCta) * p.qTokensPerCta;
-        int const end = min(base + p.qTokensPerCta, p.seqLenQ);
+        int const end = base + min(p.qTokensPerCta, p.seqLenQ - base);
         visible = min(max(seqKv - p.seqLenQ + end, 0), seqKv);
     }
-    int const tiles = (visible + p.tileKv - 1) / p.tileKv;
-    int const tilesPerGroup = p.splits * p.instsKv;
-    int const groups = (tiles + tilesPerGroup - 1) / tilesPerGroup;
-    int const local = max(groups * p.instsKv, p.instsKv);
-    return (tiles + local - 1) / local;
+    int64_t const tiles = (static_cast<int64_t>(visible) + p.tileKv - 1) / p.tileKv;
+    int64_t const tilesPerGroup = static_cast<int64_t>(p.splits) * p.instsKv;
+    int64_t const groups = (tiles + tilesPerGroup - 1) / tilesPerGroup;
+    int64_t const local = (groups > 1 ? groups : 1) * p.instsKv;
+    return static_cast<int>((tiles + local - 1) / local);
 }
 
 template <bool kBf16Partial>
@@ -199,7 +200,8 @@ __global__ void __launch_bounds__(kThreads) fullCtxReduceKernel(Params const p)
 
 cudaError_t invokeFullCtxReduce(Params const& params, bool pdl, cudaStream_t stream)
 {
-    if (params.splits < 1 || params.splits > kMaxSplits || params.rows < 1)
+    if (params.splits < 1 || params.splits > kMaxSplits || params.rows < 1 || params.qTokensPerCta <= 0
+        || params.tileKv <= 0 || params.instsKv <= 0 || params.instsKv > std::numeric_limits<int>::max() / kMaxSplits)
     {
         return cudaErrorInvalidValue;
     }

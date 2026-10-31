@@ -20,6 +20,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <limits>
 #include <optional>
 #include <torch/extension.h>
 
@@ -44,6 +45,10 @@ void minimaxM3Sm107Tp4FullCtxReduce(torch::Tensor const& partialO, torch::Tensor
     TORCH_CHECK(partialStats.scalar_type() == at::kFloat && partialStats.is_contiguous()
         && partialStats.sizes() == partialO.sizes().slice(0, 4));
     TORCH_CHECK(seqLensKv.scalar_type() == at::kInt && seqLensKv.numel() >= partialO.size(0));
+    constexpr int64_t kMaxInt = std::numeric_limits<int>::max();
+    TORCH_CHECK(qTokensPerCta > 0 && qTokensPerCta <= kMaxInt && tileKv > 0 && tileKv <= kMaxInt && instsKv > 0
+            && instsKv <= kMaxInt / fcr::kMaxSplits,
+        "fullctx_reduce: producer geometry must be positive and fit int32");
     int const rows = static_cast<int>(partialO.size(3));
     TORCH_CHECK(seqLenQ >= 1 && rows % seqLenQ == 0);
     int const headsPerKv = rows / static_cast<int>(seqLenQ);

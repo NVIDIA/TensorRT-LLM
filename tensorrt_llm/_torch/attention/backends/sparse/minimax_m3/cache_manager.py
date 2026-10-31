@@ -586,8 +586,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             if mapping.pp_size > 1
             else list(range(num_target_layers))
         )
-        sparse_layers = [layer for layer in local_layers if layer >= 3]
-        dense_layers = [layer for layer in local_layers if layer < 3]
+        sparse_layer_ids = kwargs.get("sparse_layer_ids")
+        if sparse_layer_ids is None:
+            sparse_layer_ids = default_sparse_layer_ids(config, num_target_layers)
+        sparse_layer_ids = set(int(layer) for layer in sparse_layer_ids)
+        sparse_layers = [layer for layer in local_layers if layer in sparse_layer_ids]
+        dense_layers = [layer for layer in local_layers if layer not in sparse_layer_ids]
         tp = 1 if mapping.enable_attention_dp else mapping.tp_size
         kv_heads = max(1, int(config.num_key_value_heads) // tp)
         head_dim = int(

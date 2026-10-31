@@ -113,6 +113,7 @@ def sparse_attention_reference(
         valid = ((blocks[:, None] * PAGE + positions[None, :]) < kv_len).reshape(-1)
         logits = (q64[tok] @ keys.T) * sm_scale
         logits = logits.masked_fill(~valid[None, :], float("-inf"))
+        values = values.masked_fill(~valid[:, None], 0)
         out[tok] = torch.softmax(logits, dim=-1) @ values
     return out
 

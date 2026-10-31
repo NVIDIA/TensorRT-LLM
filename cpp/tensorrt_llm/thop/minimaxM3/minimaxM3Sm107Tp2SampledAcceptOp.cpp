@@ -47,6 +47,8 @@ void minimaxM3Sm107Tp2SampledAccept(torch::Tensor const& logits, int64_t vocabOf
     std::optional<torch::Tensor> const& forceVec, std::optional<torch::Tensor> const& extraAttempts, bool usePdl,
     bool prewaitParams, bool earlyTrigger, bool ilpWalk)
 {
+    TORCH_CHECK(logits.is_cuda() && logits.dim() == 2 && logits.scalar_type() == at::kBFloat16 && logits.stride(1) == 1,
+        "sampled_accept: logits must be CUDA BF16 [rows, vocab] with unit column stride");
     c10::cuda::CUDAGuard const deviceGuard{logits.device()};
     sa::Args a;
     a.logits = reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr());

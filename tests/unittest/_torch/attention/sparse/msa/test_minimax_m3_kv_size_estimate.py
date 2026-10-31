@@ -18,6 +18,7 @@ def _model_config(nvfp4=True, index_dtype="fp8"):
     return types.SimpleNamespace(
         pretrained_config=types.SimpleNamespace(
             num_hidden_layers=60,
+            sparse_attention_config={"sparse_attention_freq": [0] * 3 + [1] * 57},
             num_key_value_heads=4,
             head_dim=128,
             hidden_size=6144,
@@ -82,3 +83,46 @@ def test_estimate_gate(monkeypatch):
     monkeypatch.setattr(cache_manager, "get_sm_version", lambda: 107)
     monkeypatch.setattr(cache_manager, "_SM107_EXACT_KV_SIZE_ESTIMATE", False)
     assert KVM.get_cache_size_per_token(None, None) == (17280, 0)
+
+
+@pytest.mark.parametrize("dense_layers", [4, 10, 60])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_estimate_matches_nondefault_cache_layout(monkeypatch, dense_layers, explicit):
+    config = _model_config()
+    sparse_ids = list(range(dense_layers, 60))
+    kwargs = {}
+    if explicit:
+        kwargs["sparse_layer_ids"] = sparse_ids
+    else:
+        config.pretrained_config.sparse_attention_config = {
+            "sparse_attention_freq": [0] * dense_layers + [1] * (60 - dense_layers)
+        }
+    manager = object.__new__(KVM)
+    manager.sparse_layer_ids = (
+        sparse_ids
+        if explicit
+        else cache_manager.default_sparse_layer_ids(config.pretrained_config, 60)
+    )
+    assert manager.sparse_layer_ids == sparse_ids
+    manager.dtype = cache_manager.DataType.NVFP4
+    manager.pp_layers = list(range(60))
+    manager.layer_offsets = {layer: layer for layer in range(60)}
+    manager.num_kv_heads_per_layer = [2] * 60
+    manager.head_dim_per_layer = [128] * 60
+    manager.kv_factor = 2
+    manager.sparse_index_dim = 128
+    manager.indexer_kv_dtype = "fp8"
+    # The generic NVFP4 K/V allocation: 512 values / 2 + 512 scale bytes / 16.
+    generic_layer_bytes = 288
+    monkeypatch.setattr(
+        cache_manager.KVCacheManagerV2,
+        "get_layer_bytes_per_token",
+        lambda self, layer, role: generic_layer_bytes,
+    )
+    kv_bytes = sum(manager.get_layer_bytes_per_token(i, cache_manager.Role.ALL) for i in range(60))
+    index_buffers = manager._extra_buffers_per_layer(tokens_per_block=128)
+    index_bytes = (
+        sum(buffer.size for buffers in index_buffers.values() for buffer in buffers) // 128
+    )
+    extra = KVM._extra_bytes_per_token(config, _mapping(2, False), None, kwargs)
+    assert 60 * generic_layer_bytes + extra == kv_bytes + index_bytes

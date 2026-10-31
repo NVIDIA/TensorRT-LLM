@@ -13,7 +13,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch.modules.linear import Linear
 
-assert torch.cuda.is_available(), "the uGPU head requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the uGPU head requires a CUDA device", allow_module_level=True)
 
 
 def _locality():

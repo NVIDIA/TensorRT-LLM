@@ -14,7 +14,8 @@ __extra_import_path__ = ["../../../..", "."]
 from _m3_spec_inputs import gen, seed_of  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_draft_silu requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_draft_silu requires a CUDA device", allow_module_level=True)
 
 ALL = torch.arange(-(1 << 15), 1 << 15, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
 

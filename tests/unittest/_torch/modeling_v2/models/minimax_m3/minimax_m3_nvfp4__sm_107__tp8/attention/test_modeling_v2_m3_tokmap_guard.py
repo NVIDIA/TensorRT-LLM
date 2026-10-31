@@ -21,7 +21,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm.bindings.internal import thop
 
-assert torch.cuda.is_available(), "m3_tokmap_guard requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_tokmap_guard requires a CUDA device", allow_module_level=True)
 if torch.cuda.get_device_capability() != (10, 7):
     pytest.skip("the tp8 target is certified on SM 10.7 only", allow_module_level=True)
 

@@ -61,6 +61,7 @@ struct FoldTailParams
     int32_t* posOff;   // [rows * T]
     int32_t* kvOff;    // [rows]
     int32_t tokensPerStep;
+    int32_t maxRows;   // validated capacity of the source and staging buffers
 };
 
 //! One CTA of 32 lanes per row, `rows` CTAs; the first ctrl[0] rows write. Widths and tokensPerStep must be <= 32.
@@ -115,7 +116,7 @@ __device__ __forceinline__ void foldTailRow(FoldTailParams const& p, int i, int 
 //! The whole tail from one warp of a running kernel (lane = threadIdx.x % 32): rows i < *p.ctrl in order.
 __device__ __forceinline__ void foldTailWarp(FoldTailParams const& p, int lane)
 {
-    int const rows = *p.ctrl;
+    int const rows = min(*p.ctrl, p.maxRows);
     for (int i = 0; i < rows; ++i)
     {
         foldTailRow(p, i, lane);

@@ -24,7 +24,8 @@ def gen(seed: int) -> torch.Generator:
     return torch.Generator(device="cuda").manual_seed(seed)
 
 
-assert torch.cuda.is_available(), "m3_draft_silu requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_draft_silu requires a CUDA device", allow_module_level=True)
 
 ALL = torch.arange(-(1 << 15), 1 << 15, dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
 

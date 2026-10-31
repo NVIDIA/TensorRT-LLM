@@ -32,7 +32,7 @@ namespace
 __global__ void __launch_bounds__(32) foldTailKernel(FoldTailParams const p)
 {
     int const i = blockIdx.x;
-    if (i >= *p.ctrl)
+    if (i >= *p.ctrl || i >= p.maxRows)
     {
         return;
     }

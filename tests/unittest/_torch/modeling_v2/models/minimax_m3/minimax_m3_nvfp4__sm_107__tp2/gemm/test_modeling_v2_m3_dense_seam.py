@@ -22,7 +22,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     op as gemv,
 )
 
-assert torch.cuda.is_available(), "the dense seam test requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the dense seam test requires a CUDA device", allow_module_level=True)
 
 ALPHA, LIMIT, BETA = 1.702, 7.0, 1.0
 ROWS = list(range(1, modeling.TINY_MAX_TOKENS + 1))

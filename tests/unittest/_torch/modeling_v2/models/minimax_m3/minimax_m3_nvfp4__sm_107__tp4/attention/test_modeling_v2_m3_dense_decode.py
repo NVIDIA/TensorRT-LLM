@@ -31,7 +31,8 @@ from tensorrt_llm._torch.attention.backends.fmha.msa_decode import dense_decode_
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_dense_decode requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_dense_decode requires a CUDA device", allow_module_level=True)
 
 PAGE = 32
 SUBPAGES = 2

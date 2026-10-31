@@ -53,7 +53,7 @@ class _FakeComm:
 
     def __init__(self, world):
         self.world = world
-        self.barrier = threading.Barrier(world)
+        self.barrier = threading.Barrier(world, timeout=10)
         self.lock = threading.Lock()
         self.vals = []
         self.calls = 0
@@ -78,7 +78,7 @@ def _mapping(tp_size=2, adp=False):
     return SimpleNamespace(tp_size=tp_size, enable_attention_dp=adp, tp_group=list(range(tp_size)))
 
 
-def _run_ranks(fns):
+def _run_ranks(fns, comm):
     out, errs = [None] * len(fns), []
 
     def run(i):
@@ -86,12 +86,18 @@ def _run_ranks(fns):
             out[i] = fns[i]()
         except BaseException as e:  # noqa: BLE001
             errs.append(e)
+            comm.barrier.abort()
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(len(fns))]
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
+    if any(t.is_alive() for t in threads):
+        comm.barrier.abort()
+        for t in threads:
+            t.join(timeout=10)
+    assert not any(t.is_alive() for t in threads), "rank worker did not terminate"
     assert not errs, errs
     return out
 
@@ -127,7 +133,9 @@ def test_tp_agree_refuses_capture(monkeypatch):
 @pytest.mark.parametrize("oks", [(True, True), (True, False), (False, True), (False, False)])
 def test_tp_agree_built_two_ranks(two_rank_comm, oks):
     built = [object() if ok else None for ok in oks]
-    out = _run_ranks([lambda i=i: mc.tp_agree_built(_mapping(2), built[i], "t") for i in range(2)])
+    out = _run_ranks(
+        [lambda i=i: mc.tp_agree_built(_mapping(2), built[i], "t") for i in range(2)], two_rank_comm
+    )
     assert out == (built if all(oks) else [None, None])
 
 
@@ -156,7 +164,7 @@ def _core(fail: bool, world: int = 2) -> SimpleNamespace:
 def test_engine_build_agreed_across_ranks(monkeypatch, world, failing):
     comm = _patch_comm(monkeypatch, world)
     cores = [_core(rank in failing, world) for rank in range(world)]
-    _run_ranks([lambda c=c: c._prebuild_engines(3) for c in cores])
+    _run_ranks([lambda c=c: c._prebuild_engines(3) for c in cores], comm)
     keys = sorted(cores[0].moe_engines[3])
     assert keys and comm.calls == world * len(keys)
     assert not any(hasattr(c, "moe16_engines") for c in cores)

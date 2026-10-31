@@ -38,6 +38,7 @@ def _gqa_sparse_decode_mq_kernel(
     sm_scale,
     stride_qn,
     stride_qh,
+    stride_qd,
     stride_k_blk,
     stride_k_pos,
     stride_v_blk,
@@ -96,7 +97,7 @@ def _gqa_sparse_decode_mq_kernel(
     n_mask = off_n < n_valid
 
     q = tl.load(
-        q_ptr + tok[:, None] * stride_qn + row_h[:, None] * stride_qh + off_d[None, :],
+        q_ptr + tok[:, None] * stride_qn + row_h[:, None] * stride_qh + off_d[None, :] * stride_qd,
         mask=r_mask[:, None],
         other=0.0,
     ).to(tl.float16)
@@ -208,6 +209,7 @@ def launch_mq_producer(
         sm_scale,
         q.stride(0),
         q.stride(1),
+        q.stride(2),
         k_paged.stride(0),
         k_paged.stride(2),
         v_paged.stride(0),

@@ -3,11 +3,14 @@
 """Packing a decode step's small input copies into one upload and one scatter launch."""
 
 import threading
+import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
 from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache, copy_h2d_if_changed
 from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 
@@ -723,6 +726,7 @@ def _step(pack, graph, dsts, values, overlap=False, flush=True):
             step_inputs.discard()
             step_inputs.flush(in_graph=True)
     graph.replay()
+    pack.on_graph_replay()
 
 
 def test_in_graph_pack_is_issued_by_the_replay():
@@ -942,3 +946,53 @@ def test_eager_flush_does_not_advance_the_step_epoch():
     torch.cuda.synchronize()
     assert dst.tolist() == [1, 2, 3, 4]
     assert int(pack.epoch.item()) == start
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_graph_window_keeps_temporary_device_sources_until_replay(early):
+    pack, graph, (a, b, c), out = _graph_case(early)
+    source = torch.arange(16, device="cuda", dtype=a.dtype)
+    source_ref = weakref.ref(source)
+    with step_inputs.active(pack):
+        step_inputs.begin()
+        step_inputs.copy_(a, source)
+        del source
+        step_inputs.flush(in_graph=True)
+    assert source_ref() is not None
+    overwrite = torch.full((16,), -7, device="cuda", dtype=a.dtype)
+    graph.replay()
+    pack.on_graph_replay()
+    torch.cuda.synchronize()
+    assert out[:16].tolist() == list(range(16))
+    assert overwrite.eq(-7).all()
+    assert source_ref() is None
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_replay_with_a_different_pack_issues_its_copies_eagerly(early):
+    captured, graph, (a, b, c), out = _graph_case(early)
+    _step(captured, graph, (a, b, c), (list(range(16)), list(range(16))))
+    active = StepInputPack(_device(), parallel_scatter=True, in_graph=True, early_copy=early)
+    key = KeyType(batch_size=16, draft_len=0)
+    metadata = object()
+    runner = object.__new__(CUDAGraphRunner)
+    runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
+    runner.shared_static_tensors = {"input_ids": a, "position_ids": b.view(1, 16)}
+    runner.config = SimpleNamespace(use_mrope=False)
+    runner._check_strict_buffer_stability = lambda meta: None
+    runner._get_num_tokens_for_key = lambda key: 16
+    runner._step_input_prologue_keys = {key: captured}
+    runner._pre_replay_hooks = []
+    runner.graphs = {key: graph}
+    runner.graph_outputs = {key: out}
+    inputs = {
+        "attn_metadata": metadata,
+        "input_ids": torch.full_like(a, 77),
+        "position_ids": torch.full_like(b.view(1, 16), 88),
+    }
+    with step_inputs.active(active):
+        step_inputs.begin()
+        runner.replay(key, inputs)
+    torch.cuda.synchronize()
+    assert out[:16].tolist() == [77] * 16
+    assert out[16:32].tolist() == [88] * 16

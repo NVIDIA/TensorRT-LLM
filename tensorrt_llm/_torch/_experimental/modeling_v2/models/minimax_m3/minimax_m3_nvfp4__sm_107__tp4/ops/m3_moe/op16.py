@@ -151,9 +151,9 @@ class M3Moe16State:
             raise RuntimeError(f"m3_moe16: {why}")
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         self.num_ctas = num_ctas or M16_NUM_CTAS
-        if not 128 <= self.num_ctas <= sms - SHARED_CTAS:
+        if self.num_ctas != 128 or self.num_ctas + SHARED_CTAS > sms:
             raise ValueError(
-                f"m3_moe16 runs 128 .. {sms - SHARED_CTAS} routed CTAs + {SHARED_CTAS} shared (all resident)"
+                f"m3_moe16 requires exactly 128 routed CTAs + {SHARED_CTAS} shared (all resident)"
             )
         self.m = num_tokens
         plan, nb_cap = make_phase_plan16(self.num_ctas, num_tokens, M16_LAG)

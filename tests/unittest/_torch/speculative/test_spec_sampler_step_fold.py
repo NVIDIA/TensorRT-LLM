@@ -276,7 +276,14 @@ def test_store_copies_go_on_the_side_stream_when_the_sampler_stored_the_rows():
 @pytest.mark.parametrize("draft_width", [MAX_DRAFT_LEN, MAX_DRAFT_LEN - 1])
 def test_side_stream_store_copies_match_the_main_stream_copies(draft_width):
     scheduled, outputs = _step(draft_width)
-    on_main = _host_outputs(_sampler().sample_async(scheduled, outputs, []))
+    main_sampler = _sampler()
+    expected = _reference_store(_store_snapshot(main_sampler), outputs)
+    for name, tensor in expected.items():
+        getattr(main_sampler.store, name).copy_(tensor)
+    main_sampler.bind_spec_step_fold(_fold(rows_stored=True))
+    main_state = main_sampler.sample_async(scheduled, outputs, [])
+    assert main_state.sampler_event.side_stream_event is None
+    on_main = _host_outputs(main_state)
     sampler = _sampler()
     sampler.d2h_side_stream_copies = True
 

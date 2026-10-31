@@ -24,9 +24,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     tactic_for,
 )
 
-assert torch.cuda.is_available(), "the push variants require a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the push variants require a CUDA device", allow_module_level=True)
 
-H, MAXT, EMPTY = 6144, 8, -2147483648
+H, MAXT, EMPTY = 6144, 16, -2147483648
 # The boundary linears (output width H): o_proj and down, each certified row count on split-K or an even direct width,
 # up to the 8-token bucket the push arms on (ops/m3_draft_lowm.arm_push); the batch-4/8 rows past it run unpushed.
 CELLS = [
@@ -34,9 +35,11 @@ CELLS = [
     for nk, rows in sorted(ROWS.items())
     if nk[0] == H and nk[1] != 18432  # o_proj / down, not the fc
     for m in rows
-    if m <= MAXT
+    if m <= 8
     and (tactic_for(nk[0], nk[1], m)[0] == "s" or tactic_for(nk[0], nk[1], m)[1][1] % 2 == 0)
 ]
+# Two output-row tiles must populate distinct exchange rows.
+CELLS.append((6144, 16, "s", (64, 8, 2, 10)))
 
 
 def _expected_words(y: torch.Tensor, flags: torch.Tensor, world: int, rank: int) -> torch.Tensor:

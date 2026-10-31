@@ -219,10 +219,38 @@ _PRETILED: Dict[tuple, tuple] = {}
 
 def _pretiled(gu8, gusf8, dn8, dnsf8) -> torch.Tensor:
     key = (gu8.device, gu8.data_ptr(), gusf8.data_ptr(), dn8.data_ptr(), dnsf8.data_ptr())
+    sources = (gu8, gusf8, dn8, dnsf8)
+    versions = (
+        None if any(t.is_inference() for t in sources) else tuple(t._version for t in sources)
+    )
     hit = _PRETILED.get(key)
-    if hit is None:
-        hit = _PRETILED[key] = ((gu8, gusf8, dn8, dnsf8), _pretile_shared(gu8, gusf8, dn8, dnsf8))
+    if hit is None or versions is None or hit[2] != versions:
+        tiled = _pretile_shared(*sources)
+        if hit is not None:
+            # Reuse the layer's allocation across token-count states. Inference tensors
+            # have no mutation version, so rebuilding must refresh their contents.
+            with torch.inference_mode():
+                hit[1].copy_(tiled)
+            tiled = hit[1]
+        hit = _PRETILED[key] = (sources, tiled, versions)
     return hit[1]
+
+
+def _validate_output(out: torch.Tensor, m: int, device: torch.device) -> None:
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if (
+        out.dtype != torch.bfloat16
+        or tuple(out.shape) != (m, HIDDEN)
+        or not out.is_contiguous()
+        or not out.is_cuda
+        or out.device != device
+        or out.data_ptr() % 16 != 0
+    ):
+        raise ValueError(
+            f"m3_moe: out must be 16-byte aligned contiguous bf16 [{m}, {HIDDEN}] on {device}"
+        )
 
 
 def make_phase_plan(
@@ -312,7 +340,10 @@ class M3MoeState:
                 "M3MoeState allocates and compiles: build it before CUDA-graph capture"
             )
         sms_all = torch.cuda.get_device_properties(device).multi_processor_count
-        if shared and (num_ctas or sms_all) + SHARED_CTAS > sms_all:
+        resolved_ctas = (
+            (sms_all - SHARED_CTAS if shared else sms_all) if num_ctas is None else num_ctas
+        )
+        if shared and resolved_ctas + SHARED_CTAS > sms_all:
             raise ValueError(
                 f"m3_moe (shared): num_ctas + {SHARED_CTAS} shared-expert CTAs must fit the {sms_all} SMs "
                 f"(all resident at once)"
@@ -324,7 +355,7 @@ class M3MoeState:
         if not ok:
             raise RuntimeError(f"m3_moe: {why}")
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        self.num_ctas = num_ctas or sms
+        self.num_ctas = resolved_ctas
         if not MIN_CTAS <= self.num_ctas <= sms:
             raise ValueError(
                 f"m3_moe runs {MIN_CTAS} .. {sms} CTAs (all resident at once), not {self.num_ctas}"
@@ -430,6 +461,8 @@ class M3MoeState:
 
     def run(self, layer, hidden, out=None, arp=None) -> torch.Tensor:
         m = self.m
+        if out is not None:
+            _validate_output(out, m, self.device)
         if (
             hidden is None
             or hidden.dtype != torch.bfloat16
@@ -575,7 +608,12 @@ class M3MoeLayer:
             [fc31_alpha, fc31_scale_c, act_alpha, act_beta, act_clamp, fc2_alpha]
         ).float()
         self.escal = self.escal.reshape(6, e).contiguous()
-        self.bias = bias.float().contiguous()
+        device = torch.device(state.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        if bias.numel() != e or not bias.is_cuda or bias.device != device:
+            raise ValueError(f"m3_moe: routing bias must have {e} elements on {device}")
+        self.bias = bias.float().reshape(e).contiguous()
         if (
             router_weight is None
             or fc31_input_scale is None

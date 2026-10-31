@@ -46,7 +46,8 @@ void minimaxM3Sm107Tp8DrafterRopeFp8Kv(torch::Tensor const& qkv, torch::Tensor c
             && cosSin.numel() % rotaryDim == 0,
         "cos_sin must be the fp32 [positions, rotary_dim / 2] (cos, sin) table");
     int64_t const requests = qkv.size(0) / qLen;
-    TORCH_CHECK(seqLens.is_cuda() && seqLens.scalar_type() == at::kInt && seqLens.numel() >= requests);
+    TORCH_CHECK(seqLens.is_cuda() && seqLens.is_contiguous() && seqLens.scalar_type() == at::kInt
+        && seqLens.numel() >= requests);
     if (specPositionOffsets.has_value())
     {
         TORCH_CHECK(specPositionOffsets->is_cuda() && specPositionOffsets->is_contiguous()

@@ -145,9 +145,11 @@ void minimaxM3Sm107Tp8DraftStep(torch::Tensor const& x, OptTensor const& xRows, 
         TORCH_CHECK(x.size(0) >= rows, "draft_step: x must hold a row per request");
     }
     TORCH_CHECK(world >= 1 && rank >= 0 && rank < world, "draft_step: rank / world");
-    TORCH_CHECK(keys.scalar_type() == at::kLong && keys.numel() >= rows, "draft_step: keys must be int64 [>= rows]");
-    TORCH_CHECK(counters.scalar_type() == at::kInt && counters.numel() >= 2, "draft_step: counters must be int32 [2]");
-    TORCH_CHECK(wsUc.scalar_type() == at::kLong && wsUc.numel() >= 2 * ds::kMaxTokens * world,
+    TORCH_CHECK(keys.is_contiguous() && keys.scalar_type() == at::kLong && keys.numel() >= rows,
+        "draft_step: keys must be int64 [>= rows]");
+    TORCH_CHECK(counters.is_contiguous() && counters.scalar_type() == at::kInt && counters.numel() >= 2,
+        "draft_step: counters must be int32 [2]");
+    TORCH_CHECK(wsUc.is_contiguous() && wsUc.scalar_type() == at::kLong && wsUc.numel() >= 2 * ds::kMaxTokens * world,
         "draft_step: ws_uc must hold [2][8][world] slots");
     TORCH_CHECK(draftOut.scalar_type() == at::kInt && draftOut.dim() == 2 && draftOut.stride(1) == 1
             && draftOut.size(0) >= rows && step >= 0 && step < draftOut.size(1),

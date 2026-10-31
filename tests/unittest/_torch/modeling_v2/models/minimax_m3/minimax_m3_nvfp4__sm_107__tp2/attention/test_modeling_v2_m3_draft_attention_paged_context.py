@@ -26,7 +26,8 @@ __extra_import_path__ = ["../../../..", "."]
 import _m3_attn_runtime_tp2 as rt  # noqa: E402 — needs the path declared above
 from _validating import ULP, assert_within_ulp  # noqa: E402
 
-assert torch.cuda.is_available(), "m3_draft_attention requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_draft_attention requires a CUDA device", allow_module_level=True)
 pytestmark = pytest.mark.skipif(
     get_sm_version() != 107, reason="the SM107 thop paged-context path (no TRTLLM-Gen FMHA)"
 )
@@ -88,6 +89,20 @@ def _prepare(metadata, request_ids, qlens, cached, num_contexts: int) -> None:
     metadata.prepare()
 
 
+def _rope(x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    """NeoX RoPE over the whole head at the drafter's theta, float64."""
+    half = rt.HEAD_DIM // 2
+    inv_freq = rt.DRAFT_ROPE_THETA ** (
+        -torch.arange(0, rt.HEAD_DIM, 2, dtype=torch.float64, device=x.device) / rt.HEAD_DIM
+    )
+    angles = positions.to(torch.float64)[:, None] * inv_freq[None, :]
+    x = x.to(torch.float64)
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat(
+        [x1 * angles.cos() - x2 * angles.sin(), x2 * angles.cos() + x1 * angles.sin()], -1
+    )
+
+
 @pytest.mark.parametrize("case", _CASES, ids=[c[0] for c in _CASES])
 def test_paged_context_at_128_token_pages(case) -> None:
     name, cached, qlens, contexts = case
@@ -147,6 +162,13 @@ def test_paged_context_at_128_token_pages(case) -> None:
             slots = rt.flat_slots(manager, rt.DRAFT, rid, positions).long()
             rows = qkv[first : first + n]
             for h in range(rt.KV_HEADS):
+                k_cols = q_size + h * rt.HEAD_DIM
+                want_k = _rope(rows[:, k_cols : k_cols + rt.HEAD_DIM].float(), positions)
+                got_k = pool[slots // rt.PAGE, 0, h, slots % rt.PAGE].to(torch.float64)
+                step = want_k.abs().clamp_min(2.0**-6) * 2.0**-3
+                assert bool(((got_k - want_k).abs() <= step).all()), (
+                    f"K head {h} is appended rotated, in E4M3"
+                )
                 v_cols = q_size + (rt.KV_HEADS + h) * rt.HEAD_DIM
                 want_v = rows[:, v_cols : v_cols + rt.HEAD_DIM].to(torch.float8_e4m3fn)
                 got_v = pool[slots // rt.PAGE, 1, h, slots % rt.PAGE]

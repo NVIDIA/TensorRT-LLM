@@ -17,7 +17,8 @@ __extra_import_path__ = ["../../../..", "."]
 from _m3_spec_inputs import gen, seed_of  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_sampled_accept requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_sampled_accept requires a CUDA device", allow_module_level=True)
 
 DRAFT_LEN = 3
 #: Hot tokens of the distribution cells; every other logit sits 22 below the top (mass ~ 1e-5 of the total).

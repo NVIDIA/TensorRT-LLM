@@ -25,7 +25,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 __extra_import_path__ = ["../../../..", "."]
 from _m3_moe_operands import hidden_states, layer_for  # noqa: E402
 
-assert torch.cuda.is_available(), "m3_moe_engine requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_moe_engine requires a CUDA device", allow_module_level=True)
 
 SHIPPED = engine_op.SH_TAKE_BY_M
 GATED = (0, 0, 0, 0, 0, 1, 1, 1)

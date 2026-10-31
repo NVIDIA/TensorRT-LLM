@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp8/foldTail.h"
 
+#include <limits>
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -54,8 +55,11 @@ inline tensorrt_llm::kernels::minimaxM3Sm107Tp8::FoldTailParams buildParams(torc
         "minimax_m3_sm107_tp8_fold_tail: ctrl must be an int32 CUDA tensor");
     TORCH_CHECK(slots.is_cuda() && slots.scalar_type() == torch::kInt64 && slots.dim() == 1 && slots.stride(0) == 1,
         "minimax_m3_sm107_tp8_fold_tail: slots must be a contiguous 1-D int64 CUDA tensor");
-    TORCH_CHECK(rows > 0 && tokensPerStep > 0 && tokensPerStep <= kMaxWidth,
+    TORCH_CHECK(
+        rows > 0 && rows <= std::numeric_limits<int32_t>::max() && tokensPerStep > 0 && tokensPerStep <= kMaxWidth,
         "minimax_m3_sm107_tp8_fold_tail: rows must be positive and tokens_per_step in [1, 32]");
+    TORCH_CHECK(
+        rows <= std::numeric_limits<int32_t>::max() / tokensPerStep, "fold_tail: staging indices must fit int32");
     check2d(srcNew, "src_new");
     check2d(dstNew, "dst_new");
     check2d(srcNext, "src_next");
@@ -68,7 +72,14 @@ inline tensorrt_llm::kernels::minimaxM3Sm107Tp8::FoldTailParams buildParams(torc
     check1d(draftIds, "draft_ids");
     check1d(posOff, "pos_off");
     check1d(kvOff, "kv_off");
+    TORCH_CHECK(slots.numel() >= rows && srcNew.size(0) >= rows && srcNext.size(0) >= rows && srcDraft.size(0) >= rows
+            && srcLens.numel() >= rows && kvOff.numel() >= rows,
+        "minimax_m3_sm107_tp8_fold_tail: source and slot buffers must hold rows entries");
+    TORCH_CHECK(ids.numel() >= rows * tokensPerStep && posOff.numel() >= rows * tokensPerStep
+            && draftIds.numel() >= rows * (tokensPerStep - 1),
+        "minimax_m3_sm107_tp8_fold_tail: staging outputs are too small for rows * tokens_per_step");
     tensorrt_llm::kernels::minimaxM3Sm107Tp8::FoldTailParams p{};
+    p.maxRows = static_cast<int32_t>(rows);
     p.ctrl = ctrl.data_ptr<int32_t>();
     p.slots = slots.data_ptr<int64_t>();
     p.srcNew = srcNew.data_ptr<int32_t>();

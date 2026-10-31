@@ -39,7 +39,8 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 
 dispatch = modeling
 
-assert torch.cuda.is_available(), "the prebuild checks require a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("the prebuild checks require a CUDA device", allow_module_level=True)
 
 INDEX_HEADS = 4
 INDEX_DIM = 128

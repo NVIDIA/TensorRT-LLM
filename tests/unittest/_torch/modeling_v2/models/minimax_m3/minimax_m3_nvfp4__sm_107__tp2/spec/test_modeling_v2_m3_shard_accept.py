@@ -27,7 +27,8 @@ from _m3_spec_inputs import (  # noqa: E402
 )
 from _validating import certifying, validating  # noqa: E402, F401
 
-assert torch.cuda.is_available(), "m3_shard_accept requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_shard_accept requires a CUDA device", allow_module_level=True)
 
 
 def _case(spec, seed, edit_logits=None):

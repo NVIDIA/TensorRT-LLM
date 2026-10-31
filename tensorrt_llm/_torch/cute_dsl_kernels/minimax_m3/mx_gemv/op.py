@@ -120,7 +120,16 @@ def get_config(n: int, k: int, m: Optional[int] = None) -> Optional[tuple]:
 def _declines(n: int, k: int, m: int, x_bf16: bool, cfg: tuple) -> bool:
     """Whether a (split, ring, ...) config declines an [M, K] x [N, K]^T call on shape grounds."""
     split = cfg[0]
-    if not 0 < m <= MAX_TOKENS or 128 % split != 0 or (k // 128) % split != 0:
+    if (
+        not 0 < m <= MAX_TOKENS
+        or n <= 0
+        or k <= 0
+        or n % 128
+        or k % 128
+        or split <= 0
+        or 128 % split != 0
+        or (k // 128) % split != 0
+    ):
         return True
     tiles = k // 128 // split
     mma_n = _mma_n(m)
@@ -316,6 +325,8 @@ def _run(
     last_uncompiled = None
     import cuda.bindings.driver as cuda_driver
 
+    if x.dim() != 2 or weight.dim() != 2 or not x.is_contiguous() or not weight.is_contiguous():
+        return None
     m, k = x.shape
     if x_swiglu:
         k //= 2
@@ -363,6 +374,8 @@ def precompile(
     runtime arguments, so none is needed here). Runs outside capture, even while compiles are frozen."""
     import cuda.bindings.driver as cuda_driver
 
+    if weight.dim() != 2 or not weight.is_contiguous():
+        return None
     n, k = weight.shape
     push = None if ar is None else (0, 0, 0, *ar)
     resolved = _resolve(m, n, k, x_bf16, True, None, use_pdl, push, x_swiglu)
@@ -495,27 +508,14 @@ def ensure_compiled(weight: torch.Tensor, weight_scale: torch.Tensor, use_pdl: b
     if (
         weight.dim() != 2
         or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_contiguous()
         or get_config(*weight.shape) is None
     ):
         return
     n, k = weight.shape
     if (n, k, use_pdl) in _ensured:
         return
+    for width in (1, *MMA_WIDTHS[1:]):
+        precompile(weight, weight_scale, width, x_bf16=False, use_pdl=use_pdl)
+    precompile(weight, weight_scale, 1, x_bf16=True, use_pdl=use_pdl)
     _ensured.add((n, k, use_pdl))
-    xq = torch.zeros(1, k, dtype=torch.float8_e4m3fn, device=weight.device)
-    xsf = torch.full((128 * (k // 32),), 127, dtype=torch.uint8, device=weight.device)
-    m3_mx_gemv(xq, xsf, weight, weight_scale, use_pdl=use_pdl)
-    for width in MMA_WIDTHS[1:]:
-        m3_mx_gemv(
-            torch.zeros(width, k, dtype=torch.float8_e4m3fn, device=weight.device),
-            xsf,
-            weight,
-            weight_scale,
-            use_pdl=use_pdl,
-        )
-    m3_mx_gemv_bf16(
-        torch.zeros(1, k, dtype=torch.bfloat16, device=weight.device),
-        weight,
-        weight_scale,
-        use_pdl=use_pdl,
-    )

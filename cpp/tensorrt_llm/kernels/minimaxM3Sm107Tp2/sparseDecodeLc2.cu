@@ -29,6 +29,9 @@
 
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp2/sparseDecodeLc2.h"
 
+#include <mutex>
+#include <unordered_set>
+
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -588,10 +591,21 @@ cudaError_t launch(Params const& prm, int num_tokens, bool use_pdl, cudaStream_t
 {
     // Kernel attributes are set once per process, on the first launch (outside CUDA-graph capture: warmup runs
     // every variant eagerly first).
-    static cudaError_t const configured = configure<LINEAR, MXFP8, EARLY, PREWAIT>();
-    if (configured != cudaSuccess)
+    int device;
+    cudaError_t const deviceStatus = cudaGetDevice(&device);
+    if (deviceStatus != cudaSuccess)
+        return deviceStatus;
+    static std::mutex configMutex;
+    static std::unordered_set<int> configuredDevices;
     {
-        return configured;
+        std::lock_guard<std::mutex> lock(configMutex);
+        if (configuredDevices.count(device) == 0)
+        {
+            cudaError_t const configured = configure<LINEAR, MXFP8, EARLY, PREWAIT>();
+            if (configured != cudaSuccess)
+                return configured;
+            configuredDevices.insert(device);
+        }
     }
     auto kernel = m3_lc_attn_kernel<LINEAR, MXFP8, EARLY, PREWAIT>;
     cudaLaunchConfig_t cfg = {};

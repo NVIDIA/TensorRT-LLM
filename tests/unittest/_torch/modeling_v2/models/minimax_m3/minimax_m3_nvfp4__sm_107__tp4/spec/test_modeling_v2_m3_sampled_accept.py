@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(
     reason="the sm_107 TP4 target runs on SM107 only",
 )
 
-assert torch.cuda.is_available(), "m3_sampled_accept requires a CUDA device"
+if not torch.cuda.is_available():
+    pytest.skip("m3_sampled_accept requires a CUDA device", allow_module_level=True)
 
 DRAFT_LEN = 3
 #: Hot tokens of the distribution cells; every other logit sits 22 below the top (mass ~ 1e-5 of the total).
