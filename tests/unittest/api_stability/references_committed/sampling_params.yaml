@@ -18,8 +18,8 @@ methods:
         annotation: Optional[int]
         default: null
       max_tokens:
-        annotation: int
-        default: 32
+        annotation: Optional[int]
+        default: null
       min_tokens:
         annotation: Optional[int]
         default: null
