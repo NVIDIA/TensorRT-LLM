@@ -3207,6 +3207,113 @@ def test_dsml_string_parameter_values_are_kept_as_written(
                               for call in calls)) == arguments
 
 
+_DS_V3_CALL = ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+               'get_weather\n```json\n{"location": "Tokyo"}\n```'
+               "<｜tool▁call▁end｜><｜tool▁calls▁end｜>")
+_DS_V31_CALL = ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+                '{"location": "Tokyo"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>')
+
+
+@pytest.mark.parametrize(
+    "parser_cls, deltas",
+    [
+        # The closing fence and both end tokens arrive in the last delta.
+        (DeepSeekV3Parser, [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            'get_weather\n```json\n{"location": "Tokyo"}',
+            "\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ]),
+        (DeepSeekV3Parser, [_DS_V3_CALL]),
+        (DeepSeekV31Parser, [_DS_V31_CALL]),
+        # A call without arguments: the separator, the empty arguments and
+        # the end tokens arrive together.
+        (DeepSeekV31Parser, [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather",
+            "<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        ]),
+        # A stray fence after the call is not part of the arguments.
+        (DeepSeekV3Parser, [
+            _DS_V3_CALL.replace("<｜tool▁calls▁end｜>",
+                                "\n```json\n<｜tool▁calls▁end｜>")
+        ]),
+    ],
+    ids=[
+        "v3_fence_in_last_delta", "v3_whole_call", "v31_whole_call",
+        "v31_no_arguments", "v3_stray_fence_after_call"
+    ],
+)
+def test_deepseek_finish_completes_a_call_from_the_last_delta(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """finish() completes a tool call whose end came in the last delta.
+
+    Several tokens per delta (speculative decoding, stream_interval) can put
+    the end of a call, or the whole call, in the last delta.
+    """
+    parser = parser_cls()
+    results = [
+        parser.parse_streaming_increment(delta, sample_tools)
+        for delta in deltas
+    ]
+    results.append(parser.finish(sample_tools))
+
+    streamed = {}
+    for result in results:
+        for call in result.calls:
+            name, arguments = streamed.get(call.tool_index, (None, ""))
+            streamed[call.tool_index] = (call.name
+                                         or name, arguments + call.parameters)
+    whole = parser_cls().detect_and_parse("".join(deltas), sample_tools)
+    assert [
+        (name, json.loads(arguments)) for name, arguments in streamed.values()
+    ] == [(call.name, json.loads(call.parameters)) for call in whole.calls]
+    assert [call["arguments"] for call in parser.prev_tool_call_arr
+            ] == [json.loads(call.parameters) for call in whole.calls]
+
+
+@pytest.mark.parametrize(
+    "parser_cls, deltas",
+    [
+        # Two calls in one delta: the streamed arguments of the first call
+        # already come from the second, so sending the second would repeat it.
+        (DeepSeekV3Parser, [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            'get_weather\n```json\n{"location": "a"}\n```<｜tool▁call▁end｜>'
+            "<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            'get_weather\n```json\n{"loc',
+            'ation": "Tokyo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        ]),
+        # The second call's separator arrived while the first call was open.
+        (DeepSeekV31Parser, [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+            '{"location": "a"', ', "unit"',
+            ': "c"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>',
+            '{"location": "P'
+        ]),
+        # The call has no end token.
+        (DeepSeekV3Parser,
+         [_DS_V3_CALL.replace("<｜tool▁call▁end｜><｜tool▁calls▁end｜>", "")]),
+        (DeepSeekV31Parser,
+         [_DS_V31_CALL.replace("<｜tool▁call▁end｜>", "<｜tool▁call▁en")]),
+    ],
+    ids=[
+        "v3_two_calls_in_one_delta", "v31_second_call_open", "v3_no_end_token",
+        "v31_broken_end_token"
+    ],
+)
+def test_deepseek_finish_sends_nothing_when_the_buffer_is_ambiguous(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser], deltas: list[str]) -> None:
+    """finish() sends nothing unless the buffer holds exactly one whole call."""
+    parser = parser_cls()
+    for delta in deltas:
+        parser.parse_streaming_increment(delta, sample_tools)
+
+    result = parser.finish(sample_tools)
+
+    assert result.calls == []
+
+
 @pytest.mark.parametrize(
     "parser_cls, tool_call_text",
     [
@@ -3301,6 +3408,142 @@ def test_deepseek_streaming_prefix_is_delta_independent(
 
         assert streamed == prefix, f"{deltas!r} streamed {streamed!r}"
         assert names == ["get_weather"], f"{deltas!r} called {names!r}"
+
+
+def _deepseek_long_call(parser_cls: type[BaseToolParser],
+                        location: str) -> tuple[str, str, list[str]]:
+    """Split a get_weather call for streaming.
+
+    Returns the markup before the arguments, the arguments, and the tokens
+    after them.
+    """
+    if parser_cls is DeepSeekV3Parser:
+        return ("<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+                "get_weather\n```json\n", json.dumps({"location": location}),
+                ["\n```", "<｜tool▁call▁end｜>", "<｜tool▁calls▁end｜>"])
+    if parser_cls is DeepSeekV31Parser:
+        return (
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+            json.dumps({"location":
+                        location}), ["<｜tool▁call▁end｜>", "<｜tool▁calls▁end｜>"])
+    parser = parser_cls()
+    dsml = "<｜DSML｜ " if parser_cls is DeepSeekV41Parser else "<｜DSML｜"
+    close = dsml.replace("<", "</")
+    return (parser.bot_token + f'{dsml}invoke name="get_weather">'
+            f'{dsml}parameter name="location" string="true">', location,
+            [f"{close}parameter>", f"{close}invoke>", parser.eot_token])
+
+
+@pytest.mark.parametrize("parser_cls", [
+    DeepSeekV3Parser, DeepSeekV31Parser, DeepSeekV32Parser, DeepSeekV4Parser,
+    DeepSeekV41Parser
+])
+def test_deepseek_long_tool_call_streams_in_linear_time(
+        sample_tools: list[ChatCompletionToolsParam],
+        parser_cls: type[BaseToolParser]) -> None:
+    """A 64k-character argument streamed four characters per delta.
+
+    A linear parse takes about a second; one that rescans the buffer on every
+    increment takes tens of seconds, well past the bound.
+    """
+    location = "\n".join(["if (a > b) { p->x = q; } // ok"] * 2048)
+    head, body, tail = _deepseek_long_call(parser_cls, location)
+    deltas = [head] + [body[i:i + 4] for i in range(0, len(body), 4)] + tail
+    parser = parser_cls()
+    names, arguments = [], ""
+    start = time.monotonic()
+
+    for delta in deltas:
+        result = parser.parse_streaming_increment(delta, sample_tools)
+        names += [call.name for call in result.calls if call.name]
+        arguments += "".join(call.parameters for call in result.calls)
+
+    assert time.monotonic() - start < 10
+    assert names == ["get_weather"]
+    assert json.loads(arguments) == {"location": location}
+    whole = parser_cls().detect_and_parse("".join(deltas), sample_tools)
+    assert [(call.name, json.loads(call.parameters))
+            for call in whole.calls] == [("get_weather", {
+                "location": location
+            })]
+
+
+@pytest.mark.parametrize("chunk_size", range(1, 9))
+def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
+        sample_tools: list[ChatCompletionToolsParam], chunk_size: int) -> None:
+    """Two V3.1 calls with whitespace in their values, cut every few characters.
+
+    The cuts split the call end token, so a partial end token after complete
+    JSON must stay out of the arguments and still end the call.
+    """
+    calls = [("get_weather", '{"location": "a  b", "unit": "x \\n y"}'),
+             ("search_web", '{"query": "  P "}')]
+    text = ("<｜tool▁calls▁begin｜>" + "".join(
+        f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>\n{args}\n<｜tool▁call▁end｜>"
+        for name, args in calls) + "<｜tool▁calls▁end｜>")
+    parser = DeepSeekV31Parser()
+    names, arguments, content = [], {}, ""
+
+    for i in range(0, len(text), chunk_size):
+        result = parser.parse_streaming_increment(text[i:i + chunk_size],
+                                                  sample_tools)
+        content += result.normal_text
+        for call in result.calls:
+            if call.name:
+                names.append(call.name)
+            arguments[call.tool_index] = (arguments.get(call.tool_index, "") +
+                                          call.parameters)
+
+    assert names == [name for name, _ in calls]
+    assert content == ""
+    assert arguments == {i: args for i, (_, args) in enumerate(calls)}
+    assert [call["arguments"] for call in parser.prev_tool_call_arr
+            ] == [json.loads(args) for _, args in calls]
+
+
+@pytest.mark.parametrize("after_call", ["", " done"])
+def test_deepseek_v31_end_token_split_after_complete_json(
+        sample_tools: list[ChatCompletionToolsParam], after_call: str) -> None:
+    """The delta that completes the JSON ends inside the call end token.
+
+    The rest of the token arrives over two more deltas and is markup, so it
+    must not reach the content.
+    """
+    parser = DeepSeekV31Parser()
+    deltas = [
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+        '{"location": "Paris"}<｜tool▁call▁', "end", "｜>", after_call
+    ]
+    results = [
+        parser.parse_streaming_increment(delta, sample_tools)
+        for delta in deltas
+    ]
+    results.append(parser.finish(sample_tools))
+
+    calls = [call for result in results for call in result.calls]
+    assert [call.name for call in calls if call.name] == ["get_weather"]
+    assert "".join(call.parameters for call in calls) == '{"location": "Paris"}'
+    assert "".join(result.normal_text for result in results) == after_call
+    assert parser.prev_tool_call_arr[0]["arguments"] == {"location": "Paris"}
+
+
+@pytest.mark.parametrize("partial_token",
+                         ["<｜tool▁call▁en", "<｜tool▁calls▁e", "<｜tool▁ca"])
+def test_deepseek_v31_streams_text_before_a_partial_token(
+        sample_tools: list[ChatCompletionToolsParam],
+        partial_token: str) -> None:
+    """Only the possible token at the end of a delta is held back.
+
+    The text before it is sent at once, so a stream that ends there keeps it.
+    """
+    parser = DeepSeekV31Parser()
+
+    result = parser.parse_streaming_increment("Hello " + partial_token,
+                                              sample_tools)
+    finish_result = parser.finish(sample_tools)
+
+    assert result.normal_text + finish_result.normal_text == "Hello "
+    assert result.calls == finish_result.calls == []
 
 
 # ============================================================================
