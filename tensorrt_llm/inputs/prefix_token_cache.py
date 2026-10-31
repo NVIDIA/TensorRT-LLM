@@ -14,6 +14,14 @@ from there, and accepts the splice only if the first ``resync`` re-tokenized ids
 equal the cached ids over the same span. Otherwise the prompt is tokenized in
 full.
 
+A fast tokenizer encodes the text between its non-normalized added tokens (the
+chat template's role and message markers) piece by piece. Where that is exact,
+the cache splits there instead: entries end at an added token, so a tail needs no
+overlap or resync check, and the tail's pieces come from a second LRU keyed by
+piece text, so a prompt that does not extend a cached one (a first turn, an
+edited history) still reuses the pieces it shares with earlier prompts. Pieces
+not in that LRU are encoded in one batch call.
+
 Off by default; enable with the ``enable_tokenization_cache`` LLM argument.
 Each ``DefaultInputProcessor`` owns its own cache, so cached ids are never
 shared across tokenizers. Sizing knobs, eligibility rules, and measured effect
@@ -23,13 +31,18 @@ are documented in ``docs/source/features/prefix-tokenization-cache.md``.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from array import array
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import ClassVar, Mapping, Protocol, Sequence
 
+from tokenizers import Tokenizer
+from transformers import PreTrainedTokenizerFast
+
 from ..logger import logger
+from ..tokenizer import TransformersTokenizer
 
 __all__ = [
     "PrefixTokenCache",
@@ -48,6 +61,10 @@ LOG_EVERY_REQUESTS = 1000
 # text has that probe at the same position. The probe must be longer than any
 # suffix the chat template appends after the last message.
 PROBE_CHARS = 256
+# Piecewise mode re-tokenizes from a prompt's last added token, so it is used only when one
+# starts this close to the end, as chat templates' generation prompts do. Otherwise the offsets
+# splice, which backs off about this far, re-tokenizes less.
+PIECEWISE_TAIL_CHARS = 256
 
 
 class OffsetTokenizer(Protocol):
@@ -112,7 +129,99 @@ class _Entry:
     # token ``split_token``, which starts at character ``split_char``.
     split_token: int
     split_char: int
+    piecewise: bool  # split at an added token, so splicing pieces from it is exact
     probe: str  # the last PROBE_CHARS characters of ``text``
+
+
+# Charged per cached piece on top of its characters, for its dict entry and ids array.
+_PIECE_OVERHEAD_CHARS = 256
+
+
+class _PieceEncoder:
+    """Token ids of a text encoded piece by piece between added tokens, with an LRU of piece ids.
+
+    Thread-safe. Use :meth:`create`, which returns None unless splicing pieces
+    gives exactly ``tokenizer(text, add_special_tokens=False)``.
+    """
+
+    def __init__(self, backend: Tokenizer, added_ids: dict[str, int], max_chars: int) -> None:
+        self._backend = backend
+        self._added_ids = added_ids
+        # Longest first, so the leftmost match is the longest, as in the tokenizer's own split.
+        alternation = "|".join(re.escape(t) for t in sorted(added_ids, key=len, reverse=True))
+        self._split = re.compile(f"({alternation})")
+        self._max_chars = max_chars
+        self._lock = threading.Lock()
+        self._pieces: OrderedDict[str, array] = OrderedDict()  # LRU order
+        self._total_chars = 0
+
+    @classmethod
+    def create(cls, tokenizer: PreTrainedTokenizerFast, max_chars: int) -> _PieceEncoder | None:
+        backend = tokenizer.backend_tokenizer
+        added = {i: t for i, t in backend.get_added_tokens_decoder().items() if not t.normalized}
+        try:
+            serialized = backend.to_str()
+        except Exception:  # tokenizers raises a bare Exception for custom Python components
+            return None
+        # Tokens that absorb neighbouring spaces, a Metaspace that marks only the text's first
+        # word, or Python-side preprocessing make a piece's ids depend on more than the piece.
+        if (
+            not added
+            or tokenizer.split_special_tokens
+            or type(tokenizer)._encode_plus is not PreTrainedTokenizerFast._encode_plus
+            or any(t.lstrip or t.rstrip or t.single_word for t in added.values())
+            or '"prepend_scheme":"first"' in serialized
+        ):
+            return None
+        # A private copy: every HF call resets truncation and padding on its own backend.
+        backend = Tokenizer.from_str(serialized)
+        backend.no_truncation()
+        backend.no_padding()
+        encoder = cls(backend, {t.content: i for i, t in added.items()}, max_chars)
+        # A token with another inside it can match across the end of a cached prompt.
+        if any(encoder._split.search(t, 1, len(t) - 1) for t in encoder._added_ids):
+            return None
+        probe = "".join(f"a {t.content} 1\n{t.content}{t.content}b " for t in added.values())
+        expected = tokenizer(probe, add_special_tokens=False)["input_ids"]
+        return encoder if encoder.encode(probe)[0].tolist() == expected else None
+
+    def ends_near_added_token(self, text: str) -> bool:
+        return self._split.search(text, max(0, len(text) - PIECEWISE_TAIL_CHARS)) is not None
+
+    def encode(self, text: str) -> tuple[array, int, int]:
+        """Return the int32 ids of ``text`` and the token and char index of its last added token.
+
+        Both indices are 0 if ``text`` has no added token after its start.
+        """
+        # Pieces at even indices, added tokens at odd ones.
+        parts = self._split.split(text)
+        unique = dict.fromkeys(p for p in parts[::2] if p)
+        with self._lock:
+            known = {p: self._pieces[p] for p in unique if p in self._pieces}
+            for p in known:
+                self._pieces.move_to_end(p)
+        missing = [p for p in unique if p not in known]
+        if missing:
+            encodings = self._backend.encode_batch_fast(missing, add_special_tokens=False)
+            new = {p: array("i", e.ids) for p, e in zip(missing, encodings)}
+            known.update(new)
+            with self._lock:
+                for p, ids in new.items():
+                    if p not in self._pieces:
+                        self._pieces[p] = ids
+                        self._total_chars += len(p) + _PIECE_OVERHEAD_CHARS
+                while self._total_chars > self._max_chars:
+                    piece, _ = self._pieces.popitem(last=False)
+                    self._total_chars -= len(piece) + _PIECE_OVERHEAD_CHARS
+        ids, last_token, last_char, char = array("i"), 0, 0, 0
+        for i, part in enumerate(parts):
+            if i % 2:
+                last_token, last_char = len(ids), char
+                ids.append(self._added_ids[part])
+            elif part:
+                ids.extend(known[part])
+            char += len(part)
+        return ids, last_token, last_char
 
 
 class PrefixTokenCache:
@@ -127,8 +236,9 @@ class PrefixTokenCache:
     tokenized in full from then on: a cache bug must never fail a request.
     """
 
-    def __init__(self, config: PrefixTokenCacheConfig) -> None:
+    def __init__(self, config: PrefixTokenCacheConfig, pieces: _PieceEncoder | None = None) -> None:
         self._config = config
+        self._pieces = pieces
         self._lock = threading.Lock()
         self._entries: OrderedDict[int, _Entry] = OrderedDict()  # LRU order
         self._buckets: dict[int, dict[int, _Entry]] = {}
@@ -167,38 +277,60 @@ class PrefixTokenCache:
 
     def _encode(self, tokenizer: OffsetTokenizer, text: str) -> list[int]:
         found = self._lookup(text)
-        ids = None
-        if found is not None:
-            eid, entry = found
-            tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
-            if self._resynced(entry, tail_ids):
-                ids = entry.ids[: entry.split_token].tolist() + list(tail_ids)
-                base_token, base_char = entry.split_token, entry.split_char
-        if ids is None:
-            tail_ids, tail_offsets = self._tokenize(tokenizer, text)
-            ids, base_token, base_char = tail_ids, 0, 0
-
-        # Where a prompt extending this one will be re-tokenized from.
-        split_token = len(ids) - self._config.overlap
-        tail_index = split_token - base_token
+        entry = None if found is None else found[1]
+        piecewise = (
+            self._pieces is not None
+            and (entry is None or entry.piecewise)
+            and self._pieces.ends_near_added_token(text)
+        )
+        if piecewise:
+            ids, split_token, split_char, spliced = self._splice_pieces(entry, text)
+        else:
+            ids, split_token, split_char, spliced = self._splice_offsets(tokenizer, entry, text)
 
         with self._lock:
-            if found is None:
-                self.misses += 1
-            elif base_token == 0:
-                self.misses += 1
-                self.resync_failures += 1
-            else:
+            if spliced:
                 self.hits += 1
+            else:
+                self.misses += 1
+                if found is not None:
+                    self.resync_failures += 1
             if found is not None:
                 self._remove(found[0])
-            if split_token > 0 and tail_index >= 0:
-                self._insert(text, ids, split_token, base_char + tail_offsets[tail_index][0])
+            if split_token > 0:
+                self._insert(text, ids, split_token, split_char, piecewise)
             report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
             summary = self.summary() if report else None
         if summary is not None:
             logger.info(f"Prefix token cache: {summary}")
-        return ids
+        return ids.tolist()
+
+    def _splice_offsets(
+        self, tokenizer: OffsetTokenizer, entry: _Entry | None, text: str
+    ) -> tuple[array, int, int, bool]:
+        """Ids of ``text``, the split for a prompt extending it, and whether ``entry`` was used."""
+        spliced = False
+        if entry is not None:
+            tail_ids, tail_offsets = self._tokenize(tokenizer, text[entry.split_char :])
+            spliced = self._resynced(entry, tail_ids)
+        if spliced:
+            ids = entry.ids[: entry.split_token] + array("i", tail_ids)
+            base_token, base_char = entry.split_token, entry.split_char
+        else:
+            full_ids, tail_offsets = self._tokenize(tokenizer, text)
+            ids, base_token, base_char = array("i", full_ids), 0, 0
+        split_token = len(ids) - self._config.overlap
+        tail_index = split_token - base_token
+        if split_token <= 0 or tail_index < 0:
+            return ids, 0, 0, spliced
+        return ids, split_token, base_char + tail_offsets[tail_index][0], spliced
+
+    def _splice_pieces(self, entry: _Entry | None, text: str) -> tuple[array, int, int, bool]:
+        """Like :meth:`_splice_offsets`, but split at added tokens, where splicing is exact."""
+        base_token, base_char = (0, 0) if entry is None else (entry.split_token, entry.split_char)
+        tail, last_token, last_char = self._pieces.encode(text[base_char:])
+        ids = tail if entry is None else entry.ids[:base_token] + tail
+        return ids, base_token + last_token, base_char + last_char, entry is not None
 
     @staticmethod
     def _tokenize(
@@ -241,14 +373,16 @@ class PrefixTokenCache:
             # splice from; _remove() on it is a no-op.
         return best
 
-    def _insert(self, text: str, ids: Sequence[int], split_token: int, split_char: int) -> None:
+    def _insert(
+        self, text: str, ids: array, split_token: int, split_char: int, piecewise: bool
+    ) -> None:
         """Caller holds the lock."""
         key = self._bucket_key(text)
         bucket = self._buckets.setdefault(key, {})
         if any(entry.text == text for entry in bucket.values()):
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
-        entry = _Entry(text, array("i", ids), split_token, split_char, text[-PROBE_CHARS:])
+        entry = _Entry(text, ids, split_token, split_char, piecewise, text[-PROBE_CHARS:])
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)
@@ -287,5 +421,11 @@ def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
         )
         return None
     config = PrefixTokenCacheConfig.from_env()
-    logger.info(f"Prefix token cache enabled: {config}")
-    return PrefixTokenCache(config)
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    pieces = None
+    if isinstance(tokenizer, PreTrainedTokenizerFast):
+        pieces = _PieceEncoder.create(tokenizer, config.max_total_chars)
+    mode = "offsets" if pieces is None else "piecewise"
+    logger.info(f"Prefix token cache enabled ({mode}): {config}")
+    return PrefixTokenCache(config, pieces)
