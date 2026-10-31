@@ -21,41 +21,16 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include <cstdlib>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
+#include <variant>
 
 namespace
 {
-
-// RAII guard for cudaMalloc. Frees the pointer on destruction, logging a warning on failure.
-struct CudaMallocGuard
-{
-    void* ptr{nullptr};
-
-    explicit CudaMallocGuard(void* p) noexcept
-        : ptr(p)
-    {
-    }
-
-    ~CudaMallocGuard()
-    {
-        if (ptr)
-        {
-            TLLM_CUDA_CHECK_WARN(cudaFree(ptr));
-        }
-    }
-
-    void* release() noexcept
-    {
-        void* p = ptr;
-        ptr = nullptr;
-        return p;
-    }
-
-    CudaMallocGuard(CudaMallocGuard const&) = delete;
-    CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
-};
 
 // RAII guard for ncclMemAlloc. Frees the pointer on destruction, logging a warning on failure.
 struct NcclMemGuard
@@ -88,8 +63,153 @@ struct NcclMemGuard
 
 } // namespace
 
-namespace tensorrt_llm::common::nccl_util
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::nccl_util
 {
+
+void NcclCommResourceManager::registerHostCommunicator(ncclComm_t comm, HostCommunicator hostComm, int size, int rank)
+{
+    TLLM_CHECK_WITH_INFO(comm != nullptr, "NCCL communicator cannot be null");
+    int ncclSize = 0;
+    int ncclRank = 0;
+    TLLM_NCCL_CHECK(ncclCommCount(comm, &ncclSize));
+    TLLM_NCCL_CHECK(ncclCommUserRank(comm, &ncclRank));
+    TLLM_CHECK_WITH_INFO(size == ncclSize && rank == ncclRank,
+        "Host consensus communicator must match the NCCL communicator's size and rank order");
+    std::lock_guard<std::mutex> lock(mMutex);
+    mHostCommunicators.insert_or_assign(comm, std::move(hostComm));
+}
+
+void registerHostCommunicator(ncclComm_t comm, MPI_Comm hostComm, std::vector<int> const& ranks)
+{
+    TLLM_CHECK_WITH_INFO(hostComm != MPI_COMM_NULL, "Host MPI communicator cannot be null");
+    int rank = 0;
+    MPICHECK(MPI_Comm_rank(hostComm, &rank));
+    auto const it = std::find(ranks.begin(), ranks.end(), rank);
+    TLLM_CHECK_WITH_INFO(it != ranks.end(), "Current rank is not in the host subgroup");
+    NcclCommResourceManager::getInstance().registerHostCommunicator(
+        comm, NcclCommResourceManager::MpiHostGroup{hostComm, ranks}, ranks.size(), std::distance(ranks.begin(), it));
+}
+
+void registerHostCommunicator(
+    ncclComm_t comm, c10::intrusive_ptr<c10d::ProcessGroup> const& hostComm, std::vector<int> ranks)
+{
+    TLLM_CHECK_WITH_INFO(hostComm != nullptr, "Host process group cannot be null");
+    TLLM_CHECK_WITH_INFO(
+        hostComm->getBackend(c10::DeviceType::CPU) != nullptr, "Host consensus requires a CPU process-group backend");
+    if (ranks.empty())
+    {
+        ranks.resize(hostComm->getSize());
+        std::iota(ranks.begin(), ranks.end(), 0);
+    }
+    auto const it = std::find(ranks.begin(), ranks.end(), hostComm->getRank());
+    TLLM_CHECK_WITH_INFO(it != ranks.end(), "Current rank is not in the host subgroup");
+    int const rank = std::distance(ranks.begin(), it);
+    int const size = ranks.size();
+    NcclCommResourceManager::getInstance().registerHostCommunicator(comm,
+        NcclCommResourceManager::PgHostGroup{c10::weak_intrusive_ptr<c10d::ProcessGroup>(hostComm), std::move(ranks)},
+        size, rank);
+}
+
+NcclCommResourceManager::HostCommunicator NcclCommResourceManager::lookupHostCommunicator(ncclComm_t comm) const
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    auto const it = mHostCommunicators.find(comm);
+    TLLM_CHECK_WITH_INFO(it != mHostCommunicators.end(), "Matching host consensus communicator is missing");
+    return it->second;
+}
+
+namespace
+{
+
+bool mpiAllTrue(MPI_Comm comm, std::vector<int> const& ranks, bool localOk)
+{
+    mpi::MpiComm const hostMpi(comm, false);
+    int value = localOk;
+    if (ranks.size() == static_cast<size_t>(hostMpi.getSize()))
+    {
+        int allOk = 0;
+        hostMpi.allreduce(&value, &allOk, 1, mpi::MpiType::kINT32, mpi::MpiOp::MIN);
+        return allOk != 0;
+    }
+    auto const root = ranks.front();
+    auto const tag = mpi::MpiTag::kNcclWindowAllocation;
+    // Only subgroup members participate; no communicator is created during capture.
+    if (hostMpi.getRank() != root)
+    {
+        hostMpi.sendValue(value, root, tag);
+        hostMpi.recvValue(value, root, tag);
+        return value != 0;
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank == root)
+            continue;
+        int peerOk = 0;
+        hostMpi.recvValue(peerOk, rank, tag);
+        value = std::min(value, peerOk);
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank != root)
+            hostMpi.sendValue(value, rank, tag);
+    }
+    return value != 0;
+}
+
+bool pgAllTrue(c10::intrusive_ptr<c10d::ProcessGroup> const& pg, std::vector<int> const& ranks, bool localOk)
+{
+    int value = localOk;
+    pg_utils::PgHelper hostPg(pg);
+    if (ranks.size() == static_cast<size_t>(pg->getSize()))
+    {
+        PGCHECK_THROW(hostPg.allreduce(&value, {c10d::ReduceOp::MIN}));
+        return value != 0;
+    }
+    // Only subgroup members participate; no process group is created during capture.
+    auto const root = ranks.front();
+    int const tag = static_cast<int>(mpi::MpiTag::kNcclWindowAllocation);
+    if (pg->getRank() != root)
+    {
+        PGCHECK_THROW(hostPg.send(&value, root, tag));
+        PGCHECK_THROW(hostPg.recv(&value, root, tag));
+        return value != 0;
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank == root)
+        {
+            continue;
+        }
+        int peerOk = 0;
+        PGCHECK_THROW(hostPg.recv(&peerOk, rank, tag));
+        value = std::min(value, peerOk);
+    }
+    for (auto const rank : ranks)
+    {
+        if (rank != root)
+        {
+            PGCHECK_THROW(hostPg.send(&value, rank, tag));
+        }
+    }
+    return value != 0;
+}
+
+} // namespace
+
+bool hostAllTrue(ncclComm_t comm, bool localOk)
+{
+    auto const host = NcclCommResourceManager::getInstance().lookupHostCommunicator(comm);
+    if (auto const* mpiGroup = std::get_if<NcclCommResourceManager::MpiHostGroup>(&host))
+    {
+        return mpiAllTrue(mpiGroup->comm, mpiGroup->ranks, localOk);
+    }
+    auto const& pgGroup = std::get<NcclCommResourceManager::PgHostGroup>(host);
+    auto const pg = pgGroup.comm.lock();
+    TLLM_CHECK_WITH_INFO(pg != nullptr, "Matching host consensus communicator has expired");
+    return pgAllTrue(pg, pgGroup.ranks, localOk);
+}
 
 namespace
 {
@@ -206,6 +326,16 @@ bool isNcclWindowSupported()
     return windowBuffersSupported;
 }
 
+bool isNcclWindowRegistrationCaptureSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int runtimeVersion = 0;
+    return ncclGetVersion(&runtimeVersion) == ncclSuccess && runtimeVersion >= NCCL_VERSION(2, 30, 7);
+#else
+    return false;
+#endif
+}
+
 //==============================================================================
 // NcclCommResourceManager Implementation
 //==============================================================================
@@ -300,6 +430,8 @@ void NcclCommResourceManager::cleanupResources(ncclComm_t comm) noexcept
             {
                 return;
             }
+
+            mHostCommunicators.erase(comm);
 
             auto it = mCommResources.find(comm);
             if (it == mCommResources.end())
@@ -583,14 +715,13 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
         return NCCLWindowBuffer();
     }
 
-    // Registration is not capture-safe. A capture without a suitable dedicated/eager buffer must
-    // use the existing unregistered fallback path. Successful production capture lifecycles, window
-    // requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD order.
-    // Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
+    // Older NCCL runtimes require an existing dedicated/eager buffer during capture. Successful production capture
+    // lifecycles, window requests, tensor-scope exits, and explicit graph-owner releases execute in identical SPMD
+    // order. Failure and destructor paths abandon or quarantine their buffers instead of changing eligibility.
     // Cross-stream reuse is enabled only at an explicit device-synchronization boundary. Together,
     // these rules keep best-fit selection rank-symmetric: GC timing cannot change pool
     // history, and an NCCL symmetric collective never mixes window-backed and plain pointers.
-    if (isCapturing)
+    if (isCapturing && !mCaptureRegistrationSupported)
     {
         if (markFallbackWarningLoggedLocked(comm, FallbackWarning::kNoEligibleCaptureBuffer))
         {
@@ -621,11 +752,11 @@ NCCLWindowBuffer NCCLWindowAllocator::requestBuffer(ncclComm_t comm, size_t size
     if (buffer.isValid())
     {
         buffer.leaseId = mNextLeaseId++;
-        commBuffers.push_back({buffer, true, getDevice(), std::nullopt});
+        commBuffers.push_back({buffer, true, getDevice(), isCapturing ? std::make_optional(graphOwner) : std::nullopt});
     }
     else
     {
-        // The collective allreduce inside allocateAndRegisterBuffer agreed that this request
+        // The host consensus inside allocateAndRegisterBuffer agreed that this request
         // cannot use symmetric memory on at least one rank. Remember the smallest failing
         // request size so repeated too-large autotuner probes do not keep stressing this path.
         recordSymmetricFailureLocked(comm, size);
@@ -659,9 +790,9 @@ bool NCCLWindowAllocator::clearCudaErrorIfCaptureQueryFailed(
 }
 
 cudaError_t NCCLWindowAllocator::clearCudaErrorIfSymmetricAllocationFailed(
-    int localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
+    bool localAllocOk, CudaGetLastErrorFunc getLastError) noexcept
 {
-    if (localAllocOk == 0)
+    if (!localAllocOk)
     {
         return getLastError();
     }
@@ -1123,44 +1254,20 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
-    ncclComm_t comm, size_t size, int handle, cudaStream_t stream)
+    ncclComm_t comm, size_t size, int handle, cudaStream_t /*stream*/)
 {
-    // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
-    // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
-    // is unavailable; that failure may leave a sticky CUDA last-error on the device. If we
-    // deferred this cudaMalloc until after the failure, the sticky error would propagate into
-    // cudaMalloc, TLLM_CUDA_CHECK would throw, and the failing rank would never reach the
-    // collective ncclAllReduce(min) below, hanging every other rank that did succeed.
-    int* rankSyncFlag = nullptr;
-    TLLM_CUDA_CHECK(cudaMalloc(&rankSyncFlag, sizeof(int)));
-    CudaMallocGuard flagGuard{rankSyncFlag}; // frees rankSyncFlag on any early return or exception
-    TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
-
-    // Step 2: Allocate symmetric memory. This per-rank, non-collective call can fail
-    // asymmetrically. When it fails, NCCL may leave a sticky CUDA error behind; clear it before
-    // the stream-ordered flag copy and collective fallback so the failing rank still reaches
-    // ncclAllReduce with the other ranks.
+    // Allocation may fail on only some ranks and leave a sticky CUDA error. Clear it so every
+    // rank can reach the host vote, including ranks whose symmetric allocation failed.
     void* ncclPtr = nullptr;
-    TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
-    int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
-    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
+    auto const allocResult = ncclMemAlloc(&ncclPtr, size);
+    TLLM_NCCL_CHECK_WARN(allocResult);
+    bool const localAllocOk = allocResult == ncclSuccess && ncclPtr != nullptr;
+    NcclMemGuard ncclGuard{ncclPtr};
     clearCudaErrorIfSymmetricAllocationFailed(localAllocOk);
 
-    // Step 3: ncclCommWindowRegister is collective. If any rank skips it, all other ranks hang.
-    // Populate flag, reduce with min across ranks (0 if any rank failed), then read back.
-    // The flag is initialized to 0, so H2D failure is non-fatal and conservatively falls back
-    // to regular NCCL while still reaching the collective. allreduce and D2H failures throw.
-    if (localAllocOk != 0)
-    {
-        TLLM_CUDA_CHECK_WARN(
-            cudaMemcpyAsync(rankSyncFlag, &localAllocOk, sizeof(localAllocOk), cudaMemcpyHostToDevice, stream));
-    }
-    TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
-    TLLM_CUDA_CHECK_WARN(cudaStreamSynchronize(stream));
-
-    int allAllocOk = 0;
-    TLLM_CUDA_CHECK(cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost));
-    // flagGuard frees rankSyncFlag here at end of its scope
+    // Window registration is collective: all ranks must agree before entering it. This vote
+    // uses host memory and completes immediately, even while a CUDA stream is being captured.
+    bool const allAllocOk = hostAllTrue(comm, localAllocOk);
 
     if (!allAllocOk)
     {
@@ -1174,7 +1281,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
         return NCCLWindowBuffer{}; // ncclGuard frees ncclPtr
     }
 
-    // Step 4: Register with NCCL as a window. This is collective, so all ranks must reach it.
+    // Register with NCCL as a window. This is collective, so all ranks must reach it.
     // Failure here is non-fatal: warn and fall back to regular allreduce.
     // ncclGuard frees ncclPtr on return.
     ncclWindow_t window = nullptr;
@@ -1185,7 +1292,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
         return NCCLWindowBuffer{};
     }
 
-    // Step 5: Success. Transfer ownership to the returned buffer.
+    // Success. Transfer ownership to the returned buffer.
     ncclGuard.release();
     NCCLWindowBuffer buffer{ncclPtr, handle, size, window};
     TLLM_LOG_TRACE("[NCCLUtil] Allocated and registered NCCL window buffer: handle=%d, ptr=%p, size=%zu, window=%p",
@@ -1366,6 +1473,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
 
 #endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
-} // namespace tensorrt_llm::common::nccl_util
+} // namespace common::nccl_util
+
+TRTLLM_NAMESPACE_END
 
 #endif // ENABLE_MULTI_DEVICE
