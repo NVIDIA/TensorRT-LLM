@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@feature/ci-node-exclusions']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -208,7 +208,7 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 
 
-def createKubernetesPodConfig(image, type, arch = "amd64")
+def createKubernetesPodConfig(image, type, arch = "amd64", stageName = null)
 {
     def targetCould = "kubernetes-cpu"
     def selectors = """
@@ -328,7 +328,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         """.stripIndent(),
     ]
 
-    return podConfig
+    return ciNodePolicy.apply(podConfig, [pipeline: "Build", stage: stageName])
 }
 
 def echoNodeAndGpuInfo(pipeline, stageName)
@@ -426,7 +426,7 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
         return
     }
 
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build", k8s_cpu), "trt-llm", {
+    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "build", k8s_cpu, key), "trt-llm", {
         stage(key) {
             stage("[${key}] Run") {
                 echoNodeAndGpuInfo(pipeline, key)
@@ -905,7 +905,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         parallelJobs += [
         (key): {
             script {
-                trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu), "trt-llm", {
+                trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build", k8s_cpu, key), "trt-llm", {
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
