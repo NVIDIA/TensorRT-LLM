@@ -443,7 +443,7 @@ Outside exempt subtrees, `pyproject.toml` mixes static checks with packaging and
 dependencies. The rule
 claims it only when a verified raw patch reconstructs the pre-image and every
 non-comment line outside `tool.ruff`, `tool.isort`, `tool.yapf`, `tool.codespell`,
-`tool.autoflake`, and `tool.mypy` tables remains unchanged. This applies at any
+`tool.autoflake`, and `tool.pyrefly` tables remains unchanged. This applies at any
 depth. Missing patches, unreadable/new/deleted files, multiline strings, quoted
 headers, and ambiguous section syntax remain unclaimed. The conservative section
 walker does not require a new TOML dependency on Python 3.10.

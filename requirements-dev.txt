@@ -30,7 +30,7 @@ einops
 flash-linear-attention==0.5.2
 lpips
 graphviz
-mypy==1.19.1
+pyrefly==1.4.0
 mako
 oyaml
 parameterized

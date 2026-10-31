@@ -32,7 +32,7 @@ build:
     make html   # sphinx-build now imports tensorrt_llm cleanly
 
 The same logic is available as :func:`ensure_cuda_driver_stub` for in-process
-Python callers (e.g. a future mypy type-check wrapper).
+Python callers, such as build and documentation tooling.
 """
 
 import atexit

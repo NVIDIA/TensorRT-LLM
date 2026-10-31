@@ -190,6 +190,12 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+Run changed-file Python static checks with `scripts/run_pyrefly.sh`, or pass
+`--full-project` to scan all product Python files. The `[tool.pyrefly]` section in
+`pyproject.toml` defines the product roots, diagnostics, exclusions, and baseline.
+Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
+PyTorch, generated bindings, and configured third-party libraries.
+
 New C++ unit tests should use `add_tllm_gtest` with explicit `SOURCES`,
 `LINK_LIBRARIES`, `OWNER`, and scheduling `LABELS`. Request `FULL_STACK` explicitly
 for integration tests and include `gpu` in `LABELS` for tests that need a GPU.
