@@ -23,9 +23,9 @@ from typing import NamedTuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_tanh import gelu_tanh
 from tensorrt_llm.inputs.multimodal import get_multimodal_item_metadata
 
-from .ops.activation.gelu_tanh__r53 import gelu_tanh
 from .ops.attention.thop_attention__r2 import thop_attention
 from .ops.attention.vision_rope_2d_packed_qk__tower import vision_rope_2d_packed_qk
 from .ops.gemm.cublas_mm__vision import cublas_mm

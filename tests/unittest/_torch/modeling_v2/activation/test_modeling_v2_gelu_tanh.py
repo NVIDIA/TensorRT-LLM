@@ -13,11 +13,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.activation.gelu_tanh__r53 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_tanh import (  # noqa: E501
     gelu_tanh as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "gelu_tanh requires a CUDA device"

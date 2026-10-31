@@ -22,7 +22,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: The block MLP's `linear_fc1` is `[4304, 1152]`: one width, nothing split.
 INTERMEDIATE_SIZE = 4304
