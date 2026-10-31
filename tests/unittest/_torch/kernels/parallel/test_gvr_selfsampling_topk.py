@@ -340,6 +340,30 @@ def test_selfsampling_topk_posinf_regclus_completeness() -> None:
     _check_exact(logits, indices, n_valid, ref_vals)
 
 
+@pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
+def test_selfsampling_topk_posinf_unsampled_regclus_completeness(deterministic) -> None:
+    """A +inf that no bracket sample sees (finite prefix, finite row end)
+    saturates into the top histogram bin together with the finite values
+    above the bracket maximum. When that bin is the crossing bin, the emit
+    must keep the +inf among the crossing candidates (it is not above the
+    top bin), so the key-ordered selection picks it; the deterministic build
+    used to classify it as above and dropped it."""
+    batch_size, n_valid, top_k = 4, 32768, 1024
+    assert ss_host.route(batch_size, n_valid, n_valid, top_k)["kernel"] == "reg_clus"
+    gen = torch.Generator(device=_DEV).manual_seed(top_k + n_valid + 1)
+    logits = -torch.rand((batch_size, n_valid), generator=gen, dtype=torch.float32, device=_DEV)
+    logits[:, top_k : top_k + 1025] = 2.0  # above the bracket, 1,025 ties for 1,023 slots
+    logits[:, 2180] = float("inf")  # neither in the first K positions nor in the last 64
+    ref_vals, _ = torch.topk(logits, top_k, dim=1)
+    indices = torch.full((batch_size, top_k), -7, dtype=torch.int32, device=_DEV)
+    kv = torch.full((batch_size,), n_valid, dtype=torch.int32, device=_DEV)
+    ss_host.run_varlen(logits, kv, indices, max_seq_len=n_valid, deterministic=deterministic)
+    torch.cuda.synchronize()
+    assert int((indices == -7).sum()) == 0, "unwritten output slots"
+    assert torch.isposinf(logits.gather(1, indices.long())).any(dim=1).all(), "+inf dropped"
+    _check_exact(logits, indices, n_valid, ref_vals)
+
+
 def _run_varlen_case(kv, next_n, cr, top_k, seed, with_values=False):
     """Build a per-row-poisoned varlen batch, run run_varlen, verify every
     row against its own n_r (production formula) — short rows included."""
