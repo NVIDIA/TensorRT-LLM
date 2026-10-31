@@ -40,6 +40,9 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # passes keep the per-layer path. Auto-inert on models without shared indexer
 # layers (every group is a singleton -> per-layer fallback).
 _GROUP_REMAP = os.environ.get("TRTLLM_DISABLE_DSA_GROUP_REMAP", "0") != "1"
+# Opt-in locality ordering for shared-index generation groups.
+# Sorting preserves selected multisets but changes attention reduction order.
+_GROUP_REMAP_SORT = os.environ.get("TRTLLM_DSA_GROUP_REMAP_SORT", "0") == "1"
 
 _NVFP4_MAX_BLOCK_SCALE = 448.0
 _NVFP4_MAX_VALUE = 6.0
@@ -310,9 +313,10 @@ class DSATrtllmAttention(TrtllmAttention):
         slice. Returns None to signal a fall back to the per-layer path (inactive
         group, or leader output not yet available).
 
-        Grouped output is bit-identical to the per-layer path by construction;
-        that equivalence is covered by unit tests (see
-        ``tests/unittest/_torch/attention/sparse/dsa/test_cpp_custom_ops.py``).
+        Default grouped output is bit-identical to the per-layer path; the
+        opt-in sorted producer preserves its multiset instead. Default
+        equivalence is covered by unit tests (see
+        ``tests/unittest/_torch/attention/sparse/test_cpp_custom_ops.py``).
         """
         struct = metadata._ensure_group_remap_struct()
         leader_of = struct.get("leader_of")
@@ -325,13 +329,24 @@ class DSATrtllmAttention(TrtllmAttention):
 
         if self.indexer is not None:
             # Leader (full-indexer layer): compute the whole group in one launch.
-            batched = transform_local_topk_and_prepare_pool_view_grouped(
-                topk_indices,
-                metadata,
-                struct["group_layer_ids"][leader],
-                struct["group_scale"][leader],
-                is_generation,
-            )
+            batched = None
+            if _GROUP_REMAP_SORT and is_generation and not metadata.in_mtp_draft_loop:
+                from .grouped_remap_sort import try_grouped_remap_sort
+
+                batched = try_grouped_remap_sort(
+                    topk_indices,
+                    metadata,
+                    struct["group_layer_ids"][leader],
+                    struct["group_scale"][leader],
+                )
+            if batched is None:
+                batched = transform_local_topk_and_prepare_pool_view_grouped(
+                    topk_indices,
+                    metadata,
+                    struct["group_layer_ids"][leader],
+                    struct["group_scale"][leader],
+                    is_generation,
+                )
             metadata._group_remap_batched[leader] = batched
         else:
             # Shared layer: read the leader's precomputed batch. The batch is
