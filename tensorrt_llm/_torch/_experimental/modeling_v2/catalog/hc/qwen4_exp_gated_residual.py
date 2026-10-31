@@ -13,9 +13,9 @@ members do not instantiate hidden 2560. The built-in Qwen4-Exp implementation
 has fused ops for this (``trtllm::qwen4_exp_hc_*``), not wrapped here; the
 semantics follow the HuggingFace ``Qwen4ExpTextGatedResidual`` minus its norm.
 
-This target's local variant (r42) of the tp1 target's
-`ops/hc/qwen4_exp_gated_residual.py` (qwen3_8_flash_next_nvfp4__sm_103__tp1),
-copied as it stands.
+Shared by the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified tp4/tep4/dep4 target
+(`hf_fc694b5_orig__sm_103__unified`); promoted from their copies.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's geometry: 4 streams of 2560, rank-320 mixer bottleneck.
 CKPT_HC_COUNT = 4

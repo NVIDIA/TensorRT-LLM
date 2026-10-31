@@ -187,6 +187,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_gated_residual import (
+    qwen4_exp_gated_residual,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -242,7 +245,6 @@ from .ops.gemm.nvfp4_gemv import (
 from .ops.gemm.nvfp4_gemv import pack_from_bf16 as nvfp4_pack_from_bf16
 from .ops.gemm.nvfp4_gemv import pack_split_from_bf16 as nvfp4_pack_split_from_bf16
 from .ops.gemm.nvfp4_gemv import precompile as nvfp4_gemv_precompile
-from .ops.hc.qwen4_exp_gated_residual import qwen4_exp_gated_residual
 from .ops.hc.qwen4_exp_hc_decode_first_cute import qwen4_exp_hc_decode_first_cute
 from .ops.hc.qwen4_exp_hc_decode_mix_fp4_cute import (
     qwen4_exp_hc_decode_mix_cute,
