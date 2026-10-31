@@ -40,7 +40,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` is `64`** — retained as the validated configuration. Earlier releases needed this page size to avoid a legacy MLA fallback that did not support Kimi K3's 96 query heads.
 * **NVFP4 KV cache is supported** (`kv_cache_config.dtype: nvfp4`). The last two MLA layers stay in an FP8 KV cache by default (see `TLLM_KIMI_K3_FP8_KV_LAYERS` below), and KV cache block reuse with an NVFP4 KV cache requires `enable_chunked_prefill: true`.
-* **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
+* **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 NVL72 with matched DEP16 context/generation servers on KVCacheManagerV2; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
 
 ## Deployment Steps
 

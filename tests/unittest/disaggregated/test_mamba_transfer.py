@@ -311,94 +311,6 @@ def _zero_mamba_states(manager):
             state.zero_()
 
 
-def test_mamba_receiver_payload_bytes_matched_tp():
-    """mamba_receiver_payload_bytes returns correct size for matched-TP page tables."""
-    from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-        mamba_receiver_payload_bytes,
-    )
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        MAMBA_CONV_ROLE,
-        MAMBA_SSM_ROLE,
-        KVCachePageTable,
-        LocalLayer,
-        MambaLayerGroup,
-        MapperKind,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
-
-    conv_slot_bytes = 1024
-    ssm_slot_bytes = 2048
-    side_slot_bytes = 128
-    sorted_lids = [0, 1]
-
-    conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=8)
-    ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=8)
-    pool_views = [
-        PoolView(
-            pool_idx=0,
-            buffer_entries=np.array(
-                [(lid, 0, conv_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_CONV_ROLE,
-            mapper_kind=MapperKind.SECTIONED,
-            bytes_per_layer=conv_slot_bytes,
-            section_bytes=[512, 256, 256],
-        ),
-        PoolView(
-            pool_idx=1,
-            buffer_entries=np.array(
-                [(lid, 0, ssm_slot_bytes) for lid in sorted_lids], dtype=BUFFER_ENTRY_DTYPE
-            ),
-            pool_role=MAMBA_SSM_ROLE,
-            mapper_kind=MapperKind.INDEXED,
-            bytes_per_layer=ssm_slot_bytes,
-            bytes_per_head=64,
-        ),
-        PoolView(
-            pool_idx=2,
-            buffer_entries=np.array([(1, 0, side_slot_bytes)], dtype=BUFFER_ENTRY_DTYPE),
-            pool_role=frozenset({"ple_ngram_context"}),
-            mapper_kind=MapperKind.REPLICATED,
-            bytes_per_layer=side_slot_bytes,
-        ),
-    ]
-    local_layers = [
-        LocalLayer(local_layer_id=0, global_layer_id=1),
-        LocalLayer(local_layer_id=1, global_layer_id=2),
-    ]
-
-    mlg = MambaLayerGroup(
-        pool_group_idx=1,
-        local_layers=local_layers,
-        pool_views=pool_views,
-    )
-    pt = KVCachePageTable(
-        tokens_per_block=8,
-        layer_groups=[mlg],
-        pool_groups=[
-            PhysicalPoolGroup(pools=[]),  # idx 0 placeholder
-            PhysicalPoolGroup(
-                pools=[
-                    conv_pool,
-                    ssm_pool,
-                    PhysicalPool(
-                        base_address=0xC000,
-                        slot_bytes=side_slot_bytes,
-                        num_slots=8,
-                    ),
-                ]
-            ),
-        ],
-    )
-
-    got = mamba_receiver_payload_bytes(sender_page_table=pt, receiver_page_table=pt, dst_slot=3)
-    # Standard state covers both layers; the side role exists only on layer 2.
-    assert got == 2 * (conv_slot_bytes + ssm_slot_bytes) + side_slot_bytes
-
-
 def _make_rank_info(*, tp_size: int, tp_rank: int = 0) -> RankInfo:
     return RankInfo(
         instance_name="test",
@@ -709,8 +621,13 @@ def run_mamba_transfer_test(
     use_v2: bool = True,
     conv_state_layout: str = "x_b_c",
     with_ple: bool = False,
+    cpp_bounce: bool = False,
 ):
-    """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP)."""
+    """Test mamba transfer: ctx_tp -> gen_tp (PP=1, no DP).
+
+    With cpp_bounce, the C++ transfer-agent bounce carries every write, using the relaxed gate of
+    the Qwen3.5 GB300 agentic configs.
+    """
     # -- 1. Create managers, zero mamba caches --
     ctx_mgrs = _create_managers(
         ctx_tp,
@@ -732,6 +649,12 @@ def run_mamba_transfer_test(
         backend="NIXL",
         transceiver_runtime="PYTHON",
         max_tokens_in_buffer=512,
+        kv_cache_bounce_size_mb=64 if cpp_bounce else 0,
+        agent_bounce_params=(
+            {"min_descriptor_count": "1", "max_average_descriptor_size": "4MB"}
+            if cpp_bounce
+            else None
+        ),
     )
     ctx_tcs = _create_transceivers(ctx_tp, ctx_mgrs, config)
     gen_tcs = _create_transceivers(gen_tp, gen_mgrs, config)
@@ -837,6 +760,15 @@ def run_mamba_transfer_test(
         gen_tcs,
         lambda tc: tc.check_gen_transfer_status(None),
     )
+    if cpp_bounce:
+        # Only context ranks write, and every write must take the bounce.
+        agents = [tc._transfer_worker._agent for tc in ctx_tcs + gen_tcs]
+        assert all(agent.bounce_enabled for agent in agents)
+        ctx_agents = agents[:ctx_tp]
+        assert all(agent.bounce_reject_count == 0 for agent in ctx_agents), [
+            agent.bounce_reject_counts for agent in ctx_agents
+        ]
+        assert sum(agent.bounce_submit_count for agent in ctx_agents) > 0
 
     # -- 8. Read actual AFTER transfer --
     actual = _read_actual(gen_mgrs, gen_rids)
@@ -902,6 +834,7 @@ def test_mamba_transfer(ctx_tp, gen_tp):
 
 
 @pytest.mark.timeout(180)
+@pytest.mark.parametrize("cpp_bounce", [False, True], ids=["no_bounce", "cpp_bounce"])
 @pytest.mark.parametrize(
     "ctx_tp,gen_tp,conv_state_layout",
     [
@@ -911,17 +844,19 @@ def test_mamba_transfer(ctx_tp, gen_tp):
     ],
     ids=["same_tp_xbc", "expand_tp_qkv", "contract_tp_xbc"],
 )
-def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout):
+def test_v2_mamba_transfer(ctx_tp, gen_tp, conv_state_layout, cpp_bounce):
     """Transfer slot-major V2 Mamba states through Python/NIXL."""
     run_mamba_transfer_test(
         ctx_tp,
         gen_tp,
         use_v2=True,
         conv_state_layout=conv_state_layout,
+        cpp_bounce=cpp_bounce,
     )
 
 
 @pytest.mark.timeout(180)
-def test_v2_mamba_transfer_with_replicated_ple_state():
+@pytest.mark.parametrize("cpp_bounce", [False, True], ids=["no_bounce", "cpp_bounce"])
+def test_v2_mamba_transfer_with_replicated_ple_state(cpp_bounce):
     """Transfer PLE state once while standard Mamba state contracts from TP2 to TP1."""
-    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True)
+    run_mamba_transfer_test(2, 1, use_v2=True, with_ple=True, cpp_bounce=cpp_bounce)

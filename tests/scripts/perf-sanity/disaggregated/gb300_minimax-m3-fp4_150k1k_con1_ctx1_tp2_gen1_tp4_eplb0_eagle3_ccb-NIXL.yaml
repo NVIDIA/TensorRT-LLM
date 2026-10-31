@@ -117,7 +117,6 @@ worker_config:
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
       kv_cache_bounce_size_mb: 1024
-      agent_bounce_buffer_enable: true
     scheduler_config:
       capacity_scheduler_policy: MAX_UTILIZATION
     return_perf_metrics: false
@@ -173,5 +172,4 @@ worker_config:
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
       kv_cache_bounce_size_mb: 1024
-      agent_bounce_buffer_enable: true
     moe_expert_parallel_size: 1

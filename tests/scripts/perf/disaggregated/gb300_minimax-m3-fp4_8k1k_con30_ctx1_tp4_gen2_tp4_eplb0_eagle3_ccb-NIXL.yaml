@@ -124,7 +124,6 @@ worker_config:
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_transfer_timeout_ms: 600000
-      # Keep the separate Python bounce layer off; the C++ NIXL agent owns it.
       kv_cache_bounce_size_mb: 0
     disable_overlap_scheduler: false
     trust_remote_code: true

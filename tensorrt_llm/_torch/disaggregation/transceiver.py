@@ -39,9 +39,6 @@ from tensorrt_llm._torch.disaggregation.kv_cache_transceiver import (
     GenTransferStatus,
     KvCacheTransceiver,
 )
-from tensorrt_llm._torch.disaggregation.native.bounce import (
-    config_from_size as bounce_config_from_size,
-)
 from tensorrt_llm._torch.disaggregation.native.extent import CacheExtent, Chunk
 from tensorrt_llm._torch.disaggregation.native.fetch import PeerFetch
 from tensorrt_llm._torch.disaggregation.native.perf_logger import perf_log_manager
@@ -213,6 +210,9 @@ def _validate_fp4_mla_bridge_profile(
         and mapping.enable_attention_dp
         and mapping.pp_size == 1
         and mapping.cp_size == 1
+        # The C++ agent bounce scatters into the destination on the receiver agent's threads,
+        # which can still be writing after a failure is reported; the bridge cannot prove that
+        # those writes stopped.
         and cache_transceiver_config.kv_cache_bounce_size_mb == 0
         and not cache_transceiver_config.enable_pipelined_transfer
         and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1"
@@ -223,7 +223,8 @@ def _validate_fp4_mla_bridge_profile(
             "FP4 MLA lifecycle bridge requires a disaggregated NVFP4 SELFKONLY "
             "KVCacheManagerV2, the C++ NIXL agent binding, a finite timeout, "
             "no-retry ADP, PP1/CP1, "
-            "async monolithic non-layerwise transfer, and bounce disabled"
+            "async monolithic non-layerwise transfer, and kv_cache_bounce_size_mb=0 "
+            "(transfer-agent bounce disabled)"
         )
     return True
 
@@ -237,10 +238,6 @@ def _chunk_bytes_by_kind(page_table, chunk: Chunk) -> Tuple[int, int]:
     mappers move, never physical slot bytes: a coalesced pool carries one view per role class
     (summing slot_bytes per view would double count the slot) and ignored-role buffers occupy
     slot offsets no view transfers.
-
-    Bounce sizing (bounce/impl.py block_bytes_per_group) counts physical slot bytes once per
-    pool, ignored-role regions included; keep the two accountings in mind together when
-    changing either.
     """
     if page_table is None:
         return 0, 0
@@ -347,22 +344,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 quiescence_fatal_callback=(
                     self._fail_unproven_transfer if enforce_physical_ownership else None
                 ),
-                # kv_cache_bounce_size_mb is the shared bounce capacity; agent_bounce_buffer_enable
-                # routes it to exactly one implementation: the Python bounce below (per-region,
-                # size 0 = off; the per-transfer size gates are internal, tuned via env:
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS for plain-KV payloads,
-                # TRTLLM_KV_CACHE_BOUNCE_MIN_BYTES for recurrent-state payloads) or the C++
-                # transfer-agent staging buffer (bounce v2, one buffer shared by send and recv).
-                bounce=bounce_config_from_size(
-                    0
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else cache_transceiver_config.kv_cache_bounce_size_mb
-                ),
-                agent_buffer_size_mb=(
-                    cache_transceiver_config.kv_cache_bounce_size_mb
-                    if cache_transceiver_config.agent_bounce_buffer_enable
-                    else 0
-                ),
+                # kv_cache_bounce_size_mb sizes the C++ transfer-agent bounce buffer (one
+                # arena shared by send and receive); 0 disables it.
+                agent_buffer_size_mb=cache_transceiver_config.kv_cache_bounce_size_mb,
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
             )
         )
@@ -1298,7 +1282,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             raise
         finally:
             # The session exists even when publication failed, and the legacy sweep owns it.
-            # TODO: An idle bounce reservation is not handed back on the failure path.
             session = self._legacy_session(fetches)
             if session is not None:
                 self._recv_sessions[rid] = session
@@ -1710,15 +1693,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         if not cfg.enable_pipelined_transfer:
             return False
         blockers = []
-        # The Python bounce reserves a receiver region for the whole request, not per chunk.
-        # The C++ transfer-agent bounce (agent_bounce_buffer_enable) stages each transfer request
-        # independently below the Python layer, so a pipelined chunk is just another request.
-        # TODO: This only sees the local config, so a chunking sender and a bouncing receiver pass.
-        if cfg.kv_cache_bounce_size_mb != 0 and not cfg.agent_bounce_buffer_enable:
-            blockers.append(
-                f"the Python bounce buffer (kv_cache_bounce_size_mb="
-                f"{cfg.kv_cache_bounce_size_mb} without agent_bounce_buffer_enable)"
-            )
         if isinstance(self._kv_cache_manager, MambaHybridCacheManagerV2):
             blockers.append("a Mamba/hybrid cache manager")
         # Refused for the configuration, not for the piece: the per-chunk guard downstream only sees
