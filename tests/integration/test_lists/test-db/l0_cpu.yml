@@ -12,6 +12,8 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_tp4_drift.py
   - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
   - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_rejects_unsupported_projection_before_forward
   - unittest/_torch/modules/test_linear_output_slice.py::test_prepare_output_slice_dispatches_to_linear_method

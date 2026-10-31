@@ -43,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.metadata import Decod
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.warmup import DecoderWarmup
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
@@ -368,6 +369,7 @@ def test_compiled_mxfp8_warmup_backend_selection(
     monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=flashinfer_tune))
     method = MXFP8LinearMethod()
     engine = SimpleNamespace(
+        runtime_hooks=DEFAULT_RUNTIME_HOOKS,
         _warmup_timer=_WarmupTimer(rank=0),
         _config=SimpleNamespace(
             enable_autotuner=True,
@@ -489,6 +491,7 @@ def test_autotuner_warmup_skips_only_completed_token_shape(
 ) -> None:
     """A repeated warmup with an already tuned token shape must not re-run tuning."""
     engine = SimpleNamespace(
+        runtime_hooks=DEFAULT_RUNTIME_HOOKS,
         _config=SimpleNamespace(
             enable_autotuner=True,
             torch_compile_enabled=False,

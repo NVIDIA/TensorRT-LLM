@@ -42,6 +42,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
 )
 from tensorrt_llm._torch.attention.backends.sparse.registry import _resolve_minimax_m3_backend_cls
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import MsaRuntimePolicy
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import MiniMaxM3SparseAttentionConfig
 
@@ -831,6 +832,7 @@ def test_msa_indexer_enforces_real_fp8_and_bf16_handoff_states() -> None:
         # indexer takes the proxy path and needs no decode span.
         msa_decode_span = None
         msa_prefill_proxy_plan = (False, 0, 2, {}, None)
+        _msa_prefill_identity = None
         msa_prefill_n_valid_blocks = torch.ones(2, dtype=torch.int32, device="cuda")
         msa_prefill_proxy_kv_indices = torch.arange(2, dtype=torch.int32, device="cuda")
         msa_qo_lens_cpu = torch.ones(2, dtype=torch.int32)
@@ -948,6 +950,8 @@ def test_run_indexer_hands_the_indexer_this_steps_generation_span(
             return torch.zeros(num_tokens, 1, 16, dtype=torch.int32)
 
     class FakeMetadata:
+        _msa_prefill_identity = None
+
         msa_prefill_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_n_valid_blocks = torch.ones(num_tokens, dtype=torch.int32)
         msa_worst_case_max_k_tiles = 8
@@ -1976,6 +1980,122 @@ def test_on_update_kv_lens_is_a_noop_without_speculative_decoding(monkeypatch):
     assert metadata.msa_seq_lens_cuda.tolist() == [4, 6]
     assert metadata.msa_out_cache_loc.tolist() == [-1] * 5
     assert metadata.msa_n_valid_blocks.tolist() == [0] * 5
+
+
+class _RecordingKvUpdate:
+    """A model's one-launch KV update (MsaKvUpdate) that takes or declines every step."""
+
+    def __init__(self, taken: bool) -> None:
+        self._taken = taken
+        self.calls = []
+
+    def __call__(
+        self,
+        kv_lens,
+        kv_lens_staged,
+        seq_lens,
+        q_batch_row,
+        q_intra,
+        block_table,
+        tokens_per_block,
+        batch,
+        total_q,
+        msa_seq_lens,
+        cu_kv_lens,
+        out_cache_loc,
+        n_valid_blocks,
+    ) -> bool:
+        self.calls.append(
+            dict(
+                kv_lens=kv_lens,
+                kv_lens_staged=kv_lens_staged,
+                seq_lens=seq_lens,
+                q_batch_row=q_batch_row,
+                q_intra=q_intra,
+                block_table=block_table,
+                tokens_per_block=tokens_per_block,
+                batch=batch,
+                total_q=total_q,
+                msa_seq_lens=msa_seq_lens,
+                cu_kv_lens=cu_kv_lens,
+                out_cache_loc=out_cache_loc,
+                n_valid_blocks=n_valid_blocks,
+            )
+        )
+        return self._taken
+
+
+def test_default_msa_policy_has_no_kv_update(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1,), kv_staged=(5,), kv_corrected=(5,), page_size=4
+    )
+
+    assert metadata.msa_policy == MsaRuntimePolicy()
+    assert metadata.msa_policy.kv_update is None
+
+
+@pytest.mark.parametrize("prefill_counts", [False, True])
+def test_a_taken_kv_update_replaces_the_rederivation(monkeypatch, prefill_counts):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch,
+        qo_lens=(2, 3),
+        kv_staged=(9, 12),
+        kv_corrected=(8, 12),
+        page_size=4,
+        prefill_counts=prefill_counts,
+    )
+    kv_update = _RecordingKvUpdate(taken=True)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    # The hook owns the update: the metadata's own re-derivation does not run.
+    assert metadata.msa_seq_lens_cuda.tolist() == [9, 12]
+    assert metadata.msa_out_cache_loc.tolist() == [-1] * 8
+    assert metadata.msa_n_valid_blocks.tolist() == [0] * 8
+    assert len(kv_update.calls) == 1
+    call = kv_update.calls[0]
+    assert call["kv_lens"] is metadata.kv_lens_cuda
+    assert call["kv_lens_staged"] is metadata.msa_kv_lens_staged
+    assert call["q_batch_row"] is metadata.msa_q_batch_row
+    assert call["q_intra"] is metadata.msa_q_intra
+    assert call["block_table"] is metadata.msa_block_table
+    assert call["msa_seq_lens"] is metadata.msa_seq_lens_cuda
+    assert call["out_cache_loc"] is metadata.msa_out_cache_loc
+    assert call["seq_lens"].tolist() == [2, 3]
+    assert (call["tokens_per_block"], call["batch"], call["total_q"]) == (4, 2, 5)
+    assert call["cu_kv_lens"] is None
+    counts = metadata._msa_prefill_n_valid_blocks if prefill_counts else metadata.msa_n_valid_blocks
+    assert call["n_valid_blocks"].data_ptr() == counts.data_ptr()
+    assert call["n_valid_blocks"].numel() == 5
+
+
+def test_a_declined_kv_update_falls_back_to_the_rederivation(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(2, 3), kv_staged=(9, 12), kv_corrected=(8, 12), page_size=4
+    )
+    kv_update = _RecordingKvUpdate(taken=False)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    assert len(kv_update.calls) == 1
+    assert metadata.msa_seq_lens_cuda.tolist() == [8, 12]
+    assert metadata.msa_out_cache_loc[:5].tolist() == [6, 7, 109, 110, 111]
+    assert metadata.msa_n_valid_blocks[:5].tolist() == [2, 2, 3, 3, 3]
+
+
+def test_kv_update_is_not_called_without_dynamic_kv_lens(monkeypatch):
+    metadata = _kv_lens_update_metadata(
+        monkeypatch, qo_lens=(1, 1), kv_staged=(4, 6), kv_corrected=(3, 5), page_size=4
+    )
+    metadata._msa_kv_lens_dynamic = False
+    kv_update = _RecordingKvUpdate(taken=True)
+    metadata.msa_policy = MsaRuntimePolicy(kv_update=kv_update)
+
+    metadata.on_update_kv_lens()
+
+    assert kv_update.calls == []
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

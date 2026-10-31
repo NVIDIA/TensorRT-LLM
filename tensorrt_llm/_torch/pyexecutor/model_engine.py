@@ -939,6 +939,11 @@ class ModelEngine:
             assert self._lora_model is not None
             self._runner.init_cuda_graph_lora_manager(lora_config, self._lora_model)
 
+    def drop_greedy_only_outputs(self) -> None:
+        """Have every batch return logits, for an executor-side guided decoder that reads them."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.keep_greedy_only_outputs = False
+
     def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
         if hasattr(self.model, "set_guided_decoder"):
             success = self.model.set_guided_decoder(guided_decoder)

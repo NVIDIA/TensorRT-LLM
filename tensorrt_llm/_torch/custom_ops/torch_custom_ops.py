@@ -836,6 +836,19 @@ def _choose_mxfp8_tactic(custom_op: str, runner: TunableRunner,
     return tactic
 
 
+def mxfp8_quantize_autotuned(
+        input: torch.Tensor,
+        tune: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The quantize half of ``mxfp8_quantize_gemm_autotuned``: MXFP8 activation and scales,
+    on this token bucket's tuned quantize backend."""
+    quantize_runner = MXFP8QuantizeRunner(input.dtype)
+    quantize_inputs = [input]
+    return quantize_runner(quantize_inputs,
+                           tactic=_choose_mxfp8_tactic(
+                               _MXFP8_QUANTIZE_AUTOTUNED_OP, quantize_runner,
+                               quantize_inputs, tune))
+
+
 def mxfp8_quantize_gemm_autotuned(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -850,12 +863,67 @@ def mxfp8_quantize_gemm_autotuned(
         quantize_inputs,
         tactic=_choose_mxfp8_tactic(_MXFP8_QUANTIZE_AUTOTUNED_OP,
                                     quantize_runner, quantize_inputs, tune))
+    return mxfp8_gemm_autotuned(act, act_scale, weight, weight_scale,
+                                output_dtype, tune)
+
+
+def mxfp8_gemm_autotuned(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    tune: bool = False,
+) -> torch.Tensor:
+    """The GEMM half of mxfp8_quantize_gemm_autotuned for an activation already in MXFP8.
+
+    Same runner, op key and tuning-cache entries as the decode-graph MXFP8 GEMM:
+    the tactic per token bucket comes from the AutoTuner (merged across ranks
+    when the runtime asks for it), never from a per-rank backend sweep.
+    """
     gemm_runner = FlashInferMXFP8GemmRunner(output_dtype)
     gemm_inputs = [act, act_scale, weight, weight_scale]
     return gemm_runner(gemm_inputs,
                        tactic=_choose_mxfp8_tactic(
                            _FLASHINFER_MXFP8_GEMM_AUTOTUNED_OP, gemm_runner,
                            gemm_inputs, tune))
+
+
+def flashinfer_mxfp8_gemm_cute_dsl(
+    act: torch.Tensor,
+    act_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    sweep_configs: bool,
+) -> torch.Tensor:
+    """FlashInfer's CuTeDSL MXFP8 GEMM for an activation its producer already quantized.
+
+    Unlike ``mxfp8_quantize_gemm_autotuned``, the backend is fixed rather than
+    chosen per token bucket: the AutoTuner profiles with the weight L2-resident,
+    where CUTLASS can edge out CuTeDSL, while a decode step streams it cold.
+
+    ``sweep_configs`` runs FlashInfer's own CuTeDSL config sweep: it profiles
+    the configs for this shape while ``flashinfer_mxfp8_autotune`` is active
+    (the warmup tuning pass) and replays the cached best one afterwards;
+    without it the heuristic config runs.
+    """
+    if sweep_configs:
+        from ..modules.linear import flashinfer_mxfp8_autotune_active
+        context = _flashinfer_autotune(
+            tune_mode=flashinfer_mxfp8_autotune_active())
+    else:
+        context = _flashinfer_autotune(tune_mode=False, skip_ops="mxfp8_gemm")
+    with context:
+        return _flashinfer_mm_mxfp8(
+            act,
+            weight.t(),
+            act_scale,
+            weight_scale,
+            out_dtype=output_dtype,
+            use_8x4_sf_layout=False,
+            backend="cute-dsl",
+        )
 
 
 class FP4GemmRunner(TunableRunner):

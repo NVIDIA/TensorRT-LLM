@@ -24,6 +24,7 @@ import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
     ExecutorEvents,
+    MsaRuntimePolicy,
     RuntimeHooks,
     runtime_hooks_of,
 )
@@ -63,7 +64,13 @@ def test_a_model_without_hooks_gets_the_all_off_default(model):
 
 def test_every_field_defaults_to_off():
     for field in dataclasses.fields(RuntimeHooks):
-        assert getattr(DEFAULT_RUNTIME_HOOKS, field.name) in (False, None), field.name
+        value = getattr(DEFAULT_RUNTIME_HOOKS, field.name)
+        if dataclasses.is_dataclass(value):
+            assert all(
+                getattr(value, item.name) in (False, None) for item in dataclasses.fields(value)
+            )
+        else:
+            assert value in (False, None), field.name
 
 
 def test_hooks_declared_as_none_mean_the_default():
@@ -347,6 +354,12 @@ class _AllOffWalk:
             if node.attr in _SEAM_ATTRS:
                 return _SEAM_ATTRS[node.attr]
             return _UNKNOWN
+        if isinstance(node, ast.IfExp):
+            condition = self.value(node.test, env)
+            if condition is not _UNKNOWN:
+                return self.value(node.body if condition else node.orelse, env)
+            body, other = self.value(node.body, env), self.value(node.orelse, env)
+            return body if body is not _UNKNOWN and body is other else _UNKNOWN
         if self._is_seam_call(node):
             return DEFAULT_RUNTIME_HOOKS
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
@@ -481,6 +494,18 @@ def step(self, x):
         "sample.py:9: a test of a hook is not decided with every hook off",
         "sample.py:11: a hook value with every hook off is not decided",
     ]
+
+
+@pytest.mark.parametrize(
+    "expression, expected",
+    [
+        ("self.runtime_hooks.spec_step_fold if enabled else None", None),
+        ("self.runtime_hooks.spec_step_fold if enabled else object()", _UNKNOWN),
+    ],
+)
+def test_conditional_hook_binding_requires_both_branches_to_agree(expression, expected):
+    walk = _AllOffWalk("sample.py")
+    assert walk.value(ast.parse(expression, mode="eval").body, {}) is expected
 
 
 def test_the_decode_prologue_call_site_uses_its_protocol():
@@ -697,3 +722,97 @@ def test_executor_loop_cleanup_calls_at_shutdown_after_a_completed_loop(complete
     executor._executor_loop_cleanup()
     assert executor.is_shutdown
     assert events.calls == (["at_shutdown"] if completed else [])
+
+
+class _M3PlainModel(torch.nn.Module):
+    """A model that declares no hooks, like every model outside the opt-in."""
+
+
+class _M3ClassHooksModel(torch.nn.Module):
+    runtime_hooks = RuntimeHooks(pack_step_inputs=True, skip_unchanged_h2d=True)
+
+
+def test_m3_model_without_hooks_gets_the_all_off_default():
+    hooks = runtime_hooks_of(_M3PlainModel())
+
+    assert hooks is DEFAULT_RUNTIME_HOOKS
+    assert hooks == RuntimeHooks()
+    assert not hooks.pack_step_inputs
+    assert not hooks.skip_unchanged_h2d
+    assert not hooks.loop_on_execution_stream
+    assert not hooks.merge_tuned_tactics_across_ranks
+    assert not hooks.skip_greedy_rng_upload
+    assert hooks.spec_step_fold is None
+    assert hooks.msa == MsaRuntimePolicy()
+    assert not hooks.msa.short_sequence_identity
+    assert hooks.msa.kv_update is None
+    assert not hooks.msa.skip_unchanged_block_offsets
+    assert not hooks.msa.reuse_pool_views
+
+
+def test_m3_hooks_declared_as_none_mean_the_default():
+    model = _M3PlainModel()
+    model.runtime_hooks = None
+
+    assert runtime_hooks_of(model) is DEFAULT_RUNTIME_HOOKS
+
+
+def test_m3_class_attribute_hooks_are_returned_as_declared():
+    model = _M3ClassHooksModel()
+
+    assert runtime_hooks_of(model) is _M3ClassHooksModel.runtime_hooks
+
+
+def test_m3_instance_attribute_hooks_are_returned_as_declared():
+    hooks = RuntimeHooks(
+        loop_on_execution_stream=True,
+        msa=MsaRuntimePolicy(short_sequence_identity=True, reuse_pool_views=True),
+    )
+    model = _M3PlainModel()
+    model.runtime_hooks = hooks
+
+    assert runtime_hooks_of(model) is hooks
+
+
+def test_m3_instance_attribute_overrides_class_attribute():
+    hooks = RuntimeHooks(skip_greedy_rng_upload=True)
+    model = _M3ClassHooksModel()
+    model.runtime_hooks = hooks
+
+    assert runtime_hooks_of(model) is hooks
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [True, {"pack_step_inputs": True}, MsaRuntimePolicy(), "RuntimeHooks()"],
+    ids=["bool", "dict", "msa_policy", "str"],
+)
+def test_m3_hooks_of_the_wrong_type_raise(declared):
+    model = _M3PlainModel()
+    model.runtime_hooks = declared
+
+    with pytest.raises(TypeError, match=r"_M3PlainModel\.runtime_hooks must be a RuntimeHooks"):
+        runtime_hooks_of(model)
+
+
+def test_m3_hooks_are_immutable_once_declared():
+    hooks = RuntimeHooks()
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        hooks.pack_step_inputs = True
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        hooks.msa.reuse_pool_views = True
+
+
+@pytest.mark.parametrize(
+    "hooks, skips",
+    [
+        (RuntimeHooks(), False),
+        (RuntimeHooks(pack_step_inputs=True, skip_greedy_rng_upload=True), False),
+        (RuntimeHooks(skip_unchanged_h2d=True), True),
+        (RuntimeHooks(msa=MsaRuntimePolicy(skip_unchanged_block_offsets=True)), True),
+    ],
+    ids=["default", "no_skip_of_metadata", "h2d_skip", "msa_block_offset_skip"],
+)
+def test_m3_every_metadata_upload_skip_asks_for_private_metadata_buffers(hooks, skips):
+    assert hooks.skips_unchanged_metadata_uploads is skips

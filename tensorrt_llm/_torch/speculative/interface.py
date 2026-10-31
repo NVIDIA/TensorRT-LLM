@@ -638,6 +638,10 @@ class SpecMetadata:
     # for the current batch (see _temperature_only).
     temperature_only_graphs: bool = False
     temperature_only: bool = False
+    # Skip the Philox seed and offset uploads on all-greedy batches (deploy-time;
+    # from the model's RuntimeHooks). The argmax path never reads them, and the
+    # next sampled batch rewrites every row it reads.
+    skip_greedy_rng_upload: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
