@@ -878,6 +878,24 @@ class DecoderWarmup:
         if not issubclass(self._config.attention_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        # The C++ TRTLLM-Gen FMHA JIT warmup enumerates a (batchSize x seqLenKv) cartesian
+        # grid sized by engine maxima. PR #15305 densified the candidate lists, so for
+        # long-context configs (e.g., max_num_requests=2048, max_seq_len=131072 in
+        # disagg_config_ctxtp2_gentp2_llama31_8b_ucx.yaml), the grid produces thousands of
+        # NVRTC compilations that exceed the 600s server-start timeout. Skip the warmup
+        # whenever the product would blow the budget; any kernel not pre-warmed JIT-compiles
+        # lazily on first request, which is correct (just slower for that one request).
+        # The threshold matches the pre-PR #15305 effective grid size.
+        max_warmup_workload = self._config.max_batch_size * self._config.max_seq_len
+        if max_warmup_workload > 256 * 16384:
+            logger.info(
+                f"Skipping TRTLLM-Gen FMHA JIT warmup: engine config "
+                f"(max_batch_size={self._config.max_batch_size}, "
+                f"max_seq_len={self._config.max_seq_len}) "
+                f"would produce too many warmup grid points"
+            )
+            return
+
         logger.info("Running TRTLLM-Gen FMHA JIT warmup")
 
         warmup_requests_configs = []
