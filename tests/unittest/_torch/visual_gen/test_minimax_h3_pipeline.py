@@ -17,6 +17,7 @@
 
 import itertools
 import json
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -41,12 +42,132 @@ from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
     resolve_canvas_size,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
+from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import AutoPipeline, PipelineComponent
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.visual_gen.args import ParallelConfig, TorchCompileConfig, VisualGenArgs
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.parametrize("has_text_encoder", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+def test_h3_offload_components_and_stage_reuse(has_text_encoder: bool, grouped: bool) -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._device = torch.device("cpu")
+    pipeline._cuda_graph_runners = {}
+    stages = [["text_encoder", "vae"], "transformer", "audio_vae"] if grouped else None
+    pipeline.pipeline_config = SimpleNamespace(
+        cpu_offload_config=SimpleNamespace(enable=True, stages=stages, pin_memory=False)
+    )
+    pipeline.offloader = PipelineOffloader(pipeline)
+    pipeline.text_encoder = torch.nn.Linear(3, 3) if has_text_encoder else None
+    pipeline.transformer = torch.nn.Linear(3, 3)
+    pipeline.vae = torch.nn.Linear(3, 3)
+    pipeline.audio_vae = torch.nn.Linear(3, 3)
+    components = pipeline.offload_pipeline_components()
+    assert set(components) == {"transformer", "vae", "audio_vae"} | (
+        {"text_encoder"} if has_text_encoder else set()
+    )
+    inputs = torch.ones(1, 3)
+    expected = {name: module(inputs).detach().clone() for name, module in components.items()}
+    pipeline.initialize_offload_pipeline()
+    manager = pipeline.offloader.offload_pipeline.manager
+    for _ in range(2):
+        for name, module in components.items():
+            with pipeline.offloader.context_if_requested(name):
+                assert name in manager.active_stage_name.split("+")
+                torch.testing.assert_close(module(inputs), expected[name], rtol=0, atol=0)
+
+
+def test_h3_offload_materializes_whole_transformer_on_cpu() -> None:
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline.transformer = torch.nn.Linear(3, 3)
+    pipeline.pipeline_config = SimpleNamespace(
+        cpu_offload_config=SimpleNamespace(enable=True, stages=None)
+    )
+    pipeline.offloader = PipelineOffloader(pipeline)
+    loader = PipelineLoader.__new__(PipelineLoader)
+    assert loader._get_load_time_cpu_offload_modules(pipeline) == [pipeline.transformer]
+
+
+def test_h3_condition_encoder_enters_vae_offload_context() -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    active = []
+
+    @contextmanager
+    def context(name: str):
+        active.append(name)
+        yield
+        active.pop()
+
+    def encode(pixels: torch.Tensor):
+        assert active == ["vae"]
+        return SimpleNamespace(latent_dist=SimpleNamespace(sample=lambda generator: pixels[:, :2]))
+
+    pipeline.offloader.context_if_requested = context
+    pipeline.vae.config.latents_mean = [0.0, 0.0]
+    pipeline.vae.config.latents_std = [1.0, 1.0]
+    pipeline.vae.encode = encode
+    result = pipeline._encode_visual_condition(torch.zeros(1, 3, 1, 4, 4, dtype=torch.uint8))
+    assert result.shape == (1, 2, 1, 4, 4)
+    assert not active
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_h3_text_encoder_enters_offload_context(tp_size: int) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.torch_dtype = torch.bfloat16
+    pipeline.text_encoder_tp_size = tp_size
+    active = []
+
+    @contextmanager
+    def context(name: str):
+        active.append(name)
+        yield
+        active.pop()
+
+    def encode(ids: torch.Tensor) -> torch.Tensor:
+        assert active == ["text_encoder"]
+        return torch.ones(1, ids.numel(), 4)
+
+    pipeline.offloader.context_if_requested = context
+    pipeline.text_encoder = SimpleNamespace(
+        encode=encode,
+        config=SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=64)),
+        model=lambda input_ids, **kwargs: SimpleNamespace(hidden_states=[encode(input_ids)] * 51),
+    )
+    pipeline.processor = SimpleNamespace(create_mm_token_type_ids=lambda ids: [[0, 0]])
+    result = pipeline._encode_text_tokens([1, 2], {})
+    assert result.shape == (1, 2, 4)
+    assert not active
+
+
+def test_h3_audio_decoder_enters_offload_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    active = []
+
+    @contextmanager
+    def context(name: str):
+        active.append(name)
+        yield
+        active.pop()
+
+    def decode(latents, return_dict):
+        assert active == ["audio_vae"]
+        return (latents,)
+
+    pipeline.offloader.context_if_requested = context
+    pipeline.audio_vae.config.latents_mean = [0.0, 0.0, 0.0]
+    pipeline.audio_vae.config.latents_std = [1.0, 1.0, 1.0]
+    pipeline.audio_vae.decode = decode
+    monkeypatch.setattr(h3_pipeline, "unpack_audio_tokens", lambda rows, count: rows)
+    result = MiniMaxH3Pipeline._decode_audio(pipeline, torch.ones(2, 3, 4), 4)
+    assert result.shape == (3, 2, 4)
+    assert not active
 
 
 def _ulysses_mapping(world_size: int) -> SimpleNamespace:
@@ -109,6 +230,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self.workflow = "fl2va"
         self._device = torch.device("cpu")
         self.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
+        self.offloader = PipelineOffloader(self)
         self.transformer = _FakeMiniMaxH3Transformer()
         self.vae = SimpleNamespace(
             config=SimpleNamespace(latent_channels=2),
@@ -501,6 +623,8 @@ def test_text_encoder_residency_skips_non_owner_rank(
     )
     pipeline = MiniMaxH3Pipeline(config)
 
+    pipeline.pipeline_config = config
+    pipeline.offloader = PipelineOffloader(pipeline)
     pipeline.load_standard_components(
         "/tmp/checkpoint",
         torch.device("cpu"),
@@ -552,6 +676,8 @@ def test_subset_tensor_parallel_text_encoder_loads_on_participant_rank(
     )
     pipeline = MiniMaxH3Pipeline(config)
 
+    pipeline.pipeline_config = config
+    pipeline.offloader = PipelineOffloader(pipeline)
     pipeline.load_standard_components(
         "/tmp/checkpoint",
         torch.device("cpu"),
@@ -659,6 +785,8 @@ def test_subset_tensor_parallel_text_encoder_skips_nonparticipant_rank(
     )
     pipeline = MiniMaxH3Pipeline(config)
 
+    pipeline.pipeline_config = config
+    pipeline.offloader = PipelineOffloader(pipeline)
     pipeline.load_standard_components(
         "/tmp/checkpoint",
         torch.device("cpu"),
@@ -1399,6 +1527,86 @@ def test_ref2va_image_bytes() -> None:
     refs = load_references(params)
     assert refs[0].image.size == (32, 64)
     assert refs[0].image.getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_ref2va_groups_vae_stages_preserving_reference_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tensorrt_llm._torch.visual_gen.models.minimax_h3 import ref2va
+
+    pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+    torch.nn.Module.__init__(pipeline)
+    pipeline._device = torch.device("cpu")
+    pipeline._cuda_graph_runners = {}
+    pipeline.pipeline_config = SimpleNamespace(
+        cpu_offload_config=SimpleNamespace(enable=True, stages=None, pin_memory=False)
+    )
+    pipeline.text_encoder = None
+    pipeline.transformer = torch.nn.Linear(1, 1)
+    pipeline.transformer.config = SimpleNamespace(patch_size=(1, 1))
+    pipeline.vae = torch.nn.Linear(1, 1)
+    pipeline.vae.spatial_compression_ratio = 8
+    pipeline.audio_vae = torch.nn.Linear(1, 1)
+    pipeline.audio_vae.config = SimpleNamespace(
+        sampling_rate=32000, latent_channels=2, latents_mean=[0.0, 0.0], latents_std=[1.0, 1.0]
+    )
+    pipeline.processor = pipeline.tokenizer = None
+    pipeline.offloader = PipelineOffloader(pipeline)
+    pipeline.initialize_offload_pipeline()
+    manager = pipeline.offloader.offload_pipeline.manager
+    stage = manager.stage
+    transitions = []
+    visual_order, audio_order = [], []
+
+    def record_stage(name: str) -> None:
+        if manager.active_stage_name != name:
+            transitions.append(name)
+        stage(name)
+
+    def encode_visual(pixels: torch.Tensor) -> torch.Tensor:
+        with pipeline.offloader.context_if_requested("vae"):
+            assert manager.active_stage_name == "vae"
+            value = float(pixels[0, 0, 0, 0, 0].item())
+            visual_order.append(value)
+            return torch.full((1, 2, 1, 2, 2), value)
+
+    def encode_audio(audio: torch.Tensor, return_dict: bool) -> tuple:
+        assert manager.active_stage_name == "audio_vae"
+        value = audio[0, 0, 0].item()
+        audio_order.append(value)
+        return (SimpleNamespace(mode=lambda: torch.full((1, 2, 3), value)),)
+
+    monkeypatch.setattr(manager, "stage", record_stage)
+    pipeline._encode_visual_condition = encode_visual
+    pipeline.audio_vae.encode = encode_audio
+    pipeline._encode_reference_text_tokens = lambda ids, vision: torch.ones(1, 2, 4)
+    pipeline._prepare_condition_rows = lambda latents, generator: torch.cat(latents)
+    monkeypatch.setattr(ref2va, "normalize_references", lambda refs, *args: refs)
+    monkeypatch.setattr(ref2va, "_gather_vision_features", lambda *args: ({}, [], [], []))
+    monkeypatch.setattr(ref2va, "_build_presentation", lambda *args: ([1, 2], [0, 0]))
+    layouts = []
+    monkeypatch.setattr(ref2va, "build_reference_sequence", lambda *args: layouts.append(args))
+    references = [
+        SimpleNamespace(
+            kind="video",
+            has_audio=True,
+            frames=torch.full((4, 16, 16, 3), value, dtype=torch.uint8).numpy(),
+            audio=torch.full((2, 4), float(value)),
+        )
+        for value in (2, 1)
+    ]
+    try:
+        _, _, visual, audio = ref2va.prepare_references(
+            pipeline, references, "prompt", 128, 128, 124, torch.Generator()
+        )
+        assert transitions == ["vae", "audio_vae"]
+        assert visual_order == audio_order == [2, 1]
+        torch.testing.assert_close(visual[:, 0, 0, 0, 0], torch.tensor([2.0, 1.0]))
+        torch.testing.assert_close(audio, torch.tensor([[2.0, 2.0]] * 3 + [[1.0, 1.0]] * 3))
+        assert layouts[0][1] == [("video", True), ("video", True)]
+        assert layouts[0][2:4] == ([(1, 2, 2), (1, 2, 2)], [3, 3])
+    finally:
+        pipeline.offloader.cleanup()
 
 
 def test_ref2va_freezes_audio_and_video_conditions(monkeypatch: pytest.MonkeyPatch) -> None:
