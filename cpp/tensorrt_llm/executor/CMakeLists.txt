@@ -80,7 +80,6 @@ add_library(
   loraConfig.cpp
   mropeConfig.cpp
   multimodalInput.cpp
-  promptTuningConfig.cpp
   request.cpp
   response.cpp
   serialization.cpp

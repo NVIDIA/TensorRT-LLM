@@ -58,8 +58,6 @@ protected:
         tensorrt_llm::executor::SamplingConfig samplingConfig(1);
 
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
-            /*promptEmbeddingTable=*/std::nullopt,
-            /*promptVocabSize=*/std::nullopt,
             /*multimodalHashes=*/std::nullopt,
             /*multimodalPositions=*/std::nullopt,
             /*multimodalLengths=*/std::nullopt,

@@ -30,7 +30,6 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_rank,
@@ -44,13 +43,12 @@ from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
-from ..runtime import ModelConfig
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
 from .ipc import IpcQueue
 from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
-from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
+from .request import GenerationRequest, LoRARequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_prompt_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, RequestError, bucket_responses_by_frontend,
@@ -205,8 +203,6 @@ class BaseWorker(GenerationExecutor):
             self.max_seq_len = self.engine.max_seq_len
 
         self._lora_manager: Optional[LoraManager] = None
-        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
-        self._runtime_model_config: Optional[ModelConfig] = None
 
         if self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
@@ -342,17 +338,13 @@ class BaseWorker(GenerationExecutor):
                                           uids=[adapter_id],
                                           ckpt_source=lora_request.ckpt_source)
 
-    def _load_prompt_adapter(self,
-                             prompt_adapter_request: PromptAdapterRequest):
-        self._prompt_adapter_manager.load_from_ckpt(
-            [prompt_adapter_request.local_path],
-            model_config=self._runtime_model_config,
-            uids=[str(prompt_adapter_request.adapter_id)])
-
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
         assert request.id is not None
+        if request.prompt_adapter_request is not None:
+            raise RequestError(
+                "Prompt adapters are not supported by the PyTorch executor.")
         py_lora_path = None
         py_lora_ckpt_source = None
         if self._lora_manager is not None and request.lora_request is not None:
@@ -376,25 +368,14 @@ class BaseWorker(GenerationExecutor):
         # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
         # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
         # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
-        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # thread. No buffer (in-process) -> list path.
         # If both forms exist, they are assumed to describe the same token ids;
         # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
         i32_buf = getattr(request, "_prompt_token_ids_i32", None)
-        if i32_buf is not None and request.prompt_adapter_request is None:
+        if i32_buf is not None:
             prompt_token_ids = i32_buf
         else:
             prompt_token_ids = list(request.prompt_token_ids)
-        prompt_tuning_config = None
-        if request.prompt_adapter_request is not None:
-            self._load_prompt_adapter(request.prompt_adapter_request)
-            uid = str(request.prompt_adapter_request.adapter_id)
-            prompt_tuning_config = tllm.PromptTuningConfig(
-                self._prompt_adapter_manager.uid_to_weights[uid])
-            vocab_size = self._runtime_model_config.vocab_size
-            pa_length = prompt_tuning_config.embedding_table.size(0)
-            prompt_token_ids = list(range(
-                vocab_size, vocab_size + pa_length)) + prompt_token_ids
-
         # MULTIMODAL
         # NOTE: Since, we only support PyTorch backend for multimodal, we will send multimodal_data through the 'py_multimodal_data' field
         # except `multimodal_input` as it needs to go through the C++ runtime.
@@ -493,7 +474,6 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params._get_stop_words(),
                 embedding_bias=request.sampling_params.embedding_bias,
                 lora_config=lora_config,
-                prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
                 mrope_config=None,
                 kv_cache_retention_config=request.kv_cache_retention_config,
@@ -576,7 +556,13 @@ class BaseWorker(GenerationExecutor):
 
         self._results[client_id] = result
 
-        request_id = self._enqueue_request(request)
+        enqueued = False
+        try:
+            request_id = self._enqueue_request(request)
+            enqueued = True
+        finally:
+            if not enqueued:
+                self._results.pop(client_id, None)
         # request_id returned from backend is necessary for the abort_request method.
         self._client_id_to_request_id[client_id] = request_id
 

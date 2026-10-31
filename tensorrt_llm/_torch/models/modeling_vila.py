@@ -1164,7 +1164,7 @@ class VilaInputProcessor(BaseMultimodalInputProcessor,
 
         (iii) later in LLM, we can slice-and-assign based on condition fused_embed[input_ids < vocab_size] = text_embed, fused_embed[inputI > vocab_size] = mm_embed.
 
-        (3) passed input_ids and mm_embed via LlmRequest's prompt_token_ids and prompt_embedding_table fields respectively. LlmRequests can be inflight batched, and the mm_embed is passed to LLM model as `multi_modal_data` which is List[torch.Tensor] for batched requests.
+        (3) The token IDs travel in the request tokens, and mm_embed travels in the Python multimodal data. Model input preparation passes the batched multimodal embeddings to the LLM.
         """
 
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
