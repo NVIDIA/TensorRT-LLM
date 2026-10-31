@@ -7279,6 +7279,46 @@ _GLM_ARGUMENT_TEXTS = [
     (_glm_pairs(("code", "a")) + "<arg_key>n</arg_key><arg_value>2", None),
 ]
 
+_GLM_EXEC_TOOLS = [
+    _glm_typed_tool("exec", cmd="string"),
+    _glm_typed_tool("f", code="string", n="integer"),
+    _glm_tool("get_time"),
+]
+
+# The argument text of a call to `exec` that the model abandoned by opening a
+# fresh call inside it.
+_GLM_ABANDONED_ARGUMENTS = [
+    "<arg_key>cmd</arg_key><arg_value>ls -la",
+    "<arg_key>cmd</arg_key><arg_value>",
+    "<arg_key>cmd</arg_key><arg_value>ls</arg_value>",
+    "<arg_key>cmd</arg_key>",
+    "<arg_key>cm",
+    # An opener that starts no call stays in the abandoned text.
+    '<arg_key>cmd</arg_key><arg_value>echo "<tool_call>" >> f',
+]
+
+# Values that quote call markup and stay in the value. The last `<tool_call>`
+# in the argument text opens a fresh call only when the name of a declared tool
+# follows it, then directly complete pairs up to the end of the call.
+_GLM_QUOTING_VALUES = [
+    'START = "<tool_call>"',
+    "Use <tool_call> to open a call.",
+    "<tool_call>",
+    "<tool_call>exec",
+    "<tool_call>exec</arg_key>",
+    'x = "<tool_call>exec<arg_key>"',
+    "<tool_call>exec<arg_key>cmd</arg_key>",
+    "<tool_call>get_time<tool_call>exec",
+    # `run` is not a declared tool. GLM-4.5 reads a name only up to a newline.
+    "<tool_call>run<arg_key>cmd</arg_key><arg_value>ls",
+    "<tool_call>run\n<arg_key>cmd</arg_key><arg_value>ls",
+]
+
+
+def _glm_open_call(parser_cls, name, argument_text):
+    """A call cut off before its `</tool_call>`."""
+    return _glm_raw_call(parser_cls, name, argument_text)[:-len("</tool_call>")]
+
 
 @pytest.mark.parametrize("parser_cls", [Glm4ToolParser, Glm47ToolParser])
 class TestGlmStreamingMatchesWholeParse:
@@ -7325,6 +7365,120 @@ class TestGlmStreamingMatchesWholeParse:
     def test_text_without_a_complete_call_streams_verbatim(
             self, parser_cls, text):
         assert _glm_parity(parser_cls, text, AGENT_TOOLS) == (text, [])
+
+    @pytest.mark.parametrize("argument_text", _GLM_ABANDONED_ARGUMENTS)
+    def test_a_fresh_call_in_the_arguments_abandons_the_open_one(
+            self, parser_cls, argument_text):
+        """The call the model finished is delivered; the abandoned one is text."""
+        abandoned = _glm_open_call(parser_cls, "exec", argument_text)
+        fresh = _glm_call(parser_cls, "exec", ("cmd", "pwd"))
+        text = "Checking." + abandoned + fresh + " Done."
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd="pwd"))]
+        assert normal == "Checking." + abandoned + " Done."
+
+    def test_an_abandoned_call_among_others(self, parser_cls):
+        call = functools.partial(_glm_call, parser_cls)
+        abandoned = _glm_open_call(parser_cls, "exec",
+                                   "<arg_key>cmd</arg_key><arg_value>ls -la")
+        text = ("Looking." + call("exec", ("cmd", "ls")) + abandoned +
+                call("exec", ("cmd", "pwd")) + call("get_time") + " Done.")
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd="ls")), ("exec", dict(cmd="pwd")),
+                         ("get_time", {})]
+        assert normal == "Looking." + abandoned + " Done."
+
+    @pytest.mark.parametrize("name", ["exec", "Let me run it"])
+    def test_every_abandoned_call_is_released(self, parser_cls, name):
+        """Two calls abandoned in turn, the first under a name or under prose."""
+        first = _glm_open_call(parser_cls, name,
+                               "<arg_key>cmd</arg_key><arg_value>ls")
+        second = _glm_open_call(parser_cls, "functions.exec",
+                                "<arg_key>cmd</arg_key><arg_value>cat a")
+        fresh = _glm_call(parser_cls, "get_time")
+
+        normal, calls = _glm_parity(parser_cls, first + second + fresh,
+                                    _GLM_EXEC_TOOLS)
+
+        assert (normal, calls) == (first + second, [("get_time", {})])
+
+    @pytest.mark.parametrize("value", _GLM_QUOTING_VALUES)
+    @pytest.mark.parametrize("last", [True, False],
+                             ids=["last argument", "another argument follows"])
+    def test_a_value_may_quote_the_call_opener(self, parser_cls, value, last):
+        pairs = [("code", value)] + ([] if last else [("n", "3")])
+        text = _glm_call(parser_cls, "f", *pairs)
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        expected = dict(code=value) if last else dict(code=value, n=3)
+        assert (normal, calls) == ("", [("f", expected)])
+
+    def test_a_value_quoting_a_whole_call_header_reads_as_a_fresh_call(
+            self, parser_cls):
+        """A limit of the rule: this value and an abandoned call are one text.
+
+        A value that quotes a declared tool's call through its first
+        `<arg_value>`, with no `</tool_call>` after it, reads as the call
+        abandoned there.
+        """
+        quoted = _glm_call(parser_cls, "exec", ("cmd", "ls"))
+        quoted = quoted[:quoted.index("ls")]
+        text = _glm_call(parser_cls, "f", ("code", f'x = "{quoted}"'))
+
+        normal, calls = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS)
+
+        assert calls == [("exec", dict(cmd='"'))]
+        assert normal == text[:text.index(quoted)]
+
+    def test_a_finished_call_quoting_the_opener_is_not_read_as_fresh(
+            self, parser_cls):
+        """A limit of the rule: only the last `<tool_call>` is read.
+
+        Here it is quoted in the finished call's value, so the abandoned call
+        is read as written, the finished call's markup in its value.
+        """
+        abandoned = _glm_open_call(parser_cls, "exec",
+                                   "<arg_key>cmd</arg_key><arg_value>ls")
+        fresh = _glm_call(parser_cls, "exec", ("cmd", 'grep "<tool_call>" log'))
+
+        normal, calls = _glm_parity(parser_cls, abandoned + fresh,
+                                    _GLM_EXEC_TOOLS)
+
+        value = "ls" + fresh[:fresh.rindex("</arg_value>")]
+        assert (normal, calls) == ("", [("exec", dict(cmd=value))])
+
+    def test_many_openers_in_the_arguments_read_one_header(
+            self, parser_cls, monkeypatch):
+        """Call openers in one call, none of them a fresh call.
+
+        Only the last opener is read as a call header, so the headers read do
+        not grow with the openers; reading every opener to the end of the call
+        makes the parse quadratic in them.
+        """
+        split_call = parser_cls._split_call
+        headers = []
+
+        def counting_split_call(self, body):
+            headers.append(body)
+            return split_call(self, body)
+
+        monkeypatch.setattr(parser_cls, "_split_call", counting_split_call)
+
+        def headers_read(openers):
+            unit = _glm_open_call(parser_cls, "exec", _glm_pairs(("cmd", "ls")))
+            text = unit * openers + "</think></tool_call>"
+            headers.clear()
+            result = _glm_parity(parser_cls, text, _GLM_EXEC_TOOLS,
+                                 [("whole", [text])])
+            assert result == (text, [])
+            return len(headers)
+
+        assert headers_read(200) == headers_read(20)
 
     def test_a_response_with_several_calls(self, parser_cls):
         """Unreadable and restarted calls among good ones, then a cut-off."""
