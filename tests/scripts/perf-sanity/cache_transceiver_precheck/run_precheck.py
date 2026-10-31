@@ -61,6 +61,7 @@ tensorrt_llm/disaggregated_params.py and executor/result.py.
 
 import argparse
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -69,7 +70,9 @@ import secrets
 import signal
 import socket
 import sys
+import tempfile
 import time
+import traceback
 
 __extra_import_path__ = ["."]
 try:
@@ -617,6 +620,33 @@ def run_token():
     return os.environ.get("SLURM_JOB_ID", "")
 
 
+def atomic_write_shared_file(path, text, mode=0o644, fsync=False):
+    """Atomically replace a work-dir file that other ranks or instances read.
+
+    The work dir may be NFS, where creating a file can fail with a spurious
+    EEXIST. Every write therefore uses a fresh mkstemp() name, and mkstemp()
+    itself moves on to another name when a create fails with EEXIST. The temp
+    name starts with a dot, so a leftover never matches the gate's
+    status/*.status glob. mkstemp() creates the file 0600; `mode` sets the
+    final permissions.
+    """
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(text)
+            if fsync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
 def write_addr(path, payload):
     """Atomically publish an addr file.
 
@@ -624,22 +654,16 @@ def write_addr(path, payload):
     carries the session HMAC key, so restrict it to the owning user before it
     becomes visible.
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = dict(payload, job=run_token())
-    tmp = f"{path}.tmp.{os.getpid()}"
-    with open(tmp, "w") as f:
-        os.fchmod(f.fileno(), 0o600)
-        json.dump(payload, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    atomic_write_shared_file(path, json.dumps(payload), mode=0o600, fsync=True)
 
 
-def wait_for_addr(path, timeout_s):
+def wait_for_addr(path, timeout_s, work_dir=None):
     """Wait for THIS run's addr file.
 
     Files stamped with another run's job id are treated as stale and skipped
-    (keep polling).
+    (keep polling). With `work_dir`, stop waiting once its abort flag is up:
+    the instance that should publish may have failed and never will.
     """
     expect_job = run_token()
     deadline = time.monotonic() + timeout_s
@@ -655,6 +679,10 @@ def wait_for_addr(path, timeout_s):
                 if not expect_job or not stamped or stamped == expect_job:
                     return payload
                 # Stale addr from a previous run in a reused work dir.
+        if work_dir is not None:
+            reason = abort_flag_reason(work_dir)
+            if reason is not None:
+                raise _PeerAbort(f"rendezvous file {path} abandoned: {reason}")
         time.sleep(1.0)
     raise _Timeout(f"rendezvous file {path} not published within {timeout_s}s")
 
@@ -676,18 +704,12 @@ def publish_peer_progress(runner, phase):
     path = peer_progress_path(runner.work_dir, runner.role, runner.server_idx)
     try:
         runner._precheck_progress_seq = getattr(runner, "_precheck_progress_seq", 0) + 1
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {
-                    "job": run_token(),
-                    "phase": str(phase)[:400],
-                    "seq": runner._precheck_progress_seq,
-                },
-                f,
-            )
-        os.replace(tmp, path)
+        marker = {
+            "job": run_token(),
+            "phase": str(phase)[:400],
+            "seq": runner._precheck_progress_seq,
+        }
+        atomic_write_shared_file(path, json.dumps(marker))
     except OSError:
         # Missing progress only removes watchdog refreshes; the normal bounded
         # timeout and external gate remain authoritative.
@@ -725,13 +747,8 @@ def raise_abort_flag(work_dir, reason):
     if abort_flag_reason(work_dir) is not None:
         return
     try:
-        tmp = f"{path}.tmp.{os.getpid()}"
-        with open(tmp, "w") as f:
-            json.dump(
-                {"reason": (reason or "peer failure").splitlines()[0][:400], "job": run_token()},
-                f,
-            )
-        os.replace(tmp, path)
+        flag = {"reason": (reason or "peer failure").splitlines()[0][:400], "job": run_token()}
+        atomic_write_shared_file(path, json.dumps(flag))
     except OSError:
         pass  # best-effort: a missed flag only costs the usual per-peer timeout
 
@@ -760,7 +777,10 @@ class StatusRecorder:
     """Leader-side result sink.
 
     Rewritten on every record so a SIGKILL'd run still leaves the completed
-    cases + the in-flight failure on disk.
+    cases + the in-flight failure on disk. A write error is printed as
+    STATUS_WRITE_ERROR, never raised: only the leader writes, so a raise
+    would strand the other ranks in their next collective. The next
+    successful rewrite repairs both files.
     """
 
     def __init__(self, work_dir, role, server_idx, is_leader, metadata=None):
@@ -769,9 +789,7 @@ class StatusRecorder:
         self.is_leader = is_leader
         self.cases = []
         self.metadata = dict(metadata or {})
-        status_dir = os.path.join(work_dir, "status")
-        if is_leader:
-            os.makedirs(status_dir, exist_ok=True)
+        status_dir = os.path.join(work_dir, "status")  # created on the first write
         self.json_path = os.path.join(status_dir, f"{role}_{server_idx}.json")
         self.text_path = os.path.join(status_dir, f"{role}_{server_idx}.status")
         # NIXL_* is deliberately absent: the only such variable seen in
@@ -808,27 +826,34 @@ class StatusRecorder:
         }
         if extra:
             doc.update(extra)
-        tmp = f"{self.json_path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(doc, f, indent=2)
-        os.replace(tmp, self.json_path)
-        with open(f"{self.text_path}.tmp", "w") as f:
-            if failed:
-                first = failed[0]
-                # One-line summary for the launch-script console output: root
-                # cause only (first line, bounded); the full reason incl. any
-                # backtrace stays in the .json.
-                reason = " | ".join(first["reason"].splitlines()[:2])[:400]
-                f.write(
-                    f"FAIL {self.role}_{self.server_idx}: {len(failed)} case(s) failed; "
-                    f"first: peer={first['peer']} req_len={first['req_len']} "
-                    f"{first['status']}: {reason}\n"
-                )
-            elif final:
-                f.write(f"PASS {self.role}_{self.server_idx}: {len(self.cases)} case(s)\n")
-            else:
-                f.write(f"RUNNING {self.role}_{self.server_idx}\n")
-        os.replace(f"{self.text_path}.tmp", self.text_path)
+        if failed:
+            first = failed[0]
+            # One-line summary for the launch-script console output: root
+            # cause only (first two lines joined, bounded); the full reason
+            # incl. any backtrace stays in the .json.
+            reason = " | ".join(first["reason"].splitlines()[:2])[:400]
+            line = (
+                f"FAIL {self.role}_{self.server_idx}: {len(failed)} case(s) failed; "
+                f"first: peer={first['peer']} req_len={first['req_len']} "
+                f"{first['status']}: {reason}"
+            )
+        elif final:
+            line = f"PASS {self.role}_{self.server_idx}: {len(self.cases)} case(s)"
+        else:
+            line = f"RUNNING {self.role}_{self.server_idx}"
+        try:
+            # The gate reads the one-line .status file, so write it first.
+            atomic_write_shared_file(self.text_path, line + "\n")
+            atomic_write_shared_file(self.json_path, json.dumps(doc, indent=2))
+        except OSError as e:
+            # Log the verdict too: the gate's error excerpt is then the only
+            # place left that names the root cause.
+            print(
+                f"[precheck {self.role}_{self.server_idx}] STATUS_WRITE_ERROR: "
+                f"{type(e).__name__}: {e}; verdict: {line}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def parse_bandwidth_gbps(csv_dir, rank, tag="recv"):
@@ -1689,6 +1714,7 @@ def _gen_open_session(runner, peer_idx, arm):
             addr = wait_for_addr(
                 addr_path(runner.work_dir, peer_idx, runner.server_idx),
                 plan["rendezvous_timeout_s"],
+                runner.work_dir,
             )
             # Session HMAC key: shared only through the work-dir addr file,
             # never over the network.
@@ -1971,6 +1997,45 @@ def _make_peer_failure_recorder(runner, disarm, current_cell):
     return record_peer_failure
 
 
+def _hard_abort_unhandled(runner, exc):
+    """Record an error that escaped the peer loop on this rank, then abort every rank.
+
+    The error may be local to this rank (e.g. a failed leader-only file write)
+    while the other ranks wait in a collective this rank will never join, so
+    returning from main() would hang in MPI_Finalize.
+    """
+    try:
+        signal.alarm(0)  # a pending phase alarm must not interrupt the verdict write
+        traceback.print_exception(exc)
+        name = f"{runner.role}_{runner.server_idx}"
+        detail = f"{type(exc).__name__}: {exc}"  # str() keeps an OSError's path; repr() drops it
+        print(
+            f"[precheck {name} r{runner.rank}] UNHANDLED_ERROR: {detail[:400]}",
+            file=sys.stderr,
+            flush=True,
+        )
+        if runner.is_leader:
+            with contextlib.suppress(Exception):  # peers must still get the abort flag
+                runner.recorder.record("-", 0, "UNHANDLED_ERROR", detail)
+            raise_abort_flag(runner.work_dir, f"{name} UNHANDLED_ERROR: {detail}")
+        else:
+            # If the leader hit the same error, give it time to write its verdict
+            # before this rank's abort kills it. No barrier: the other ranks may
+            # be blocked in a different collective.
+            time.sleep(ABORT_COORDINATION_TIMEOUT_S)
+            # The leader may not have failed and is about to be killed, so peer
+            # instances would otherwise wait out their timeouts. Write-once: if
+            # the leader already raised the flag, this is a no-op.
+            raise_abort_flag(runner.work_dir, f"{name} r{runner.rank} UNHANDLED_ERROR: {detail}")
+    except Exception:  # noqa: BLE001 - abort must still happen
+        pass
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        _hard_abort_process(runner.comm)
+
+
 def _hard_abort_unquiesced(runner, current_cell, exc):
     """Persist the ownership-fatal verdict, then exit without teardown."""
     try:
@@ -2209,6 +2274,8 @@ def main(argv=None):
         except Exception:  # noqa: BLE001 - abort must still happen
             pass
         _hard_abort_unquiesced(runner, current_cell, e)
+    except Exception as e:  # noqa: BLE001 - a rank-local error must still abort all ranks
+        _hard_abort_unhandled(runner, e)
     finally:
         stop_watchdog()
 
