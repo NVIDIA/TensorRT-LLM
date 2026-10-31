@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Authenticate the github.com clone below; no-op when no token is available.
 source "${SCRIPT_DIR}/github_auth.sh"
 
-GITHUB_URL="https://github.com"
+GITHUB_URL="${GITHUB_MIRROR:-https://github.com}"
 UCX_INSTALL_PATH="/usr/local/ucx/"
 
 # Build against the oldest supported libfabric ABI, independently of the runtime EFA installation.
@@ -18,7 +18,7 @@ cd "${WORK_DIR}"
 LIBFABRIC_VERSION="v1.21.0"
 LIBFABRIC_INSTALL_PATH="${WORK_DIR}/libfabric"
 wget --tries=3 --waitretry=5 --timeout=30 --read-timeout=60 \
-    "https://github.com/ofiwg/libfabric/releases/download/${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION#v}.tar.bz2" -O libfabric.tar.bz2
+    "${GITHUB_URL}/ofiwg/libfabric/releases/download/${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION#v}.tar.bz2" -O libfabric.tar.bz2
 tar xjf libfabric.tar.bz2 && rm libfabric.tar.bz2
 cd "libfabric-${LIBFABRIC_VERSION#v}"
 ./autogen.sh

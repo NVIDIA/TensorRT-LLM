@@ -15,6 +15,7 @@ INSTALL_NIXL = ROOT / "docker/common/install_nixl.sh"
 # Execute the full installer while replacing network, compilation and package installation.
 _COMMAND = r"""
 wget() {
+    printf '%s\n' "$@" > "$WGET_ARGS"
     [ "$FAIL_STAGE" != download ] || return 23
     : > libfabric.tar.bz2
 }
@@ -61,6 +62,7 @@ def _run_installer(
     pkg_config_path: str | None = None,
     arch: str = "x86_64",
     fail_stage: str = "",
+    github_mirror: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     mpi_path = tmp_path / "mpi"
     for name in ("include/hwloc.h", "lib/libhwloc.so", "lib/pkgconfig/hwloc.pc"):
@@ -88,6 +90,7 @@ def _run_installer(
         "CONFIGURE_ARGS",
         "PIP_ARGS",
         "GIT_ARGS",
+        "WGET_ARGS",
         "MESON_ARGS",
         "MESON_PKG_CONFIG_PATH",
         "RESTORED_LD_PATH",
@@ -95,6 +98,8 @@ def _run_installer(
         env[name] = str(tmp_path / name.lower())
     if pkg_config_path is not None:
         env["PKG_CONFIG_PATH"] = pkg_config_path
+    if github_mirror is not None:
+        env["GITHUB_MIRROR"] = github_mirror
     return subprocess.run(
         ["bash", "-c", _COMMAND],
         cwd=tmp_path,
@@ -151,3 +156,18 @@ def test_failed_install_cleans_build_files(tmp_path: Path, fail_stage: str) -> N
     result = _run_installer(tmp_path, fail_stage=fail_stage)
     assert result.returncode != 0
     _assert_cleaned(tmp_path)
+
+
+@pytest.mark.parametrize("github_mirror", (None, "", "https://mirror.example.test/github"))
+def test_libfabric_release_mirror(tmp_path: Path, github_mirror: str | None) -> None:
+    result = _run_installer(tmp_path, github_mirror=github_mirror)
+    assert result.returncode == 0, result.stderr
+    base = github_mirror or "https://github.com"
+    assert (
+        f"{base}/ofiwg/libfabric/releases/download/v1.21.0/libfabric-1.21.0.tar.bz2"
+        in (tmp_path / "wget_args").read_text().splitlines()
+    )
+    # The release-asset mirror does not serve the Git protocol.
+    assert (
+        "https://github.com/ai-dynamo/nixl.git" in (tmp_path / "git_args").read_text().splitlines()
+    )

@@ -11,6 +11,7 @@ if [ "${ID}" != "ubuntu" ]; then
 fi
 
 EFA_INSTALLER_VERSION="${EFA_INSTALLER_VERSION:-1.51.0}"
+# TODO: Use an internal mirror once the pinned EFA installer is available there.
 EFA_INSTALLER_URL="https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"
 
 WORK_DIR="$(mktemp -d)"
