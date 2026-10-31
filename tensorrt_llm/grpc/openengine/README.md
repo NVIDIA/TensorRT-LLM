@@ -136,6 +136,35 @@ Enable load reporting independently with `--grpc --grpc-protocol openengine --op
 
 For attention DP, each publisher binds `base_port + global_rank`. When event streaming is enabled, OpenEngine collects the live publisher descriptors at executor startup and advertises every rank, including remote nodes. Those hostnames and ports must be reachable from the subscriber. A missing publisher fails startup; an unavailable discovery snapshot fails the RPC rather than synthesizing socket addresses. PP and CP streaming remain unsupported. The extra placement collection is OpenEngine-only; native HTTP serving and OpenEngine with events disabled do not enable it.
 
+### Image routing metadata
+
+`GetModelInfo.extra.trtllm_image_routing_version = 1` advertises image routing
+metadata for aggregated Qwen3-VL with KV cache manager V2 explicitly enabled,
+block reuse enabled, and ZMQ event publishing. Image passthrough separately
+requires `supports_multimodal` and `extra.trtllm_supported_modalities` to advertise
+image support. Set `use_kv_cache_manager_v2=True` explicitly: `"auto"` is
+excluded from capability discovery even if the engine resolves it to V2.
+Video, audio, and disaggregated image routing are not advertised.
+
+For image blocks, `BlockStored.trtllm_image_routing` contains
+`version` and `token_id_offset` (the vocabulary size). The existing
+`BlockStored.mm_keys` contains the keys, aligned with the stored blocks. Each key
+retains its native content `hash` and `start_offset` and gains an optional `uuid`.
+Keys are serialized only in `mm_keys`. The publisher emits this extension for
+all multimodal keys, including video/audio keys; the name identifies the current
+image-routing contract, not a modality filter. Only image routing has been
+validated and advertised by OpenEngine. Native image tokens start with a digest
+and continue with IDs above `token_id_offset`; a router can normalize those
+tokens using identities it sent in `MediaItem.uuid`. Native block hashes, parent chains, and removals retain
+their existing meaning. Cache hashing continues to include image content.
+
+Native multimodal token contexts carry the optional UUID alongside the digest,
+including continuation blocks. The publisher reads this identity directly from
+native events; items without a UUID omit it. Consumers must ignore image stores
+without a usable identity while continuing to process removals. Routing identities
+must refer to stable media content. This extension does not change the OpenEngine
+schema.
+
 ### Node-local discovery
 
 OpenEngine exposes optional, versioned `ServerInfo.extra.trtllm_node` metadata without changing the protocol schema. It describes a shared engine incarnation (`engine_id`), local hostname (`node_id`), whether this is the leader, node count, KV block size, local publishing DP ranks, and the global rank-to-node ownership map. The engine ID matches `GetServerInfo.instance_id` on the serving ingress and node metadata listeners. Consumers can use this information to partition telemetry collection without introducing routing-framework-specific server options.
