@@ -78,8 +78,8 @@ class QsaExpandBlockIndices(OpWrapper):
     Fusion boundary: index arithmetic and the tail only. Scoring, Top-K, the
     per-row causal group bound and the geometry are the caller's.
 
-    The unified target's variant of the qwen4_exp tp1 target's entry of the same name,
-    with the unified target's row counts and sequence lengths added as cells.
+    Shared by the qwen4_exp tp1 and unified targets (promoted from their copies); the
+    unified target's row counts and sequence lengths are among the cells.
     """
 
     ARCHS = frozenset({Arch.SM_103})

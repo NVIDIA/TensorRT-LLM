@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the unified target's qsa_paged_sparse_gqa variant (`__r26`).
+"""GPU test for the qsa_paged_sparse_gqa catalog entry.
 
 The paged state is real: one `[pages, slot_pages, kv, tpb, D]` HND pool whose
 layer planes are the call's K and V -- tp1's cells one layer's adjacent pair,

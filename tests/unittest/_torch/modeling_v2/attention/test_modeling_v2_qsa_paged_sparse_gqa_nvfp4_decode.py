@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the unified target's `qsa_paged_sparse_gqa_nvfp4_decode` variant (`__r39`), copied from
-the tp1 target's: against the reference of `qsa_paged_sparse_gqa_nvfp4` (the unified target's `__r38`)
+"""GPU test for the `qsa_paged_sparse_gqa_nvfp4_decode` catalog entry: against the reference of
+`qsa_paged_sparse_gqa_nvfp4`
 and QSA's bf16 kernel over the dequantized pool, inside the NVFP4 op's band (4 ulp of each
 (row, head)'s max, 2 ulp relative RMS), over its cells with and without the output gate; plus
 determinism and graph replay against eager.

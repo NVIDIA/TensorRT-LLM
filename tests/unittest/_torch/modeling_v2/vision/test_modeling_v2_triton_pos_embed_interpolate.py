@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp unified target's triton_pos_embed_interpolate entry
-(local variant `tower`).
+"""GPU test for the triton_pos_embed_interpolate catalog entry (the qwen4_exp unified
+target's vision tower).
 
 `op.reference` is the explicit four-corner sum in fp64, returned unrounded as
 fp32, so the band measures the op's own bf16 arithmetic. `_resize64` runs

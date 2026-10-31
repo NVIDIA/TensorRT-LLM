@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the ple_ngram_embed entry (the unified target's variant r15).
+"""GPU test for the ple_ngram_embed catalog entry.
 
 Integer bookkeeping plus a one-rounding dequantize, so gated bitwise -- the
 embedding and the whole published pool -- against the entry's reference, which

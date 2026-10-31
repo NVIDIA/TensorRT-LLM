@@ -4,8 +4,7 @@
 grouped FC1 GEMM + SwiGLU + FP8 requantization + grouped FC2 GEMM +
 routing-weighted combine, in one trtllm-gen call.
 
-The qwen4 unified target's variant (r40) of the qwen4_exp tp1 target's
-`ops/moe/fp8_block_scale_moe_runner`, copied from it."""
+Shared by the qwen4_exp tp1 and unified targets' MTP layers (promoted from their copies)."""
 
 from __future__ import annotations
 

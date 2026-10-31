@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp gelu_erf entry, as the unified target's local variant r54.
+"""GPU test for the gelu_erf catalog entry.
 
 The entry's identity is *which* GELU it is, and the wrong answer -- the tanh
 GELU this same tower's block MLPs use -- rounds to within about one bf16 ulp of

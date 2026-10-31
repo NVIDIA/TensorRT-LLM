@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_gated_residual entry (the unified target's local variant r42).
+"""GPU test for the qwen4_exp_gated_residual catalog entry.
 
 The thing under test is a formula -- which operand is gated, which axis is
 reduced, where each division by `hc_count` sits, the factor on the injection

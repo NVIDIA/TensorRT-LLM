@@ -108,7 +108,7 @@ class QsaMtpReuseTopk(OpWrapper):
     the expansion into token indices plus the incomplete causal tail
     (`qsa_expand_block_indices`) are the caller's.
 
-    The unified target's variant of the qwen4_exp tp1 target's entry of the same name.
+    Shared by the qwen4_exp tp1 and unified targets (promoted from their copies).
     """
 
     ARCHS = frozenset({Arch.SM_103})

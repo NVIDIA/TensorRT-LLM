@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_hc_inject_norm entry (the unified target's local variant r8).
+"""GPU test for the qwen4_exp_hc_inject_norm catalog entry.
 
 Cells are gated at one ulp of the activation dtype against the float64
 reference; the MoE-combine cells widen the residual's band by the combine's own

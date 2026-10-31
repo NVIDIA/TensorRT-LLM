@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp_post_inject entry (the unified target's local variant r11).
+"""GPU test for the qwen4_exp_post_inject catalog entry.
 
 The cells are gated bitwise (16-bit) by `_compare`. Beyond them: the
 leading-dim guard and graph capture.

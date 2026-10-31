@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the unified target's qsa_paged_sparse_gqa_nvfp4 variant (`__r38`).
+"""GPU test for the qsa_paged_sparse_gqa_nvfp4 catalog entry.
 
 The paged state is real: one NVFP4 pool as the QSA cache manager serves it --
 e2m1 data `[pages, 2, kv, tpb, D/2]` and e4m3 block scales `[pages, 2, kv, tpb,

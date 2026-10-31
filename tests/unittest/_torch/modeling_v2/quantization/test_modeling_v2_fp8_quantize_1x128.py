@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_quantize_1x128 entry (the unified target's local variant r41).
+"""GPU test for the fp8_quantize_1x128 catalog entry.
 
 The entry owns the contract. This file turns a cell into an input, holds
 every code disagreement of a cell to a rounding tie, and adds what a cell

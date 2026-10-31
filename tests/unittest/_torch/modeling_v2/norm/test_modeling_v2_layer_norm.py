@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the unified target's layer_norm entry (local variant r51).
+"""GPU test for the layer_norm catalog entry.
 
 Weight and bias are drawn over this checkpoint's own 110 vision LayerNorm
 tensors' ranges: the affine is wide enough (weights to 17.5, biases to -25.6)

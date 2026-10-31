@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA's block top-k and its expansion to token indices, one launch per batch of rows.
 
-A CuTe DSL kernel written for the tp1 target
-(`models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1/ops/attention/qsa_topk_expand_decode.py`)
-and copied as the unified target's variant: an in-tree callable. The decode path ran `qsa_topk_select`
+A CuTe DSL kernel written for the qwen4_exp tp1 target and shared with the unified target
+(promoted from their copies): an in-tree callable. The decode path ran `qsa_topk_select`
 (the CUDA indexer top-k, one CTA a row) and then `qsa_expand_block_indices` (one
 more launch) per attention layer. Here one CTA per row holds four consecutive scores a
 thread and narrows to the k-th largest by radix passes over the scores' bit patterns
