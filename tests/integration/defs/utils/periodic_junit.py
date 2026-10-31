@@ -27,6 +27,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from typing import Optional, TextIO
@@ -42,6 +43,22 @@ except ImportError:
     TestReport = None  # type: ignore
     LogXML = None  # type: ignore
     Item = None  # type: ignore
+
+
+def _dump_all_thread_stacks(output: TextIO) -> None:
+    """Write every thread's stack to ``output``, with or without a file descriptor."""
+    try:
+        output.fileno()
+    except (OSError, ValueError):
+        # faulthandler needs a real descriptor; pytest's sys-level capture replaces
+        # sys.stderr with an in-memory stream, so format the stacks in Python.
+        names = {thread.ident: thread.name for thread in threading.enumerate()}
+        for ident, frame in sys._current_frames().items():
+            output.write(f"\nThread {names.get(ident, '<unknown>')} "
+                         f"({ident:#x}):\n")
+            output.write("".join(traceback.format_stack(frame)))
+        return
+    faulthandler.dump_traceback(file=output, all_threads=True)
 
 
 class PeriodicJUnitXML:
@@ -455,14 +472,14 @@ class PeriodicJUnitXML:
 
     def _dump_hang(self, nodeid: str) -> None:
         """Write every thread's stack to the sidecar and stderr from the timer."""
-        if self._hang_file is None:
-            return
         for output in (self._hang_file, sys.stderr):
+            if output is None:
+                continue
             try:
                 output.write(
                     f"\n===== hang watchdog fired for {nodeid} =====\n")
                 output.flush()
-                faulthandler.dump_traceback(file=output, all_threads=True)
+                _dump_all_thread_stacks(output)
                 output.flush()
             except (OSError, RuntimeError, ValueError):
                 pass
@@ -484,7 +501,9 @@ class PeriodicJUnitXML:
         completed test can never produce a dump. This also makes ``func_only``
         irrelevant: any phase overrunning the timeout dumps.
         """
-        if not self.dump_hang_traceback or self._hang_file is None:
+        # Armed even when the sidecar could not be opened: the dump still goes to
+        # stderr.
+        if not self.dump_hang_traceback:
             return
         self._cancel_hang_timer()  # never leave a stale timer armed
         timeout = self._effective_timeout(item)
