@@ -278,7 +278,6 @@ common-files: &common_files |
         tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
-        tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |
         tensorrt_llm/_torch/pyexecutor/py_executor_creator.py |
@@ -527,12 +526,6 @@ common-files: &common_files |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
-        tests/unittest/_torch/executor/test_chunked_logits.py |
-        tests/unittest/_torch/executor/test_executor_request_queue.py |
-        tests/unittest/_torch/executor/test_overlap_scheduler.py |
-        tests/unittest/_torch/executor/test_pytorch_model_engine.py |
-        tests/unittest/_torch/executor/test_resource_manager.py |
-        tests/unittest/_torch/executor/test_router_dealer_ipc.py |
         tests/unittest/_torch/helpers.py |
         tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
@@ -603,6 +596,11 @@ common-files: &common_files |
         tests/unittest/_torch/multimodal/test_multimodal_runtime.py |
         tests/unittest/_torch/multimodal/test_share_multiparams.py |
         tests/unittest/_torch/pattern_watcher.py |
+        tests/unittest/_torch/pyexecutor/test_chunked_logits.py |
+        tests/unittest/_torch/pyexecutor/test_executor_request_queue.py |
+        tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py |
+        tests/unittest/_torch/pyexecutor/test_resource_manager.py |
+        tests/unittest/_torch/pyexecutor/test_router_dealer_ipc.py |
         tests/unittest/_torch/ray_orchestrator/conftest.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py |
@@ -1007,7 +1005,6 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/pyexecutor/kv_cache/mamba_cache_manager.py |
         tensorrt_llm/_torch/pyexecutor/layerwise_nvtx_marker.py |
         tensorrt_llm/_torch/pyexecutor/llm_request.py |
-        tensorrt_llm/_torch/pyexecutor/model_engine.py |
         tensorrt_llm/_torch/pyexecutor/model_loader.py |
         tensorrt_llm/_torch/pyexecutor/py_executor.py |
         tensorrt_llm/_torch/pyexecutor/py_executor_creator.py |
@@ -1256,12 +1253,6 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/attention/test_vanilla_attention.py |
         tests/unittest/_torch/compilation/test_add_norm.py |
         tests/unittest/_torch/debugger/test_debugger_addon.py |
-        tests/unittest/_torch/executor/test_chunked_logits.py |
-        tests/unittest/_torch/executor/test_executor_request_queue.py |
-        tests/unittest/_torch/executor/test_overlap_scheduler.py |
-        tests/unittest/_torch/executor/test_pytorch_model_engine.py |
-        tests/unittest/_torch/executor/test_resource_manager.py |
-        tests/unittest/_torch/executor/test_router_dealer_ipc.py |
         tests/unittest/_torch/helpers.py |
         tests/unittest/_torch/kernels/parallel/deep_gemm_tests.py |
         tests/unittest/_torch/kernels/parallel/test_dsv3_fused_a_gemm.py |
@@ -1332,6 +1323,11 @@ legacy-files: &legacy_files |
         tests/unittest/_torch/multimodal/test_multimodal_runtime.py |
         tests/unittest/_torch/multimodal/test_share_multiparams.py |
         tests/unittest/_torch/pattern_watcher.py |
+        tests/unittest/_torch/pyexecutor/test_chunked_logits.py |
+        tests/unittest/_torch/pyexecutor/test_executor_request_queue.py |
+        tests/unittest/_torch/pyexecutor/test_overlap_scheduler.py |
+        tests/unittest/_torch/pyexecutor/test_resource_manager.py |
+        tests/unittest/_torch/pyexecutor/test_router_dealer_ipc.py |
         tests/unittest/_torch/ray_orchestrator/conftest.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py |
         tests/unittest/_torch/ray_orchestrator/multi_gpu/test_mapping.py |
@@ -1467,7 +1463,7 @@ legacy-files: &legacy_files |
 # list; the hook's own `files:` pattern only gates *when* the hook triggers.
 
 # Global exclude: vendored code + trtllm-gen FMHA artifacts (cubin pointers, export headers, cuda_ptx)
-exclude: '(^tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16(_small_bh)?\.py$|^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
+exclude: '(^tensorrt_llm/_torch/attention/kernels/blackwell/kimi_k3_kda/kda_chunked_bt16(_small_bh)?\.py$|^cpp/tensorrt_llm/common/sha256/|^triton_kernels/|^tensorrt_llm/_torch/attention/backends/prims_ts/|^tensorrt_llm/_torch/visual_gen/cute_dsl_kernels/blackwell/sol_attn/|^tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe/|^tensorrt_llm/_torch/moe/kernels/megamoe_scheduler/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$|trtllmGenKernels/fmha/trtllmGen_fmha_export/|trtllmGenKernels/fmha/cuda_ptx/|trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/KernelMetaInfo\.h$|trtllmGenKernels/gemm/trtllmGen_gemm_export/KernelMetaInfo\.h$|\.cubin\.tar\.zst$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:

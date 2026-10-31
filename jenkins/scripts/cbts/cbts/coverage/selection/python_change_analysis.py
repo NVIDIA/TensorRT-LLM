@@ -73,17 +73,17 @@ def _collect_scopes(tree: ast.Module) -> list[_Scope]:
         for node in stmts:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 qual = prefix + node.name
-                recorded = "<locals>" not in qual
                 sig_start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
                 body_start = node.body[0].lineno
-                body_attr = qual if recorded else enclosing_attr
+                # Every def/class owns its own body, closures included: the collector
+                # records a named closure under its own full qualname.
                 scopes.append(
-                    _Scope(qual, sig_start, body_start, node.end_lineno, body_attr, enclosing_attr)
+                    _Scope(qual, sig_start, body_start, node.end_lineno, qual, enclosing_attr)
                 )
                 if isinstance(node, ast.ClassDef):
-                    walk(node.body, qual + ".", body_attr)
+                    walk(node.body, qual + ".", qual)
                 else:
-                    walk(node.body, qual + ".<locals>.", body_attr)
+                    walk(node.body, qual + ".<locals>.", qual)
             else:
                 subs = list(_substatements(node))
                 if subs:
@@ -138,21 +138,6 @@ def import_executed_qualnames(source: str) -> set[str]:
         walk(ast.parse(source).body, "")
     except SyntaxError:
         pass
-    return out
-
-
-def closure_attributed_qualnames(source: str, lines: set[int]) -> set[str]:
-    """Qualnames a changed line only reaches by walking out of a `<locals>` scope."""
-    try:
-        tree = ast.parse(source)
-    except SyntaxError:
-        return set()
-    scopes = _collect_scopes(tree)
-    out: set[str] = set()
-    for line in lines:
-        best = _innermost(line, scopes)
-        if best is not None and "<locals>" in best.qualname:
-            out.add(_attribute(line, scopes))
     return out
 
 
@@ -1010,6 +995,8 @@ def _recorded_definition_groups(
                 definitions.setdefault(qualname, []).append(node)
                 if isinstance(node, ast.ClassDef):
                     walk(node.body, qualname + ".")
+                else:
+                    walk(node.body, qualname + ".<locals>.")
             else:
                 walk(list(_substatements(node)), prefix)
 
@@ -1098,14 +1085,35 @@ class _FunctionNames(ast.NodeVisitor):
             self.visit(keyword.value)
 
     def _include_nested_loads(self, node: ast.AST) -> None:
-        # Nested code objects are not recorded separately. Attribute their
-        # binding dependencies conservatively to the recorded outer function,
-        # but do not infer caller edges across the nested scope.
+        # A class body runs at the outer def's own definition time, so rolling its
+        # whole subtree up here. Each method also gets its own, separately resolved
+        # fact when `_recorded_definition_groups` reaches it, so a changed binding
+        # a method uses attributes to both, which is sound.
         self.nested_loaded.update(
             child.id
             for child in ast.walk(node)
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
         )
+
+    def _include_signature_loads(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        # Only a nested def's *signature* -- decorators, defaults, annotations --
+        # runs in this scope at definition time; its body runs later, when the
+        # nested def itself is called, and resolves through its own fact instead
+        # (`_recorded_definition_groups` records it separately under its own
+        # qualname; see pystart.py's `_SKIP_QUALNAMES` for the collection side).
+        args = node.args
+        parts: list[ast.AST] = [
+            *node.decorator_list,
+            *args.defaults,
+            *(default for default in args.kw_defaults if default is not None),
+        ]
+        if node.returns is not None:
+            parts.append(node.returns)
+        for argument in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg):
+            if argument is not None and argument.annotation is not None:
+                parts.append(argument.annotation)
+        for part in parts:
+            self._include_nested_loads(part)
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
         self._include_nested_loads(node)
@@ -1121,11 +1129,11 @@ class _FunctionNames(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self.bound.add(node.name)
-        self._include_nested_loads(node)
+        self._include_signature_loads(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self.bound.add(node.name)
-        self._include_nested_loads(node)
+        self._include_signature_loads(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self.bound.add(node.name)
@@ -1559,12 +1567,6 @@ def analyze_python_changes(
             for node in ast.walk(function)
         )
     )
-    if any(
-        consumer == qualname or consumer.startswith(qualname + ".")
-        for consumer in consumers
-        for qualname in ambiguous_qualnames
-    ):
-        return PythonChangeFacts(set(), set(), {}, "ambiguous class/function declaration")
     safe_annotation_bindings = cached_typing_imports.keys() | new_class_bindings
     import_loads = {
         _attribute(node.lineno, scopes)

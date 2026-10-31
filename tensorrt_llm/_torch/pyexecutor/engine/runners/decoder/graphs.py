@@ -34,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManager,
     ResourceManagerType,
 )
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
 from tensorrt_llm._torch.pyexecutor.sampler.sampler_common import SampleType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -46,11 +47,7 @@ from tensorrt_llm._torch.speculative import (
 from tensorrt_llm._torch.speculative.utils import get_static_draft_len
 from tensorrt_llm._torch.utils import get_per_request_prefill_cuda_graph_flag
 from tensorrt_llm.inputs.multimodal import _has_mm_payload_keys
-from tensorrt_llm.llmapi.llm_args import (
-    BaseSparseAttentionConfig,
-    PrefillCudaGraphBackend,
-    SeqLenAwareSparseAttentionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, PrefillCudaGraphBackend
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -58,6 +55,7 @@ from ...lora import LoraParamBuilder
 from ..common import get_top_level_model, prepare_multimodal_indices
 from .config import DecoderRunnerConfig
 from .dummy_requests import DummyRequestFactory
+from .inputs import DecoderInputPreparer
 from .metadata import DecoderMetadata
 from .warmup import WarmupAgreement
 
@@ -188,7 +186,7 @@ class DecoderCudaGraphs:
     def __init__(
         self,
         *,
-        cuda_graph_runner: CUDAGraphRunner | None,
+        cuda_graph_runner: CUDAGraphRunner,
         breakable_cuda_graph_runner: BreakableCUDAGraphRunner | None,
         config: DecoderRunnerConfig,
         mapping: Mapping,
@@ -205,8 +203,10 @@ class DecoderCudaGraphs:
         torch_compile_bypass: Callable[[], contextlib.AbstractContextManager[None]],
         context_promotion_supported: bool,
         warmup_inputs: torch.Tensor | None = None,
+        inputs: DecoderInputPreparer | None = None,
     ) -> None:
         self.cuda_graph_runner = cuda_graph_runner
+        self._inputs = inputs
         self.breakable_cuda_graph_runner = breakable_cuda_graph_runner
         self._config = config
         self.mapping = mapping
@@ -252,7 +252,7 @@ class DecoderCudaGraphs:
     @property
     def enabled(self) -> bool:
         """Return whether generation batches may run as CUDA graphs."""
-        return self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled
+        return self.cuda_graph_runner.enabled
 
     def register_sample_type_resolver(self, resolver: Callable | None) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
@@ -329,7 +329,7 @@ class DecoderCudaGraphs:
 
     def reset_padding_dummies(self) -> None:
         """Drop padding dummies that belong to an earlier KV cache manager."""
-        self.cuda_graph_runner.padding_dummy_requests = {}
+        self.cuda_graph_runner.reset_padding_dummies()
 
     def preallocate_padding_dummies(self, resource_manager: ResourceManager) -> None:
         """Allocate the padding dummies while the KV cache is still empty."""
@@ -371,9 +371,6 @@ class DecoderCudaGraphs:
 
     @contextlib.contextmanager
     def no_cuda_graph(self) -> Iterator[None]:
-        if self.cuda_graph_runner is None:
-            yield
-            return
         _run_cuda_graphs = self.cuda_graph_runner.enabled
         self.cuda_graph_runner.enabled = False
         try:
@@ -602,7 +599,9 @@ class DecoderCudaGraphs:
                     restore_attn_metadata_after_draft_replay(attn_metadata, saved_draft)
         return outputs
 
-    def _get_graphs_to_capture(self, cuda_graph_batch_sizes: list[int]) -> list[tuple[int, int]]:
+    def _get_graphs_to_capture(
+        self, cuda_graph_batch_sizes: list[int]
+    ) -> list[tuple[int, int] | tuple[int, int, int]]:
         """Determine which (batch_size, draft_len) graphs to capture.
 
         Returns:
@@ -621,6 +620,33 @@ class DecoderCudaGraphs:
             logger.info(
                 f"Dynamic draft length enabled for one-model path. "
                 f"Capturing {len(graphs)} graphs: {graphs}"
+            )
+            return graphs
+
+        if self._inputs is not None and self._inputs._dspark_confidence_enabled:
+            max_draft_len = int(self._config.spec_config.max_draft_len)
+            native_graphs = [(bs, max_draft_len) for bs in cuda_graph_batch_sizes]
+            if not self._inputs._dspark_trims_submitted_tokens:
+                return native_graphs
+            from tensorrt_llm._torch.speculative.dspark_planner import ExactSpsCostTable
+
+            exact_table = self._inputs._dspark_sps_cost_table
+            if not isinstance(exact_table, ExactSpsCostTable):
+                raise RuntimeError(
+                    "DSpark confidence graph capture requires an authenticated exact SPS table"
+                )
+            ragged_graphs = [
+                (bs, max_draft_len, verifier_budget)
+                for bs in cuda_graph_batch_sizes
+                for verifier_budget in exact_table.production_candidate_budgets(bs)
+            ]
+            # Full K keeps the ordinary native graph. Compact layouts have
+            # distinct keys; they cannot alias its uniform attention layout.
+            graphs = native_graphs + ragged_graphs
+            logger.info(
+                f"DSpark ragged verification: capturing {len(graphs)} graphs "
+                f"({len(native_graphs)} native static-K{max_draft_len} graphs + "
+                f"{len(ragged_graphs)} exact measured (G,V) cells)."
             )
             return graphs
 
@@ -691,6 +717,13 @@ class DecoderCudaGraphs:
                     )
                     with flashinfer_autotune_context, flashinfer_mxfp8_decode_graph_capture():
                         self._capture_generation_cuda_graphs(resource_manager)
+                    if (
+                        is_warmup_only
+                        and runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks
+                    ):
+                        # Tactics tuned while warming the decode graphs agree across
+                        # ranks before the capture pass reads them.
+                        AutoTuner.get().post_tune_merge_tactics()
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
@@ -719,14 +752,11 @@ class DecoderCudaGraphs:
         # avoid creating warmup requests whose position_ids exceed the RoPE
         # table (max_position_embeddings).
         effective_max_seq_len = self._config.max_seq_len
-        if self.mapping is not None and self.mapping.has_cp_helix():
+        if self.mapping.has_cp_helix():
             effective_max_seq_len = self._config.max_seq_len // self.mapping.cp_size
 
-        sparse_config = self.sparse_attention_config
-        if (
-            isinstance(sparse_config, SeqLenAwareSparseAttentionConfig)
-            and sparse_config.needs_separate_short_long_cuda_graphs()
-        ):
+        short_long_seq_len_threshold = self.cuda_graph_runner.short_long_seq_len_threshold
+        if short_long_seq_len_threshold is not None:
             # For short sequences, subtract the maximum runtime tokens consumed
             # by a generation step so all current-step tokens stay within the
             # sequence length threshold. PARD uses 2K tokens here, not K+1.
@@ -734,7 +764,7 @@ class DecoderCudaGraphs:
                 self._config.max_draft_len
             )
             # For long sequences, use the default maximum sequence length.
-            max_seq_len = sparse_config.seq_len_threshold - max_runtime_tokens_per_gen_step
+            max_seq_len = short_long_seq_len_threshold - max_runtime_tokens_per_gen_step
             if max_seq_len < effective_max_seq_len:
                 max_seq_len_list = [effective_max_seq_len, max_seq_len]
             else:
@@ -758,7 +788,9 @@ class DecoderCudaGraphs:
             pinned_tier = sample_type or SampleType.FULL
             self.cuda_graph_runner.set_capture_sample_type(pinned_tier)
             try:
-                for bs, draft_len in graphs_to_capture:
+                for entry in graphs_to_capture:
+                    bs, draft_len = entry[:2]
+                    verify_bucket = entry[2] if len(entry) == 3 else None
                     if bs > self._config.max_batch_size:
                         continue
 
@@ -773,6 +805,8 @@ class DecoderCudaGraphs:
                         with self._dummy_requests.release_batch_context(
                             warmup_request, resource_manager
                         ) as batch:
+                            if batch is not None and verify_bucket is not None:
+                                self._set_warmup_ragged_windows(batch, verify_bucket, draft_len)
                             if batch is None:
                                 # No KV cache space for this batch size. During KV
                                 # cache estimation this makes the profiling peak
@@ -814,6 +848,8 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
+                if self._inputs is not None and self._inputs._dspark_confidence_enabled:
+                    self.cuda_graph_runner.agreed_ragged_bucket = None
 
         if self._lora.cuda_graph_manager is None:
             lora_graph_cases = [False]
@@ -1003,9 +1039,32 @@ class DecoderCudaGraphs:
                     torch.cuda.synchronize()
 
     def release(self, *, release_nccl_window_owners: bool = True) -> None:
-        if self.cuda_graph_runner is not None:
-            self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
+        self.cuda_graph_runner.clear(release_nccl_window_owners=release_nccl_window_owners)
         if self.breakable_cuda_graph_runner is not None:
             self.breakable_cuda_graph_runner.clear(
                 release_nccl_window_owners=release_nccl_window_owners
             )
+
+    def _set_warmup_ragged_windows(self, batch, verify_bucket: int, draft_len: int) -> None:
+        """Give a capture batch per-request windows summing to ``verify_bucket``.
+
+        The warmup batch must hit the bucket total exactly, or the graph is
+        keyed under a total no runtime batch produces and every ragged step
+        silently falls back to eager. Any split with the right sum captures
+        the right shape (the raggedness lives in the contents of qo_indptr).
+        """
+        requests = batch.generation_requests
+        if not requests:
+            return
+        from tensorrt_llm._torch.speculative.ragged_helpers import RaggedVerifyLayout
+
+        lens = torch.ones(len(requests), dtype=torch.int32)
+        layout = RaggedVerifyLayout.from_verify_lens(
+            lens, graph_num_tokens=int(verify_bucket), total_verify_tokens=len(requests)
+        )
+        filled = layout.fill_bucket(max_verify_len=1 + int(draft_len))
+        for request, tokens in zip(requests, filled.verify_lens.tolist()):
+            request.py_verify_len = int(tokens) - 1
+        # Publish to the runner too: the graph key carries this value, and the
+        # runtime fit never runs during capture.
+        self.cuda_graph_runner.agreed_ragged_bucket = int(verify_bucket)

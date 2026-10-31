@@ -233,6 +233,10 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:5-con:1-ep:1] TIMEOUT(180)
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:20-con:4-ep:1] TIMEOUT(180)
   - perf/test_perf.py::test_perf[qwen3.8_flash_next_fp4_mtp-serve-pytorch-float4-maxbs:16-maxnt:8192-kv_frac:0.5-input_output_len:8192,1024-reqs:80-con:16-ep:1] TIMEOUT(180)
+  #glm_5.3_flash_fp8 (4-GPU TP4/EP4)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:5-con:1-ep:4-tp:4-gpus:4] TIMEOUT(120) #min_latency
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:160-con:32-ep:4-tp:4-gpus:4] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_flash_fp8-serve-pytorch-float8-input_output_len:1024,1024-reqs:640-con:128-ep:4-tp:4-gpus:4] TIMEOUT(120) #max_throughput
 
 
 # 7: B200, B300 test cases
@@ -265,14 +269,14 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v4_pro_fp4-bench-pytorch-float4-maxbs:128-maxnt:8448-input_output_len:8192,1024-reqs:10-con:1-ep:8-tp:8-gpus:8] TIMEOUT(120) #min_latency
   #deepseek_v4_pro_dspark (DSpark speculative decoding, FP4+FP8 mixed, 8-GPU)
   - perf/test_perf.py::test_perf[deepseek_v4_pro_dspark-bench-pytorch-float4-maxbs:128-maxnt:4096-kv_frac:0.5-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  #glm_5_fp8 (MoE FP8 708G, 8-GPU ep=8)
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:8000,1000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
-  - perf/test_perf.py::test_perf[glm_5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120) #max_throughput
+  #glm_5.3_fp8 (8-GPU TP8/EP8)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:128,128-ep:8-tp:8-gpus:8]
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:2000,500-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:8000,1000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-input_output_len:1000,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-maxbs:1-input_output_len:8000,1000-reqs:10-con:1-ep:8-tp:8-gpus:8] #min_latency
+  - perf/test_perf.py::test_perf[glm_5.3_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-kv_frac:0.6-input_output_len:8000,1000-con:512-ep:8-tp:8-gpus:8] TIMEOUT(120) #max_throughput
   #glm_5.2_fp4 (MoE NVFP4 433G, MLA + DSA on the DeepSeek-V3.2 path, 8-GPU ep=8)
   - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:128,128-ep:8-tp:8-gpus:8]
   - perf/test_perf.py::test_perf[glm_5.2_fp4-bench-pytorch-float4-input_output_len:500,2000-ep:8-tp:8-gpus:8] TIMEOUT(120)

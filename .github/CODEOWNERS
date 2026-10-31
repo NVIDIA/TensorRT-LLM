@@ -138,7 +138,6 @@
 # Matches nothing today -- PR #17968 moved these tests out -- but kept so a recreated custom_ops/ lands here instead of on the global fallback.
 /tests/unittest/_torch/custom_ops @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/distributed @NVIDIA/trt-llm-runtime-devs
-/tests/unittest/_torch/executor @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/peft @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/misc/test_autotuner.py @NVIDIA/trt-llm-runtime-devs
 /tests/unittest/_torch/modules @NVIDIA/trt-llm-runtime-devs
@@ -228,8 +227,8 @@
 /tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
-/tests/unittest/_torch/executor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/pyexecutor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # ===== DISAGGREGATED SERVING =====
@@ -387,6 +386,11 @@
 # Individual handles rather than a team, like SCAFFOLDING: this is one bounded
 # experiment with named owners, not a standing domain.
 /tensorrt_llm/_torch/_experimental/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
+# What every modeling_v2 family library shares (the discovery and the common/
+# macros): the modeling_v2 owners, and the kernels owners because it is CUDA and
+# links against the stock libraries.
+/cpp/tensorrt_llm/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
+/cpp/cmake/modules/modeling_v2.cmake @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 /tests/unittest/_torch/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 /tests/integration/defs/accuracy/modeling_v2 @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju
 # The two catalog categories whose contracts state kernel behaviour the
@@ -399,6 +403,10 @@
 /tests/unittest/_torch/modeling_v2/models/glm_moe_dsa @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/kernels/glmMoeDsa @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/thop/glmMoeDsa/ @NVIDIA/trt-llm-kernels-devs @dongfengy @Tabrizian @xwang233
+# A family's native code lives in its csrc/ directories: the kernels owners
+# co-own it. Last, so it applies under the family rules above; a family with its
+# own owners adds them here.
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/ @tianyuxbear @Wanli-Jiang @WeiHaocheng @litaotju @NVIDIA/trt-llm-kernels-devs
 
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners

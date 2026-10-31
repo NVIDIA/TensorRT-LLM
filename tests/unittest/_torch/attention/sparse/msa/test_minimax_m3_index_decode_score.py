@@ -175,11 +175,13 @@ def test_index_decode_score_matches_reference(dtype, num_heads, decode_query_len
 
 @skip_not_sm100
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_index_decode_score_multi_round_split_k(dtype):
+@pytest.mark.parametrize("split_k", [None, 256, 512], ids=["default", "split256", "split512"])
+def test_index_decode_score_multi_round_split_k(dtype, split_k):
     """A request longer than split_k pages makes the per-CTA block loop iterate.
 
-    split_k is 256, so 33000 tokens is 258 blocks and CTAs 0 and 1 each handle
-    two blocks while the rest handle one.
+    The default split_k is 256, so 33000 tokens is 258 blocks and CTAs 0 and 1
+    each handle two blocks while the rest handle one. With 512 every block has
+    its own CTA and the trailing CTAs have none.
     """
     seq_lens = [33000, 32768 + 1]
     idx_q, k_cache, block_table, seq_lens_dev, _, score, expected = _make_inputs(
@@ -187,10 +189,37 @@ def test_index_decode_score_multi_round_split_k(dtype):
     )
     assert (max(seq_lens) + PAGE_SIZE - 1) // PAGE_SIZE > 256
 
+    split_k_args = () if split_k is None else (split_k,)
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
-        idx_q, k_cache, block_table, seq_lens_dev, score, 1
+        idx_q, k_cache, block_table, seq_lens_dev, score, 1, *split_k_args
     )
     _assert_scores_close(score, expected)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    ("num_heads", "decode_query_len", "seq_lens"),
+    [(4, 1, [300, 1500, 2049, 33000]), (4, 4, [4097, 70000])],
+    ids=["decode", "spec_verify"],
+)
+def test_index_decode_score_does_not_depend_on_split_k(
+    dtype, num_heads, decode_query_len, seq_lens
+):
+    """Each block is scored by exactly one CTA, so the scores are identical across split_k."""
+    idx_q, k_cache, block_table, seq_lens_dev, _, score, expected = _make_inputs(
+        seq_lens, dtype=dtype, num_heads=num_heads, decode_query_len=decode_query_len, seed=5
+    )
+    scores = {}
+    for split_k in (256, 512):
+        score.fill_(-float("inf"))
+        torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
+            idx_q, k_cache, block_table, seq_lens_dev, score, decode_query_len, split_k
+        )
+        scores[split_k] = score.clone()
+
+    assert torch.equal(scores[256], scores[512])
+    _assert_scores_close(scores[512], expected)
 
 
 @skip_not_sm100

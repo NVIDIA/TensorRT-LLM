@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 from dataclasses import dataclass
 from math import gcd
 from typing import Optional, Tuple, Union
@@ -10,6 +7,7 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import OperandMajorMode
 
 from .smem_workspace import SmemRegion
+
 
 # Every block-scaled tcgen05 MMA kind accumulates in F32 and no other accumulator is legal, so
 # this belongs to the instruction family rather than being a caller choice.
@@ -54,9 +52,7 @@ def make_tcgen05_tmem_plan(
     accumulators; other supported cases maximize disjoint accumulator stages.
     """
     if mma_instruction.participates not in (1, 2):
-        raise ValueError(
-            f"TCGen05 MMA participates must be one or two, got {mma_instruction.participates}."
-        )
+        raise ValueError(f"TCGen05 MMA participates must be one or two, got {mma_instruction.participates}.")
     if len(mma_instruction.instruction_mnk) != 3 or len(mma_tiler_mnk) != 3:
         raise ValueError("instruction_mnk and mma_tiler_mnk must each contain three dimensions.")
     if any(dimension <= 0 for dimension in (*mma_instruction.instruction_mnk, *mma_tiler_mnk)):
@@ -64,10 +60,7 @@ def make_tcgen05_tmem_plan(
 
     instruction_m, instruction_n, instruction_k = mma_instruction.instruction_mnk
     tile_m, tile_n, tile_k = mma_tiler_mnk
-    if (
-        instruction_m % mma_instruction.participates != 0
-        or instruction_n % mma_instruction.participates != 0
-    ):
+    if instruction_m % mma_instruction.participates != 0 or instruction_n % mma_instruction.participates != 0:
         raise ValueError("MMA instruction M and N must be divisible by participates.")
     if tile_m % instruction_m != 0 or tile_n % instruction_n != 0 or tile_k % instruction_k != 0:
         raise ValueError("MMA instruction dimensions must divide mma_tiler_mnk.")
@@ -97,9 +90,7 @@ def make_tcgen05_tmem_plan(
     tmem_column_capacity = cute.arch.get_max_tmem_alloc_cols(arch)
     accumulator_stage_columns = tile_n
     scale_factor_columns = sfa_columns + sfb_columns
-    accumulator_stage_count = (
-        tmem_column_capacity - scale_factor_columns
-    ) // accumulator_stage_columns
+    accumulator_stage_count = (tmem_column_capacity - scale_factor_columns) // accumulator_stage_columns
     if accumulator_stage_count < 1:
         raise ValueError("Scale-factor TMEM leaves no accumulator stage.")
 
@@ -161,9 +152,7 @@ def _round_tmem_allocation_columns(used_columns: int, capacity_columns: int) -> 
     else:
         allocation_columns = _round_up(used_columns, 32)
     if allocation_columns > capacity_columns:
-        raise ValueError(
-            f"TMEM plan needs {allocation_columns} columns, exceeding {capacity_columns}."
-        )
+        raise ValueError(f"TMEM plan needs {allocation_columns} columns, exceeding {capacity_columns}.")
     return allocation_columns
 
 
@@ -192,9 +181,7 @@ def make_smem_layouts(
     arch: str,
 ) -> Union[Tuple[SmemRegion, SmemRegion], Tuple[SmemRegion, SmemRegion, SmemRegion, SmemRegion]]:
     """Derive workspace-ready TCGen05 operand regions without an MLIR context."""
-    has_scale_factors = any(
-        value is not None for value in (mma_inst.sfa_type, mma_inst.sfb_type, mma_inst.sf_vec_size)
-    )
+    has_scale_factors = any(value is not None for value in (mma_inst.sfa_type, mma_inst.sfb_type, mma_inst.sf_vec_size))
     if has_scale_factors and any(
         value is None for value in (mma_inst.sfa_type, mma_inst.sfb_type, mma_inst.sf_vec_size)
     ):
@@ -211,9 +198,7 @@ def make_smem_layouts(
         raise ValueError(f"All stage counts must be positive, got {operand_stages}.")
 
     if mma_inst.participates not in (1, 2):
-        raise ValueError(
-            f"TCGen05 MMA participates must be one or two, got {mma_inst.participates}."
-        )
+        raise ValueError(f"TCGen05 MMA participates must be one or two, got {mma_inst.participates}.")
     if len(mma_inst.instruction_mnk) != 3 or len(mma_tiler_mnk) != 3:
         raise ValueError("instruction_mnk and mma_tiler_mnk must each contain three dimensions.")
     if any(dimension <= 0 for dimension in (*mma_inst.instruction_mnk, *mma_tiler_mnk)):
@@ -401,12 +386,8 @@ def _tiled_divide_2d(shape, stride, tile_shape):
     ):
         raise ValueError("A 2-D tiled divide requires rank-2 shape, stride, and tile.")
 
-    mn_tile_stride, mn_rest_shape, mn_rest_stride = _divide_mode_by_tile(
-        shape[0], stride[0], tile_shape[0]
-    )
-    k_tile_stride, k_rest_shape, k_rest_stride = _divide_mode_by_tile(
-        shape[1], stride[1], tile_shape[1]
-    )
+    mn_tile_stride, mn_rest_shape, mn_rest_stride = _divide_mode_by_tile(shape[0], stride[0], tile_shape[0])
+    k_tile_stride, k_rest_shape, k_rest_stride = _divide_mode_by_tile(shape[1], stride[1], tile_shape[1])
     return (
         ((tile_shape[0], tile_shape[1]), mn_rest_shape, k_rest_shape),
         ((mn_tile_stride, k_tile_stride), mn_rest_stride, k_rest_stride),
@@ -471,9 +452,7 @@ def _make_ab_region(
 
     mma_mn_shape = _prefix_tile_profile(mn_shape, value_shape[0])
     mma_k_shape = _prefix_tile_profile(k_shape, value_shape[1])
-    mma_shape, mma_stride = _tiled_divide_2d(
-        (mn_shape, k_shape), (mn_stride, k_stride), (mma_mn_shape, mma_k_shape)
-    )
+    mma_shape, mma_stride = _tiled_divide_2d((mn_shape, k_shape), (mn_stride, k_stride), (mma_mn_shape, mma_k_shape))
     return SmemRegion(
         name="",
         kind="tensor",
@@ -512,10 +491,7 @@ def _make_sf_region(
     full_k_stride = ((0, 1), 512 if basic_chunk_repetitions > 1 else 0)
 
     mma_mn_shape = ((32, 4), instruction_mn_blocks)
-    mma_k_shape = (
-        sf_vec_size,
-        _prefix_tile_profile((4, basic_chunk_repetitions), instruction_k // sf_vec_size),
-    )
+    mma_k_shape = (sf_vec_size, _prefix_tile_profile((4, basic_chunk_repetitions), instruction_k // sf_vec_size))
     mma_shape, mma_stride = _tiled_divide_2d(
         (full_mn_shape, full_k_shape), (full_mn_stride, full_k_stride), (mma_mn_shape, mma_k_shape)
     )
