@@ -37,19 +37,19 @@ def _make_video(raw_bytes_hash=None, audio=None, frames=None, meta=None):
 
 
 def _tensor_serialize_calls(spy) -> int:
-    return sum(1 for call in spy.call_args_list if isinstance(call.args[0], torch.Tensor))
+    return sum(1 for call in spy.call_args_list if isinstance(call.args[1], torch.Tensor))
 
 
 def test_source_anchor_skips_frame_walk(mocker):
     """When `raw_bytes_hash` is set the frames must not be serialized."""
-    spy = mocker.spy(md, "serialize_item")
+    spy = mocker.spy(md, "_hash_serialized_item")
     _hex(_make_video(raw_bytes_hash="a" * 64))
     assert _tensor_serialize_calls(spy) == 0
 
 
 def test_frame_walk_fallback_serializes_every_frame(mocker):
     """When `raw_bytes_hash` is None the fallback hashes each frame."""
-    spy = mocker.spy(md, "serialize_item")
+    spy = mocker.spy(md, "_hash_serialized_item")
     _hex(_make_video(raw_bytes_hash=None))
     assert _tensor_serialize_calls(spy) == 3
 
