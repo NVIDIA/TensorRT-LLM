@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import errno
 import functools
 import ipaddress
 import math
@@ -1075,6 +1076,144 @@ def _normalize_file_uri(uri: str) -> str:
     return uri
 
 
+# Directory from which request-supplied local media paths may be read.
+# Media parts of a server request may name a `file://` URI or a bare path; such
+# a reference is read from the server's own filesystem, so it is accepted only
+# when TRTLLM_MEDIA_ALLOWED_LOCAL_PATH names a directory and the resolved path
+# lies inside it. Unset (the default) refuses every local reference. The
+# offline Python API does not go through this check.
+_ALLOWED_LOCAL_MEDIA_PATH_ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+
+# Flags for the single open of a request-supplied local file. Each is left
+# out on a platform that lacks it; the fstat checks on the open descriptor
+# apply either way.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+
+
+def is_local_media_url(url: str) -> bool:
+    """Whether *url* names a server-side file (a `file://` URI or a bare path)."""
+    return urlparse(url).scheme in ("", "file")
+
+
+# A directory whose entries name this process's open descriptors. A decoder
+# handed ``<dir>/<fd>`` reads the file that is already open and checked, so the
+# request's own path is never looked up again and nothing is copied. ``None``
+# where the platform has no such directory; the open file is then read into
+# memory and decoded from bytes.
+_DESCRIPTOR_DIR = next((d for d in ("/proc/self/fd", "/dev/fd") if os.path.isdir(d)), None)
+
+
+def open_allowed_local_media(url: str) -> int:
+    """Open a request-supplied local media reference; return its read-only descriptor.
+
+    Raises ``ValueError`` unless ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` names a
+    directory, the reference resolves (symlinks and ``..`` included) to a path
+    inside it, and that path is a regular file within the media size limit. A
+    reference refused for its location gets the same message whether or not it
+    exists, and so does one refused because the variable does not name a
+    directory; that misconfiguration is logged on the server.
+
+    The file is opened once, without following a symlink in its final
+    component, and the regular-file and size checks run on the open descriptor.
+    An entry swapped for a symlink, FIFO or device after the path was resolved
+    is therefore refused instead of opened. The caller owns the descriptor and
+    closes it. Blocking; call it on an executor.
+    """
+    refused = ValueError(
+        "Local media paths are not accepted by this server. Send the media as "
+        "an http(s) or base64 data URL, or start the server with "
+        f"{_ALLOWED_LOCAL_MEDIA_PATH_ENV}=<directory> to allow files under "
+        "that directory."
+    )
+    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if not allowed_root:
+        raise refused
+    parsed = urlparse(url)
+    if parsed.scheme == "file" and parsed.netloc not in ("", "localhost"):
+        raise refused
+    root = os.path.realpath(allowed_root)
+    if not os.path.isdir(root):
+        # Operator configuration: report it in the server log, not to the client.
+        logger.warning(
+            "%s=%r is not a directory; refusing the local media reference.",
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            allowed_root,
+        )
+        raise refused
+    resolved = os.path.realpath(_normalize_file_uri(url))
+    if os.path.commonpath([root, resolved]) != root:
+        raise refused
+    # `resolved` has no symlink left, so one met here appeared after resolution.
+    # O_NONBLOCK keeps a FIFO from blocking the open; the fstat below rejects it.
+    try:
+        fd = os.open(resolved, os.O_RDONLY | _O_NOFOLLOW | _O_NONBLOCK | _O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise refused from exc
+        raise ValueError(f"Local media file could not be read: {url!r}") from exc
+    try:
+        stat = os.fstat(fd)
+        if not S_ISREG(stat.st_mode):
+            raise ValueError(f"Local media path is not a regular file: {url!r}")
+        _check_media_size(stat.st_size, _MAX_RESPONSE_BYTES)
+    except OSError as exc:
+        os.close(fd)
+        raise ValueError(f"Local media file could not be read: {url!r}") from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_open_media(fd: int, url: str) -> bytes:
+    """Read the regular file behind ``fd`` from the start, bounded by the media size limit."""
+    try:
+        # Read the reported size plus one byte, so a file that grew since the
+        # fstat is noticed; only then spend the remaining budget on it.
+        budget = _MAX_RESPONSE_BYTES + 1
+        chunk_size = os.fstat(fd).st_size + 1
+        chunks: list[bytes] = []
+        while budget > 0:
+            chunk = os.read(fd, min(chunk_size, budget))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            budget -= len(chunk)
+            chunk_size = 1 << 20
+    except OSError as exc:
+        raise ValueError(f"Local media file could not be read: {url!r}") from exc
+    data = b"".join(chunks)
+    _check_media_size(len(data), _MAX_RESPONSE_BYTES)
+    return data
+
+
+def log_allowed_local_media_path() -> None:
+    """Log the local media policy once, at server start.
+
+    Unset ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`` is the default and is not
+    logged. A value that is not a directory is reported here, since every
+    request naming a local file would otherwise fail with a generic error
+    while the operator sees nothing at startup.
+    """
+    allowed_root = os.environ.get(_ALLOWED_LOCAL_MEDIA_PATH_ENV, "")
+    if not allowed_root:
+        return
+    if os.path.isdir(os.path.realpath(allowed_root)):
+        logger.info(
+            "Request media may name local files under %r (%s).",
+            allowed_root,
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+        )
+    else:
+        logger.warning(
+            "%s=%r is not a directory; every request naming a local media file will be refused.",
+            _ALLOWED_LOCAL_MEDIA_PATH_ENV,
+            allowed_root,
+        )
+
+
 def _check_media_size(size: int, max_bytes: int) -> None:
     if size > max_bytes:
         raise ValueError(f"Media input exceeds maximum allowed size of {max_bytes} bytes.")
@@ -1250,6 +1389,11 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
                 )
             return await self._run_in_executor(self.load_base64, media_type, b64_data)
         elif parsed.scheme in ("", "file"):
+            # No path policy here: this branch serves the offline API, which
+            # reads the caller's own files. A URL taken from a server request
+            # must go through `async_load_allowed_local_file` instead, which
+            # confines it to TRTLLM_MEDIA_ALLOWED_LOCAL_PATH and never looks
+            # the request's path up again.
             return await self._run_in_executor(self.load_file, url)
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
@@ -1257,6 +1401,27 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     async def async_load_bytes(self, data: bytes) -> _MediaT:
         """Decode in-memory media without blocking the event loop."""
         return await self._run_in_executor(self.load_bytes, data)
+
+    async def async_load_allowed_local_file(self, url: str) -> _MediaT:
+        """Decode a request-supplied local file under the allowed-directory policy.
+
+        Opens the file with `open_allowed_local_media` and decodes it in the
+        same executor step. The decoder reads it through the descriptor's own
+        path (``/proc/self/fd/<n>``), the way `load_file` reads any local file,
+        so the request's path is never looked up again and nothing is copied.
+        Where the platform has no such path the open file is read into memory
+        and decoded from bytes.
+        """
+        return await self._run_in_executor(self._load_allowed_local_file, url)
+
+    def _load_allowed_local_file(self, url: str) -> _MediaT:
+        fd = open_allowed_local_media(url)
+        try:
+            if _DESCRIPTOR_DIR is None:
+                return self.load_bytes(_read_open_media(fd, url))
+            return self.load_file(f"{_DESCRIPTOR_DIR}/{fd}")
+        finally:
+            os.close(fd)
 
     @staticmethod
     async def _run_in_executor(fn, *args, **kwargs):
