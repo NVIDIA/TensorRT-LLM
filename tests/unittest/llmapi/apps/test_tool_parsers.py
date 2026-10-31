@@ -5296,14 +5296,30 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
             if call.name:
                 entry["name"] = call.name
             if call.parameters:
-                entry["parameters"] = entry.get("parameters", "") + call.parameters
+                entry["parameters"] = entry.get("parameters",
+                                                "") + call.parameters
         assert [(entry["name"], json.loads(entry["parameters"]))
                 for _, entry in sorted(streamed.items())] == [
-                    ("get_weather", {}),
                     ("search_web", {
                         "query": "AI"
                     }),
                 ]
+
+    def test_streaming_reports_no_call_without_end_token(
+            self, sample_tools, parser):
+        """A stream that stops before the end token reports no call."""
+        text = ("Sure. " + f'{BOT_TOKEN}{CALL_PREFIX}'
+                f'get_weather{{location:{_g4_s("NYC")}}}')
+
+        assert parser.detect_and_parse(text, sample_tools).calls == []
+
+        streaming = Gemma4ToolParser()
+        calls = []
+        for i in range(0, len(text), 4):
+            calls += streaming.parse_streaming_increment(
+                text[i:i + 4], sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+        assert calls == []
 
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
@@ -5325,12 +5341,13 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         chunk1 = (f'{BOT_TOKEN}{CALL_PREFIX}'
                   f'get_weather{{location:')
         result1 = parser.parse_streaming_increment(chunk1, sample_tools)
-        assert len(result1.calls) == 1
-        assert result1.calls[0].name == "get_weather"
+        assert result1.calls == []
 
         chunk2 = f'{_g4_s("Tokyo")}}}{EOT_TOKEN}'
         result2 = parser.parse_streaming_increment(chunk2, sample_tools)
-        assert len(result2.calls) >= 1
+        assert len(result2.calls) == 1
+        assert result2.calls[0].name == "get_weather"
+        assert json.loads(result2.calls[0].parameters) == {"location": "Tokyo"}
 
     def test_parse_streaming_increment_multiple_tools(self, sample_tools,
                                                       parser):
