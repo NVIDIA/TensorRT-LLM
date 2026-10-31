@@ -227,6 +227,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ple.ple_ngram_embed i
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (
+    fp8_quantize_1x128,
+)
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -308,7 +311,6 @@ from .ops.moe.fp4_moe_renorm_cute_dsl import fp4_moe_renorm_cute_dsl
 from .ops.moe.moe_sort import moe_sort
 from .ops.moe.moe_unpermute_inplace import moe_unpermute_inplace
 from .ops.quantization.bf16_to_fp32 import bf16_to_fp32
-from .ops.quantization.fp8_quantize_1x128 import fp8_quantize_1x128
 from .ops.ssm.causal_conv1d_triton_update import causal_conv1d_triton_update
 from .ops.ssm.causal_conv1d_update import causal_conv1d_update
 from .ops.ssm.cu_seqlens_from_seq_lens import cu_seqlens_from_seq_lens

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the fp8_quantize_1x128 entry (this target's local variant r41).
+"""GPU test for the fp8_quantize_1x128 entry (the unified target's local variant r41).
 
 The entry owns the contract. This file turns a cell into an input, holds
 every code disagreement of a cell to a rounding tie, and adds what a cell
@@ -13,15 +13,15 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.quantization.fp8_quantize_1x128__r41 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (  # noqa: E501
     SCALE_ULP_GATE,
     block_scales,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.quantization.fp8_quantize_1x128__r41 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp8_quantize_1x128 import (  # noqa: E501
     fp8_quantize_1x128 as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "fp8_quantize_1x128 requires a CUDA device"

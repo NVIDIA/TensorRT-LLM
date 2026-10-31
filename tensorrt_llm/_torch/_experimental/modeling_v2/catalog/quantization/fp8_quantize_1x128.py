@@ -7,7 +7,8 @@ from __future__ import annotations
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Largest finite e4m3 magnitude.
 E4M3_MAX = 448.0
