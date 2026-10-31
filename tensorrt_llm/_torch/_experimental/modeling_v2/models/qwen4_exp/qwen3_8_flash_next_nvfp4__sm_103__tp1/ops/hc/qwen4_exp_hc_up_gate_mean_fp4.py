@@ -20,11 +20,14 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (
+    _BLOCK_H,
+    hc_up_gate_mean_fp4,
+    qwen4_exp_hc_up_gate_mean,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
-
-from .qwen4_exp_hc_up_gate_mean import _BLOCK_H, hc_up_gate_mean_fp4, qwen4_exp_hc_up_gate_mean
 
 #: NVFP4 block: one e4m3 scale per this many contiguous elements.
 SF_VEC = 16

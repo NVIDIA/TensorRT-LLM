@@ -9,19 +9,31 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_gated_residual import (  # noqa: E501
-    gate_ratio,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (  # noqa: E501
+    _BLOCK_H,
+    _COMPILED,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.hc.qwen4_exp_hc_up_gate_mean import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (  # noqa: E501
     qwen4_exp_hc_up_gate_mean as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "qwen4_exp_hc_up_gate_mean requires a CUDA device"
 
 DEV = "cuda"
+
+
+def gate_ratio(out: torch.Tensor, ref: torch.Tensor) -> float:
+    """Worst element's distance from `ref` as a fraction of the test's band:
+    `rtol = eps`, `atol = eps * max|ref|`, both of `ref`'s dtype. Below 1 is
+    inside. (`qwen4_exp_gated_residual`'s band, restated so this test reads
+    no other target's code.)"""
+    eps = torch.finfo(ref.dtype).eps
+    ref64 = ref.double()
+    atol = eps * ref64.abs().max().item()
+    return ((out.double() - ref64).abs() / (atol + eps * ref64.abs())).max().item()
 
 
 def _compare(out, ref) -> None:
@@ -51,7 +63,36 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — fixture by
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % (2**31))
     mixed = op(*args)
     assert mixed.shape == (cell.spec["rows"], cell.spec.get("hidden", 2560))
+    # The answer came from the CuTe DSL kernel, JIT-compiled for this device.
+    assert (_BLOCK_H, args[3], mixed.shape[1], args[0].shape[1], False) in _COMPILED
     _compare(mixed, op.reference(*args))
+
+
+def _rolled_streams(low, up, normed, hc_count):
+    """Stream s's gate applied to stream s+1's normed values."""
+    return op.reference(low, up, normed.roll(normed.shape[1] // hc_count, dims=1), hc_count)
+
+
+def _three_of_four_streams(low, up, normed, hc_count):
+    """The last stream dropped from the mean (its normed values zeroed)."""
+    hidden = normed.shape[1] // hc_count
+    dropped = normed.clone()
+    dropped[:, (hc_count - 1) * hidden :] = 0
+    return op.reference(low, up, dropped, hc_count)
+
+
+@pytest.mark.parametrize("wrong", [_rolled_streams, _three_of_four_streams])
+@pytest.mark.parametrize("rows", [1, 1024])
+def test_the_band_refuses_a_wrong_mix(wrong, rows) -> None:
+    """The band passes the kernel and refuses a mix that is wrong by one stream.
+
+    `atol = eps * max|ref|` is wider than torch's bf16 default, so it has to
+    discriminate: the kernel sits well under 1 (`note`), a wrong mix far above.
+    """
+    args = _build(dict(rows=rows), seed=17 + rows)
+    mixed = op(*args)
+    assert gate_ratio(mixed, op.reference(*args)) <= 1.0
+    assert gate_ratio(mixed, wrong(*args)) > 10.0
 
 
 def test_guard_refuses_a_contiguous_up() -> None:

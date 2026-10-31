@@ -45,11 +45,13 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_injec
     _bf16x2,
     _ldg_v4,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (
+    _asm,
+    _st_global_v4,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.custom_pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .qwen4_exp_hc_up_gate_mean import _asm, _st_global_v4
 
 #: Programmatic dependent launch (sm_90+), off with TRTLLM_ENABLE_PDL=0.
 _PDL = get_env_enable_pdl()

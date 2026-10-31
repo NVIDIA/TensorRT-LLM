@@ -196,6 +196,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_injec
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_lowrank_act import (
     qwen4_exp_hc_lowrank_act,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.hc.qwen4_exp_hc_up_gate_mean import (
+    qwen4_exp_hc_up_gate_mean,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
@@ -265,7 +268,6 @@ from .ops.hc.qwen4_exp_hc_decode_tc_first import precompile as hc_tc_first_preco
 from .ops.hc.qwen4_exp_hc_decode_tc_first import qwen4_exp_hc_decode_tc_first
 from .ops.hc.qwen4_exp_hc_first_rescale_tc import qwen4_exp_hc_first_rescale_tc
 from .ops.hc.qwen4_exp_hc_inject_rstd import qwen4_exp_hc_inject_rstd
-from .ops.hc.qwen4_exp_hc_up_gate_mean import qwen4_exp_hc_up_gate_mean
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4 import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.hc.qwen4_exp_hc_up_gate_mean_rstd import (
     qwen4_exp_hc_up_gate_mean_rstd,
