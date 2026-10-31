@@ -1,13 +1,53 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 set -ex
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Authenticate the github.com clone below; no-op when no token is available.
-source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
+source "${SCRIPT_DIR}/github_auth.sh"
 
-GITHUB_URL="https://github.com"
+GITHUB_URL="${GITHUB_MIRROR:-https://github.com}"
 UCX_INSTALL_PATH="/usr/local/ucx/"
+
+# Build against the oldest supported libfabric ABI, independently of the runtime EFA installation.
+# Keep the sources and build-only libraries isolated from the caller's working directory.
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "${WORK_DIR}"' EXIT
+cd "${WORK_DIR}"
+LIBFABRIC_VERSION="v1.21.0"
+LIBFABRIC_INSTALL_PATH="${WORK_DIR}/libfabric"
+wget --tries=3 --waitretry=5 --timeout=30 --read-timeout=60 \
+    "${GITHUB_URL}/ofiwg/libfabric/releases/download/${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION#v}.tar.bz2" -O libfabric.tar.bz2
+tar xjf libfabric.tar.bz2 && rm libfabric.tar.bz2
+cd "libfabric-${LIBFABRIC_VERSION#v}"
+./autogen.sh
+./configure --prefix="${LIBFABRIC_INSTALL_PATH}" \
+            --disable-verbs \
+            --disable-psm3 \
+            --disable-opx \
+            --disable-usnic \
+            --disable-rstream \
+            --enable-efa \
+            --with-cuda=/usr/local/cuda \
+            --enable-cuda-dlopen \
+            --with-gdrcopy \
+            --enable-gdrcopy-dlopen
+make -j"${NPROC:-$(nproc)}"
+make install
+cd ../
+rm -rf "libfabric-${LIBFABRIC_VERSION#v}"
+
+# NGC PyTorch's default Open MPI comes from HPC-X and is exposed at /usr/local/mpi.
+# Reuse the hwloc bundled with that MPI installation for the EFA plugin.
+HWLOC_INSTALL_PATH="/usr/local/mpi"
+if [[ -f "${HWLOC_INSTALL_PATH}/include/hwloc.h" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/libhwloc.so" &&
+      -f "${HWLOC_INSTALL_PATH}/lib/pkgconfig/hwloc.pc" ]]; then
+    export PKG_CONFIG_PATH="${HWLOC_INSTALL_PATH}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+fi
 CUDA_PATH="/usr/local/cuda"
-NIXL_VERSION="v1.5.0"
+NIXL_VERSION="v1.5.2"
 NIXL_REPO="https://github.com/ai-dynamo/nixl.git"
 OLD_LD_LIBRARY_PATH=$LD_LIBRARY_PATH
 
@@ -36,8 +76,10 @@ fi
 CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
+# This build-only prefix is removed on exit; runtime libfabric comes from the image or host.
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
+    -Dlibfabric_path="${LIBFABRIC_INSTALL_PATH}" \
     -Dcudapath_lib="$CUDA_PATH/lib64" \
     -Dcudapath_inc="$CUDA_PATH/include" \
     -Dgds_path="$GDS_PATH" \
@@ -49,7 +91,7 @@ meson setup builddir \
 
 cd builddir && ninja install
 cd ../..
-rm -rf nixl*  # Remove NIXL source tree to save space
+rm -rf nixl  # Remove NIXL source tree to save space
 export LD_LIBRARY_PATH=$OLD_LD_LIBRARY_PATH
 
 # Consumers import `nixl`, but the build above installs the backend as
