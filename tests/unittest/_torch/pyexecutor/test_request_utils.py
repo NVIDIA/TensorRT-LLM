@@ -125,7 +125,9 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
 
 
 @pytest.mark.parametrize("conversation_params", [None, ConversationParams(conversation_id="conv")])
-def test_request_envelope_preserves_conversation_params(conversation_params):
+def test_request_envelope_preserves_conversation_params(
+    conversation_params: ConversationParams | None,
+) -> None:
     request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=10)
     request.py_conversation_params = conversation_params
     restored = _broadcast_round_trip(request)
@@ -1761,7 +1763,7 @@ class TestBroadcasterClock:
 
 
 @pytest.mark.parametrize("route", ["local", "pickle", "rpc", "ipc"])
-def test_typed_request_inputs_transport_and_child_policy(route):
+def test_typed_request_inputs_transport_and_child_policy(route: str) -> None:
     from tensorrt_llm.executor.ipc import IpcQueue
 
     features = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -1821,7 +1823,9 @@ def test_typed_request_inputs_transport_and_child_policy(route):
 
 
 @pytest.mark.parametrize("route", ["tp", "tp_single_round", "pp", "pp_async"])
-def test_broadcaster_transports_complete_envelopes(route, monkeypatch):
+def test_broadcaster_transports_complete_envelopes(
+    route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     wire = {}
     monkeypatch.setenv("TRTLLM_PP_REQ_SEND_ASYNC", "1" if route == "pp_async" else "0")
 
@@ -1833,12 +1837,12 @@ def test_broadcaster_transports_complete_envelopes(route, monkeypatch):
         prev_pp_rank = 0
         next_pp_rank = 1
 
-        def __init__(self, rank):
+        def __init__(self, rank: int) -> None:
             self.rank = rank
             self.is_first_pp_rank = rank == 0
             self.is_last_pp_rank = rank == 1
 
-        def broadcast(self, value, root=0):
+        def broadcast(self, value: object, root: int = 0) -> object:
             if self.rank == root:
                 wire["broadcast"] = pickle.dumps(value)
                 return value
@@ -1846,7 +1850,9 @@ def test_broadcaster_transports_complete_envelopes(route, monkeypatch):
 
         broadcast_or_none = tp_cp_broadcast = broadcast
 
-        def broadcast_int64(self, value, root=0, prefer_cpu=False):
+        def broadcast_int64(
+            self, value: list[int], root: int = 0, prefer_cpu: bool = False
+        ) -> list[int]:
             if self.rank == root:
                 wire["header"] = pickle.dumps(value)
                 return value
@@ -1854,13 +1860,13 @@ def test_broadcaster_transports_complete_envelopes(route, monkeypatch):
 
         tp_cp_broadcast_int64 = broadcast_int64
 
-        def send_object(self, value, dest, tag):
+        def send_object(self, value: object, dest: int, tag: int) -> SimpleNamespace:
             wire[tag] = pickle.dumps(value)
             return SimpleNamespace(wait=lambda: None)
 
         isend_object = send_object
 
-        def recv_object(self, source, tag):
+        def recv_object(self, source: int, tag: int) -> object:
             return pickle.loads(wire[tag])
 
     request = trtllm.Request(input_token_ids=[1, 2], max_tokens=2)

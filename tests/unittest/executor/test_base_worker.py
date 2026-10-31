@@ -902,7 +902,8 @@ def test_rpc_submit_rejects_prompt_adapters_before_dispatch(
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("ignore_eos", [False, True])
 @pytest.mark.parametrize("simple", [False, True])
-def test_worker_enqueues_serializable_python_input_envelope(ignore_eos, simple):
+def test_worker_enqueues_serializable_python_input_envelope(
+        ignore_eos: bool, simple: bool) -> None:
     import pickle
 
     from tensorrt_llm._torch.pyexecutor.llm_request import \
