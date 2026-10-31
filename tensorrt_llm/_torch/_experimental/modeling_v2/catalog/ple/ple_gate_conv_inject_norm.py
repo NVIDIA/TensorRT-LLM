@@ -320,8 +320,8 @@ ENGINE_SLOTS = 461
 TP4_SLOTS = TEP4_SLOTS
 
 
-def _cell(why: str, lengths, **spec) -> Cell:
-    return Cell(why=why, spec=dict(lengths=tuple(lengths), **spec))
+def _spec(lengths, **spec) -> dict:
+    return dict(lengths=tuple(lengths), **spec)
 
 
 class PleGateConvInjectNorm(OpWrapper):
@@ -370,54 +370,59 @@ class PleGateConvInjectNorm(OpWrapper):
     # conv_input (True -> a staged conv-input buffer is passed). The
     # checkpoint's 4 x 2560 bf16 geometry throughout.
     CELLS: tuple[Cell, ...] = (
-        _cell("decode 128 x 1 row at the 461-slot pool", (1,) * 128, pool_slots=ENGINE_SLOTS),
-        _cell("MTP3 verify: 64 sequences x 4 rows", (4,) * 64, pool_slots=ENGINE_SLOTS),
+        Cell(
+            why="decode 128 x 1 row at the 461-slot pool",
+            spec=_spec((1,) * 128, pool_slots=ENGINE_SLOTS),
+        ),
+        Cell(
+            why="MTP3 verify: 64 sequences x 4 rows",
+            spec=_spec((4,) * 64, pool_slots=ENGINE_SLOTS),
+        ),
         # Context-shaped (prefill / mixed) steps: the packed-row conv.
-        _cell("prefill 8192 rows, fresh", (8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
-        _cell(
-            "mixed step: 2 contexts + 64 decode rows",
-            (3001, 5000) + (1,) * 64,
-            carries=(False, True) + (True,) * 64,
-            pool_slots=ENGINE_SLOTS,
+        Cell(
+            why="prefill 8192 rows, fresh",
+            spec=_spec((8192,), carries=(False,), pool_slots=ENGINE_SLOTS),
+        ),
+        Cell(
+            why="mixed step: 2 contexts + 64 decode rows",
+            spec=_spec(
+                (3001, 5000) + (1,) * 64,
+                carries=(False, True) + (True,) * 64,
+                pool_slots=ENGINE_SLOTS,
+            ),
         ),
         # The unified target's members, each at the per-rank conv pool its rank binds, as
         # the forward calls it: decode and verify with `has_initial_states` None and
         # `max_rows` the rows per sequence (a verify step also stages the conv
         # input), prefill with one flag per sequence and `max_rows` the step's rows.
-        _cell(
-            f"tep4 decode: 128 x 1 row, {TEP4_SLOTS} slots",
-            (1,) * 128,
-            pool_slots=TEP4_SLOTS,
+        Cell(
+            why=f"tep4 decode: 128 x 1 row, {TEP4_SLOTS} slots",
+            spec=_spec((1,) * 128, pool_slots=TEP4_SLOTS),
         ),
-        _cell(
-            f"dep4 decode: a rank's 32 x 1 row, {DEP4_SLOTS} slots",
-            (1,) * 32,
-            pool_slots=DEP4_SLOTS,
+        Cell(
+            why=f"dep4 decode: a rank's 32 x 1 row, {DEP4_SLOTS} slots",
+            spec=_spec((1,) * 32, pool_slots=DEP4_SLOTS),
         ),
-        _cell(
-            f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
-            (2,) * 128,
-            pool_slots=TEP4_SLOTS,
-            conv_input=True,
+        Cell(
+            why=f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
+            spec=_spec((2,) * 128, pool_slots=TEP4_SLOTS, conv_input=True),
         ),
-        _cell(
-            f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row conv), {TEP4_SLOTS} slots",
-            (8,) * 128,
-            pool_slots=TEP4_SLOTS,
-            conv_input=True,
+        Cell(
+            why=f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row conv), {TEP4_SLOTS} slots",
+            spec=_spec((8,) * 128, pool_slots=TEP4_SLOTS, conv_input=True),
         ),
-        _cell(
-            f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
-            (8192,),
-            carries=(False,),
-            pool_slots=TEP4_SLOTS,
+        Cell(
+            why=f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
+            spec=_spec((8192,), carries=(False,), pool_slots=TEP4_SLOTS),
         ),
-        _cell(
-            f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
-            (8192 - 127,) + (1,) * 127,
-            carries=(False,) + (True,) * 127,
-            max_rows=8192,
-            pool_slots=TEP4_SLOTS,
+        Cell(
+            why=f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
+            spec=_spec(
+                (8192 - 127,) + (1,) * 127,
+                carries=(False,) + (True,) * 127,
+                max_rows=8192,
+                pool_slots=TEP4_SLOTS,
+            ),
         ),
     )
 

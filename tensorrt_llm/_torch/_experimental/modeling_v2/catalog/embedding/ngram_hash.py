@@ -39,8 +39,8 @@ CKPT_VOCAB_SIZE = 248320
 CKPT_CONTEXT_LEN = len(CKPT_MULTIPLIERS) - 1
 
 
-def _rows(batch: int, length: int, query: int, why: str, **spec) -> Cell:
-    return Cell(why=why, spec=dict(batch=batch, length=length, num_query_tokens=query, **spec))
+def _rows(batch: int, length: int, query: int, **spec) -> dict:
+    return dict(batch=batch, length=length, num_query_tokens=query, **spec)
 
 
 class NgramHash(OpWrapper):
@@ -81,36 +81,29 @@ class NgramHash(OpWrapper):
     # rows hashed per request instead: `ngram_size - 1` carried ids ahead of
     # the request's query tokens.
     CELLS: tuple[Cell, ...] = (
-        _rows(4, 3, 1, "decode row whose cached context is EOS", eos_positions=(0, 1)),
-        _rows(
-            32, 3, 1, "call site: 32 windows, decode / MTP verify", lead_eos=False, eos_density=0.2
+        Cell(
+            why="decode row whose cached context is EOS",
+            spec=_rows(4, 3, 1, eos_positions=(0, 1)),
         ),
-        _rows(
-            8192, 3, 1, "call site: 8192 windows, largest prefill", lead_eos=False, eos_density=0.05
+        Cell(
+            why="call site: 32 windows, decode / MTP verify",
+            spec=_rows(32, 3, 1, lead_eos=False, eos_density=0.2),
         ),
-        _rows(
-            128,
-            3,
-            1,
-            "call site: 128 windows, a 128-request decode batch",
-            lead_eos=False,
-            eos_density=0.05,
+        Cell(
+            why="call site: 8192 windows, largest prefill",
+            spec=_rows(8192, 3, 1, lead_eos=False, eos_density=0.05),
         ),
-        _rows(
-            1024,
-            3,
-            1,
-            "call site: 1024 windows, 128 requests x 8 rows of an MTP-7 verify",
-            lead_eos=False,
-            eos_density=0.05,
+        Cell(
+            why="call site: 128 windows, a 128-request decode batch",
+            spec=_rows(128, 3, 1, lead_eos=False, eos_density=0.05),
         ),
-        _rows(
-            128,
-            CKPT_CONTEXT_LEN + 8,
-            8,
-            "chunk tail: 128 requests, 2 carried ids then 8 query tokens each",
-            lead_eos=False,
-            eos_density=0.05,
+        Cell(
+            why="call site: 1024 windows, 128 requests x 8 rows of an MTP-7 verify",
+            spec=_rows(1024, 3, 1, lead_eos=False, eos_density=0.05),
+        ),
+        Cell(
+            why="chunk tail: 128 requests, 2 carried ids then 8 query tokens each",
+            spec=_rows(128, CKPT_CONTEXT_LEN + 8, 8, lead_eos=False, eos_density=0.05),
         ),
     )
 

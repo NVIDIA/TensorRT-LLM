@@ -38,23 +38,20 @@ _SIGN_BIT = torch.iinfo(torch.int32).min
 _REFERENCE_TILE_ELEMENTS = 1 << 25
 
 
-def _cell(why: str, rows: int, cols: int, windows: tuple, scores: str) -> Cell:
-    return Cell(
-        why=why,
-        spec=dict(
-            rows=rows,
-            cols=cols,
-            windows=windows,
-            scores=scores,
-            # Every column outside a row's window is NaN, +inf or 3e38.
-            tail="poison",
-            dtype=torch.float32,
-            k=_BLOCK_TOPK,
-            offsets="zero",
-            deterministic=False,
-            tie_break=int(TopKTieBreak.LARGE),
-            dsa_graph_safe=False,
-        ),
+def _spec(rows: int, cols: int, windows: tuple, scores: str) -> dict:
+    return dict(
+        rows=rows,
+        cols=cols,
+        windows=windows,
+        scores=scores,
+        # Every column outside a row's window is NaN, +inf or 3e38.
+        tail="poison",
+        dtype=torch.float32,
+        k=_BLOCK_TOPK,
+        offsets="zero",
+        deterministic=False,
+        tie_break=int(TopKTieBreak.LARGE),
+        dsa_graph_safe=False,
     )
 
 
@@ -87,75 +84,51 @@ class FlashinferTopKRaggedTransform(OpWrapper):
     # `relu_rare` one in 200, so the zero tie class straddles the budget in every window
     # wider than `k` up to the envelope's 65536 columns.
     CELLS: tuple[Cell, ...] = (
-        _cell(
-            "decode: one row over the tp1 target's 260-page table",
-            1,
-            _TP1_COLUMNS,
-            ("random", 2051, 4 * _TP1_COLUMNS - 1),
-            "relu",
+        Cell(
+            why="decode: one row over the tp1 target's 260-page table",
+            spec=_spec(1, _TP1_COLUMNS, ("random", 2051, 4 * _TP1_COLUMNS - 1), "relu"),
         ),
-        _cell(
-            "decode batch 128 at 2080 columns, window edges first",
-            128,
-            _TP1_COLUMNS,
-            ("edges",),
-            "relu",
+        Cell(
+            why="decode batch 128 at 2080 columns, window edges first",
+            spec=_spec(128, _TP1_COLUMNS, ("edges",), "relu"),
         ),
-        _cell(
-            "decode batch 128 at core's max_seq_len 9216 (2304 columns)",
-            128,
-            _CORE_COLUMNS,
-            ("edges",),
-            "relu",
+        Cell(
+            why="decode batch 128 at core's max_seq_len 9216 (2304 columns)",
+            spec=_spec(128, _CORE_COLUMNS, ("edges",), "relu"),
         ),
-        _cell(
-            "decode batch 128 at MTP's max_seq_len 16384 (4096 columns)",
-            128,
-            _MTP_COLUMNS,
-            ("edges",),
-            "relu",
+        Cell(
+            why="decode batch 128 at MTP's max_seq_len 16384 (4096 columns)",
+            spec=_spec(128, _MTP_COLUMNS, ("edges",), "relu"),
         ),
-        _cell(
-            "MTP7 verify: 128 requests x 8 = 1024 rows at 4096 columns",
-            1024,
-            _MTP_COLUMNS,
-            ("verify", 128, 8, 0, 4 * _MTP_COLUMNS - 8),
-            "relu_sparse",
+        Cell(
+            why="MTP7 verify: 128 requests x 8 = 1024 rows at 4096 columns",
+            spec=_spec(
+                1024, _MTP_COLUMNS, ("verify", 128, 8, 0, 4 * _MTP_COLUMNS - 8), "relu_sparse"
+            ),
         ),
-        _cell(
-            "decode: one row over the tune's 262144-token table (65536 columns)",
-            1,
-            _ENVELOPE_COLUMNS,
-            ("random", 2051, 4 * _ENVELOPE_COLUMNS - 1),
-            "relu",
+        Cell(
+            why="decode: one row over the tune's 262144-token table (65536 columns)",
+            spec=_spec(1, _ENVELOPE_COLUMNS, ("random", 2051, 4 * _ENVELOPE_COLUMNS - 1), "relu"),
         ),
-        _cell(
-            "decode batch 128 at 65536 columns, zero ties straddle the budget",
-            128,
-            _ENVELOPE_COLUMNS,
-            ("random", 2051, 4 * _ENVELOPE_COLUMNS - 1),
-            "relu_rare",
+        Cell(
+            why="decode batch 128 at 65536 columns, zero ties straddle the budget",
+            spec=_spec(
+                128, _ENVELOPE_COLUMNS, ("random", 2051, 4 * _ENVELOPE_COLUMNS - 1), "relu_rare"
+            ),
         ),
-        _cell(
-            "prefill: an 8192-row chunk from position 0 at 2304 columns",
-            8192,
-            _CORE_COLUMNS,
-            ("chunk", 0),
-            "relu",
+        Cell(
+            why="prefill: an 8192-row chunk from position 0 at 2304 columns",
+            spec=_spec(8192, _CORE_COLUMNS, ("chunk", 0), "relu"),
         ),
-        _cell(
-            "prefill: an 8192-row chunk ending a 262144-token prompt, ties straddle",
-            8192,
-            _ENVELOPE_COLUMNS,
-            ("chunk", 4 * _ENVELOPE_COLUMNS - 8192),
-            "relu_rare",
+        Cell(
+            why="prefill: an 8192-row chunk ending a 262144-token prompt, ties straddle",
+            spec=_spec(
+                8192, _ENVELOPE_COLUMNS, ("chunk", 4 * _ENVELOPE_COLUMNS - 8192), "relu_rare"
+            ),
         ),
-        _cell(
-            "non-zero row starts: 128 ragged windows in a 4096-column table",
-            128,
-            _MTP_COLUMNS,
-            ("ragged",),
-            "relu",
+        Cell(
+            why="non-zero row starts: 128 ragged windows in a 4096-column table",
+            spec=_spec(128, _MTP_COLUMNS, ("ragged",), "relu"),
         ),
     )
 

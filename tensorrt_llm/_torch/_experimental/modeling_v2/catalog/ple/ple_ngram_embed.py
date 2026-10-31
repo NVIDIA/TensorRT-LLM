@@ -293,8 +293,8 @@ def _ple_ngram_publish_kernel(
     tl.store(pool_row + c, published, mask=cmask)
 
 
-def _cell(why: str, lengths, **spec) -> Cell:
-    return Cell(why=why, spec=dict(lengths=tuple(lengths), **spec))
+def _spec(lengths, **spec) -> dict:
+    return dict(lengths=tuple(lengths), **spec)
 
 
 class PleNgramEmbed(OpWrapper):
@@ -329,89 +329,68 @@ class PleNgramEmbed(OpWrapper):
     # 320001536-row device table, rows filled where touched). The checkpoint's
     # 3-gram of 8 heads per order, int32 ids.
     CELLS: tuple[Cell, ...] = (
-        _cell(
-            "decode 128 x 1 row, host-resident table, 461 slots",
-            (1,) * 128,
-            pool_slots=ENGINE_SLOTS,
-            table="host",
+        Cell(
+            why="decode 128 x 1 row, host-resident table, 461 slots",
+            spec=_spec((1,) * 128, pool_slots=ENGINE_SLOTS, table="host"),
         ),
-        _cell(
-            "decode 128 x 1 row, the full checkpoint-height table",
-            (1,) * 128,
-            pool_slots=ENGINE_SLOTS,
-            table="ckpt",
-            eos_density=0.05,
+        Cell(
+            why="decode 128 x 1 row, the full checkpoint-height table",
+            spec=_spec((1,) * 128, pool_slots=ENGINE_SLOTS, table="ckpt", eos_density=0.05),
         ),
-        _cell(
-            "MTP3 verify: 64 sequences x 4 rows, 461 slots",
-            (4,) * 64,
-            pool_slots=ENGINE_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why="MTP3 verify: 64 sequences x 4 rows, 461 slots",
+            spec=_spec((4,) * 64, pool_slots=ENGINE_SLOTS, table="host", eos_density=0.05),
         ),
         # Context-shaped (prefill / mixed) steps: the packed-row form.
-        _cell(
-            "mixed step: 2 contexts + 64 decode rows",
-            (3001, 5000) + (1,) * 64,
-            carries=(False, True) + (True,) * 64,
-            pool_slots=ENGINE_SLOTS,
-            eos_density=0.05,
+        Cell(
+            why="mixed step: 2 contexts + 64 decode rows",
+            spec=_spec(
+                (3001, 5000) + (1,) * 64,
+                carries=(False, True) + (True,) * 64,
+                pool_slots=ENGINE_SLOTS,
+                eos_density=0.05,
+            ),
         ),
         # The unified target's members, each at the per-rank n-gram pool its rank binds,
         # as the forward calls it: decode and verify with `has_initial_states`
         # None and `max_rows` the rows per sequence, prefill with one flag per
         # sequence and `max_rows` the step's row count.
-        _cell(
-            f"tep4 decode: 128 x 1 row, host-resident table, {TEP4_SLOTS} slots",
-            (1,) * 128,
-            pool_slots=TEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"tep4 decode: 128 x 1 row, host-resident table, {TEP4_SLOTS} slots",
+            spec=_spec((1,) * 128, pool_slots=TEP4_SLOTS, table="host", eos_density=0.05),
         ),
-        _cell(
-            f"dep4 decode: a rank's 32 x 1 row, host-resident table, {DEP4_SLOTS} slots",
-            (1,) * 32,
-            pool_slots=DEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"dep4 decode: a rank's 32 x 1 row, host-resident table, {DEP4_SLOTS} slots",
+            spec=_spec((1,) * 32, pool_slots=DEP4_SLOTS, table="host", eos_density=0.05),
         ),
-        _cell(
-            f"tp4 decode: 128 x 1 row, the full checkpoint-height table, {TP4_SLOTS} slots",
-            (1,) * 128,
-            pool_slots=TP4_SLOTS,
-            table="ckpt",
-            eos_density=0.05,
+        Cell(
+            why=f"tp4 decode: 128 x 1 row, the full checkpoint-height table, {TP4_SLOTS} slots",
+            spec=_spec((1,) * 128, pool_slots=TP4_SLOTS, table="ckpt", eos_density=0.05),
         ),
-        _cell(
-            f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
-            (2,) * 128,
-            pool_slots=TEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"tep4 MTP1 verify: 128 sequences x 2 rows, {TEP4_SLOTS} slots",
+            spec=_spec((2,) * 128, pool_slots=TEP4_SLOTS, table="host", eos_density=0.05),
         ),
-        _cell(
-            f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row form), {TEP4_SLOTS} slots",
-            (8,) * 128,
-            pool_slots=TEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"tep4 MTP7 verify: 128 sequences x 8 rows (packed-row form), {TEP4_SLOTS} slots",
+            spec=_spec((8,) * 128, pool_slots=TEP4_SLOTS, table="host", eos_density=0.05),
         ),
-        _cell(
-            f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
-            (8192,),
-            carries=(False,),
-            pool_slots=TEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"tep4 prefill: one fresh 8192-token context, {TEP4_SLOTS} slots",
+            spec=_spec(
+                (8192,), carries=(False,), pool_slots=TEP4_SLOTS, table="host", eos_density=0.05
+            ),
         ),
-        _cell(
-            f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
-            (8192 - 127,) + (1,) * 127,
-            carries=(False,) + (True,) * 127,
-            max_rows=8192,
-            pool_slots=TEP4_SLOTS,
-            table="host",
-            eos_density=0.05,
+        Cell(
+            why=f"envelope: 8192 rows over 128 sequences (1 context + 127 decode), {TEP4_SLOTS} slots",
+            spec=_spec(
+                (8192 - 127,) + (1,) * 127,
+                carries=(False,) + (True,) * 127,
+                max_rows=8192,
+                pool_slots=TEP4_SLOTS,
+                table="host",
+                eos_density=0.05,
+            ),
         ),
     )
 

@@ -62,16 +62,13 @@ def _spread(num_seqs: int, pool_slots: int) -> tuple[int, ...]:
     return slots
 
 
-def _cell(why: str, lengths, slots, carries, pool_slots: int, **spec) -> Cell:
-    return Cell(
-        why=why,
-        spec=dict(
-            lengths=tuple(lengths),
-            slots=tuple(slots),
-            carries=tuple(carries),
-            pool_slots=pool_slots,
-            **spec,
-        ),
+def _spec(lengths, slots, carries, pool_slots: int, **spec) -> dict:
+    return dict(
+        lengths=tuple(lengths),
+        slots=tuple(slots),
+        carries=tuple(carries),
+        pool_slots=pool_slots,
+        **spec,
     )
 
 
@@ -116,67 +113,71 @@ class NgramTokenHistory(OpWrapper):
     # "literal" | "seq_lens" (zeros + int64 cumsum of an int32 seq_lens prefix --
     # `cu_seqlens_from_seq_lens`' form). `ngram_size` is the checkpoint's 3.
     CELLS: tuple[Cell, ...] = (
-        _cell(
-            "MTP verify p=8: 32 decodes x 8 rows, qsl rebuilt",
-            (8,) * 32,
-            _scattered(32),
-            (True,) * 32,
-            ENGINE_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
+        Cell(
+            why="MTP verify p=8: 32 decodes x 8 rows, qsl rebuilt",
+            spec=_spec(
+                (8,) * 32,
+                _scattered(32),
+                (True,) * 32,
+                ENGINE_SLOTS,
+                qsl_from="seq_lens",
+                **_CALL_SITE,
+            ),
         ),
-        _cell(
-            "MTP verify mixed: 37-token context + 8 x 3 rows",
-            (37,) + (3,) * 8,
-            _scattered(9),
-            (False,) + (True,) * 8,
-            ENGINE_SLOTS,
-            qsl_from="seq_lens",
-            eos_density=0.05,
-            **_CALL_SITE,
+        Cell(
+            why="MTP verify mixed: 37-token context + 8 x 3 rows",
+            spec=_spec(
+                (37,) + (3,) * 8,
+                _scattered(9),
+                (False,) + (True,) * 8,
+                ENGINE_SLOTS,
+                qsl_from="seq_lens",
+                eos_density=0.05,
+                **_CALL_SITE,
+            ),
         ),
-        _cell(
-            "zero-token rows: carry kept, fresh reseeded",
-            (2, 0, 0),
-            (0, 1, 2),
-            (True, True, False),
-            3,
+        Cell(
+            why="zero-token rows: carry kept, fresh reseeded",
+            spec=_spec((2, 0, 0), (0, 1, 2), (True, True, False), 3),
         ),
-        _cell(
-            f"tep4 decode: 128 x 1 row at the rank's {TEP4_SLOTS}-slot pool",
-            (1,) * 128,
-            _spread(128, TEP4_SLOTS),
-            (True,) * 128,
-            TEP4_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
+        Cell(
+            why=f"tep4 decode: 128 x 1 row at the rank's {TEP4_SLOTS}-slot pool",
+            spec=_spec(
+                (1,) * 128,
+                _spread(128, TEP4_SLOTS),
+                (True,) * 128,
+                TEP4_SLOTS,
+                qsl_from="seq_lens",
+                **_CALL_SITE,
+            ),
         ),
-        _cell(
-            f"dep4 decode: a rank's 32 x 1 row at its {DEP4_SLOTS}-slot pool",
-            (1,) * 32,
-            _spread(32, DEP4_SLOTS),
-            (True,) * 32,
-            DEP4_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
+        Cell(
+            why=f"dep4 decode: a rank's 32 x 1 row at its {DEP4_SLOTS}-slot pool",
+            spec=_spec(
+                (1,) * 32,
+                _spread(32, DEP4_SLOTS),
+                (True,) * 32,
+                DEP4_SLOTS,
+                qsl_from="seq_lens",
+                **_CALL_SITE,
+            ),
         ),
-        _cell(
-            f"tep4 MTP7 verify: 128 x 8 rows at the {TEP4_SLOTS}-slot pool",
-            (8,) * 128,
-            _spread(128, TEP4_SLOTS),
-            (True,) * 128,
-            TEP4_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
+        Cell(
+            why=f"tep4 MTP7 verify: 128 x 8 rows at the {TEP4_SLOTS}-slot pool",
+            spec=_spec(
+                (8,) * 128,
+                _spread(128, TEP4_SLOTS),
+                (True,) * 128,
+                TEP4_SLOTS,
+                qsl_from="seq_lens",
+                **_CALL_SITE,
+            ),
         ),
-        _cell(
-            "tep4 prefill: one fresh 8192-token context, max_num_tokens",
-            (8192,),
-            (TEP4_SLOTS - 1,),
-            (False,),
-            TEP4_SLOTS,
-            qsl_from="seq_lens",
-            **_CALL_SITE,
+        Cell(
+            why="tep4 prefill: one fresh 8192-token context, max_num_tokens",
+            spec=_spec(
+                (8192,), (TEP4_SLOTS - 1,), (False,), TEP4_SLOTS, qsl_from="seq_lens", **_CALL_SITE
+            ),
         ),
     )
 

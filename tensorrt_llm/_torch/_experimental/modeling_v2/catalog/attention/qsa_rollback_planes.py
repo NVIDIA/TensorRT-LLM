@@ -39,22 +39,6 @@ def _verify(requests: int, p: int) -> dict:
     return dict(_TEP4_POOL, rows=requests * p, requests=requests, p=p, rejected="bool")
 
 
-#: The cells both halves are certified at: the tp1 target's own, and the unified target's MTP verify
-#: rows at `max_batch_size` 128 over a tep4 rank's pool.
-_CELLS: tuple[Cell, ...] = (
-    Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
-    Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
-    Cell(
-        why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 257109-page coalesced pool",
-        spec=_verify(128, 2),
-    ),
-    Cell(
-        why="tep4 MTP7 verify: 128 requests x 8 rows (1024, the envelope's largest), same pool",
-        spec=_verify(128, 8),
-    ),
-)
-
-
 @triton.jit
 def _gather_kernel(ptrs, page_strides, pages, within, out, rows, ROW: tl.constexpr):
     plane = tl.program_id(0)
@@ -106,7 +90,20 @@ class QsaRollbackGather(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = _CELLS
+    # Both halves are certified at the same cells: the tp1 target's own, and the unified
+    # target's MTP verify rows at `max_batch_size` 128 over a tep4 rank's pool.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
+        Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
+        Cell(
+            why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 257109-page coalesced pool",
+            spec=_verify(128, 2),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows (1024, the envelope's largest), same pool",
+            spec=_verify(128, 8),
+        ),
+    )
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.begin`, before the verify step's
     trunk writes any plane; `pages` / `within` are the generation rows' QSA page and offset
@@ -176,7 +173,20 @@ class QsaRollbackRestore(OpWrapper):
     """
 
     ARCHS = frozenset({Arch.SM_103})
-    CELLS: tuple[Cell, ...] = _CELLS
+    # Both halves are certified at the same cells: the tp1 target's own, and the unified
+    # target's MTP verify rows at `max_batch_size` 128 over a tep4 rank's pool.
+    CELLS: tuple[Cell, ...] = (
+        Cell(why="12 planes, 4 verify rows (MTP3, one request)", spec=dict(planes=12, rows=4)),
+        Cell(why="12 planes, 512 verify rows (MTP3, 128 requests)", spec=dict(planes=12, rows=512)),
+        Cell(
+            why="tep4 MTP1 verify: 128 requests x 2 rows (256) over the 257109-page coalesced pool",
+            spec=_verify(128, 2),
+        ),
+        Cell(
+            why="tep4 MTP7 verify: 128 requests x 8 rows (1024, the envelope's largest), same pool",
+            spec=_verify(128, 8),
+        ),
+    )
     note = """
     Metadata consumed: none. Call site: `SpeculativeRollback.commit_speculative_states`,
     after the draft loop: `old` is the begin step's `qsa_rollback_gather` output, `rejected`
