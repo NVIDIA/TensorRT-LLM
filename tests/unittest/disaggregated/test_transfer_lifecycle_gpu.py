@@ -351,7 +351,7 @@ def _new_request(role: str, request_id: int, unique_id: int, endpoint: str) -> L
     request.py_disaggregated_params = DisaggregatedParams(
         disagg_request_id=unique_id,
         schedule_style=DisaggScheduleStyle.GENERATION_FIRST,
-        ctx_request_id=1 if role == "gen" else None,
+        ctx_request_id=unique_id if role == "gen" else None,
         ctx_dp_rank=0 if role == "gen" else None,
         ctx_info_endpoint=endpoint if role == "gen" else None,
     )

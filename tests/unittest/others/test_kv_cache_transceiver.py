@@ -298,7 +298,7 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
                 request_type="generation_only",
                 disagg_request_id=ctx_request.py_disaggregated_params.
                 disagg_request_id,
-                ctx_request_id=ctx_request.request_id,
+                ctx_request_id=ctx_request.context_phase_params.req_id,
                 ctx_dp_rank=ctx_request.context_phase_params.ctx_dp_rank,
                 ctx_info_endpoint=ctx_request.context_phase_params.
                 disagg_info_endpoint,

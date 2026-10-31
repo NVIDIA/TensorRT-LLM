@@ -846,9 +846,19 @@ def get_block_ids_per_layer_groups(
 
 
 def add_and_verify_request(
-    setup, ctx_request_id, gen_request_id, request_len, send_first: bool = True
+    setup,
+    ctx_request_id,
+    gen_request_id,
+    request_len,
+    send_first: bool = True,
+    distinct_gen_disagg_id: bool = False,
 ):
-    """Helper function to add and verify a request transfer."""
+    """Helper function to add and verify a request transfer.
+
+    ``distinct_gen_disagg_id`` gives the generation request its own
+    ``disagg_request_id``, as a generation retry does, while ``ctx_request_id``
+    keeps naming the context TxSession.
+    """
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     ctx_kv_cache_managers = setup["ctx_kv_cache_managers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
@@ -931,11 +941,15 @@ def add_and_verify_request(
         is_streaming=False,
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
+    gen_disagg_rid = unique_rid
+    if distinct_gen_disagg_id:
+        gen_disagg_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+        assert gen_disagg_rid != unique_rid
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=ctx_dp_rank,
         ctx_info_endpoint=ctx_info_endpoint,
-        disagg_request_id=unique_rid,
+        disagg_request_id=gen_disagg_rid,
     )
     # Add sequence to gen KV cache managers
     gen_kv_caches = []
@@ -1365,7 +1379,7 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=0,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1610,7 +1624,7 @@ def _setup_chunked_request(setup, ctx_request_id, gen_request_id, request_len):
         llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         ctx_dp_rank=0,
         ctx_info_endpoint=ctx_info_endpoint,
         disagg_request_id=unique_rid,
@@ -1789,7 +1803,7 @@ def test_session_has_transferring_tasks_false():
     )
     gen_request.py_disaggregated_params = DisaggregatedParams(
         disagg_request_id=unique_rid,
-        ctx_request_id=ctx_request.py_request_id,
+        ctx_request_id=unique_rid,
         schedule_style=1,
     )
 
@@ -1971,7 +1985,7 @@ def test_incompatible_peer_fails_only_affected_requests(
             llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
         )
         req.py_disaggregated_params = DisaggregatedParams(
-            ctx_request_id=request_id,
+            ctx_request_id=rid,
             ctx_dp_rank=0,
             ctx_info_endpoint=bad_endpoint,
             disagg_request_id=rid,
@@ -2524,6 +2538,426 @@ def test_failed_write_build_reports_failure_to_the_receiver():
     assert (peer_rank, rid, slice_id, is_last, size) == (3, 42, 0, True, 0)
     assert status == transfer_mod._AGENT_RESULT_CODE[transfer_mod.AgentResult.FAILED]
     assert task.status == transfer_mod.TaskStatus.ERROR
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
+def test_transfer_with_distinct_gen_disagg_id(use_v2):
+    """A generation retry carries a fresh disagg_request_id but the same ctx_request_id.
+
+    The receiver keys its session by its own disagg id and names the sender's by
+    the ctx id, so the sender resolves its TxSession and answers under the
+    receiver's key; the transfer completes even though the two ids differ.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=use_v2,
+    )
+    request_len = setup["request_len"]
+    try:
+        add_and_verify_request(
+            setup, 0, 1, request_len, send_first=True, distinct_gen_disagg_id=True
+        )
+        add_and_verify_request(
+            setup, 2, 3, request_len, send_first=False, distinct_gen_disagg_id=True
+        )
+    finally:
+        for worker in setup["ctx_transfer_workers"]:
+            worker.shutdown()
+        for worker in setup["gen_transfer_workers"]:
+            worker.shutdown()
+
+
+def _alloc_request_kv(setup, request, managers, transfer_workers):
+    """Allocate KV for one request on every manager; return (kv_caches, block_ids per rank)."""
+    use_v2 = setup["use_v2"]
+    tokens_per_block = setup["tokens_per_block"]
+    kv_caches = []
+    for mgr in managers:
+        kv = mgr._create_kv_cache(request.py_request_id, None, None)
+        assert kv.resume(torch.cuda.current_stream().cuda_stream)
+        assert kv.resize(request.prompt_len)
+        kv_caches.append(kv)
+    block_ids = [
+        get_block_ids_per_layer_groups(
+            mgr, tw, request.py_request_id, use_v2, tokens_per_block, request.prompt_len
+        )
+        for mgr, tw in zip(managers, transfer_workers, strict=True)
+    ]
+    return kv_caches, block_ids
+
+
+def _full_chunk(block_ids_per_groups, prompt_len):
+    return Chunk(
+        block_ids_per_layer_groups=block_ids_per_groups,
+        kind_per_layer_group=[CacheKind.PAGED] * len(block_ids_per_groups),
+        token_range=TokenRange(start=0, end=prompt_len),
+        is_last=True,
+    )
+
+
+def _setup_retry_attempts(setup, ctx_request_id, gen_request_ids, request_len):
+    """One context request plus two generation attempts for it.
+
+    The first attempt is the original (disagg_request_id == ctx_request_id); the
+    second is a retry (fresh disagg_request_id, same ctx_request_id), as the
+    orchestrator issues after a failed POST to the generation server.
+    """
+    sampling_params = SamplingParams()
+    ctx_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    retry_rid = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
+    assert retry_rid != ctx_rid
+
+    def _make(request_id, request_type):
+        return LlmRequest(
+            request_id=request_id,
+            max_new_tokens=1,
+            input_tokens=list(range(request_len)),
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(
+                sampling_params._get_sampling_config()
+            ),
+            is_streaming=False,
+            llm_request_type=request_type,
+        )
+
+    ctx_request = _make(ctx_request_id, LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+    ctx_request.py_disaggregated_params = DisaggregatedParams(disagg_request_id=ctx_rid)
+
+    gen_requests = []
+    for gen_request_id, disagg_rid in zip(gen_request_ids, (ctx_rid, retry_rid), strict=True):
+        gen_request = _make(gen_request_id, LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY)
+        gen_request.py_disaggregated_params = DisaggregatedParams(
+            ctx_request_id=ctx_rid,
+            ctx_dp_rank=0,
+            ctx_info_endpoint=setup["ctx_info_endpoint"],
+            disagg_request_id=disagg_rid,
+        )
+        gen_requests.append(gen_request)
+
+    ctx_kv_caches, ctx_block_ids = _alloc_request_kv(
+        setup, ctx_request, setup["ctx_kv_cache_managers"], setup["ctx_transfer_workers"]
+    )
+    gen_kv_caches, gen_block_ids = [], []
+    for gen_request in gen_requests:
+        caches, block_ids = _alloc_request_kv(
+            setup, gen_request, setup["gen_kv_cache_managers"], setup["gen_transfer_workers"]
+        )
+        gen_kv_caches.extend(caches)
+        gen_block_ids.append(block_ids)
+
+    return {
+        "ctx_request": ctx_request,
+        "gen_requests": gen_requests,
+        "ctx_kv_caches": ctx_kv_caches,
+        "gen_kv_caches": gen_kv_caches,
+        # per rank -> per layer group
+        "ctx_block_ids": ctx_block_ids,
+        # per attempt -> per rank -> per layer group
+        "gen_block_ids": gen_block_ids,
+    }
+
+
+def _close_retry_attempt_kv(info):
+    torch.cuda.current_stream().synchronize()
+    for kv in info["ctx_kv_caches"] + info["gen_kv_caches"]:
+        kv.close()
+
+
+def _wait_until(predicate, timeout_s=10.0, what="condition"):
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.005)
+
+
+def _assert_kv_landed_only_in(setup, info, served, untouched, use_v2):
+    ctx_request = info["ctx_request"]
+    ctx_block_ids = info["ctx_block_ids"][0]
+    ctx_mgr = setup["ctx_kv_cache_managers"][0]
+    gen_mgr = setup["gen_kv_cache_managers"][0]
+    served_req, served_blocks = served
+    other_req, other_blocks = untouched
+    for lg_id in range(len(ctx_block_ids)):
+        ctx_data = get_block_data(
+            ctx_mgr, ctx_block_ids[lg_id], lg_id, use_v2, ctx_request.py_request_id
+        )
+        got = get_block_data(gen_mgr, served_blocks[lg_id], lg_id, use_v2, served_req.py_request_id)
+        other = get_block_data(gen_mgr, other_blocks[lg_id], lg_id, use_v2, other_req.py_request_id)
+        assert ctx_data.equal(got), f"layer group {lg_id}: served attempt missed the KV"
+        assert not ctx_data.equal(other), f"layer group {lg_id}: refused attempt was written"
+
+
+@pytest.mark.timeout(120)
+@pytest.mark.parametrize("use_v2", [True], ids=["v2"])
+def test_gen_retry_while_first_attempt_active_is_refused_by_sender(use_v2):
+    """A retry arriving while the first attempt is live registers under its own key.
+
+    The two attempts never share a Receiver entry. The sender sees a second
+    request for the same piece from the same rank, refuses it with FAILED and
+    serves only the first attempt; the retry's close evicts nothing but itself.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=use_v2,
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    request_len = setup["request_len"]
+    try:
+        info = _setup_retry_attempts(setup, 10, [11, 12], request_len)
+        ctx_request = info["ctx_request"]
+        gen_a, gen_b = info["gen_requests"]
+        ctx_block_ids = info["ctx_block_ids"][0]
+        gen_a_block_ids, gen_b_block_ids = (ids[0] for ids in info["gen_block_ids"])
+        receiver = gen_tw._receiver
+
+        tx = ctx_tw.create_tx_session(ctx_request)
+        rx_a = gen_tw.create_rx_session(gen_a)
+        rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
+        rx_b = gen_tw.create_rx_session(gen_b)
+        key_a, key_b = rx_a.disagg_request_id, rx_b.disagg_request_id
+        assert key_b != key_a
+        assert rx_a.sender_request_id == rx_b.sender_request_id == tx.disagg_request_id
+        assert receiver._get_session(key_a) is rx_a
+        assert receiver._get_session(key_b) is rx_b
+
+        rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
+        assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
+        assert rx_b.status == SessionStatus.ERROR
+        # The sender kept only the first attempt's request for this rank; the
+        # repeat was refused before it was saved.
+        sender = ctx_tw._sender
+        first = sender._get_first_req_info(tx.disagg_request_id)
+        assert first is not None and first.instance_rank == gen_tw._rank_info.instance_rank
+        assert first.unique_rid == key_a
+        assert len(sender._get_req_info(tx.disagg_request_id)) == 1
+
+        tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
+        assert tx.wait_complete() == WaitResult.COMPLETED
+        assert rx_a.wait_complete(blocking=True) == WaitResult.COMPLETED
+        assert rx_a.status == SessionStatus.TRANSFERRED
+        assert rx_b.status == SessionStatus.ERROR
+        _assert_kv_landed_only_in(
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), use_v2
+        )
+
+        rx_b.close()
+        assert receiver._get_session(key_b) is None
+        assert receiver._get_session(key_a) is rx_a
+        rx_a.close()
+        assert receiver._get_session(key_a) is None
+
+        tx.close()
+        _close_retry_attempt_kv(info)
+    finally:
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_gen_retry_after_first_attempt_retired_is_refused_by_sender():
+    """Once the first attempt has retired, a retry may register but is not served again.
+
+    The sender already shipped the piece to the first attempt and the TxSession
+    is still live; the repeat request from the same rank gets FAILED, the
+    settled piece is not rewritten, and the sender stays TRANSFERRED.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=True,
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    request_len = setup["request_len"]
+    try:
+        info = _setup_retry_attempts(setup, 20, [21, 22], request_len)
+        ctx_request = info["ctx_request"]
+        gen_a, gen_b = info["gen_requests"]
+        ctx_block_ids = info["ctx_block_ids"][0]
+        gen_a_block_ids, gen_b_block_ids = (ids[0] for ids in info["gen_block_ids"])
+        receiver = gen_tw._receiver
+
+        tx = ctx_tw.create_tx_session(ctx_request)
+        tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
+        rx_a = gen_tw.create_rx_session(gen_a)
+        rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
+        assert tx.wait_complete() == WaitResult.COMPLETED
+        assert rx_a.wait_complete(blocking=True) == WaitResult.COMPLETED
+        key_a = rx_a.disagg_request_id
+        rx_a.close()
+        assert receiver._get_session(key_a) is None
+
+        rx_b = gen_tw.create_rx_session(gen_b)
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        assert receiver._get_session(key_b) is rx_b
+        rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
+        assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
+        assert rx_b.status == SessionStatus.ERROR
+        assert tx.status == SessionStatus.TRANSFERRED
+        _assert_kv_landed_only_in(
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), True
+        )
+
+        rx_b.close()
+        tx.close()
+        _close_retry_attempt_kv(info)
+    finally:
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_gen_retry_after_first_attempt_cancelled_fails_fast():
+    """A retry after the first attempt was cancelled gets FAILED from the sender at once.
+
+    The cancel reached the TxSession, so the retry's request meets a terminal
+    session and is answered immediately instead of waiting for a transfer
+    that can no longer happen.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=True,
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    request_len = setup["request_len"]
+    try:
+        info = _setup_retry_attempts(setup, 30, [31, 32], request_len)
+        ctx_request = info["ctx_request"]
+        gen_a, gen_b = info["gen_requests"]
+        gen_a_block_ids, gen_b_block_ids = (ids[0] for ids in info["gen_block_ids"])
+        receiver = gen_tw._receiver
+
+        tx = ctx_tw.create_tx_session(ctx_request)
+        rx_a = gen_tw.create_rx_session(gen_a)
+        rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
+        key_a = rx_a.disagg_request_id
+        assert rx_a.cancel()
+        _wait_until(
+            lambda: tx.status == SessionStatus.CANCELLED,
+            what="the sender to observe the cancel",
+        )
+        assert tx.cancelled_by_peer is True
+        rx_a.close()
+        assert receiver._get_session(key_a) is None
+
+        rx_b = gen_tw.create_rx_session(gen_b)
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        assert receiver._get_session(key_b) is rx_b
+        rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
+        assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
+        # The sender's CANCEL fan-out names the first attempt's key, so only its
+        # FAILED answer to the repeat request can end the retry.
+        assert rx_b.status == SessionStatus.ERROR
+
+        rx_b.close()
+        tx.close()
+        _close_retry_attempt_kv(info)
+    finally:
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
+
+
+@pytest.mark.timeout(60)
+def test_gen_retry_ignores_stale_success_of_timed_out_first_attempt():
+    """A SUCCESS still in flight for a timed-out attempt cannot complete its retry.
+
+    The first attempt times out and closes while the sender's SUCCESS for it is
+    on the wire. The retry registers under its own key, so the stale result finds
+    no session and is dropped; the retry ends with the sender's FAILED and its KV
+    pages stay untouched.
+    """
+    setup = create_transfer_worker_setup(
+        ctx_tp=1,
+        ctx_pp=1,
+        ctx_enable_dp=False,
+        gen_tp=1,
+        gen_pp=1,
+        gen_enable_dp=False,
+        use_v2=True,
+    )
+    ctx_tw = setup["ctx_transfer_workers"][0]
+    gen_tw = setup["gen_transfer_workers"][0]
+    request_len = setup["request_len"]
+    try:
+        info = _setup_retry_attempts(setup, 40, [41, 42], request_len)
+        ctx_request = info["ctx_request"]
+        gen_a, gen_b = info["gen_requests"]
+        ctx_block_ids = info["ctx_block_ids"][0]
+        gen_a_block_ids, gen_b_block_ids = (ids[0] for ids in info["gen_block_ids"])
+        receiver = gen_tw._receiver
+
+        # Hold every KV result on the receiver so the first attempt's SUCCESS is
+        # still "in flight" when it times out, closes and the retry registers.
+        held = []
+        passthrough = [False]
+        deliver = receiver._process_kv_agent_result
+
+        def gated(send_id, message):
+            if passthrough[0]:
+                return deliver(send_id, message)
+            held.append((send_id, message))
+
+        receiver._process_kv_agent_result = gated
+
+        tx = ctx_tw.create_tx_session(ctx_request)
+        tx.send(_full_chunk(ctx_block_ids, ctx_request.prompt_len))
+        rx_a = gen_tw.create_rx_session(gen_a)
+        rx_a._timeout_s = 1.0
+        rx_a.receive(_full_chunk(gen_a_block_ids, gen_a.prompt_len))
+        assert tx.wait_complete() == WaitResult.COMPLETED
+        _wait_until(lambda: held, what="the sender's SUCCESS to reach the receiver")
+        assert rx_a.wait_complete(blocking=True) == WaitResult.FAILED
+        key_a = rx_a.disagg_request_id
+        rx_a.close()
+        assert receiver._get_session(key_a) is None
+
+        rx_b = gen_tw.create_rx_session(gen_b)
+        key_b = rx_b.disagg_request_id
+        assert key_b != key_a
+        rx_b.receive(_full_chunk(gen_b_block_ids, gen_b.prompt_len))
+
+        # Let the stale SUCCESS land now, after the retry is registered.
+        passthrough[0] = True
+        for args in held:
+            deliver(*args)
+        assert receiver._get_session(key_b) is rx_b
+
+        assert rx_b.wait_complete(blocking=True) == WaitResult.FAILED
+        assert rx_b.status == SessionStatus.ERROR
+        assert tx.status == SessionStatus.TRANSFERRED
+        _assert_kv_landed_only_in(
+            setup, info, (gen_a, gen_a_block_ids), (gen_b, gen_b_block_ids), True
+        )
+
+        rx_b.close()
+        tx.close()
+        _close_retry_attempt_kv(info)
+    finally:
+        ctx_tw.shutdown()
+        gen_tw.shutdown()
 
 
 if __name__ == "__main__":

@@ -396,7 +396,10 @@ def run_kv_transfer_test(
                 llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
             )
             gen_request.py_disaggregated_params = DisaggregatedParams(
-                ctx_request_id=ctx_rid,
+                # Mirrors a real ctx response: ContextPhaseParams.req_id
+                # resolves disagg-first, so it equals the id the ctx TxSession
+                # registered under, not the ctx server's local request id.
+                ctx_request_id=unique_rid,
                 ctx_dp_rank=ctx_dp_rank,
                 ctx_info_endpoint=ctx_info_endpoint,
                 disagg_request_id=unique_rid,
