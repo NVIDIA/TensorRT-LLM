@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import hashlib
 import os
 import re
 import shlex
@@ -240,7 +241,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             arg_list += ["-m", unittest_markexpr]
     case_fn = re.sub(r'[/\s"\']+', '-', case)
     if len(case_fn) > 80:
-        case_fn = case_fn[:80]
+        case_hash = hashlib.sha256(case.encode()).hexdigest()[:16]
+        case_fn = f'{case_fn[:63]}-{case_hash}'
     # MoE entries expand to too many sub-tests, which introduces noise into
     # the overall TRT-LLM test quality metrics. Skip per-sub-test reporting
     # for MoE by prefixing with "moe-" (CI only collects files starting

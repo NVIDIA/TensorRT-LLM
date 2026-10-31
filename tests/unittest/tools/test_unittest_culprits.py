@@ -18,8 +18,11 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
+
+pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = _REPO_ROOT / "tests/integration/defs/test_unittests.py"
@@ -60,6 +63,50 @@ def _load_test_unittests_module() -> types.ModuleType:
 _TEST_UNITTESTS = _load_test_unittests_module()
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
+
+
+def test_long_selectors_preserve_separate_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(
+        pd, "read_csv", lambda path: pd.DataFrame(columns=["gpu", "unittest_case_name"])
+    )
+    nvml = types.ModuleType("pynvml")
+    nvml.nvmlInit = lambda: None
+    nvml.nvmlDeviceGetHandleByIndex = lambda index: index
+    nvml.nvmlDeviceGetName = lambda handle: "CPU"
+    nvml.NVMLError = RuntimeError
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setenv("LLM_TEST_PARALLEL_OVERRIDE", "1")
+    monkeypatch.setattr(_TEST_UNITTESTS, "tests_path", lambda: str(tmp_path))
+
+    reports = []
+
+    def run_cmd(command: list[str], **kwargs: object) -> None:
+        path = Path(
+            next(
+                arg.split("=", 1)[1]
+                for arg in command
+                if arg.startswith("--periodic-junit-xmlpath=")
+            )
+        )
+        reports.append(path)
+        path.write_text(str(len(reports)), encoding="utf-8")
+
+    request = Mock()
+    request.config.getoption.return_value = None
+    prefix = (
+        "unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver"
+    )
+    for selector in (f'{prefix} -k "v2 and no_window"', f'{prefix} -k "v2 and uniform_window"'):
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), selector, str(tmp_path), request
+        )
+
+    assert reports[0] != reports[1]
+    assert [path.read_text(encoding="utf-8") for path in reports] == ["1", "2"]
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
