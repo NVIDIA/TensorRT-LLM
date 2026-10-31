@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import functools
 import os
-import socket
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -868,78 +867,9 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         ProcessGroup; for pure DEP a node-local NCCL WORLD suffices. No-op
         under Ray or single-rank.
         """
-        if not dist.is_available() or dist.is_initialized():
-            return
-        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
+        from tensorrt_llm._torch.distributed.initialization import ensure_cutedsl_torch_distributed
 
-        try:
-            world = mpi_world_size()
-            rank = mpi_rank()
-        except Exception as e:  # not under MPI either -> leave uninitialized
-            logger.debug(
-                f"[MegaMoECuteDsl] MPI rank query failed ({e!r}); "
-                "skipping torch.distributed bootstrap."
-            )
-            return
-        if world <= 1:
-            return
-        # Check pure DEP BEFORE any collective: under PP/CP hybrids some ranks
-        # never construct a MegaMoE module, so the bcast/init below would hang
-        # instead of failing loud. Rank-identical inputs -> lockstep raise.
-        if world != self.ep_size:
-            raise ValueError(
-                f"MegaMoECuteDsl requires pure DEP (MPI WORLD == EP) to "
-                f"bootstrap torch.distributed: got MPI world={world}, "
-                f"EP={self.ep_size}."
-            )
-
-        # Rank 0 draws a free port (a fixed one collides across same-node
-        # jobs). The bcast is UNCONDITIONAL and rank 0 alone decides
-        # (honoring ITS pre-set MASTER_* env): gating the collective on
-        # per-rank env presence would desync the communicator when the vars
-        # are exported on only a subset of ranks. No bind-race retry: a sound
-        # one needs cross-rank failure agreement, and the close()->bind()
-        # window is negligible next to the fixed-port collision this replaces.
-        def _pick_rendezvous():
-            addr = os.environ.get("MASTER_ADDR")
-            port = os.environ.get("MASTER_PORT")
-            if addr and port:
-                return (addr, port)
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("", 0))
-                port = sock.getsockname()[1]
-            try:
-                addr = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                # Unresolvable hostname (minimal containers / broken DNS):
-                # this bootstrap is documented single-node, loopback works.
-                addr = "127.0.0.1"
-            return (addr, str(port))
-
-        host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
-        os.environ["MASTER_ADDR"] = str(host)
-        os.environ["MASTER_PORT"] = str(port)
-        # The executor already bound this rank's device before the model was
-        # built (base_worker: global_mpi_rank() % device_count). Re-deriving it
-        # here could pick a different GPU (e.g. a disagg ctx/gen pair sharing a
-        # node) and would move only the layers built after this point, so bind
-        # NCCL to the current device instead of selecting one.
-        device_id = None
-        if torch.cuda.is_available():
-            device_id = torch.device("cuda", torch.cuda.current_device())
-        logger.info(
-            f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
-            f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "
-            f"device={device_id}, "
-            f"{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}) for the "
-            f"EP rendezvous."
-        )
-        dist.init_process_group(
-            backend="cuda:nccl,cpu:gloo",
-            rank=rank,
-            world_size=world,
-            device_id=device_id,
-        )
+        ensure_cutedsl_torch_distributed(self.ep_size)
 
     def _resolve_ep_pg(self):
         """Return the torch.distributed ProcessGroup for the EP sub-world.
