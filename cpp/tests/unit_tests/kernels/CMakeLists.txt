@@ -24,8 +24,27 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;logits;gpu")
-add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
-add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
+add_tllm_gtest(
+  cascadeAttentionKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
+add_tllm_gtest(
+  cascadeAttentionNumericsTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionNumericsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  tllm::kernel_attention_decode
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -71,8 +90,32 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;rope;gpu")
-add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
-add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
+add_tllm_gtest(
+  smoothQuantKernelTest
+  OWNER
+  kernel
+  SOURCES
+  smoothQuant/smoothQuantKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_smooth_quant
+  tllm::kernel_int8_gemm
+  TEST_PREFIX
+  "SmoothQuant."
+  LABELS
+  "unit;kernels;smooth-quant;gpu")
+add_tllm_gtest(
+  weightOnlyKernelTest
+  OWNER
+  kernel
+  SOURCES
+  weightOnly/weightOnlyKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_weight_only
+  tllm::kernel_weight_only_gemm
+  TEST_PREFIX
+  "WeightOnly."
+  LABELS
+  "unit;kernels;weight-only;gpu")
 add_tllm_gtest(
   mlaPreprocessTest
   OWNER
@@ -96,7 +139,17 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;sparse-attention;gpu")
 
-add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
+add_tllm_gtest(
+  cudaCoreGemmKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cudaCoreGemm/cudaCoreGemmKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cuda_core_gemm
+  CUDA::cublasLt
+  LABELS
+  "unit;kernels;cuda-core-gemm;gpu")
 
 add_tllm_gtest(
   mlaChunkedPrefillTest
@@ -122,14 +175,30 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;moe-communication;gpu")
 
-add_gtest(
+add_tllm_gtest(
   gemmSwigluRunnerTest
+  OWNER
+  kernel
+  SOURCES
   fused_gated_gemm/gemmSwigluRunnerTest.cu
-  ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/kernels/fused_gated_gemm/gemm_swiglu_e4m3.cu
+  LINK_LIBRARIES
+  tllm::kernel_gated_gemm
+  LABELS
+  "unit;kernels;gated-gemm;gpu"
   NO_GTEST_MAIN)
-add_gtest(gemmSwigluKernelTestSm90Fp8
-          fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu NO_GTEST_MAIN
-          NO_TLLM_LINKAGE)
+
+add_executable(gemmSwigluKernelTestSm90Fp8 EXCLUDE_FROM_ALL
+               fused_gated_gemm/gemmSwigluKernelTestSm90Fp8.cu)
+target_link_libraries(gemmSwigluKernelTestSm90Fp8
+                      PRIVATE gtest tllm::kernel_cutlass_headers)
+target_compile_features(gemmSwigluKernelTestSm90Fp8 PRIVATE cxx_std_20)
+add_test(NAME gemmSwigluKernelTestSm90Fp8 COMMAND gemmSwigluKernelTestSm90Fp8)
+set_tests_properties(
+  gemmSwigluKernelTestSm90Fp8
+  PROPERTIES ENVIRONMENT "CUDA_MODULE_LOADING=LAZY" SKIP_RETURN_CODE 77 LABELS
+             "unit;kernels;gated-gemm;gpu")
+add_dependencies(kernel-tests gemmSwigluKernelTestSm90Fp8)
+add_dependencies(google-tests gemmSwigluKernelTestSm90Fp8)
 
 foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   set_property(TARGET ${target_name} PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
@@ -151,14 +220,44 @@ foreach(target_name gemmSwigluRunnerTest;gemmSwigluKernelTestSm90Fp8)
   endif()
 endforeach()
 
-set(ROUTING_KERNEL_TEST_SRC
-    moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
-    moe/routing/routingCustomTest.cpp moe/routing/routingDeepSeekTest.cpp)
-add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
-target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
+add_tllm_gtest(
+  routingKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/routing/routingTest.cpp
+  moe/routing/routingLlama4Test.cpp
+  moe/routing/routingCustomTest.cpp
+  moe/routing/routingDeepSeekTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_routing
+  tllm::runtime_buffers
+  Python3::Python
+  LABELS
+  "unit;kernels;moe-routing;gpu")
 
-add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
-add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
+add_tllm_gtest(
+  blockScaleMoeActivationTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeActivationTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
+add_tllm_gtest(
+  blockScaleMoeFinalizeTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeFinalizeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
 
 add_tllm_gtest(
   moeLoadBalanceKernelTest
@@ -227,7 +326,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;attention-mask;gpu")
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu")
 
 add_tllm_gtest(
   nvfp4ColdPageKernelsTest

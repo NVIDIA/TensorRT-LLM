@@ -172,7 +172,10 @@ file(GLOB_RECURSE GROUPED_SRC_CU ${MOE_CUTLASS_DIR}/*.cu)
 file(GLOB_RECURSE FBGEMM_SRC_CU fp8_rowwise_gemm/*.cu)
 
 # Get the sources for FP8 Blockwise GEMM launchers
-file(GLOB_RECURSE FP8_BLOCKSCALE_GEMM_SRC_CU fp8_blockscale_gemm/*.cu)
+set(FP8_BLOCKSCALE_GEMM_SRC_CU
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+    ${CMAKE_CURRENT_SOURCE_DIR}/fp8_blockscale_gemm/fp8_blockscale_quant_packed.cu
+)
 
 # Get the sources for FP4 GEMM launchers
 file(GLOB_RECURSE FP4_SRC_CU fp4_gemm/*.cu)
@@ -184,6 +187,15 @@ file(GLOB_RECURSE ARGEMM_SRC_CU allreduce_gemm/*.cu)
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 set(ALL_SRCS ${SRC_CPP};${SRC_CU})
+list(
+  REMOVE_ITEM
+  ALL_SRCS
+  "${CMAKE_CURRENT_SOURCE_DIR}/int8_gemm/int8_gemm_bf16.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/int8_gemm/int8_gemm_fp16.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/int8_gemm/int8_gemm_fp32.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/int8_gemm/int8_gemm_int32.cu")
+list(REMOVE_ITEM ALL_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/cutlass_heuristic.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/cutlass_preprocessors.cpp")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fpA_intB_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_rowwise_gemm/.*")
 list(FILTER ALL_SRCS EXCLUDE REGEX "fp8_blockscale_gemm/.*")
@@ -206,9 +218,20 @@ message(VERBOSE "FP4 srcs ${FP4_SRC_CU} ${FP4_CU_INSTANTIATIONS}")
 message(VERBOSE "ARgemm srcs ${ARGEMM_SRC_CU}")
 message(VERBOSE "All srcs ${ALL_SRCS}")
 
-add_library(cutlass_src STATIC ${ALL_SRCS})
+if(ALL_SRCS)
+  add_library(cutlass_src STATIC ${ALL_SRCS})
+  target_link_libraries(cutlass_src PUBLIC tllm::kernel_gemm_utilities
+                                           tllm::kernel_int8_gemm)
+else()
+  add_library(cutlass_src INTERFACE)
+  target_link_libraries(cutlass_src INTERFACE tllm::kernel_gemm_utilities
+                                              tllm::kernel_int8_gemm)
+endif()
 
 add_library(fpA_intB_gemm_src STATIC ${MIXED_SRC_CPP} ${MIXED_SRC_CU})
+add_library(tllm::kernel_weight_only_gemm ALIAS fpA_intB_gemm_src)
+target_link_libraries(fpA_intB_gemm_src PUBLIC tllm::kernel_gemm_utilities
+                                               tllm::common_environment)
 add_cuda_architectures(fpA_intB_gemm_src 89)
 add_instantiations(fpA_intB_gemm_src ${INSTANTIATION_GENERATION_DIR}/gemm)
 
@@ -218,11 +241,18 @@ set_cuda_architectures(fb_gemm_src ${CUTLASS_COMMON_ARCHS})
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
+add_library(tllm::kernel_fp8_block_scale_gemm ALIAS fp8_blockscale_gemm_src)
+target_link_libraries(
+  fp8_blockscale_gemm_src
+  PUBLIC tllm::kernel_gemm_utilities tllm::common_environment CUDA::cuda_driver
+         ${NVRTC_LIB} ${NVRTC_BUILTINS_LIB})
 set_cuda_architectures(fp8_blockscale_gemm_src ${CUTLASS_COMMON_ARCHS})
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)
 add_library(gemm_swiglu_sm90_src STATIC ${GEMM_SWIGLU_SM90_SRC_CU})
+add_library(tllm::kernel_gated_gemm ALIAS gemm_swiglu_sm90_src)
+target_link_libraries(gemm_swiglu_sm90_src PUBLIC tllm::kernel_gemm_utilities)
 set_cuda_architectures(gemm_swiglu_sm90_src 90)
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
