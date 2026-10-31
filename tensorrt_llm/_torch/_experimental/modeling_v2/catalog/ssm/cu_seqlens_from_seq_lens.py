@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: Integer dtypes accepted on either side. ``torch.cumsum`` silently accepts
 #: bool and floating dtypes and answers wrongly with them.

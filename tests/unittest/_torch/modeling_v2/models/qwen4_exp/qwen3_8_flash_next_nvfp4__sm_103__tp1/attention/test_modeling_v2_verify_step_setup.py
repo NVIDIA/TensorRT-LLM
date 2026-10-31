@@ -11,11 +11,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_rollbac
     plane_table,
     qsa_rollback_gather,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
+    cu_seqlens_from_seq_lens,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.verify_step_setup import (  # noqa: E501
     verify_step_setup,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.cu_seqlens_from_seq_lens import (  # noqa: E501
-    cu_seqlens_from_seq_lens,
 )
 
 assert torch.cuda.is_available(), "the verify step setup test requires a CUDA device"
