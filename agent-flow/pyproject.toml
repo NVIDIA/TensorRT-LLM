@@ -21,6 +21,7 @@ test = [
 [project.scripts]
 agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
+modeling-v2-onboard = "agent_flow.workflows.modeling_v2_onboard.cli:main"
 perf-analyze = "agent_flow.workflows.perf_analyze.cli:main"
 perf-optimize = "agent_flow.workflows.perf_optimize.cli:main"
 
@@ -86,6 +87,7 @@ extend-ignore = [
 # Markdown tables in prompt string literals — a table row must stay on one line.
 "agent_flow/workflows/modeling_bringup/prompts/plan_drafter_extra.py" = ["E501"]
 "agent_flow/workflows/modeling_bringup/prompts/reviewer_extra.py" = ["E501"]
+"agent_flow/workflows/modeling_v2_onboard/prompts/*.py" = ["E501"]
 
 [tool.ruff.lint.pycodestyle]
 max-line-length = 120
