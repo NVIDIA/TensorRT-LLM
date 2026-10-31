@@ -15,7 +15,8 @@ from ..llmapi.utils import print_traceback_on_error
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .postprocessor_hook import load_post_processor_hook
+from .postprocessor_hook import (end_post_processor_hook,
+                                 load_post_processor_hook)
 from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
 
 if TYPE_CHECKING:
@@ -234,6 +235,18 @@ class PostprocWorker:
                 if sub_batch:
                     await self._push_pipes[frontend_id].put_async(sub_batch)
 
+    def _end_record(self, client_id: int, reason: str) -> None:
+        """Drop the record of a request that ends without a final response.
+
+        The post-processing hook gets no final chunk for such a request, so it
+        is told through its optional ``on_request_end`` instead; otherwise any
+        per-request state the hook keeps would live as long as the worker.
+        """
+        record = self._records.pop(client_id, None)
+        if record is not None:
+            end_post_processor_hook(self._post_processor_hook, record.id,
+                                    reason)
+
     async def _mainloop(self):
         ''' The loop for handle_response and keep producing outputs. '''
 
@@ -247,7 +260,7 @@ class PostprocWorker:
             # directly so the proxy handles it via its ErrorResponse path.
             if isinstance(inp.rsp, ErrorResponse):
                 batch.append(inp.rsp)
-                self._records.pop(client_id, None)
+                self._end_record(client_id, "error")
                 return
             try:
                 response_result = inp.rsp.result if is_llm_response(
@@ -298,7 +311,7 @@ class PostprocWorker:
                         error_msg=f"Postprocessing error: {e}",
                         request_id=getattr(inp.rsp, 'request_id', -1),
                     ))
-                self._records.pop(client_id, None)
+                self._end_record(client_id, "postprocessing_error")
 
         while not self._to_stop.is_set():
             batch = []

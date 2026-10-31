@@ -45,7 +45,8 @@ The hook works the same with or without the out-of-process post-processing worke
 
 ## The hook interface
 
-A hook implements a single method, `__call__(self, chunk) -> verdict`:
+A hook implements a single required method, `__call__(self, chunk) -> verdict` (see *Per-request
+state* for the optional `on_request_end`):
 
 ```python
 from tensorrt_llm.executor.postprocessor_hook import (
@@ -125,6 +126,10 @@ class BannedPhraseGuard:
         if chunk.is_final:
             self._buffers.pop(chunk.request_id, None)
         return emit(chunk.text_diff)
+
+    def on_request_end(self, request_id: int, reason: str) -> None:
+        # Optional: release a request that ended without a final chunk.
+        self._buffers.pop(request_id, None)
 ```
 
 ### Suppress output
@@ -148,6 +153,25 @@ pool is enabled) and shared across all requests it handles, so any per-request s
 shared across processes or across separate `LLM` instances; when the post-processing worker pool is
 enabled, all chunks of a single request are still routed to the same worker, so per-request state
 remains consistent for that request.
+
+A request can also end without a final chunk when the hook raises. With the post-processing worker
+pool enabled, executor errors and other post-processing exceptions can end a request this way too.
+To release its state, a hook can define the optional method `on_request_end(self, request_id,
+reason)`, as `BannedPhraseGuard` above does. It is called when the hook raises on either the in-proxy
+or worker path, and when the worker drops a request after an error:
+
+- `request_id` is the value the hook saw as `chunk.request_id`.
+- `reason` is `"error"` when the executor reported an error for the request, and
+  `"postprocessing_error"` when its post-processing raised.
+- It is never called for a request that finished normally. It may be called for a request the hook
+  never received a chunk for, so treat an unknown `request_id` as a no-op.
+- Cleanup must be idempotent: a hook exception can notify it once at the failure and again when
+  the worker drops the request.
+- An exception it raises is logged and ignored.
+- Hooks without the method are unaffected.
+
+With the Ray orchestrator, executor errors do not pass through the post-processing worker pool, so
+there `on_request_end` is called only with `"postprocessing_error"`.
 
 Engine-level batching is transparent to the hook: even when requests are batched together in the
 engine, the hook is invoked **once per request** (per output, per chunk) — there is no batched-call
@@ -195,6 +219,8 @@ The hook's unit and end-to-end tests double as runnable usage examples:
 pytest tests/unittest/executor/test_postprocessor_hook.py -v
 ```
 
+- How a post-processing worker releases a request that ends in an error (`on_request_end`):
+  `tests/unittest/executor/test_postproc_worker_request_end.py`.
 - End-to-end serving tests across endpoints, streaming modes, and worker-pool settings:
   `tests/unittest/llmapi/apps/_test_openai_post_processor.py`.
 - The deterministic sample hooks used by those tests:
