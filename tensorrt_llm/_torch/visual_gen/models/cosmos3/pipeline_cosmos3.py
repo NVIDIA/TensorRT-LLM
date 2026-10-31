@@ -55,7 +55,6 @@ from tensorrt_llm.media.decoding import decode_video_reference_window, video_str
 from .action import (
     ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
-    COSMOS3_ASPECT_RATIO_BUCKETS,
     action_reference_frame_step,
     action_reference_size,
     action_start_frame_offset,
@@ -72,6 +71,7 @@ from .action import (
 from .config_resolver import Cosmos3ConfigResolver
 from .defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
     COSMOS3_DURATION_TEMPLATE,
@@ -83,6 +83,7 @@ from .defaults import (
     COSMOS3_V2V_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
+    find_closest_target_size,
     resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
 )
@@ -95,7 +96,6 @@ from .transfer import (
     TRANSFER_DEFAULTS,
     Cosmos3TransferConfig,
     decode_media_to_uint8_cthw,
-    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,

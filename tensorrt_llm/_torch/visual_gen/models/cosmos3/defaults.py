@@ -20,12 +20,6 @@ Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, TypedDict
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    COSMOS3_ACTION_RESOLUTIONS,
-    EMBODIMENT_TO_DOMAIN_ID,
-    VIDEO_RES_SIZE_INFO,
-    normalize_action_resolution,
-)
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 
@@ -33,9 +27,87 @@ from tensorrt_llm.inputs.media_io import sniff_media_kind
 # Constant tables
 # ---------------------------------------------------------------------------
 
-# Cosmos3 output resolution buckets keyed by target level, then aspect ratio;
-# each value is (width, height). A source frame maps onto the bucket whose
-# aspect ratio is closest (see ``find_closest_target_size`` in ``transfer.py``).
+# The reference's ``W,H`` aspect buckets: every canvas is one of these shapes, and a
+# request's bucket string is carried into the caption verbatim, so a resolved frame
+# size maps back to the nearest bucket rather than to its exact reduced ratio
+# (832x480 reduces to "15,26", which the model never saw).
+COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+# Output sizes per resolution level and aspect bucket, as (width, height).
+VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "16,9": (320, 192),
+        "9,16": (192, 320),
+    },
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "704": {
+        "1,1": (960, 960),
+        "4,3": (1088, 832),
+        "3,4": (832, 1088),
+        "16,9": (1280, 704),
+        "9,16": (704, 1280),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
+
+COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
+
+
+def normalize_action_resolution(resolution: Any) -> int:
+    if resolution is None:
+        raise ValueError("Cosmos3 action_resolution is required for action generation.")
+    try:
+        bucket = int(resolution)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
+        ) from exc
+    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
+        raise ValueError(
+            f"Unknown Cosmos3 action_resolution={bucket}; "
+            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
+        )
+    return bucket
+
+
+def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
+    """The ``resolution`` bucket whose aspect ratio is closest to ``h/w``, as
+    ``(width, height)``, so a source frame lands on a supported size undistorted."""
+    key = str(resolution)
+    if key not in VIDEO_RES_SIZE_INFO:
+        raise ValueError(
+            f"Unknown Cosmos3 resolution={resolution!r}; "
+            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
+        )
+    input_ratio = h / w
+    best_size = None
+    best_diff = float("inf")
+    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
+        diff = abs(input_ratio - cand_h / cand_w)
+        if diff < best_diff:
+            best_diff = diff
+            best_size = (cand_w, cand_h)
+    assert best_size is not None
+    return best_size
+
+
 # The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
 _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
 COSMOS3_720P_PARAMS = {
@@ -491,6 +563,8 @@ def canonical_domain_preset_key(
     resolved_id = int(domain_id)
     if resolved_id == 0:
         return None
+
+    from .action import EMBODIMENT_TO_DOMAIN_ID
 
     candidates: list[str] = []
     for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items():

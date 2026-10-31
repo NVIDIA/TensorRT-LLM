@@ -13,15 +13,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    COSMOS3_ASPECT_RATIO_BUCKETS,
     EMBODIMENT_TO_DOMAIN_ID,
     EMBODIMENT_TO_RAW_ACTION_DIM,
-    VIDEO_RES_SIZE_INFO,
     action_reference_frame_step,
     action_reference_size,
     crop_action_latent,
-    find_closest_target_size,
-    normalize_action_resolution,
     prepare_action_latents,
     resize_and_pad_action_image,
     resolve_action_content_size,
@@ -30,11 +26,15 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DOMAIN_PRESET_ALIASES,
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_POLICY_SAMPLING_PARAMS,
+    VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
     get_domain_preset,
+    normalize_action_resolution,
     resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
 )
@@ -68,7 +68,7 @@ class TestFindClosestTargetSize:
         )
 
     def test_unknown_resolution_raises(self):
-        with pytest.raises(ValueError, match="Unknown Cosmos3 action resolution"):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 resolution"):
             find_closest_target_size(480, 832, 1080)
 
     @pytest.mark.parametrize("action_resolution", sorted(VIDEO_RES_SIZE_INFO))

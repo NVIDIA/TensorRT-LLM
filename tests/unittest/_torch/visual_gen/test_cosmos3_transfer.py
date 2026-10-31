@@ -31,6 +31,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
     VIDEO_RES_SIZE_INFO,
+    find_closest_target_size,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import DISTILLED_GUIDANCE_SCALE
@@ -40,7 +41,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
     BILATERAL_SIGMA_SPACE,
     _scaled_bilateral_params,
     decode_media_to_uint8_cthw,
-    find_closest_target_size,
     load_or_compute_control_frames,
     pad_temporal_frames,
     resolve_transfer_config,
@@ -1310,5 +1310,5 @@ class TestFindClosestTargetSize:
         )
 
     def test_unknown_resolution_raises(self):
-        with pytest.raises(ValueError, match="Unknown Cosmos3 transfer resolution"):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 resolution"):
             find_closest_target_size(720, 1280, 1080)

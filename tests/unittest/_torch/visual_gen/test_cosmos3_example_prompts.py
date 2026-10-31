@@ -15,11 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     VIDEO_RES_SIZE_INFO,
     find_closest_target_size,
-)
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_domain_action_config,
 )

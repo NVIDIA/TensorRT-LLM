@@ -30,13 +30,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .action import EMBODIMENT_TO_DOMAIN_ID, normalize_action_resolution, resolve_raw_action_dim
+from .action import EMBODIMENT_TO_DOMAIN_ID, resolve_raw_action_dim
 from .config_resolver import Conflict, Default, Resolved, same_value
 from .defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_GENERATION_DEFAULTS,
     canonical_domain_preset_key,
+    normalize_action_resolution,
 )
 from .sampling import DISTILLED_GUIDANCE_SCALE
 
