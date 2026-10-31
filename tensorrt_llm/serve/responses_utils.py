@@ -60,8 +60,11 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
+from tensorrt_llm.inputs.chat_template_guard import \
+    unreferenced_chat_template_kwargs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+from tensorrt_llm.inputs.utils import (rendered_hf_chat_template_source,
+                                       resolve_hf_chat_template)
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -93,6 +96,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.serving_extensions import normalize_reasoning_effort
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -1291,6 +1295,30 @@ def _create_output_messages(
     return messages
 
 
+def _custom_tool_parameters() -> dict[str, Any]:
+    # A custom tool takes one freeform string rather than JSON arguments -
+    # apply_patch is the common case, whose payload is a patch, not an
+    # object. The chat template can only describe functions, so it is
+    # described as a single named string parameter and the call is turned
+    # back into a custom tool call on the way out; see
+    # _tool_call_output_item. Without the named parameter the model invents
+    # its own argument name and the client rejects the call as an
+    # incompatible payload.
+    return {
+        "type": "object",
+        "properties": {
+            CUSTOM_TOOL_INPUT_ARG: {
+                "type":
+                "string",
+                "description":
+                "The complete freeform input for this tool, "
+                "passed through verbatim.",
+            },
+        },
+        "required": [CUSTOM_TOOL_INPUT_ARG],
+    }
+
+
 def _get_chat_completion_function_tools(
         tools: Optional[list[Tool]]) -> list[ChatCompletionToolsParam]:
     function_tools: list[ChatCompletionToolsParam] = []
@@ -1316,29 +1344,6 @@ def _get_chat_completion_function_tools(
                                         function=definition(
                                             name, description, parameters))
 
-    def custom_parameters() -> dict[str, Any]:
-        # A custom tool takes one freeform string rather than JSON arguments -
-        # apply_patch is the common case, whose payload is a patch, not an
-        # object. The chat template can only describe functions, so it is
-        # described as a single named string parameter and the call is turned
-        # back into a custom tool call on the way out; see
-        # _tool_call_output_item. Without the named parameter the model invents
-        # its own argument name and the client rejects the call as an
-        # incompatible payload.
-        return {
-            "type": "object",
-            "properties": {
-                CUSTOM_TOOL_INPUT_ARG: {
-                    "type":
-                    "string",
-                    "description":
-                    "The complete freeform input for this tool, "
-                    "passed through verbatim.",
-                },
-            },
-            "required": [CUSTOM_TOOL_INPUT_ARG],
-        }
-
     for tool in tools:
         tool_type = getattr(tool, "type", None)
         if isinstance(tool, FunctionTool):
@@ -1363,7 +1368,7 @@ def _get_chat_completion_function_tools(
                 # tool as custom, so the output path goes looking for
                 # CUSTOM_TOOL_INPUT_ARG the prompt never mentioned.
                 if getattr(inner, "type", None) == "custom":
-                    inner_parameters = custom_parameters()
+                    inner_parameters = _custom_tool_parameters()
                 else:
                     inner_parameters = getattr(inner, "parameters", None)
                 inner_description = getattr(inner, "description", None)
@@ -1382,7 +1387,7 @@ def _get_chat_completion_function_tools(
         elif tool_type in ("custom", ):
             function_tools.append(
                 as_function(tool.name, getattr(tool, "description", None),
-                            custom_parameters()))
+                            _custom_tool_parameters()))
         elif is_web_search_tool(tool):
             # Web search is a *server* tool: the client sends the definition
             # and expects the server to run the query and feed the results
@@ -1422,6 +1427,148 @@ def _get_chat_completion_function_tools(
     return function_tools
 
 
+def _template_supports_deferred_tools(template_source: Optional[str]) -> bool:
+    """Whether the active template renders namespace/deferred tools natively.
+
+    Keyed on the template reading `deferred_render_mode`: the template
+    revision that introduced that variable is the one that renders
+    `{"type": "namespace"}` tools and `defer_loading` flags itself.
+    `None` (a renderer with no analyzable Jinja source) and templates the
+    reference analysis cannot see into stay on the flattened rendering,
+    which every template understands.
+    """
+    if not isinstance(template_source, str):
+        return False
+    return not unreferenced_chat_template_kwargs(template_source,
+                                                 ("deferred_render_mode", ))
+
+
+def _explicit_defer_flag(tool) -> Optional[bool]:
+    """The tool's `defer_loading` only when the client set it.
+
+    Tri-state matters: the template reads an absent flag on a namespace
+    member as "inherit the namespace's deferral", while explicit flags can
+    carve members out (a member set `false` renders eagerly when other
+    members are explicitly `true`). A pydantic default of `None` must
+    therefore not be serialized as `false`.
+    """
+    flag = getattr(tool, "defer_loading", None)
+    return flag if isinstance(flag, bool) else None
+
+
+def _wants_native_tool_rendering(tools: Optional[list[Tool]]) -> bool:
+    """True when the request carries structure only the native form keeps."""
+    for tool in tools or []:
+        if getattr(tool, "type", None) == "namespace":
+            return True
+        if _explicit_defer_flag(tool):
+            return True
+    return False
+
+
+def _native_function_tool_dict(name: str, description: Optional[str],
+                               parameters: Optional[Any],
+                               defer_flag: Optional[bool]) -> dict[str, Any]:
+    function: dict[str, Any] = {
+        "name": name,
+        "description": description or "",
+        "parameters": parameters if parameters is not None else {
+            "type": "object",
+            "properties": {},
+        },
+    }
+    if defer_flag is not None:
+        function["defer_loading"] = defer_flag
+    return {"type": "function", "function": function}
+
+
+def _native_tools_for_chat_template(tools: list[Tool]) -> list[dict[str, Any]]:
+    """Tool dicts in the shape the native template rendering expects.
+
+    Function and custom tools keep the chat-completions wrapping (with the
+    same freeform schema a flattened custom tool gets); a namespace passes
+    through as `{"type": "namespace", ...}` with flat member entries, so
+    the template itself qualifies the names, writes the namespace metadata
+    line and recipient pattern, and applies `defer_loading`. Tools the
+    template cannot describe (web_search and unknown types) are dropped
+    exactly as the flattened conversion drops them; the flattened pass over
+    the same request already warned about them.
+    """
+    native: list[dict[str, Any]] = []
+    for tool in tools:
+        tool_type = getattr(tool, "type", None)
+        if isinstance(tool, FunctionTool) or tool_type == "function":
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           getattr(tool, "parameters", None),
+                                           _explicit_defer_flag(tool)))
+        elif tool_type == "namespace":
+            members: list[dict[str, Any]] = []
+            for inner in getattr(tool, "tools", None) or []:
+                inner_name = getattr(inner, "name", None)
+                if not inner_name:
+                    continue
+                if getattr(inner, "type", None) == "custom":
+                    inner_parameters = _custom_tool_parameters()
+                else:
+                    inner_parameters = getattr(inner, "parameters", None)
+                member: dict[str, Any] = {
+                    "name":
+                    inner_name,
+                    "description":
+                    getattr(inner, "description", None)
+                    or getattr(tool, "description", None) or "",
+                    "parameters":
+                    inner_parameters if inner_parameters is not None else {
+                        "type": "object",
+                        "properties": {},
+                    },
+                }
+                member_flag = _explicit_defer_flag(inner)
+                if member_flag is not None:
+                    member["defer_loading"] = member_flag
+                members.append(member)
+            entry: dict[str, Any] = {
+                "type": "namespace",
+                "name": tool.name,
+                "description": getattr(tool, "description", None) or "",
+                "tools": members,
+            }
+            ns_flag = _explicit_defer_flag(tool)
+            if ns_flag is not None:
+                entry["defer_loading"] = ns_flag
+            native.append(entry)
+        elif tool_type in ("custom", ):
+            native.append(
+                _native_function_tool_dict(tool.name,
+                                           getattr(tool, "description", None),
+                                           _custom_tool_parameters(),
+                                           _explicit_defer_flag(tool)))
+    return native
+
+
+def _tools_for_chat_template(
+        tools: Optional[list[Tool]], flat_tool_dicts: list[dict[str, Any]],
+        template_source: Optional[str]) -> list[dict[str, Any]]:
+    """The tool dicts handed to `apply_chat_template`.
+
+    Default is the flattened function-tool view every template understands.
+    A request carrying namespace tools or explicit `defer_loading` flags
+    switches to the native structures when the active template renders them
+    (see _template_supports_deferred_tools): the model was trained on the
+    native rendering, and flattening erases the deferral, so every tool
+    arrives eagerly with its full schema. On an older template the flattened
+    view keeps today's eager rendering rather than handing the template
+    structures it would mis-render.
+    """
+    if not _wants_native_tool_rendering(tools):
+        return flat_tool_dicts
+    if not _template_supports_deferred_tools(template_source):
+        return flat_tool_dicts
+    return _native_tools_for_chat_template(tools)
+
+
 async def _create_input_tokens(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
@@ -1454,23 +1601,37 @@ async def _create_input_tokens(
         await conversation_store.store_messages(request.request_id, messages,
                                                 request.previous_response_id)
 
+    model_type = resolve_top_level_model_type(model_config)
     # Same pipeline as the chat route: the server template and the model
     # extension's tool serialization apply here too.
     render_resources = RenderResources.from_parts(
         tokenizer=tokenizer,
-        model_type=resolve_top_level_model_type(model_config),
+        model_type=model_type,
         hf_config=model_config,
         processor=processor,
         default_chat_template=chat_template)
-    tools_dict = [
+    flat_tool_dicts = [
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
     messages = _render_developer_as_system(messages, tokenizer, processor,
-                                           tools_dict, chat_template)
+                                           flat_tool_dicts, chat_template)
     conversation, mm_coroutines, mm_placeholder_counts, mm_item_order = parse_chat_messages_coroutines(
         messages, model_config, multimodal_server_config)
     has_media = any(message.get("media") for message in conversation)
+    # Resolved before the tool-form decision: the same source drives both
+    # the native-vs-flattened choice and the reasoning-kwargs injection.
+    # Template resolution only uses tools for variant selection, which the
+    # flattened view serves as well as the native one.
+    template_source = rendered_hf_chat_template_source(
+        tokenizer=tokenizer,
+        processor=processor,
+        chat_template=chat_template,
+        tools=flat_tool_dicts,
+        model_type=model_type,
+    )
+    tools_dict = _tools_for_chat_template(request.tools, flat_tool_dicts,
+                                          template_source)
     # Carry the request's reasoning configuration into the chat template.
     #
     # Chat templates that support thinking are opt-in: DeepSeek-V4's custom
@@ -1484,7 +1645,19 @@ async def _create_input_tokens(
     # It matters beyond effort level: when thinking is not enabled the model
     # can still emit a stray closing think tag, and the reasoning parser -
     # which expects the thinking-mode framing - leaves it in the visible text.
-    chat_template_kwargs = reasoning_chat_template_kwargs(request)
+    #
+    # The injection is template-aware: templates differ in which reasoning
+    # kwargs they implement (some read reasoning_effort but have no thinking
+    # toggle), so injected keys the active template never reads are dropped
+    # rather than handed to it. Kwargs the client sent are forwarded
+    # untouched and stay subject to the render-site guard. A serve-derived
+    # effort also goes through the model's normalizer (see
+    # ServingExtension.normalize_reasoning_effort).
+    chat_template_kwargs = reasoning_chat_template_kwargs(
+        request,
+        template_source=template_source,
+        model_type=model_type,
+    )
 
     render_task = render_conversation(
         render_resources,
@@ -1619,7 +1792,9 @@ async def request_preprocess(
 
 
 # TODO(JunyiXu-nv): move to use the same function in postprocess_handlers after multiple post processors are supported
-def reasoning_chat_template_kwargs(request) -> dict:
+def reasoning_chat_template_kwargs(request,
+                                   template_source: Optional[str] = None,
+                                   model_type: Optional[str] = None) -> dict:
     """Chat-template kwargs implied by a request's reasoning configuration.
 
     Both the prompt and the reasoning parser need these. DeepSeek-V4's
@@ -1628,6 +1803,19 @@ def reasoning_chat_template_kwargs(request) -> dict:
     constructed with the same flag - otherwise it falls back to an identity
     parser and the reasoning, plus its closing tag, stays in the visible
     answer. Deriving both from one place keeps them from drifting apart.
+
+    `template_source` (the Jinja source about to be rendered, from
+    `rendered_hf_chat_template_source`) makes the injection template-aware:
+    templates differ in which reasoning kwargs they implement, so injected
+    keys the template never reads are dropped instead of being handed to it.
+    Only injected keys are filtered: kwargs the client sent are returned
+    untouched and keep their render-site guard semantics. Callers with no
+    template to render (the reasoning-parser sites, custom non-Jinja
+    tokenizers) pass no source and get the full injection.
+
+    `model_type` selects the model's effort normalizer (see
+    `ServingExtension.normalize_reasoning_effort`) for an effort derived
+    from `reasoning.effort`; without it the effort is forwarded unchanged.
     """
     # Check the type rather than the truthiness of each attribute. A caller
     # that passes a stand-in object - a Mock in a unit test, say - hands back a
@@ -1635,18 +1823,30 @@ def reasoning_chat_template_kwargs(request) -> dict:
     # `attr.keys()` and fail with a TypeError instead of falling back.
     raw = getattr(request, "chat_template_kwargs", None)
     kwargs = dict(raw) if isinstance(raw, Mapping) else {}
+    client_keys = frozenset(kwargs)
     reasoning = getattr(request, "reasoning", None)
     if reasoning is None:
         return kwargs
     effort = getattr(reasoning, "effort", None)
+    if isinstance(effort, str) and effort:
+        # Serve-derived, so it goes through the model's normalizer (identity
+        # unless the model registers one). None means "leave the template
+        # default"; a model whose template cannot turn reasoning off maps
+        # `none` to one of its levels instead.
+        effort = normalize_reasoning_effort(effort, model_type)
     if effort == "none":
         kwargs.setdefault("thinking", False)
         return kwargs
     if isinstance(effort, str) and effort:
+        # A kwarg the client wrote stays verbatim.
         kwargs.setdefault("reasoning_effort", effort)
     # A `reasoning` object asks a reasoning model to reason; without an
     # effort it reasons at the model's default effort.
     kwargs.setdefault("thinking", True)
+    if template_source is not None:
+        injected = [key for key in kwargs if key not in client_keys]
+        for key in unreferenced_chat_template_kwargs(template_source, injected):
+            del kwargs[key]
     return kwargs
 
 

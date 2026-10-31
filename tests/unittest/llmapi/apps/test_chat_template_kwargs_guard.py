@@ -18,10 +18,20 @@ from tensorrt_llm.inputs.chat_template_guard import (
     ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR,
     ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS,
     UnusedChatTemplateKwargsError,
+    unreferenced_chat_template_kwargs,
     validate_chat_template_kwargs,
 )
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.inputs.content_format import ContentFormat
+from tensorrt_llm.inputs.registry import (
+    MULTIMODAL_PLACEHOLDER_REGISTRY,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+)
+from tensorrt_llm.inputs.utils import apply_chat_template, rendered_hf_chat_template_source
 from tensorrt_llm.serve.render import RenderResources, render_chat
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
+from tensorrt_llm.tokenizer.deepseek_v41 import DeepseekV41Tokenizer
 
 
 def render_chat_request_for_tokenizer(request, tokenizer):
@@ -216,6 +226,43 @@ class TestValidateChatTemplateKwargs:
         assert "drop_thinking" not in str(excinfo.value)
 
 
+class TestUnreferencedChatTemplateKwargs:
+    """The query used by kwarg-constructing code mirrors the validator.
+
+    Serve code that injects template kwargs (the Responses reasoning routing)
+    asks this before handing kwargs to the render, so the serve's own
+    injection can never turn into a guard rejection.
+    """
+
+    def test_flags_only_unreferenced_keys(self):
+        assert unreferenced_chat_template_kwargs(
+            TEMPLATE_WITH_TOGGLE, ["enable_thinking", "disable_reasoning"]
+        ) == frozenset({"disable_reasoning"})
+
+    def test_always_allowed_names_never_flagged(self):
+        assert (
+            unreferenced_chat_template_kwargs(TEMPLATE_PLAIN, ALWAYS_ALLOWED_CHAT_TEMPLATE_KWARGS)
+            == frozenset()
+        )
+
+    def test_non_string_template_flags_nothing(self):
+        # Matches the validator, which skips when there is no source string.
+        assert unreferenced_chat_template_kwargs(None, ["thinking"]) == frozenset()
+
+    def test_unparseable_template_falls_closed(self):
+        # `disable_reasoning` is not on the always-consumed surface (unlike
+        # `thinking`, which the reasoning parsers read), so an unanalyzable
+        # template flags it.
+        assert unreferenced_chat_template_kwargs(
+            TEMPLATE_UNPARSEABLE, ["disable_reasoning", "messages"]
+        ) == frozenset({"disable_reasoning"})
+
+    def test_cleared_keys_pass_the_validator(self):
+        kwargs = {"enable_thinking": True, "tools": None}
+        assert unreferenced_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, kwargs) == frozenset()
+        validate_chat_template_kwargs(TEMPLATE_WITH_TOGGLE, kwargs)
+
+
 class _FakeJinjaTokenizer:
     """Tokenizer stub exercising the HF-Jinja apply_chat_template path.
 
@@ -262,6 +309,83 @@ class TestApplyChatTemplateWiring:
         with pytest.raises(ValueError, match="disable_reasoning"):
             self._apply(TEMPLATE_WITH_GENERATION_TAG, {"disable_reasoning": True})
         assert self._apply(TEMPLATE_WITH_GENERATION_TAG, {"reasoning_effort": "high"}) == "rendered"
+
+
+class TestRenderedChatTemplateSource:
+    """Kwarg-constructing code must see the same template the render uses."""
+
+    @pytest.mark.parametrize(
+        "tokenizer_cls", [DeepseekV32Tokenizer, DeepseekV4Tokenizer, DeepseekV41Tokenizer]
+    )
+    def test_deepseek_tokenizers_have_no_source(self, tokenizer_cls):
+        # They render with their own Python encoders, so there is no Jinja
+        # source for the referenced-kwargs analysis to read.
+        tokenizer = tokenizer_cls.__new__(tokenizer_cls)
+        assert rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None) is None
+
+    def test_model_that_skips_chat_templates_has_no_source(self):
+        # apply_chat_template joins such a model's content and never renders the
+        # tokenizer's template; both functions take that from one dispatch.
+        model_type = "passthrough_model_for_source_test"
+        MULTIMODAL_PLACEHOLDER_REGISTRY.set_placeholder_metadata(
+            model_type,
+            MultimodalPlaceholderMetadata(
+                placeholder_map={"image": "<image>"},
+                placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+                content_format=ContentFormat.PASSTHROUGH,
+            ),
+        )
+        try:
+            tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+            assert (
+                rendered_hf_chat_template_source(
+                    tokenizer=tokenizer, processor=None, model_type=model_type
+                )
+                is None
+            )
+            assert (
+                apply_chat_template(
+                    model_type=model_type,
+                    tokenizer=tokenizer,
+                    processor=None,
+                    conversation=[{"role": "user", "content": "hi"}],
+                    add_generation_prompt=True,
+                    mm_placeholder_counts=[{}],
+                )
+                == "hi"
+            )
+        finally:
+            MULTIMODAL_PLACEHOLDER_REGISTRY.remove_placeholder_metadata(model_type)
+
+    def test_jinja_tokenizer_source_returned(self):
+        tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+        assert (
+            rendered_hf_chat_template_source(tokenizer=tokenizer, processor=None)
+            == TEMPLATE_WITH_TOGGLE
+        )
+
+    def test_explicit_chat_template_wins(self):
+        tokenizer = _FakeJinjaTokenizer(TEMPLATE_WITH_TOGGLE)
+        assert (
+            rendered_hf_chat_template_source(
+                tokenizer=tokenizer, processor=None, chat_template=TEMPLATE_PLAIN
+            )
+            == TEMPLATE_PLAIN
+        )
+
+    def test_python_native_tokenizer_has_no_source(self):
+        # A tokenizer that overrides apply_chat_template with no declared
+        # Jinja template renders natively; there is no source to analyze and
+        # the render-site guard never runs on that path.
+        class _NativeTokenizer:
+            chat_template = None
+
+            def apply_chat_template(self, *args, **kwargs):
+                return "rendered"
+
+        assert (
+            rendered_hf_chat_template_source(tokenizer=_NativeTokenizer(), processor=None) is None
+        )
 
 
 class _FakeRouterTokenizer:
