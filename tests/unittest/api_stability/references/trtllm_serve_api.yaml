@@ -1120,7 +1120,7 @@ models:
       parallel_tool_calls:
         kind: openai
         type: Optional[bool]
-        default: false
+        default: true
         status: stable
         required: false
       previous_response_id:
