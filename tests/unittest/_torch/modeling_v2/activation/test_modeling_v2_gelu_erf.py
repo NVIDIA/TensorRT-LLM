@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the qwen4_exp gelu_erf entry.
+"""GPU test for the qwen4_exp gelu_erf entry, as the unified target's local variant r54.
 
 The entry's identity is *which* GELU it is, and the wrong answer -- the tanh
 GELU this same tower's block MLPs use -- rounds to within about one bf16 ulp of
@@ -14,11 +14,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.activation.gelu_erf import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import (  # noqa: E501
     gelu_erf as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "gelu_erf requires a CUDA device"

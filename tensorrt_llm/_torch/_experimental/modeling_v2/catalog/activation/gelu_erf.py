@@ -3,12 +3,16 @@
 """Non-gated exact (erf) GELU -- what `torch.nn.GELU()` is -- the vision patch
 merger's activation, which no config key names.
 
-Tier-3 composed: one `torch.nn.functional.gelu(x)` call, `approximate="none"`.
+Native torch (rung 4 of the sourcing ladder): one `torch.nn.functional.gelu(x)`
+call, `approximate="none"` -- one elementwise CUDA kernel, the same call the
+stock tower makes (`modeling_qwen3vl.py`'s merger `nn.GELU()`).
 `torch.ops.trtllm.moe_gelu` computes this function bitwise but is not a
 substitute: its `tile_idx_to_mn_limit` / `num_non_exiting_tiles` operands must
 be int32 *device* tensors (on the host it raises nothing and returns garbage,
 nan, or an illegal memory access), so wrapping it means launching two fills
-before the call; it also rejects fp32 and non-2-D inputs.
+before the call; it also rejects fp32 and non-2-D inputs. FlashInfer's
+`activation` module has only gated forms (`gelu_and_mul`, `gelu_tanh_and_mul`,
+`silu_and_mul`), as has `torch.ops.trtllm.flashinfer_gelu_tanh_and_mul`.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ import math
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: `merger.linear_fc1` is `[4608, 4608]`: spatial merge 2 over a 1152-wide tower.
 MERGER_WIDTH = 4608
@@ -54,6 +58,10 @@ class GeluErf(OpWrapper):
             why="merger activand, 1 merged row x 4608 bf16",
             spec=dict(shape=(1, MERGER_WIDTH), dtype=torch.bfloat16, lo=-16.0, hi=16.0),
         ),
+        Cell(
+            why="the merger-built activand at the tower call ceiling: 8192 merged rows x 4608",
+            spec=dict(shape=(8192, MERGER_WIDTH), dtype=torch.bfloat16, dist="merger"),
+        ),
     )
 
     note = """
@@ -61,7 +69,18 @@ class GeluErf(OpWrapper):
 
     Certified on contiguous bf16 `[rows, 4608]` activands (what the merger's fc1
     returns) at 1, 512 and 8192 rows (8192, from 32768 patch rows, the most one
-    tower call carries).
+    tower call carries); 512 and 8192 rows also on the merger-built
+    distribution. The unified target's call site is the vision tower's patch merger,
+    eager and rank-invariant: every rank runs the whole tower at tp4, tep4 and
+    dep4, so the shapes are tp1's.
+
+    Measured on GB300 against `reference` (fp64, rounded once to bf16): the
+    merger-built activand (std 0.88, absmax 4.9) is bitwise equal at 512 rows
+    and differs in 12 of 37748736 elements at 8192 rows; the uniform [-16, 16]
+    spread differs in 4440714 of 37748736. Every difference is at most
+    2.4e-7 absolute, in the negative tail where the output is near zero. One
+    kernel per call (`GeluCUDAKernelImpl`, vectorized elementwise), a
+    compiled-in torch kernel: no JIT path.
 
     Identity is pinned by fp32 only (the identity test).
     Max |erf GELU - tanh GELU| is 4.73e-4 at x = -2.699; in fp32 the tanh form

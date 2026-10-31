@@ -120,6 +120,7 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_con
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.gelu_erf import gelu_erf
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -150,7 +151,6 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 
 from . import weights as _weights
 from .ops.activation.fused_sigmoid_mul_inplace import fused_sigmoid_mul_inplace
-from .ops.activation.gelu_erf import gelu_erf
 from .ops.activation.gelu_tanh import gelu_tanh
 from .ops.activation.silu_and_mul_rows import silu_and_mul_rows
 from .ops.attention.qsa_canonical_selection import qsa_canonical_selection
