@@ -25,6 +25,7 @@ PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
         "AfmoeForCausalLM",
         "BartForConditionalGeneration",
+        "BeamForCausalLM",
         "BertForSequenceClassification",
         "CLIPVisionModel",
         "Cohere2ForCausalLM",
