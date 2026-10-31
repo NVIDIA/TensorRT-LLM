@@ -691,6 +691,33 @@ def test_request_validation_rejects_variable_beam_width_with_overlap(
         PyExecutor._validate_request(executor, request)
 
 
+@pytest.mark.parametrize(
+    ("beam_width_array", "error"),
+    [
+        pytest.param([2, 2], True, id="ends-below-beam-width"),
+        pytest.param([3, 3], False, id="ends-at-beam-width"),
+    ],
+)
+def test_request_validation_rejects_beam_width_array_ending_below_beam_width(
+    beam_width_array: list[int],
+    error: bool,
+) -> None:
+    request = _make_admission_request(0)
+    request.sampling_config = types.SimpleNamespace(
+        beam_width=3,
+        beam_width_array=beam_width_array,
+        length_penalty=None,
+    )
+    executor = _make_admission_executor(None, [request])
+    executor.max_beam_width = 3
+
+    if error:
+        with pytest.raises(ValueError, match="does not end at beam_width"):
+            PyExecutor._validate_request(executor, request)
+    else:
+        PyExecutor._validate_request(executor, request)
+
+
 def test_model_validation_fails_only_the_request_it_rejects() -> None:
     requests = [_make_admission_request(i) for i in range(3)]
 

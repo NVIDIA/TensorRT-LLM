@@ -7200,6 +7200,14 @@ class PyExecutor:
                         f"beam_width_array {list(beam_width_array)} decreases; "
                         "only non-decreasing arrays are supported for "
                         "Variable-Beam-Width-Search.")
+                # Finalize returns beam_width beams, so an array that ends
+                # below it decodes too few and leaves the extra beams empty.
+                if beam_width_array[-1] != sampling_config.beam_width:
+                    raise ValueError(
+                        f"beam_width_array {list(beam_width_array)} does not "
+                        f"end at beam_width {sampling_config.beam_width}; "
+                        "Variable-Beam-Width-Search must end at the full "
+                        "width.")
 
             # length_penalty is an exponent on the generated length, and the
             # ranking assumes it only ever shrinks the magnitude of a negative
