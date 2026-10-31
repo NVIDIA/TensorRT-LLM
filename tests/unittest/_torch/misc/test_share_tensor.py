@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import multiprocessing as mp
 import unittest
 
@@ -28,8 +30,7 @@ class TestShareTensor(unittest.TestCase):
             container = SharedTensorContainer.from_tensor(tensor)
             q.put(('success', container.dump_to_dict()))
 
-            # Wait for consumer to signal it's done
-            # This keeps the producer alive until ownership is transferred to consumer
+            # CUDA consumers must drop their views before signaling completion.
             q.get()
 
         except Exception as e:
@@ -51,12 +52,10 @@ class TestShareTensor(unittest.TestCase):
             self.assertEqual(status, 'success')
             reconstructed = SharedTensorContainer.from_dict(
                 data).get_local_view()
-            queue.put(
-                'done'
-            )  # producer can be released as early as here as ownership is transferred to consumer
             self.assertTrue(torch.allclose(reconstructed.cpu(),
                                            self.ref_tensor))
             del reconstructed
+            queue.put('done')
             producer.join()
         finally:
             # Explicit cleanup to prevent QueueFeederThread leak
@@ -267,6 +266,152 @@ class TestShareTensor(unittest.TestCase):
             parent_conn.send("exit")
             producer.join()
             parent_conn.close()
+
+    def test_release_unconsumed_cpu_export(self):
+        """The producer can release a CPU export that no consumer opened."""
+        import base64
+        import gc
+        import time
+        from pathlib import Path
+
+        tensor = torch.arange(1024)
+        container = SharedTensorContainer.from_tensor(tensor)
+        handle = container.dump_to_dict()
+        name = base64.b64decode(handle["storage_handle"]).decode().lstrip("/")
+        path = Path("/dev/shm") / name
+        self.assertTrue(path.exists())
+        consumer = SharedTensorContainer.from_dict(handle)
+        self.assertTrue(consumer.reference_consumed)
+        del consumer
+        # The consumer above released its reference; release the second export.
+        container.dump_to_dict()
+        container.release_unconsumed()
+        del tensor, container
+        deadline = time.monotonic() + 15
+        while path.exists() and time.monotonic() < deadline:
+            gc.collect()
+            time.sleep(0.05)
+        self.assertFalse(path.exists())
+
+    def test_failed_cpu_export_releases_storage(self):
+        """A failure after exporting storage leaves no unconsumed reference."""
+        import gc
+        from pathlib import Path
+        from unittest.mock import patch
+
+        paths = []
+
+        def fail_conversion(_metadata, storage_metadata):
+            name = storage_metadata[1].decode().lstrip("/")
+            paths.append(Path("/dev/shm") / name)
+            raise RuntimeError("CPU handle conversion failed")
+
+        tensor = torch.arange(1024)
+        container = SharedTensorContainer.from_tensor(tensor)
+        with patch.object(SharedTensorContainer,
+                          "cpu_handle_to_dict",
+                          side_effect=fail_conversion):
+            with self.assertRaisesRegex(RuntimeError, "CPU handle conversion"):
+                container.dump_to_dict()
+        del tensor, container
+        gc.collect()
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].exists())
+
+    def test_cpu_export_preserves_sharing_strategy(self):
+        """Other threads keep their configured transport during CPU export."""
+        from unittest.mock import patch
+
+        strategy = torch.multiprocessing.get_sharing_strategy()
+        observed = []
+        original = torch.storage.TypedStorage._share_filename_cpu_
+
+        def observe(storage):
+            observed.append(torch.multiprocessing.get_sharing_strategy())
+            return original(storage)
+
+        container = SharedTensorContainer.from_tensor(torch.arange(1024))
+        with patch.object(torch.storage.TypedStorage, "_share_filename_cpu_",
+                          observe):
+            handle = container.dump_to_dict()
+        view = SharedTensorContainer.from_dict(handle).get_local_view()
+        self.assertTrue(torch.equal(view, torch.arange(1024)))
+        self.assertEqual(view.data_ptr(), container.tensor_handle[1].data_ptr())
+        self.assertEqual(observed, [strategy])
+        self.assertEqual(torch.multiprocessing.get_sharing_strategy(), strategy)
+
+    def test_cuda_view_failure_after_storage_import(self):
+        """View failure cannot make the sender release a consumed CUDA ref."""
+        from unittest.mock import patch
+
+        from torch.multiprocessing import reductions
+
+        from tensorrt_llm._torch.shared_tensor.shared_tensor import \
+            _SharedTensorRebuildMethodRegistry as Registry
+
+        storage = torch.empty(1).untyped_storage()
+        handle = (torch.Tensor, (1, ), (1, ), 0, torch.storage.TypedStorage,
+                  torch.float32, 0, b"storage", 4, 0, False, b"counter", 0,
+                  b"event", False)
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                container = SharedTensorContainer(Registry.REBUILD_CUDA, handle)
+                with (patch.object(reductions,
+                                   "storage_from_cache",
+                                   return_value=storage if cached else None),
+                      patch.object(torch.cuda, "_lazy_init"),
+                      patch.object(torch.storage.TypedStorage,
+                                   "_new_shared_cuda",
+                                   return_value=storage) as opened,
+                      patch.object(torch.storage.TypedStorage,
+                                   "_release_ipc_counter") as released,
+                      patch.object(torch._utils,
+                                   "_rebuild_tensor",
+                                   side_effect=MemoryError("View failed"))):
+                    with self.assertRaisesRegex(MemoryError, "View failed"):
+                        container.get_local_view()
+                    self.assertTrue(container.reference_consumed)
+                    self.assertEqual(opened.call_count, int(not cached))
+                    self.assertEqual(released.call_count, int(cached))
+
+    def test_cuda_storage_failure_before_import(self):
+        """A CUDA failure before native import leaves the sender's reference."""
+        from unittest.mock import patch
+
+        from torch.multiprocessing import reductions
+
+        from tensorrt_llm._torch.shared_tensor.shared_tensor import \
+            _SharedTensorRebuildMethodRegistry as Registry
+
+        handle = (torch.Tensor, (1, ), (1, ), 0, torch.storage.TypedStorage,
+                  torch.float32, 0, b"storage", 4, 0, False, b"counter", 0,
+                  b"event", False)
+        container = SharedTensorContainer(Registry.REBUILD_CUDA, handle)
+        with (patch.object(reductions, "storage_from_cache", return_value=None),
+              patch.object(torch.cuda, "_lazy_init"),
+              patch.object(torch.storage.TypedStorage,
+                           "_new_shared_cuda",
+                           side_effect=RuntimeError("Import failed"))):
+            with self.assertRaisesRegex(RuntimeError, "Import failed"):
+                container.get_local_view()
+        self.assertFalse(container.reference_consumed)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_release_unconsumed_cuda_export(self):
+        """The producer can release a CUDA export that no consumer opened."""
+        import gc
+
+        torch.cuda.synchronize()
+        torch.cuda.ipc_collect()
+        before = torch.cuda.memory_allocated()
+        tensor = torch.empty(1 << 20, device="cuda")
+        container = SharedTensorContainer.from_tensor(tensor)
+        self.assertFalse(container.reference_consumed)
+        container.release_unconsumed()
+        del tensor, container
+        gc.collect()
+        torch.cuda.ipc_collect()
+        self.assertEqual(torch.cuda.memory_allocated(), before)
 
 
 if __name__ == '__main__':
