@@ -15,6 +15,9 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
@@ -28,6 +31,8 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_gsm8k
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_eagle3_gsm8k_and_acceptance
   # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
   # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
   # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that

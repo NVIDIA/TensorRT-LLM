@@ -17,6 +17,7 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.flashinfer import FlashInferAttentionMetadata
 from ..attention.backends.sparse.params import MTPIndexShareMetadata
 from ..model_config import ModelConfig
+from ..pyexecutor.h2d_cache import copy_h2d_if_changed
 from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -346,8 +347,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      dtype=torch.int,
                                      device='cpu',
                                      pin_memory=prefer_pinned())
-        self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
-                                                 non_blocking=True)
+        copy_h2d_if_changed(self.batch_indices_cuda[:num_seqs], batch_indices)
         # Snapshot the real (unpadded) scheduled token count before the decrement
         # below. maybe_capture_hidden_states runs during the target forward and
         # must bound the capture by this count; self.num_tokens is about to be
@@ -368,8 +368,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
             eagle_slot_ids_tensor = torch.tensor(eagle_slot_ids,
                                                  dtype=torch.int,
                                                  pin_memory=prefer_pinned())
-            self.slot_ids[:num_seqs].copy_(eagle_slot_ids_tensor,
-                                           non_blocking=True)
+            copy_h2d_if_changed(self.slot_ids[:num_seqs], eagle_slot_ids_tensor)
 
         sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
         if sa_manager is not None:

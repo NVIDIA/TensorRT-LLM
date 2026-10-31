@@ -54,6 +54,7 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
+from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -78,6 +79,7 @@ from .py_executor import PyExecutor, PyExecutorResources
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
+from .runtime_hooks import runtime_hooks_of
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -4616,7 +4618,11 @@ def instantiate_sampler(
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
-        return get_spec_decoder(sampler_args, engine.spec_config)
+        sampler = get_spec_decoder(sampler_args, engine.spec_config)
+        spec_step_fold = runtime_hooks_of(engine.model).spec_step_fold
+        if spec_step_fold is not None and isinstance(sampler, SpecSampler):
+            sampler.bind_spec_step_fold(spec_step_fold)
+        return sampler
 
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine.

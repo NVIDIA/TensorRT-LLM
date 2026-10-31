@@ -319,7 +319,18 @@ class SingleTokenContextGraphBatchTestCase(unittest.TestCase):
 @pytest.mark.parametrize("fails", [False, True], ids=["success", "failure"])
 def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
     runner = decoder_graphs(
-        decoder_config(), cuda_graph_runner=Mock(enabled=True, is_warmup_only=False)
+        decoder_config(),
+        cuda_graph_runner=Mock(
+            spec_set=[
+                "enabled",
+                "is_warmup_only",
+                "short_long_seq_len_threshold",
+                "set_capture_sample_type",
+            ],
+            enabled=True,
+            is_warmup_only=False,
+            short_long_seq_len_threshold=None,
+        ),
     )
     resource_manager = Mock()
     assert not runner._config.is_spec_decode
