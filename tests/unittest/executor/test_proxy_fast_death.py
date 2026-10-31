@@ -15,6 +15,8 @@
 """EngineDeadError, the pending-result broadcast, and queue-step fast-fail (no GPU)."""
 
 import asyncio
+import copy
+import pickle
 import queue as _queue
 import time as _time
 from concurrent.futures import Future as _Future
@@ -40,6 +42,27 @@ def test_engine_dead_error_is_importable_and_carries_root_cause():
     assert "MPI worker exited unexpectedly" in str(err)
     # No root cause is also fine.
     assert "Engine has died" in str(EngineDeadError())
+
+
+@pytest.mark.parametrize("cause", [RuntimeError("PyExecutor has already been shutdown"), None])
+def test_engine_dead_error_pickle_round_trip_keeps_message(cause):
+    err = EngineDeadError(cause)
+    restored = pickle.loads(pickle.dumps(err))
+    assert type(restored) is EngineDeadError
+    assert str(restored) == str(err)
+    assert restored.args == err.args
+    assert type(restored.root_cause) is type(cause)
+    assert str(restored.root_cause) == str(cause)
+    # Each further hop must leave the message unchanged as well.
+    assert str(pickle.loads(pickle.dumps(restored))) == str(err)
+
+
+def test_engine_dead_error_copy_keeps_message():
+    err = EngineDeadError(RuntimeError("boom"))
+    for clone in (copy.copy(err), copy.deepcopy(err)):
+        assert str(clone) == str(err)
+        assert isinstance(clone.root_cause, RuntimeError)
+        assert str(clone.root_cause) == "boom"
 
 
 class _FakeResult:

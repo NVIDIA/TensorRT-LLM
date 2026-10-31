@@ -185,6 +185,12 @@ class EngineDeadError(RuntimeError):
         super().__init__(msg)
         self.root_cause = root_cause
 
+    def __reduce__(self):
+        # Rebuild from root_cause so pickle and copy format the message once.
+        # self.args holds the formatted message, and passing it back to
+        # __init__ would prefix it again.
+        return (self.__class__, (self.root_cause, ), self.__dict__)
+
 
 class ProcessPoolExecutorSession(MpiSession):
     # This process pool is introduced for better recoverable exceptions handling.
