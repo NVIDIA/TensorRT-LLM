@@ -65,6 +65,9 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    validate_context_first_peer,
+)
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
@@ -332,6 +335,7 @@ class _LogicalTask:
         self._logical_outcomes = _LogicalOutcomes()
         self._logical_index = self._logical_outcomes.add_task()
         self._retirement: Optional[RetirementDeadline] = None
+        self._enforce_physical_ownership: bool | None = None
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Join the session before this task is exposed to a worker or caller."""
@@ -556,12 +560,14 @@ class Sender(SenderBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        context_first_ownership: bool = False,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
         self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
@@ -613,6 +619,37 @@ class Sender(SenderBase):
     @property
     def endpoint(self):
         return self._messenger.endpoint
+
+    def ownership_enabled(self, context_first: bool) -> bool:
+        """Select ownership without changing unqualified request workflows.
+
+        Args:
+            context_first: Whether the request uses context-first scheduling.
+
+        Returns:
+            Whether this request uses physical ownership enforcement.
+        """
+        return getattr(self, "_enforce_physical_ownership", False) or (
+            getattr(self, "_context_first_ownership", False) and context_first
+        )
+
+    def _owns_task(self, task: SendTaskBase) -> bool:
+        """Read the immutable session selection, including standalone task callers.
+
+        Args:
+            task: Piece whose session selected its ownership policy.
+
+        Returns:
+            Whether the piece requires protected submission and settlement.
+        """
+        selected = task._enforce_physical_ownership
+        if selected is not None:
+            return selected
+        if not getattr(self, "_context_first_ownership", False):
+            return self._enforce_physical_ownership
+        return self.ownership_enabled(
+            task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
 
     def _add_req_info(self, unique_rid: int, instance_rank: int, req_info: RecvReqInfo):
         with self._peer_requests_lock:
@@ -694,24 +731,23 @@ class Sender(SenderBase):
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
+        owned = tx_session._enforce_physical_ownership
         pre_cancel = False
         cancelled_by_peer = False
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
-            if self._enforce_physical_ownership and unique_rid in self._sessions:
+            if owned and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
-                if not self._enforce_physical_ownership:
+                if not owned:
                     self._pre_cancelled_rids.pop(unique_rid)
-            if not (pre_cancel and self._enforce_physical_ownership):
-                self._sessions[unique_rid] = (
-                    tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
-                )
+            if not (pre_cancel and owned):
+                self._sessions[unique_rid] = tx_session if owned else weakref.ref(tx_session)
         if pre_cancel:
-            if self._enforce_physical_ownership:
+            if owned:
                 tx_session.cancel_local(by_peer=cancelled_by_peer, report_unsubmitted_aux=False)
                 # Make the cancelled session visible only after its terminal
                 # state and the previously saved requests are captured. Late
@@ -801,10 +837,10 @@ class Sender(SenderBase):
         return dealers[endpoint]
 
     def _get_result_dealer(
-        self, endpoint: Optional[str], *, legacy_shared: bool = False
+        self, endpoint: Optional[str], *, legacy_shared: bool = False, owned: bool | None = None
     ) -> ZMQMessenger:
         """Keep legacy early-failure routing outside the ownership bridge."""
-        if legacy_shared and not self._enforce_physical_ownership:
+        if legacy_shared and not (self._enforce_physical_ownership if owned is None else owned):
             return self._get_or_connect_dealer(endpoint)
         return self._get_or_connect_thread_dealer(endpoint)
 
@@ -814,7 +850,7 @@ class Sender(SenderBase):
         peer_rank: int,
         request: TransferRequest,
     ) -> tuple[bool, Optional[str]]:
-        if not self._enforce_physical_ownership:
+        if not self._owns_task(task):
             status = self._agent.submit_transfer_requests(request)
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
@@ -1036,7 +1072,7 @@ class Sender(SenderBase):
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
 
-        owned = self._enforce_physical_ownership
+        owned = self._owns_task(write_meta.task)
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
         if session is None:
@@ -1077,7 +1113,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True, owned=owned).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1110,7 +1146,9 @@ class Sender(SenderBase):
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
                 task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+                self._get_result_dealer(
+                    write_meta.peer_endpoint, legacy_shared=True, owned=owned
+                ).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1231,7 +1269,7 @@ class Sender(SenderBase):
 
     @nvtx_range("_deliver_aux_to_agent")
     def _deliver_aux_to_agent(self, write_meta: WriteMeta):
-        owned = self._enforce_physical_ownership
+        owned = self._owns_task(write_meta.task)
         session = self._get_session(write_meta.unique_rid)
         if session is None:
             msg = f"_deliver_aux_to_agent: TxSession {write_meta.unique_rid} not found or already GC'd"
@@ -1605,7 +1643,7 @@ class Sender(SenderBase):
             try:
                 self._dispatch_task_to_peer(task, info)
             except Exception as error:
-                if not self._enforce_physical_ownership:
+                if not self._owns_task(task):
                     raise
                 if first_error is None:
                     first_error = error
@@ -1614,7 +1652,7 @@ class Sender(SenderBase):
 
     def _dispatch_task_to_peer(self, task: KVSendTask | AuxSendTask, info: RecvReqInfo) -> None:
         owned = False
-        if self._enforce_physical_ownership:
+        if self._owns_task(task):
             admission = self._begin_task_operation(task, info.instance_rank)
             if admission is None:
                 return
@@ -1623,6 +1661,13 @@ class Sender(SenderBase):
                 return
             owned = True
         try:
+            if (
+                owned
+                and getattr(self, "_context_first_ownership", False)
+                and task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            ):
+                peer = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+                validate_context_first_peer(self._registrar.self_rank_info, peer)
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
             trans_meta = (
@@ -1697,19 +1742,24 @@ class Sender(SenderBase):
         session = None
         with self._sessions_lock:
             session = self._get_session(unique_rid)
-            if session is None or self._enforce_physical_ownership:
+            owned = (
+                session._enforce_physical_ownership
+                if session is not None
+                else self.ownership_enabled(context_first=len(message) == 4)
+            )
+            if session is None or owned:
                 # Parked with the peer as who asked: the session built afterwards reads its
                 # cancellation from here, and an id on its own would read as a local cancel.
-                if self._enforce_physical_ownership:
+                if owned:
                     self._pre_cancelled_rids.setdefault(unique_rid, True)
                 else:
                     self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
-            if self._enforce_physical_ownership:
+            if owned:
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
-        if self._enforce_physical_ownership and len(message) == 4:
+        if owned and len(message) == 4:
             # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
             self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
 
@@ -1772,7 +1822,8 @@ class Sender(SenderBase):
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
-                self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
+                self.ownership_enabled(info.context_first)
+                and info.unique_rid in self._pre_cancelled_rids
             )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
@@ -1914,7 +1965,7 @@ class Sender(SenderBase):
         *,
         defer_to_worker: bool,
     ) -> None:
-        if defer_to_worker or self._enforce_physical_ownership:
+        if defer_to_worker or self.ownership_enabled(info.context_first):
             # Listener-side rejection must share the worker's ordered stream;
             # it cannot overtake an ambiguous write's pending IN_DOUBT report.
             thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
@@ -1985,7 +2036,11 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown:
                 return
-            if self._enforce_physical_ownership and self._sessions:
+            if any(
+                (session := self._get_session(rid)) is not None
+                and session._enforce_physical_ownership
+                for rid in self._sessions
+            ):
                 raise RuntimeError("Sender refuses shutdown while transfer ownership is active")
             if any(self._pending_settlements):
                 raise RuntimeError("Sender refuses shutdown while settlement reports are pending")
@@ -2052,11 +2107,13 @@ class TxSession(TxSessionBase):
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
+        self._enforce_physical_ownership = Sender.ownership_enabled(
+            sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self._retirement = None
-        if retirement_watchdog is not None:
+        if retirement_watchdog is not None and self._enforce_physical_ownership:
             if overall_timeout_s is None:
                 raise ValueError("deadline retirement requires the overall transfer timeout")
             self._retirement = retirement_watchdog.create_owner(
@@ -2163,6 +2220,7 @@ class TxSession(TxSessionBase):
                 prompt_len=self._base_args.prompt_len,
             )
             task._unique_rid = self.disagg_request_id
+            task._enforce_physical_ownership = self._enforce_physical_ownership
             task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
             self._has_last_slice |= chunk.is_last
@@ -2193,6 +2251,7 @@ class TxSession(TxSessionBase):
                 params = self._base_args.params
                 task = AuxSendTask(params, self.aux_slot)
                 task._unique_rid = self.disagg_request_id
+                task._enforce_physical_ownership = self._enforce_physical_ownership
                 task.bind_logical_outcomes(self._logical_outcomes)
                 self.aux_task = task
                 if self._retirement is not None and self._has_last_slice:
@@ -2312,6 +2371,11 @@ class TxSession(TxSessionBase):
                 return False
             self._logical_outcomes.cancel(by_peer)
             self._terminal_status = SessionStatus.CANCELLED
+            if self._enforce_physical_ownership and not self._need_aux:
+                # The context may retire before GEN arrives. Preserve a fence
+                # so late REQUEST_DATA cannot recreate a writer for this ID.
+                with self._sender._sessions_lock:
+                    self._sender._pre_cancelled_rids.setdefault(self.disagg_request_id, by_peer)
             # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
             # error, our own side asking is an ordinary end.
             self.cancelled_by_peer = by_peer
@@ -2685,13 +2749,13 @@ class Receiver(ReceiverBase):
         bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        context_first_ownership: bool = False,
     ):
         self._registrar = peer_registrar
         self._agent = agent
         self._bounce = bounce
-        # Internal component gate only. Production wiring is added after the
-        # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -2700,6 +2764,9 @@ class Receiver(ReceiverBase):
         # without re-validating. Executor-thread-only access, no lock (same
         # discipline as _sender_ep_instance_map).
         self._incompatible_peers: dict[str, str] = {}
+        # Context-first protection has a narrower profile than legacy transfers;
+        # its failures must not poison unrelated requests to the same endpoint.
+        self._context_first_incompatible_peers: dict[str, str] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -2719,6 +2786,19 @@ class Receiver(ReceiverBase):
     def endpoint(self):
         return self._messenger.endpoint
 
+    def ownership_enabled(self, context_first: bool) -> bool:
+        """Select physical protection for the locally qualified request workflow.
+
+        Args:
+            context_first: Whether the request uses context-first scheduling.
+
+        Returns:
+            Whether publication and retirement require ownership evidence.
+        """
+        return getattr(self, "_enforce_physical_ownership", False) or (
+            getattr(self, "_context_first_ownership", False) and context_first
+        )
+
     def shutdown(self):
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
@@ -2727,7 +2807,11 @@ class Receiver(ReceiverBase):
         with self._sessions_lock:
             if self._shutdown:
                 return
-            if self._enforce_physical_ownership and self._sessions:
+            if any(
+                (session := self._resolve_session_entry(rid, entry)) is not None
+                and session._enforce_physical_ownership
+                for rid, entry in self._sessions.items()
+            ):
                 raise RuntimeError("Receiver refuses shutdown while transfer ownership is active")
             self._shutdown = True
         for dealer in self._dealers.values():
@@ -2897,8 +2981,29 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
+        protected_context_first = (
+            task._enforce_physical_ownership
+            and getattr(self, "_context_first_ownership", False)
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         try:
+            if protected_context_first:
+                info_endpoint = self._extract_info_endpoint(params)
+                cached_error = self._context_first_incompatible_peers.get(info_endpoint)
+                if cached_error is not None:
+                    raise PeerIncompatibleError(cached_error)
             peer_infos: RankInfo = self._get_sender_info(params)
+            if protected_context_first:
+                try:
+                    validate_context_first_peer(self._registrar.self_rank_info, peer_infos)
+                except ValueError as error:
+                    message = (
+                        f"context peer at '{info_endpoint}' cannot provide requested KV "
+                        f"lifecycle enforcement: {error}; restart this generation worker "
+                        "to re-validate after correcting the peer configuration"
+                    )
+                    self._context_first_incompatible_peers[info_endpoint] = message
+                    raise PeerIncompatibleError(message) from error
         except PeerIncompatibleError as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
@@ -2915,7 +3020,7 @@ class Receiver(ReceiverBase):
                 "dispatch_task: context peer incompatible, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
-            if self._enforce_physical_ownership:
+            if task._enforce_physical_ownership:
                 session = self._get_session(task._unique_rid)
                 if session is None:
                     task.cancel_unpublished()
@@ -2996,7 +3101,7 @@ class Receiver(ReceiverBase):
         fanin_bounce = bounced and task.expected_transfers > 1
         key = (receiver_req.unique_rid, receiver_req.slice_id)
         receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
-        if not self._enforce_physical_ownership:
+        if not session._enforce_physical_ownership:
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
             session._sender_endpoints.update(sender_endpoints)
@@ -3133,7 +3238,8 @@ class Receiver(ReceiverBase):
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
         """Notify senders and return the endpoints whose cancel message was sent."""
         message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
-        if self._enforce_physical_ownership:
+        session = self._get_session(unique_rid)
+        if session is not None and session._enforce_physical_ownership:
             rank_info = self._registrar.self_rank_info
             message.extend(
                 [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
@@ -3182,11 +3288,9 @@ class Receiver(ReceiverBase):
 
     def _process_session_quiesced(self, message: list[bytes]) -> None:
         """Dispatch no-future-access proof only to the matching live request."""
-        if not self._enforce_physical_ownership:
-            return
         peer_rank, unique_rid = int(message[1]), int(message[2])
         session = self._get_session(unique_rid)
-        if session is not None:
+        if session is not None and session._enforce_physical_ownership:
             session.process_session_quiesced(peer_rank)
 
     def _handle_cancel_session(self, message: list[bytes]):
@@ -3200,7 +3304,7 @@ class Receiver(ReceiverBase):
                 # cancellation from here, and an id on its own would read as a local cancel.
                 self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
-            if self._enforce_physical_ownership:
+            if session._enforce_physical_ownership:
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
@@ -3283,11 +3387,13 @@ class RxSession(RxSessionBase):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
+        self._enforce_physical_ownership = Receiver.ownership_enabled(
+            receiver, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self._retirement = None
-        if retirement_watchdog is not None:
+        if retirement_watchdog is not None and self._enforce_physical_ownership:
             if timeout_s is None:
                 raise ValueError("deadline retirement requires the transfer timeout")
             self._retirement = retirement_watchdog.create_owner(request_id, "receive", timeout_s)
@@ -3518,6 +3624,7 @@ class RxSession(RxSessionBase):
             expected_write_bytes=expected_write_bytes,
         )
         task.bind_logical_outcomes(self._logical_outcomes)
+        task._enforce_physical_ownership = self._enforce_physical_ownership
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
@@ -3538,6 +3645,7 @@ class RxSession(RxSessionBase):
                 expected_write_bytes=expected_write_bytes,
             )
             task.bind_logical_outcomes(self._logical_outcomes)
+            task._enforce_physical_ownership = self._enforce_physical_ownership
             task.begin_publication()
             self._kv_tasks.append(task)
             if self._retirement is not None and chunk.is_last:
@@ -4210,6 +4318,7 @@ class TransferWorkerConfig:
     bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
+    context_first_ownership: bool = False
     # Internal activation gate: only the qualified containment policy supplies it.
     quiescence_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
     # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
@@ -4228,7 +4337,7 @@ class TransferWorker:
         self._config = config
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
-            if not config.enforce_physical_ownership:
+            if not (config.enforce_physical_ownership or config.context_first_ownership):
                 raise ValueError("deadline retirement requires physical ownership")
             for timeout in (config.tx_overall_timeout_s, config.rx_timeout_s):
                 if timeout is None or not math.isfinite(timeout) or timeout <= 0:
@@ -4246,6 +4355,7 @@ class TransferWorker:
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
+        self._rank_info.context_first_ownership = config.context_first_ownership
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
@@ -4357,6 +4467,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                context_first_ownership=self._config.context_first_ownership,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
@@ -4364,6 +4475,7 @@ class TransferWorker:
                 bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                context_first_ownership=self._config.context_first_ownership,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint

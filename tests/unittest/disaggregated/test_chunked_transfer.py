@@ -454,6 +454,7 @@ def _make_respond_transceiver(session, chunk, *, pipelined=True):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
+    session._enforce_physical_ownership = False
     # A send session appends one task per chunk and the caller reads the new one back by
     # position, so a double whose send() leaves the list empty has nothing at that position.
     session.kv_tasks = []

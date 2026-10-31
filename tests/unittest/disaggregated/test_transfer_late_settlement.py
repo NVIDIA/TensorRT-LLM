@@ -459,7 +459,7 @@ def test_listener_failure_uses_worker_stream_in_ownership_bridge() -> None:
     sender = _sender()
     sender._send_task_queues = [queue.Queue()]
     sender._get_or_connect_dealer = Mock()
-    info = SimpleNamespace(unique_rid=401, instance_rank=7)
+    info = SimpleNamespace(unique_rid=401, instance_rank=7, context_first=False)
     message = [transfer_mod.MessageType.KV_AGENT_RESULT, b"failed"]
     sender._route_result_messages_to_receiver(info, "receiver", [message], defer_to_worker=False)
     sender._get_or_connect_dealer.assert_not_called()

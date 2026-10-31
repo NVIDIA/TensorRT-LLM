@@ -800,6 +800,8 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     Returns the TransferWorkerConfig it wired.
     """
+    monkeypatch.delenv("TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT", raising=False)
+    monkeypatch.delenv("TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE", raising=False)
     worker = SimpleNamespace(page_table=None)
     worker_constructor = Mock(return_value=worker)
     monkeypatch.setattr(
@@ -835,6 +837,7 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
     # Everything the constructor can reach, not only what it reaches with these values: the
     # world-size and helix reads sit behind an env check, a monkeypatch and `cp_size == 1`.
     mapping = SimpleNamespace(
+        rank=0,
         cp_size=1,
         world_size=1,
         pp_size=1,
@@ -847,8 +850,8 @@ def _construct_worker_config(monkeypatch, cache_config) -> TransferWorkerConfig:
 
     KvCacheTransceiverV2(
         mapping=mapping,
-        dist=Mock(),
-        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4),
+        dist=Mock(allgather=Mock(side_effect=lambda value: [value])),
+        kv_cache_manager=Mock(spec=KVCacheManagerV2, max_batch_size=4, is_disagg=False),
         cache_transceiver_config=cache_config,
     )
 
@@ -880,7 +883,7 @@ def test_transceiver_activates_fail_stop_only_for_ownership_bridge(
         assert isinstance(callback.__self__, KvCacheTransceiverV2)
         assert callback.__self__._kv_cache_manager is config.kv_cache_manager
         assert callback.__self__._retirement_mpi_comm is communicator
-        qualify_world.assert_called_once_with(callback.__self__._mapping)
+        qualify_world.assert_called_once_with(callback.__self__._mapping, warn=False)
     else:
         assert callback is None
         qualify_world.assert_not_called()
