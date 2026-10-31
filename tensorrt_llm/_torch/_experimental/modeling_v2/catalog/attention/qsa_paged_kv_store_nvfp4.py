@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""QSA sparse path's paged K/V append into an NVFP4 pool: quantize and scatter in one launch."""
+"""QSA sparse path's paged K/V append into an NVFP4 pool: quantize and scatter in one launch.
+
+Promoted from the copies of the qwen4_exp tp1 target
+(`qwen3_8_flash_next_nvfp4__sm_103__tp1`) and the unified target, whose dep4 cells it carries.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from .._op import Arch, Cell, OpWrapper
 
 #: Values per e4m3 block scale, and e2m1 values per stored byte.
 _SF_VEC = 16
@@ -59,6 +63,19 @@ _CKPT = dict(
 )
 
 _DECODE = ((0, 1), (31, 1), (32, 1), (33, 1), (100, 1), (255, 1), (7, 1), (64, 1))
+
+#: One dep4 rank's kv_nvfp4 pool as the stock engine sizes it (core's config with NVFP4 K/V and
+#: chunked prefill): 213295 slots, its measured `maxNumBlocks`; the trunk layout of 24 role pages
+#: a slot, layer 11's planes (the last attention layer's); and the `qsa_block_table` of
+#: `max_num_requests` 128 rows by `max_blocks_per_seq` 292 columns (max_seq_len 9216).
+#: `last_page` puts that request's last page on the pool's last slot, so the stores land past
+#: 2^31 bytes of both the data and the scale plane. The pool alone is 47 GB, so `large`.
+_DEP4_PAGES = 213295
+_DEP4 = dict(slots=128, width=292, slot_pages=24, layer=11, last_page=0, large=True)
+#: 32 decode rows of 32 requests: max_seq_len - 1 first, page edges, then a stride over the table.
+_DEP4_DECODE = ((9215, 1), (0, 1), (31, 1), (32, 1), (33, 1)) + tuple(
+    (293 * i + 17, 1) for i in range(1, 28)
+)
 
 
 def _spec(segments, pages, **overrides) -> dict:
@@ -391,6 +408,21 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
             "P=1 and P=3) at unit second-level scales: data and both scale layouts bitwise equal",
             spec=_spec(((0, 115), (0, 101), (0, 36)), pages=96, thop_append=True),
         ),
+        Cell(
+            why="dep4 kv_nvfp4 decode: one row at position 9215 (max_seq_len - 1) on the last "
+            "of the rank's 213295 pool slots, 128 x 292 table",
+            spec=_spec(((9215, 1),), pages=_DEP4_PAGES, **_DEP4),
+        ),
+        Cell(
+            why="dep4 kv_nvfp4 decode: 32 requests of the 128 table rows at positions 0..9215 "
+            "across page edges, on the rank's 213295-slot pool",
+            spec=_spec(_DEP4_DECODE, pages=_DEP4_PAGES, **_DEP4),
+        ),
+        Cell(
+            why="dep4 kv_nvfp4 context chunk: 8192 rows (max_num_tokens), one prompt's chunk at "
+            "2048..9215 and a new prompt's first 1024, on the rank's 213295-slot pool",
+            spec=_spec(((2048, 7168), (0, 1024)), pages=_DEP4_PAGES, **_DEP4),
+        ),
     )
 
     note = """
@@ -431,9 +463,21 @@ class QsaPagedKvStoreNvfp4(OpWrapper):
     tokens_per_block. A served call puts the width and each stride in one fixed
     class (the k/v head slices of the packed QKV row, the planes' slot, head and
     token strides, the contiguous table's) and varies the page count and the
-    table height. The cells run (other, other) and (multiple of 16, multiple of
-    16); the other combinations, a table height of 1 among them, are not
-    certified.
+    table height. The cells run (other, other), (multiple of 16, multiple of 16)
+    and, at dep4, (other, multiple of 16); (multiple of 16, other) and a table
+    height of 1 are not certified.
+
+    The unified target at dep4 with NVFP4 K/V (the kv_nvfp4 variant): a rank holds both
+    KV heads in the trunk layout, data `[slots, 24, 2, 32, 128]` and scales
+    `[slots, 24, 2, 32, 16]`, attention layer j's K and V at role pages 2j and
+    2j + 1 (the stock manager's `get_buffers` / `get_block_scale_buffers` views
+    on GB300). The stock engine at that configuration (chunked prefill on,
+    max_num_tokens 8192) measured `maxNumBlocks` 213295 a rank, and the dep4
+    cells drive that many slots under its 128 x 292 `qsa_block_table`, one
+    request's last page on the pool's last slot: stores land 4.19e10 bytes into
+    the data plane and 5.24e9 into the scale plane. A cell's pool is 47 GB and
+    its peak 49.3 GiB, so the dep4 cells are `large`; each runs in under 1.1 s
+    including the Triton compile.
 
     Not finite values: a NaN or +-inf in a block is not certified (the e2m1 and
     e4m3 conversions saturate, the block maximum is the kernel's `max`).

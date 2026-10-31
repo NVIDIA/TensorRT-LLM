@@ -150,6 +150,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_i
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_kv_store import (
     qsa_paged_kv_store,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_kv_store_nvfp4 import (
+    qsa_paged_kv_store_nvfp4,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -181,7 +184,6 @@ from .ops.activation.fused_sigmoid_mul_inplace__mtp import (
 from .ops.activation.fused_sigmoid_mul_inplace__r17 import fused_sigmoid_mul_inplace
 from .ops.attention.fused_qk_norm_rope__mtp import fused_qk_norm_rope as mtp_fused_qk_norm_rope
 from .ops.attention.fused_qk_norm_rope__r3 import fused_qk_norm_rope
-from .ops.attention.qsa_paged_kv_store_nvfp4__r37 import qsa_paged_kv_store_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa__r26 import qsa_paged_sparse_gqa
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4__r38 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode__r39 import qsa_paged_sparse_gqa_nvfp4_decode
