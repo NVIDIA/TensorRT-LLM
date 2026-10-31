@@ -309,6 +309,14 @@ set_target_properties(
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Cluster launch helpers must use the CUDA runtime that registered the kernel.
+  set(CUTLASS_RUNTIME_SYMBOLS_MAP
+      "${PROJECT_SOURCE_DIR}/cmake/templates/cutlass_runtime_symbols.map")
+  target_link_options(${SHARED_TARGET} PRIVATE
+                      "LINKER:--version-script,${CUTLASS_RUNTIME_SYMBOLS_MAP}")
+  set_property(TARGET ${SHARED_TARGET} APPEND
+               PROPERTY LINK_DEPENDS "${CUTLASS_RUNTIME_SYMBOLS_MAP}")
+
   # Keep host code, unwind tables, and the GOT within PC-relative addressing
   # range, including after BOLT appends code, by placing CUDA payloads first.
   set(CUDA_FATBIN_LINKER_SCRIPT
