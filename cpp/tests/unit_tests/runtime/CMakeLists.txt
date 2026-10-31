@@ -33,11 +33,26 @@ add_tllm_gtest(
   tllm::runtime_memory
   LABELS
   "unit;runtime;gpu")
-add_tllm_gtest(gdrcopyTest SOURCES gdrcopyTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
 add_tllm_gtest(
-  hostAccessibleDeviceAllocatorTest SOURCES
-  hostAccessibleDeviceAllocatorTest.cu FULL_STACK LABELS "unit;full-stack;gpu")
+  gdrcopyTest
+  OWNER
+  runtime
+  SOURCES
+  gdrcopyTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_gdr
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  hostAccessibleDeviceAllocatorTest
+  OWNER
+  runtime
+  SOURCES
+  hostAccessibleDeviceAllocatorTest.cu
+  LINK_LIBRARIES
+  tllm::runtime_host_accessible_memory
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   iBufferTest
   OWNER
@@ -48,8 +63,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(ipcNvlsMemoryTest SOURCES ipcNvlsMemoryTest.cpp FULL_STACK
-               LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  ipcNvlsMemoryTest
+  OWNER
+  runtime
+  SOURCES
+  ipcNvlsMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_ipc_nvls
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   iTensorTest
   OWNER
@@ -60,10 +83,27 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(loraCacheTest SOURCES loraCacheTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
-add_tllm_gtest(loraUtilsTest SOURCES loraUtilsTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  loraCacheTest
+  OWNER
+  runtime
+  SOURCES
+  loraCacheTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_lora_cache
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  loraUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  loraUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_lora
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(moeLoadBalancerTest SOURCES moeLoadBalancerTest.cpp FULL_STACK
                LABELS "unit;full-stack;gpu")
 add_tllm_gtest(
@@ -76,8 +116,16 @@ add_tllm_gtest(
   tllm::runtime_distributed
   LABELS
   "unit;runtime;host")
-add_tllm_gtest(localizationTest SOURCES localizationTest.cu FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  localizationTest
+  OWNER
+  runtime
+  SOURCES
+  localizationTest.cu
+  LINK_LIBRARIES
+  tllm::runtime_locality
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   localityDomainPublicConfigTest
   OWNER
@@ -111,8 +159,16 @@ add_tllm_gtest(
   "unit;runtime;gpu")
 add_tllm_gtest(transposeKVKernelTest SOURCES transposeKVKernelTest.cpp
                FULL_STACK LABELS "unit;full-stack;gpu")
-add_tllm_gtest(utilsTest SOURCES utilsTest.cpp FULL_STACK LABELS
-               "unit;full-stack;gpu")
+add_tllm_gtest(
+  utilsTest
+  OWNER
+  runtime
+  SOURCES
+  utilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_numpy
+  LABELS
+  "unit;runtime;gpu")
 add_tllm_gtest(
   virtualMemoryTest
   OWNER
@@ -123,8 +179,16 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;runtime;gpu")
-add_tllm_gtest(workerPoolTest SOURCES workerPoolTest.cpp FULL_STACK LABELS
-               "unit;full-stack;host")
+add_tllm_gtest(
+  workerPoolTest
+  OWNER
+  runtime
+  SOURCES
+  workerPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_worker_pool
+  LABELS
+  "unit;runtime;host")
 add_tllm_gtest(
   worldConfigTest
   OWNER

@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "agentName.h"
+
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -28,12 +30,6 @@
 
 namespace tensorrt_llm::executor::kv_cache
 {
-
-// Generate a unique agent name for NIXL/UCX connection identity.
-// Format: {hostname}_{pid}_{random64}_{counter}
-// The per-process random suffix prevents collisions across Docker containers
-// that share hostname (--network host) and PID namespace.
-std::string genUniqueAgentName();
 
 struct RequestAndBufferInfo
 {
