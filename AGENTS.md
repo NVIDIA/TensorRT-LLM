@@ -168,9 +168,69 @@ Key files:
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
+### Branch and worktree hygiene
+
+As of Oct 29, 2026, a clean `git clone` TensorRT-LLM checkout contains 20k+ files.
+It can increase to 10+ GB and 80k+ files with generated .cu files, built C++ artifacts in `cpp/build*`,
+libraries staged in `tensorrt_llm/libs/`, wheel and related packages in `build/` and a venv holding
+the dependencies.
+Cluster Lustre file system has limited disk and file count space. Every extra worktree therefore
+costs a lot of resources plus rebuild time.
+
+Reduce creation of new branches and worktrees if you can and suggest cleanups to user after work
+is done. This includes branches and worktrees both on the local computer and on the remote cluster.
+
+- If user's conversation shows the work belongs to an existing branch, keep commits to that branch.
+- When reporting your work to user, also list the items you created (see the list below) to keep user
+  informed on resource usage.
+
+#### Cleanup when work is done
+Ask user a direct yes/no question about cleanup when you report the task's results, and again after
+the task's last step (for example, after you open a PR). Do not drop this question to make room for a
+question about the next step. A note such as "you can delete it later" does not count.
+
+In the question, list every item the task left on the local computer and on each cluster it used. Say
+which items to keep and why, for example the PR branch until the PR merges.
+
+- Local and remote branches.
+- New worktrees including build outputs: `cpp/build*`, `build/` and venvs inside them.
+- Container images: `.sqsh` files and Docker images.
+- Job folders, Slurm logs and other temporary files.
+- Jobs that are still running.
+
+Before you ask, also look for worktrees that are 30+ days old via `git worktree list` and add them
+to the list.
+If you have visited container image folders during your work, also look for container images that
+are 30+ days old, and add them to the list.
+
+If user has not previously granted you the permission to delete, do not delete any item on the
+list until user says yes.
+
+#### Automatic Dev Loop
+If user tasks you with an automatic develop/optimization/debugging loop where each iteration involves trying
+some code changes:
+
+- Prefer rebuilding in place in a single base worktree across all iterations: files in venv are reused
+  and CMake recompiles only the changed files.
+  - If the entire loop only involves Python change, build once with an editable install; later Python edits
+    take effect without rebuilding.
+- If you must create a new worktree at each iteration to store code changes and build artifacts (e.g. a
+  breadth-first dynamic tree search on code design or requiring runtime comparisons against builds from prior
+  iterations):
+  - If the entire loop only involves Python change, build TRTLLM only once on a base worktree. At each
+    iteration, check out a new worktree from the commit the base worktree was built at, hard-link the base
+    worktree's build outputs (the files Git ignores under `tensorrt_llm/`) into it instead of rebuilding,
+    and use `PYTHONPATH` pointing at the new worktree during run time.
+  - Once you know the built artifacts of one worktree (its build directories and the container images built
+    only for it) will never be used again by any worktree or job, clean up that worktree if user has granted
+    you the permission to delete. If not, add its items to the cleanup list. To clean up, delete the built
+    artifacts. If the code needs to be kept, commit it and keep note of the branch name, then run
+    `git worktree remove`. Otherwise, delete the branch and worktree too.
+
 ### GitHub CLI authentication (`GH_CONFIG_DIR`)
 
-The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
+The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory.
+**Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
 
 1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
 2. If not explicitly set, default to `~/.config/gh`; do not ask for confirmation.
