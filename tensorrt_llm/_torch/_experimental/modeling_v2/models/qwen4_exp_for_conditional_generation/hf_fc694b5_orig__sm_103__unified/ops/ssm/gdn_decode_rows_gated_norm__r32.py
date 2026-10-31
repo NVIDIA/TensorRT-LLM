@@ -4,8 +4,8 @@
 over the fp32 or bf16 state pool: the decode step at batch sizes past the cluster kernel's
 over an fp32 pool, and at every batch size over a bf16 pool.
 
-A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target and copied unchanged, with
-this file, from its `ops/ssm/gdn_decode_rows_gated_norm.py` (this target's variant r32); the
+A CuTe DSL kernel written for the Qwen3.8-Flash-Next tp1 target, shared with the unified
+target (promoted from their copies, the kernel unchanged); the
 recurrence is the gated delta rule of FlashInfer's
 `gdn_decode.gated_delta_rule_decode_pretranspose`, reimplemented here. At a
 decode batch the step is the pool's traffic -- each (row, v-head) state, 64 KB fp32 or
@@ -40,11 +40,14 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
+    _recurrence_reference,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
+    gdn_decode_gated_norm_pdl as _one_launch,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .gdn_decode_gated_norm_pdl__r31 import _recurrence_reference
-from .gdn_decode_gated_norm_pdl__r31 import gdn_decode_gated_norm_pdl as _one_launch
 
 #: Key columns a lane (one 16-byte fp32 or 8-byte bf16 vector of a state row).
 _PL = 4

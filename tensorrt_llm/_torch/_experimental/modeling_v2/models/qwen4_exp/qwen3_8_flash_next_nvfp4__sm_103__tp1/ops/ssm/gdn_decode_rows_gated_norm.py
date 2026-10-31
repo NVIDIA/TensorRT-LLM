@@ -38,11 +38,14 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
+    _recurrence_reference,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_gated_norm_pdl import (
+    gdn_decode_gated_norm_pdl as _one_launch,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .gdn_decode_gated_norm_pdl import _recurrence_reference
-from .gdn_decode_gated_norm_pdl import gdn_decode_gated_norm_pdl as _one_launch
 
 #: Key columns a lane (one 16-byte fp32 or 8-byte bf16 vector of a state row).
 _PL = 4

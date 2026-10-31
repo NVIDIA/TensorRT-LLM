@@ -36,11 +36,12 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import dsl_user_op
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.rms_norm_gated_token_major import (
     rms_norm_gated_token_major as _gated_norm,
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Decode rows per launch this entry is certified for.
 MAX_ROWS = 4
@@ -430,7 +431,7 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     `dt_bias` fp32 `[HV]`; `norm_weight` bf16 `[V]`; `V % 32 == 0` (rows a warp:
     `V / 32`), `K % 32 == 0`; int32 `slots` `[rows]`. **The pool rows and `slots` must not be
     written by any kernel of the same step queued ahead of this one**: both are read
-    before `griddepcontrol.wait`. That holds for this target's decode steps (each
+    before `griddepcontrol.wait`. That holds for the unified target's decode steps (each
     layer's pool is written only by its own recurrence, `slots` is filled before the
     step's graph launches) and is why the entry is not for verify or prefill steps.
 
@@ -442,9 +443,9 @@ class GdnDecodeGatedNormPdl(OpWrapper):
     Source: the CuTe DSL kernel in this file, JIT-compiled (`cute_ext.compile`) for the
     running device at the first call per geometry; the cells ran that path on sm_103.
 
-    This target: its routing admits a bf16 recurrent-state cache only, and this kernel takes
+    The unified target: its routing admits a bf16 recurrent-state cache only, and this kernel takes
     an fp32 pool only -- a bf16 pool fails its compile loudly ("`copy` currently only
-    supports equal source and destination element type bit width") -- so this target's
+    supports equal source and destination element type bit width") -- so the unified target's
     decode step does not launch it. Its bf16 decode recurrence is
     `gdn_decode_rows_gated_norm`, which reads this entry's `reference` and
     `_recurrence_reference` (both round the state to the pool's own dtype) and not its
