@@ -837,7 +837,11 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
+            // Keep the job workspace (job-output.log etc.) for debugging; the
+            // PruneSlurmOutputs job removes it after the retention period. Drop the
+            // S3 spool and anything holding credentials right away: the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -2254,7 +2258,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
+                    # Keep xtrace off here too: the exported pipeline env includes OpenSearch credentials.
+                    set +x
                     ${envExportStatements}
+                    set -x
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
