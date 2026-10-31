@@ -1126,6 +1126,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # emits per turn, so parallel emission remains model behavior either way.
     parallel_tool_calls: Optional[bool] = None
     user: Optional[str] = None
+    # Standard OpenAI field, accepted for compatibility and otherwise ignored:
+    # KV cache reuse needs no client hint, and cache_salt is the field that
+    # isolates cached prefixes between users.
+    prompt_cache_key: Optional[str] = None
     reasoning_effort: Optional[ReasoningEffort | Literal[
         "low", "medium", "high", "max", "none"]] = Field(
             default=ReasoningEffort.LOW,
