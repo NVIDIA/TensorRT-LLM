@@ -3502,6 +3502,25 @@ def test_deepseek_v31_two_calls_stream_at_any_chunk_size(
             ] == [json.loads(args) for _, args in calls]
 
 
+@pytest.mark.parametrize("partial_token",
+                         ["<｜tool▁call▁en", "<｜tool▁calls▁e", "<｜tool▁ca"])
+def test_deepseek_v31_streams_text_before_a_partial_token(
+        sample_tools: list[ChatCompletionToolsParam],
+        partial_token: str) -> None:
+    """Only the possible token at the end of a delta is held back.
+
+    The text before it is sent at once, so a stream that ends there keeps it.
+    """
+    parser = DeepSeekV31Parser()
+
+    result = parser.parse_streaming_increment("Hello " + partial_token,
+                                              sample_tools)
+    finish_result = parser.finish(sample_tools)
+
+    assert result.normal_text + finish_result.normal_text == "Hello "
+    assert result.calls == finish_result.calls == []
+
+
 # ============================================================================
 # Glm4ToolParser Tests
 # ============================================================================

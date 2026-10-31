@@ -140,8 +140,9 @@ class DeepSeekV31Parser(BaseToolParser):
 
         if self._pending_call_end:
             pending = current_text.lstrip()
-            if not pending or (len(pending) < len(_TOOL_CALL_END)
-                               and _TOOL_CALL_END.startswith(pending)):
+            if not pending or (
+                len(pending) < len(_TOOL_CALL_END) and _TOOL_CALL_END.startswith(pending)
+            ):
                 self._buffer = pending
                 return StreamingParseResult()
             if pending.startswith(_TOOL_CALL_END):
@@ -155,13 +156,13 @@ class DeepSeekV31Parser(BaseToolParser):
         has_tool_call = bool(start_indices)
 
         if not has_tool_call:
-            if any(
+            # Only the end of the text that could start a token is held back.
+            held = max(
                 self._ends_with_partial_token(current_text, token)
                 for token in (*start_tokens, self.eot_token, _TOOL_CALL_END)
-            ):
-                return StreamingParseResult()
-            normal_text = current_text
-            self._buffer = ""
+            )
+            normal_text = current_text[: len(current_text) - held]
+            self._buffer = current_text[len(normal_text) :]
             self._sep_search_start = 0
             for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 normal_text = normal_text.replace(e_token, "")
