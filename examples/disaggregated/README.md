@@ -583,10 +583,29 @@ trtllm-serve disaggregated -c disagg_config.yaml -m ./metadata_config.yaml
 
 The metadata_config file looks like
 ```yaml
+server_type: etcd
 hostname: "localhost"
 port: 2379
 health_check_timeout: 5.0
-refersh_interval: 10.0
+refresh_interval: 10.0
+```
+
+To use an ETCD server with TLS, add ```ca_cert``` (with optional ```cert_key``` and ```cert_cert``` for client certificates) to the metadata_config file. To use ETCD authentication, add ```user``` and ```password``` together with ```ca_cert```: the etcd client sends its authentication token only over a TLS connection, and the config is rejected if ```user``` and ```password``` are set without ```ca_cert```. The ETCD user needs read and write permission on the ```trtllm/``` key prefix only. The etcd client logs in once, when the server starts, and does not renew its token: after ETCD stops accepting the token, for example following an ETCD restart, restart the context, generation and disaggregated servers so that they log in again. Set ```record_auth_key``` to the same non-empty secret in the metadata_config file of every context, generation and disaggregated server: servers then sign the records they register, and the disaggregated server ignores records without a valid signature.
+
+Without these fields the connection to the ETCD server is anonymous and unencrypted, and the disaggregated server uses every ```trtllm/*``` record found in the store. When the ETCD server is reachable from hosts other than the context, generation and disaggregated servers, enable ETCD authentication with TLS together with ```record_auth_key```. The signature is checked only by readers, so access control of the store itself still comes from the ETCD server. A metadata_config file with all optional fields looks like
+
+```yaml
+server_type: etcd
+hostname: "etcd.internal"
+port: 2379
+health_check_timeout: 5.0
+refresh_interval: 10.0
+user: "trtllm"
+password: "<etcd user credential>"
+ca_cert: "/etc/trtllm/etcd-ca.pem"
+cert_key: "/etc/trtllm/etcd-client-key.pem"
+cert_cert: "/etc/trtllm/etcd-client.pem"
+record_auth_key: "<shared secret, identical on every server>"
 ```
 
 The ```hostname``` and ```port``` must match those used when starting the ETCD server. The ```health_check_timeout``` parameter specifies how long a server will be considered dead if no healthy response is received. By default, trtllm will perform two checks before marking a server as dead. The ```refresh_interval``` parameter determines how often the latest server list is fetched from the ETCD server.

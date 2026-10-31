@@ -13,9 +13,11 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
 from mpi4py.util import pkl5
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import (ConfigDict, Field, TypeAdapter, ValidationError,
+                      model_validator)
 
 from .._utils import global_mpi_rank, global_mpi_size
+from .utils import StrictBaseModel
 
 __all__ = [
     'InternalRequestAuthKey',
@@ -29,7 +31,8 @@ __all__ = [
     'validate_internal_request_auth_key',
 ]
 
-InternalRequestAuthKey = Annotated[str, Field(strict=True, min_length=1)] | None
+_AuthKey = Annotated[str, Field(strict=True, min_length=1)]
+InternalRequestAuthKey = _AuthKey | None
 _AUTH_KEY_ADAPTER = TypeAdapter(InternalRequestAuthKey)
 
 
@@ -186,13 +189,68 @@ class DisaggServerConfig():
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
 
 
-@dataclass
-class MetadataServerConfig():
-    server_type: Literal['etcd']
-    hostname: str = "localhost"
-    port: int = 2379
-    health_check_timeout: float = 5.0
-    refresh_interval: float = 10.0
+class MetadataServerConfig(StrictBaseModel):
+    """Settings of the metadata server that context and generation servers register with."""
+
+    # Keeps the values of rejected fields, such as credentials, out of errors.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    server_type: Literal['etcd'] = Field(
+        description="Type of the metadata server.")
+    hostname: str = Field(default="localhost",
+                          description="Host of the metadata server.")
+    port: int = Field(default=2379, description="Port of the metadata server.")
+    health_check_timeout: float = Field(
+        default=5.0,
+        description="Seconds without a healthy response after which a server "
+        "is considered dead.")
+    refresh_interval: float = Field(
+        default=10.0,
+        description="Seconds between fetches of the latest server list.")
+    user: Optional[str] = Field(
+        default=None,
+        description="User name for the metadata server. Requires `password` "
+        "and `ca_cert`.")
+    password: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="Password for the metadata server. Requires `user` and "
+        "`ca_cert`.")
+    ca_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the CA certificate used to verify the metadata "
+        "server. Enables TLS.")
+    cert_key: Optional[str] = Field(
+        default=None,
+        description="Path to the client key. Requires `cert_cert` and "
+        "`ca_cert`.")
+    cert_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the client certificate. Requires `cert_key` and "
+        "`ca_cert`.")
+    record_auth_key: Optional[_AuthKey] = Field(
+        default=None,
+        repr=False,
+        description="Shared secret used to sign and verify server records. "
+        "When set, records without a valid signature are ignored by readers.")
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> "MetadataServerConfig":
+        if (self.user is None) != (self.password is None):
+            raise ValueError(
+                "metadata server user and password must be set together")
+        if self.user is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server user and password require ca_cert: the etcd "
+                "client sends its authentication token only over a TLS "
+                "connection")
+        if (self.cert_key is None) != (self.cert_cert is None):
+            raise ValueError(
+                "metadata server cert_key and cert_cert must be set together")
+        if self.cert_key is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server cert_key and cert_cert require ca_cert")
+        return self
 
 
 def get_usage_tokens_from_ctx(
