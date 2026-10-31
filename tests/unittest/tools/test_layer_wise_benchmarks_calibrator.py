@@ -14,11 +14,19 @@ cannot be used here: _init_replay_mode() decodes every record and moves the slot
 to CUDA.
 """
 
+from collections import UserDict
+from collections.abc import Mapping
 from typing import Iterable
 
 import pytest
+import torch
 
-from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Calibrator, Mode
+from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import (
+    Calibrator,
+    Mode,
+    NoDecoderLayers,
+    _decoder_layers,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -229,3 +237,204 @@ def test_replay_token_count_rejects_an_empty_window() -> None:
 def test_replay_token_count_requires_replay_mode() -> None:
     with pytest.raises(ValueError, match="only valid in REPLAY mode"):
         Calibrator().get_replay_token_count()
+
+
+class _Layer:
+    """Stands in for a decoder layer: the one thing the calibrator wraps."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def forward(self, *args, **kwargs) -> None:
+        self.calls += 1
+        return None
+
+
+class _Holder:
+    def __init__(self, **attrs) -> None:
+        self.__dict__.update(attrs)
+
+
+def test_decoder_layers_of_a_plain_causal_lm() -> None:
+    layers = [_Layer(), _Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(layers=layers))) is layers
+
+
+@pytest.mark.parametrize("attr", ["layers", "block", "blocks", "h"])
+def test_decoder_layers_under_each_known_name(attr: str) -> None:
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(**{attr: layers}))) is layers
+
+
+def test_decoder_layers_accepts_a_module_list() -> None:
+    """A PyTorch ModuleList remains a supported layer container."""
+    layers = torch.nn.ModuleList([torch.nn.Identity()])
+    assert _decoder_layers(_Holder(layers=layers)) is layers
+
+
+def test_decoder_layers_of_a_vl_wrapper_without_an_inner_model() -> None:
+    """A wrapper that holds its stack directly, with no inner `.model`."""
+    layers = [_Layer(), _Layer(), _Layer()]
+    assert _decoder_layers(_Holder(layers=layers)) is layers
+
+
+def test_decoder_layers_descends_into_llm() -> None:
+    """The bug this function exists for.
+
+    Qwen3.5-9B registers as `Qwen3_5VLModel`, which keeps the causal LM under
+    `llm` rather than `model`, so its stack is at `model.llm.model.layers`.
+    Stopping after one unwrap raised NoDecoderLayers here, which is a better
+    failure than the original AttributeError and is still a failure.
+    """
+    layers = [_Layer(), _Layer()]
+    vl = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    assert _decoder_layers(vl) is layers
+
+
+def test_decoder_layers_descends_into_language_model() -> None:
+    """The HF-style `*ForConditionalGeneration` shape, Gemma-3/4 among them."""
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(language_model=_Holder(model=_Holder(layers=layers)))) is layers
+
+
+@pytest.mark.parametrize("wrapper", ["llm", "language_model"])
+def test_decoder_layers_searches_past_an_empty_model_branch(wrapper: str) -> None:
+    """An empty higher-priority branch must not hide another decoder stack."""
+    layers = [_Layer(), _Layer()]
+    model = _Holder(model=_Holder(), **{wrapper: _Holder(layers=layers)})
+    assert _decoder_layers(model) is layers
+
+
+def test_decoder_layers_preserves_wrapper_priority() -> None:
+    """Prefer the model subtree before trying sibling wrapper names."""
+    preferred = [_Layer()]
+    other = [_Layer()]
+    model = _Holder(model=_Holder(model=_Holder(layers=preferred)), llm=_Holder(layers=other))
+    assert _decoder_layers(model) is preferred
+
+
+def test_decoder_layers_searches_past_a_cyclic_model_branch() -> None:
+    """A cycle in one wrapper branch must not hide another decoder stack."""
+    layers = [_Layer()]
+    model = _Holder(llm=_Holder(layers=layers))
+    model.model = _Holder(model=model)
+    assert _decoder_layers(model) is layers
+
+
+def test_decoder_layers_stops_on_a_self_referential_wrapper() -> None:
+    """A wrapper whose `model` is itself must not spin."""
+    holder = _Holder()
+    holder.model = holder
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(holder)
+
+
+def test_decoder_layers_skips_a_mapping_named_h() -> None:
+    """A dict passes __getitem__ and len(), then raises KeyError on [0].
+
+    `h` is the one name here that a config mapping plausibly collides with, and
+    catching only TypeError let that one attribute abort the search before the
+    real stack was found.
+    """
+    layers = [_Layer()]
+    holder = _Holder(h={"attn": 1}, blocks=layers)
+    assert _decoder_layers(_Holder(model=holder)) is layers
+
+
+@pytest.mark.parametrize("mapping_type", [dict, UserDict])
+def test_decoder_layers_skips_an_integer_keyed_mapping(mapping_type: type[Mapping]) -> None:
+    """An integer-keyed mapping must not hide a later layer-list candidate."""
+    layers = [_Layer()]
+    model = _Holder(layers=mapping_type({0: _Layer()}), blocks=layers)
+    assert _decoder_layers(model) is layers
+
+
+@pytest.mark.parametrize("mapping", [{"attn": 1}, {0: _Layer()}, UserDict({0: _Layer()})])
+def test_decoder_layers_raises_when_only_a_mapping_is_present(mapping: Mapping) -> None:
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_Holder(model=_Holder(h=mapping)))
+
+
+def _wrapped_chain(unwraps: int, layers) -> _Holder:
+    """`layers` behind `unwraps` levels of `.model`."""
+    obj = _Holder(layers=layers)
+    for _ in range(unwraps):
+        obj = _Holder(model=obj)
+    return obj
+
+
+@pytest.mark.parametrize("unwraps", [0, 1, 2, 3, 4])
+def test_decoder_layers_searches_the_whole_budget(unwraps: int) -> None:
+    """Examine the object reached by the last permitted unwrap.
+
+    `range(_MAX_UNWRAP_DEPTH)` searched the root and three levels while the name
+    promised four, so a four-deep layout raised instead of resolving.
+    """
+    layers = [_Layer()]
+    assert _decoder_layers(_wrapped_chain(unwraps, layers)) is layers
+
+
+def test_decoder_layers_retries_a_shared_branch_with_its_own_depth_budget() -> None:
+    """A shorter sibling path can reach layers beyond the first path's budget."""
+    layers = [_Layer()]
+    shared = _wrapped_chain(3, layers)
+    model = _Holder(model=_Holder(model=shared), llm=shared)
+    assert _decoder_layers(model) is layers
+
+
+def test_decoder_layers_stops_one_level_past_the_budget() -> None:
+    """The budget is a bound, not a suggestion -- one level further refuses."""
+    with pytest.raises(NoDecoderLayers):
+        _decoder_layers(_wrapped_chain(5, [_Layer()]))
+
+
+def test_maybe_wrap_model_wraps_layers_behind_a_nested_wrapper() -> None:
+    """Through the public entry point, not the helper.
+
+    _decoder_layers is what the tests above exercise, but what the calibrator
+    actually does is assign onto `forward` for every layer it returns. A
+    regression that left nested `llm` layers unwrapped would pass every test
+    above and measure nothing at run time.
+
+    MARK mode reaches _wrap_layer_forward without touching CUDA.
+    """
+    layers = [_Layer(), _Layer(), _Layer()]
+    model = _Holder(llm=_Holder(model=_Holder(layers=layers)))
+    originals = [layer.forward for layer in layers]
+
+    calibrator = Calibrator()
+    calibrator.mode = Mode.MARK
+    assert calibrator.maybe_wrap_model(model) is model
+
+    for idx, (layer, original) in enumerate(zip(layers, originals)):
+        assert layer.forward is not original, f"layer {idx} left unwrapped"
+        # `==`, not `is`: attribute access builds a fresh bound method each time,
+        # so the object captured before wrapping is never identical to the one
+        # functools.wraps recorded, however correct the wrapping is.
+        assert layer.forward.__wrapped__ == original
+        # The wrapper has to delegate, not replace.
+        assert layer.forward() is None
+        assert layer.calls == 1
+
+
+def test_decoder_layers_rejects_a_decoy_container() -> None:
+    """A sized, indexable attribute is not by itself a decoder stack.
+
+    `_wrap_layer_forward` assigns `forward` onto each item it is handed, so
+    accepting a list of, say, config dicts would wrap nothing, measure nothing,
+    and still produce a number.
+    """
+    with pytest.raises(NoDecoderLayers, match="none of"):
+        _decoder_layers(_Holder(model=_Holder(blocks=[{"hidden": 4096}])))
+
+
+def test_decoder_layers_skips_an_empty_candidate_for_a_real_one() -> None:
+    """An architecture may define the name and leave it empty."""
+    layers = [_Layer()]
+    assert _decoder_layers(_Holder(model=_Holder(layers=[], blocks=layers))) is layers
+
+
+def test_decoder_layers_names_the_type_it_could_not_resolve() -> None:
+    """The message has to say which class to go read, not just that it failed."""
+    with pytest.raises(NoDecoderLayers, match=r"_Holder keeps its decoder layers"):
+        _decoder_layers(_Holder(model=_Holder(decoder=[_Layer()])))
