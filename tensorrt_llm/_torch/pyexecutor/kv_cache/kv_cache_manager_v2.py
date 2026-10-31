@@ -1793,6 +1793,13 @@ class KVCacheManagerV2(BaseResourceManager):
     # Read by KvCacheCreator: a subclass that overrides the context
     # commit/history protocol opts out of generic reuse-match backoff.
     _supports_reuse_match_backoff = True
+    # The same question for a separate one-model draft pool, which holds only
+    # the speculation layers and may therefore support the protocol when the
+    # pool holding the model's own layers does not.
+    _supports_draft_reuse_match_backoff = True
+    # Opt-in for a subclass whose target truncates reuse to a coarse grid,
+    # where the draft's one-token backoff costs it a whole interval.
+    _drop_advisory_draft_lookahead = False
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
     #
@@ -2038,8 +2045,24 @@ class KVCacheManagerV2(BaseResourceManager):
         # a block's reuse key covers no token past its end.
         self._draft_prompt_lookahead = draft_prompt_lookahead(spec_config) or 0
         # Unsupported adapters keep their main-like reuse endpoint.
+        supports_backoff = (
+            self._supports_draft_reuse_match_backoff
+            if self.is_draft
+            else self._supports_reuse_match_backoff
+        )
         self.reuse_match_backoff = self._draft_prompt_lookahead
-        if not self._supports_reuse_match_backoff:
+        if not supports_backoff:
+            self.reuse_match_backoff = 0
+        elif (
+            self.is_draft
+            and joint_kv_cache_reuse
+            and self._drop_advisory_draft_lookahead
+            and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+        ):
+            # The trim is advisory, but the scheduler caps the target at the
+            # draft's claim, so on a snapshot-grid target one token costs a
+            # whole interval. Exact verification already rejects a bad draft
+            # token; relaxed acceptance does not, so it keeps the trim.
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -5061,6 +5084,9 @@ class KVCacheManagerV2(BaseResourceManager):
             del points_by_id[request.py_request_id]
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
+
+    def note_context_fork(self, req: LlmRequest, fork: int) -> None:
+        """Hook for recurrent-state managers; the attention-only base ignores the hint."""
 
     def probe_context_reuse(self, req: LlmRequest) -> int | None:
         """Reusable prefix depth for this pool, without claiming pages.
