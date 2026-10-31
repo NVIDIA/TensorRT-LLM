@@ -181,6 +181,12 @@ The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub
 
 See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 
+In sparse checkouts, `pre-commit run --files ...` still runs the repository-wide
+`vendor-sources-check`, `waive list check`, and `validate-test-lists` hooks.
+These require the vendored trees/patches and test-list scripts/data even for an
+unrelated Python edit. Restore those paths or explicitly report skipped hooks;
+passing file-level lint alone does not establish a full repository check.
+
 | Layer | Location | Notes |
 |-------|----------|-------|
 | Unit tests | `tests/unittest/` | Run in pre-merge CI; some tests require GPU |

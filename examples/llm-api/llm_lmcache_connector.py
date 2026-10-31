@@ -23,13 +23,14 @@ LMCache stores previously computed KV tensors and replays them on subsequent
 requests with the same prefix, reducing recomputation.
 
 The connector implementation lives in LMCache:
-  lmcache.integration.tensorrt_llm.tensorrt_adapter
+  lmcache.inprocess.integration.tensorrt_llm.tensorrt_adapter
 
 TRT-LLM resolves the ``"lmcache"`` preset to the correct import paths
 automatically via the connector registry.
 
 Prerequisites:
-  pip install lmcache
+  Install an LMCache release that provides the lmcache.inprocess package:
+  pip install --upgrade lmcache
 
 How to run:
   PYTHONHASHSEED=0 LMCACHE_CHUNK_SIZE=32 \
@@ -53,11 +54,11 @@ from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
 
 try:
-    from lmcache.integration.tensorrt_llm import destroy_engine
+    from lmcache.inprocess.integration.tensorrt_llm.tensorrt_adapter import destroy_engine
 except ImportError as e:
     raise ImportError(
-        "LMCache is not installed or is missing the TensorRT-LLM integration. "
-        "Run: pip install 'lmcache'"
+        "LMCache is not installed or is missing the in-process TensorRT-LLM integration. "
+        "Install a release providing lmcache.inprocess: pip install --upgrade lmcache"
     ) from e
 
 # A prompt long enough to produce at least one full TRT-LLM KV block.
