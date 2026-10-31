@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-__extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
+__extra_import_path__ = ["../../.."]  # noqa: F841 -- repo's file-scoped import hook
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import routing
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1 import (  # noqa: E501

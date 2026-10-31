@@ -158,3 +158,54 @@ def test_unrouted_target_falls_back_to_everything(tmp_path: Path, changed: str) 
     result = rule.apply(PRInputs(changed_files=[f"{_SRC}/{changed}"], diffs={}))
     kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
     assert kept == set(_ENTRIES)
+
+
+def test_parenthesized_target_import_keeps_family_selection(tmp_path: Path) -> None:
+    rule = _rule(tmp_path)
+    (tmp_path / _SRC / "models/fam/routing.py").write_text(
+        "from .a.modeling import (\n    ModelingV2A,\n)\nfrom .b.modeling import ModelingV2B\n"
+    )
+    result = rule.apply(PRInputs(changed_files=[f"{_SRC}/models/fam/a/modeling.py"], diffs={}))
+    kept = {entry for waives in result.block_filters[("l0_b300", 0)].values() for entry in waives}
+    assert kept == {
+        f"{_UNIT}/test_modeling_v2_claims.py",
+        f"{_UNIT}/models/fam",
+        f"{_GATE_A}::test_gsm8k[tp1]",
+    }
+
+
+@pytest.fixture(scope="module")
+def repository_cpu_rule() -> ModelingV2Rule:
+    repo = Path(__file__).resolve().parents[4]
+    index = YAMLIndex.load(repo / "tests/integration/test_lists/test-db")
+    index.blocks = [block for block in index.blocks if block.yaml_stem == "l0_cpu"]
+    return ModelingV2Rule(index, {}, repo_root=repo)
+
+
+@pytest.mark.parametrize(
+    "family", ["deepseek_v3", "gpt_oss", "glm_moe_dsa", "kimi_k3_vl", "qwen4_exp"]
+)
+def test_repository_cpu_selection_keeps_model_tests_in_their_family(
+    repository_cpu_rule: ModelingV2Rule, family: str
+) -> None:
+    result = repository_cpu_rule.apply(
+        PRInputs(changed_files=[f"{_SRC}/models/{family}/routing.py"], diffs={})
+    )
+    kept = {
+        entry
+        for blocks in result.block_filters.values()
+        for entries in blocks.values()
+        for entry in entries
+    }
+    expected_family = f"{_UNIT}/models/{family}/"
+    family_tests = {entry for entry in kept if entry.startswith(f"{_UNIT}/models/")}
+    assert family_tests
+    assert all(entry.startswith(expected_family) for entry in family_tests), family_tests
+    assert f"{_UNIT}/test_modeling_v2_claims.py" in kept
+    expected_tests = {
+        entry
+        for block in repository_cpu_rule.yaml_index.blocks
+        for entry in block.tests
+        if entry.startswith(expected_family)
+    }
+    assert expected_tests <= kept

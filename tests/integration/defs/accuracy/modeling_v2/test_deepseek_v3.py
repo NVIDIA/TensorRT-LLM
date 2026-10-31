@@ -45,6 +45,7 @@ from ..accuracy_core import (
     assert_acceptance_length,
     compute_acceptance_length,
 )
+from ._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU
 # architecture, and a receipt from another one says nothing here.
@@ -152,12 +153,15 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         # about metadata that engine prepared, so the only place it can be
         # checked honestly is a run that prepared it; a synthesized metadata
         # object would be checking the synthesizer.
-        with LLM(
-            self.MODEL_PATH,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-            **parallel,
-        ) as llm:
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **parallel,
+            ) as llm,
+        ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -186,16 +190,22 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         # engines were built under the same mode.
         modeling_v2 = dict(modeling_v2="require", env_overrides={MODELING_V2_VALIDATE_ENV: "1"})
 
-        with LLM(self.MODEL_PATH, **modeling_v2, **parallel) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(self.MODEL_PATH, **modeling_v2, **parallel) as llm,
+        ):
             identity = task.evaluate(llm)
 
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP3,
-            kv_cache_config=self.MTP3_KV,
-            **modeling_v2,
-            **parallel,
-        ) as llm:
+        with (
+            scoped_env_overrides(modeling_v2["env_overrides"]),
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP3_KV,
+                **modeling_v2,
+                **parallel,
+            ) as llm,
+        ):
             mtp3 = task.evaluate(llm)
 
         delta = mtp3 - identity
@@ -242,16 +252,19 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
 
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
-        with LLM(
-            self.MODEL_PATH,
-            speculative_config=self.MTP3,
-            kv_cache_config=self.MTP3_KV,
-            cuda_graph_config=CudaGraphConfig(),
-            enable_iter_perf_stats=True,
-            modeling_v2=mode,
-            env_overrides=rank_env,
-            **parallel,
-        ) as llm:
+        with (
+            scoped_env_overrides(rank_env),
+            LLM(
+                self.MODEL_PATH,
+                speculative_config=self.MTP3,
+                kv_cache_config=self.MTP3_KV,
+                cuda_graph_config=CudaGraphConfig(),
+                enable_iter_perf_stats=True,
+                modeling_v2=mode,
+                env_overrides=rank_env,
+                **parallel,
+            ) as llm,
+        ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             acceptance_length = compute_acceptance_length(llm)
@@ -276,13 +289,16 @@ class TestModelingV2DeepseekR10528Nvfp4Sm10xDefault(LlmapiAccuracyTestHarness):
         """
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS, _SCORES_FILTER)
 
-        with LLM(
-            self.MODEL_PATH,
-            enable_chunked_prefill=True,
-            max_num_tokens=256,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-            **parallel,
-        ) as llm:
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                enable_chunked_prefill=True,
+                max_num_tokens=256,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **parallel,
+            ) as llm,
+        ):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
