@@ -138,6 +138,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.flashinfer_
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
+    qsa_topk_expand_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
+    supports as _topk_expand_supports,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
@@ -174,8 +180,6 @@ from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode__r39 import qsa_paged_spar
 from .ops.attention.qsa_prefill_compress__r19 import qsa_prefill_compress
 from .ops.attention.qsa_rollback_planes__r47 import plane_table as _plane_table
 from .ops.attention.qsa_rollback_planes__r47 import qsa_rollback_gather, qsa_rollback_restore
-from .ops.attention.qsa_topk_expand_decode__r22 import qsa_topk_expand_decode
-from .ops.attention.qsa_topk_expand_decode__r22 import supports as _topk_expand_supports
 from .ops.attention.spec_rollback_commit__r48 import spec_rollback_commit, spec_rollback_stage
 from .ops.attention.thop_attention__r2 import QM_FP8_KV_CACHE, QM_NVFP4_KV_CACHE, thop_attention
 from .ops.comm.allgather__r6 import allgather

@@ -4,7 +4,7 @@
 
 A CuTe DSL kernel written for the tp1 target
 (`models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1/ops/attention/qsa_topk_expand_decode.py`)
-and copied as this target's variant: an in-tree callable. The decode path ran `qsa_topk_select`
+and copied as the unified target's variant: an in-tree callable. The decode path ran `qsa_topk_select`
 (the CUDA indexer top-k, one CTA a row) and then `qsa_expand_block_indices` (one
 more launch) per attention layer. Here one CTA per row holds four consecutive scores a
 thread and narrows to the k-th largest by radix passes over the scores' bit patterns
@@ -27,12 +27,13 @@ import torch
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices as _expand,
 )
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Consecutive scores a thread holds (one 16-byte load).
 KPT = 4
@@ -495,7 +496,7 @@ def supports(scores) -> bool:
     return scores.shape[1] % KPT == 0 and scores.shape[1] <= MAX_WIDTH
 
 
-#: This target's score-table widths, `block_table.shape[1] * 32 // 4`: core's `max_seq_len`
+#: The unified target's score-table widths, `block_table.shape[1] * 32 // 4`: core's `max_seq_len`
 #: 9216 (288 pages) and MTP's 16384 (512 pages, `MAX_WIDTH` itself). The tune's 262144
 #: (65536 columns) is past `MAX_WIDTH`: `supports` sends it to the composition.
 _CORE_WIDTH = 2304
@@ -567,7 +568,7 @@ class QsaTopkExpandDecode(OpWrapper):
                 rows=16, pos=tuple(8192 + 37 * r for r in range(16)), lognormal=True, width=2560
             ),
         ),
-        # This target's call sites, at its own widths (`_CORE_WIDTH`, `_MTP_WIDTH`).
+        # The unified target's call sites, at its own widths (`_CORE_WIDTH`, `_MTP_WIDTH`).
         Cell(
             why="core decode, 1 row at the 2304-wide table, its full window, relu-sparse",
             spec=dict(rows=1, pos=(9215,), relu_sparse=True, width=_CORE_WIDTH),
@@ -617,7 +618,7 @@ class QsaTopkExpandDecode(OpWrapper):
     Certified, every cell bitwise against `reference` (block list and token selection):
     - tp1's cells at 2560 columns: decode 1 row of near-equal scores, 4 rows, 16 rows of
       log-normal scores (threshold bins ranked pairwise), and a 2048-row context chunk.
-    - This target's cells at its own widths (`_CORE_WIDTH` 2304, `_MTP_WIDTH` 4096), with
+    - The unified target's cells at its own widths (`_CORE_WIDTH` 2304, `_MTP_WIDTH` 4096), with
       relu-sparse scores: the zero class, negative zeros among it, straddles the 512-block
       budget and is resolved by the tie rule. They are:
       - decode, 1 and 128 rows at 2304, with windows of 0, 1, 511, 512, 513 and 2304 blocks among them;

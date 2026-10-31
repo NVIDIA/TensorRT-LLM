@@ -10,11 +10,11 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (  # noqa: E501
+    qsa_topk_expand_decode,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_paged_sparse_gqa_decode import (  # noqa: E501
     qsa_paged_sparse_gqa_decode as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.attention.qsa_topk_expand_decode import (  # noqa: E501
-    qsa_topk_expand_decode,
 )
 
 __extra_import_path__ = ["../../../.."]

@@ -131,6 +131,12 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_no
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_expand_block_indices import (
     qsa_expand_block_indices,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
+    qsa_topk_expand_decode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
+    supports as _topk_expand_supports,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     QM_FP8_KV_CACHE,
     QM_NVFP4_KV_CACHE,
@@ -177,8 +183,6 @@ from .ops.attention.qsa_prefill_compress import qsa_prefill_compress
 from .ops.attention.qsa_rollback_planes import plane_table as _plane_table
 from .ops.attention.qsa_rollback_planes import qsa_rollback_gather, qsa_rollback_restore
 from .ops.attention.qsa_sparse_gqa_rowtile import qsa_sparse_gqa_rowtile
-from .ops.attention.qsa_topk_expand_decode import qsa_topk_expand_decode
-from .ops.attention.qsa_topk_expand_decode import supports as _topk_expand_supports
 from .ops.attention.qsa_topk_select import qsa_topk_select
 from .ops.attention.qwen4_exp_attn_decode_prologue import SCORE_ROWS as _PROLOGUE_SCORE_ROWS
 from .ops.attention.qwen4_exp_attn_decode_prologue import qwen4_exp_attn_decode_prologue
