@@ -1,22 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
+import random
 import shutil
 import subprocess
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from typing import Any, AsyncIterator
 
 from openai_codex.client import CodexConfig
+from openai_codex.errors import TransportClosedError
 from openai_codex.generated.v2_all import (
     AskForApproval,
     AskForApprovalValue,
     FunctionDynamicToolSpec,
     SandboxMode,
+    ThreadForkParams,
     ThreadStartParams,
 )
 
@@ -29,19 +37,50 @@ from .codex_transport import CodexTransport
 
 
 def _resolve_codex_bin() -> str:
+    """The ``codex`` binary a Codex backend launches.
+
+    ``$CODEX_BIN`` names one outright. Otherwise the pinned runtime, unless
+    the ``codex`` on ``PATH`` is newer: a login offers a new model only to a
+    client that knows it, and the operator's own CLI is the one kept current.
+    """
     override = os.environ.get("CODEX_BIN")
     if override:
         if not Path(override).is_file():
             raise FileNotFoundError(f"CODEX_BIN={override!r} does not point to a file.")
         return override
+    system_bin = shutil.which("codex")
     try:
         from codex_cli_bin import bundled_codex_path
     except ImportError:
-        system_bin = shutil.which("codex")
         if system_bin:
             return system_bin
         raise FileNotFoundError("Install the pinned Codex CLI runtime or set CODEX_BIN.") from None
-    return str(bundled_codex_path())
+    bundled = str(bundled_codex_path())
+    if system_bin and _newer(system_bin, bundled):
+        return system_bin
+    return bundled
+
+
+@functools.lru_cache(maxsize=None)
+def _newer(candidate: str, than: str) -> bool:
+    """Whether ``candidate``'s ``codex --version`` is newer than ``than``'s; False when unreadable."""
+    mine = _version_tuple(candidate)
+    return bool(mine) and mine > _version_tuple(than)
+
+
+def _version_tuple(cli_path: str) -> tuple[int, ...]:
+    """``codex-cli 0.162.1`` as ``(0, 162, 1)``; empty when it cannot be read."""
+    try:
+        out = subprocess.run(
+            [cli_path, "--version"], capture_output=True, text=True, timeout=_CLI_VERSION_TIMEOUT_S
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    words = out.stdout.split() if out.returncode == 0 else []
+    try:
+        return tuple(int(part) for part in words[-1].split("-")[0].split(".")) if words else ()
+    except ValueError:
+        return ()
 
 
 def _dynamic_tool_spec(tool: Any) -> dict[str, Any]:
@@ -88,6 +127,55 @@ async def _session_init(transport: CodexTransport, cwd: Path) -> SessionInitEven
 
 _CLI_VERSION_TIMEOUT_S = 5.0
 _VERSION_CACHE: str | None = None
+
+#: Most to least open. A session asks for the first its site's requirements
+#: allow: Codex narrows a forbidden request by itself, and silently.
+_SANDBOXES = (SandboxMode.danger_full_access, SandboxMode.workspace_write, SandboxMode.read_only)
+_APPROVALS = (
+    AskForApprovalValue.never,
+    AskForApprovalValue.on_request,
+    AskForApprovalValue.untrusted,
+)
+#: ``thread/start``'s sandbox policy types, named as a configuration names its modes.
+_SANDBOX_NAMES = {
+    "dangerFullAccess": SandboxMode.danger_full_access.value,
+    "workspaceWrite": SandboxMode.workspace_write.value,
+    "readOnly": SandboxMode.read_only.value,
+    "externalSandbox": "external-sandbox",
+}
+#: App servers started together can collide on Codex's shared state database,
+#: and the one that loses exits at once; a moment later it starts.
+_START_ATTEMPTS = 3
+_RESTART_WAIT_S = (1.0, 3.0)
+
+
+async def _permissions(transport: CodexTransport) -> tuple[SandboxMode, AskForApprovalValue]:
+    """The most open sandbox and approval policy the site's Codex requirements allow.
+
+    Requirements come from ``/etc/codex/requirements.toml``, MDM or the cloud;
+    a runtime that cannot read them gets the most open of each.
+    """
+    try:
+        response = await asyncio.wait_for(
+            transport.request("configRequirements/read", {}), timeout=5
+        )
+    except Exception:
+        response = {}
+    requirements = response.get("requirements") or {}
+    sandboxes = requirements.get("allowedSandboxModes")
+    approvals = requirements.get("allowedApprovalPolicies")
+    sandbox = next((m for m in _SANDBOXES if sandboxes is None or m.value in sandboxes), None)
+    approval = next((a for a in _APPROVALS if approvals is None or a.value in approvals), None)
+    return sandbox or _SANDBOXES[0], approval or _APPROVALS[0]
+
+
+def _sandbox_name(policy: Any) -> str | None:
+    kind = policy.get("type") if isinstance(policy, dict) else None
+    return _SANDBOX_NAMES.get(kind, kind)
+
+
+def _approval_name(policy: Any) -> str | None:
+    return policy if policy is None or isinstance(policy, str) else "granular"
 
 
 def _codex_sdk_version() -> str:
@@ -139,9 +227,6 @@ def _codex_backend_version() -> str:
     return _VERSION_CACHE
 
 
-_REASONING_EFFORT = "max"
-
-
 def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
     if not names:
         return ()
@@ -149,31 +234,69 @@ def _disabled_skills_override(names: tuple[str, ...]) -> tuple[str, ...]:
     return (f"skills.config=[{entries}]",)
 
 
+#: The feature switches that keep a session's user-installed plugins and apps out of it.
+_NO_PLUGINS_OVERRIDES: tuple[str, ...] = ("features.plugins=false", "features.apps=false")
+
+
+def _config_overrides(disabled_skills: tuple[str, ...], plugins: bool) -> tuple[str, ...]:
+    """The app server's ``-c`` overrides: skills turned off, and plugins unless kept."""
+    return _disabled_skills_override(disabled_skills) + (() if plugins else _NO_PLUGINS_OVERRIDES)
+
+
 class CodexBackend(Backend):
     def __init__(
         self,
         reasoning_effort: str | None = None,
         disabled_skills: tuple[str, ...] = (),
+        writable_roots: tuple[str, ...] = (),
+        plugins: bool = True,
+        home: Path | None = None,
+        sqlite_home: Path | None = None,
     ) -> None:
         self._transport: CodexTransport | None = None
-        self._reasoning_effort = reasoning_effort or _REASONING_EFFORT
+        self._reasoning_effort = reasoning_effort
         self._disabled_skills = disabled_skills
+        self._writable_roots = writable_roots
+        self._plugins = plugins
+        # The app server's state directories; unset ones are the environment's.
+        # A configuration file's own ``sqlite_home`` would win over the
+        # environment, so the databases' directory is also an override.
+        self._env = {
+            name: str(path)
+            for name, path in (("CODEX_HOME", home), ("CODEX_SQLITE_HOME", sqlite_home))
+            if path is not None
+        }
+        self._state_overrides = (
+            (f"sqlite_home={json.dumps(str(sqlite_home))}",) if sqlite_home is not None else ()
+        )
+        self._sandbox, self._approval = _SANDBOXES[0], _APPROVALS[0]
 
     def version(self) -> str:
         return _codex_backend_version()
 
     def reasoning_effort(self) -> str:
-        return self._reasoning_effort
+        return self._reasoning_effort or ""
 
     async def __aenter__(self) -> "CodexBackend":
-        self._transport = CodexTransport(
-            CodexConfig(
-                codex_bin=_resolve_codex_bin(),
-                experimental_api=True,
-                config_overrides=_disabled_skills_override(self._disabled_skills),
+        for attempt in range(1, _START_ATTEMPTS + 1):
+            transport = CodexTransport(
+                CodexConfig(
+                    codex_bin=_resolve_codex_bin(),
+                    experimental_api=True,
+                    config_overrides=_config_overrides(self._disabled_skills, self._plugins)
+                    + self._state_overrides,
+                    env=self._env or None,
+                )
             )
-        )
-        await self._transport.start()
+            try:
+                await transport.start()
+                break
+            except TransportClosedError:
+                if attempt == _START_ATTEMPTS:
+                    raise
+                await asyncio.sleep(random.uniform(*_RESTART_WAIT_S))
+        self._transport = transport
+        self._sandbox, self._approval = await _permissions(transport)
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -191,6 +314,7 @@ class CodexBackend(Backend):
         disallowed_tools: list[str] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
         cwd: Path | None = None,
+        fork_from: str | None = None,
     ) -> AsyncIterator[BackendClient]:
         if self._transport is None:
             raise RuntimeError("CodexBackend must be entered before creating clients.")
@@ -240,27 +364,57 @@ class CodexBackend(Backend):
                 server["disabled_tools"] = list(
                     dict.fromkeys([*inherited, *server["disabled_tools"]])
                 )
-        config.update(
-            model_reasoning_effort=self._reasoning_effort,
-            model_context_window=1000000,
-        )
-        params = ThreadStartParams(
-            model=model,
+        if self._reasoning_effort is not None:
+            config["model_reasoning_effort"] = self._reasoning_effort
+        if self._sandbox is SandboxMode.workspace_write and self._writable_roots:
+            # Besides the session's cwd. Anything else waits on an approval,
+            # which the transport grants.
+            config["sandbox_workspace_write"] = {
+                "writable_roots": [str(Path(root).resolve()) for root in self._writable_roots]
+            }
+        options = dict(
+            # An empty model leaves the choice to Codex's own configuration.
+            model=model or None,
             developer_instructions=system_prompt or None,
             config=config,
             cwd=str(session_cwd),
-            sandbox=SandboxMode.danger_full_access,
-            approval_policy=AskForApproval(root=AskForApprovalValue.never),
+            sandbox=self._sandbox,
+            approval_policy=AskForApproval(root=self._approval),
         )
+        if fork_from is not None:
+            if definitions:
+                raise ValueError(
+                    "thread/fork cannot introduce dynamic tools; use native MCP tools "
+                    "or start a fresh session with these tools"
+                )
+            params = ThreadForkParams(thread_id=fork_from, exclude_turns=True, **options)
+        else:
+            params = ThreadStartParams(**options)
         payload = params.model_dump(by_alias=True, mode="json", exclude_none=True)
         if definitions:
             payload["dynamicTools"] = [_dynamic_tool_spec(tool) for tool in definitions]
         session_init = await _session_init(self._transport, session_cwd)
-        started = await self._transport.request("thread/start", payload)
+        started = await self._transport.request(
+            "thread/fork" if fork_from is not None else "thread/start", payload
+        )
         thread_id = started["thread"]["id"]
+        session_init = replace(
+            session_init or SessionInitEvent(),
+            backend="codex",
+            model=started.get("model"),
+            reasoning_effort=started.get("reasoningEffort"),
+            session_id=thread_id,
+            sandbox=_sandbox_name(started.get("sandbox")),
+            approval_policy=_approval_name(started.get("approvalPolicy")),
+        )
         self._transport.register_tools(thread_id, definitions)
         try:
-            yield CodexClient(self._transport, thread_id, session_init=session_init)
+            yield CodexClient(
+                self._transport,
+                thread_id,
+                session_init=session_init,
+                inherited_history=fork_from is not None,
+            )
         finally:
             self._transport.unregister_tools(thread_id)
             # Unload the thread, while retaining the saved session just as the

@@ -23,6 +23,7 @@ agent-team = "agent_flow.workflows.agent_team.cli:main"
 modeling-bringup = "agent_flow.workflows.modeling_bringup.cli:main"
 perf-analyze = "agent_flow.workflows.perf_analyze.cli:main"
 perf-optimize = "agent_flow.workflows.perf_optimize.cli:main"
+trtllm-modeling-v2 = "agent_flow.workflows.trtllm_modeling_v2.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -33,8 +34,29 @@ include = ["agent_flow*"]
 
 # Prompt assets read at runtime (the analyzer copies the TRT-LLM kernel
 # taxonomy into its workspace), so they must survive a non-editable install.
+#
+# trtllm_modeling_v2 ships its entry skill the same way: it is copied into each
+# run's workspace, so it is versioned with the workflow that dispatches it
+# instead of depending on a checkout's `.claude/skills`. The example task spec
+# is listed too: it is the template `--task` starts from.
 [tool.setuptools.package-data]
 "agent_flow.workflows.perf_analyze" = ["assets/*.json"]
+"agent_flow.workflows.trtllm_modeling_v2" = [
+    "task.example.yaml",
+    "agents/skills/**/*.md",
+    "README.md",
+    "spec/INTAKE.md",
+    # The compute sessions' shell wrappers, run by path inside and outside
+    # the container.
+    "infra/compute/scripts/*.sh",
+    # Not a package: the scheduler puts this directory on every job's
+    # PYTHONPATH so its sitecustomize records which checkout each process
+    # imported.
+    "infra/compute/resolvehook/*.py",
+    # Not a package either: the engine gates put this directory first on
+    # PYTHONPATH so every rank's worker prints what its engine runs.
+    "checks/harness/rankhook/*.py",
+]
 
 ####################################################################################################
 ###############################  LINTING, FORMATTING AND TESTING CONFIGURATION  ####################

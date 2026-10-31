@@ -16,10 +16,14 @@ CODEX_DEFAULT_MODEL = os.environ.get("CODEX_DEFAULT_MODEL", "gpt-6-astra")
 class BackendConfig:
     kind: BackendKind
     model: str
-    # Provider reasoning tier. ``None`` retains the backend's historical
-    # maximum-effort default.
+    # Provider reasoning tier. ``None`` leaves it to the backend: Claude
+    # Code's maximum, or the effort Codex's own configuration sets.
     reasoning_effort: str | None = None
     disabled_skills: tuple[str, ...] = ()
+    # ``False`` runs Codex without the plugins and apps its user installed
+    # (Slack, mail, drives...): an unattended session gets only the tools it
+    # is configured with here. Claude Code takes plugins from its settings.
+    plugins: bool = True
     tools: list[Any] | None = None
     # Native SDK hook configuration. Claude accepts HookMatcher callbacks.
     # Codex requires hooks to be configured and trusted in its native config;
@@ -39,11 +43,25 @@ class BackendConfig:
     # diff the session cwd's git HEAD and must target the task's repo,
     # not the framework repo.
     cwd: Path | None = None
+    # Directories besides ``cwd`` the agent writes. A Codex session the site
+    # confines to a workspace-write sandbox may write them without approval;
+    # Claude Code, which runs unsandboxed, ignores them.
+    writable_roots: tuple[str, ...] = ()
+    # Where Codex keeps its login, configuration and session rollouts
+    # (``CODEX_HOME``) and its SQLite databases (``CODEX_SQLITE_HOME``).
+    # ``None`` keeps the launching environment's. SQLite is not safe on a file
+    # system several hosts write at once, such as a network home that
+    # concurrent runs share. Claude Code ignores both.
+    codex_home: Path | None = None
+    codex_sqlite_home: Path | None = None
 
 
 @dataclass(frozen=True)
 class SessionConfig:
     mode: SessionMode = "stateless"
+    # Start as a fork of this earlier session (its backend id): with its
+    # history, under a new id. Only backends that can fork accept it.
+    fork_from: str | None = None
 
 
 @dataclass(frozen=True)
