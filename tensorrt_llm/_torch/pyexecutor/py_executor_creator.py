@@ -47,8 +47,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            should_use_separate_draft_kv_cache)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler,
-                    is_disagg_enabled, is_mla)
+                    create_py_executor_instance, create_py_executor_resources,
+                    instantiate_sampler, is_disagg_enabled, is_mla)
 from .config_utils import (is_hybrid_linear, is_minimax_m3,
                            resolve_cache_transceiver_config,
                            uses_fp4_mla_attention, uses_vswa_kv_cache_layout)
@@ -1267,7 +1267,7 @@ def _create_py_executor(
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
-        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        # Reclaim unreachable allocations before warmup.
         gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
@@ -1305,75 +1305,62 @@ def _create_py_executor(
         peft_cache_config = py_executor.peft_cache_config
 
     if estimating_kv_cache:
-        assert kv_cache_creator is not None
-        _move_model_engine_metrics(py_executor, model_engine, "initial")
-        # record initial metrics as py_executor will be deleted later
-        initial_model_engine_metrics = dict(py_executor.metrics)
-        with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
-            kv_cache_creator.configure_kv_cache_capacity(py_executor)
+        try:
+            assert kv_cache_creator is not None
+            _move_model_engine_metrics(py_executor, model_engine, "initial")
+            # Preserve profiling metrics across execution-state reinitialization.
+            initial_model_engine_metrics = dict(py_executor.metrics)
+            with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
+                kv_cache_creator.configure_kv_cache_capacity(py_executor)
 
-        with _startup_timer.phase("profiling_resource_teardown"):
-            # Shut down the transceiver before tearing down KV cache managers so
-            # that NIXL-registered (pinned) GPU memory is deregistered first;
-            # otherwise the old KV cache memory stays pinned and the subsequent
-            # KV cache allocation will OOM.
-            try:
-                if hasattr(py_executor, 'kv_cache_transceiver'
-                           ) and py_executor.kv_cache_transceiver is not None:
-                    with _startup_timer.phase("profiling_transceiver_shutdown"):
-                        py_executor.kv_cache_transceiver.shutdown()
-            finally:
-                with _startup_timer.phase("profiling_kv_cache_teardown"):
-                    kv_cache_creator.teardown_managers(resources)
+            with _startup_timer.phase("profiling_resource_teardown"):
+                # Profiling has released graphs, registrations and manager resources.
+                kv_cache_creator.teardown_managers(resources)
+                gc.collect()
+                torch.cuda.empty_cache()
 
-            del py_executor  # free before constructing new
-            gc.collect()
-            torch.cuda.empty_cache()
+            with allocation_scope(ExecutorMemoryType.KV_CACHE):
+                # Before estimating KV cache size, a minimal KV cache has been allocated using
+                # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
+                # the original value before creating the final KV cache.
+                kv_cache_creator._max_seq_len = model_engine_max_seq_len
+                kv_cache_creator.build_managers(resources, False)
 
-        with allocation_scope(ExecutorMemoryType.KV_CACHE):
-            # Before estimating KV cache size, a minimal KV cache has been allocated using
-            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
-            # the original value before creating the final KV cache.
-            kv_cache_creator._max_seq_len = model_engine_max_seq_len
-            kv_cache_creator.build_managers(resources, False)
+            model_engine.set_warmup_purpose("final_executor")
 
-        model_engine.set_warmup_purpose("final_executor")
+            with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
 
-        with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES):
-
-            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
-            gc.collect()
-            py_executor = create_py_executor_instance(
-                dist=dist,
-                resources=resources,
-                mapping=mapping,
-                llm_args=llm_args,
-                ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
-                    ctx_chunk_config,
-                    resources.get(ResourceManagerType.KV_CACHE_MANAGER),
-                    tokens_per_block, scheduler_config.context_chunking_policy),
-                model_engine=model_engine,
-                start_worker=False,
-                sampler=sampler,
-                drafter=drafter,
-                guided_decoder=guided_decoder,
-                lora_config=lora_config,
-                garbage_collection_gen0_threshold=
-                garbage_collection_gen0_threshold,
-                kv_connector_manager=kv_connector_manager,
-                resource_governor_queue=resource_governor_queue,
-                max_seq_len=net_max_seq_len,
-                max_batch_size=max_batch_size,
-                max_beam_width=max_beam_width,
-                max_num_tokens=max_num_tokens,
-                peft_cache_config=peft_cache_config,
-                scheduler_config=scheduler_config,
-                cache_transceiver_config=cache_transceiver_config,
-                virtual_memory_pools=vm_pools,
-                execution_stream=execution_stream,
-                dwdp_manager=dwdp_manager,
-                max_num_sequences=max_num_seq_slots,
-            )
+                # Reclaim detached profiling state before capturing final graphs.
+                gc.collect()
+                execution_resources = create_py_executor_resources(
+                    dist=dist,
+                    resources=resources,
+                    mapping=mapping,
+                    llm_args=llm_args,
+                    ctx_chunk_config=_branch_snapshot_ctx_chunk_config(
+                        ctx_chunk_config,
+                        resources.get(ResourceManagerType.KV_CACHE_MANAGER),
+                        tokens_per_block,
+                        scheduler_config.context_chunking_policy),
+                    model_engine=model_engine,
+                    lora_config=lora_config,
+                    kv_connector_manager=kv_connector_manager,
+                    max_seq_len=net_max_seq_len,
+                    max_batch_size=max_batch_size,
+                    max_beam_width=max_beam_width,
+                    max_num_tokens=max_num_tokens,
+                    peft_cache_config=peft_cache_config,
+                    scheduler_config=scheduler_config,
+                    cache_transceiver_config=cache_transceiver_config,
+                    virtual_memory_pools=vm_pools,
+                    execution_stream=execution_stream,
+                    dwdp_manager=dwdp_manager,
+                    max_num_sequences=max_num_seq_slots,
+                )
+                py_executor.rebind_resources(execution_resources)
+        except BaseException:
+            py_executor.shutdown()
+            raise
 
     _adjust_torch_mem_fraction()
 
