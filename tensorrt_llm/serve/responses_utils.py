@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -122,6 +123,72 @@ ENABLE_RESPONSES_DEBUG_MSG = os.environ.get("TRTLLM_RESPONSES_DEBUG") == "1"
 # The parameter a freeform custom tool is described with; see
 # _get_chat_completion_function_tools and _tool_call_output_item.
 CUSTOM_TOOL_INPUT_ARG = "input"
+
+# The `include` value that asks for `encrypted_content` on reasoning items.
+_REASONING_CARRIER_INCLUDE = "reasoning.encrypted_content"
+
+# The `encrypted_content` this server writes on a reasoning item: this prefix,
+# then the item's reasoning text as standard base64 of its UTF-8 bytes. It is
+# an encoding, not encryption, and holds nothing but the text the item's
+# `content` already shows. It exists for clients that replay reasoning by
+# `encrypted_content` alone (the Codex CLI asks for it with `include` and
+# sends reasoning items back without their content), so the text the model
+# generated comes back verbatim. The version in the prefix lets the format
+# change without misreading older values; a value without this prefix was
+# written by another server and is never decoded.
+_REASONING_CARRIER_PREFIX = "trtllm-reasoning-v1:"
+
+
+def _reasoning_carrier_requested(request: Any) -> bool:
+    """Whether the request asks for ``encrypted_content`` on reasoning items.
+
+    Read with getattr and checked by type, so a stand-in request object
+    without ``include`` reads as not asking.
+    """
+    include = getattr(request, "include", None)
+    return isinstance(include,
+                      (list, tuple)) and _REASONING_CARRIER_INCLUDE in include
+
+
+def _encode_reasoning_carrier(text: str) -> str:
+    """The ``encrypted_content`` for a reasoning item; see the prefix above."""
+    return _REASONING_CARRIER_PREFIX + base64.b64encode(
+        text.encode("utf-8")).decode("ascii")
+
+
+def _decode_reasoning_carrier(value: Any) -> Optional[str]:
+    """The reasoning text in an ``encrypted_content`` this server wrote.
+
+    None for any other value: absent, another server's opaque value, or one
+    that carries this server's prefix but does not decode.
+    """
+    if not isinstance(value,
+                      str) or not value.startswith(_REASONING_CARRIER_PREFIX):
+        return None
+    try:
+        return base64.b64decode(value[len(_REASONING_CARRIER_PREFIX):],
+                                validate=True).decode("utf-8")
+    except ValueError:
+        # Not base64 (binascii.Error), not ASCII, or not UTF-8
+        # (UnicodeDecodeError): all are ValueErrors.
+        return None
+
+
+def _reasoning_output_item(item_id: str, text: str, status: Optional[str],
+                           carrier: bool) -> ResponseReasoningItem:
+    """A reasoning output item; ``carrier`` adds its ``encrypted_content``."""
+    extra = {
+        "encrypted_content": _encode_reasoning_carrier(text)
+    } if carrier else {}
+    return ResponseReasoningItem(
+        id=item_id,
+        summary=[],
+        type="reasoning",
+        content=[Content(text=text, type="reasoning_text")],
+        status=status,
+        **extra,
+    )
+
 
 # Each spelling of a declared tool's name -> (namespace, bare name, custom);
 # see _tool_resolution.
@@ -972,6 +1039,48 @@ def _template_renders(template: str, role: str) -> bool:
     return renders
 
 
+def _reasoning_item_to_chat_message(
+        item: dict) -> Optional[ChatCompletionMessageParam]:
+    """The assistant reasoning a replayed reasoning item holds, if any.
+
+    An ``encrypted_content`` this server wrote holds the reasoning exactly as
+    generated and is read first: clients replay the item by it alone, and a
+    template that renders earlier reasoning (DeepSeek-V4.1 does once tools
+    are declared) reproduces the prompt the model generated from only with
+    that exact text. Any other ``encrypted_content`` holds reasoning this
+    server cannot read, another model's, so the item is not replayed as this
+    model's reasoning, whatever readable text it also carries. Without one,
+    the item's content, else its summary, is the reasoning. An item with
+    nothing readable is skipped rather than rejected: its reasoning is
+    already absent from the payload, and failing here costs the whole
+    conversation.
+    """
+    carrier = item.get("encrypted_content")
+    if carrier:
+        text = _decode_reasoning_carrier(carrier)
+        if text is not None:
+            return {"role": "assistant", "reasoning": text}
+        if isinstance(carrier,
+                      str) and carrier.startswith(_REASONING_CARRIER_PREFIX):
+            _warn_once("Responses API: skipping a replayed reasoning item "
+                       "whose encrypted_content carries this server's prefix "
+                       "but does not decode.")
+        else:
+            _warn_once("Responses API: skipping a replayed reasoning item "
+                       "whose encrypted_content this server did not write; "
+                       "another model's reasoning is not replayed as this "
+                       "model's.")
+        return None
+    content = item.get("content")
+    if isinstance(content, str):
+        content = [{"text": content}]
+    content = content or item.get("summary")
+    if not content:
+        return None
+    # Reasoning is always the assistant's.
+    return {"role": "assistant", "reasoning": _content_text(content)}
+
+
 def _response_output_item_to_chat_completion_message(
     item: Union[dict, ResponseInputOutputItem],
     tool_resolution: Optional[_ToolResolution] = None,
@@ -1002,25 +1111,16 @@ def _response_output_item_to_chat_completion_message(
                     ]
                 }
             return item
-        case "message" | "reasoning":
+        case "reasoning":
+            return _reasoning_item_to_chat_message(item)
+        case "message":
             content = item.get("content")
             if isinstance(content, str):
                 content = [{"text": content}]
-            elif item_type == "reasoning" and not content:
-                # Reasoning may carry only a summary, or nothing readable.
-                content = item.get("summary")
-                if not content:
-                    return None
             if not content:
                 raise ValueError(
                     f"Input item of type {item_type!r} has empty or missing 'content'"
                 )
-            if item_type == "reasoning":
-                # Reasoning is always the assistant's.
-                return {
-                    "role": "assistant",
-                    "reasoning": _content_text(content)
-                }
             # Honour the item's own role. Hardcoding "assistant" here turned
             # the caller's user turn into an assistant turn, so the model was
             # asked to continue its own message with no user message in the
@@ -1120,35 +1220,50 @@ def _response_output_item_to_chat_completion_message(
             return None
 
 
-def _fold_tool_calls_into_open_assistant_turn(
-        messages: list[ChatCompletionMessageParam],
-        message: ChatCompletionMessageParam, turn_start: int) -> bool:
-    """Attach a converted tool-call item to the assistant message before it.
+def _fold_into_open_assistant_turn(messages: list[ChatCompletionMessageParam],
+                                   message: ChatCompletionMessageParam,
+                                   turn_start: int) -> bool:
+    """Fold a converted input item into the assistant message before it.
 
-    The N calls of one assistant turn arrive as N ``function_call`` items. Kept
-    in one assistant message, as chat completions does, they let the chat
-    template bind each tool result to its call by id; templates that align
-    results with the last assistant message only (GLM) lose that binding when
-    the calls are split across messages.
+    One assistant turn arrives as several items: its reasoning, then any
+    message text, then one item per call. The model generated it as one
+    assistant message, which is how chat completions carries it and how chat
+    templates render it, so the items are folded back into one message with
+    its reasoning, content and tool_calls. Split across messages, the turn
+    renders differently: templates that bind tool results to the last
+    assistant message only (GLM) lose the call-result binding, and templates
+    that render earlier reasoning (DeepSeek-V4.1 with tools) no longer
+    reproduce the prompt the model generated from.
 
-    Only messages from ``turn_start`` on, converted from this request's input,
-    are extended; a tool result or user message in between ends the turn.
+    Message text joins the open message until a call has joined it, and is
+    appended as is: one generation's text is split into items without adding
+    or dropping characters. A call joins it unless it has content of its own.
+    A reasoning item always opens a new message, and so does any item after a
+    message that is not the assistant's. Only messages from ``turn_start``
+    on, converted from this request's input, are extended.
     """
-    if message.get("role") != "assistant" or not message.get("tool_calls"):
-        return False
-    if message.get("content") is not None:
-        # A message with content of its own is a turn of its own.
-        return False
-    if len(messages) <= turn_start:
+    if message.get("role") != "assistant" or len(messages) <= turn_start:
         return False
     last = messages[-1]
     if last.get("role") != "assistant":
         return False
-    # Replaced, not updated: the target may be the caller's own input item.
-    messages[-1] = {
-        **last, "tool_calls":
-        [*(last.get("tool_calls") or []), *message["tool_calls"]]
-    }
+    # The target is replaced, not updated: it may be the caller's own item.
+    if message.get("tool_calls"):
+        if message.get("content") is not None:
+            # A message with content of its own is a turn of its own.
+            return False
+        messages[-1] = {
+            **last, "tool_calls":
+            [*(last.get("tool_calls") or []), *message["tool_calls"]]
+        }
+        return True
+    text = message.get("content")
+    if set(message) != {"role", "content"} or not isinstance(text, str):
+        return False
+    open_text = last.get("content") or ""
+    if last.get("tool_calls") or not isinstance(open_text, str):
+        return False
+    messages[-1] = {**last, "content": open_text + text}
     return True
 
 
@@ -1172,19 +1287,20 @@ def chat_messages_from_responses_input(
         })
 
     # Prepend the conversation history.
-    # Skip the reasoning output, but keep the tool calls a reasoning message
-    # carries: the tool results that follow answer them.
+    # Skip the reasoning output, but keep the text and tool calls a reasoning
+    # message carries: a turn folded from input items keeps its text there,
+    # and the tool results that follow answer the calls.
     for msg in prev_msgs:
         if "reasoning" not in msg:
             messages.append(msg)
             continue
-        tool_calls = msg.get("tool_calls")
+        content, tool_calls = msg.get("content"), msg.get("tool_calls")
+        if not content and not tool_calls:
+            continue
+        stripped = {"role": "assistant", "content": content}
         if tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": tool_calls,
-            })
+            stripped["tool_calls"] = tool_calls
+        messages.append(stripped)
 
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
@@ -1198,8 +1314,7 @@ def chat_messages_from_responses_input(
                 inp, tool_resolution)
             if message is None:
                 continue
-            if _fold_tool_calls_into_open_assistant_turn(
-                    messages, message, turn_start):
+            if _fold_into_open_assistant_turn(messages, message, turn_start):
                 continue
             messages.append(message)
 
@@ -1821,6 +1936,7 @@ def _create_output_content(
     chat_template_kwargs: Optional[dict[str, Any]] = None,
     streamed_tool_calls: Optional[list[ResponseOutputItem]] = None,
     streamed_item_ids: Optional[list[StreamedItem]] = None,
+    reasoning_carrier: bool = False,
 ) -> Tuple[list[ResponseOutputItem], list[ChatCompletionMessageParam],
            list[str]]:
     """Build the output items for a finished generation.
@@ -1829,7 +1945,10 @@ def _create_output_content(
     None) the snapshot repeats what the stream published: its reasoning and
     message items when they cover the re-parsed text, and its tool-call items
     as emitted. Otherwise items are derived from a whole-text parse, reusing
-    streamed ids positionally where a stream ran.
+    streamed ids positionally where a stream ran. ``reasoning_carrier`` gives
+    every reasoning item its ``encrypted_content``, encoded from the same
+    text as the item's content, so the stream and the snapshot carry the
+    same value whenever they carry the same text.
     """
     output_items: list[ResponseOutputItem] = []
     output_messages: list[ChatCompletionMessageParam] = []
@@ -1888,15 +2007,8 @@ def _create_output_content(
             for record in streamed_item_ids:
                 if record.item_type == "reasoning":
                     output_items.append(
-                        ResponseReasoningItem(
-                            id=record.item_id,
-                            summary=[],
-                            type="reasoning",
-                            content=[
-                                Content(text=record.text, type="reasoning_text")
-                            ],
-                            status=None,
-                        ))
+                        _reasoning_output_item(record.item_id, record.text,
+                                               None, reasoning_carrier))
                 else:
                     output_items.append(
                         ResponseOutputMessage(
@@ -1921,15 +2033,9 @@ def _create_output_content(
         else:
             if reasoning_text:
                 output_items.append(
-                    ResponseReasoningItem(
-                        id=_streamed_or_fresh_id("reasoning"),
-                        summary=[],
-                        type="reasoning",
-                        content=[
-                            Content(text=reasoning_text, type="reasoning_text")
-                        ],
-                        status=None,
-                    ))
+                    _reasoning_output_item(_streamed_or_fresh_id("reasoning"),
+                                           reasoning_text, None,
+                                           reasoning_carrier))
                 stored_reasoning = reasoning_text
 
             # Check again after tool parsing to avoid empty text
@@ -2226,7 +2332,8 @@ def _create_response(
             request.tools,
             chat_template_kwargs=reasoning_chat_template_kwargs(request),
             streamed_tool_calls=streamed_tool_calls,
-            streamed_item_ids=streamed_item_ids)
+            streamed_item_ids=streamed_item_ids,
+            reasoning_carrier=_reasoning_carrier_requested(request))
 
     finish_reason = final_res.outputs[0].finish_reason
     response = ResponsesResponse.from_request(
@@ -2682,7 +2789,7 @@ def _assembled_tool_calls(
     return calls
 
 
-def _close_open_item(helper):
+def _close_open_item(helper, reasoning_carrier: bool = False):
     """Close whichever output item is currently open, if any.
 
     Reasoning and text live in different item types, so a generation that
@@ -2690,18 +2797,16 @@ def _close_open_item(helper):
     the message item. Without this the message deltas are emitted while the
     reasoning item is still open - the client attributes the answer to the
     reasoning item and never receives a message item at all.
+
+    ``reasoning_carrier`` gives a closed reasoning item its
+    ``encrypted_content``; see ``_reasoning_output_item``.
     """
     if not helper.is_output_item_added_sent:
         return
     if helper.is_reasoning_sent:
         text = helper.take_reasoning()
-        item = ResponseReasoningItem(
-            id=helper.item_id,
-            summary=[],
-            type="reasoning",
-            content=[Content(text=text, type="reasoning_text")],
-            status="completed",
-        )
+        item = _reasoning_output_item(helper.item_id, text, "completed",
+                                      reasoning_carrier)
         yield helper.get_reasoning_text_done_event(text)
         yield helper.get_content_part_done_event(
             PartReasoningTextDone(type="reasoning_text", text=text))
@@ -2738,6 +2843,9 @@ def _generate_streaming_event(
 ):
     available_tools = _get_chat_completion_function_tools(request.tools)
     tool_parser_id = _effective_tool_parser(tool_parser_id, request)
+    # Closed reasoning items carry their encrypted_content when asked, as the
+    # final snapshot's do (see _create_response).
+    carrier = _reasoning_carrier_requested(request)
     output_idx = output.index
     delta_text = output.text_diff
     calls = []
@@ -2787,7 +2895,7 @@ def _generate_streaming_event(
     # to, and an item is opened before its first delta (whitespace included).
     if reasoning_delta_text:
         if streaming_events_helper.is_text_sent:
-            yield from _close_open_item(streaming_events_helper)
+            yield from _close_open_item(streaming_events_helper, carrier)
         streaming_events_helper.is_reasoning_sent = True
         yield from streaming_events_helper.get_reasoning_output_added_events()
         streaming_events_helper.append_reasoning(reasoning_delta_text)
@@ -2795,7 +2903,7 @@ def _generate_streaming_event(
             reasoning_delta_text)
     if delta_text:
         if streaming_events_helper.is_reasoning_sent:
-            yield from _close_open_item(streaming_events_helper)
+            yield from _close_open_item(streaming_events_helper, carrier)
         streaming_events_helper.is_text_sent = True
         yield from streaming_events_helper.get_message_output_added_events()
         streaming_events_helper.append_text(delta_text)
@@ -2804,7 +2912,7 @@ def _generate_streaming_event(
     # A call has started, so the open item ends here; only the incremental
     # parser knows this while the call is still being generated.
     if calls:
-        yield from _close_open_item(streaming_events_helper)
+        yield from _close_open_item(streaming_events_helper, carrier)
 
     if incremental_calls:
         call_fragments = streaming_events_helper.tool_call_fragments(output_idx)
@@ -2833,14 +2941,14 @@ def _generate_streaming_event(
     # Text the parser still held follows everything the last chunk carried.
     if released_text:
         if streaming_events_helper.is_reasoning_sent:
-            yield from _close_open_item(streaming_events_helper)
+            yield from _close_open_item(streaming_events_helper, carrier)
         streaming_events_helper.is_text_sent = True
         yield from streaming_events_helper.get_message_output_added_events()
         streaming_events_helper.append_text(released_text)
         yield streaming_events_helper.get_text_delta_event(released_text, [])
 
     # Nothing transitions after the last item, so it is closed here.
-    yield from _close_open_item(streaming_events_helper)
+    yield from _close_open_item(streaming_events_helper, carrier)
 
     # Calls go out once generation finishes, after every other item. Already
     # emitted calls are skipped, so a finished output seen twice is harmless.

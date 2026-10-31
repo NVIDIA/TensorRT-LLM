@@ -268,6 +268,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_custom_tools.py
   - unittest/llmapi/apps/test_responses_deepseek_v41_namespaces.py
   - unittest/llmapi/apps/test_responses_input_preprocess.py
+  - unittest/llmapi/apps/test_responses_reasoning_carrier.py
   - unittest/llmapi/apps/test_responses_store_replay.py
   - unittest/llmapi/apps/test_responses_stream_final_consistency.py
   - unittest/llmapi/apps/test_responses_streaming_events.py
