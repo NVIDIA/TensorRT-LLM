@@ -27,11 +27,12 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.modules.fla.flashinfer_chunk import (
     chunk_gated_delta_rule as _fi_chunk_gated_delta_rule,
 )
 from tensorrt_llm._torch.modules.fla.fused_state_io import cast_scatter_fp32_vk_to_vk
+
+from .._op import Arch, Cell, OpWrapper
 
 #: qwen3.8-flash-next-nvfp4's Gated DeltaNet at tp1: (H, HV, K, V) -- 16 q/k
 #: heads, 48 v heads, head dims 128.
@@ -394,7 +395,7 @@ class FlashinferChunkGatedDeltaRule(OpWrapper):
     `use_qk_l2norm_in_kernel`. At 4/12: 2 context sequences on CP and 4 to
     127 on the chunked kernel (the cells hold 1 and 3, and 128); a dep4 rank
     at more than 512 carried tokens; tp4's own slot count (no engine has
-    run tp4; tep4's stands in) and any pool counted on this target's own
+    run tp4; tep4's stands in) and any pool counted on the unified target's own
     engines or under a variant (MTP, kv_fp8/kv_nvfp4, chunked, reuse);
     a call inside a CUDA graph (the target calls it eagerly).
 
