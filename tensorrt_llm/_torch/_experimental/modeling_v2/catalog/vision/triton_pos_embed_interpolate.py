@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import _triton_pos_embed_interpolate
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint: num_position_embeddings 2304 (a 48 x 48 grid), hidden 1152,
 #: spatial_merge_size 2.

@@ -18,11 +18,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.vision.triton_pos_embed_interpolate__tower import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.vision.triton_pos_embed_interpolate import (  # noqa: E501
     triton_pos_embed_interpolate as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import ULP, assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "triton_pos_embed_interpolate requires a CUDA device"
