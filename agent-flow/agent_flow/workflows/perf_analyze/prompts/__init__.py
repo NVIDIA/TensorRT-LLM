@@ -9,6 +9,7 @@ from ._common import (
     REMOTE_SLURM_EXECUTION,
     SOL_ANALYZER_CONTEXT,
     SOL_REPORTER_GUIDANCE,
+    benchmark_driver_prompt,
 )
 from .analyzer import SYSTEM_PROMPT as ANALYZER_SYSTEM_PROMPT
 from .benchmarker import SYSTEM_PROMPT as BENCHMARKER_SYSTEM_PROMPT
@@ -59,11 +60,15 @@ class PromptBundle:
         )
 
 
-DEFAULT_PROMPTS = PromptBundle(
+BASE_PROMPTS = PromptBundle(
     benchmarker=BENCHMARKER_SYSTEM_PROMPT,
     projector=PROJECTOR_SYSTEM_PROMPT,
     analyzer=ANALYZER_SYSTEM_PROMPT,
     reporter=REPORTER_SYSTEM_PROMPT,
+)
+DEFAULT_PROMPTS = BASE_PROMPTS.with_extensions(
+    benchmarker=benchmark_driver_prompt(None),
+    analyzer=benchmark_driver_prompt(None),
 )
 
 
@@ -117,11 +122,16 @@ def build_perf_analyze_prompts(
     before the run by ``sol_methodology.resolve_sol_methodology``); it
     appends the projector's fallback block and changes nothing else.
 
-    ``remote_execution`` is the resolved task spec. When it names an SSH
-    target, the remote boundary and task-specific connection values are
-    appended to the three roles that may inspect or produce runtime data.
+    ``remote_execution`` is the resolved task spec. Its ``benchmark.type``
+    selects the builtin or external benchmark fragment. When it names an
+    SSH target, the remote boundary and task-specific connection values
+    are appended to the three roles that may inspect or produce runtime data.
     """
-    bundle = DEFAULT_PROMPTS
+    benchmark_prompt = benchmark_driver_prompt(remote_execution)
+    bundle = BASE_PROMPTS.with_extensions(
+        benchmarker=benchmark_prompt,
+        analyzer=benchmark_prompt,
+    )
     if not include_casebook:
         bundle = bundle.with_extensions(
             benchmarker=CASEBOOK_DISABLED,
@@ -155,6 +165,7 @@ PROMPTS_DIRNAME = "prompts"
 
 __all__ = [
     "ANALYZER_SYSTEM_PROMPT",
+    "BASE_PROMPTS",
     "BENCHMARKER_SYSTEM_PROMPT",
     "DEFAULT_PROMPTS",
     "PROJECTOR_SYSTEM_PROMPT",

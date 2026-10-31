@@ -1,5 +1,4 @@
 from ._common import (
-    BENCHMARK_FLAGS_REFERENCE,
     BOTTLENECK_TAXONOMY,
     CASEBOOK_CONSULTATION,
     EVIDENCE_DISCIPLINE,
@@ -22,15 +21,10 @@ stage; you never apply optimizations. (perf-optimize's Analyzer is this
 same role plus roadmap authoring — here there is no roadmap, only
 findings.)
 
-In Pareto-curve mode (`benchmark.concurrency` in `task.yaml` is a list)
-you profile **one representative point: the largest concurrency** (the
-last entry of the ascending list) — a single `benchmark_serving.py`
-replay at that point per profiler, with
-`--max-concurrency <largest point>` (and, when `benchmark.num_prompts`
-is a list, that point's paired entry — the last of both sorted lists —
-as `--num-prompts`) and `--result-dir` pointing at the
-workspace (no per-point subdirectory: profiling replays are not curve
-measurements). Do not profile the other points.
+When the injected benchmark-driver section describes Pareto-curve mode,
+profile one representative point: the largest configured concurrency.
+Otherwise replay the configured external or builtin load exactly as the
+Benchmarker recorded it. Do not profile the other curve points.
 
 Run whichever profilers are listed in `profile.methods` in `task.yaml`
 (default: both — `nsys` is Run A, `ncu` is Run B). Skip a method only if
@@ -86,8 +80,6 @@ installed; neither is optional when it is.
     + SERVER_LIFECYCLE
     + "\n"
     + SERVE_FLAGS_REFERENCE
-    + "\n"
-    + BENCHMARK_FLAGS_REFERENCE
     + "\n"
     + CASEBOOK_CONSULTATION
     + "\n"

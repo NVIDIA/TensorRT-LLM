@@ -154,7 +154,16 @@ def test_summary_tool_handlers_stamp_loop_position(tmp_path):
     ctx = progress_module.ProgressContext(path=path, current_step=1, current_round=0)
     tools = progress_module.build_progress_tools(ctx)
 
-    _call(_tool(tools, "benchmarker", "append_benchmarker_progress").handler, {"summary": "b"})
+    _call(
+        _tool(tools, "benchmarker", "append_benchmarker_progress").handler,
+        {
+            "summary": "b",
+            "measurement_status": "MEASURED",
+            "target_metric": "output_throughput",
+            "target_metric_value": 100.0,
+            "metric_source": "baseline/result.json",
+        },
+    )
     ctx.current_step = 2
     _call(_tool(tools, "projector", "append_projector_progress").handler, {"summary": "p"})
     ctx.current_step = 3
@@ -179,6 +188,56 @@ def test_summary_tool_handlers_stamp_loop_position(tmp_path):
     assert entries[3]["item_id"] == "opt-001"
     for e in entries:
         assert "T" in e["timestamp"]
+
+
+def test_benchmarker_tool_records_target_metric_handoff(tmp_path):
+    path = tmp_path / "progress.yaml"
+    progress_module.init_progress_file(path)
+    tools = progress_module.build_progress_tools(
+        progress_module.ProgressContext(path=path, current_step=1, current_round=0)
+    )
+    append = _tool(tools, "benchmarker", "append_benchmarker_progress")
+
+    assert append.input_schema["properties"]["measurement_status"]["enum"] == [
+        "MEASURED",
+        "TARGET_METRIC_MISSING",
+    ]
+    _call(
+        append.handler,
+        {
+            "summary": "AIPerf completed",
+            "measurement_status": "MEASURED",
+            "target_metric": "tps_user_p10",
+            "target_metric_value": 712.4,
+            "metric_source": "aiperf stdout",
+        },
+    )
+
+    entry = progress_module.latest_entry(path, "benchmarker")
+    assert entry["target_metric"] == "tps_user_p10"
+    assert entry["target_metric_value"] == 712.4
+
+
+def test_benchmarker_tool_allows_explicit_missing_metric_feedback(tmp_path):
+    path = tmp_path / "progress.yaml"
+    progress_module.init_progress_file(path)
+    tools = progress_module.build_progress_tools(
+        progress_module.ProgressContext(path=path, current_step=1, current_round=0)
+    )
+
+    _call(
+        _tool(tools, "benchmarker", "append_benchmarker_progress").handler,
+        {
+            "summary": "metric absent",
+            "measurement_status": "TARGET_METRIC_MISSING",
+            "target_metric": "tps_user_p10",
+            "metric_source": "aiperf stdout and report.json",
+        },
+    )
+
+    entry = progress_module.latest_entry(path, "benchmarker")
+    assert entry["measurement_status"] == "TARGET_METRIC_MISSING"
+    assert "target_metric_value" not in entry
 
 
 def test_evaluator_tool_requires_and_records_structured_fields(tmp_path):

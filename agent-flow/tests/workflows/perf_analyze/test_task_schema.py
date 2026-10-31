@@ -9,6 +9,7 @@ import yaml
 
 from agent_flow.workflows.perf_analyze.task_schema import (
     TaskSchemaError,
+    benchmark_type,
     casebook_enabled,
     concurrency_points,
     dump_task_yaml,
@@ -47,6 +48,7 @@ def test_valid_minimal_applies_defaults(tmp_path):
     # No serve block any more; extra_llm_api_options stays omitted by default.
     assert "serve" not in data
     assert "extra_llm_api_options" not in data
+    assert data["benchmark"]["type"] == "builtin"
     assert data["benchmark"]["dataset_name"] == "random"
     assert data["benchmark"]["random_input_len"] == 1024
     assert data["benchmark"]["random_output_len"] == 128
@@ -67,6 +69,69 @@ def test_valid_minimal_applies_defaults(tmp_path):
     assert sol_enabled(data) is True
     assert is_curve_mode(data) is False
     assert concurrency_points(data) == [64]
+
+
+def test_external_benchmark_preserves_only_user_fields(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "benchmark": {
+                "type": "external",
+                "path": "/opt/aiperf",
+                "command": "aiperf benchmark --output results.json",
+                "notes": "Read tps_user_p10 from results.json.",
+            },
+        },
+    )
+
+    data = load_and_validate_task_yaml(path)
+
+    assert benchmark_type(data) == "external"
+    assert data["benchmark"] == {
+        "type": "external",
+        "path": "/opt/aiperf",
+        "command": "aiperf benchmark --output results.json",
+        "notes": "Read tps_user_p10 from results.json.",
+    }
+    assert is_curve_mode(data) is False
+    assert concurrency_points(data) == []
+
+
+@pytest.mark.parametrize("field", ["path", "command", "notes"])
+def test_external_benchmark_requires_its_three_fields(tmp_path, field):
+    ckpt, repo = _paths(tmp_path)
+    benchmark = {
+        "type": "external",
+        "path": "/opt/aiperf",
+        "command": "aiperf benchmark",
+        "notes": "Read the requested metric from stdout.",
+    }
+    del benchmark[field]
+    path = _write(
+        tmp_path,
+        {"checkpoint_path": ckpt, "trtllm_repo_path": repo, "benchmark": benchmark},
+    )
+
+    with pytest.raises(TaskSchemaError, match=rf"benchmark\.{field}.*required"):
+        load_and_validate_task_yaml(path)
+
+
+def test_benchmark_type_rejects_unknown_driver(tmp_path):
+    ckpt, repo = _paths(tmp_path)
+    path = _write(
+        tmp_path,
+        {
+            "checkpoint_path": ckpt,
+            "trtllm_repo_path": repo,
+            "benchmark": {"type": "mystery"},
+        },
+    )
+
+    with pytest.raises(TaskSchemaError, match="benchmark.type"):
+        load_and_validate_task_yaml(path)
 
 
 def test_user_values_override_defaults(tmp_path):

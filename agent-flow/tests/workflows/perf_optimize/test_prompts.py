@@ -45,15 +45,7 @@ from agent_flow.workflows.perf_optimize.prompts._common import (
     kernel_coverage_analyzer_note,
 )
 
-_ALL_PROMPTS = {
-    "benchmarker": BENCHMARKER_SYSTEM_PROMPT,
-    "projector": PROJECTOR_SYSTEM_PROMPT,
-    "analyzer": ANALYZER_SYSTEM_PROMPT,
-    "optimizer": OPTIMIZER_SYSTEM_PROMPT,
-    "evaluator": EVALUATOR_SYSTEM_PROMPT,
-    "qa": QA_SYSTEM_PROMPT,
-    "reporter": REPORTER_SYSTEM_PROMPT,
-}
+_ALL_PROMPTS = vars(DEFAULT_PROMPTS)
 
 # Roles that run the canonical benchmark_serving.py command themselves.
 _MEASURING = ("benchmarker", "analyzer", "evaluator", "qa")
@@ -90,6 +82,29 @@ def test_measuring_roles_carry_canonical_benchmark_flags():
         for flag in _BENCHMARK_CANONICAL_FLAGS:
             assert flag in _ALL_PROMPTS[role], (role, flag)
         assert "do not improvise" in _ALL_PROMPTS[role], role
+
+
+def test_external_benchmark_prompt_is_injected_into_every_measuring_role():
+    task = {
+        "benchmark": {
+            "type": "external",
+            "path": "/opt/aiperf",
+            "command": "aiperf benchmark --dataset semianalysisai/cc-traces-weka-062126",
+            "notes": "Read tps_user_p10 and total_tps_per_gpu from stdout.",
+        },
+        "optimize": {"target_metric": "tps_user_p10"},
+    }
+
+    bundle = build_perf_optimize_prompts(remote_execution=task)
+
+    for role in ("benchmarker", "analyzer", "evaluator", "integrator", "qa"):
+        prompt = getattr(bundle, role)
+        assert "/opt/aiperf" in prompt
+        assert "semianalysisai/cc-traces-weka-062126" in prompt
+        assert "tps_user_p10" in prompt
+        assert "benchmark_serving.py" not in prompt
+        assert "--random-input-len" not in prompt
+        assert "--no-test-input" not in prompt
 
 
 def test_analyzer_carries_canonical_nsys_flags():
@@ -475,15 +490,16 @@ def test_measuring_roles_carry_the_measurement_protocol():
     protocol = _norm(MEASUREMENT_PROTOCOL)
     assert "positive = improvement" in protocol
     assert "output_throughput" in protocol
-    # Curve mode: one run per point over one server launch, per-point
-    # result dirs, and the worked Pareto example.
-    assert "one run per `benchmark.concurrency` point" in protocol
-    assert "concurrency_<c>" in protocol
+    # Builtin-only curve mechanics come from the selected driver fragment;
+    # the common protocol stays valid for arbitrary external outputs.
+    builtin = _norm(DEFAULT_PROMPTS.benchmarker)
+    assert "One run per concurrency point" in builtin
+    assert "concurrency_<c>" in builtin
     assert "Curve worked example" in protocol
     assert "mean = +3.24%" in protocol
     for role in ("benchmarker", "evaluator", "qa"):
         assert "Measurement protocol" in _ALL_PROMPTS[role], role
-        assert "one run per `benchmark.concurrency` point" in _norm(_ALL_PROMPTS[role]), role
+        assert "One run per concurrency point" in _norm(_ALL_PROMPTS[role]), role
 
 
 def test_measuring_roles_carry_the_derived_metrics_reference():

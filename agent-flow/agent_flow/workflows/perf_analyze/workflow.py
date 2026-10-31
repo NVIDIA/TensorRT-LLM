@@ -19,7 +19,7 @@ from .progress import (
     read_progress,
 )
 from .prompts import DEFAULT_PROMPTS, PromptBundle
-from .prompts._common import profile_ranks_note
+from .prompts._common import external_benchmark_run_instruction, profile_ranks_note
 from .roles import ROLES
 from .sol_methodology import SolMethodology, output_instruction, projector_instruction
 from .state import (
@@ -34,6 +34,8 @@ from .state import (
 )
 from .task_schema import (
     CASEBOOK_SKILL_NAMES,
+    EXTERNAL_BENCHMARK,
+    benchmark_type,
     casebook_enabled,
     concurrency_points,
     dump_task_yaml,
@@ -405,7 +407,12 @@ class PerfAnalyzeWorkflow:
 
     def _run_benchmarker(self) -> None:
         self._progress_ctx.current_step = 1
-        if self._curve_mode():
+        task_data = self._task_data()
+        if benchmark_type(task_data) == EXTERNAL_BENCHMARK:
+            load_instruction = external_benchmark_run_instruction(task_data, self.workspace)
+            driver_instruction = ""
+            artifact_instruction = "Capture the benchmark output and result artifacts"
+        elif self._curve_mode():
             points = self._curve_points()
             load_instruction = (
                 f"then run `benchmark_serving.py` **once per concurrency "
@@ -414,11 +421,23 @@ class PerfAnalyzeWorkflow:
                 f"points), passing `--result-dir {self.workspace}/"
                 f"concurrency_<c>` for the run at point `<c>`"
             )
+            driver_instruction = (
+                " Use the **canonical `benchmark_serving.py` command in your system "
+                "prompt** — fill in the paths and `benchmark` values, keep the "
+                "other flags as given, and do not improvise."
+            )
+            artifact_instruction = "Capture the result JSON of every run"
         else:
             load_instruction = (
                 "then run `benchmark_serving.py` at the single configured "
                 "operating point from the `benchmark` block"
             )
+            driver_instruction = (
+                " Use the **canonical `benchmark_serving.py` command in your system "
+                "prompt** — fill in the paths and `benchmark` values, keep the "
+                "other flags as given, and do not improvise."
+            )
+            artifact_instruction = "Capture the result JSON of every run"
         self.benchmarker(
             f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
@@ -432,11 +451,8 @@ class PerfAnalyzeWorkflow:
             )
             + f"Launch `trtllm-serve` (passing `--extra_llm_api_options` when "
             f"set), poll it to "
-            f"readiness, {load_instruction}. Use the "
-            f"**canonical `benchmark_serving.py` command in your system "
-            f"prompt** — fill in the paths and `benchmark` values, keep the "
-            f"other flags as given, and do not improvise. Capture "
-            f"the result JSON of every run and tear the server down "
+            f"readiness, {load_instruction}.{driver_instruction} "
+            f"{artifact_instruction} and tear the server down "
             f"(always).\n\n"
             f"Do **all** of this within this single turn — poll readiness in "
             f"the foreground and do not yield to a background poll; the stage "
