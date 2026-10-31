@@ -61,6 +61,14 @@ See the [Installation Guide](docs/source/installation/installation-guide.md) for
 [build from source](docs/source/installation/build-from-source.md) for development builds,
 and [Container Images](docs/source/installation/containers.md) for information about the container images.
 
+Prepare AIPerf clients with `scripts/install_benchmark_tools.py` and Python 3.11–3.13
+before starting benchmark servers. Clients use isolated environments; add the
+client launcher directory to `PATH`. Before upgrading an existing runtime, run
+`python3 scripts/install_benchmark_tools.py --check-runtime` with its interpreter;
+ambient AIPerf requires a clean runtime or explicit removal. See the
+[benchmark setup guide](docs/source/commands/trtllm-serve/run-benchmark-with-trtllm-serve.md#installation)
+for stock and AgentX client setup.
+
 ### Reference Configs
 
 `examples/configs/database/` contains pareto-optimized serving configurations

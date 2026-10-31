@@ -70,12 +70,14 @@ slurm_install_setup() {
 
         which python3
         python3 --version
+        python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --check-runtime
         retry_command apt-get install -y libffi-dev
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
         fi
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+        retry_command --timeout 2700 python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --profile all --bin-dir /usr/local/bin
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-grpc-smg.txt"
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command --timeout 2700 bash "$llmSrcNode/jenkins/scripts/install_mamba.sh"

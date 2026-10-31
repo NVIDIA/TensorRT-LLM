@@ -449,7 +449,89 @@ AIPerf integrates directly with the OpenAI-compatible endpoints exposed by
 
 ### Installation
 
-AIPerf is installed with TensorRT-LLM by default.  
+#### Migrating an existing runtime
+
+Benchmark clients must live in separate environments. Before upgrading TensorRT-LLM
+or installing `requirements-dev.txt`, run this read-only check with the Python
+interpreter used by the inference runtime:
+
+```bash
+python3 scripts/install_benchmark_tools.py --check-runtime
+```
+
+Older development installs may contain AIPerf 0.8.0, whose aiohttp requirement
+conflicts with the runtime's new minimum. Removing AIPerf from the requirements
+file does not uninstall an existing copy. The preflight rejects any ambient
+AIPerf installation and leaves all packages unchanged. CI benchmark setup runs
+this check before installing runtime dependencies.
+
+Use a clean runtime environment when upgrading. To reuse an existing environment,
+explicitly remove its AIPerf installation, then upgrade the runtime dependencies
+and check consistency with that same interpreter:
+
+```bash
+python3 -m pip uninstall aiperf
+python3 scripts/install_benchmark_tools.py --check-runtime
+python3 -m pip install --upgrade -r requirements-dev.txt
+python3 -m pip check
+```
+
+The benchmark installer never removes runtime packages. Uninstalling AIPerf does
+not remove its old dependencies; a clean runtime avoids retaining unused legacy
+packages. The preflight only checks the benchmark/runtime separation, not the
+security status of every installed package. Metadata export remains available
+independently of this check.
+
+#### Installing the client
+
+Install the benchmark client separately with Python 3.11, 3.12, or 3.13.
+The setup interpreter needs `virtualenv>=20.29.1,<22.0`, supplied by
+`requirements-dev.txt`, to create pip-enabled environments even when the OS
+does not provide `ensurepip`. For a standalone client setup, install that
+utility explicitly:
+
+```bash
+python3.12 -m pip install 'virtualenv>=20.29.1,<22.0'
+```
+
+Then install the client:
+
+```bash
+export TRTLLM_BENCHMARK_ENV_ROOT="$PWD/.benchmark-tools"
+python3.12 scripts/install_benchmark_tools.py
+export PATH="$TRTLLM_BENCHMARK_ENV_ROOT/bin:$PATH"
+```
+
+This installs the pinned stock AIPerf client without changing TensorRT-LLM's Python packages.
+TensorRT-LLM itself continues to support Python 3.10. Installation is an explicit
+setup step; benchmark commands do not install packages. Setup upgrades the selected
+client environment, including compatible transitive dependencies, and records
+the resolved package versions in `trtllm-benchmark.json` inside that environment. For AgentX tests, run
+`python3.12 scripts/install_benchmark_tools.py --profile agentx` in the same setup.
+The pinned AgentX fork uses its own dependencies and is not a replacement for the
+stock `aiperf` command.
+
+The current pins are provisional fork revisions, not official AIPerf or AgentX releases:
+[stock `a3033142`](https://github.com/BowenFu/aiperf/commit/a3033142f8a03b5d19903fa86bc3399d6d279876)
+and [AgentX `8cde0829`](https://github.com/BowenFu/aiperf/commit/8cde0829edf28aa49d2018412c33b118c675c7b5).
+They include the dependency updates, offline local-tokenizer support and integer
+TIFF-to-PNG compatibility with Pillow 13.
+
+The CI and disaggregated benchmark adapters save the selected client's current
+software in `client_environment.json` alongside its benchmark outputs, before
+the timed workload. Custom interpreters can be selected with
+`TRTLLM_AIPERF_PYTHON` (stock) or `AGENTX_PYTHON`; the record describes that
+interpreter. Compare results using matching client source and dependency
+versions, since client changes can affect measured latency.
+
+For a manual run, record the environment separately:
+
+```bash
+python3 scripts/install_benchmark_tools.py --profile stock \
+    --export-environment client_environment.json
+```
+
+This mode does not install packages or create a client environment.
 
 
 ### Running AIPerf with trtllm-serve

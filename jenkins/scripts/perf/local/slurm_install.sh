@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # Set up error handling
 set -xEeuo pipefail
@@ -45,6 +47,7 @@ slurm_install_setup() {
         fi
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
+        python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --check-runtime
 
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
@@ -76,6 +79,7 @@ slurm_install_setup() {
             retry_command bash -c "cd $llmSrcNode && pip install --retries 10 -e . && pip install --retries 10 -r requirements-dev.txt"
         fi
 
+        retry_command --timeout 2700 python3 "$llmSrcNode/scripts/install_benchmark_tools.py" --profile all --bin-dir /usr/local/bin
         # Generic post-install hook (opt-in; no-op unless POST_INSTALL_HOOK set).
         # Runs ONCE per node here, on the localid-0 task, INSIDE the locked section
         # and BEFORE the lock file is written -- so the other ranks (which wait on

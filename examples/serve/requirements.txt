@@ -1,1 +1,1 @@
-aiperf
+# Install the isolated benchmark client with scripts/install_benchmark_tools.py.
