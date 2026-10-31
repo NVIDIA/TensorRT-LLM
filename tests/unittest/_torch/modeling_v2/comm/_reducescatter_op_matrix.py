@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU certification matrix for the reducescatter catalog entry.
 
+A cell runs at its `world`, one without it at `CELLS_DEFAULT_WORLD`; the
+collected entry point starts this job at world 2 and 4.
+
 A collective cannot be exercised in one process, so this script is its own
 launcher: run it plainly and it spawns one worker process per device, with one
 rank per device named in CUDA_VISIBLE_DEVICES, under a deadline the parent
@@ -24,15 +27,15 @@ watchdog. That sub-job doubles as the harness's positive control, since it
 is a real collective deadlock this launcher has to survive.
 
 Not a pytest module, despite the `check_*` bodies. They are one fixed
-sequence inside a single 4-rank job rather than independent cases: each reads
+sequence inside a single job rather than independent cases: each reads
 module-global rank state that only `_run_one_rank` binds, and several assert
 on communicator state the previous one left behind. Collected as tests they
 would run at world size 1 against unbound globals — so neither this file's
 name nor its function names match pytest's collection patterns, which is what
 keeps it uncollectable however pytest is pointed at this tree.
 
-The collected entry point is
-`tests/unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py`:
+The collected entry point is `test_modeling_v2_reducescatter_op_matrix.py`
+beside this file:
 it starts this job and turns its exit code into an assertion. Both halves are
 started by file path: the launcher must not import `tensorrt_llm` (that calls
 CUDA nor torch.distributed state of its own), and the
@@ -65,7 +68,11 @@ DEADLINE_S = 1800
 # import and communicator bring-up before the pair is issued (~50 s measured)
 # plus the driver's teardown of four contexts holding a spinning kernel.
 
-HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
+HIDDEN = 2560  # Qwen3.8-Flash-Next's hidden size (and DeepSeek-V3-Lite's)
+
+# The world size a cell without a `world` key is certified at: the deepseek-r1
+# and gpt-oss cells are their dep4 layout, measured at 4 ranks only.
+CELLS_DEFAULT_WORLD = 4
 
 # The row counts one engine's decode graphs are captured at. trtllm's graph
 # runner instantiates one graph per configured batch size, and under attention
@@ -73,13 +80,18 @@ HIDDEN = 2560  # DeepSeek-V3-Lite hidden size, the caller that motivates this
 # with `cuda_graph_config.max_batch_size = 256` and the default list that is 35
 # graphs at [1..32, 64, 128, 256], all alive at once in one memory pool and
 # replayed interleaved as the served batch size moves. This op's input carries
-# every rank's rows, so its captured input is WORLD times that.
+# every rank's rows, so its captured input is WORLD times that. The qwen4
+# unified target's dep4 engine captures 1, 2, 4, 8, 16, 24 and 32 (max_batch_size 32), all
+# inside this list.
 GRAPH_BATCH_SIZES: Tuple[int, ...] = tuple(range(1, 33)) + (64, 128, 256)
 
-# Reduce-scatters inside one decode graph for this checkpoint: 30 layers with
-# `first_k_dense_replace = 1`, so 29 expert-parallel MoE calls, each followed
-# by one reduce-scatter of the four expert windows' partial outputs.
-SITES_PER_DECODE_GRAPH = 29
+# Reduce-scatters inside one decode graph, each ending one expert-parallel MoE
+# call with a reduce-scatter of the expert windows' partial sums. The qwen4
+# unified checkpoint has 48 (all its layers are MoE, no dense layer in
+# config.json); a 30-layer deepseek-shaped checkpoint with
+# `first_k_dense_replace = 1` has 29. One graph holding the larger count
+# covers the smaller.
+SITES_PER_DECODE_GRAPH = 48
 
 # bf16 unit roundoff: the format carries 8 significand bits, so eps = 2^-8 and
 # a round-to-nearest step is off by at most 2^-9 of the running value. Used by
@@ -426,8 +438,16 @@ def check_certified_cells() -> None:
     order, which stream the call lands on. This one says the plain thing: for
     every configuration the entry claims, the slice is the sum, bitwise, and the
     guard admits the input a shipped target passes.
+
+    A cell runs at its `world`; one without it at CELLS_DEFAULT_WORLD.
     """
-    for i, cell in enumerate(entry.reducescatter.CELLS):
+    cells = [
+        (i, cell)
+        for i, cell in enumerate(entry.reducescatter.CELLS)
+        if cell.spec.get("world", CELLS_DEFAULT_WORLD) == WORLD
+    ]
+    assert cells, f"no cell is certified at world size {WORLD}"
+    for i, cell in cells:
         spec = cell.spec
         rows, trailing, dtype = spec["rows_per_rank"], spec["trailing"], spec["dtype"]
         seed = 9000 + 13 * i
@@ -437,6 +457,8 @@ def check_certified_cells() -> None:
             out = reducescatter(x, spec["sizes"], GROUP)
         assert out.shape == (rows, *trailing), (cell.why, out.shape)
         _assert_bitwise(out, _ref(sizes, RANK, seed, dtype, trailing), cell.why)
+        if RANK == 0:
+            print(f"[rank 0] world={WORLD} cell bitwise: {cell.why}", flush=True)
         dist.barrier()
 
 
@@ -594,9 +616,11 @@ def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> Non
 
     1. It is **deterministic**: eight identical eager calls return bitwise
        identical tensors, and so do eight replays of a captured call.
-    2. It is **not** the correctly rounded exact sum. The op accumulates in the
-       input dtype, so about a third of the elements differ from an fp32
-       reduction rounded once.
+    2. Above two ranks it is **not** the correctly rounded exact sum. The op
+       accumulates in the input dtype, so about a third of the elements differ
+       from an fp32 reduction rounded once. At two ranks the chain is a single
+       bf16 addition, which rounds the exact sum once, so there it **is** the
+       correctly rounded sum, bitwise.
     3. It **is** a sequential summation in the input dtype, in ring order
        starting at the destination's successor — matched bitwise on every
        element here. That order is NCCL's algorithm choice for this topology;
@@ -623,11 +647,21 @@ def check_reduction_is_deterministic_and_accumulates_in_the_input_dtype() -> Non
             exact += chunk.float()
             absum += chunk.float().abs()
 
-        # (2) not the correctly rounded exact sum
+        # (2) not the correctly rounded exact sum, unless there is one addition
         differs = (outs[0] != exact.to(torch.bfloat16)).float().mean().item()
-        assert differs > 0.05, (
-            f"rows={rows}: only {differs:.4f} of elements differ from an fp32 "
-            "reduction — the op may have started accumulating in fp32"
+        if WORLD == 2:
+            _assert_bitwise(
+                outs[0], exact.to(torch.bfloat16), f"two-term correctly rounded sum at rows={rows}"
+            )
+        else:
+            assert differs > 0.05, (
+                f"rows={rows}: only {differs:.4f} of elements differ from an fp32 "
+                "reduction — the op may have started accumulating in fp32"
+            )
+        print(
+            f"[rank {RANK}] world={WORLD} rows={rows}: {differs:.4f} of elements differ "
+            "from the correctly rounded sum",
+            flush=True,
         )
 
         # (3) a sequential chain in ring order, starting at my successor
@@ -773,11 +807,11 @@ def check_cuda_graph_at_every_engine_batch_size() -> None:
 def check_cuda_graph_one_site_per_moe_layer_in_every_batch_size_graph() -> None:
     """The decode graph this checkpoint captures, at all 35 batch sizes.
 
-    1015 captured reduce-scatters, one memory pool. The sites are independent —
-    each reads its own buffer and every one gets a distinct payload, so a site
-    that returned a neighbour's data would fail the bitwise gate. Two replay
-    orders rather than four: the per-order cost is 29x the single-site test's
-    and the axis this one adds is site count, not order.
+    1680 captured reduce-scatters (48 sites x 35 graphs), one memory pool. The
+    sites are independent — each reads its own buffer and every one gets a
+    distinct payload, so a site that returned a neighbour's data would fail the
+    bitwise gate. Two replay orders rather than four: the per-order cost is 48x
+    the single-site test's and the axis this one adds is site count, not order.
     """
     inputs, graphs, outputs = _capture_per_batch_size(sites=SITES_PER_DECODE_GRAPH, seed=21000)
     seed = 310000
@@ -1367,7 +1401,8 @@ def _run_one_rank(device: Optional[int] = None) -> int:
     # Run as a spawned worker process, not collected by pytest, so the repo's
     # `__extra_import_path__` mechanism is not in play. The mutation is confined
     # to these rank processes.
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    # comm -> modeling_v2, where _validating is.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from _validating import validating as _validating_cm
 
     validating = _validating_cm
@@ -1488,6 +1523,8 @@ if __name__ == "__main__":
     if _WORKER_FLAG in sys.argv:
         sys.exit(_run_one_rank())
     if "--srun" in sys.argv:
+        # _rank_job is beside this file, in comm/.
+        sys.path.insert(0, str(Path(__file__).resolve().parents[0]))
         import _rank_job
 
         sys.exit(_run_one_rank(device=_rank_job.adopt_srun_env()))
