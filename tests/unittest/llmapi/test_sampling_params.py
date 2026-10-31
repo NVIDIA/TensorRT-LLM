@@ -270,6 +270,24 @@ def test_sampling_params_rejects_nan(field):
 
 
 @pytest.mark.parametrize(
+    "embedding_bias_in",
+    [
+        None,
+        torch.tensor([0, 0, -1.0, 0, -2.5], dtype=torch.float32),
+        [0, 0, -1.0, 0, -2.5],
+        ((2, -1.0), (4, -2.5)),
+    ],
+)
+def test_sampling_params_sets_embedding_bias_sparse(embedding_bias_in):
+    params = SamplingParams(embedding_bias=embedding_bias_in)
+    assert params.embedding_bias is embedding_bias_in
+    if embedding_bias_in is None:
+        assert params._embedding_bias_sparse is None
+    else:
+        assert params._embedding_bias_sparse == ((2, -1.0), (4, -2.5))
+
+
+@pytest.mark.parametrize(
     ("field", "value"),
     [
         ("top_p", -0.1),
