@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ipaddress
 import logging
 import os
 import threading
@@ -427,8 +428,10 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
                 raise ValueError(expected) from exc
             if hostname.startswith('[') and hostname.endswith(']'):
                 hostname = hostname[1:-1]
-                if not hostname or '[' in hostname or ']' in hostname:
-                    raise ValueError(expected)
+                try:
+                    ipaddress.IPv6Address(hostname)
+                except ipaddress.AddressValueError as exc:
+                    raise ValueError(expected) from exc
             elif not hostname or ':' in hostname or '[' in hostname or ']' in hostname:
                 raise ValueError(expected)
             hostnames.append(hostname)
