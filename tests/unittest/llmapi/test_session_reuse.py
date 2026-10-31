@@ -11,6 +11,8 @@ import pytest
 from test_common import session_reuse
 from test_common.session_reuse import SessionReuseCache
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakePool:
     def __init__(self, n_workers, wait_shutdown=False, env_overrides=None):
