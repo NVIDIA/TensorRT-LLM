@@ -420,7 +420,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
             return False
 
     class FakeMetadata:
-        pass
+        helix_context_local_slots = None
 
     class FakeAttention:
 
@@ -461,6 +461,68 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
         latent_cache,
     )
     assert result == expected_path
+
+
+@pytest.mark.parametrize("fp4_cache", [False, True],
+                         ids=["non-fp4-kv", "fp4-kv"])
+@pytest.mark.parametrize("owned_prefill", [False, True],
+                         ids=["ordinary-prefill", "owner-only-prefill"])
+@pytest.mark.cpu_only
+def test_mla_owned_prefill_rejects_fp4_before_cache_update(
+        fp4_cache: bool, owned_prefill: bool,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = mock.Mock(spec=mla_module.TrtllmAttention)
+    backend.uses_fp4_mla_attention = fp4_cache
+    metadata = mock.Mock(spec=TrtllmAttentionMetadata)
+    metadata.helix_context_local_slots = object() if owned_prefill else None
+    attention = types.SimpleNamespace(
+        mha=backend,
+        num_context_heads=2,
+        qk_head_dim=4,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=2,
+        v_head_dim=2,
+        kv_lora_rank=4,
+        apply_rotary_emb=True,
+        out_scale=None,
+        _use_kvbproj_strided_out=lambda: False,
+        _project_context_kv=mock.Mock(return_value=torch.zeros((3, 8))),
+    )
+    q = torch.zeros((3, 8))
+    compressed_kv = torch.zeros((3, 4))
+    k_pe = torch.zeros((3, 2))
+    position_ids = torch.arange(3)
+    output = torch.empty((3, 4))
+    latent_cache = torch.zeros((3, 6))
+    backend.forward.return_value = output
+    monkeypatch.setattr(mla_module, "maybe_compiled_copy_",
+                        lambda dst, src: dst.copy_(src))
+
+    def forward() -> torch.Tensor:
+        return mla_module.MLA.forward_context_default(attention, q,
+                                                      compressed_kv, k_pe,
+                                                      position_ids, metadata,
+                                                      output, latent_cache)
+
+    if fp4_cache and owned_prefill:
+        with pytest.raises(NotImplementedError,
+                           match="Owner-only Helix prefill.*FP4"):
+            forward()
+        backend.mla_rope_append_paged_kv_assign_q.assert_not_called()
+        attention._project_context_kv.assert_not_called()
+        backend.forward.assert_not_called()
+    else:
+        assert forward() is output
+        attention._project_context_kv.assert_called_once_with(compressed_kv)
+        backend.forward.assert_called_once()
+        if owned_prefill:
+            backend.mla_rope_append_paged_kv_assign_q.assert_called_once_with(
+                q, latent_cache, metadata)
+        else:
+            backend.mla_rope_append_paged_kv_assign_q.assert_not_called()
+        forward_args = backend.forward.call_args.kwargs["forward_args"]
+        expected_latent_cache = None if owned_prefill else latent_cache
+        assert forward_args.latent_cache is expected_latent_cache
 
 
 # Convert parameterized tests to pytest parametrize

@@ -63,14 +63,27 @@ def build_attention_metadata(
 ) -> AttentionMetadata:
     """Construct attention metadata and resolve model-derived inputs."""
     pretrained_config = model_config.pretrained_config
+    sparse_attention_config = model_config.sparse_attention_config
     if enable_context_mla_with_cached_kv is None:
+        # Dense owner-only Helix prefill needs append indptrs even without cached tokens.
         enable_context_mla_with_cached_kv = is_mla(pretrained_config) and (
-            attention_runtime_features.cache_reuse or attention_runtime_features.chunked_prefill
+            attention_runtime_features.cache_reuse
+            or attention_runtime_features.chunked_prefill
+            or (sparse_attention_config is None and mapping.has_cp_helix())
+        )
+    elif (
+        enable_context_mla_with_cached_kv is False
+        and is_mla(pretrained_config)
+        and sparse_attention_config is None
+        and mapping.has_cp_helix()
+    ):
+        raise ValueError(
+            "Helix MLA requires enable_context_mla_with_cached_kv=True "
+            "to prepare owner-only KV append metadata"
         )
     if max_num_heads_per_kv is None:
         max_num_heads_per_kv = _get_max_num_heads_per_kv(model_config)
 
-    sparse_attention_config = model_config.sparse_attention_config
     sparse_metadata_params = (
         sparse_attention_config.to_sparse_metadata_params(pretrained_config=pretrained_config)
         if sparse_attention_config is not None

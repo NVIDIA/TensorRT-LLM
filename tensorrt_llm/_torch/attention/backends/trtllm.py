@@ -224,6 +224,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
 
+    # Int32 slots in each request's rank-local KV cache, one per context
+    # token. -1 skips persistence; temporary Q/K still cover every token.
+    helix_context_local_slots: Optional[torch.Tensor] = None
+
     # Per-token helix state for speculative verify groups (a 1 + draft_len
     # group may straddle a ledger-page boundary onto two CP ranks, so the
     # per-sequence boolean above is insufficient there). See
@@ -726,6 +730,31 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 torch.tensor(helix_owned_new_tokens, dtype=torch.int))
             self._helix_spec_tokens_valid = True
 
+    def _prepare_helix_context_slots(
+            self, cached_token_lens: Optional[torch.Tensor]) -> None:
+        """Map global context positions to the cache manager's Helix pages."""
+        self.helix_context_local_slots = None
+        cache_mapping = getattr(self.kv_cache_manager, "mapping", None)
+        if (self.num_contexts == 0 or cached_token_lens is None
+                or cache_mapping is None or not cache_mapping.has_cp_helix()):
+            return
+        # Context batches run eagerly. Build once per batch on the host,
+        # then share the device view across all MLA layers.
+        lengths = self.seq_lens[:self.num_contexts].to(torch.int64)
+        starts = torch.cumsum(lengths, dim=0) - lengths
+        positions = torch.arange(self.num_ctx_tokens,
+                                 dtype=torch.int64,
+                                 device="cpu")
+        positions += torch.repeat_interleave(
+            cached_token_lens[:self.num_contexts] - starts, lengths)
+        page = self.kv_cache_manager.tokens_per_block
+        blocks = positions // page
+        slots = (blocks // cache_mapping.cp_size) * page + positions % page
+        slots.masked_fill_(
+            blocks % cache_mapping.cp_size != cache_mapping.cp_rank, -1)
+        self.helix_context_local_slots = maybe_pin_memory(slots.to(
+            torch.int32)).to(self.seq_lens_cuda.device, non_blocking=True)
+
     def helix_local_len_vec(self, global_lens: torch.Tensor) -> torch.Tensor:
         """Vectorized rank-local prefix length for helix round-robin pages.
 
@@ -990,6 +1019,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int,
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
+
+        self._prepare_helix_context_slots(cached_token_lens)
 
         if self.enable_flash_mla:
             self.prepare_flash_mla()
@@ -2851,6 +2882,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_manager.max_seq_len,
             beam_width,
             self.quant_mode,
+            metadata.helix_context_local_slots,
         )
 
     def merge_attention_for_mla(
