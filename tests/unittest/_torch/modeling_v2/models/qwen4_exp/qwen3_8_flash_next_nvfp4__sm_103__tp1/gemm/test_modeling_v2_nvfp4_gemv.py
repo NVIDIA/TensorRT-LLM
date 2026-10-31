@@ -14,11 +14,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_triton_update import (  # noqa: E501
     causal_conv1d_triton_update,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.causal_conv1d_update import (  # noqa: E501
+    causal_conv1d_update,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.gemm import (  # noqa: E501
     nvfp4_gemv as nv,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.causal_conv1d_update import (  # noqa: E501
-    causal_conv1d_update,
 )
 
 assert torch.cuda.is_available(), "nvfp4_gemv requires a CUDA device"
