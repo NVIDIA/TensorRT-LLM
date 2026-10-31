@@ -64,10 +64,18 @@ def test_efa_container_install(
     )
     assert (result.returncode != 0) == bool(fail_stage), result.stderr
     assert not list(scratch.iterdir())
+    if fail_stage == "download":
+        assert (tmp_path / "curl_args").exists()
+        assert not (tmp_path / "efa_args").exists()
+    elif fail_stage == "install":
+        assert (tmp_path / "efa_args").exists()
     if os_id == "rocky":
         assert not (tmp_path / "curl_args").exists()
         assert not (tmp_path / "apt_args").exists()
     elif not fail_stage:
+        curl_args = (tmp_path / "curl_args").read_text().splitlines()
+        assert curl_args[curl_args.index("--connect-timeout") + 1] == "30"
+        assert curl_args[curl_args.index("--max-time") + 1] == "1800"
         assert (tmp_path / "efa_args").read_text().splitlines() == [
             "--skip-mpi",
             "--skip-rdma-core",

@@ -18,7 +18,8 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 cd "${WORK_DIR}"
 
-curl --retry 3 --retry-delay 2 -fsSL -o "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
+curl --connect-timeout 30 --max-time 1800 --retry 3 --retry-delay 2 \
+    -fsSL -o "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz" \
     "${EFA_INSTALLER_URL}"
 tar -xf "aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz"
 cd aws-efa-installer
@@ -27,6 +28,6 @@ apt-get update
 
 # --skip-mpi: NGC images already ship HPC-X / Open MPI; do not overwrite it.
 # --skip-rdma-core: use the base image's rdma-core.
-# --build-ngc: install the EFA userspace packages without host driver installation,
+# --build-ngc: unattended EFA userspace setup without host driver installation,
 #              device verification, limit configuration or dependency replacement.
 ./efa_installer.sh --skip-mpi --skip-rdma-core --build-ngc
