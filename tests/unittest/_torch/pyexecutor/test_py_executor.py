@@ -3990,6 +3990,40 @@ def test_reset_prefix_cache_clears_target_and_draft_reuse_trees():
     stub.draft_kv_cache_manager.reset_reuse_state.assert_called_once_with()
 
 
+@pytest.mark.parametrize("failure_stage", ["native_clear", "conversation_clear", "flush"])
+def test_reset_prefix_cache_preserves_routes_only_if_native_clear_fails(failure_stage):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_events import StreamingKVCacheEventManager
+    from tensorrt_llm._torch.route_capture import RouteCapture
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.impl = Mock()
+    manager.event_manager = None
+    manager.conversation_manager = Mock()
+    manager._sharing = None
+    if failure_stage == "native_clear":
+        failing_step = manager.impl.clear_reusable_blocks
+    elif failure_stage == "conversation_clear":
+        failing_step = manager.conversation_manager.clear
+    else:
+        manager.event_manager = Mock(spec=StreamingKVCacheEventManager)
+        manager.flush_iteration_events = Mock()
+        failing_step = manager.flush_iteration_events
+    failing_step.side_effect = RuntimeError("reset failed")
+    route_capture = RouteCapture(rank=0)
+    route_capture._shared[1] = torch.ones((1, 1), dtype=torch.int16)
+    stub = object.__new__(PyExecutor)
+    stub.kv_cache_manager = manager
+    stub.enable_joint_kv_cache_reuse = False
+    stub.model_engine = types.SimpleNamespace(route_capture=route_capture)
+
+    with pytest.raises(RuntimeError, match="reset failed"):
+        PyExecutor.reset_prefix_cache(stub)
+
+    manager.impl.clear_reusable_blocks.assert_called_once()
+    assert bool(route_capture._shared) == (failure_stage == "native_clear")
+
+
 class TestPendingTransferResponseFlush:
     def test_rank_local_fatal_error_does_not_issue_adp_response_gather(self):
         """A lone fatal rank must fail locally rather than desynchronize TP."""

@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
+
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
     "iter_reused_blocks",
@@ -8311,9 +8312,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 success = False
         return success
 
-    def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+    def reset_reuse_state(
+        self,
+        *,
+        on_cleared: Optional[Callable[[], None]] = None,
+    ):
+        try:
+            self.impl.clear_reusable_blocks()
+            if on_cleared is not None:
+                on_cleared()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # The sidecar consumes the per-rank streaming publisher. Flush it
+            # even while inference is paused, without starting a buffered ADP gather.
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.flush_iteration_events()
