@@ -46,6 +46,7 @@ from ..speculative.utils import get_static_draft_len
 from ..utils import get_per_request_prefill_cuda_graph_flag, set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
+from .disagg_gen_prefetch import resolve_disagg_gen_prefetch_requests
 from .engine.cuda_graph import filter_cuda_graph_batch_sizes
 from .engine.lora import make_lora_model_config
 from .engine.model_call import ModelCaller
@@ -262,7 +263,7 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
-        from ._util import (compute_max_num_sequences,
+        from ._util import (compute_max_num_sequences, is_disagg_enabled,
                             resolved_kv_cache_manager_is_v2,
                             should_enable_adp_dummy_fixes,
                             should_enable_non_overlap_adp_forward_intent,
@@ -363,20 +364,33 @@ class PyTorchModelEngine(ModelEngine):
         self._enable_non_overlap_adp_forward_intent = (
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler))
+        kv_cache_manager_is_v2 = resolved_kv_cache_manager_is_v2(
+            llm_args.kv_cache_config, self.max_beam_width)
+        is_hybrid = is_hybrid_linear(pretrained_config)
+        has_mrope_delta_cache = resolve_mrope_position_deltas_cache(
+            self.model) is not None
         self._enable_overlap_headroom = should_enable_overlap_headroom(
             mapping,
             llm_args.disable_overlap_scheduler,
-            kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
-                llm_args.kv_cache_config, self.max_beam_width),
-            is_hybrid=is_hybrid_linear(pretrained_config),
-            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
-                self.model) is not None)
+            kv_cache_manager_is_v2=kv_cache_manager_is_v2,
+            is_hybrid=is_hybrid,
+            has_mrope_delta_cache=has_mrope_delta_cache)
+        # Seats for the generation requests a disaggregated worker admits
+        # beyond max_batch_size to prefetch their KV (0 unless opted in).
+        self.disagg_gen_prefetch_requests = resolve_disagg_gen_prefetch_requests(
+            is_disagg=is_disagg_enabled(
+                getattr(llm_args, "cache_transceiver_config", None)),
+            enable_attention_dp=mapping.enable_attention_dp,
+            has_pp=mapping.has_pp(),
+            is_hybrid=is_hybrid,
+            has_mrope_delta_cache=has_mrope_delta_cache,
+            kv_cache_manager_is_v2=kv_cache_manager_is_v2)
         self.max_num_seq_slots = compute_max_num_sequences(
             mapping,
             self.batch_size,
             llm_args.disable_overlap_scheduler,
             enable_overlap_headroom=self._enable_overlap_headroom,
-        )
+        ) + self.disagg_gen_prefetch_requests
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):

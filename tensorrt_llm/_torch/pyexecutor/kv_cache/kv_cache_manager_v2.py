@@ -109,6 +109,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..config_utils import get_layer_attention_window, uses_vswa_kv_cache_layout
 from ..connectors.kv_cache_connector import KvCacheConnectorManager
+from ..disagg_gen_prefetch import resolve_disagg_gen_prefetch_requests
 from ..kv_cache_events import StreamingKVCacheEventManager, validate_streaming_support
 from ..kv_cache_stats import (
     KVCacheV2IterationStatsReport,
@@ -2228,6 +2229,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self._fresh_fill_announced = False
         self._fresh_fill_unavailable_announced = False
         self.max_admissible_sequences = max_num_sequences * (2 if needs_extra_leases else 1)
+        # A disaggregated generation worker that prefetches KV for requests
+        # beyond max_batch_size holds that many more leases at once.
+        self.max_admissible_sequences += resolve_disagg_gen_prefetch_requests(
+            is_disagg=is_disagg,
+            enable_attention_dp=mapping.enable_attention_dp,
+            has_pp=mapping.has_pp(),
+            warn=False,
+        )
         # The guard page is held by a permanent sequence, so it needs an index
         # slot of its own. Taking one of the scheduler's would change which
         # requests get admitted, so a run with the diagnostic on would no

@@ -732,6 +732,19 @@ class PyExecutor:
                     f"{required_max_num_tokens} to run at the declared "
                     f"max_batch_size.")
             self.max_num_active_requests = derived_cap
+        # Generation-only requests admitted beyond max_num_active_requests so
+        # their KV transfer overlaps the running decode. The engine widened
+        # its sequence-slot pool by the same amount; 0 unless opted in.
+        self.disagg_gen_prefetch_requests = (getattr(
+            model_engine, "disagg_gen_prefetch_requests",
+            0) if kv_cache_transceiver is not None else 0)
+        if self.disagg_gen_prefetch_requests > 0:
+            logger.info(
+                f"[PyExecutor] disaggregated generation KV prefetch: admitting "
+                f"up to {self.disagg_gen_prefetch_requests} generation-only "
+                f"requests beyond max_num_active_requests="
+                f"{self.max_num_active_requests}; the forward batch is still "
+                f"capped at max_batch_size")
         self.active_requests: List[LlmRequest] = []
         self.expected_num_active_requests = 0
         # Buffer for responses staged by rank-divergent paths (disagg transfer
@@ -6176,7 +6189,38 @@ class PyExecutor:
         """Return the maximum number of distinct requests admitted at once."""
         if self.enable_attention_dp:
             return self.dist.tp_size * self.max_num_active_requests
-        return self.max_num_active_requests
+        return (self.max_num_active_requests +
+                getattr(self, "disagg_gen_prefetch_requests", 0))
+
+    def _limit_prefetch_admission(
+            self, waiting_queue: WaitingQueue,
+            new_requests: List[RequestQueueItem],
+            total_num_active_requests: int) -> List[RequestQueueItem]:
+        """Admit only generation-only requests into the KV prefetch slots.
+
+        Popped items (with their child requests) that fit within
+        ``max_num_active_requests - total_num_active_requests`` use the
+        regular slots. Later items use the prefetch slots and must be
+        generation-only requests without child requests; the first item that
+        is not, and everything after it, go back to the front of the waiting
+        queue so FCFS order is kept.
+        """
+        regular = self.max_num_active_requests - total_num_active_requests
+        cut = len(new_requests)
+        used = 0
+        for idx, item in enumerate(new_requests):
+            used += 1 + len(item.child_req_ids or ())
+            if used <= regular:
+                continue
+            request = item.request
+            if (item.child_req_ids or request is None
+                    or getattr(request, "request_type", None)
+                    != RequestType.REQUEST_TYPE_GENERATION_ONLY):
+                cut = idx
+                break
+        if cut < len(new_requests):
+            waiting_queue.prepend_requests(new_requests[cut:])
+        return new_requests[:cut]
 
     def _configure_benchmark_req_queues_size(self) -> None:
         """Clamp the benchmark fill target to the request admission ceiling."""
@@ -6296,6 +6340,10 @@ class PyExecutor:
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
+        if (new_requests and not self.enable_attention_dp
+                and getattr(self, "disagg_gen_prefetch_requests", 0) > 0):
+            new_requests = self._limit_prefetch_admission(
+                waiting_queue, new_requests, total_num_active_requests)
         if (not new_requests or
                 not getattr(self, "_mm_encoder_item_scheduling_enabled", False)
                 or self.enable_attention_dp):

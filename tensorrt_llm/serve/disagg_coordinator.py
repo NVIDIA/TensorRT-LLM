@@ -227,19 +227,57 @@ class DisaggCoordinatorService(DisaggCoordinator):
         normalized_role = self._normalize_role(role)
         router = self._router_for_role(normalized_role)
         reservation_key = (normalized_role, req_id)
+        if getattr(router, "placement_hold_timeout_s", None) is not None:
+            server, info, request_id = await self._select_with_hold(
+                router, reservation_key, routing_key, req_id, exclude_server
+            )
+        else:
+            async with self._reservation_lock(reservation_key):
+                previous = self._reservation_tasks.pop(reservation_key, None)
+                if previous is not None:
+                    previous.cancel()
+                    await router.finish_request_by_id(req_id, False)
+                server, info, request_id = await router.get_next_server_by_key(
+                    routing_key, req_id=req_id, exclude_server=exclude_server
+                )
+                self._reservation_tasks[reservation_key] = asyncio.create_task(
+                    self._expire_reservation(reservation_key, router)
+                )
+        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
+        return server, self._compact_route_info(info), request_id
+
+    async def _select_with_hold(
+        self,
+        router: Router,
+        reservation_key: tuple[str, int],
+        routing_key,
+        req_id,
+        exclude_server: Optional[str],
+    ) -> Tuple[str, dict, Optional[str]]:
+        """Place through a router that may hold the request until a server frees.
+
+        The placement runs outside the reservation lock: the lock stripes are
+        shared with ``finish``, and a finish is what frees the server a held
+        placement waits for.
+        """
         async with self._reservation_lock(reservation_key):
             previous = self._reservation_tasks.pop(reservation_key, None)
             if previous is not None:
                 previous.cancel()
                 await router.finish_request_by_id(req_id, False)
-            server, info, request_id = await router.get_next_server_by_key(
-                routing_key, req_id=req_id, exclude_server=exclude_server
-            )
-            self._reservation_tasks[reservation_key] = asyncio.create_task(
-                self._expire_reservation(reservation_key, router)
-            )
-        self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
-        return server, self._compact_route_info(info), request_id
+        server, info, request_id = await router.get_next_server_by_key(
+            routing_key, req_id=req_id, exclude_server=exclude_server
+        )
+        async with self._reservation_lock(reservation_key):
+            stale = self._reservation_tasks.pop(reservation_key, None)
+            if stale is not None:
+                stale.cancel()
+            # A finish that landed between placement and here already released it.
+            if router.has_placement(req_id):
+                self._reservation_tasks[reservation_key] = asyncio.create_task(
+                    self._expire_reservation(reservation_key, router)
+                )
+        return server, info, request_id
 
     @staticmethod
     def _compact_route_info(info: dict) -> dict:
