@@ -149,6 +149,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_k
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa import (
     qsa_paged_sparse_gqa,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (
+    qsa_paged_sparse_gqa_nvfp4,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_topk_expand_decode import (
     qsa_topk_expand_decode,
 )
@@ -187,7 +190,6 @@ from .ops.attention.qsa_nvfp4_pages_to_bf16 import qsa_nvfp4_pages_to_bf16
 from .ops.attention.qsa_paged_sparse_gqa_decode import MAX_ROWS as _SPARSE_DECODE_MAX_ROWS
 from .ops.attention.qsa_paged_sparse_gqa_decode import qsa_paged_sparse_gqa_decode
 from .ops.attention.qsa_paged_sparse_gqa_decode import supports as _sparse_decode_supports
-from .ops.attention.qsa_paged_sparse_gqa_nvfp4 import qsa_paged_sparse_gqa_nvfp4
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_decode import qsa_paged_sparse_gqa_nvfp4_decode
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import qsa_paged_sparse_gqa_nvfp4_verify
 from .ops.attention.qsa_paged_sparse_gqa_nvfp4_verify import takes_grouped as _verify_takes_grouped

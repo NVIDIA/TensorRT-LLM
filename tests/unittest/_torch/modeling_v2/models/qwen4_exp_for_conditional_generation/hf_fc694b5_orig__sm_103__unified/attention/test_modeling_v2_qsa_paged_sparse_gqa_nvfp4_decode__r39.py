@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention import (  # noqa: E501
-    qsa_paged_sparse_gqa_nvfp4__r38 as _nvfp4_module,
+    qsa_paged_sparse_gqa_nvfp4 as _nvfp4_module,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_paged_sparse_gqa_nvfp4_decode__r39 import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4_decode as op,

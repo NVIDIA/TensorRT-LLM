@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""QSA sparse GQA over an NVFP4 paged pool: attention over explicitly selected tokens."""
+"""QSA sparse GQA over an NVFP4 paged pool: attention over explicitly selected tokens.
+
+Promoted from the copies of the qwen4_exp tp1 target and the unified target; the cells are
+the tp1 target's and dep4's.
+"""
 
 from __future__ import annotations
 
@@ -10,12 +14,12 @@ import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Approved exception (as for `qsa_paged_sparse_gqa`): QSA's sparse path has no torch.ops
 # surface; its row-count PDL policy is reached as Python. The split-K buckets are this
 # entry's own: an NVFP4 tile needs 16 tokens where the bf16 one takes 64.
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import _qsa_pdl_enabled
+
+from .._op import Arch, Cell, OpWrapper
 
 #: Base-2 online softmax: scores are scaled by log2(e) once.
 _LOG2_E = tl.constexpr(1.4426950408889634)
@@ -69,6 +73,30 @@ def _spec(**overrides) -> dict:
 def _decode(segments, launches=_SPLIT_K, **overrides) -> dict:
     base = dict(segments=segments, slots=32, prefill_pair=False, launches=launches)
     return _spec(**{**base, **overrides})
+
+
+#: One dep4 rank's engine under `kv_nvfp4` (attention DP, so tp1's 24/2 x 256 geometry):
+#: `max_batch_size` 32 a rank and `max_seq_len` 9216 give a `[32, 292]` table
+#: (`ceil((9216 + 1) / 32)` rounded up to a multiple of 4); the trunk layout's 24 role pages
+#: a slot, layer 11's planes the last of them.
+_DEP4 = dict(pages=292, slots=32, slot_pages=24, layer=11)
+
+#: The byte offset the dep4 cells' pools straddle: one page of layer 11's scale plane
+#: advances 24 x 2 x 32 x 16 bytes, so from page 87382 on it lies past 2^31 bytes (the data
+#: plane, 8x wider, from page 10923). A dep4 pool holds far more pages than either.
+_OFFSET_EDGE = 2**31
+
+
+def _dep4_context(segments, pool_pages) -> dict:
+    """A context step of dep4's kv_nvfp4 engine: the prefill pair, the prefill kernel."""
+    return _decode(
+        segments,
+        launches=_PREFILL,
+        prefill_pair=True,
+        pool_pages=pool_pages,
+        offset_edge=_OFFSET_EDGE,
+        **_DEP4,
+    )
 
 
 @triton.jit
@@ -935,6 +963,18 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
             why="captured decode: G 1, 8 and 32 requests x 1 and 8 rows, replay == eager",
             spec=_decode((), slots=32, capture=dict(groups=(1, 8, 32), rows_per_request=(1, 8))),
         ),
+        Cell(
+            why="dep4 8192-row context chunk (max_num_tokens): a request at 1152..9215 "
+            "(max_seq_len, table column 287) and one from 0, [32, 292] table, trunk layout, "
+            "pages straddling 2^31 bytes of the scale plane; 87408 pages",
+            spec=_dep4_context(((1152, 8064), (0, 128)), pool_pages=87408),
+        ),
+        Cell(
+            why="dep4 512-row context step (the chunked variant's max_num_tokens): four "
+            "requests' chunks, one ending at max_seq_len, one crossing the 2048-token "
+            "selection budget; 87401 pages (not a multiple of 16)",
+            spec=_dep4_context(((8960, 256), (0, 160), (2000, 64), (5000, 32)), pool_pages=87401),
+        ),
     )
 
     note = """
@@ -948,7 +988,11 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
 
     Call sites (the target's `modeling.py`): the context/mixed forward passes the
     prefill pair on every step, the decode forward never does; both pass `q` as
-    the 24-head slice of the packed QKV row (row stride 7168).
+    the 24-head slice of the packed QKV row (row stride 7168). In the unified
+    target only dep4's `kv_nvfp4` engine binds an NVFP4 pool, with tp1's 24/2 x 256
+    geometry (attention DP): its context steps, up to `max_num_tokens` 8192 rows (512
+    in the chunked variant), over a `[32, 292]` table (`max_batch_size` 32 a rank,
+    `max_seq_len` 9216) and the trunk layout's 24 role pages a slot.
 
     Launch shapes at Hkv 2 (programs = rows x 2): split-K at 32-token tiles
     64-way up to 2 rows, 16-way up to 8, 8-way up to 16 and 4-way up to 32
@@ -973,12 +1017,27 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     [32, 260] table; a replay after new operands are written in place is
     bitwise the eager call on them.
 
-    Compiled variants: the kernels take the pool's page count (`num_pages`), the
+    Compiled variants: the kernels are Triton, JIT-compiled on first call for the
+    device that runs them; every cell ran that path on sm_103 (GB300). They take
+    the pool's page count (`num_pages`), the
     table's row count (`num_requests`) and the split-K kernel the step's row
     count as plain ints, and Triton compiles each apart at 1, at multiples of 16
     and otherwise. Every cell runs a 32-row table (a multiple of 16); the other
-    table-height classes are not certified. Every other plain int -- the strides, the table width 260 and
-    the selection's row stride 2051 -- is fixed at the served value the cells use.
+    table-height classes are not certified. The page count is driven at both the
+    multiple-of-16 class and the other (the dep4 cells: 87408 and 87401). Every other
+    plain int -- the strides, the table widths 260 (tp1) and 292 (dep4) and the
+    selection's row stride 2051 -- is fixed at the served values the cells use.
+
+    Large pools: every page index is widened to 64 bits before its product with a
+    plane's page stride. In the trunk layout one page of a layer's scale plane
+    advances 24 x 2 x 32 x 16 bytes and of its data plane 8x that, so a pool past
+    87381 pages addresses both planes past 2^31 bytes; the dep4 cells place their
+    requests' pages on both sides of that edge in the scale plane (the test asserts
+    it), with every scale outside them NaN. Measured on GB300 against `reference`:
+    at 8192 rows at most 2.00 bf16 ulp of a row's magnitude (99.9th percentile 0.82),
+    relative RMS 0.25 ulp, cosine 0.9999996; at 512 rows 1.98 / 0.85 / 0.24 ulp. A table
+    shifted by one page measures 821 / 904 ulp and one dropped token a row 477 / 305 ulp,
+    against the test's band of 4 per element and 2 RMS.
 
     Preconditions:
       - Whenever the prefill kernel can run, each selection row is packed at the
@@ -999,11 +1058,13 @@ class QsaPagedSparseGqaNvfp4(OpWrapper):
     Every row, request, page and position index is widened to 64 bits before any
     product. Not certified: head geometries other than 24/2 x 256;
     `tokens_per_block` other than 32; more than 8192 rows; capture of the
-    context/mixed site; a pool of one slot; second-level scales other than 1.0;
-    the prefill pair on the split-K kernel (256 context rows or fewer); one split
-    without a merge; the trunk layout on the prefill kernel; rows whose selection
-    resolves no token (all padding, a foreign request, unmapped pages); an fp16
-    or unsliced q; int64 request indices.
+    context/mixed site; a pool of one slot; second-level scales other than 1.0
+    (the target binds ones); the prefill pair on the split-K kernel (256 context
+    rows or fewer); one split without a merge; rows whose selection resolves no
+    token (all padding, a foreign request, unmapped pages); an fp16 or unsliced q;
+    int64 request indices; dep4's own measured pool page count (the cells' pools
+    are sized to the 2^31-byte edge rather than to an engine's allocation, which
+    is larger); positions past `max_seq_len` 9216.
     """
 
     def __call__(

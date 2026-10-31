@@ -2,9 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """QSA sparse GQA over an NVFP4 paged K/V pool, decode rows: CuTe DSL split-K + merge.
 
-This target's local variant of the tp1 target's `ops/attention/qsa_paged_sparse_gqa_nvfp4_decode`,
-the kernels unchanged, carrying dep4's `kv_nvfp4` decode cells until the promotion merges the
-two into the catalog.
+Promoted from the copies of the qwen4_exp tp1 target and the unified target, the kernels
+unchanged; the cells are the tp1 target's and dep4's `kv_nvfp4` decode cells.
 
 CuTe DSL written for the tp1 target, both launches. One CTA (eight warps) serves one
 (row, KV head, split) and walks the split's tiles of 64 selected tokens with an online
@@ -49,10 +48,11 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (
+    qsa_paged_sparse_gqa_nvfp4 as _composition,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
-
-from .qsa_paged_sparse_gqa_nvfp4__r38 import qsa_paged_sparse_gqa_nvfp4 as _composition
 
 TILE = 64
 WARPS = 8

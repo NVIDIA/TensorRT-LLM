@@ -16,8 +16,9 @@ import triton
 import triton.language as tl
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from .qsa_paged_sparse_gqa_nvfp4 import _e2m1_to_f32
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (
+    _e2m1_to_f32,
+)
 
 #: Values per e4m3 block scale, e2m1 values per byte, tokens per V scale group.
 _SF_VEC = 16

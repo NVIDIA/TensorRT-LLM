@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for this target's qsa_paged_sparse_gqa_nvfp4 variant (`__r38`).
+"""GPU test for the unified target's qsa_paged_sparse_gqa_nvfp4 variant (`__r38`).
 
 The paged state is real: one NVFP4 pool as the QSA cache manager serves it --
 e2m1 data `[pages, 2, kv, tpb, D/2]` and e4m3 block scales `[pages, 2, kv, tpb,
@@ -20,15 +20,15 @@ import re
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention import (  # noqa: E501
-    qsa_paged_sparse_gqa_nvfp4__r38 as _entry,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention.qsa_paged_sparse_gqa_nvfp4__r38 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_sparse_gqa_nvfp4 import (  # noqa: E501
     qsa_paged_sparse_gqa_nvfp4 as op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp_for_conditional_generation.hf_fc694b5_orig__sm_103__unified.ops.attention import (  # noqa: E501
+    qsa_paged_sparse_gqa_nvfp4 as _entry,
 )
 from tensorrt_llm._torch.attention.backends.sparse.qsa.kernels import triton_qsa_paged_sparse_gqa
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402,F401
 
 assert torch.cuda.is_available(), "qsa_paged_sparse_gqa_nvfp4 requires a CUDA device"
