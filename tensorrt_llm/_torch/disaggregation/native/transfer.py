@@ -2848,8 +2848,9 @@ class Receiver(ReceiverBase):
     ) -> bool:
         """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
         The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
+          * every head duplication factor is 1, rank-wide and in each matched view pair (target
+            and draft views may replicate heads differently) -- else some ranks don't send KV yet
+            still count in expected_transfers, so the live writers overflow their slots;
           * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
             for PP fan-in, every overlapping stage must hold the same number of layers
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
@@ -2857,7 +2858,14 @@ class Receiver(ReceiverBase):
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
         Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
         the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
+        # Any duplicated head, rank-wide or in a single view pair, leaves some
+        # writers without a share (sender side) or doubles one (receiver side).
+        view_factors = getattr(overlap, "view_duplicate_head_factors", {}).values()
+        if (
+            overlap.duplicate_head_factor != 1
+            or overlap.peer_duplicate_head_factor != 1
+            or any(factor != 1 for pair in view_factors for factor in pair)
+        ):
             return False
         if overlap.overlap_pp_size > 1:
             lpp = getattr(peer_ri, "layer_num_per_pp", None)
@@ -2953,16 +2961,19 @@ class Receiver(ReceiverBase):
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
         # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
+        # _fanin_bounce_safe() (TP-by-head), and never under ADP broadcast (sender_dp_rank
         # None), where the real writer count exceeds expected_transfers and would overflow the slot.
         topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
         # Helix writers contribute unequal shares (one KV owner, one state
         # sender, the rest empty), so the fan-in equal split would overflow
         # into neighboring reservations; use the per-fragment path.
         cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
+        # Rank 0's page table cannot establish equal writer shares for other
+        # PP stages, so multi-writer PP transfers use the per-fragment path.
         allow_bounce = task.expected_transfers == 1 or (
             sender_dp_rank is not None
             and not cp_involved
+            and peer_infos.pp_size <= 1
             and self._fanin_bounce_safe(
                 topo_overlap,
                 peer_infos,
@@ -3108,6 +3119,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_view_head_geometry(sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "

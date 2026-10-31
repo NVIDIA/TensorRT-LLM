@@ -38,7 +38,12 @@ from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
     PLE_NGRAM_CONTEXT,
     Qwen4ExpHybridCacheManager,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaRole
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     CacheTypeCpp,
@@ -226,7 +231,7 @@ def test_layer_group_meta_serialization():
         dtype=BUFFER_ENTRY_DTYPE,
     )
     kv_pool = PhysicalPool(base_address=1000, slot_bytes=512, num_slots=10)
-    pv = PoolView(pool_idx=0, buffer_entries=entries)
+    pv = PoolView(pool_idx=0, buffer_entries=entries, num_kv_heads=4)
     local_layers = [
         LocalLayer(local_layer_id=0, global_layer_id=0),
         LocalLayer(local_layer_id=1, global_layer_id=1),
@@ -251,6 +256,10 @@ def test_layer_group_meta_serialization():
     assert restored_lg.kv_head_num_per_rank == 4
     assert len(restored_lg.local_layers) == 2
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
+    assert restored_lg.pool_views[0].num_kv_heads == 4
+    # Older page tables omit per-view metadata and retain the rank-wide fallback.
+    del d["layer_groups"][0]["pool_views"][0]["num_kv_heads"]
+    assert KVCachePageTable.from_dict(d).layer_groups[0].pool_views[0].num_kv_heads is None
 
 
 def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
@@ -319,6 +328,7 @@ def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_l
     )
 
 
+@pytest.mark.cpu_only
 def test_v2_builder_stamps_homogeneous_pool_kinds():
     """Split KV / INDEX_KEY pools get NHD and REPLICATED views respectively."""
     from types import SimpleNamespace
@@ -341,10 +351,93 @@ def test_v2_builder_stamps_homogeneous_pool_kinds():
     assert len(views) == 2
     assert views[0].pool_role == frozenset({"key", "value"})
     assert views[0].mapper_kind == MapperKind.NHD
+    assert views[0].num_kv_heads == 1
     assert get_unique_layers(views[0]) == {0, 1}
     assert views[1].pool_role == frozenset({"index_key"})
     assert views[1].mapper_kind == MapperKind.REPLICATED
+    assert views[1].num_kv_heads is None
     assert get_unique_layers(views[1]) == {1}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "owners, head_counts, expected_num_views",
+    [
+        pytest.param(("target", "target"), (2, 2), 1, id="target-uniform-heads"),
+        pytest.param(("target", "target"), (2, 1), 2, id="target-mixed-heads"),
+        pytest.param(("target", "draft"), (2, 2), 2, id="mixed-owners-uniform-heads"),
+        pytest.param(("target", "draft"), (2, 1), 2, id="mixed-owners-mixed-heads"),
+        pytest.param(("draft", "draft"), (2, 1), 2, id="draft-mixed-heads"),
+    ],
+)
+def test_v2_builder_partitions_coalesced_views_by_owner_and_heads(
+    owners: tuple[str, str], head_counts: tuple[int, int], expected_num_views: int
+) -> None:
+    from types import SimpleNamespace
+
+    # FP16 (2 heads, dim 64) and (1 head, dim 128) share a 4096-byte K/V
+    # buffer size at 16 tokens per block.
+    buffer_size = 4096
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0,
+            pool_index=0,
+            offset=(2 * layer + role_index) * buffer_size,
+            size=buffer_size,
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(
+        attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(4 * buffer_size,)
+    )
+    manager.num_kv_heads_per_layer = list(head_counts)
+    manager.layer_specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=KVCacheLayerOwner(owners[layer]),
+            dtype=DataType.HALF,
+            num_kv_heads=heads,
+            head_dim=128 // heads,
+            buffer_roles=(Role.KEY, Role.VALUE),
+        )
+        for layer, heads in enumerate(head_counts)
+    )
+    manager.get_disagg_pool_view_partition = (
+        KVCacheManagerV2.get_disagg_pool_view_partition.__get__(manager)
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+
+    assert len(views) == expected_num_views
+    if expected_num_views == 2:
+        assert [view.num_kv_heads for view in views] == list(head_counts)
+        assert [get_unique_layers(view) for view in views] == [{0}, {1}]
+        assert [view.pool_idx for view in views] == [0, 0]
+        assert [view.buffer_entries["offset"].tolist() for view in views] == [
+            [0, buffer_size],
+            [2 * buffer_size, 3 * buffer_size],
+        ]
+    else:
+        assert views[0].num_kv_heads == 2
+        assert get_unique_layers(views[0]) == {0, 1}
+
+
+@pytest.mark.cpu_only
+def test_v2_builder_rejects_mixed_heads_without_view_partition():
+    from types import SimpleNamespace
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * layer + role_index) * 128, size=128
+        )
+        for layer in range(2)
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}, slot_bytes_list=(512,))
+    manager.num_kv_heads_per_layer = [2, 1]
+    with pytest.raises(ValueError, match="different per-rank KV-head counts"):
+        build_page_table_from_manager(manager)
 
 
 def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():

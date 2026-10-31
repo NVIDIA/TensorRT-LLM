@@ -238,8 +238,15 @@ def test_fanin_bounce_safe_gate() -> None:
 
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup: int, pp: int, ranks: tuple[int, ...] = (0,)) -> SimpleNamespace:
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
+    def ov(
+        dup: int, pp: int, ranks: tuple[int, ...] = (0,), *, peer_dup: int = 1
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            duplicate_head_factor=dup,
+            peer_duplicate_head_factor=peer_dup,
+            overlap_pp_size=pp,
+            ranks=list(ranks),
+        )
 
     def ri(lpp: list[int], page_table: SimpleNamespace | None = None) -> SimpleNamespace:
         return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
@@ -248,10 +255,13 @@ def test_fanin_bounce_safe_gate() -> None:
         view = SimpleNamespace(mapper_kind=mapper_kind)
         return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
-    # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
+    # A single PP stage is safe only when neither side duplicates heads.
     assert safe(ov(1, 1), ri([24]), None) is True
     assert safe(ov(1, 0), ri([24]), None) is True
     assert safe(ov(2, 1), ri([24]), None) is False  # duplicate heads / MLA -> some don't send
+    # The sender can duplicate heads even when the receiver does not. With
+    # no per-view overrides, this must still disable the equal writer split.
+    assert safe(ov(1, 1, ranks=(0, 1), peer_dup=2), ri([24]), None) is False
     # EVEN PP fan-in (equal layers per overlapping stage) -> allowed
     assert safe(ov(1, 4), ri([20, 20, 20, 20]), None) is True
     # UNEVEN PP fan-in -> per-writer sizes differ -> fall back
@@ -282,6 +292,28 @@ def test_fanin_bounce_safe_gate() -> None:
             pt(MapperKind.NHD),
         )
         is True
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "view_factors,expected", [((1, 1), True), ((2, 1), False), ((1, 2), False)]
+)
+def test_fanin_bounce_checks_per_view_head_duplication(view_factors, expected):
+    tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap
+
+    overlap = PeerOverlap(
+        duplicate_head_factor=1,
+        overlap_pp_size=1,
+        ranks=[0, 1],
+        view_duplicate_head_factors={(0, 1): view_factors},
+    )
+    assert (
+        tfr.Receiver._fanin_bounce_safe(
+            overlap, SimpleNamespace(layer_num_per_pp=[2], page_table=None), None
+        )
+        is expected
     )
 
 
