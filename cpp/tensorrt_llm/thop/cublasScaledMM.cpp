@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (out) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,9 @@
 #include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "userbuffersTensor.h"
+#include <c10/cuda/CUDAGuard.h>
 #include <cublasLt.h>
+#include <cuda.h>
 #include <torch/extension.h>
 #include <unordered_map>
 
@@ -40,6 +42,34 @@ using tensorrt_llm::common::check;
 using tensorrt_llm::common::CublasMMWrapper;
 
 using cublas_lut::AlgoListType;
+
+CUcontext getCurrentCudaContext()
+{
+    CUcontext context{};
+    CUresult result = cuCtxGetCurrent(&context);
+    if (result == CUDA_ERROR_NOT_INITIALIZED || context == nullptr)
+    {
+        TLLM_CUDA_CHECK(cudaFree(nullptr));
+        result = cuCtxGetCurrent(&context);
+    }
+    TLLM_CHECK_WITH_INFO(result == CUDA_SUCCESS, "cuCtxGetCurrent failed with error %d", result);
+    TLLM_CHECK_WITH_INFO(context != nullptr, "Current CUDA context is null");
+    return context;
+}
+
+std::shared_ptr<CublasMMWrapper> getCublasWrapper()
+{
+    thread_local std::unordered_map<CUcontext, std::shared_ptr<CublasMMWrapper>> cublasWrappers;
+    auto& cublasWrapper = cublasWrappers[getCurrentCudaContext()];
+    if (!cublasWrapper)
+    {
+        auto cublasHandle = getCublasHandle();
+        auto cublasLtHandle = getCublasLtHandle();
+        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
+    }
+
+    return cublasWrapper;
+}
 
 void set_algo_attr(cublasLtMatmulAlgo_t& algo, std::array<int, 8> const& attr_list)
 {
@@ -165,14 +195,14 @@ inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t str
 {
     struct KeyHash
     {
-        std::size_t operator()(std::pair<int, cudaStream_t> const& key) const noexcept
+        std::size_t operator()(std::pair<CUcontext, cudaStream_t> const& key) const noexcept
         {
-            return std::hash<int>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
+            return std::hash<CUcontext>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
         }
     };
 
-    thread_local std::unordered_map<std::pair<int, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
-    auto key = std::make_pair(device.index(), stream);
+    thread_local std::unordered_map<std::pair<CUcontext, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
+    auto key = std::make_pair(getCurrentCudaContext(), stream);
 
     if (workspace_tensors.find(key) == workspace_tensors.end())
     {
@@ -197,13 +227,8 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     int32_t n = b.sizes()[1];
     int32_t k = a.sizes()[1];
 
-    thread_local std::shared_ptr<CublasMMWrapper> cublasWrapper;
-    if (cublasWrapper == nullptr)
-    {
-        auto cublasHandle = getCublasHandle();
-        auto cublasLtHandle = getCublasLtHandle();
-        cublasWrapper = std::make_shared<CublasMMWrapper>(cublasHandle, cublasLtHandle, nullptr, nullptr);
-    }
+    at::cuda::CUDAGuard deviceGuard(a.device());
+    auto cublasWrapper = getCublasWrapper();
 
     cudaDataType_t aType = convert_torch_dtype(a.scalar_type());
     cudaDataType_t bType = convert_torch_dtype(b.scalar_type());
