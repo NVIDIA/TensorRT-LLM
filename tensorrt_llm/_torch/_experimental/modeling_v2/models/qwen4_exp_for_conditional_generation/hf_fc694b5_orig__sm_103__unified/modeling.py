@@ -243,6 +243,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_rows_g
     gdn_decode_rows,
     gdn_decode_rows_gated_norm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_prefill_conv_post import (
+    gdn_prefill_conv_post,
+)
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -274,7 +277,6 @@ from .ops.moe.fp4_block_scale_moe_runner__r4 import fp4_block_scale_moe_runner
 from .ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update__r46 import (
     fused_recurrent_gated_delta_rule_cached_replay_update,
 )
-from .ops.ssm.gdn_prefill_conv_post__r27 import gdn_prefill_conv_post
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.

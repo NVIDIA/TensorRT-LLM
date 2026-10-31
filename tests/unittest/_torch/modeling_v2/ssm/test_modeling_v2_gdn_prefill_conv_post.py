@@ -3,8 +3,14 @@
 """GPU test for the gdn_prefill_conv_post entry.
 
 Every cell is checked against the entry's fp32/fp64 reference, the conv pool
-bitwise. Geometry is a Qwen3.8-Flash-Next linear-attention layer: 16 x 128 key heads,
-48 x 128 value heads, qkv_dim 10240, conv width 4, bf16 activations.
+bitwise. Geometry is a Qwen3.8-Flash-Next linear-attention layer, conv width 4, bf16
+activations: the whole layer (16 x 128 key heads, 48 x 128 value heads, qkv_dim 10240,
+a 16480-wide projection) at tp1 and on a dep4 rank, a quarter of it (4 / 12 heads,
+qkv_dim 2560, a 4120-wide projection) on a tp4 or tep4 rank. The pool is a view of a
+bigger buffer, which the test also checks the call leaves alone outside the view: a
+two-layer buffer for the tp1 cells, the stock manager's page (36 GDN layers a slot,
+the view at the last) for a rank's cells: at an engine's measured slot count, or at
+slots whose offset passes 2^31 elements.
 """
 
 import math
@@ -13,7 +19,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_prefill_conv_post import (  # noqa: E501
     A_LOG_RANGE,
     CONV_WIDTH,
     DT_BIAS_RANGE,
@@ -26,18 +32,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
     SOFTPLUS_THRESHOLD,
     _engine_slots,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.gdn_prefill_conv_post import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_prefill_conv_post import (  # noqa: E501
     gdn_prefill_conv_post as op,
 )
 
-__extra_import_path__ = ["../../../.."]
+__extra_import_path__ = [".."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "gdn_prefill_conv_post requires a CUDA device"
 
 DEV = "cuda"
 DTYPE = torch.bfloat16
-HEADS = (NUM_K_HEADS, HEAD_K_DIM, NUM_V_HEADS, HEAD_V_DIM)
 PAD = -1
 L2_NORM_EPS = 1e-6
 #: `g`'s band, derived as in the fused_gdn_post_conv entry test: two SASS
@@ -45,7 +50,21 @@ L2_NORM_EPS = 1e-6
 #: the threshold, every term scaled by exp(A_log).
 _APPROX_ULP = 2.0**-22
 G_ATOL = 4 * _APPROX_ULP * SOFTPLUS_THRESHOLD * math.exp(A_LOG_RANGE[1])
-A_COL = QKV_DIM + NUM_V_HEADS * HEAD_V_DIM
+
+
+def _geometry(spec):
+    """`(num_k_heads, num_v_heads, head_dim, qkv_dim, projection width)` of a cell: its
+    own, or the tp1 layer's."""
+    hk = spec.get("num_k_heads", NUM_K_HEADS)
+    hv = spec.get("num_v_heads", NUM_V_HEADS)
+    d = spec.get("head_dim", HEAD_K_DIM)
+    assert d == HEAD_K_DIM == HEAD_V_DIM
+    qkv = 2 * hk * d + hv * d
+    width = spec.get("x_row_stride", IN_PROJ_WIDTH)
+    assert width == qkv + hv * d + 2 * hv, (
+        f"x_row_stride {width} is not the [q|k|v|z|a|b] projection of {hk}/{hv} heads"
+    )
+    return hk, hv, d, qkv, width
 
 
 def _build(spec, seed):
@@ -53,22 +72,28 @@ def _build(spec, seed):
     g = torch.Generator(device=DEV).manual_seed(seed)
     lengths = spec["lengths"]
     n_tok = sum(lengths)
+    hk, hv, d, qkv, width = _geometry(spec)
+    a_col = qkv + hv * d
 
     def randn(*shape):
         return torch.randn(*shape, generator=g, device=DEV).to(DTYPE)
 
     # "in_proj" and "rows" both carve x, a and b out of one projection; "rows"
     # leaves `extra_rows` trailing rows the call must not read.
-    proj = randn(n_tok + spec.get("extra_rows", 0), IN_PROJ_WIDTH)
-    x = proj[:n_tok, :QKV_DIM]
-    a = proj[:n_tok, A_COL : A_COL + NUM_V_HEADS]
-    b = proj[:n_tok, A_COL + NUM_V_HEADS :]
-    assert x.stride(0) == a.stride(0) == IN_PROJ_WIDTH
-    weight = (torch.randn(QKV_DIM, CONV_WIDTH, generator=g, device=DEV) * 0.5).to(DTYPE)
+    proj = randn(n_tok + spec.get("extra_rows", 0), width)
+    x = proj[:n_tok, :qkv]
+    a = proj[:n_tok, a_col : a_col + hv]
+    b = proj[:n_tok, a_col + hv : a_col + 2 * hv]
+    assert x.stride(0) == a.stride(0) == width
+    weight = (torch.randn(qkv, CONV_WIDTH, generator=g, device=DEV) * 0.5).to(DTYPE)
     pool_slots = spec["pool_slots"]
-    # The pool is a per-layer view of a two-layer buffer, as a cache manager
-    # hands it out: slot stride twice the slot's own size.
-    conv_states = randn(pool_slots, 2, QKV_DIM, CONV_WIDTH - 1)[:, 1]
+    # The pool is a per-layer view of a multi-layer buffer, as a cache manager
+    # hands it out: two layers for the tp1 cells (slot stride twice the slot's own
+    # size); for a rank's cells the stock page, `page_layers` (36) GDN layers'
+    # states a slot, viewed at the last -- the strides and offset the manager's
+    # `get_conv_states` returns, measured.
+    layers = spec.get("page_layers", 2)
+    conv_states = randn(pool_slots, layers, qkv, CONV_WIDTH - 1)[:, layers - 1]
     slots = spec.get("slots") or _engine_slots(len(lengths))
     bounds = [0]
     for n in lengths:
@@ -77,9 +102,9 @@ def _build(spec, seed):
     si = torch.tensor(slots, dtype=torch.int32, device=DEV)
     hi = torch.tensor(spec["initial"], dtype=torch.bool, device=DEV)
     lo, hi_ = A_LOG_RANGE
-    A_log = torch.rand(NUM_V_HEADS, generator=g, device=DEV) * (hi_ - lo) + lo
+    A_log = torch.rand(hv, generator=g, device=DEV) * (hi_ - lo) + lo
     lo, hi_ = DT_BIAS_RANGE
-    dt_bias = torch.rand(NUM_V_HEADS, generator=g, device=DEV) * (hi_ - lo) + lo
+    dt_bias = torch.rand(hv, generator=g, device=DEV) * (hi_ - lo) + lo
     return [
         x,
         weight,
@@ -91,7 +116,10 @@ def _build(spec, seed):
         b,
         A_log,
         dt_bias,
-        *HEADS,
+        hk,
+        d,
+        hv,
+        d,
         PAD,
         L2_NORM_EPS,
         SOFTPLUS_THRESHOLD,
@@ -123,11 +151,34 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     args = _build(cell.spec, seed=zlib.crc32(cell.why.encode()))
     want = op.reference(*args)
     inputs = [t.clone() if isinstance(t, torch.Tensor) else t for t in args]
+    pool = args[2]
+    page = pool._base
+    page_before = page.clone()
     out = op(*args)
     for i, (arg, before) in enumerate(zip(args, inputs)):
         if isinstance(arg, torch.Tensor) and i != 2:
             assert torch.equal(arg, before), f"input {i} must be read-only"
-    _compare(out, args[2], want, what=f"{cell.why[:30]} vs reference")
+    _compare(out, pool, want, what=f"{cell.why[:30]} vs reference")
+    # The rest of the buffer -- the other layers' sub-pages of every slot -- is untouched.
+    layer = (pool.storage_offset() - page.storage_offset()) // page.stride(1)
+    page_before[:, layer] = want[5]
+    assert torch.equal(page, page_before), "the call wrote outside its layer's view of the pool"
+
+
+def test_cells_carry_from_slots_past_the_int32_offset() -> None:
+    """The cells read a carried window at a slot whose element offset on the stock page
+    passes 2^31 at both rank geometries, and 2^32 at 16 / 48 heads -- where a 32-bit slot
+    offset faults or wraps back into the page -- so the 64-bit slot base stays exercised."""
+    reach = {}
+    for cell in op.CELLS:
+        spec = cell.spec
+        if "page_layers" not in spec:
+            continue
+        hk, _, _, qkv, _ = _geometry(spec)
+        slot_stride = spec["page_layers"] * qkv * (CONV_WIDTH - 1)
+        carried = [s for s, init in zip(spec["slots"], spec["initial"]) if init]
+        reach[hk] = max([reach.get(hk, 0)] + [s * slot_stride for s in carried])
+    assert reach[NUM_K_HEADS] >= 2**32 and reach[NUM_K_HEADS // 4] >= 2**31, reach
 
 
 def test_guard_refuses_channel_strided_x() -> None:

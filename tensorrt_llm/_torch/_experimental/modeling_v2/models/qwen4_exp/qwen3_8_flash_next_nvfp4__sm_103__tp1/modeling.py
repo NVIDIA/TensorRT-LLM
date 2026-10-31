@@ -252,6 +252,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_decode_rows_g
     gdn_decode_rows,
     gdn_decode_rows_gated_norm,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.ssm.gdn_prefill_conv_post import (
+    gdn_prefill_conv_post,
+)
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
@@ -341,7 +344,6 @@ from .ops.ssm.fused_recurrent_gated_delta_rule_update import fused_recurrent_gat
 from .ops.ssm.gdn_cached_replay_cute import gdn_cached_replay_cute
 from .ops.ssm.gdn_in_proj_conv1d_pdl import MAX_ROWS as _GDN_CONV_FUSED_MAX_ROWS
 from .ops.ssm.gdn_in_proj_conv1d_pdl import gdn_in_proj_conv1d_pdl
-from .ops.ssm.gdn_prefill_conv_post import gdn_prefill_conv_post
 from .ops.ssm.pack_gdn_decode_qkv import pack_gdn_decode_qkv
 from .ops.vision.patch_embed_conv3d import patch_embed_conv3d
 from .ops.vision.pos_embed_interpolate import pos_embed_interpolate

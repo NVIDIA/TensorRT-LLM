@@ -7,7 +7,7 @@ in, and each sequence's conv window published to the paged pool.
 
 The conv pass is CuTe DSL, the gates and the window publish Triton, all three
 written for the Qwen3.8-Flash-Next tp1 target (its `ops/ssm/gdn_prefill_conv_post`)
-and reused here at this target's per-rank geometries, the conv pass reading a pool
+and reused here at the unified target's per-rank geometries, the conv pass reading a pool
 slot through a 64-bit base address (on a dep4 rank's stock conv page a slot's offset
 passes 2^31 elements from slot 1942). The three-call
 composition it replaces -- `extract_transpose_prefill_slice` (token-major ->
@@ -31,8 +31,9 @@ from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 from triton.language.extra.cuda import libdevice
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch.kernels.blackwell.utils import make_ptr
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's linear-attention geometry at tp1.
 NUM_K_HEADS, HEAD_K_DIM, NUM_V_HEADS, HEAD_V_DIM = 16, 128, 48, 128
@@ -961,7 +962,7 @@ class GdnPrefillConvPost(OpWrapper):
     the factor FlashInfer's kernel takes, bitwise the `torch.exp` the chunk
     op would otherwise launch.
 
-    This target (tp4, tep4, dep4) makes the same call per rank, from its
+    The unified target (tp4, tep4, dep4) makes the same call per rank, from its
     prefill GDN core: a tp4 or tep4 rank over its own `[T, 4120]` projection
     (4 key / 12 value heads, conv dim 2560: its conv weight rows, its
     `A_log`/`dt_bias` entries and its conv pool are the rank's shares), a dep4
