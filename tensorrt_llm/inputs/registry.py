@@ -220,6 +220,10 @@ class BaseMultimodalInputProcessor(ABC):
         raise ValueError(
             "This processor does not support prepared decode inputs")
 
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return per-modality decode defaults, below server and request overrides."""
+        return {}
+
     def get_mm_item_metadata(
         self,
         prompt_token_ids: List[int],

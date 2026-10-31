@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """Reusable preferred/fallback cluster scheduling without hardware CLC."""
 
 import dataclasses
@@ -19,6 +16,8 @@ from .work_id_claim import (
     AtomicCounterWorkIdState,
     FixedGroupMixedCgaAtomicCounterWorkIdState,
     GridStrideWorkIdState,
+    broadcast_atomic_counter_ready,
+    broadcast_atomic_counter_ready_or_claim,
     claim_work_id,
     initialize_fixed_group_mixed_cga_work_id_state,
 )
@@ -49,19 +48,14 @@ class NonClcMixedCgaConfig:
                 and not isinstance(self.fallback_cluster_count, bool)
                 and self.fallback_cluster_count == 0
             )
-            if (
-                self.fallback_cluster_shape == self.preferred_cluster_shape
-                or has_no_fallback_clusters
-            ):
+            if self.fallback_cluster_shape == self.preferred_cluster_shape or has_no_fallback_clusters:
                 object.__setattr__(self, "fallback_cluster_shape", None)
                 object.__setattr__(self, "preferred_cluster_count", None)
                 object.__setattr__(self, "fallback_cluster_count", None)
 
         if self.fallback_cluster_shape is None:
             if not self._is_positive_int(self.launch_cluster_count):
-                raise ValueError(
-                    "launch_cluster_count must be positive when fallback_cluster_shape is absent."
-                )
+                raise ValueError("launch_cluster_count must be positive when fallback_cluster_shape is absent.")
             mn_split_factors = (1, 1)
             split_factor = 1
             launch_cluster_cnt_merge_as_preferred = self.launch_cluster_count
@@ -70,9 +64,7 @@ class NonClcMixedCgaConfig:
             if len(self.fallback_cluster_shape) != len(self.preferred_cluster_shape):
                 raise ValueError("preferred and fallback cluster shapes must have equal rank.")
             if not self._is_positive_int(self.preferred_cluster_count):
-                raise ValueError(
-                    "preferred_cluster_count must be positive when fallback_cluster_shape is present."
-                )
+                raise ValueError("preferred_cluster_count must be positive when fallback_cluster_shape is present.")
             if (
                 isinstance(self.fallback_cluster_count, bool)
                 or not isinstance(self.fallback_cluster_count, int)
@@ -92,16 +84,12 @@ class NonClcMixedCgaConfig:
                     self.preferred_cluster_shape, self.fallback_cluster_shape
                 )
             ):
-                raise ValueError(
-                    "Every preferred cluster dimension must be divisible by its fallback dimension."
-                )
+                raise ValueError("Every preferred cluster dimension must be divisible by its fallback dimension.")
             split_factor = self._shape_size(mn_split_factors)
             is_mixed = self.fallback_cluster_shape != self.preferred_cluster_shape
             if is_mixed:
                 if split_factor > 16 or split_factor & (split_factor - 1):
-                    raise ValueError(
-                        "The preferred/fallback cluster split factor must be a power of two at most 16."
-                    )
+                    raise ValueError("The preferred/fallback cluster split factor must be a power of two at most 16.")
                 if self.fallback_cluster_count % split_factor != 0:
                     raise ValueError(
                         "fallback_cluster_count must be divisible by the preferred/fallback cluster split factor."
@@ -110,22 +98,14 @@ class NonClcMixedCgaConfig:
                     self.preferred_cluster_count + self.fallback_cluster_count // split_factor
                 )
             else:
-                launch_cluster_cnt_merge_as_preferred = (
-                    self.preferred_cluster_count + self.fallback_cluster_count
-                )
+                launch_cluster_cnt_merge_as_preferred = self.preferred_cluster_count + self.fallback_cluster_count
 
         if launch_cluster_cnt_merge_as_preferred <= 0:
-            raise ValueError(
-                "The resolved launch must contain at least one cluster merged as preferred."
-            )
+            raise ValueError("The resolved launch must contain at least one cluster merged as preferred.")
         object.__setattr__(self, "mn_split_factors", mn_split_factors)
         object.__setattr__(self, "split_factor", split_factor)
-        object.__setattr__(
-            self, "launch_cluster_cnt_merge_as_preferred", launch_cluster_cnt_merge_as_preferred
-        )
-        object.__setattr__(
-            self, "total_cta_cnt", launch_cluster_cnt_merge_as_preferred * preferred_cluster_size
-        )
+        object.__setattr__(self, "launch_cluster_cnt_merge_as_preferred", launch_cluster_cnt_merge_as_preferred)
+        object.__setattr__(self, "total_cta_cnt", launch_cluster_cnt_merge_as_preferred * preferred_cluster_size)
         object.__setattr__(self, "is_mixed", is_mixed)
 
     @staticmethod
@@ -162,16 +142,27 @@ class NonClcMixedCgaSchedulerWorker:
         config: NonClcMixedCgaConfig,
         work_id_mode: WorkIdAcquisitionMode,
         stream_count: int,
+        work_id_stride: Optional[int] = None,
     ) -> None:
         if work_id_mode not in ("grid_stride", "atomic_counter"):
-            raise ValueError(
-                "Non-CLC mixed-CGA scheduling supports grid_stride or atomic_counter work IDs."
-            )
+            raise ValueError("Non-CLC mixed-CGA scheduling supports grid_stride or atomic_counter work IDs.")
         if isinstance(stream_count, bool) or not isinstance(stream_count, int) or stream_count <= 0:
             raise ValueError("stream_count must be a positive Python int.")
+        if work_id_stride is None:
+            work_id_stride = config.launch_cluster_cnt_merge_as_preferred
+        if isinstance(work_id_stride, bool) or not isinstance(work_id_stride, int) or work_id_stride <= 0:
+            raise ValueError("work_id_stride must be a positive Python int.")
         self.config = config
         self.work_id_mode = work_id_mode
         self.stream_count = stream_count
+        # The work stream can have fewer participants than the physical launch
+        # when some clusters only communicate. Atomic claims do not use this.
+        self.work_id_stride = work_id_stride
+
+    @property
+    def max_fallback_cluster_count(self) -> int:
+        """Upper bound on physical fallback clusters: every preferred-cluster slot of the launch split."""
+        return self.config.launch_cluster_cnt_merge_as_preferred * self.config.split_factor
 
     def register_smem_regions(self, smem_workspace: SmemWorkspace) -> None:
         """Register the cluster-local claim broadcast channel."""
@@ -197,10 +188,12 @@ class NonClcMixedCgaSchedulerWorker:
                     buffer_space="local",
                     reset="tail_reset",
                 )
+                # Under PDL more slots can split into fallback clusters than the host plan assumed: size the group
+                # table for every slot splitting.
                 device_workspace.register(
                     self.fallback_group_token_region,
                     cutlass.Int64,
-                    (self.config.fallback_cluster_count,),
+                    (self.max_fallback_cluster_count,),
                     buffer_space="local",
                     reset="tail_reset",
                 )
@@ -240,9 +233,9 @@ class NonClcMixedCgaSchedulerWorker:
                 for dimension_idx in cutlass.range_constexpr(len(self.config.mn_split_factors)):
                     preferred_dimension = self.config.preferred_cluster_shape[dimension_idx]
                     fallback_dimension = self.config.fallback_cluster_shape[dimension_idx]
-                    inner_coordinate = (
-                        Int32(block_idx[dimension_idx]) % Int32(preferred_dimension)
-                    ) // Int32(fallback_dimension)
+                    inner_coordinate = (Int32(block_idx[dimension_idx]) % Int32(preferred_dimension)) // Int32(
+                        fallback_dimension
+                    )
                     flattened_index = flattened_index + inner_coordinate * Int32(dimension_stride)
                     dimension_stride *= self.config.mn_split_factors[dimension_idx]
                 cta_coord_in_preferred_cluster = self._preferred_cluster_cta_coord(
@@ -255,20 +248,15 @@ class NonClcMixedCgaSchedulerWorker:
             cluster_pipeline = pipeline.PipelineAsync.create(
                 num_stages=1,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-                consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * active_cluster_size
-                ),
-                barrier_storage=smem_workspace.ptr(
-                    self.cluster_pipeline_mbarriers_region, smem_base
-                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32 * active_cluster_size),
+                barrier_storage=smem_workspace.ptr(self.cluster_pipeline_mbarriers_region, smem_base),
                 defer_sync=True,
             )
             atomic_counter_state = AtomicCounterWorkIdState(
                 counter_pointer=device_workspace.ptr(self.work_id_counter_region),
                 counter_count=self.stream_count,
                 broadcast_pointer=smem_workspace.ptr(self.cluster_broadcast_region, smem_base),
-                is_leader_cta=(cta_coord_in_active_cluster[0] + cta_coord_in_active_cluster[1])
-                == Int32(0),
+                is_leader_cta=(cta_coord_in_active_cluster[0] + cta_coord_in_active_cluster[1]) == Int32(0),
                 cluster_pipeline=cluster_pipeline,
                 producer_state=pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1),
                 consumer_state=pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1),
@@ -278,12 +266,10 @@ class NonClcMixedCgaSchedulerWorker:
                 self._cta_coord_in_active_cluster = cta_coord_in_active_cluster
                 self._work_id_state = FixedGroupMixedCgaAtomicCounterWorkIdState(
                     atomic_counter_state=atomic_counter_state,
-                    registration_counter_pointer=device_workspace.ptr(
-                        self.fallback_registration_counter_region
-                    ),
+                    registration_counter_pointer=device_workspace.ptr(self.fallback_registration_counter_region),
                     group_token_pointer=device_workspace.ptr(self.fallback_group_token_region),
                     split_factor=self.config.split_factor,
-                    fallback_cluster_count=self.config.fallback_cluster_count,
+                    fallback_cluster_count=self.max_fallback_cluster_count,
                     is_fallback_cluster=is_fallback_cluster,
                     fallback_group_idx=Int32(0),
                     in_group_idx=Int32(0),
@@ -296,7 +282,7 @@ class NonClcMixedCgaSchedulerWorker:
         else:
             self._work_id_state = GridStrideWorkIdState(
                 next_work_id=Int32(block_idx[2]),
-                work_id_stride=Int32(self.config.launch_cluster_cnt_merge_as_preferred),
+                work_id_stride=Int32(self.work_id_stride),
             )
         self.claimed_stream_index = Int32(0)
 
@@ -304,9 +290,7 @@ class NonClcMixedCgaSchedulerWorker:
     def initialize_fallback_group(self) -> None:
         """Register one physical fallback cluster with its fixed logical group."""
         if cutlass.const_expr(self.config.is_mixed and self.work_id_mode == "atomic_counter"):
-            self._work_id_state = initialize_fixed_group_mixed_cga_work_id_state(
-                self._work_id_state
-            )
+            self._work_id_state = initialize_fixed_group_mixed_cga_work_id_state(self._work_id_state)
             if self._work_id_state.is_fallback_cluster:
                 self.cta_coord_in_preferred_cluster = self._preferred_cluster_cta_coord(
                     self._cta_coord_in_active_cluster, self._work_id_state.in_group_idx
@@ -321,10 +305,8 @@ class NonClcMixedCgaSchedulerWorker:
             self.config.mn_split_factors[1]
         )
         return (
-            cta_coord_in_active_cluster[0]
-            + inner_cluster_m * Int32(self.config.fallback_cluster_shape[0]),
-            cta_coord_in_active_cluster[1]
-            + inner_cluster_n * Int32(self.config.fallback_cluster_shape[1]),
+            cta_coord_in_active_cluster[0] + inner_cluster_m * Int32(self.config.fallback_cluster_shape[0]),
+            cta_coord_in_active_cluster[1] + inner_cluster_n * Int32(self.config.fallback_cluster_shape[1]),
             Int32(0),
         )
 
@@ -334,18 +316,14 @@ class NonClcMixedCgaSchedulerWorker:
         if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
             raise ValueError("Work-ID counters are only available in atomic_counter mode.")
         work_id_state = self._work_id_state
-        if cutlass.const_expr(
-            isinstance(work_id_state, FixedGroupMixedCgaAtomicCounterWorkIdState)
-        ):
+        if cutlass.const_expr(isinstance(work_id_state, FixedGroupMixedCgaAtomicCounterWorkIdState)):
             work_id_state = work_id_state.atomic_counter_state
         return work_id_state.counter_pointer + stream_index
 
     @cute.jit
     def claim_next_work(self, stream_index=0) -> Int32:
         """Claim the next canonical work ID and update the preferred CTA coordinate."""
-        claimed_work_id, self._work_id_state = claim_work_id(
-            self._work_id_state, atomic_counter_index=stream_index
-        )
+        claimed_work_id, self._work_id_state = claim_work_id(self._work_id_state, atomic_counter_index=stream_index)
         canonical_work_id = claimed_work_id
         if cutlass.const_expr(self.config.is_mixed and self.work_id_mode == "atomic_counter"):
             cta_coord_in_preferred_cluster = self._cta_coord_in_active_cluster
@@ -358,6 +336,69 @@ class NonClcMixedCgaSchedulerWorker:
         else:
             self.claimed_stream_index = Int32(stream_index)
         return canonical_work_id
+
+    @cute.jit
+    def cluster_uniform_counter_ready(
+        self,
+        counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        ready_is_mask: bool = False,
+    ) -> Boolean:
+        """Return one leader-loaded readiness predicate to every active CTA.
+
+        V1 deliberately excludes fixed fallback groups.  Their several
+        physical clusters must rendezvous for every logical work-ID claim, so
+        independently polling readiness could make group members take
+        different claim paths.  Homogeneous preferred clusters have one shared
+        claim/broadcast channel and therefore one uniform decision.
+        """
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError(
+                "cluster_uniform_counter_ready requires atomic-counter work IDs."
+            )
+        if cutlass.const_expr(self.config.is_mixed):
+            raise NotImplementedError(
+                "cluster-uniform readiness polling does not yet support fixed "
+                "preferred/fallback groups."
+            )
+        ready, self._work_id_state = broadcast_atomic_counter_ready(
+            self._work_id_state,
+            counter_pointer,
+            ready_threshold,
+            ready_is_mask,
+        )
+        return ready
+
+    @cute.jit
+    def cluster_uniform_counter_ready_or_claim(
+        self,
+        ready_counter_pointer: cute.Pointer,
+        ready_threshold: Int32,
+        claim_stream_index=0,
+        ready_is_mask: bool = False,
+    ) -> Tuple[Boolean, Int32]:
+        """Probe readiness or claim one ID, uniformly across one cluster."""
+        if cutlass.const_expr(self.work_id_mode != "atomic_counter"):
+            raise ValueError(
+                "cluster_uniform_counter_ready_or_claim requires "
+                "atomic-counter work IDs."
+            )
+        if cutlass.const_expr(self.config.is_mixed):
+            raise NotImplementedError(
+                "fused cluster readiness/claim does not support fixed "
+                "preferred/fallback groups."
+            )
+        ready, claimed_work_id, self._work_id_state = (
+            broadcast_atomic_counter_ready_or_claim(
+                self._work_id_state,
+                ready_counter_pointer,
+                ready_threshold,
+                atomic_counter_index=claim_stream_index,
+                ready_is_mask=ready_is_mask,
+            )
+        )
+        self.claimed_stream_index = Int32(claim_stream_index)
+        return ready, claimed_work_id
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -374,14 +415,15 @@ class NonClcMixedCgaSchedulerWorker:
         def rebuild(field):
             nonlocal value_index
             field_value_count = len(extract_mlir_values(field))
-            result = new_from_mlir_values(
-                field, values[value_index : value_index + field_value_count]
-            )
+            result = new_from_mlir_values(field, values[value_index : value_index + field_value_count])
             value_index += field_value_count
             return result
 
         result = type(self)(
-            config=self.config, work_id_mode=self.work_id_mode, stream_count=self.stream_count
+            config=self.config,
+            work_id_mode=self.work_id_mode,
+            stream_count=self.stream_count,
+            work_id_stride=self.work_id_stride,
         )
         result._work_id_state = rebuild(self._work_id_state)
         result.cta_coord_in_preferred_cluster = rebuild(self.cta_coord_in_preferred_cluster)

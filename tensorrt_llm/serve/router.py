@@ -2023,14 +2023,31 @@ class CoordinatorDelegatingRouter(Router):
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
-        body = await self._post_select(payload)
-        info = body.get("info") or {}
-        if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
-            # The coordinator placed nothing; repeat with the content key.
-            payload["routing_key"] = await asyncio.to_thread(
-                self._local.content_routing_key, request)
-            body = await self._post_select(payload)
+        selection = asyncio.create_task(self._post_select(payload))
+        try:
+            body = await asyncio.shield(selection)
             info = body.get("info") or {}
+            if body["server"] is None and info.get(ROUTING_CONTENT_REQUIRED):
+                # The coordinator placed nothing; repeat with the content key.
+                payload["routing_key"] = await asyncio.to_thread(
+                    self._local.content_routing_key, request)
+                selection = asyncio.create_task(self._post_select(payload))
+                body = await asyncio.shield(selection)
+                info = body.get("info") or {}
+        except asyncio.CancelledError:
+            # /finish must not overtake /select and leave a late reservation.
+            # Keep its existing HTTP timeout/retry bounds, even if the caller
+            # cancels again while we wait to release the original routing ID.
+            settled = asyncio.gather(selection, return_exceptions=True)
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    pass
+            await self.finish_request(request,
+                                      success=False,
+                                      req_id=payload["req_id"])
+            raise
         self._select_lat.record(time.monotonic() - _t0)
         if body["server"] is None:
             raise ValueError(f"coordinator /select placed no {self._role} "

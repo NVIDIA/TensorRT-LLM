@@ -20,6 +20,7 @@ arguments and stops construction before any model is built.
 
 import pytest
 
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig, MoePerLayerDynamicLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.tools.layer_wise_benchmarks import runner as runner_module
 
@@ -87,3 +88,29 @@ def test_runner_llm_args_follow_mapping_and_model_defaults(monkeypatch):
     assert llm_args.max_beam_width == 3
     # ... and are resolved from the text-only config the model loads with.
     assert recorded["config_loader"] == "load_pretrained_config_text_only"
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "use_cuda_graph", "error"),
+    [
+        (MoePerLayerDynamicLoadBalancerConfig(num_slots=408), True, "does not support CUDA graphs"),
+        (MoeLoadBalancerConfig(num_slots=384, layer_updates_per_iter=1), False, "static standard"),
+    ],
+)
+def test_runner_rejects_load_balancers_a_layer_slice_cannot_run(
+    load_balancer, use_cuda_graph, error
+):
+    with pytest.raises(ValueError, match=error):
+        runner_module._check_load_balancer_support(load_balancer, use_cuda_graph)
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "use_cuda_graph"),
+    [
+        (None, True),
+        (MoePerLayerDynamicLoadBalancerConfig(num_slots=408), False),
+        (MoeLoadBalancerConfig(num_slots=384, layer_updates_per_iter=0), True),
+    ],
+)
+def test_runner_accepts_load_balancers_a_layer_slice_can_run(load_balancer, use_cuda_graph):
+    runner_module._check_load_balancer_support(load_balancer, use_cuda_graph)

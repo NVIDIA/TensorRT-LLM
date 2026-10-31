@@ -226,6 +226,104 @@ def test_tool_names_are_namespace_qualified():
     assert "NS desc\\nD" in prompt
 
 
+def _assistant_call(name, **namespace_fields):
+    """An assistant turn with one call; ``namespace_fields`` go on the call."""
+    call = {"id": "c1", "type": "function", "function": {"name": name, "arguments": "{}"}}
+    for location, namespace in namespace_fields.items():
+        target = call if location == "call" else call["function"]
+        target["namespace"] = namespace
+    return [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+    ]
+
+
+@pytest.mark.parametrize("location", ["call", "function"])
+def test_tool_call_names_are_namespace_qualified(location):
+    """A call carrying its namespace is rendered as ``namespace::name``, like its schema."""
+    prompt = encode_messages(_assistant_call("do_it", **{location: "ns"}), thinking_mode="chat")
+
+    assert '<｜DSML｜ invoke name="ns::do_it">' in prompt
+
+
+@pytest.mark.parametrize(
+    "name, namespace_fields",
+    [
+        ("a::b::c", {}),
+        ("other::do_it", {"call": "ns"}),
+        ("do_it", {"call": "a::b"}),
+        ("do_it", {"call": 5}),
+        (None, {"call": "ns"}),
+    ],
+)
+def test_a_call_name_the_encoder_rejects_is_rendered_as_written(name, namespace_fields):
+    """A replayed call is history; rejecting its name would end the conversation."""
+    prompt = encode_messages(_assistant_call(name, **namespace_fields), thinking_mode="chat")
+
+    assert f'<｜DSML｜ invoke name="{name}">' in prompt
+
+
+_TOOLS_WITH_A_NAMESPACE = [
+    {
+        "type": "function",
+        "namespace": {"name": "ns", "description": "NS desc"},
+        "function": {"name": "do_it", "parameters": {"type": "object", "properties": {}}},
+    },
+    _TOOL[0],
+]
+
+
+def test_a_call_under_the_dotted_spelling_renders_under_the_namespaced_name():
+    """A chat template without namespaces calls ``ns::do_it`` ``ns.do_it``.
+
+    The server's Responses API replays a call to a namespaced tool under that
+    flattened name. The model was shown ``ns::do_it`` and writes its calls so,
+    and the replay must be what it generated.
+    """
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+    conversation = _assistant_call("ns.do_it")
+    original = copy.deepcopy(conversation)
+
+    prompt = tokenizer.apply_chat_template(conversation, tools=_TOOLS_WITH_A_NAMESPACE)
+
+    assert '<｜DSML｜ invoke name="ns::do_it">' in prompt
+    assert prompt == tokenizer.apply_chat_template(
+        _assistant_call("do_it", call="ns"), tools=_TOOLS_WITH_A_NAMESPACE
+    )
+    assert conversation == original
+
+
+def _namespaced_tool(namespace, name):
+    return {"type": "function", "namespace": namespace, "function": {"name": name}}
+
+
+@pytest.mark.parametrize(
+    "tools, name",
+    [
+        pytest.param(_TOOL, "ns.do_it", id="no_namespaced_tool"),
+        pytest.param(
+            [
+                _namespaced_tool("ns", "do_it"),
+                {"type": "function", "function": {"name": "ns.do_it"}},
+            ],
+            "ns.do_it",
+            id="declared_under_the_dotted_name",
+        ),
+        pytest.param(
+            [_namespaced_tool("ns", "x.do_it"), _namespaced_tool("ns.x", "do_it")],
+            "ns.x.do_it",
+            id="names_two_namespaced_tools",
+        ),
+    ],
+)
+def test_a_dotted_call_name_is_kept_unless_it_names_one_namespaced_tool(tools, name):
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(_assistant_call(name), tools=tools)
+
+    assert f'<｜DSML｜ invoke name="{name}">' in prompt
+
+
 # ---------------------------------------------------------------------------
 # Delta 6, and the boundaries this backend refuses to guess at
 # ---------------------------------------------------------------------------
@@ -302,6 +400,21 @@ def test_apply_chat_template_maps_thinking_flags_to_thinking_mode():
 )
 def test_apply_chat_template_passes_through_reasoning_effort(effort, budget):
     """Named and integer budgets survive both the wrapper and renderer."""
+    tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "q"}], thinking=True, reasoning_effort=effort
+    )
+
+    assert f"Reasoning Effort: {budget} (range 1-100," in prompt
+
+
+@pytest.mark.parametrize(
+    "effort, budget",
+    [("minimal", 25), ("low", 50), ("medium", 62), ("high", 75), ("xhigh", 87), ("max", 100)],
+)
+def test_apply_chat_template_places_openai_effort_levels_on_the_budget(effort, budget):
+    """OpenAI's level names reach the renderer as budgets; the renderer itself stays strict."""
     tokenizer = DeepseekV41Tokenizer(_DummyTokenizer())
 
     prompt = tokenizer.apply_chat_template(
@@ -426,6 +539,21 @@ _TOOL_CALLS = [
         "function": {"name": "get_weather", "arguments": '{"city": "Paris", "n": 3}'},
     }
 ]
+# The namespace beside the function, inside it, and in a qualified name.
+_TOOL_CALLS_NS = [
+    {
+        "id": "c1",
+        "type": "function",
+        "namespace": "ns",
+        "function": {"name": "do_it", "arguments": '{"n": 3}'},
+    },
+    {
+        "id": "c2",
+        "type": "function",
+        "function": {"name": "do_it", "namespace": "ns", "arguments": "{}"},
+    },
+    {"id": "c3", "type": "function", "function": {"name": "ns::do_it", "arguments": "{}"}},
+]
 
 # Conversation shapes, chosen to cover each branch of the renderer rather than to
 # look realistic: every role, tasks, tool results, wo_eos, response_format and
@@ -463,6 +591,12 @@ DIFFERENTIAL_CASES = {
         {"role": "user", "content": "weather in Paris?"},
         {"role": "assistant", "content": "", "tool_calls": _TOOL_CALLS},
         {"role": "tool", "tool_call_id": "c1", "content": "sunny"},
+    ],
+    "namespaced_tool_calls": [
+        {"role": "system", "content": "S", "tools": _TOOL_NS},
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": "", "tool_calls": _TOOL_CALLS_NS},
+        {"role": "tool", "tool_call_id": "c1", "content": "done"},
     ],
     "two_tool_results": [
         {"role": "user", "content": "q"},

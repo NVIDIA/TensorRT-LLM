@@ -6668,6 +6668,73 @@ class TestConfigureParserSpecialTokenDecoding:
         assert sampling_params.skip_special_tokens is False
         assert sampling_params.spaces_between_special_tokens is True
 
+    @pytest.mark.parametrize(
+        "reasoning_parser, tool_parser, with_tools, skip, spaces",
+        [
+            ("kimi_k3", "kimi_k3", True, False, False),
+            ("kimi_k3", None, False, False, False),
+            (None, "deepseek_v32", True, False, True),
+            (None, "deepseek_v32", False, True, True),
+            (None, None, True, True, True),
+        ],
+    )
+    def test_the_responses_route_applies_it(self, monkeypatch, reasoning_parser,
+                                            tool_parser, with_tools, skip,
+                                            spaces) -> None:
+        """/v1/responses detokenizes for the parsers as chat completions does.
+
+        Without it Kimi-K3's tags arrive with their special tokens dropped or
+        spaced apart, and its tool calls reach the client as message text.
+        """
+        import asyncio
+        from types import SimpleNamespace
+
+        import tensorrt_llm.serve.openai_server as server_module
+        from tensorrt_llm.serve.openai_protocol import ResponsesRequest
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        async def fake_preprocess(**kwargs):
+            return [1, 2, 3], SamplingParams()
+
+        monkeypatch.setattr(server_module, "responses_api_request_preprocess",
+                            fake_preprocess)
+        submitted = []
+
+        def generate_async(*, sampling_params, **kwargs):
+            submitted.append(sampling_params)
+            raise RuntimeError("stop after submission")
+
+        server = object.__new__(OpenAIServer)
+        server.model = "test-model"
+        server.enable_store = False
+        server.use_harmony = False
+        server.tokenizer = None
+        server.model_config = None
+        server.processor = None
+        server.multimodal_server_config = None
+        server.chat_template = None
+        server.tool_parser = tool_parser
+        server.metrics_collector = None
+        server.conversation_store = None
+        server.generator = SimpleNamespace(args=SimpleNamespace(
+            reasoning_parser=reasoning_parser, num_postprocess_workers=0),
+                                           generate_async=generate_async)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        tools = [{
+            "type": "function",
+            "name": "exec_command",
+            "parameters": {
+                "type": "object"
+            }
+        }] if with_tools else None
+        request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+
+        asyncio.run(server.openai_responses(request, raw_request))
+
+        (sampling_params, ) = submitted
+        assert sampling_params.skip_special_tokens is skip
+        assert sampling_params.spaces_between_special_tokens is spaces
+
 
 # ============================================================================
 # Forced tool call: argument truncation — TRTLLM-12758

@@ -72,7 +72,6 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     GPU_LEVEL,
     AttentionLayerConfig,
-    AttentionReusePolicy,
     AttnLifeCycle,
     Batch,
     BatchDesc,
@@ -94,6 +93,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     PlannedDropHandle,
     PoolGroupPeakBlockStats,
     PoolRebalanceConfig,
+    ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
     SwaScratchReuseConfig,
@@ -141,6 +141,7 @@ from ..scheduler import ScheduledRequests
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+
 
 KV_CACHE_ITERATION_STATS_DELTA_FIELDS = _KV_CACHE_ITERATION_STATS_DELTA_FIELDS
 KV_CACHE_ITERATION_STATS_REUSE_FIELDS = (
@@ -309,7 +310,7 @@ class KVCacheLayerSpec:
     buffer_roles: tuple[DataRole, ...]
     sliding_window_size: Optional[int] = None
     num_sink_tokens: Optional[int] = None
-    reuse_policy: AttentionReusePolicy = AttentionReusePolicy.REQUIRED
+    reuse_policy: ReusePolicy = ReusePolicy.REQUIRED
 
     def __post_init__(self) -> None:
         if self.global_layer_id < 0:
@@ -3923,7 +3924,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         )
                     )
                 else:
-                    layers.append(SsmLayerConfig(layer_id=layer_id, buffers=buffers))
+                    layers.append(
+                        SsmLayerConfig(
+                            layer_id=layer_id, buffers=buffers, reuse_policy=layer.reuse_policy
+                        )
+                    )
 
         if not layers:
             raise ValueError("KVCacheManagerV2 requires at least one non-empty local cache layer")
@@ -4061,7 +4066,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     # Native SWA includes the next query's write position.
                     sliding_window_size=self.last_n + 1,
                     num_sink_tokens=self.first_n,
-                    reuse_policy=AttentionReusePolicy.REQUIRED,
+                    reuse_policy=ReusePolicy.REQUIRED,
                 )
             )
 
@@ -8307,9 +8312,21 @@ class KVCacheManagerV2(BaseResourceManager):
                 success = False
         return success
 
-    def reset_reuse_state(self):
-        self.impl.clear_reusable_blocks()
-        if self.conversation_manager is not None:
-            self.conversation_manager.clear()
-        if self._sharing is not None:
-            self._sharing._on_reset()
+    def reset_reuse_state(
+        self,
+        *,
+        on_cleared: Optional[Callable[[], None]] = None,
+    ):
+        try:
+            self.impl.clear_reusable_blocks()
+            if on_cleared is not None:
+                on_cleared()
+            if self.conversation_manager is not None:
+                self.conversation_manager.clear()
+            if self._sharing is not None:
+                self._sharing._on_reset()
+        finally:
+            # The sidecar consumes the per-rank streaming publisher. Flush it
+            # even while inference is paused, without starting a buffered ADP gather.
+            if isinstance(self.event_manager, StreamingKVCacheEventManager):
+                self.flush_iteration_events()
