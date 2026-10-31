@@ -5749,6 +5749,45 @@ class TestGemma4ToolParser(BaseToolParserTestClass):
         calls += streaming.finish(sample_tools).calls
         assert calls == []
 
+    @pytest.mark.parametrize("text", [
+        "Sure. " + _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+        _g4_tc("search_web", f'query:{_g4_s("AI")}'),
+        _g4_tc("search_web", f'query:{_g4_s("a")}') +
+        _g4_tc("get_weather", f'location:{_g4_s("LA")}') +
+        _g4_tc("search_web", f'query:{_g4_s("b")}'),
+        _g4_tc("search_web", f'query:{_g4_s("a")}') +
+        _g4_tc("search_web", f'query:{_g4_s("b")}') + " Done.",
+        _g4_tc("search_web", f'query:{_g4_s("a")}') + f'{BOT_TOKEN}' +
+        f'{CALL_PREFIX}get_weather{{location:{_g4_s("LA")}}}',
+        _g4_tc("search_web", f'query:{_g4_s("a")}') +
+        _g4_tc("get_weather", "opts:" + "{a:" * 5000 + "1" + "}" * 5000),
+    ],
+                             ids=[
+                                 "text_and_two_calls", "three_calls",
+                                 "two_calls_then_text",
+                                 "complete_then_incomplete",
+                                 "valid_then_unparsable"
+                             ])
+    def test_streaming_reports_every_call_in_one_increment(
+            self, sample_tools, parser, text):
+        """An increment that holds several calls reports each complete one."""
+        expected = [
+            (call.name, json.loads(call.parameters))
+            for call in parser.detect_and_parse(text, sample_tools).calls
+        ]
+
+        streaming = Gemma4ToolParser()
+        calls = streaming.parse_streaming_increment(text, sample_tools).calls
+        calls += streaming.finish(sample_tools).calls
+
+        assert [call.tool_index for call in calls] == list(range(len(expected)))
+        assert [(call.name, json.loads(call.parameters))
+                for call in calls] == expected
+        assert [(entry["name"], entry["arguments"])
+                for entry in streaming.prev_tool_call_arr] == expected
+        assert [json.loads(args) for args in streaming.streamed_args_for_tool
+                ] == [args for _, args in expected]
+
     def test_structure_info(self, parser):
         info_fn = parser.structure_info()
         info = info_fn("get_weather")

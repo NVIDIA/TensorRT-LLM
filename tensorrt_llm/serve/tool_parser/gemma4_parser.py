@@ -357,9 +357,22 @@ class Gemma4ToolParser(BaseToolParser):
         """Streaming incremental parsing for Gemma4 tool calls.
 
         Maintains state across chunks to handle tool calls that span
-        multiple streaming increments.
+        multiple streaming increments. Every complete call in the buffer is
+        reported, so an increment that holds several calls reports all of them.
         """
         self._buffer += new_text
+        normal_parts, calls = [], []
+        while True:
+            state = (self._buffer, self._is_inside_tool_call)
+            result = self._parse_buffer_once(tools)
+            normal_parts.append(result.normal_text)
+            calls += result.calls
+            if (self._buffer, self._is_inside_tool_call) == state:
+                break
+        return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
+
+    def _parse_buffer_once(self, tools: List[Tool]) -> StreamingParseResult:
+        """Consume the text before the next call, or the next complete call."""
         current_text = self._buffer
 
         if not hasattr(self, "_tool_indices"):
