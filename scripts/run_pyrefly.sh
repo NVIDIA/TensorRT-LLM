@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Run Pyrefly on changed product Python files, or the whole project with
-# --full-project. Add --rebase-upstream to check the current branch in a new
-# worktree rebased on the latest upstream main and emit its Git diff report.
+# --full-project. Add --rebase-upstream to check the current branch (or HEAD
+# when detached) in a new worktree rebased on upstream main and emit its diff.
 # Excluded paths and third-party symbols are removed from the JSON report by
 # scripts/pyrefly_exclusion.py. This hook is advisory and always returns success;
 # the filtered diagnostic report is written to pyrefly_final_report.json and
@@ -39,8 +39,8 @@ Run Pyrefly on changed product Python files, or the whole project.
 
 Options:
   --full-project           Check all product Python files.
-  --rebase-upstream        Rebase a new worktree on latest upstream main, report
-                           its changed files and lines, and check changed files.
+  --rebase-upstream        Rebase a new worktree from the current branch or HEAD
+                           on upstream main, report its diff, and check changed files.
   --no-diff-filter         Keep diagnostics from all lines in changed files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
 
@@ -96,7 +96,7 @@ print_report_summary() {
 }
 
 cleanup_rebase_resources() {
-    local status=$?
+    local status="${1:-$?}"
     trap - EXIT
     if [[ -n "$REBASE_WORKTREE_PATH" ]]; then
         git -C "$PROJECT_DIR" worktree remove --force "$REBASE_WORKTREE_PATH" \
@@ -119,6 +119,23 @@ cleanup_rebase_resources() {
     return "$status"
 }
 
+handle_rebase_exit() {
+    local status=$?
+    local report_path="$REPORT_FILE"
+    trap - EXIT
+    cleanup_rebase_resources "$status" || true
+    if (( status != 0 )); then
+        if [[ "$report_path" != /* ]]; then
+            report_path="$PROJECT_DIR/$report_path"
+        fi
+        python3 "$WORKFLOW_SCRIPT" record-rebase-failure \
+            "$report_path" "$status" "${BASH_COMMAND:-unknown command}" || true
+        printf 'WARNING: advisory rebase-upstream check failed (exit status %s); see report: %s\n' \
+            "$status" "$report_path" >&2
+    fi
+    exit 0
+}
+
 run_rebased_check() {
     if (( FULL_PROJECT )); then
         echo "ERROR: --rebase-upstream checks changed files; it cannot be combined with --full-project" >&2
@@ -131,11 +148,7 @@ run_rebased_check() {
     upstream_url="git@github.com:NVIDIA/TensorRT-LLM.git"
     fallback_url="https://github.com/NVIDIA/TensorRT-LLM.git"
     timestamp="$(date +%Y%m%d_%H%M%S)_$$"
-    source_branch="$(git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD || true)"
-    if [[ -z "$source_branch" ]]; then
-        echo "ERROR: --rebase-upstream requires a named branch" >&2
-        return 2
-    fi
+    source_branch="$(git -C "$PROJECT_DIR" symbolic-ref --quiet --short HEAD || printf 'HEAD')"
     worktree_parent="$(mktemp -d "${TMPDIR:-/tmp}/pyrefly-rebase.XXXXXX")"
     random_suffix="${worktree_parent##*.}"
     worktree_path="$worktree_parent/worktree"
@@ -161,7 +174,6 @@ run_rebased_check() {
     REBASE_WORKTREE_PATH="$worktree_path"
     REBASE_WORKTREE_PARENT="$worktree_parent"
     REBASE_TEMP_BRANCH="$temp_branch"
-    trap cleanup_rebase_resources EXIT
     export GIT_LFS_SKIP_SMUDGE="${GIT_LFS_SKIP_SMUDGE:-1}"
     PATCH_FILE="$(mktemp)"
     git -C "$PROJECT_DIR" diff --binary HEAD > "$PATCH_FILE"
@@ -177,13 +189,13 @@ run_rebased_check() {
 
     git -C "$PROJECT_DIR" worktree add --quiet -b "$temp_branch" "$worktree_path" "$source_branch"
     if ! git -C "$worktree_path" rebase "$main_sha"; then
-        echo "Rebase stopped; resolve it in worktree: $worktree_path" >&2
+        echo "Rebase failed; the temporary worktree and branch will be cleaned up." >&2
         return 1
     fi
     if [[ -s "$PATCH_FILE" ]]; then
         if ! git -C "$worktree_path" apply --3way "$PATCH_FILE"; then
             echo "Could not apply current tracked edits after rebase." >&2
-            echo "Inspect the worktree: $worktree_path" >&2
+            echo "The temporary worktree and branch will be cleaned up." >&2
             return 1
         fi
         git -C "$worktree_path" reset --mixed HEAD
@@ -275,8 +287,9 @@ run_rebased_check() {
 }
 
 if (( REBASE_UPSTREAM )); then
+    trap handle_rebase_exit EXIT
     run_rebased_check "$@"
-    exit $?
+    exit 0
 fi
 
 cleanup() {

@@ -48,9 +48,7 @@ def clear_path_module_exclusions(source_path: Path, destination_path: Path) -> N
         raise ValueError(f"{source_path} has no [tool.pyrefly] section")
     next_section = re.search(r"(?m)^\[", config[section_start + 1 :])
     section_end = (
-        section_start + 1 + next_section.start()
-        if next_section is not None
-        else len(config)
+        section_start + 1 + next_section.start() if next_section is not None else len(config)
     )
     section = config[section_start:section_end]
     for key in ("project-excludes", "ignore-missing-imports", "replace-imports-with-any"):
@@ -205,6 +203,20 @@ def annotate_rebased_report(
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
+def record_rebase_failure(report_path: Path, status: int, failed_command: str) -> None:
+    """Record an advisory failure that stopped the upstream-rebase workflow."""
+    try:
+        report = json.loads(report_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        report = {"tool": "pyrefly"}
+    report.update(
+        workflow_error="rebase-upstream check failed before completion",
+        workflow_exit_code=status,
+        failed_command=failed_command,
+    )
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -240,6 +252,11 @@ def main() -> int:
     annotate_parser.add_argument("path_module_filter", type=int)
     annotate_parser.add_argument("checked_files", nargs="*")
 
+    failure_parser = subparsers.add_parser("record-rebase-failure")
+    failure_parser.add_argument("report", type=Path)
+    failure_parser.add_argument("status", type=int)
+    failure_parser.add_argument("failed_command")
+
     args = parser.parse_args()
     if args.command == "print-summary":
         print_summary(args.report)
@@ -249,6 +266,8 @@ def main() -> int:
         wrap_unfiltered_report(args.source, args.destination, args.stderr, args.status)
     elif args.command == "filter-diff-lines":
         filter_diff_lines(args.source, args.destination, args.project_root, args.diff_base)
+    elif args.command == "record-rebase-failure":
+        record_rebase_failure(args.report, args.status, args.failed_command)
     else:
         annotate_rebased_report(
             args.report,

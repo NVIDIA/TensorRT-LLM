@@ -163,7 +163,7 @@ def is_excluded_symbol(
     project_root: Path,
     scopes_by_path: dict[str, ImportScope | None],
 ) -> bool:
-    description = str(error.get("description", ""))
+    description = str(error.get("concise_description") or error.get("description", ""))
     line = error.get("line")
     path = str(error.get("path", ""))
     for first, second in NAME_PATTERN.findall(description):
