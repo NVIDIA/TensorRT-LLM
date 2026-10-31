@@ -25,6 +25,14 @@ implements_tips:
   - "Use KVCacheManagerV2"
   - "Support common features, such as CUDA graph and scheduler overlap"
 
+# Optional: the ModelExpress (MX) qualification step runs by default once
+# full-model parity passes. Set `enabled: false` to skip it, or
+# `existing_model: true` when the model already exists in TensorRT-LLM and
+# MX qualification is the whole task.
+# model_express:
+#   enabled: true
+#   existing_model: false
+
 # Optional: include this section only when the workflow is launched from a
 # Slurm login node and GPU validation must run through Slurm.
 # slurm-environment:

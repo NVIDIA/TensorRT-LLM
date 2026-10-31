@@ -24,6 +24,9 @@ infrastructure and is validated against accuracy criteria.
   CUDA graphs, CPU overlap, and chunked prefill.
 - Support various model-parallel strategies used by TensorRT-LLM.
 - Validate the implemented model's accuracy on datasets.
+- Qualify eligible dense BF16 models for ModelExpress (MX) checkpoint loading,
+  by default as the last bring-up step, or as the whole task for a model that
+  already exists in TensorRT-LLM (see [Task file](#task-file)).
 
 ### What it cannot do yet
 
@@ -253,6 +256,40 @@ To run from a Slurm login node, add an optional `slurm-environment` section
 with `slurm_partition` and `docker_image`. The presence of this section is
 what injects the Slurm/container prompt block into the agents. See
 [`task.slurm.example.yaml`](task.slurm.example.yaml) for a full example.
+
+### ModelExpress (MX) qualification
+
+Once full-model parity passes, every bring-up checks whether the model is
+eligible for ModelExpress checkpoint loading. Only text-only dense BF16
+causal-LM models within the limits in
+[`docs/source/features/model-express.md`](../../../../docs/source/features/model-express.md)
+qualify. Eligible models get an exact MX qualification profile and its tests,
+following that doc's "Adding a Model Family" section. The agents record one of
+`MX: qualified — <profile_id>`, `MX: not eligible — <reason>`, or
+`MX: disabled by task.yaml`. The donor/receiver GPU test needs a ModelExpress
+server and at least two GPUs, so it is deferred to the ModelExpress CI stages
+unless `MODEL_EXPRESS_URL` and enough GPUs are available.
+
+The optional `model_express` block controls the step:
+
+```yaml
+model_express:
+  enabled: false         # skip the MX step for this task
+```
+
+```yaml
+# Qualify a model that already exists in TensorRT-LLM; this is the whole task.
+reference_code_path: /path/to/transformers/models/phi3/modeling_phi3.py
+checkpoint_path: /path/to/llm-models/Phi-4
+trtllm_repo_path: /path/to/TensorRT-LLM
+model_express:
+  existing_model: true
+```
+
+Unknown keys and non-boolean values are rejected. When a run resumes, the
+checkpointed `<workspace>/task.yaml` decides, so pass `--clean` to change the
+block for an existing workspace. If you pass `--acceptance-criteria` to skip
+planning, add an MX item yourself or disable the step.
 
 All flags from the generic `agent-team` CLI are accepted as-is. See the
 [`agent_team` README](../agent_team/README.md#useful-flags) for their semantics.
