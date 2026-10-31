@@ -48,6 +48,8 @@ def _worker(lengths):
         _max_ctx=1000,
         _ctx_len=torch.tensor(lengths, dtype=torch.long, device="cuda"),
         _ctx_len_host=list(lengths),
+        _ctx_base_pages=torch.zeros(len(lengths), dtype=torch.long, device="cuda"),
+        _ctx_base_host=[0] * len(lengths),
         _batch_to_slot_buffer=DeviceCopyBuffer(torch.zeros(8, dtype=torch.long, device="cuda")),
     )
     w._write_ctx_len = partial(DFlashWorker._write_ctx_len, w)
@@ -109,9 +111,9 @@ def test_prepare_resets_only_evicted_slots():
     written = []
     write = worker._write_ctx_len
 
-    def record(updates):
+    def record(updates: dict[int, int], base_updates: dict[int, int] | None = None) -> None:
         written.append(dict(updates))
-        write(updates)
+        write(updates, base_updates)
 
     worker._write_ctx_len = record
     _prepare(worker, [11, 12, 13, FLOOR + 1], num_generations=4)

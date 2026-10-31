@@ -45,7 +45,7 @@ pytestmark = pytest.mark.cpu_only
 
 
 class _Req:
-    def __init__(self, req_id):
+    def __init__(self, req_id: int) -> None:
         self.py_request_id = req_id
         self.lora_task_id = None
         self.cache_salt = None
@@ -54,6 +54,7 @@ class _Req:
         self.context_current_position = 0
         self.context_chunk_size = 8
         self.py_draft_tokens = None
+        self.is_disagg_generation_init_state = False
 
 
 class _Batch:
@@ -67,7 +68,7 @@ class _Batch:
         return self.context_requests + self.generation_requests
 
 
-def _manager(resume_ok):
+def _manager(resume_ok: bool) -> tuple[KVCacheManagerV2, MagicMock]:
     """A draft manager whose resume answers ``resume_ok``, with nothing else real.
 
     Built without ``__init__``: the method under test needs only the mirror
@@ -78,10 +79,12 @@ def _manager(resume_ok):
     manager.is_draft = True
     manager.enable_joint_kv_cache_reuse = False
     manager.num_extra_kv_tokens = 0
+    manager._mirror_uses_draft_view = False  # one-engine external drafter: target view
     manager._allocated_draft_lens = set()
     cache = MagicMock(name="kv_cache")
     cache.resize.return_value = True
     cache.capacity = 0
+    cache.history_length = 0
     manager._mirror_draft_kv_cache = MagicMock(return_value=cache)
     manager._resume_and_restore = MagicMock(return_value=resume_ok)
     manager._required_gen_capacity = MagicMock(return_value=1)
