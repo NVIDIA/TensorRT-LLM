@@ -2013,6 +2013,34 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"(got pp_size={mapping.pp_size}). Set "
                     "pipeline_parallel_size=1 or enable_attention_dp=False."
                 )
+            if kv_cache_config.enable_kv_pool_rebalance:
+                raise ValueError(
+                    "KVCacheManagerV2 does not support KV pool rebalance with "
+                    "helix context parallelism: a rebalance changes pool sizes "
+                    "on each rank independently of the cross-rank quota agreed "
+                    "at construction. Set "
+                    "kv_cache_config.enable_kv_pool_rebalance=False."
+                )
+            if not is_disagg:
+                if (kv_cache_config.host_cache_size or 0) > 0 or (
+                    kv_cache_config.disk_cache_size or 0
+                ) > 0:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support cache tiers below "
+                        "GPU with aggregated helix context parallelism: "
+                        "suspending to a lower tier is not validated to make "
+                        "the same decisions on every CP rank. Set "
+                        "kv_cache_config.host_cache_size=0 and "
+                        "kv_cache_config.disk_cache_size=0."
+                    )
+                if kv_connector_manager is not None:
+                    raise ValueError(
+                        "KVCacheManagerV2 does not support a KV cache "
+                        "connector with aggregated helix context parallelism: "
+                        "its loads, saves and deferred preemptions are not "
+                        "validated to make the same decisions on every CP "
+                        "rank. Unset kv_connector_config."
+                    )
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.max_cuda_graph_batch_size = max_cuda_graph_batch_size
@@ -2256,7 +2284,16 @@ class KVCacheManagerV2(BaseResourceManager):
         connector_registers_pages = (
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
-        if connector_registers_pages and kv_cache_config.host_cache_size is None:
+        if self._has_cp_helix and not is_disagg:
+            # Aggregated helix runs GPU-only (lower tiers are rejected above),
+            # so pool pressure is relieved by preemption, as in the connector
+            # case.
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 host tier disabled: aggregated helix runs "
+                "GPU-only and relieves KV pressure by recompute pause."
+            )
+        elif connector_registers_pages and kv_cache_config.host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -2369,7 +2406,11 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        if not has_host_cache_tier:
+        # Aggregated helix runs GPU-only but its CP ranks still need a common
+        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # waiting in the first collective.
+        sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
+        if not sync_init_status:
             candidate = self._allocate_cache_pools(
                 config,
                 event_manager=event_sink,

@@ -56,7 +56,7 @@ from tensorrt_llm.llmapi.llm_args import (
     MTPDecodingConfig,
     PARDDecodingConfig,
 )
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     BAD_PAGE_INDEX,
@@ -1491,6 +1491,38 @@ def test_peer_init_failure_discards_local_candidate() -> None:
         )
 
     local_impl.shutdown.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("peer_failed", [False, True])
+def test_agg_helix_gpu_only_init_syncs_status_across_ranks(peer_failed: bool) -> None:
+    """Aggregated helix has no host tier but must still agree on init success.
+
+    Without the sync, a rank that failed to allocate raises alone and its peers
+    carry on into collectives that never complete.
+    """
+    local_impl = Mock()
+    helix_mapping = Mapping(
+        world_size=2,
+        rank=0,
+        cp_size=2,
+        cp_config={"cp_type": CpType.HELIX},
+    )
+    module = "tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2"
+    status = _KVCacheManagerInitStatus.ABORT if peer_failed else _KVCacheManagerInitStatus.OK
+
+    with patch(f"{module}._sync_kv_cache_manager_init_status", return_value=status) as sync:
+        config = KvCacheConfig(
+            max_gpu_total_bytes=16 << 20, host_cache_size=0, enable_block_reuse=False
+        )
+        if peer_failed:
+            with pytest.raises(RuntimeError, match="failed on another rank"):
+                _make_manager_for_cache_tier_test(config, [local_impl], mapping=helix_mapping)
+            local_impl.shutdown.assert_called_once_with()
+        else:
+            _make_manager_for_cache_tier_test(config, [local_impl], mapping=helix_mapping)
+
+    sync.assert_called_once_with(_KVCacheManagerInitStatus.OK, helix_mapping)
 
 
 @pytest.mark.parametrize("add_secondary_gpu_tier", [False, True])
