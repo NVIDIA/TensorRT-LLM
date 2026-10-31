@@ -199,6 +199,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
     QM_NVFP4_KV_CACHE,
     thop_attention,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import (
+    cublas_mm as mtp_cublas_mm,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.graph.eager_on_graph import (
     eager_on_graph,
 )
@@ -289,8 +293,6 @@ from .ops.comm.allgather__r6 import allgather
 from .ops.comm.allreduce__r5 import NONE as _SUM_ONLY
 from .ops.comm.allreduce__r5 import allreduce, allreduce_group_args
 from .ops.comm.reducescatter__r7 import reducescatter
-from .ops.gemm.cublas_mm__mtp import cublas_mm as mtp_cublas_mm
-from .ops.gemm.cublas_mm__r1 import cublas_mm
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
