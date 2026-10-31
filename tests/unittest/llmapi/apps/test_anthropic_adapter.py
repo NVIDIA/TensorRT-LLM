@@ -630,14 +630,25 @@ def test_tool_choice_any_rejected_instead_of_downgraded():
         )
 
 
-def test_disable_parallel_tool_use_rejected():
-    with pytest.raises(AnthropicRequestError, match="disable_parallel_tool_use"):
-        convert_anthropic_request(
-            make_request(
-                tools=[{"name": "f", "input_schema": {"type": "object"}}],
-                tool_choice={"type": "auto", "disable_parallel_tool_use": True},
-            )
+@pytest.mark.parametrize(
+    ("tool_choice", "parallel_tool_calls"),
+    [
+        ({"type": "auto", "disable_parallel_tool_use": True}, False),
+        ({"type": "auto", "disable_parallel_tool_use": False}, None),
+        ({"type": "auto"}, None),
+        # "none" allows no call at all, so there is nothing to limit.
+        ({"type": "none", "disable_parallel_tool_use": True}, None),
+    ],
+)
+def test_disable_parallel_tool_use_asks_for_one_call(tool_choice, parallel_tool_calls):
+    """The chat pipeline then stops generation after the first tool call."""
+    chat = convert_anthropic_request(
+        make_request(
+            tools=[{"name": "f", "input_schema": {"type": "object"}}],
+            tool_choice=tool_choice,
         )
+    )
+    assert chat.parallel_tool_calls is parallel_tool_calls
 
 
 @pytest.mark.parametrize("choice", [{"type": "any"}, {"type": "tool", "name": "f"}])

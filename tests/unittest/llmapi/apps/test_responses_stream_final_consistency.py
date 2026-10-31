@@ -293,6 +293,53 @@ def test_an_unterminated_call_is_text_in_both_views():
     assert not mock_logger.warning.called
 
 
+# What a DeepSeek-V4.1 generation ended by parallel_tool_calls=false leaves:
+# the first call, closed by the kept stop, inside a calls block never closed.
+_V41_STOPPED_CHUNKS = [
+    "Running it.",
+    "\n\n<｜DSML｜ calls>\n",
+    '<｜DSML｜ invoke name="exec">\n',
+    '<｜DSML｜ parameter name="input" string="true">ls</｜DSML｜ parameter>\n',
+    "</｜DSML｜ invoke>\n",
+]
+
+
+def test_a_dsml_generation_stopped_after_its_first_call_reports_exactly_that_call():
+    """The stream and its snapshot both report the call, and nothing after it."""
+    processor = _processor(tools=[_tool()], reasoning_parser=None, tool_parser="deepseek_v41")
+    frames, result = _stream(processor, _V41_STOPPED_CHUNKS)
+
+    streamed = _done_items(frames, "function_call")
+    assert [(c["name"], json.loads(c["arguments"])) for c in streamed] == [
+        ("exec", {"input": "ls"})
+    ]
+    final = _final_output(processor, result)
+    assert [item for item in final if item["type"] == "function_call"] == streamed
+    assert _message_texts(final) == _message_texts(_done_items(frames, "message"))
+    assert "".join(_message_texts(final)).strip() == "Running it."
+
+
+def test_a_non_streamed_dsml_generation_stopped_after_its_first_call_reports_that_call():
+    text = "".join(_V41_STOPPED_CHUNKS)
+    request = ResponsesRequest(model="test-model", input="hi", tools=[_tool()])
+    response = create_response_non_store(
+        generation_result=_generation_chunk(text, text, True),
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+        tool_parser="deepseek_v41",
+        num_prompt_tokens=2,
+    ).model_dump()
+
+    assert [(item["type"], item.get("name")) for item in response["output"]] == [
+        ("message", None),
+        ("function_call", "exec"),
+    ]
+    assert _message_texts(response["output"]) == ["Running it."]
+    assert response["status"] == "completed"
+
+
 def test_tool_choice_none_keeps_the_markup_as_text_in_both_views():
     processor = _processor(
         tools=[_tool()], reasoning_parser="glm47", tool_parser="glm47", tool_choice="none"

@@ -297,6 +297,47 @@ def _configure_parser_special_token_decoding(
         sampling_params.spaces_between_special_tokens = False
 
 
+def _single_tool_call_stops(tool_parser_name: Optional[str]) -> tuple[str, ...]:
+    """The texts that end one tool call in this format; empty if it has none.
+
+    See ``BaseToolParser.single_call_stops``.
+    """
+    if not tool_parser_name:
+        return ()
+    tool_parser_cls = ToolParserFactory.parsers.get(tool_parser_name.lower())
+    if tool_parser_cls is None:
+        return ()
+    return tool_parser_cls().single_call_stops
+
+
+def _stop_after_first_tool_call(sampling_params: SamplingParams,
+                                stops: tuple[str, ...]) -> bool:
+    """End generation on the first of ``stops`` and keep it in the output.
+
+    This honours a request for at most one tool call per turn without
+    rewriting what the model wrote: ``stops`` end one call
+    (``BaseToolParser.single_call_stops``), and the tool parser needs the
+    matched text to read that call as complete. ``include_stop_str_in_output``
+    covers every stop of a request, so nothing changes when the request's
+    own stop strings or ids are to be left out of the output.
+
+    Returns:
+        Whether the stops were added.
+    """
+    client_stops = sampling_params.stop
+    if isinstance(client_stops, str):
+        client_stops = [client_stops]
+    client_stops = list(client_stops or [])
+    if ((client_stops or sampling_params.stop_token_ids)
+            and not sampling_params.include_stop_str_in_output):
+        return False
+    sampling_params.stop = client_stops + [
+        stop for stop in stops if stop not in client_stops
+    ]
+    sampling_params.include_stop_str_in_output = True
+    return True
+
+
 def _record_generator_termination(generator) -> None:
     """Classify a fatal generator error without exposing exception details."""
     component = "llm"
@@ -2298,7 +2339,33 @@ class OpenAIServer(_VideoRoutesMixin):
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
                     status_code=HTTPStatus.BAD_REQUEST)
+            # At most one tool call per turn (also Anthropic's
+            # disable_parallel_tool_use): generation ends after the first call
+            # where the tool-call format allows it; elsewhere this is accepted
+            # and said once.
+            single_call_stops: tuple[str, ...] = ()
+            if (request.parallel_tool_calls is False and all_tools
+                    and request.tool_choice != "none"):
+                stops = _single_tool_call_stops(self.tool_parser)
+                client_stops = sampling_params.stop
+                if isinstance(client_stops, str):
+                    client_stops = [client_stops]
+                client_stops = set(client_stops or [])
+                if stops and _stop_after_first_tool_call(
+                        sampling_params, stops):
+                    # A stop the request lists itself keeps its stop reason.
+                    single_call_stops = tuple(stop for stop in stops
+                                              if stop not in client_stops)
+                else:
+                    logger.warning_once(
+                        "'parallel_tool_calls=false' is accepted but not "
+                        "enforced when the tool-call format has no text that "
+                        "ends a single call, or when the request's own stop "
+                        "strings are left out of the output; the model may "
+                        "still emit several tool calls in one turn.",
+                        key="chat_parallel_tool_calls_unenforced")
             postproc_args = ChatPostprocArgs.from_request(request)
+            postproc_args.single_call_stops = single_call_stops
             self._apply_spec_decode_stats_opt_in(postproc_args)
             # Some models' prompt-token accounting excludes trailing rendered
             # tokens (kimi_k3: the generation channel opener); the model still
@@ -3336,9 +3403,12 @@ class OpenAIServer(_VideoRoutesMixin):
                                raw_request: Request) -> Response:
         """Serve one /v1/responses request, streaming or not.
 
-        ``parallel_tool_calls=false`` and, on the non-Harmony path,
-        ``tool_choice`` values other than "auto" and "none" are accepted but
-        not enforced (logged once). ``tool_choice="none"`` skips tool parsing.
+        ``parallel_tool_calls=false`` ends generation after the first tool
+        call where the tool-call format has a text that ends one call
+        (``BaseToolParser.single_call_stops``); elsewhere, and on the Harmony
+        path, it is accepted but not enforced (logged once). So are, on the
+        non-Harmony path, ``tool_choice`` values other than "auto" and
+        "none". ``tool_choice="none"`` skips tool parsing.
         """
 
         async def create_response(
@@ -3425,13 +3495,23 @@ class OpenAIServer(_VideoRoutesMixin):
             # worker would pull KV cache from.
             self._validate_internal_disagg_request(request, raw_request)
 
+            # parallel_tool_calls=false ends generation after the first tool
+            # call where the tool-call format allows it (applied below, once
+            # the sampling params exist); elsewhere it is accepted and said
+            # once.
+            single_call_stops: tuple[str, ...] = ()
             if ("parallel_tool_calls" in request.model_fields_set
                     and request.parallel_tool_calls is False):
-                logger.warning_once(
-                    "Responses API: 'parallel_tool_calls=false' is accepted "
-                    "but not enforced; the model may still emit several tool "
-                    "calls in one turn.",
-                    key="responses_parallel_tool_calls_unenforced")
+                if not self.use_harmony:
+                    single_call_stops = _single_tool_call_stops(
+                        self.tool_parser)
+                if not single_call_stops:
+                    logger.warning_once(
+                        "Responses API: 'parallel_tool_calls=false' is "
+                        "accepted but not enforced for this tool-call format; "
+                        "the model may still emit several tool calls in one "
+                        "turn.",
+                        key="responses_parallel_tool_calls_unenforced")
             if not self.use_harmony and request.tool_choice not in ("auto",
                                                                     "none"):
                 logger.warning_once(
@@ -3486,6 +3566,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     reasoning_parser_name=self.generator.args.reasoning_parser,
                     tool_parser_name=self.tool_parser,
                     has_tools=bool(request.tools))
+            if (single_call_stops and request.tools
+                    and request.tool_choice != "none"):
+                # A Responses request sets no stops of its own, so these
+                # always apply.
+                _stop_after_first_tool_call(sampling_params, single_call_stops)
 
             streaming_processor = None
             if request.stream:

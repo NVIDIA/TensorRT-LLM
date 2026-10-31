@@ -275,6 +275,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_responses_usage.py
   - unittest/llmapi/apps/test_serve_lazy_import.py
   - unittest/llmapi/apps/test_serving_extensions.py
+  - unittest/llmapi/apps/test_single_tool_call_stop.py
   - unittest/llmapi/apps/test_tool_parsers.py
   - unittest/llmapi/apps/test_web_search_shared.py
   - unittest/llmapi/test_bench_async.py

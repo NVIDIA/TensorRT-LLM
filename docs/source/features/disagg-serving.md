@@ -233,9 +233,10 @@ The disaggregated server also serves `/v1/responses`, with both `context_first` 
 - A request with `previous_response_id` is rejected with a 400, because a stored response lives in one worker's memory and a later request may reach another worker. Send the earlier turns in `input` instead.
 - `store` is ignored: nothing is persisted, and the server logs a warning once when a client asks for it.
 
-One limitation applies to `/v1/responses` on every server, disaggregated or not:
+Two limitations apply to `/v1/responses` on every server, disaggregated or not:
 
-- `parallel_tool_calls: false`, and a `tool_choice` other than `auto` or `none` on non-Harmony models, are accepted but not enforced. The server logs a warning once.
+- A `tool_choice` other than `auto` or `none` on non-Harmony models is accepted but not enforced. The server logs a warning once.
+- `parallel_tool_calls: false` ends generation after the first tool call only when the tool parser declares the text that ends one call, as the DeepSeek DSML parsers (`deepseek_v32`, `deepseek_v4`, `deepseek_v41`) do. With other tool parsers, and on Harmony models, it is accepted but not enforced, and the server logs a warning once.
 
 #### Launching disaggregated servers on SLURM clusters
 

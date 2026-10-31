@@ -104,6 +104,10 @@ class ChatPostprocArgs(PostprocArgs):
     reasoning_parser: Optional[str] = None
     tool_parser: Optional[str] = None
     tool_parser_grammar_constrained: bool = False
+    # Stops the server added to end generation after the first tool call
+    # (parallel_tool_calls=false). The client did not ask for them, so a
+    # generation they end reports no stop_reason.
+    single_call_stops: tuple[str, ...] = ()
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
     tool_parser_dict: dict[int, BaseToolParser] = field(default_factory=dict)
@@ -398,6 +402,14 @@ def forced_tool_arguments_end(text: str) -> Optional[int]:
     return end
 
 
+def _client_stop_reason(stop_reason: Optional[Union[int, str]],
+                        args: ChatPostprocArgs) -> Optional[Union[int, str]]:
+    """The stop reason to report: none for a stop the server added itself."""
+    if stop_reason in args.single_call_stops:
+        return None
+    return stop_reason
+
+
 @nvtx_range_debug("chat_stream_post_processor")
 def chat_stream_post_processor(rsp: GenerationResultBase,
                                args: ChatPostprocArgs) -> List[str]:
@@ -595,7 +607,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             speculative_decoding=_build_spec_decode_stats(
                 getattr(output, '_spec_dec_counters', None), args,
                 output.finish_reason),
-            stop_reason=output.stop_reason,
+            stop_reason=_client_stop_reason(output.stop_reason, args),
         )
         if args.return_logprobs:
             logprobs = output.logprobs_diff
@@ -608,7 +620,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 choice.finish_reason = "tool_calls"
             else:
                 choice.finish_reason = output.finish_reason
-            choice.stop_reason = output.stop_reason
+            choice.stop_reason = _client_stop_reason(output.stop_reason, args)
             finish_reason_sent[i] = True
         chunk = ChatCompletionStreamResponse(choices=[choice],
                                              model=args.model,
@@ -755,7 +767,7 @@ def chat_response_post_processor(
         choice = ChatCompletionResponseChoice(
             index=output.index,
             message=message,
-            stop_reason=output.stop_reason,
+            stop_reason=_client_stop_reason(output.stop_reason, args),
             disaggregated_params=disaggregated_params,
             avg_decoded_tokens_per_iter=getattr(rsp,
                                                 'avg_decoded_tokens_per_iter',

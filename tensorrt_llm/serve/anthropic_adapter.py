@@ -364,8 +364,6 @@ def _convert_tool_choice(
     if choice is None:
         # check_tool_choice validator defaults to "auto" when tools are set.
         return "auto" if tools else None
-    if choice.disable_parallel_tool_use and choice.type != "none":
-        raise AnthropicRequestError("tool_choice.disable_parallel_tool_use=true is not supported")
     if choice.type == "none":
         return "none"
     if tools is None:
@@ -475,6 +473,11 @@ def convert_anthropic_request(request: AnthropicMessagesRequest) -> ChatCompleti
         chat_request["tools"] = [t.model_dump() for t in tools]
     if tool_choice is not None:
         chat_request["tool_choice"] = tool_choice
+    choice = request.tool_choice
+    if choice is not None and choice.disable_parallel_tool_use and choice.type != "none":
+        # At most one tool_use block: the chat pipeline ends generation after
+        # the first tool call where the tool-call format allows it.
+        chat_request["parallel_tool_calls"] = False
     if request.temperature is not None:
         chat_request["temperature"] = request.temperature
     if request.top_p is not None:
