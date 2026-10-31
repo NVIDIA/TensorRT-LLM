@@ -56,6 +56,9 @@
 #include <random>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#ifdef TEST_UCX_ZMQ_AVAILABLE
+#include <zmq.hpp>
+#endif
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using LlmRequest = tensorrt_llm::batch_manager::LlmRequest;
@@ -202,6 +205,50 @@ TEST_F(UcxCommTest, Basic)
         throw e;
     }
 }
+
+#ifdef TEST_UCX_ZMQ_AVAILABLE
+TEST_F(UcxCommTest, malformedMultipartRequestDoesNotStopListener)
+{
+    try
+    {
+        auto connectionManager = makeOneUcxConnectionManager();
+        ASSERT_NE(connectionManager, nullptr);
+
+        auto const& commState = connectionManager->getCommState();
+        auto const& socketState = commState.getSocketState().at(commState.getSelfIdx());
+        auto const host
+            = socketState.mIp.find(':') == std::string::npos ? socketState.mIp : "[" + socketState.mIp + "]";
+        auto const endpoint = "tcp://" + host + ":" + std::to_string(socketState.mPort);
+
+        zmq::context_t context;
+        zmq::socket_t requestSocket(context, zmq::socket_type::req);
+        requestSocket.set(zmq::sockopt::rcvtimeo, 5000);
+        requestSocket.set(zmq::sockopt::sndtimeo, 5000);
+        requestSocket.connect(endpoint);
+
+        ASSERT_TRUE(requestSocket.send(zmq::buffer("malformed"), zmq::send_flags::sndmore).has_value());
+        ASSERT_TRUE(requestSocket.send(zmq::buffer("trailing-frame"), zmq::send_flags::none).has_value());
+        zmq::message_t errorReply;
+        ASSERT_TRUE(requestSocket.recv(errorReply).has_value());
+        EXPECT_EQ(errorReply.size(), 0);
+
+        auto peerConnectionManager = makeOneUcxConnectionManager();
+        auto connections = peerConnectionManager->getConnections(commState);
+        EXPECT_EQ(connections.size(), 1);
+    }
+    catch (std::exception const& e)
+    {
+        std::string error = e.what();
+        if (error.find("UCX wrapper library is not open correctly") != std::string::npos
+            || error.find("Unable to load UCX wrapper library symbol") != std::string::npos)
+        {
+            GTEST_SKIP() << "UCX wrapper library is not open correctly. Skip this test case.";
+        }
+
+        throw;
+    }
+}
+#endif
 
 TEST_F(UcxCommTest, multiSend)
 {
