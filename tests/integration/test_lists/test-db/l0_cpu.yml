@@ -73,6 +73,7 @@ l0_cpu:
   - unittest/others/test_sparse_offload_accuracy.py
   # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
   - unittest/others/test_perf_sanity_port_reservation.py
+  - unittest/others/test_kimi3_ci_selection.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a

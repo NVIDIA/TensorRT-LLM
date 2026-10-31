@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import pytest
+from test_common.grouped_test_utils import preserve_worker_env
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.configs import KimiK3Config, KimiLinearConfig
@@ -168,6 +169,7 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(16)
     @pytest.mark.skip_less_device_memory(200000)
     @pytest.mark.parametrize("fp8_kv", [False, True], ids=["bf16-kv", "fp8-kv"])
+    @pytest.mark.private_mpi_session
     def test_prims_ts(self, fp8_kv: bool, monkeypatch: pytest.MonkeyPatch) -> None:
         """Full K3: strict PrimTS MLA context/decode, chunking, reuse and graphs.
 
@@ -177,30 +179,34 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
         """
         monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
         self._assert_checkpoint_routing()
-        with LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=16,
-            moe_expert_parallel_size=16,
-            enable_attention_dp=True,
-            max_batch_size=32,
-            # The explicit 4096-token reuse probe must span context chunks.
-            max_num_tokens=2048,
-            max_seq_len=8192,
-            trust_remote_code=True,
-            enable_chunked_prefill=True,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
-            moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
-            kv_cache_config=KvCacheConfig(
-                dtype="fp8" if fp8_kv else "auto",
-                enable_block_reuse=True,
-                free_gpu_memory_fraction=0.25,
-                tokens_per_block=64,
-                mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
-            ),
-            enable_iter_perf_stats=True,
-            max_stats_len=256,
-            return_perf_metrics=True,
-        ) as llm:
+        with (
+            preserve_worker_env(16, "TLLM_FMHA_LIBS"),
+            LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=16,
+                moe_expert_parallel_size=16,
+                enable_attention_dp=True,
+                max_batch_size=32,
+                # The explicit 4096-token reuse probe must span context chunks.
+                max_num_tokens=2048,
+                max_seq_len=8192,
+                trust_remote_code=True,
+                enable_chunked_prefill=True,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=32),
+                moe_config=MoeConfig(max_num_tokens=33024, use_low_precision_moe_combine=True),
+                kv_cache_config=KvCacheConfig(
+                    dtype="fp8" if fp8_kv else "auto",
+                    enable_block_reuse=True,
+                    free_gpu_memory_fraction=0.25,
+                    tokens_per_block=64,
+                    mamba_state_config=MambaStateConfig(periodic_snapshot_interval=256),
+                ),
+                enable_iter_perf_stats=True,
+                max_stats_len=256,
+                return_perf_metrics=True,
+                env_overrides={"TLLM_FMHA_LIBS": "prims_ts"},
+            ) as llm,
+        ):
             self._assert_resolved_args(llm, "reuse")
             assert llm.args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if fp8_kv else None)
             assert_kv_cache_reuse_for_llm(llm, [1] + [42] * 4094 + [43])
@@ -454,7 +460,7 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
     DSPARK_MODEL_PATH = f"{llm_models_root()}/RadixArk-Kimi-K3-DSpark"
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    def test_gsm8k_tep8(self):
+    def test_gsm8k_tep8(self) -> None:
         """GSM8K plus an acceptance-length gate on the TEP8 DSpark recipe.
 
         TEP, not TestKimiK3's DEP16 recipe: with attention DP off the drafter gets
@@ -463,8 +469,24 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
         a drafter producing garbage scores the same and only runs slower --
         hence the acceptance-length assertion.
         """
+        self._run_gsm8k_tep8(fp8_kv=False)
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.private_mpi_session
+    def test_prims_ts_fp8_tep8(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Qualify strict PrimTS FP8 MLA prefill/MTP decode with FP32 KDA state."""
+        monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
+        with preserve_worker_env(8, "TLLM_FMHA_LIBS"):
+            self._run_gsm8k_tep8(fp8_kv=True, env_overrides={"TLLM_FMHA_LIBS": "prims_ts"})
+
+    def _run_gsm8k_tep8(self, *, fp8_kv: bool, env_overrides: dict[str, str] | None = None) -> None:
+        """Run the shared DSpark7 workload and its baseline acceptance gate."""
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=False, free_gpu_memory_fraction=0.20, tokens_per_block=64
+            dtype="fp8" if fp8_kv else "auto",
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.20,
+            tokens_per_block=64,
+            mamba_ssm_cache_dtype="float32",
         )
         spec_config = DSparkDecodingConfig(
             max_draft_len=7, speculative_model=self.DSPARK_MODEL_PATH, attention_backend="TRTLLM"
@@ -493,11 +515,14 @@ class TestKimiK3DSpark(LlmapiAccuracyTestHarness):
             max_stats_len=-1,
             enable_iter_perf_stats=True,
             speculative_config=spec_config,
+            env_overrides=env_overrides,
         ) as llm:
             # Unlike TestKimiK3's MXFP4 weights, the requant ships
             # hf_quant_config.json, so the matcher sees MIXED_PRECISION --
             # only the experts are 4-bit.
             assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            assert llm.args.quant_config.kv_cache_quant_algo == (QuantAlgo.FP8 if fp8_kv else None)
+            assert llm.args.kv_cache_config.mamba_ssm_cache_dtype == "float32"
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             assert_acceptance_length_for_llm(
