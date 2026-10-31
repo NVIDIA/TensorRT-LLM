@@ -348,6 +348,29 @@ def test_markov_tp_exchange_only_for_a_drafter_with_shard_logits(monkeypatch):
     assert exchange_for(nn.Linear(4, 4)) is None
 
 
+def test_vocab_parallel_head_exchanges_over_nccl(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The LM-head pair exchange stays off the Lamport workspace shared with the
+    model's all-reduces, like the Markov chain's exchange."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.distributed import AllReduceStrategy
+    from tensorrt_llm._torch.speculative import vocab_parallel
+
+    strategies = []
+
+    def fake_all_reduce(
+        mapping: SimpleNamespace, strategy: AllReduceStrategy, dtype: torch.dtype
+    ) -> str:
+        strategies.append(strategy)
+        return "all_reduce"
+
+    monkeypatch.setattr(vocab_parallel, "AllReduce", fake_all_reduce)
+    mapping = SimpleNamespace(tp_size=2, tp_rank=1)
+    lm_head = SimpleNamespace(mapping=mapping, num_embeddings=1024, out_features=512)
+    vocab_parallel.VocabParallelHead(lm_head)
+    assert strategies == [AllReduceStrategy.NCCL]
+
+
 def test_target_logits_are_the_shard_once_the_head_is_bound(monkeypatch):
     """The worker's target-logits hook hands its forward this rank's vocab
     shard once the target head is bound, and the gathered logits before."""
