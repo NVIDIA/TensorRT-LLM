@@ -935,7 +935,7 @@ def test_transformer_block_is_fullgraph_compile_safe(
 
 @pytest.mark.parametrize(
     ("backend", "supported"),
-    [("VANILLA", True), ("FA4", True), ("TRTLLM", False), ("CUTEDSL", False)],
+    [("VANILLA", True), ("FA4", True), ("TRTLLM", True), ("FLASHINFER", True), ("CUTEDSL", False)],
 )
 def test_key_padding_mask_support_tracks_attention_backend(backend: str, supported: bool) -> None:
     config = _make_model_config()
@@ -947,7 +947,7 @@ def test_key_padding_mask_support_tracks_attention_backend(backend: str, support
 
 @requires_cuda
 def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
-    """TRTLLM/CUTEDSL swallow key_padding_mask via **kwargs, so fail loudly instead."""
+    """Reject padding when the selected backend cannot express it."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
@@ -958,7 +958,7 @@ def test_forward_rejects_padded_rows_on_backend_that_ignores_the_mask() -> None:
     model(**inputs)
 
     model._supports_key_padding_mask = False
-    model._attn_backend = "TRTLLM"
+    model._attn_backend = "CUTEDSL"
     with pytest.raises(NotImplementedError, match="key_padding_mask"):
         model(**inputs)
 
