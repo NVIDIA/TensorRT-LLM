@@ -8,11 +8,11 @@ from typing import Tuple
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
 # Tier-2 sourcing: a vendored Triton callable reached as ordinary Python. QSA's
 # kernel plane has no torch.ops surface.
 from tensorrt_llm._torch.attention.backends.sparse.qsa import kernels as _qsa_kernels
+
+from .._op import Arch, Cell, OpWrapper
 
 #: This checkpoint's main K/V geometry and the engine's QSA metadata. `heads_q`
 #: places k and v as head slices of the packed `[T, 24 + 2 + 2, 256]` QKV
@@ -43,7 +43,7 @@ _DECODE = ((0, 1), (31, 1), (32, 1), (33, 1), (100, 1), (255, 1), (7, 1), (64, 1
 #: page edge and some inside one.
 _MTP7_32 = tuple((29 + 61 * i, 8) for i in range(32))
 
-#: One rank's QSA K/V pool as the stock `Qwen4ExpHybridCacheManager` lays it out at this target's
+#: One rank's QSA K/V pool as the stock `Qwen4ExpHybridCacheManager` lays it out at the unified target's
 #: members: a page holds the K and V role planes of all 12 attention layers (24 role pages of
 #: `[hkv, 32, 256]`), so a layer's `get_buffers(i, kv_layout="HND")` view steps 24 role pages a
 #: page. `pool="engine"` cells drive layer 47's view (`layer_slot` 11, the page's last planes) at
@@ -153,7 +153,7 @@ class QsaPagedKvStore(OpWrapper):
             why="fp8 decode MTP7: 32 requests x 8 rows (256), blocks straddling pages",
             spec=_spec(_MTP7_32, pages=1200, slots=40, cache_dtype=_F8),
         ),
-        # This target's members over the engine's own pool: one rank's page count, the
+        # The unified target's members over the engine's own pool: one rank's page count, the
         # 24-role-page stride, layer 47's view, a 128-row table.
         Cell(
             why="tep4 decode, 1 row: hkv 1 off the 4352-wide row, position 9215, "

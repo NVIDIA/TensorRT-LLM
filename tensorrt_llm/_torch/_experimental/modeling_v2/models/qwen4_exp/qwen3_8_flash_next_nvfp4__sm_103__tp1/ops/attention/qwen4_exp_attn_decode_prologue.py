@@ -53,9 +53,11 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_i
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_index_store import (
     qsa_paged_index_store as _index_store,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.qsa_paged_kv_store import (
+    qsa_paged_kv_store as _kv_store,
+)
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 
-from .qsa_paged_kv_store import qsa_paged_kv_store as _kv_store
 from .qsa_paged_kv_store_nvfp4 import _e2m1x2, _quantize_row, _rcp_approx
 from .qsa_paged_kv_store_nvfp4 import qsa_paged_kv_store_nvfp4 as _kv_store_nvfp4
 from .qsa_prefill_compress import qsa_prefill_compress as _compress
