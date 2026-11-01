@@ -74,6 +74,9 @@ _AUXILIARY_SMS = 4
 # them and live in the helper sets, so both relay paths are covered.
 _HIDDEN = 256
 _INTERMEDIATE = 128
+# A production-size bundle (about 37 MB per expert): its relay takes long enough that a READY gate opening on the
+# previous launch's cells copies helper rows that are still being written.
+_PRODUCTION_BUNDLE = (7168, 3072)
 _WORKER_TIMEOUT_S = 600
 # Every launch publishes READY 1, which MegaMoE's gate waits for.
 _READY = 1
@@ -355,6 +358,7 @@ class _Layers:
         count: int,
         auxiliary_sms: int = _AUXILIARY_SMS,
         helper_slot_mode: str = "shared_banks",
+        bundle_dims: tuple = (_HIDDEN, _INTERMEDIATE),
     ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
@@ -380,7 +384,7 @@ class _Layers:
         self.manager = PerLayerDynamicMoeLoadBalancer(ep_rank=rank, ep_size=world, config=config)
         self.mapping = SimpleNamespace(moe_ep_size=world, moe_ep_rank=rank, local_rank=device)
         self.process_group = dist.group.WORLD
-        bundle = BundleLayout.create(hidden=_HIDDEN, intermediate=_INTERMEDIATE)
+        bundle = BundleLayout.create(hidden=bundle_dims[0], intermediate=bundle_dims[1])
         self.arenas = []
         for layer in range(count):
             self.arenas.append(
@@ -1118,6 +1122,7 @@ def _case_trap(layers: _Layers, kind: str) -> dict:
 _CASES = {
     "reference": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
     "reference_aux16": (_case_reference, 1, 16, "shared_banks"),
+    "reference_production_bundle": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
     "balanced_and_empty": (_case_balanced_and_empty, 1, _AUXILIARY_SMS, "shared_banks"),
     "resident_repeat": (_case_resident_repeat, 1, _AUXILIARY_SMS, "per_layer_resident"),
     "resident_sequence": (_case_resident_sequence, 1, _AUXILIARY_SMS, "per_layer_resident"),
@@ -1182,7 +1187,10 @@ def _run_worker(case: str):
         if any(reasons):
             return "; ".join(sorted({r for r in reasons if r})), []
         _init_process_group(rank, world)
-        layers = _Layers(rank, world, device, count, auxiliary_sms, mode)
+        dims = (
+            _PRODUCTION_BUNDLE if case.endswith("production_bundle") else (_HIDDEN, _INTERMEDIATE)
+        )
+        layers = _Layers(rank, world, device, count, auxiliary_sms, mode, dims)
         if case.startswith("gate_under_hog"):
             _starve_relay(layers)
         try:
