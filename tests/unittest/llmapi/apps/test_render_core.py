@@ -561,6 +561,32 @@ class TestExtensions:
             != render_chat(chat_request(), harmony_resources()).token_ids
         )
 
+    def test_the_generic_thinking_kwargs_reach_the_kimi_k3_prompt(self) -> None:
+        # K3's template reads `thinking` / `thinking_effort`; the extension derives them from the
+        # `enable_thinking` / `reasoning_effort` that other templates read and the Anthropic
+        # adapter sends.
+        res = RenderResources.from_tokenizer(make_tokenizer(name=KIMI_K3), model_type="kimi_k3")
+
+        def render(**chat_template_kwargs) -> str:
+            request = chat_request(
+                messages=[{"role": "user", "content": "hi"}],
+                chat_template_kwargs=chat_template_kwargs or None,
+            )
+            return render_chat(request, res, tokenize=False).text
+
+        default = render()
+        assert default.startswith('<|open|>message role="system" type="thinking-effort"<|sep|>')
+        assert "`thinking_effort=max`" in default
+        assert default.endswith("<|open|>think<|sep|>")
+
+        # Thinking off: the prompt opens with the user turn and ends in the answer channel.
+        off = render(enable_thinking=False)
+        assert off.startswith('<|open|>message role="user"<|sep|>hi')
+        assert off.endswith("<|open|>response<|sep|>")
+
+        low = render(reasoning_effort="low")
+        assert low == default.replace("`thinking_effort=max`", "`thinking_effort=low`")
+
 
 class TestRenderConversation:
     def test_matches_render_chat_for_a_parsed_conversation(self, tokenizer) -> None:
