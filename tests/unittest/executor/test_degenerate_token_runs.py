@@ -57,6 +57,8 @@ class _Request:
 
     def __init__(self, params: SamplingParams):
         self.py_stop_words_list = params._get_stop_words()
+        self.py_num_generated_only_stop_words = len(params._degenerate_token_runs)
+        self.py_orig_prompt_len = len(PROMPT)
         self.tokens = list(PROMPT)
 
     def get_tokens(self, beam_idx: int) -> list:
@@ -239,3 +241,43 @@ def test_detector_matches_exact_and_wrapped_messages():
 def test_detector_rejects_other_errors():
     assert not is_degenerate_generation_message("Generation failed: request cancelled")
     assert not is_degenerate_generation_message("")
+
+
+@pytest.mark.parametrize("ordinary_rule", [False, True])
+def test_production_run_does_not_count_prompt_suffix(ordinary_rule: bool) -> None:
+    """Only server-added runs exclude a pre-tokenized prompt suffix."""
+    params = SamplingParams(end_id=END_ID)
+    params._set_degenerate_token_runs([PAD], 20)
+    tokens = [PAD] * 19
+    request = SimpleNamespace(
+        py_stop_words_list=([[PAD] * 20] if ordinary_rule else []) + params._get_stop_words(),
+        py_num_generated_only_stop_words=1,
+        py_orig_prompt_len=len(tokens),
+        get_tokens=lambda beam_idx: tokens,
+    )
+    for generated in range(1, 21):
+        tokens.append(PAD)
+        assert meet_stop_token_criteria(request, PAD) == (ordinary_rule or generated >= 20)
+    result = _finished_result(params)
+    with pytest.raises(RequestError, match="degenerate"):
+        _finish(result, [PAD] * 20, tllm.FinishReason.STOP_WORDS)
+
+
+@pytest.mark.parametrize("ignore_eos", [False, True])
+def test_worker_marks_only_server_added_stop_rules(ignore_eos: bool) -> None:
+    from tensorrt_llm.executor.base_worker import BaseWorker
+    from tensorrt_llm.executor.request import GenerationRequest
+
+    params = SamplingParams(end_id=END_ID, max_tokens=32, stop_token_ids=[7], ignore_eos=ignore_eos)
+    params._set_degenerate_token_runs([PAD], 20)
+    request = GenerationRequest(prompt_token_ids=[PAD] * 19, sampling_params=params)
+    request.set_id(42)
+    submitted: list[tllm.Request] = []
+    worker = SimpleNamespace(
+        _lora_manager=None,
+        max_seq_len=256,
+        engine=SimpleNamespace(enqueue_request=lambda value: submitted.append(value) or 42),
+    )
+    assert BaseWorker._enqueue_request(worker, request) == 42
+    assert submitted[0].py_num_generated_only_stop_words == (0 if ignore_eos else 1)
+    assert submitted[0].stop_words == ([] if ignore_eos else [[7], [PAD] * 20])

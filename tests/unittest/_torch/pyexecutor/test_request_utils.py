@@ -1746,3 +1746,32 @@ class TestBroadcasterClock:
         (values,), _ = other.broadcast_int64.call_args
         assert list(values) == [0, 0, -1]
         assert b.rank0_aux == pytest.approx(0.17) and b.rank0_now == pytest.approx(1.0)
+
+
+def test_generated_only_stop_rules_survive_broadcast_and_child_cloning() -> None:
+    """Rule provenance must reach every rank and every return sequence."""
+    source = trtllm.Request(
+        input_token_ids=[2] * 19,
+        max_tokens=32,
+        stop_words=[[7, 2], [2] * 20],
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    source.py_num_generated_only_stop_words = 1
+    source.py_conversation_params = None
+    objects = RequestBroadcaster._collect_py_objects(None, [RequestQueueItem(42, source)])
+    restored = trtllm.Request(
+        input_token_ids=[2] * 19,
+        max_tokens=32,
+        stop_words=[[7, 2], [2] * 20],
+        sampling_config=trtllm.SamplingConfig(num_return_sequences=2),
+    )
+    attach_py_objects_to_requests(
+        [RequestQueueItem(42, restored)], pickle.loads(pickle.dumps(objects))
+    )
+    request = executor_request_to_llm_request(
+        42, restored, child_req_ids=[43], exclude_last_generation_logits=False
+    )
+    for candidate in (request, request.child_requests[0]):
+        assert candidate.py_num_generated_only_stop_words == 1
+        assert candidate.py_stop_words_list == [[7, 2], [2] * 20]
+        assert candidate.py_orig_prompt_len == 19

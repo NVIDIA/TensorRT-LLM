@@ -483,6 +483,11 @@ class BaseWorker(GenerationExecutor):
                 disagg_request_id=disagg_request_id,
                 cache_salt=request.cache_salt,
                 priority=request.priority)
+            # Server-added degenerate runs are the trailing stop rules and
+            # must never consume a suffix of the input prompt.
+            executor_request.py_num_generated_only_stop_words = (
+                0 if request.sampling_params.ignore_eos else len(
+                    request.sampling_params._degenerate_token_runs))
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path

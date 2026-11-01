@@ -145,7 +145,7 @@ def test_compact_stop_words_history_and_slot_reuse() -> None:
                 assert handler.store.stop_words_metadata_cuda[8].tolist() == [
                     replacement.tensor.data_ptr(),
                     2,
-                    8,
+                    10,
                     steps + 2,
                     beams,
                 ]
@@ -254,7 +254,7 @@ def test_compact_stop_words_storage_and_finish_precedence() -> None:
     )
     # Metadata plus actual rules and per-request windows; no 1024 x 1024 x 256 tensor.
     assert total_bytes < 64 * 1024
-    assert handler._stop_word_allocations[3].tensor.numel() == 2 + 256 + 2 * 256
+    assert handler._stop_word_allocations[3].tensor.numel() == 2 + 256 + 1 + 2 * 256
 
     slots = torch.tensor([2], device="cuda", dtype=torch.int64)
     tokens = torch.zeros((1, 1025, 1), device="cuda", dtype=torch.int32)
@@ -314,3 +314,59 @@ def test_compact_stop_words_storage_and_finish_precedence() -> None:
     handler.release_request(long)
     assert not handler._stop_word_allocations
     assert not handler.has_stop_word_history
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("steps", [1, 3])
+def test_generated_only_stop_words_preserve_prompt_spanning_rules(steps: int) -> None:
+    """Production-length runs ignore prompt tokens, including rejected draft suffixes."""
+    from types import SimpleNamespace
+
+    handler = FinishReasonsHandler(
+        max_num_sequences=3, max_beam_width=1, max_tokens=steps, max_seq_len=256
+    )
+    slots_host = torch.tensor([0, 2], dtype=torch.int32)
+    slots = slots_host.cuda().long()
+    handler.setup_new_request_handling()
+    for slot in (0, 2):
+        request = SimpleNamespace(
+            py_seq_slot=slot,
+            py_stop_words_list=[[2] * 20] * (1 if slot == 0 else 2),
+            py_num_generated_only_stop_words=1,
+            py_orig_prompt_len=19,
+            py_max_new_tokens=100,
+            py_end_id=99,
+            is_context_only_request=False,
+            py_beam_width=1,
+            get_tokens=lambda: [[2] * 19],
+        )
+        handler.prepare_for_new_request(request)
+    handler.update_for_new_request(
+        seq_slots_cuda_long=slots,
+        max_lengths_cuda=torch.full((2,), 119, device="cuda", dtype=torch.int32),
+        end_ids_cuda=torch.full((2,), 99, device="cuda", dtype=torch.int32),
+        seq_slots_host=slots_host,
+    )
+    tokens = torch.full((steps, 4, 1), 2, device="cuda", dtype=torch.int32)
+    generated = 0
+    previous_accepted = 1
+    iteration = 0
+    while generated < 20:
+        handler.store.num_accepted_draft_tokens_host[slots_host] = previous_accepted - 1
+        reasons = handler.write_finish_reasons(
+            seq_slots_host=slots_host,
+            seq_slots_cuda=slots,
+            seq_lens_cuda=torch.full((2,), 19 + generated, device="cuda", dtype=torch.int32),
+            new_tokens_cuda=tokens,
+        ).cpu()
+        expected = [
+            FinishReason.STOP_WORDS.value
+            if generated + step + 1 >= 20
+            else FinishReason.NOT_FINISHED.value
+            for step in range(steps)
+        ]
+        assert reasons[:, 0, 0].tolist() == expected
+        assert reasons[:, 2, 0].tolist() == [FinishReason.STOP_WORDS.value] * steps
+        previous_accepted = 1 if iteration % 2 == 0 else steps
+        generated += previous_accepted
+        iteration += 1

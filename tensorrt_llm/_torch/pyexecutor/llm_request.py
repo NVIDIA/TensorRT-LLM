@@ -707,6 +707,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             additional_outputs: Optional[List[str]] = None,
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
+            num_generated_only_stop_words: int = 0,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
             parent_request: Optional["LlmRequest"] = None,
@@ -853,6 +854,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         # Keep py_stop_words_list as a python list, rather than a tensor.
         self.py_stop_words_list = stop_words_list
+        # Only the trailing server-added rules exclude prompt tokens.
+        self.py_num_generated_only_stop_words = num_generated_only_stop_words
 
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
@@ -1242,6 +1245,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_perf_metrics=self.return_perf_metrics,
             return_encoder_output=self.py_return_encoder_output,
             stop_words_list=deepcopy(self.py_stop_words_list),
+            num_generated_only_stop_words=self.py_num_generated_only_stop_words,
             num_logprobs=self.py_num_logprobs,
             use_chunked_generation_logits=self.py_use_chunked_generation_logits,
             logits_chunk_size=self.py_logits_chunk_size,
@@ -1679,6 +1683,8 @@ def executor_request_to_llm_request(
         end_id=executor_request.end_id,
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
+        num_generated_only_stop_words=getattr(
+            executor_request, "py_num_generated_only_stop_words", 0),
         position_ids=position_ids,
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,

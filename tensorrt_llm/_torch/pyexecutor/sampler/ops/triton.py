@@ -192,6 +192,8 @@ def _compact_stop_match_kernel(
     slots,
     tokens,
     output,
+    seq_lens,
+    HAS_SEQ_LENS: tl.constexpr,
     token_stride_step,
     token_stride_request,
     token_stride_beam,
@@ -224,7 +226,13 @@ def _compact_stop_match_kernel(
         begin = tl.load(base + rule, valid, other=0)
         end = tl.load(base + rule + 1, valid, other=0)
         length = end - begin
-        matches = valid & (length > 0)
+        min_lengths = base + rule_count + 1 + tl.load(base + rule_count)
+        min_length = tl.load(min_lengths + rule, valid, other=0)
+        if HAS_SEQ_LENS:
+            enough_tokens = tl.load(seq_lens + request) + step + 1 >= min_length
+        else:
+            enough_tokens = min_length == 0
+        matches = valid & (length > 0) & enough_tokens
         for offset in range(tl.max(length, 0)):
             active = valid & (offset < length)
             expected = tl.load(base + rule_count + 1 + begin + offset, active, other=0)
@@ -245,12 +253,14 @@ def compact_stop_words(
     accepted: torch.Tensor | int,
     *,
     single_token_only: bool = False,
+    seq_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Match packed per-request rules without a rule-by-token comparison tensor.
 
     Metadata points to int32 allocations containing rule offsets, rule tokens,
-    and two rolling-history windows. The caller retains these allocations and
-    records their use on the current stream because they are indirect inputs.
+    per-rule minimum sequence lengths, and two rolling-history windows. The caller
+    retains these allocations and records their use on the current stream because
+    they are indirect inputs.
 
     Args:
         metadata: Contiguous CUDA int64 tensor of shape [max_num_sequences, 5].
@@ -265,6 +275,8 @@ def compact_stop_words(
             one, used to advance the rolling history. Unused for single-token rules.
         single_token_only: Whether all rules contain exactly one token, allowing
             history updates to be skipped.
+        seq_lens: CUDA sequence lengths before these tokens, shaped [requests].
+            Required to match generated-only rules; ordinary rules need no lengths.
 
     Returns:
         CUDA bool tensor of shape [steps, requests, beams], true where a sequence
@@ -293,6 +305,8 @@ def compact_stop_words(
         slots,
         tokens,
         result,
+        seq_lens,
+        seq_lens is not None,
         *tokens.stride(),
         requests,
         steps,

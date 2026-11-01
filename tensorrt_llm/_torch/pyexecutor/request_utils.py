@@ -521,6 +521,7 @@ class RequestBroadcaster:
                 "py_multimodal_data",
                 "py_scheduling_params",
                 "py_num_logprobs",
+                "py_num_generated_only_stop_words",
                 "py_disaggregated_params",
                 "py_lora_path",
                 "py_lora_ckpt_source",

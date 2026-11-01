@@ -249,7 +249,12 @@ class FinishReasonsHandler:
         for word in words:
             flat_tokens.extend(word)
             offsets.append(len(flat_tokens))
-        history_offset = len(offsets) + len(flat_tokens)
+        generated_only_start = len(words) - getattr(request, "py_num_generated_only_stop_words", 0)
+        min_lengths = [
+            request.py_orig_prompt_len + len(word) if index >= generated_only_start else 0
+            for index, word in enumerate(words)
+        ]
+        history_offset = len(offsets) + len(flat_tokens) + len(min_lengths)
         window_length = max_length - 1 + self._max_tokens if max_length > 1 else 0
         history_size = window_length * self._max_beam_width
         host = torch.zeros(
@@ -258,7 +263,7 @@ class FinishReasonsHandler:
             device="cpu",
             pin_memory=prefer_pinned(),
         )
-        host[:history_offset] = torch.tensor(offsets + flat_tokens, dtype=torch.int32)
+        host[:history_offset] = torch.tensor(offsets + flat_tokens + min_lengths, dtype=torch.int32)
         if window_length:
             history = host[history_offset : history_offset + history_size].view(
                 window_length, self._max_beam_width
@@ -537,6 +542,7 @@ class FinishReasonsHandler:
                     num_accepted_tokens[stop_word_indices]
                     if isinstance(num_accepted_tokens, torch.Tensor)
                     else num_accepted_tokens,
+                    seq_lens=seq_lens[stop_word_indices],
                 ),
                 FinishReason.STOP_WORDS.value,
             )
@@ -616,6 +622,8 @@ class FinishReasonsHandler:
         seq_slots: torch.Tensor,
         tokens: torch.Tensor,
         num_accepted_tokens: torch.Tensor | int,
+        *,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Checks if the tokens are stop words
 
@@ -626,6 +634,8 @@ class FinishReasonsHandler:
               Shape: [max_tokens, len(requests), max_beam_width]
             num_accepted_tokens: The number of accepted draft tokens +1 for each request.
               Shape: [len(requests)] if torch.Tensor
+            seq_lens: Sequence lengths before the newly generated tokens, shaped [requests].
+                Required for generated-only rules.
         Returns:
             A tensor where each element is True if the sequence at the corresponding token
             ends with a stop word, False otherwise
@@ -633,7 +643,11 @@ class FinishReasonsHandler:
         """
         self.record_stop_word_stream()
         return compact_stop_words(
-            self.store.stop_words_metadata_cuda, seq_slots, tokens, num_accepted_tokens
+            self.store.stop_words_metadata_cuda,
+            seq_slots,
+            tokens,
+            num_accepted_tokens,
+            seq_lens=seq_lens,
         )
 
     @nvtx_range("_are_stop_words_single_token")
@@ -642,6 +656,8 @@ class FinishReasonsHandler:
         seq_slots: torch.Tensor,
         tokens: torch.Tensor,
         _num_accepted_tokens: torch.Tensor | int,
+        *,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Checks if the tokens are stop words (single token per stop word only)
 
@@ -651,6 +667,8 @@ class FinishReasonsHandler:
             tokens: A buffer containing the newly generated tokens.
               Shape: [max_tokens, len(requests), max_beam_width]
             _num_accepted_tokens: Unused
+            seq_lens: Sequence lengths before the newly generated tokens, shaped [requests].
+                Required for generated-only rules.
         Returns:
             A tensor where each element is True if the sequence at the corresponding token
             ends with a stop word, False otherwise
@@ -663,4 +681,5 @@ class FinishReasonsHandler:
             tokens,
             _num_accepted_tokens,
             single_token_only=True,
+            seq_lens=seq_lens,
         )

@@ -358,8 +358,12 @@ def meet_stop_token_criteria(
 
         # Slow path: at least one multi-token stop word exists
         tokens = request.get_tokens(beam_idx)
-        for stop_word in stop_words_list:
-            if len(stop_word) > len(tokens):
+        generated_only_start = len(stop_words_list) - request.py_num_generated_only_stop_words
+        for index, stop_word in enumerate(stop_words_list):
+            available = len(tokens)
+            if index >= generated_only_start:
+                available -= request.py_orig_prompt_len
+            if len(stop_word) > available:
                 continue
             if tokens[-len(stop_word) :] == stop_word:
                 return True
