@@ -1451,6 +1451,7 @@ class PrimsTSFmha(PhasedFmha):
             kv_indptr,
             out=params.output,
             softmax_stats=stats,
+            softmax_scale=buffers["bmm1_scale"][:1] if fp8 and stats is not None else None,
             scale_softmax_log2=buffers["bmm1_scale"][1:] if fp8 else None,
             output_scale=buffers["bmm2_scale"] if fp8 else None,
             validate=False,
