@@ -297,7 +297,7 @@ def test_serve_llm_disagg_cluster_key_leaves_launcher_llm_args(monkeypatch, tmp_
     cluster = kwargs["disagg_cluster_config"]
     assert isinstance(cluster, DisaggClusterConfig)
     # A cluster_uri in the YAML wins over --disagg_cluster_uri today; the flag
-    # only fills a missing one.
+    # only fills a missing one. The precedence change belongs to #20490.
     assert cluster.cluster_uri == "etcd://cfg:2379"
 
 
@@ -375,6 +375,38 @@ def test_openengine_launch_server_does_not_mutate_llm_args(monkeypatch):
     assert recorder.kwargs["_openengine_discovery"]["port"] == 12345
 
 
+def test_openengine_cli_passes_provisioned_connector_config(monkeypatch):
+    oe_server = pytest.importorskip("tensorrt_llm.grpc.openengine.server")
+    monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
+    llm_args = {
+        "model": "m",
+        "backend": "pytorch",
+        "num_serve_frontends": 1,
+        "kv_connector_config": {
+            "connector_module": "mod",
+            "connector_scheduler_class": "Scheduler",
+            "connector_worker_class": "Worker",
+        },
+    }
+    snapshot = copy.deepcopy(llm_args)
+    with (
+        mock.patch.object(serve_module, "get_is_diffusion_only_model", return_value=False),
+        mock.patch.object(serve_module, "device_count", return_value=1),
+        mock.patch.object(serve_module, "get_llm_args", return_value=(llm_args, None)),
+        mock.patch.object(oe_server, "launch_server") as launch,
+    ):
+        serve_main(
+            args=["dummy/model", "--grpc", "--grpc-protocol", "openengine"],
+            standalone_mode=False,
+        )
+
+    _assert_unchanged("OpenEngine CLI", llm_args, snapshot)
+    launch.assert_called_once()
+    connector = launch.call_args.kwargs["llm_args"]["kv_connector_config"]
+    assert isinstance(connector, KvCacheConnectorConfig)
+    assert connector.connector_module == "mod"
+
+
 def test_smg_launch_server_does_not_mutate_llm_args(monkeypatch):
     pytest.importorskip("smg_grpc_proto")
     smg_server = pytest.importorskip("tensorrt_llm.grpc.smg.server")
@@ -384,6 +416,11 @@ def test_smg_launch_server_does_not_mutate_llm_args(monkeypatch):
         "model": "m",
         "backend": "pytorch",
         "build_config": {"max_batch_size": 8},
+        "kv_connector_config": {
+            "connector_module": "mod",
+            "connector_scheduler_class": "Scheduler",
+            "connector_worker_class": "Worker",
+        },
     }
     snapshot = copy.deepcopy(llm_args)
 
@@ -393,6 +430,7 @@ def test_smg_launch_server_does_not_mutate_llm_args(monkeypatch):
     _assert_unchanged("launch_smg_server", llm_args, snapshot)
     assert "build_config" not in recorder.kwargs
     assert recorder.kwargs["model"] == "m"
+    assert isinstance(recorder.kwargs["kv_connector_config"], KvCacheConnectorConfig)
 
 
 def test_update_llm_args_with_extra_dict_does_not_mutate_yaml_telemetry():
@@ -423,7 +461,7 @@ def test_extract_disagg_cluster_config_does_not_mutate_cluster_config_dict():
 
     _assert_unchanged("extract_disagg_cluster_config", cluster_config_dict, snapshot)
     assert isinstance(cluster_config_dict["minimal_instances"], dict)
-    # A cluster_uri in the mapping wins over the cluster_uri argument today.
+    # Preserve current precedence here; #20490 changes it separately.
     assert first.cluster_uri == "etcd://cfg:2379"
     assert first.minimal_instances == MinimalInstances(context_servers=2, generation_servers=3)
 
