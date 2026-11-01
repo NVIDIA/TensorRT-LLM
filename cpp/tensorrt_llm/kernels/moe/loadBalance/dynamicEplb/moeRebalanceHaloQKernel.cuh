@@ -909,7 +909,7 @@ __device__ __forceinline__ int plan_halo_m_warp_impl(int const* histogram, int l
             {
                 unsigned const key = __reduce_max_sync(mask,
                     valid ? ((static_cast<unsigned>(group_room[level]) << 5)
-                                | (31u - static_cast<unsigned>(group_index[level])))
+                        | (31u - static_cast<unsigned>(group_index[level])))
                           : 0u);
                 group = 31 - static_cast<int>(key & 31u);
                 open_levels |= key ? 1u << level : 0u;
@@ -933,15 +933,15 @@ __device__ __forceinline__ int plan_halo_m_warp_impl(int const* histogram, int l
 #pragma unroll
             for (int level = 0; level < kMaxLevels; ++level)
             {
-                member[level] = group_ranks[level]
-                    && group_index[level] == static_cast<int>((level_groups >> (3 * level)) & 7u);
+                member[level]
+                    = group_ranks[level] && group_index[level] == static_cast<int>((level_groups >> (3 * level)) & 7u);
                 level_first[level] = __reduce_min_sync(mask, member[level] ? lane_key : 0xffffffffu);
             }
             /* and the next emptiest, the second receiver */
 #pragma unroll
             for (int level = 0; level < kMaxLevels; ++level)
-                level_second[level] = __reduce_min_sync(
-                    mask, member[level] && lane_key != level_first[level] ? lane_key : 0xffffffffu);
+                level_second[level]
+                    = __reduce_min_sync(mask, member[level] && lane_key != level_first[level] ? lane_key : 0xffffffffu);
         }
 
         /* The rank's export if it were the owner: the finest level with a
@@ -995,10 +995,10 @@ __device__ __forceinline__ int plan_halo_m_warp_impl(int const* histogram, int l
              * room and ends the spread as the loop below would. */
             bool const odd = chosen_level & 1;
             bool const high = chosen_level & 2;
-            unsigned const first_key = high ? (odd ? level_first[3] : level_first[2])
-                                            : (odd ? level_first[1] : level_first[0]);
-            unsigned const second_key = high ? (odd ? level_second[3] : level_second[2])
-                                             : (odd ? level_second[1] : level_second[0]);
+            unsigned const first_key
+                = high ? (odd ? level_first[3] : level_first[2]) : (odd ? level_first[1] : level_first[0]);
+            unsigned const second_key
+                = high ? (odd ? level_second[3] : level_second[2]) : (odd ? level_second[1] : level_second[0]);
             int const first = static_cast<int>(first_key & 31u);
             int const first_amount = imin(target - static_cast<int>(first_key >> 5), remaining);
             remaining -= first_amount;
@@ -1090,9 +1090,8 @@ __device__ __forceinline__ int plan_halo_m_warp_impl(int const* histogram, int l
 
 /* Lane count and key width chosen once: the caller runs lanes 0-7 for EP <= 8,
  * and 5-bit-index keys hold loads below 2^27, which a total below 2^26 bounds. */
-__device__ int plan_halo_m_warp(int const* histogram, int* load, int* quota, int const* candidates,
-    int* /*recv_used*/, int* /*send_used*/, int* /*next_index*/, int* /*frozen*/, int* plan, int ep, int experts,
-    int helpers)
+__device__ int plan_halo_m_warp(int const* histogram, int* load, int* quota, int const* candidates, int* /*recv_used*/,
+    int* /*send_used*/, int* /*next_index*/, int* /*frozen*/, int* plan, int ep, int experts, int helpers)
 {
     int const lane = threadIdx.x & 31;
     int const lane_load = lane < ep ? load[lane] : 0;
@@ -1100,15 +1099,15 @@ __device__ int plan_halo_m_warp(int const* histogram, int* load, int* quota, int
     {
         int const total = __reduce_add_sync(0xffu, lane_load);
         if (total <= 0x03ffffff)
-            return plan_halo_m_warp_impl<true, 8>(histogram, lane_load, total, quota, candidates, plan, ep, experts,
-                helpers);
-        return plan_halo_m_warp_impl<false, 8>(histogram, lane_load, total, quota, candidates, plan, ep, experts,
-            helpers);
+            return plan_halo_m_warp_impl<true, 8>(
+                histogram, lane_load, total, quota, candidates, plan, ep, experts, helpers);
+        return plan_halo_m_warp_impl<false, 8>(
+            histogram, lane_load, total, quota, candidates, plan, ep, experts, helpers);
     }
     int const total = __reduce_add_sync(0xffffffffu, lane_load);
     if (total <= 0x03ffffff)
-        return plan_halo_m_warp_impl<true, 32>(histogram, lane_load, total, quota, candidates, plan, ep, experts,
-            helpers);
+        return plan_halo_m_warp_impl<true, 32>(
+            histogram, lane_load, total, quota, candidates, plan, ep, experts, helpers);
     return plan_halo_m_warp_impl<false, 32>(histogram, lane_load, total, quota, candidates, plan, ep, experts, helpers);
 }
 
@@ -1298,8 +1297,8 @@ __device__ __forceinline__ void halo_q_pair(
         bool const right_short = count_right > quota_right;
         bool const right_over = quota_right > count_right;
         unsigned const flags = __reduce_or_sync(0xffffffffu,
-            common ? (left_short && right_over ? 1u : 0u) | (left_over ? 2u : 0u)
-                    | (right_short && left_over ? 4u : 0u) | (right_over ? 8u : 0u)
+            common ? (left_short && right_over ? 1u : 0u) | (left_over ? 2u : 0u) | (right_short && left_over ? 4u : 0u)
+                    | (right_over ? 8u : 0u)
                    : 0u);
         if ((flags & 3u) != 3u && (flags & 12u) != 12u)
             return;
