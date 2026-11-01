@@ -161,29 +161,29 @@ def _multirow_pdl(grid_size: int, device_index: int) -> bool:
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
 def _rms_norm_gated_fwd_multirow_kernel(
-    X,  # pointer to the input
-    Y,  # pointer to the output
-    W,  # pointer to the weights
-    Z,  # pointer to the gate branch
-    Rstd,  # optional pointer to the 1/std
-    FP8_SCALE,  # static scale for an optional FP8 output
-    stride_x_row,
-    stride_y_row,
-    stride_z_tok,
-    M,  # number of rows in X
-    eps,
-    N: tl.constexpr,  # row length; power of two, whole row per program
-    ROWS: tl.constexpr,  # rows per program
-    HEADS_PER_TOK: tl.constexpr,
-    GATE_SIGMOID: tl.constexpr,
-    WEIGHT_IS_DELTA: tl.constexpr,
-    SAVE_RSTD: tl.constexpr,
-    OUTPUT_FP8: tl.constexpr,
-    LAUNCH_WITH_PDL: tl.constexpr,
-    EARLY_TRIGGER: tl.constexpr = False,
-    # Fast-path hints; the defaults take the general strided, masked path.
-    CONTIG: tl.constexpr = False,  # X and Y rows dense (stride == N)
-    EVEN: tl.constexpr = False,  # M % ROWS == 0: no row masking needed
+        X,  # pointer to the input
+        Y,  # pointer to the output
+        W,  # pointer to the weights
+        Z,  # pointer to the gate branch
+        Rstd,  # optional pointer to the 1/std
+        FP8_SCALE,  # static scale for an optional FP8 output
+        stride_x_row,
+        stride_y_row,
+        stride_z_tok,
+        M,  # number of rows in X
+        eps,
+        N: tl.constexpr,  # row length; power of two, whole row per program
+        ROWS: tl.constexpr,  # rows per program
+        HEADS_PER_TOK: tl.constexpr,
+        GATE_SIGMOID: tl.constexpr,
+        WEIGHT_IS_DELTA: tl.constexpr,
+        SAVE_RSTD: tl.constexpr,
+        OUTPUT_FP8: tl.constexpr,
+        LAUNCH_WITH_PDL: tl.constexpr,
+        EARLY_TRIGGER: tl.constexpr = False,
+        # Fast-path hints; the defaults take the general strided, masked path.
+        CONTIG: tl.constexpr = False,  # X and Y rows dense (stride == N)
+        EVEN: tl.constexpr = False,  # M % ROWS == 0: no row masking needed
 ):
     """Gated rmsnorm(x), several short rows per program.
 
