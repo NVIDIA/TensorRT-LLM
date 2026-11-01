@@ -29,10 +29,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, CapacitySchedulerPolicy, KVEventsConfig,
-    KvCacheCompressionConfig, KvCacheConfig, MultimodalEncoderSchedulingPolicy,
-    PeftCacheConfig, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
-    TorchLlmArgs, WaitingQueuePolicy)
+    CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
+    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
+    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
+    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -54,6 +54,7 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_num_extra_kv_tokens,
                            get_num_spec_layers, get_spec_decoder,
                            should_use_separate_draft_kv_cache)
+from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
                            extract_mamba_kv_cache_params,
@@ -74,10 +75,11 @@ from .kv_cache.mamba_cache_manager import (BaseMambaCacheManager,
                                            use_py_mamba_cache_manager)
 from .llm_request import ExecutorResponse, LlmRequestState
 from .model_engine import ModelEngine
-from .py_executor import PyExecutor
+from .py_executor import PyExecutor, PyExecutorResources
 from .resource_manager import (KVCacheCompressionManager, KVCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
+from .runtime_hooks import runtime_hooks_of
 from .sampler import EarlyStopSampler, EarlyStopWithMMResult, TorchSampler
 from .sampler.penalties import PenaltyStore
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
@@ -1900,7 +1902,7 @@ class KvCacheCreator:
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
                 warmup.close()
-                py_executor.shutdown_for_kv_cache_estimation()
+                py_executor.release_resources()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 
@@ -3776,6 +3778,13 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if (issubclass(kv_cache_manager_cls,
+                       (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
+                and model_engine is not None):
+            from ..modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+            mamba_manager_extra_kwargs["gdn_fused_verify"] = any(
+                module.fused_verify for module in model_engine.model.modules()
+                if isinstance(module, Qwen3NextGatedDeltaNet))
         if is_qwen4_exp(config) and issubclass(kv_cache_manager_cls,
                                                MambaHybridCacheManagerV2):
             mamba_manager_extra_kwargs.update(
@@ -4092,7 +4101,7 @@ def validate_seq_slot_pool_covers_admission(max_num_sequences: int,
         "shortfall means one of them was re-derived from max_batch_size.")
 
 
-def create_py_executor_instance(
+def create_py_executor_resources(
     *,
     dist,
     resources,
@@ -4100,14 +4109,8 @@ def create_py_executor_instance(
     llm_args,
     ctx_chunk_config,
     model_engine,
-    start_worker,
-    sampler,
-    drafter,
-    guided_decoder: Optional[GuidedDecoder] = None,
     lora_config: Optional[LoraConfig] = None,
-    garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
-    resource_governor_queue=None,
     max_seq_len: Optional[int] = None,
     max_batch_size: Optional[int] = None,
     max_beam_width: Optional[int] = None,
@@ -4119,13 +4122,12 @@ def create_py_executor_instance(
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
     max_num_sequences: Optional[int] = None,
-) -> PyExecutor:
+) -> PyExecutorResources:
+    """Build the resource graph shared by initial execution and rebinding."""
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
 
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
-
-    spec_config = model_engine.spec_config
 
     is_disagg = is_disagg_enabled(cache_transceiver_config)
 
@@ -4359,6 +4361,16 @@ def create_py_executor_instance(
     if v2_scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         v2_scheduler_capacity += 1
 
+    context_scheduling_policy = (scheduler_config.context_scheduling_policy
+                                 if scheduler_config is not None else
+                                 ContextSchedulingPolicy.FCFS)
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and context_scheduling_policy != ContextSchedulingPolicy.FCFS):
+        logger.warning(
+            f"scheduler_config.context_scheduling_policy="
+            f"{context_scheduling_policy.value} is ignored: it needs the KV "
+            "cache manager V2 scheduler")
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -4384,6 +4396,10 @@ def create_py_executor_instance(
             enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
             # A disaggregated generation worker must not replay context locally.
             enable_recompute_pause=not is_disagg,
+            context_scheduling_policy=context_scheduling_policy,
+            context_starvation_iterations=scheduler_config.
+            context_starvation_iterations
+            if scheduler_config is not None else None,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):
@@ -4499,14 +4515,80 @@ def create_py_executor_instance(
             executor_max_seq_len = min(executor_max_seq_len,
                                        int(decoder_position_limit))
 
+    return PyExecutorResources(
+        resource_manager=resource_manager,
+        scheduler=scheduler,
+        kv_cache_transceiver=kv_cache_transceiver,
+        peft_cache_config=peft_cache_config,
+        virtual_memory_pools=virtual_memory_pools,
+        kv_connector_manager=kv_connector_manager,
+        dwdp_manager=dwdp_manager,
+        max_seq_len=executor_max_seq_len,
+        max_num_sequences=max_num_sequences,
+        waiting_queue_policy=waiting_queue_policy,
+    )
+
+
+def create_py_executor_instance(
+    *,
+    dist,
+    resources,
+    mapping,
+    llm_args,
+    ctx_chunk_config,
+    model_engine,
+    start_worker,
+    sampler,
+    drafter,
+    guided_decoder: Optional[GuidedDecoder] = None,
+    lora_config: Optional[LoraConfig] = None,
+    garbage_collection_gen0_threshold: Optional[int] = None,
+    kv_connector_manager: Optional[KvCacheConnectorManager] = None,
+    resource_governor_queue=None,
+    max_seq_len: Optional[int] = None,
+    max_batch_size: Optional[int] = None,
+    max_beam_width: Optional[int] = None,
+    max_num_tokens: Optional[int] = None,
+    peft_cache_config: Optional[PeftCacheConfig] = None,
+    scheduler_config: Optional[SchedulerConfig] = None,
+    cache_transceiver_config: Optional[CacheTransceiverConfig] = None,
+    virtual_memory_pools: Optional[dict] = None,
+    execution_stream: Optional[torch.cuda.Stream] = None,
+    dwdp_manager: Optional[DwdpManager] = None,
+    max_num_sequences: Optional[int] = None,
+    transfer_budget_is_explicit: bool = False,
+) -> PyExecutor:
+    execution_resources = create_py_executor_resources(
+        dist=dist,
+        resources=resources,
+        mapping=mapping,
+        llm_args=llm_args,
+        ctx_chunk_config=ctx_chunk_config,
+        model_engine=model_engine,
+        lora_config=lora_config,
+        kv_connector_manager=kv_connector_manager,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_beam_width=max_beam_width,
+        max_num_tokens=max_num_tokens,
+        peft_cache_config=peft_cache_config,
+        scheduler_config=scheduler_config,
+        cache_transceiver_config=cache_transceiver_config,
+        virtual_memory_pools=virtual_memory_pools,
+        execution_stream=execution_stream,
+        dwdp_manager=dwdp_manager,
+        max_num_sequences=max_num_sequences,
+    )
+    spec_config = model_engine.spec_config
+    config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
-        resource_manager,
-        scheduler,
+        execution_resources.resource_manager,
+        execution_resources.scheduler,
         model_engine=model_engine,
         sampler=sampler,
         drafter=drafter,
         dist=dist,
-        max_num_sequences=max_num_sequences,
+        max_num_sequences=execution_resources.max_num_sequences,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
         enable_early_first_token_response=llm_args.
         enable_early_first_token_response,
@@ -4516,18 +4598,19 @@ def create_py_executor_instance(
         if spec_config is not None else 0,
         max_total_draft_tokens=(spec_config.tokens_per_gen_step -
                                 1) if spec_config is not None else 0,
-        kv_cache_transceiver=kv_cache_transceiver,
+        kv_cache_transceiver=execution_resources.kv_cache_transceiver,
+        transfer_budget_is_explicit=transfer_budget_is_explicit,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-        kv_connector_manager=kv_connector_manager,
+        kv_connector_manager=execution_resources.kv_connector_manager,
         resource_governor_queue=resource_governor_queue,
-        max_seq_len=executor_max_seq_len,
-        peft_cache_config=peft_cache_config,
-        virtual_memory_pools=virtual_memory_pools,
+        max_seq_len=execution_resources.max_seq_len,
+        peft_cache_config=execution_resources.peft_cache_config,
+        virtual_memory_pools=execution_resources.virtual_memory_pools,
         execution_stream=execution_stream,
-        waiting_queue_policy=waiting_queue_policy,
-        dwdp_manager=dwdp_manager,
+        waiting_queue_policy=execution_resources.waiting_queue_policy,
+        dwdp_manager=execution_resources.dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
@@ -4604,7 +4687,11 @@ def instantiate_sampler(
     )
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
-        return get_spec_decoder(sampler_args, engine.spec_config)
+        sampler = get_spec_decoder(sampler_args, engine.spec_config)
+        spec_step_fold = runtime_hooks_of(engine.model).spec_step_fold
+        if spec_step_fold is not None and isinstance(sampler, SpecSampler):
+            sampler.bind_spec_step_fold(spec_step_fold)
+        return sampler
 
     if mm_encoder_only:
         # NOTE: handle model outputs specially for mm encoder executor/engine.

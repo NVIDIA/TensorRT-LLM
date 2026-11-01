@@ -2012,18 +2012,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    if woken_by_timer:
-                        # Idle poll: a non-blocking read on the metrics
-                        # thread, idle while this loop owns the queue.
-                        for llm_stat in await asyncio.get_running_loop(
-                        ).run_in_executor(self._metrics_stats_executor,
-                                          self.generator.get_stats, 0):
-                            self._record_iteration_stat(llm_stat)
-                    else:
-                        async for llm_stat in self.generator.get_stats_async(
-                                timeout=0.5):
-                            self._record_iteration_stat(llm_stat)
+                    # A timer wakeup (multi-frontend launcher poll) reads
+                    # without waiting.
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats,
+                                      0 if woken_by_timer else 0.5):
+                        self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -3475,6 +3473,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
+            if not self.use_harmony:
+                # Detokenize as chat completions does for these parsers: a
+                # parser that reads special tokens needs them kept, and Kimi-K3's
+                # tags also need them without spaces in between. Without this,
+                # `<|open|>tools<|sep|>` arrives as `<|open|> tools <|sep|>` and
+                # every K3 tool call reaches the client as message text.
+                _configure_parser_special_token_decoding(
+                    sampling_params,
+                    reasoning_parser_name=self.generator.args.reasoning_parser,
+                    tool_parser_name=self.tool_parser,
+                    has_tools=bool(request.tools))
 
             streaming_processor = None
             if request.stream:

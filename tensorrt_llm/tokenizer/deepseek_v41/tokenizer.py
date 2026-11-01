@@ -40,8 +40,9 @@ differences, each verified against the checkpoint by
    ``" parameter"`` -- where V4 used ``tool_calls``/``invoke``/``parameter``.
    These render into different tokens, so a V4-rendered tool call is not the
    sequence V4.1 was trained to emit or to read back.
-5. **Tool names are namespace-qualified** (``namespace::name``), and a namespace
-   description is prepended to the tool description.
+5. **Tool names are namespace-qualified** (``namespace::name``), in the tool
+   schemas and in the tool calls, and a namespace description is prepended to
+   the tool description.
 6. **There is no ``developer`` role**, and assistant reasoning is read only from
    ``reasoning_content`` (V4 also accepted ``reasoning``). ``apply_chat_template``
    renders a developer message as a system message.
@@ -90,6 +91,16 @@ REASONING_EFFORT_TEMPLATE = (
 )
 REASONING_EFFORT_MAPPINGS = {"low": 50, "high": 75, "max": 100}
 DEFAULT_REASONING_EFFORT = "high"
+# OpenAI's reasoning levels, placed on the same budget: the levels the checkpoint
+# names keep their budgets, and the others fall between them in order.
+OPENAI_REASONING_EFFORTS = {
+    "minimal": 25,
+    "low": 50,
+    "medium": 62,
+    "high": 75,
+    "xhigh": 87,
+    "max": 100,
+}
 
 TOOLS_TEMPLATE = """## Tools
 
@@ -207,12 +218,89 @@ def _tools_from_openai_format(tools: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 def _tool_calls_from_openai_format(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    calls = []
+    for tool_call in tool_calls:
+        function = tool_call["function"]
+        call = {"name": function["name"], "arguments": function["arguments"]}
+        namespace = tool_call.get("namespace") or function.get("namespace")
+        if namespace is not None:
+            call["namespace"] = namespace
+        calls.append(call)
+    return calls
+
+
+def _tool_call_name_for_encoding(tool_call: dict[str, Any]) -> str:
+    """The name a tool call is rendered under: ``namespace::name`` if namespaced.
+
+    The checkpoint's encoder qualifies the name with the call's namespace.
+    Where it would reject the pair instead (a ``::`` in either part, or a name
+    qualified with another namespace), the name is rendered as written: the
+    call is history the model already produced, and failing the request on it
+    would end the conversation.
+    """
+    name = tool_call["name"]
+    namespace = tool_call.get("namespace")
+    if isinstance(namespace, dict):
+        namespace = namespace.get("name")
+    if not isinstance(name, str) or not isinstance(namespace, str):
+        return name
+    if "::" in name or "::" in namespace:
+        return name
+    return f"{namespace}::{name}"
+
+
+def _qualified_names_by_dotted_spelling(tools: list[dict[str, Any]]) -> dict[str, str]:
+    """``<namespace>.<name>`` -> ``<namespace>::<name>`` for each namespaced tool.
+
+    A chat template that cannot show namespaces is given a namespaced tool as
+    a function named ``<namespace>.<name>``; the server's Responses API
+    flattens namespaces that way, and replays an earlier call to such a tool
+    under that name. A spelling is mapped only if it names exactly one
+    namespaced tool and no tool is declared under it.
+    """
+    declared = {function["name"] for function in _tools_from_openai_format(tools)}
+    candidates: dict[str, list[str]] = {}
+    for name in declared:
+        namespace, separator, bare_name = name.partition("::")
+        if separator:
+            candidates.setdefault(f"{namespace}.{bare_name}", []).append(name)
+    return {
+        spelling: names[0]
+        for spelling, names in candidates.items()
+        if len(names) == 1 and spelling not in declared
+    }
+
+
+def _name_calls_as_declared(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Name each call to a namespaced tool the way the tool is declared.
+
+    A call made under the dotted spelling of a namespaced tool (see
+    ``_qualified_names_by_dotted_spelling``) is renamed to the tool's
+    ``namespace::name``, the name the model was shown and writes its calls
+    under, so a replayed turn renders as the model generated it. A call that
+    carries its namespace in a field of its own is left as it is. Renaming
+    uses only the current request's tools. If a later turn drops a namespace
+    declaration, earlier dotted calls stay dotted and prefix reuse stops at
+    that call.
+    """
+    qualified_names = _qualified_names_by_dotted_spelling(tools)
+    if not qualified_names:
+        return messages
+
+    def renamed(tool_call: dict[str, Any]) -> dict[str, Any]:
+        function = tool_call.get("function") or {}
+        qualified_name = qualified_names.get(function.get("name"))
+        if qualified_name is None or tool_call.get("namespace") or function.get("namespace"):
+            return tool_call
+        return {**tool_call, "function": {**function, "name": qualified_name}}
+
     return [
-        {
-            "name": tool_call["function"]["name"],
-            "arguments": tool_call["function"]["arguments"],
-        }
-        for tool_call in tool_calls
+        {**message, "tool_calls": [renamed(call) for call in message["tool_calls"]]}
+        if message.get("tool_calls")
+        else message
+        for message in messages
     ]
 
 
@@ -486,7 +574,7 @@ def render_message(
                 TOOL_CALL_TEMPLATE.format(
                     dsml_token=DSML_TOKEN,
                     tool_call_tag_name=TOOL_CALL_TAG_NAME,
-                    name=tool_call.get("name"),
+                    name=_tool_call_name_for_encoding(tool_call),
                     arguments=_encode_arguments_to_dsml(tool_call),
                 )
                 for tool_call in tool_calls
@@ -613,8 +701,11 @@ class DeepseekV41Tokenizer(TransformersTokenizer):
         thinking_mode = "thinking" if thinking else "chat"
         # Unlike V4, any value the checkpoint accepts is passed through: the
         # budget is numeric, so clamping to {"max", "high"} would silently
-        # discard a caller's "low" or explicit integer.
+        # discard a caller's "low" or explicit integer. OpenAI's level names
+        # are translated to the budget; anything else is left to the renderer.
         reasoning_effort = kwargs.get("reasoning_effort")
+        if isinstance(reasoning_effort, str) and reasoning_effort in OPENAI_REASONING_EFFORTS:
+            reasoning_effort = OPENAI_REASONING_EFFORTS[reasoning_effort]
 
         conversation = kwargs.get("conversation", messages)
         # V4.1 has no developer role; a developer message is a system message.
@@ -623,6 +714,7 @@ class DeepseekV41Tokenizer(TransformersTokenizer):
             for message in conversation
         ]
         if tools:
+            messages = _name_calls_as_declared(messages, tools)
             # The checkpoint's encoder renders tools from the system message that
             # leads the conversation, after its content: one system block, not a
             # tools-only block ahead of the caller's system prompt.

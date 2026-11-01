@@ -437,6 +437,13 @@ def get_model_yaml_config(model_label: str,
                 'num_postprocess_workers': 4,
             }
         },
+        # GLM-5.3-Flash serving cases send text-only requests.
+        {
+            'patterns': ['glm_5.3_flash_fp8-serve-pytorch'],
+            'config': {
+                'disable_mm_encoder': True,
+            }
+        },
         # GLM-5.2 NVFP4 reuses the DeepSeek-V3.2 MLA + DSA path with
         # cross-layer indexer sharing; NVFP4 weights run on the CuteDSL MoE
         # backend (see accuracy/test_glm52.py::TestGLM52NVFP4).

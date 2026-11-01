@@ -285,14 +285,22 @@ public:
     int numLayers() const noexcept;
 
     std::vector<LayerId> layerIds() const;
+
+    //! Deprecated: use getBufferGroupId(). Returns the shared group of a uniform layer.
+    //! Throws common::TllmException if the queried layer spans several lifecycle groups.
     LayerGroupId getLayerGroupId(LayerId layerId) const;
 
-    // Layer grouping: layers with the same lifecycle share pool allocation.
-    // NOTE: the iteration order of the layer lists (and of the groups) is NOT
-    // part of the API contract and may differ across backends/runs. Do not rely
-    // on it to infer buffer/pool memory order — query poolGroupDescs()
-    // (PoolGroupDesc::pools[i].baseAddress + coalescedBuffers) for that.
+    //! Cache group of one buffer; throws std::out_of_range for an unknown buffer.
+    CacheGroupId getBufferGroupId(LayerId layerId, DataRole const& role) const;
+
+    //! Deprecated: use bufferGrouping(). Partitions uniform layers by lifecycle.
+    //! Throws common::TllmException if any layer spans several groups. Member order
+    //! is unspecified; use poolGroupDescs() to inspect physical buffer ordering.
     TypedVec<LayerGroupId, std::vector<LayerId>> layerGrouping() const;
+
+    //! Buffer membership indexed by CacheGroupId. Each buffer appears once.
+    //! Member order is unspecified and does not describe physical memory ordering.
+    TypedVec<CacheGroupId, std::vector<BufferId>> bufferGrouping() const;
 
     // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.
     std::vector<BufferId> allBufferIds() const;
