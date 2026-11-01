@@ -410,7 +410,12 @@ def _attention_sink_for_local_head(
     if cutlass.const_expr(cfg.store_softmax_stats):
         # Center in natural-log units before the base conversion so exported
         # statistics and normalization share the exact original FP32 anchor.
-        sink_delta = (sink_val - max_val * stats_scale) * Float32(1.4426950408889634)
+        # Explicit rounding prevents contraction with the sink subtraction:
+        # that must use the same rounded maximum published in the statistics.
+        scaled_max = cute.math.mul(
+            max_val, stats_scale, rounding=cute.math.RoundingMode.NEAREST_EVEN
+        )
+        sink_delta = (sink_val - scaled_max) * Float32(1.4426950408889634)
     else:
         sink_delta = (
             sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2
