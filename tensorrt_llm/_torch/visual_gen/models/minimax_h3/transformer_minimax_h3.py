@@ -159,13 +159,6 @@ class MiniMaxH3Attention(Attention):
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
         )
-        # Ulysses rank of this attention's sequence shard (0 without Ulysses), for the padded-row
-        # bound of the fused FP8 cast.
-        self._l8_rank = (
-            torch.distributed.get_rank(group=self.attn.process_group)
-            if getattr(self.attn, "world_size", 1) > 1
-            else 0
-        )
         self.use_async_ulysses = use_async_ulysses
 
     def _use_fused_qk_norm_rope(
@@ -299,6 +292,20 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
+
+    @property
+    def _l8_rank(self) -> int:
+        """Ulysses rank of this attention's sequence shard (0 without Ulysses), for the
+        padded-row bound of the fused FP8 cast; read once from the group and cached."""
+        rank = self.__dict__.get("_l8_rank_cache")
+        if rank is None:
+            rank = (
+                torch.distributed.get_rank(group=self.attn.process_group)
+                if getattr(self.attn, "world_size", 1) > 1
+                else 0
+            )
+            self.__dict__["_l8_rank_cache"] = rank
+        return rank
 
     def _use_fused_fp8_qk(
         self,
