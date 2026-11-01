@@ -18,7 +18,7 @@ Calibration files of the static-scale variant of `fused_fp8_qk.py` (board thread
 | `H3_FP8_SCALE_FUSION` | `dynamic` | `static` |
 | `H3_FP8_STATIC_SCALES` | – | `table-job4-heldout1-margin1.0.json` |
 | `H3_FP8_STATIC_MARGIN` | – | `1.0` |
-| `H3_FP8_FUSION_SPLIT` / `_BLOCK_H` / `_WARPS` | `1` / `8` / `4` | same |
+| `H3_FP8_FUSION_SPLIT` / `_BLOCK_H` / `_WARPS` | `1` / `8` / `4` as pinned by the stack-2 arm; the module defaults are `0` / `4` / `2` (lever 8c, ¶15221: 4 heads per tile with 2 warps is bit-identical to 8 / 4 and 5–7 % faster on the pair at 38k / 104k) | same |
 | `H3_FP8_SAT_LOG` | optional | `<json>` writes clipped-element counts per layer and tensor |
 
 The table JSON maps `str(layer_idx)` to `[descale_q, descale_k, descale_v]`; a descale is `max(amax / 448, 1 / (448 · 512))` rounded to BF16, the same value the dynamic quantizer produces. The loader also accepts the raw calibration log (`{"descale_max": {...}}`).

@@ -268,8 +268,8 @@ def _reduce_amax(amax: torch.Tensor) -> None:
 
 def _launch_config() -> Tuple[int, int]:
     return (
-        int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "8")),
-        int(os.environ.get("H3_FP8_FUSION_WARPS", "4")),
+        int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "4")),
+        int(os.environ.get("H3_FP8_FUSION_WARPS", "2")),
     )
 
 
