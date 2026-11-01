@@ -1176,11 +1176,13 @@ def test_sequence_lengths_are_live_source_view() -> None:
 @pytest.mark.parametrize("num_heads", [6, 96])
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
+@pytest.mark.parametrize("store_softmax_stats", [False, True])
 def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     monkeypatch: pytest.MonkeyPatch,
     num_heads: int,
     fp8: bool,
     mask: PredefinedAttentionMask,
+    store_softmax_stats: bool,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=192, is_mla=True, num_heads=num_heads, num_kv_heads=num_heads)
@@ -1194,7 +1196,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     v = torch.empty(9, num_heads * 256, dtype=q.dtype)[:, num_heads * 128 :]
     qo_indptr = torch.tensor([0, 2, 5], dtype=torch.int32)
     output = torch.empty(5, num_heads, 128, dtype=q.dtype)
-    stats = torch.empty(5, num_heads, 2)
+    stats = torch.empty(5, num_heads, 2) if store_softmax_stats else None
     meta = SimpleNamespace(
         mla_prepare_ctx_cu_seqlens=lambda: qo_indptr,
         max_seq_len=4096,
@@ -1246,7 +1248,7 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.run.call_args.kwargs["softmax_stats"] is stats
     assert wrapper.run.call_args.kwargs["out"] is output
     assert wrapper.run.call_args.args[1].shape == (9, num_heads, 192)
-    assert wrapper.plan.call_args.kwargs["store_softmax_stats"]
+    assert wrapper.plan.call_args.kwargs["store_softmax_stats"] is store_softmax_stats
     assert wrapper.plan.call_args.kwargs["max_seq_len_q"] == 256
     assert wrapper.plan.call_args.kwargs["max_kv_len"] == 128
     processed_dtype = torch.float8_e4m3fn if fp8 else q.dtype
@@ -1257,8 +1259,27 @@ def test_mla_context_wrapper_reuses_plan_and_updates_chunk_offsets(
     assert wrapper.plan.call_args.kwargs["mask_type"] == (
         "causal" if mask == PredefinedAttentionMask.CAUSAL else "dense"
     )
-    assert (wrapper.run.call_args.kwargs["scale_softmax_log2"] is not None) == fp8
-    assert (wrapper.run.call_args.kwargs["output_scale"] is not None) == fp8
+    for preprocess_call, run_call in zip(
+        native_preprocess.call_args_list, wrapper.run.call_args_list, strict=True
+    ):
+        bmm1_scale, bmm2_scale = preprocess_call.args[-2:]
+        softmax_scale = run_call.kwargs["softmax_scale"]
+        scale_softmax_log2 = run_call.kwargs["scale_softmax_log2"]
+        output_scale = run_call.kwargs["output_scale"]
+        if fp8 and store_softmax_stats:
+            assert softmax_scale.shape == (1,)
+            assert softmax_scale.data_ptr() == bmm1_scale.data_ptr()
+        else:
+            assert softmax_scale is None
+        if fp8:
+            assert scale_softmax_log2.shape == (1,)
+            assert scale_softmax_log2.data_ptr() == (
+                bmm1_scale.data_ptr() + bmm1_scale.element_size()
+            )
+            assert output_scale.data_ptr() == bmm2_scale.data_ptr()
+        else:
+            assert scale_softmax_log2 is None
+            assert output_scale is None
     assert wrapper.run.call_args.kwargs["validate"] is False
 
 
