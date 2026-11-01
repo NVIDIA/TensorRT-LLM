@@ -236,6 +236,22 @@ def _qkv_cast_kernel(
         tl.store(v_out_ptr + out_row + offs, (v * f_v).to(tl.float8e4nv), mask=mask)
 
 
+_REDUCE_GROUP = None
+
+
+def set_reduce_group(group) -> None:
+    """Process group whose ranks hold shards of the same sequence (Ulysses): the dynamic amax is
+    all-reduced (MAX) over it before the cast so every rank casts and dequantizes with the same
+    scale. ``None`` (default) means a single rank."""
+    global _REDUCE_GROUP
+    _REDUCE_GROUP = group
+
+
+def _reduce_amax(amax: torch.Tensor) -> None:
+    if _REDUCE_GROUP is not None:
+        torch.distributed.all_reduce(amax, op=torch.distributed.ReduceOp.MAX, group=_REDUCE_GROUP)
+
+
 def _launch_config() -> Tuple[int, int]:
     return (
         int(os.environ.get("H3_FP8_FUSION_BLOCK_H", "8")),
@@ -284,6 +300,8 @@ def _qk_norm_rope_fp8_split(
                 ROW_STRIDE=3 * width,
                 num_warps=num_warps,
             )
+    if not static:
+        _reduce_amax(amax)
     for i in range(3):
         _tensor_cast_kernel[grid](
             qkv[..., i * width : (i + 1) * width],
@@ -382,6 +400,7 @@ def qk_norm_rope_fp8(
             BLOCK_H=block_h,
             num_warps=num_warps,
         )
+        _reduce_amax(amax)
         static = False
     else:
         amax = static_descale  # unused in the static branch; keeps the signature
@@ -593,6 +612,7 @@ def norm_rope_fp8_tensor(
             ROW_STRIDE=h * d,
             num_warps=num_warps,
         )
+        _reduce_amax(amax)
         static = False
     elif out_fp8:
         descale = static_descale.to(torch.float32).reshape(1).contiguous().clone()

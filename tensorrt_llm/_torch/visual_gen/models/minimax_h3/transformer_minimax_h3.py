@@ -47,7 +47,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
-from .fused_fp8_qk import fusion_mode, static_descale
+from .fused_fp8_qk import fusion_mode, set_reduce_group, static_descale
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -298,6 +298,10 @@ class MiniMaxH3Attention(Attention):
         backend = getattr(self.attn, "inner_backend", self.attn)
         if getattr(backend, "quant_dtype", None) != "fp8":
             return False
+        # Ulysses: the ranks hold shards of one sequence; the dynamic amax must be reduced over
+        # them so the codes that travel through the all-to-all share one scale per tensor.
+        if getattr(self.attn, "world_size", 1) > 1:
+            set_reduce_group(self.attn.process_group)
         if self.local_num_attention_heads != self.local_num_key_value_heads:
             return False
         for norm in (self.norm_q, self.norm_k):
