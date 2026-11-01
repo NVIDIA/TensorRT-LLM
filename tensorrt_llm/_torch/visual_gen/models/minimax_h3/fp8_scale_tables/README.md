@@ -9,6 +9,7 @@ Calibration files of the static-scale variant of `fused_fp8_qk.py` (board thread
 1. [Flags](#1-flags)
 2. [Tables](#2-tables)
 3. [How a table is made](#3-how-a-table-is-made)
+4. [Composition with Ulysses](#4-composition-with-ulysses)
 
 ## 1. Flags
 
@@ -40,3 +41,14 @@ Reading (lead ¶15055): widening every scale costs more than clipping a dozen ou
 4. Run with `H3_FP8_SCALE_FUSION=static H3_FP8_STATIC_SCALES=<table> H3_FP8_SAT_LOG=<json>` and read the saturation counts.
 
 Job scripts and pulled results: `docs/minimax-h3/sweep-nvfp4/` in the workspace (`jobs/lever8-fp8-scale-fusion-r200.sbatch`, parts `calib` / `e2e` / `gate` / `ship`).
+
+## 4. Composition with Ulysses
+
+Under Ulysses the per-rank amax must be reduced (MAX) over the sequence-parallel group before the cast, so the dynamic variant adds all-reduces on the compute stream. How many depends on the entry point:
+
+| Entry point | Used by | Dynamic mode: all-reduces per layer | Static mode |
+|---|---|---|---|
+| `h3_lever8::qk_norm_rope_fp8` (packed, also the split launch `H3_FP8_FUSION_SPLIT=1`) | synchronous Ulysses (the composed stack) | 1, on a 3-element tensor (q, k, v together; 50 per step) | 0 |
+| `h3_lever8::norm_rope_fp8_tensor` via `norm_rope_tensor(..., fp8=True)` | asynchronous Ulysses pairing (`H3_L13_PAIR=fp8`), one call per tensor inside the async closures | 3 (150 per step, measured 39.5 ms at U4 19k, job 922930) | 0 |
+
+**Dynamic mode and the async path do not compose.** The per-tensor API cannot merge its three reductions into one: the async closures quantize Q, K and V at different points, so each call reduces its own amax. Rule (lead ruling ¶15146): an asynchronous-Ulysses arm that carries lever 8 runs the static table (`table-job4-heldout1-margin1.0.json`, the gated alternative row) or does not carry lever 8; the synchronous arm runs dynamic mode and is unaffected.
