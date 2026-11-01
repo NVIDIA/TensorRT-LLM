@@ -83,6 +83,12 @@ __all__ = ["DeepgemmCudaW4a8Mxfp4Mxfp8Impl", "MegaMoEDeepGemm"]
 # ``release_symm_buffer_cache`` bounds the lifetime.
 _MEGA_MOE_SYMM_BUFFER_CACHE: Dict[tuple, Tuple[object, object]] = {}
 
+# Geometries whose reachable token tiles ``_prime_kernels`` has already compiled
+# in this process. DeepGEMM specializes a MegaMoE kernel on this geometry, the
+# activation constants and the tile, never on a layer's weights, so later
+# layers with the same key would only repeat the same ladder.
+_MEGA_MOE_PRIMED_TILES: set = set()
+
 
 class _DeepGemmTimeoutProxy:
     """Applies MoE communication timeouts to DeepGEMM's in-kernel barriers.
@@ -925,10 +931,30 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
         Tile selection is not monotonic in the token count. Query the bundled
         heuristic over the supported range instead of guessing its boundaries.
         Every EP rank follows the same ladder before staging the live inputs.
+        The first layer of each geometry runs the ladder; later layers with the
+        same geometry reuse its compiled kernels and skip it.
         """
         if not AutoTuner.get().is_tuning_mode or torch.cuda.is_current_stream_capturing():
             return
         buf = self._symm_buffer
+        key = (
+            self.ep_size,
+            self.num_slots,
+            buf.num_max_tokens_per_rank,
+            self.max_num_tokens,
+            self.routing_method.experts_per_token,
+            self.hidden_size,
+            self.intermediate_size,
+            self.dg_activation,
+            self.act_clamp,
+            self.act_alpha,
+            self.act_beta,
+            self.fast_math,
+            str(buf.x.device),
+        )
+        if key in _MEGA_MOE_PRIMED_TILES:
+            self._kernels_primed = True
+            return
         buf.x.zero_()
         buf.x_sf.zero_()
         buf.topk_weights.zero_()
@@ -950,6 +976,7 @@ class DeepgemmCudaW4a8Mxfp4Mxfp8Impl(MoEImplBase):
             )
             self._launch_kernel(output)
             primed_block_sizes.add(block_m)
+        _MEGA_MOE_PRIMED_TILES.add(key)
         self._kernels_primed = True
 
     def run_moe(

@@ -124,6 +124,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_deepgemm as mega_moe_deepgemm_module
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     IMPL_PRIORITY,
     _reject_unsupported_activation,
@@ -442,6 +443,7 @@ def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
 
     deep_gemm = SimpleNamespace(
         fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe=lambda *args: 16,
         get_symm_buffer_for_mega_moe=lambda: None,
         transform_sf_into_required_layout=lambda: None,
         transform_weights_for_mega_moe=lambda: None,
@@ -469,6 +471,7 @@ def test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout(monkeypatch):
 
     deep_gemm = SimpleNamespace(
         fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe=lambda *args: 16,
         get_symm_buffer_for_mega_moe=lambda: None,
         transform_sf_into_required_layout=lambda: None,
         transform_weights_for_mega_moe=lambda: None,
@@ -483,6 +486,34 @@ def test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout(monkeypatch):
         quantization_module._import_deep_gemm()
 
     deep_gemm.set_barrier_timeout_seconds = lambda seconds: None
+    assert quantization_module._import_deep_gemm() is deep_gemm
+
+
+def test_import_deep_gemm_rejects_mega_moe_without_block_m_heuristic(monkeypatch):
+    """MegaMoE primes its token tiles through DeepGEMM's block-M heuristic."""
+    import tensorrt_llm
+    import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module
+
+    def fp8_fp4_mega_moe(*, situ_beta=None, situ_linear_beta=None):
+        pass
+
+    def per_token_cast_to_fp8(*, use_packed_ue8m0=False):
+        pass
+
+    deep_gemm = SimpleNamespace(
+        fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_symm_buffer_for_mega_moe=lambda: None,
+        transform_sf_into_required_layout=lambda: None,
+        transform_weights_for_mega_moe=lambda: None,
+        per_token_cast_to_fp8=per_token_cast_to_fp8,
+        set_barrier_timeout_seconds=lambda seconds: None,
+    )
+    monkeypatch.setattr(tensorrt_llm, "deep_gemm", deep_gemm)
+
+    with pytest.raises(quantization_module._MegaMoEUnavailable, match="get_block_m_for_mega_moe"):
+        quantization_module._import_deep_gemm()
+
+    deep_gemm.get_block_m_for_mega_moe = lambda *args: 16
     assert quantization_module._import_deep_gemm() is deep_gemm
 
 
@@ -2839,10 +2870,12 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
     monkeypatch, tuning_mode, capturing
 ):
+    monkeypatch.setattr(mega_moe_deepgemm_module, "_MEGA_MOE_PRIMED_TILES", set())
     moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
     torch.nn.Module.__init__(moe)
     moe.max_num_tokens = 8
     moe.hidden_size = 4
+    moe.intermediate_size = 6
     moe.ep_size = 8
     moe.num_slots = 384
     moe.dtype = torch.bfloat16
@@ -2916,6 +2949,55 @@ def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
     assert torch.equal(buf.topk_idx[:2], ctx.token_selected_experts)
     assert torch.equal(buf.topk_weights[:2], ctx.token_final_scales)
     assert all(torch.equal(routes[:2], ctx.token_selected_experts) for _, routes in launches[-2:])
+
+
+@pytest.mark.cpu_only
+def test_megamoe_deepgemm_primes_each_geometry_once_per_process(monkeypatch):
+    """Layers that share a geometry reuse the tiles the first of them compiled."""
+    monkeypatch.setattr(mega_moe_deepgemm_module, "_MEGA_MOE_PRIMED_TILES", set())
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=True))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def make_layer(hidden_size):
+        moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+        torch.nn.Module.__init__(moe)
+        moe.max_num_tokens = 3
+        moe.hidden_size = hidden_size
+        moe.intermediate_size = 6
+        moe.ep_size = 8
+        moe.num_slots = 16
+        moe.routing_method = SimpleNamespace(experts_per_token=2)
+        moe.dg_activation = "swiglu"
+        moe.act_clamp = None
+        moe.act_alpha = None
+        moe.act_beta = None
+        moe.fast_math = True
+        moe._t_l1 = None
+        moe._t_l2 = None
+        moe._kernels_primed = False
+        moe._symm_buffer = SimpleNamespace(
+            x=torch.ones((4, hidden_size)),
+            x_sf=torch.ones((4, 1)),
+            topk_idx=torch.zeros((4, 2), dtype=torch.int64),
+            topk_weights=torch.ones((4, 2)),
+            num_max_tokens_per_rank=4,
+        )
+        moe._dg = SimpleNamespace(
+            get_block_m_for_mega_moe=MagicMock(return_value=16),
+            fp8_fp4_mega_moe=MagicMock(),
+        )
+        return moe
+
+    first, same_geometry, other_geometry = make_layer(4), make_layer(4), make_layer(8)
+    for layer in (first, same_geometry, other_geometry):
+        layer._prime_kernels()
+
+    assert first._dg.get_block_m_for_mega_moe.call_count == 4
+    first._dg.fp8_fp4_mega_moe.assert_called_once()
+    same_geometry._dg.get_block_m_for_mega_moe.assert_not_called()
+    same_geometry._dg.fp8_fp4_mega_moe.assert_not_called()
+    other_geometry._dg.fp8_fp4_mega_moe.assert_called_once()
+    assert all(layer._kernels_primed for layer in (first, same_geometry, other_geometry))
 
 
 def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
