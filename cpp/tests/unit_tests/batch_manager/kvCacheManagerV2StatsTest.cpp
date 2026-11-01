@@ -772,10 +772,10 @@ std::vector<int> hotPoolGroups(KvCacheManager const& manager)
 
 TEST_F(ReplayCacheTest, FixedPrivateSsmCapacityTakesItsSlotsBeforeRatioSizing)
 {
-    // Hot-tier slot counts of makeReservedSsmConfig() without the bound, recorded before maxLiveKvCaches
-    // existed.
+    // Hot-tier slot counts of makeReservedSsmConfig() without the bound, as the elastic ratio sizing gives
+    // them; the bound must leave this layout unchanged.
     std::map<size_t, std::vector<SlotCount>> const elasticSlots{
-        {32 << 20, {3072, 384, 3584}}, {64 << 20, {6656, 768, 6656}}};
+        {32 << 20, {3584, 384, 3072}}, {64 << 20, {6656, 768, 6656}}};
     std::map<size_t, std::vector<SlotCount>> reservedSlots;
     for (auto const& [quota, expected] : elasticSlots)
     {

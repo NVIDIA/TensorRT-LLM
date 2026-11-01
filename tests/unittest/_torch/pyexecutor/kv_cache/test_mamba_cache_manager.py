@@ -2584,6 +2584,21 @@ def test_v2_hybrid_fp4_sizing_counts_hp_page_for_snapshot_lineage() -> None:
     assert with_hp_page[1] - without_hp_page[1] == 2 * 7
 
 
+def _stub_buffer_grouping(layer_grouping, mamba_layers=(0, 2)):
+    """``impl.buffer_grouping`` of a stub manager: one buffer per listed layer, SSM_STATE for the recurrent layers and
+    KEY for the others."""
+    return [
+        [
+            SimpleNamespace(
+                layer_id=LayerId(layer),
+                role=MambaRole.SSM_STATE if layer in mamba_layers else Role.KEY,
+            )
+            for layer in group
+        ]
+        for group in layer_grouping
+    ]
+
+
 def _fp4_mla_hybrid_manager_stub(
     manager_cls: type[MambaHybridCacheManagerV2] = MambaHybridCacheManagerV2,
 ) -> MambaHybridCacheManagerV2:
@@ -2666,7 +2681,7 @@ def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
     assert mgr.get_buffers(2) is None
 
     mgr._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
-    mgr.impl = SimpleNamespace(layer_grouping=[[0, 2], [1, 3], [4, 5]])
+    mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[0, 2], [1, 3], [4, 5]]))
     assert mgr._get_pool_roles(0) == (MambaRole.SSM_STATE, None)
     assert mgr._get_pool_roles(2) == (Role.MLA_HP_TAIL, None)
 
@@ -2715,7 +2730,7 @@ def _fp4_mla_hybrid_with_fp8_fallback(
         ),
     )
     # Lifecycles: SSM layers, FP4 MLA latent cache, FP8 fallback, HP ring.
-    mgr.impl = SimpleNamespace(layer_grouping=[[0, 2], [1], [3], [4]])
+    mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[0, 2], [1], [3], [4]]))
     return mgr
 
 
@@ -2758,11 +2773,8 @@ def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
 ) -> None:
     mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch, KimiK3HybridCacheManager)
     mgr._state_layout = None
-    mgr._kda_replay = (
-        SimpleNamespace(disagg_ignored_roles=lambda _: frozenset({DataRole("kda_conv_q")}))
-        if kda_replay
-        else None
-    )
+    # What __init__ declares for the KDA replay buffers, which the manager keeps out of transfers.
+    mgr._replay_layouts = {0: {DataRole("kda_conv_q"): (torch.bfloat16, [8])}} if kda_replay else {}
 
     ignored = mgr.get_disagg_ignored_roles()
 
@@ -2800,7 +2812,7 @@ def test_v2_hybrid_fp4_disagg_global_layer_ids_reject_unknown_virtual_layer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
-    mgr.impl = SimpleNamespace(layer_grouping=[[5]])
+    mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[5]]))
 
     with pytest.raises(ValueError, match="Unknown hybrid FP4 MLA internal layer 5"):
         mgr.get_disagg_global_layer_ids(0)
@@ -5267,7 +5279,7 @@ def test_v2_hybrid_private_ssm_buffer_uses_buffer_group_lookups():
         assert len({required, private, attention}) == 3
         assert mgr.ssm_layer_group_id == required
         assert int(mgr.impl.get_buffer_group_id(LayerId(1), MambaRole.CONV_STATE)) == required
-        with pytest.raises(ValueError):
+        with pytest.raises(RuntimeError, match="layer groups"):
             mgr.impl.get_layer_group_id(LayerId(0))
         assert mgr.num_pools == len(mgr.impl.buffer_grouping)
         assert sorted(mgr._layer_ids_by_group[private]) == [0, 1]
@@ -6274,14 +6286,19 @@ def test_v2_kda_replay_suspend_resume_matches_an_unsuspended_run(slot_taken):
 )
 def test_v2_kda_replay_state_follows_a_suspended_request(monkeypatch, manager_cls, kwargs):
     """While a request is suspended, another cache takes its SSM slot and the runtime moves its SSM page to the host
-    tier. Its KDA replay state, pending drafts included, lives in PRIVATE pages that follow it: after the resume its
-    states, replay buffers and accepted-draft count are bit for bit those it was suspended with, and nothing was
-    seeded on the way."""
+    tier. Its KDA replay state, pending drafts included, lives in PRIVATE pages, or with the drafts' records in its SSM
+    page, and follows it: after the resume its states, replay buffers and accepted-draft count are bit for bit those
+    it was suspended with, and nothing was seeded on the way."""
     mgr = _v2_kda_replay_manager_with_large_slots(manager_cls, **kwargs)
     others = []
     request = None
     try:
-        assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+        if kwargs.get("kda_draft_records", False):
+            assert mgr.replay_layer_group_id is None
+            replay_group = mgr.ssm_layer_group_id
+        else:
+            assert mgr.replay_layer_group_id not in (None, mgr.ssm_layer_group_id)
+            replay_group = mgr.replay_layer_group_id
         monkeypatch.setattr(
             mgr._kda_replay, "seed_transferred_slots", MagicMock(side_effect=AssertionError)
         )
@@ -6297,9 +6314,7 @@ def test_v2_kda_replay_state_follows_a_suspended_request(monkeypatch, manager_cl
 
         mgr.suspend_request(request)
         _take_ssm_slot(mgr, slot, others)
-        _fill_kda_slot(
-            mgr, slot, others[0].get_ssm_block_base_index(mgr.replay_layer_group_id), generator
-        )
+        _fill_kda_slot(mgr, slot, others[0].get_ssm_block_base_index(replay_group), generator)
         assert mgr.resume_request(request)
         mgr._setup_state_indices([request], num_contexts=0)
 

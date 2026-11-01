@@ -1415,17 +1415,19 @@ def test_triton_replay_conv_window_copy_with_separate_replay_slots():
     torch.cuda.synchronize()
 
 
-@pytest.mark.parametrize("kernel", ["v2", "two_cta"])
-@pytest.mark.parametrize("quantize_output", [False, True], ids=["bf16_out", "mxfp8_out"])
+@pytest.mark.parametrize(
+    "kernel,quantize_output",
+    [("v2", False), ("two_cta", False), ("two_cta", True)],
+    ids=["v2", "two_cta", "two_cta_mxfp8"],
+)
 @pytest.mark.parametrize("B,H,num_spec", [(2, 6, 7), (32, 6, 6)], ids=lambda v: str(v))
 def test_verify_kernels_with_separate_replay_slots(
-    B, H, num_spec, quantize_output, kernel, monkeypatch
+    B, H, num_spec, kernel, quantize_output, monkeypatch
 ):
-    """v2 and the two-CTA kernel read and write the conv and replay caches and the accepted counts
-    at ``replay_state_indices`` and the states at ``ssm_state_indices``: bit for bit the verify
-    whose caches share the state slots, with the other replay rows left alone."""
-    if quantize_output and kernel == "v2":
-        pytest.skip("MXFP8 output runs the two-CTA kernel only")
+    """v2 and the two-CTA kernel (which alone takes the MXFP8 output) read and write the conv and
+    replay caches and the accepted counts at ``replay_state_indices`` and the states at
+    ``ssm_state_indices``: bit for bit the verify whose caches share the state slots, with the
+    other replay rows left alone."""
     coupled = _packed_fused_norm_inputs(B, H, num_spec, torch.float32)
     state_slots = coupled["ssm_state_indices"].long()
     num_replay_rows = B + 5
