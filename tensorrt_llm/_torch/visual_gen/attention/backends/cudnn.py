@@ -38,6 +38,7 @@ that they never read those rows.
 """
 
 import math
+import os
 import threading
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
@@ -47,6 +48,9 @@ import torch
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+# Lever 19 study switch (§657 box 46): write the padded-prefix attention output in place.
+_PREFIX_INPLACE = os.environ.get("H3_CUDNN_PREFIX_INPLACE", "0") == "1"
 
 from ....attention.backends.interface import PredefinedAttentionMask
 from ...cache import BlockCausalKVCacheManager, ForwardPlan
@@ -802,7 +806,15 @@ class CuDNNAttention(AttentionBackend):
         is_causal: bool,
         with_lse: bool,
         fp8_descales: Optional[torch.Tensor] = None,
+        out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Run one dense attention problem.
+
+        ``out``: optional ``[B, S_q, H, D_v]`` NHD view to write the output into (the
+        padded-prefix path hands the valid rows of its padded buffer); its inner strides must
+        be those of a packed NHD tensor. With B = 1 the batch stride is never dereferenced,
+        so a row-range view of a longer buffer qualifies.
+        """
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
@@ -900,7 +912,17 @@ class CuDNNAttention(AttentionBackend):
             device=device,
         )
 
-        output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        if out is None:
+            output = torch.empty(b, s_q, h_q, d_v, dtype=out_dtype, device=device)
+        else:
+            if (
+                out.shape != (b, s_q, h_q, d_v)
+                or out.dtype != out_dtype
+                or out.stride()[1:] != (h_q * d_v, d_v, 1)
+                or (b > 1 and out.stride(0) != s_q * h_q * d_v)
+            ):
+                raise ValueError("cuDNN attention: `out` must be a packed NHD view of the problem shape.")
+            output = out
         tensor_map = {bundle.inputs[name]: tensor for name, tensor in buffers.items()}
         tensor_map[bundle.outputs["o"]] = output.transpose(1, 2)
 
@@ -965,6 +987,26 @@ class CuDNNAttention(AttentionBackend):
             raise ValueError("cuDNN padding mask must be boolean with shape [batch, sequence].")
         lengths = self._padding_prefix_lengths(key_padding_mask)
         seq_len = q.shape[1]
+        if _PREFIX_INPLACE:
+            # Lever 19 (§657 box 46): one padded output buffer; cuDNN writes each item's valid
+            # prefix straight into it and only the padding rows are zero-filled, instead of a
+            # full-size zero-fill (F.pad) plus a full copy (torch.cat) per layer. Same cuDNN
+            # plan (the problem shape and strides are unchanged), so the values are identical.
+            output = q.new_empty((len(lengths), seq_len, self.num_heads, v.shape[3]), dtype=self._out_dtype())
+            for batch_idx, length in enumerate(lengths):
+                if length < seq_len:
+                    output[batch_idx, length:].zero_()
+                if length:
+                    item = slice(batch_idx, batch_idx + 1)
+                    self._run(
+                        q[item, :length],
+                        k[item, :length],
+                        v[item, :length],
+                        is_causal=False,
+                        with_lse=False,
+                        out=output[item, :length],
+                    )
+            return output
         outputs = []
         for batch_idx, length in enumerate(lengths):
             if length == 0:
