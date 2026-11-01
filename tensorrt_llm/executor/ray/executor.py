@@ -44,6 +44,7 @@ from ..postproc_worker import PostprocWorkerConfig
 from ..request import GenerationRequest
 from ..result import GenerationResult
 from ..rpc_proxy_mixin import RpcExecutorMixin
+from ..utils import RequestError
 from .gpu_worker import RayGPUWorker, RayWorkerWrapper
 
 __all__ = [
@@ -282,6 +283,9 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         Low-level API to the executor. Return a "future" GenerationResult
         which can be waited. Forwards the request to the workers through RPC.
         """
+        if request.prompt_adapter_request is not None:
+            raise RequestError(
+                "Prompt adapters are not supported by the PyTorch executor.")
         if request.id is None:
             request.set_id(self._get_next_client_id())
         logprob_params = self._get_logprob_params(request)

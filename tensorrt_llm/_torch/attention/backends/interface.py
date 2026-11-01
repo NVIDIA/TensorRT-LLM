@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
+    from .fmha.gqa_decode import KvAppendPlan
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -1065,6 +1066,12 @@ class AttentionForwardArgs:
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Attention output gate [num_tokens, ...] offered to the FMHA library: one that multiplies sigmoid(gate) into
+    # the output sets output_gate_applied, and the caller applies the gate otherwise.
+    output_gate: Optional[torch.Tensor] = None
+    output_gate_applied: bool = False
+    # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
+    kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse

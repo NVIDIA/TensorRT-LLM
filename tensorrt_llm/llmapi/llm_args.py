@@ -3310,6 +3310,24 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "is enabled. Required when use_dynamic_tree is True; ignored (with a "
         "warning) when use_dynamic_tree is False.")
 
+    draft_lm_head_dtype: Literal["auto", "mxfp8"] = Field(
+        default="auto",
+        status="prototype",
+        description=
+        "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an "
+        "MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention "
+        "DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the "
+        "acceptance length, but never the output.")
+
+    draft_moe_dtype: Literal["auto", "nvfp4"] = Field(
+        default="auto",
+        status="prototype",
+        description=
+        "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized "
+        "to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the "
+        "TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never "
+        "the output.")
+
     # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
 
@@ -4401,6 +4419,14 @@ class WaitingQueuePolicy(StrEnum):
     PRIORITY = "priority"  # Higher request.priority value is served first; ties broken by FCFS
 
 
+class ContextSchedulingPolicy(StrEnum):
+    """Order in which the scheduler admits pending context requests."""
+
+    FCFS = "fcfs"  # Arrival order
+    # Fewest prompt tokens not covered by reusable KV cache first; ties in arrival order
+    SHORTEST_UNCACHED_FIRST = "shortest_uncached_first"
+
+
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
 class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
@@ -4461,6 +4487,37 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
                      "duplicate-request deferral, and token-budget decisions. "
                      "This is orthogonal to "
                      "kv_cache_config.enable_block_reuse."))
+
+    context_scheduling_policy: ContextSchedulingPolicy = Field(
+        default=ContextSchedulingPolicy.FCFS,
+        description=(
+            "Order in which pending context requests are admitted: 'fcfs' "
+            "(arrival order) or 'shortest_uncached_first' (fewest prompt "
+            "tokens not covered by reusable KV cache first, which lowers "
+            "TTFT under load at the cost of fairness). Only the KV cache "
+            "manager V2 scheduler supports 'shortest_uncached_first'."),
+        status="prototype")
+
+    context_starvation_iterations: Optional[PositiveInt] = Field(
+        default=None,
+        description=(
+            "With context_scheduling_policy='shortest_uncached_first', "
+            "chunked prefill and a max_num_tokens budget: a context request "
+            "pending for more than this many scheduler iterations takes up "
+            "to a quarter of max_num_tokens of each iteration's budget "
+            "ahead of the shortest-first order, oldest first. None "
+            "disables it."),
+        status="prototype")
+
+    @model_validator(mode="after")
+    def validate_context_starvation_iterations(self) -> 'SchedulerConfig':
+        if (self.context_starvation_iterations is not None
+                and self.context_scheduling_policy
+                != ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST):
+            raise ValueError(
+                "context_starvation_iterations requires "
+                "context_scheduling_policy='shortest_uncached_first'")
+        return self
 
     def _to_pybind(self) -> _SchedulerConfig:
         return _SchedulerConfig(
@@ -6057,6 +6114,17 @@ class BaseLlmArgs(StrictBaseModel):
         "path only).",
         status="prototype")
 
+    serve_frontend_affinity_port_stride: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also "
+        "listens on its own port, port + stride * (i + 1), so a client can "
+        "send every turn of a conversation to the same frontend process. A "
+        "disaggregated server does so for context requests that carry a "
+        "conversation id when its context_servers section sets the same "
+        "num_serve_frontends and serve_frontend_affinity_port_stride.",
+        status="prototype")
+
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",
@@ -6977,6 +7045,22 @@ class TorchLlmArgs(BaseLlmArgs):
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
                                    description="Allreduce strategy to use.",
                                    status="beta")
+
+    mnnvl_allreduce_fp8_payload: bool = Field(
+        default=False,
+        description=
+        "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of "
+        "1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which "
+        "halves the NVLink bytes of both stages.",
+        status="prototype")
+
+    replicate_embedding: bool = Field(
+        default=False,
+        description=
+        "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a "
+        "lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by "
+        "Qwen3-Next / Qwen3.5 models without attention DP.",
+        status="prototype")
 
     checkpoint_loader: Optional[object] = Field(
         default=None,

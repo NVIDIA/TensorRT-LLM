@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Dict, List, Optional, Sequence, Type
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Type
 
 import numpy as np
 import torch
@@ -28,6 +28,9 @@ from .sparse import (get_flashinfer_sparse_attn_attention_backend,
                      get_vanilla_sparse_attn_attention_backend)
 from .sparse.params import SparseParams
 from .vanilla import VanillaAttention
+
+if TYPE_CHECKING:
+    from .fmha.gqa_decode import GqaDecodeSetup
 
 
 def get_attention_backend(
@@ -82,6 +85,8 @@ def create_attention(
     aux_stream: Optional[torch.cuda.Stream] = None,
     kv_cache_dtype: str = "auto",
     skip_correction_threshold: float = 0.0,
+    gqa_decode: Optional["GqaDecodeSetup"] = None,
+    cache_context_plan: bool = False,
 ) -> AttentionBackend:
     if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
         raise ValueError(
@@ -118,6 +123,8 @@ def create_attention(
         sparse_params=sparse_params,
         kv_cache_dtype=kv_cache_dtype,
         skip_correction_threshold=skip_correction_threshold,
+        gqa_decode=gqa_decode,
+        cache_context_plan=cache_context_plan,
     )
 
     return attn_cls(

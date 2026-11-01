@@ -109,7 +109,10 @@ def _install_graph_runner_stub(runner: DecoderRunner, key: KeyType | None = None
     stub.replayed_inputs = []
 
     def replay(
-        key: KeyType, inputs: dict[str, Any], position_id_offsets: torch.Tensor | None = None
+        key: KeyType,
+        inputs: dict[str, Any],
+        position_id_offsets: torch.Tensor | None = None,
+        static_inputs_staged: int = 0,
     ) -> dict[str, torch.Tensor]:
         stub.replayed_inputs.append(_clone_tensors(inputs))
         return {"logits": torch.zeros((inputs["input_ids"].shape[0], 10), device="cuda")}

@@ -52,6 +52,7 @@ def make_stub_manager(
     # for a one-model draft, which reads D prompt tokens past the target's end.
     mgr.reuse_match_backoff = reuse_match_backoff
     mgr.vocab_size = 32000
+    mgr.event_manager = None
     mgr.conversation_manager = None
     mgr.kv_connector_manager = None
     mgr.kv_cache_map = {}

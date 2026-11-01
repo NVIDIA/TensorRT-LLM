@@ -1242,6 +1242,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::StreamingBlockRemovedData>(m, "StreamingBlockRemovedData")
         .def_ro("block_hashes", &kv::StreamingBlockRemovedData::blockHashes);
 
+    nb::class_<kv::StreamingAllBlocksClearedData>(m, "StreamingAllBlocksClearedData");
+
     nb::class_<kv::StreamingEventStats>(m, "StreamingEventStats")
         .def_ro("stored_blocks", &kv::StreamingEventStats::storedBlocks)
         .def_ro("removed_blocks", &kv::StreamingEventStats::removedBlocks)

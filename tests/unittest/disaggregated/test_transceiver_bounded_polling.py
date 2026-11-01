@@ -414,6 +414,7 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_recv_session = False
     transceiver._gen_need_sync = True
+    transceiver._init_gen_idle_poll(False)
     transceiver._recv_sessions = {}
     transceiver._recv_reqs = {}
     transceiver._gen_consensus = Mock(return_value=[])
@@ -1305,3 +1306,234 @@ def test_poll_interval_pump_drives_completion() -> None:
     elapsed = time.monotonic() - start
     assert elapsed < 0.5
     assert session.is_completed()
+
+
+# ---------------------------------------------------------------------------
+# GEN idle receive-status skip: simulated ranks run check_gen_transfer_status in lockstep
+# threads whose allgather is a barrier, so a rank that skips a collective its peers enter
+# breaks the barrier.
+# ---------------------------------------------------------------------------
+
+
+class _GenCollective:
+    def __init__(self, world_size: int) -> None:
+        self.world_size = world_size
+        self.barrier = threading.Barrier(world_size, timeout=5.0)
+        self.slots: list = [None] * world_size
+        self.calls = [0] * world_size
+
+    def allgather_for(self, rank: int) -> Callable:
+        def allgather(payload):
+            self.calls[rank] += 1
+            self.slots[rank] = payload
+            self.barrier.wait()
+            gathered = list(self.slots)
+            self.barrier.wait()
+            return gathered
+
+        return allgather
+
+
+class _RecvSession:
+    def __init__(self) -> None:
+        self.completed = False
+        self.status = SessionStatus.READY
+        self.transfer_end_time = None
+        self.kv_cache_size_bytes = 0
+
+    def is_completed(self) -> bool:
+        return self.completed
+
+    def has_failed(self) -> bool:
+        return False
+
+    def wait_complete(self, blocking: bool = False):
+        return WaitResult.COMPLETED if self.completed else None
+
+    def kv_write_verified(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        pass
+
+
+class _RecvFetch:
+    def __init__(self, fail: bool = False) -> None:
+        self.session = None
+        self.fail = fail
+
+    def fetch(self, _extent, expected_write_bytes: int) -> None:
+        if self.fail:
+            raise RuntimeError("no peer")
+        self.session = _RecvSession()
+
+
+def _gen_request(rid: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        py_request_id=rid,
+        request_id=rid,
+        state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+        py_disaggregated_params=None,
+        set_kv_cache_transfer_start=lambda _t: None,
+        set_kv_cache_transfer_end=lambda _t: None,
+        set_kv_cache_size=lambda _s: None,
+    )
+
+
+def _make_gen_ranks(world_size: int, fail_fetch: bool = False):
+    collective = _GenCollective(world_size)
+    ranks = []
+    for rank in range(world_size):
+        transceiver = object.__new__(KvCacheTransceiverV2)
+        transceiver._ever_had_recv_session = True
+        transceiver._gen_need_sync = True
+        transceiver._gen_allgather = collective.allgather_for(rank)
+        transceiver._mapping = SimpleNamespace(
+            world_size=world_size, enable_attention_dp=False, pp_size=1, cp_size=1
+        )
+        transceiver._dist = SimpleNamespace(rank=rank)
+        transceiver._recv_sessions = {}
+        transceiver._recv_reqs = {}
+        transceiver._init_gen_idle_poll(True)
+        transceiver._assert_disagg_history_declared = lambda _req: None
+        transceiver._open_peer_source = lambda _req: _RecvFetch(fail_fetch)
+        transceiver._create_cache_extent = lambda _req: SimpleNamespace(local=None)
+        transceiver._page_table = None
+        transceiver._kv_size_rank_factor = 1
+        ranks.append(transceiver)
+    return collective, ranks
+
+
+def _lockstep(ranks, fn: Callable) -> list:
+    """Run fn(rank_index, transceiver) on every rank concurrently; re-raise any failure."""
+    results: list = [None] * len(ranks)
+    errors: list = []
+
+    def run(i: int) -> None:
+        try:
+            results[i] = fn(i, ranks[i])
+        except BaseException as error:  # noqa: BLE001 - surfaced below
+            errors.append(error)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(ranks))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+    return results
+
+
+def _poll_gen(ranks) -> list:
+    return _lockstep(ranks, lambda _i, t: t.check_gen_transfer_status(0))
+
+
+def test_gen_idle_skip_session_on_one_rank_keeps_every_rank_polling() -> None:
+    collective, ranks = _make_gen_ranks(2)
+    # Rank 0 still holds a receive session (e.g. a cancel retired rank 1's first).
+    ranks[0]._recv_sessions[7] = _RecvSession()
+    ranks[0]._recv_reqs[7] = _gen_request(7)
+    for _ in range(3):
+        _poll_gen(ranks)
+    assert collective.calls == [6, 6]
+    assert not any(t._gen_idle_agreed for t in ranks)
+
+
+def test_gen_idle_skip_failed_receive_resumes_polling() -> None:
+    collective, ranks = _make_gen_ranks(2, fail_fetch=True)
+    _poll_gen(ranks)
+    assert all(t._gen_idle_agreed for t in ranks)
+    for t in ranks:
+        # A receive that fails before creating its session still clears the flag.
+        with pytest.raises(RuntimeError):
+            t.request_and_receive_async(_gen_request(9))
+    assert not any(t._gen_idle_agreed for t in ranks)
+    calls = list(collective.calls)
+    _poll_gen(ranks)
+    assert collective.calls == [c + 2 for c in calls]
+    assert all(t._gen_idle_agreed for t in ranks)
+
+
+def test_gen_idle_skip_staggered_transfers_keep_lockstep() -> None:
+    # Shards finish in different rounds and receives arrive mid-flight and in the round the last
+    # session retires; the idle flag is set only after a round in which no rank held a session.
+    world = 4
+    collective, ranks = _make_gen_ranks(world)
+
+    def round_(admit=(), finish=None):
+        # finish: {rid: [ranks whose shard completes in this round]}
+        for rid, done_ranks in (finish or {}).items():
+            for r in done_ranks:
+                ranks[r]._recv_sessions[rid].completed = True
+
+        def step(_i, t):
+            for rid in admit:
+                t.request_and_receive_async(_gen_request(rid))
+            return t.check_gen_transfer_status(0)
+
+        completed = [sorted(s[0]) for s in _lockstep(ranks, step)]
+        assert all(c == completed[0] for c in completed), completed
+        flags = {t._gen_idle_agreed for t in ranks}
+        assert len(flags) == 1, flags
+        if any(t._recv_sessions for t in ranks):
+            assert flags == {False}
+        assert len(set(collective.calls)) == 1, collective.calls
+        return completed[0]
+
+    assert round_() == [] and ranks[0]._gen_idle_agreed  # idle: one agreed round
+    calls = list(collective.calls)
+    assert round_() == [] and collective.calls == calls  # skipped on every rank
+    assert round_(admit=(1, 2, 3)) == []  # the admission clears the flag on every rank
+    assert round_(finish={1: [0, 1], 2: [2]}) == []  # partial shards: no consensus yet
+    assert round_(finish={1: [2, 3]}) == [1]  # last shard of 1: retired on every rank together
+    assert round_(admit=(4,), finish={2: [0, 1, 3], 3: [3]}) == [2]
+    assert round_(finish={3: [0, 1, 2], 4: [0, 1, 2, 3]}) == [3, 4]
+    assert not ranks[0]._gen_idle_agreed  # this round still gathered sessions
+    assert round_() == [] and ranks[0]._gen_idle_agreed
+    # A receive in the round in which the last session retires: the flag stays clear.
+    assert round_(admit=(5,)) == []
+    assert round_(admit=(6,), finish={5: [0, 1, 2, 3]}) == [5]
+    assert not ranks[0]._gen_idle_agreed
+    assert round_(finish={6: [0, 1, 2, 3]}) == [6]
+    assert round_() == [] and ranks[0]._gen_idle_agreed
+    calls = list(collective.calls)
+    assert round_() == [] and collective.calls == calls
+
+
+def test_gen_idle_skip_deferred_publication_keeps_lockstep() -> None:
+    # A receive admitted in one round but started in staggered rounds: the admission report
+    # clears the idle flag on every rank, and a deferred receive counts as a session until it
+    # starts, so no rank enters a status collective its peers skip.
+    world = 4
+    collective, ranks = _make_gen_ranks(world)
+    _poll_gen(ranks)
+    assert all(t._gen_idle_agreed for t in ranks)
+
+    def round_(start=(), admit=0):
+        def step(i, t):
+            if admit:
+                t.set_gen_deferred_receives(admit)
+            if i in start:
+                t.request_and_receive_async(_gen_request(11))
+                t.set_gen_deferred_receives(0)
+            return t.check_gen_transfer_status(0)
+
+        statuses = _lockstep(ranks, step)
+        assert len(set(collective.calls)) == 1, collective.calls
+        assert len({t._gen_idle_agreed for t in ranks}) == 1
+        return [sorted(s[0]) for s in statuses]
+
+    calls = list(collective.calls)
+    round_(admit=1)  # admitted everywhere, started nowhere: no rank may stay idle
+    assert collective.calls == [c + 2 for c in calls]
+    assert not any(t._gen_idle_agreed for t in ranks)
+    round_(start=(0, 2))
+    assert not any(t._gen_idle_agreed for t in ranks)
+    round_(start=(1, 3))
+    for t in ranks:
+        t._recv_sessions[11].completed = True
+    assert round_() == [[11]] * world
+    assert not any(t._recv_sessions for t in ranks)
+    round_()
+    assert all(t._gen_idle_agreed for t in ranks)
