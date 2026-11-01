@@ -131,9 +131,20 @@ def _qkv_amax_kernel(
         mask = (h < H)[:, None] & (d < D)[None, :]
         offs = h[:, None] * D + d[None, :]
         offs_p = h[:, None] * D + partner[None, :]
-        yq = _norm_rope_tile(row + offs, row + offs_p, mask, wq_d, wq_p, cos_v, sin_v, sign, inv_d, eps)
+        yq = _norm_rope_tile(
+            row + offs, row + offs_p, mask, wq_d, wq_p, cos_v, sin_v, sign, inv_d, eps
+        )
         yk = _norm_rope_tile(
-            row + H * D + offs, row + H * D + offs_p, mask, wk_d, wk_p, cos_v, sin_v, sign, inv_d, eps
+            row + H * D + offs,
+            row + H * D + offs_p,
+            mask,
+            wk_d,
+            wk_p,
+            cos_v,
+            sin_v,
+            sign,
+            inv_d,
+            eps,
         )
         v = tl.load(row + 2 * H * D + offs, mask=mask, other=0.0).to(tl.float32)
         m_q = tl.maximum(m_q, tl.abs(yq))
@@ -204,10 +215,21 @@ def _qkv_cast_kernel(
         mask = (h < H)[:, None] & (d < D)[None, :]
         offs = h[:, None] * D + d[None, :]
         offs_p = h[:, None] * D + partner[None, :]
-        yq = _norm_rope_tile(row + offs, row + offs_p, mask, wq_d, wq_p, cos_v, sin_v, sign, inv_d, eps)
+        yq = _norm_rope_tile(
+            row + offs, row + offs_p, mask, wq_d, wq_p, cos_v, sin_v, sign, inv_d, eps
+        )
         tl.store(q_out_ptr + out_row + offs, (yq * f_q).to(tl.float8e4nv), mask=mask)
         yk = _norm_rope_tile(
-            row + H * D + offs, row + H * D + offs_p, mask, wk_d, wk_p, cos_v, sin_v, sign, inv_d, eps
+            row + H * D + offs,
+            row + H * D + offs_p,
+            mask,
+            wk_d,
+            wk_p,
+            cos_v,
+            sin_v,
+            sign,
+            inv_d,
+            eps,
         )
         tl.store(k_out_ptr + out_row + offs, (yk * f_k).to(tl.float8e4nv), mask=mask)
         v = tl.load(row + 2 * H * D + offs, mask=mask, other=0.0).to(tl.float32)
@@ -257,8 +279,19 @@ def qk_norm_rope_fp8(
         amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
         descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
         _qkv_amax_kernel[grid](
-            qkv, weight_q, weight_k, cos, sin, amax, s, eps,
-            H=h, D=d, ROT=rot, BLOCK_H=block_h, num_warps=num_warps,
+            qkv,
+            weight_q,
+            weight_k,
+            cos,
+            sin,
+            amax,
+            s,
+            eps,
+            H=h,
+            D=d,
+            ROT=rot,
+            BLOCK_H=block_h,
+            num_warps=num_warps,
         )
         static = False
     else:
@@ -266,8 +299,24 @@ def qk_norm_rope_fp8(
         descale = static_descale.to(torch.float32).contiguous()
         static = True
     _qkv_cast_kernel[grid](
-        qkv, weight_q, weight_k, cos, sin, amax, descale, q8, k8, v8, s, eps,
-        STATIC=static, H=h, D=d, ROT=rot, BLOCK_H=block_h, num_warps=num_warps,
+        qkv,
+        weight_q,
+        weight_k,
+        cos,
+        sin,
+        amax,
+        descale,
+        q8,
+        k8,
+        v8,
+        s,
+        eps,
+        STATIC=static,
+        H=h,
+        D=d,
+        ROT=rot,
+        BLOCK_H=block_h,
+        num_warps=num_warps,
     )
     if _AMAX_LOG is not None and not static:
         _record_descale(layer_idx, descale)
@@ -275,10 +324,230 @@ def qk_norm_rope_fp8(
 
 
 @qk_norm_rope_fp8.register_fake
-def _qk_norm_rope_fp8_fake(qkv, weight_q, weight_k, cos, sin, static_descale, eps, num_heads, head_dim, layer_idx):
+def _qk_norm_rope_fp8_fake(
+    qkv, weight_q, weight_k, cos, sin, static_descale, eps, num_heads, head_dim, layer_idx
+):
     b, s, _ = qkv.shape
     out = qkv.new_empty((b, s, num_heads * head_dim), dtype=torch.float8_e4m3fn)
-    return out, qkv.new_empty(out.shape, dtype=out.dtype), qkv.new_empty(out.shape, dtype=out.dtype), qkv.new_empty((3,), dtype=torch.float32)
+    return (
+        out,
+        qkv.new_empty(out.shape, dtype=out.dtype),
+        qkv.new_empty(out.shape, dtype=out.dtype),
+        qkv.new_empty((3,), dtype=torch.float32),
+    )
+
+
+# ----------------------------------------------------------------------------------------------
+# Per-tensor variant (async Ulysses: Q, K, V arrive as three [B, S, H, D] tensors)
+# ----------------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _tensor_amax_kernel(
+    x_ptr,
+    w_ptr,
+    cos_ptr,
+    sin_ptr,
+    amax_ptr,
+    S,
+    eps,
+    NORM_ROPE: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    r = tl.program_id(0)
+    t = r % S
+    d = tl.arange(0, D)
+    hh = tl.arange(0, BLOCK_H)
+    row = x_ptr + r.to(tl.int64) * (H * D)
+    m = tl.zeros((BLOCK_H, D), dtype=tl.float32)
+    if NORM_ROPE:
+        partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
+        w_d = tl.load(w_ptr + d).to(tl.float32)
+        w_p = tl.load(w_ptr + partner).to(tl.float32)
+        inv_d = 1.0 / D
+    for h0 in range(0, H, BLOCK_H):
+        h = h0 + hh
+        mask = (h < H)[:, None] & (d < D)[None, :]
+        offs = h[:, None] * D + d[None, :]
+        if NORM_ROPE:
+            offs_p = h[:, None] * D + partner[None, :]
+            y = _norm_rope_tile(
+                row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
+            )
+        else:
+            y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
+        m = tl.maximum(m, tl.abs(y))
+    tl.atomic_max(amax_ptr, tl.max(tl.max(m, axis=1), axis=0))
+
+
+@triton.jit
+def _tensor_cast_kernel(
+    x_ptr,
+    w_ptr,
+    cos_ptr,
+    sin_ptr,
+    amax_ptr,
+    descale_ptr,
+    out_ptr,
+    S,
+    eps,
+    NORM_ROPE: tl.constexpr,
+    OUT_FP8: tl.constexpr,
+    STATIC: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    ROT: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    r = tl.program_id(0)
+    t = r % S
+    d = tl.arange(0, D)
+    hh = tl.arange(0, BLOCK_H)
+    row = x_ptr + r.to(tl.int64) * (H * D)
+    out_row = out_ptr + r.to(tl.int64) * (H * D)
+    if NORM_ROPE:
+        partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
+        w_d = tl.load(w_ptr + d).to(tl.float32)
+        w_p = tl.load(w_ptr + partner).to(tl.float32)
+        inv_d = 1.0 / D
+    if OUT_FP8:
+        if STATIC:
+            s = tl.load(descale_ptr)
+        else:
+            s = _scale_from_amax(tl.load(amax_ptr))
+            if r == 0:
+                tl.store(descale_ptr, s)
+        f = _div_rn(1.0, s)
+    for h0 in range(0, H, BLOCK_H):
+        h = h0 + hh
+        mask = (h < H)[:, None] & (d < D)[None, :]
+        offs = h[:, None] * D + d[None, :]
+        if NORM_ROPE:
+            offs_p = h[:, None] * D + partner[None, :]
+            y = _norm_rope_tile(
+                row + offs, row + offs_p, mask, w_d, w_p, cos_v, sin_v, sign, inv_d, eps
+            )
+        else:
+            y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
+        if OUT_FP8:
+            tl.store(out_row + offs, (y * f).to(tl.float8e4nv), mask=mask)
+        else:
+            tl.store(out_row + offs, y.to(tl.bfloat16), mask=mask)
+
+
+@torch.library.custom_op("h3_lever8::norm_rope_fp8_tensor", mutates_args=())
+def norm_rope_fp8_tensor(
+    x: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
+    static_descale: Optional[torch.Tensor],
+    eps: float,
+    out_fp8: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """One ``[B, S, H, D]`` tensor: per-head RMSNorm + RoPE when ``weight`` is given (Q or K),
+    identity otherwise (V); output BF16, or FP8 E4M3 with the per-tensor ``descale`` ``[1]`` fp32
+    when ``out_fp8``. The BF16 output is the same value the compiled eager path produces; the FP8
+    output uses the same scale arithmetic as ``qk_norm_rope_fp8``. ``S`` is the local sequence
+    (``cos`` / ``sin`` are ``[S, ROT]`` for these rows). Returns ``(out, descale)``; ``descale``
+    is a ``[1]`` fp32 tensor holding 1.0 for the BF16 output.
+    """
+    b, s, h, d = x.shape
+    x = x.contiguous()
+    norm_rope = weight is not None
+    if norm_rope:
+        if cos is None or sin is None:
+            raise ValueError("norm + RoPE needs cos and sin")
+        cos = cos.contiguous()
+        sin = sin.contiguous()
+        rot = cos.shape[-1]
+    else:
+        rot = 2  # unused
+        cos = sin = weight = x  # placeholders, never dereferenced
+    rows = b * s
+    out = torch.empty(
+        (b, s, h, d), dtype=torch.float8_e4m3fn if out_fp8 else torch.bfloat16, device=x.device
+    )
+    block_h, num_warps = _launch_config()
+    grid = (rows,)
+    amax = torch.zeros(1, dtype=torch.float32, device=x.device)
+    if out_fp8 and static_descale is None:
+        descale = torch.empty(1, dtype=torch.float32, device=x.device)
+        _tensor_amax_kernel[grid](
+            x,
+            weight,
+            cos,
+            sin,
+            amax,
+            s,
+            eps,
+            NORM_ROPE=norm_rope,
+            H=h,
+            D=d,
+            ROT=rot,
+            BLOCK_H=block_h,
+            num_warps=num_warps,
+        )
+        static = False
+    elif out_fp8:
+        descale = static_descale.to(torch.float32).reshape(1).contiguous()
+        static = True
+    else:
+        descale = torch.ones(1, dtype=torch.float32, device=x.device)
+        static = True
+    _tensor_cast_kernel[grid](
+        x,
+        weight,
+        cos,
+        sin,
+        amax,
+        descale,
+        out,
+        s,
+        eps,
+        NORM_ROPE=norm_rope,
+        OUT_FP8=out_fp8,
+        STATIC=static,
+        H=h,
+        D=d,
+        ROT=rot,
+        BLOCK_H=block_h,
+        num_warps=num_warps,
+    )
+    return out, descale
+
+
+@norm_rope_fp8_tensor.register_fake
+def _norm_rope_fp8_tensor_fake(x, weight, cos, sin, static_descale, eps, out_fp8):
+    return (
+        x.new_empty(x.shape, dtype=torch.float8_e4m3fn if out_fp8 else torch.bfloat16),
+        x.new_empty((1,), dtype=torch.float32),
+    )
+
+
+def norm_rope_tensor(
+    x: torch.Tensor,
+    norm_weight: Optional[torch.Tensor],
+    cos: Optional[torch.Tensor],
+    sin: Optional[torch.Tensor],
+    eps: float,
+    fp8: bool = False,
+    static_descale: Optional[torch.Tensor] = None,
+):
+    """Per-tensor entry point for the async Ulysses path (lever 13, ¶14969).
+
+    ``norm_rope_tensor(q, norm_q.weight, cos, sin, eps)`` -> BF16 ``[B, S, H, D]``;
+    ``norm_rope_tensor(q, norm_q.weight, cos, sin, eps, fp8=True)`` -> ``(q_fp8, descale[1])``;
+    ``norm_rope_tensor(v, None, None, None, eps, fp8=True)`` casts V without norm or RoPE.
+    The three descales concatenated (``torch.cat``) are the ``fp8_descales`` the cuDNN backend takes.
+    """
+    out, descale = torch.ops.h3_lever8.norm_rope_fp8_tensor(
+        x, norm_weight, cos, sin, static_descale, float(eps), bool(fp8)
+    )
+    return (out, descale) if fp8 else out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -356,9 +625,14 @@ def _dump_amax_log() -> None:
     if _AMAX_LOG is None or not _RUNNING:
         return
     table = {str(k): [float(x) for x in v.cpu().tolist()] for k, v in sorted(_RUNNING.items())}
-    payload = {"descale_max": table, "calls": {str(k): v for k, v in sorted(_CALLS.items())},
-               "note": "descale = max(amax / 448, 1 / (448 * 512)) rounded to bf16; q, k, v per layer"}
-    path = f"{_AMAX_LOG}.pid{os.getpid()}" if os.environ.get("H3_FP8_AMAX_LOG_PER_PID") else _AMAX_LOG
+    payload = {
+        "descale_max": table,
+        "calls": {str(k): v for k, v in sorted(_CALLS.items())},
+        "note": "descale = max(amax / 448, 1 / (448 * 512)) rounded to bf16; q, k, v per layer",
+    }
+    path = (
+        f"{_AMAX_LOG}.pid{os.getpid()}" if os.environ.get("H3_FP8_AMAX_LOG_PER_PID") else _AMAX_LOG
+    )
     with open(path, "w") as f:
         json.dump(payload, f, indent=1)
 
