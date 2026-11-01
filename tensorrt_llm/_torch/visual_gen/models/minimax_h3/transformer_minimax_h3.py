@@ -21,6 +21,7 @@ The architecture follows the Diffusers implementations while using TRT-LLM's
 linear, attention, normalization, and dynamic-weight-loading modules
 """
 
+import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -50,6 +51,17 @@ from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
 from .fused_fp8_qk import fusion_mode, set_reduce_group, static_descale
 
 MINIMAX_H3_MODALITY_NUM = 3
+
+try:  # lever 8 overlay (fused_fp8_qk.py): per-tensor norm + RoPE (+ FP8 cast) for the async Ulysses path
+    from .fused_fp8_qk import fusion_mode as _l8_fusion_mode
+    from .fused_fp8_qk import norm_rope_tensor as _l8_norm_rope_tensor
+    from .fused_fp8_qk import set_reduce_group as _l8_set_reduce_group
+    from .fused_fp8_qk import static_descale as _l8_static_descale
+except ImportError:
+    _l8_fusion_mode = None
+    _l8_norm_rope_tensor = None
+    _l8_set_reduce_group = None
+    _l8_static_descale = None
 
 
 @dataclass
@@ -366,29 +378,80 @@ class MiniMaxH3Attention(Attention):
         batch_size, sequence_length = hidden_states.shape[:2]
         head_dim = self.head_dim
 
-        def project(linear: Linear, heads: int, norm: RMSNorm) -> torch.Tensor:
-            states = norm(linear(hidden_states).view(batch_size, sequence_length, heads, head_dim))
+        # Pairing with the lever 8 per-tensor norm + RoPE kernel when its overlay is present:
+        # "bf16" fuses norm and RoPE per projection; "fp8" (H3_L13_PAIR=fp8, FP8 attention
+        # backend) also casts to e4m3 before the push, so the all-to-all carries 1-byte codes
+        # viewed as bf16 and the receiver views them back (recv_view_dtype).
+        pair = None
+        if _l8_norm_rope_tensor is not None and rotary_emb is not None and _l8_fusion_mode() != "off":
+            backend = getattr(self.attn, "inner_backend", self.attn)
+            pair = "bf16"
+            if (
+                os.environ.get("H3_L13_PAIR", "bf16") == "fp8"
+                and getattr(backend, "quant_dtype", None) == "fp8"
+            ):
+                pair = "fp8"
+        cos, sin = rotary_emb if rotary_emb is not None else (None, None)
+        eps = float(self.norm_q.variance_epsilon)
+        descales = static_in = valid_len = None
+        if pair == "fp8":
+            group = getattr(self.attn, "process_group", None)
+            if getattr(self.attn, "world_size", 1) > 1:
+                _l8_set_reduce_group(group)
+            descales = torch.empty(3, dtype=torch.float32, device=hidden_states.device)
+            if _l8_fusion_mode() == "static":
+                static_in = _l8_static_descale(self.layer_idx, hidden_states.device)
+            if key_padding_mask is not None:
+                rank = torch.distributed.get_rank(group=group) if group is not None else 0
+                lengths = key_padding_mask.sum(dim=1) - rank * sequence_length
+                valid_len = lengths.clamp(0, sequence_length).to(torch.int32).contiguous()
+
+        def project(linear: Linear, heads: int, norm: Optional[RMSNorm], index: int) -> torch.Tensor:
+            states = linear(hidden_states).view(batch_size, sequence_length, heads, head_dim)
+            weight = norm.weight if norm is not None else None
+            if pair == "fp8":
+                codes, descale = _l8_norm_rope_tensor(
+                    states,
+                    weight,
+                    cos if norm is not None else None,
+                    sin if norm is not None else None,
+                    eps,
+                    fp8=True,
+                    static_descale=static_in[index : index + 1] if static_in is not None else None,
+                    valid_len=valid_len,
+                )
+                descales[index : index + 1].copy_(descale)
+                return codes.view(torch.bfloat16)
+            if norm is None:
+                return states
+            if pair == "bf16":
+                return _l8_norm_rope_tensor(states, weight, cos, sin, eps)
+            states = norm(states)
             if rotary_emb is not None:
                 states = apply_minimax_h3_rotary_emb(states, *rotary_emb)
             return states
 
         def compute_q() -> torch.Tensor:
-            return project(self.to_q, self.local_num_attention_heads, self.norm_q)
+            return project(self.to_q, self.local_num_attention_heads, self.norm_q, 0)
 
         def compute_k() -> torch.Tensor:
-            return project(self.to_k, self.local_num_key_value_heads, self.norm_k)
+            return project(self.to_k, self.local_num_key_value_heads, self.norm_k, 1)
 
         def compute_v() -> torch.Tensor:
-            return self.to_v(hidden_states).view(
-                batch_size, sequence_length, self.local_num_key_value_heads, head_dim
-            )
+            return project(self.to_v, self.local_num_key_value_heads, None, 2)
 
+        fp8_kwargs = (
+            {"fp8_descales": descales, "recv_view_dtype": torch.float8_e4m3fn}
+            if pair == "fp8"
+            else {}
+        )
         out_4d = self.attn.forward_async(
             compute_q,
             compute_k,
             compute_v,
             key_padding_mask=key_padding_mask,
             timestep=timestep,
+            **fp8_kwargs,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))

@@ -792,6 +792,9 @@ class UlyssesAttention(AttentionBackend):
         if attn_kwargs.get("kv") is not None:
             raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
+        # The async ops push bf16 only; a caller that hands over 1-byte codes viewed as
+        # bf16 names the dtype the received tensors are viewed back to.
+        recv_view_dtype = attn_kwargs.pop("recv_view_dtype", None)
 
         # Issue the closures in issue_order. Order is correctness-neutral (_join_async
         # syncs all recv bufs); it only tunes which push overlaps which compute.
@@ -843,6 +846,10 @@ class UlyssesAttention(AttentionBackend):
                 q_out = q_out.transpose(1, 2).contiguous()
                 k_out = k_out.transpose(1, 2).contiguous()
                 v_out = v_out.transpose(1, 2).contiguous()
+        if recv_view_dtype is not None:
+            q_out = q_out.view(recv_view_dtype)
+            k_out = k_out.view(recv_view_dtype)
+            v_out = v_out.view(recv_view_dtype)
 
         if is_hnd:
             if gate_compress is not None:
