@@ -327,7 +327,7 @@ index 8c331d05a5b55717df3ba4dd1ff55b6ca44c831e..9c0a5e7243ee2d4ad33eed1afd45f9b8
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index f4e67b642efb6d8f8ad5e5519c1679c47e776f54..9ab920d4ba7017db8d26f884ae2e420b67ddb920 100644
+index d29e7145f1da027ec86be7247a64a0a7d730c102..c4b11379ab3076644f4e7bdadf9948049bb23556 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -385,7 +385,7 @@ index f4e67b642efb6d8f8ad5e5519c1679c47e776f54..9ab920d4ba7017db8d26f884ae2e420b
          tile_idx = _resolve_kv_tile_idx_context(
              stage_info, kv_tile_start, tile_offset=tile_offset
          )
-@@ -5903,3 +5892,14 @@ class GmemOResource(MemoryResource):
+@@ -5942,3 +5931,14 @@ class GmemOResource(MemoryResource):
                  prims.cp_async_bulk_commit_group()
                  if cutlass.const_expr(self.cfg.gmem_o_store_wait_after_write):
                      prims.cp_async_bulk_wait_group(0, read=True)
@@ -419,7 +419,7 @@ index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f683ab31eed 100644
+index 7774f881518b11f8e3fc0626afbcd757c77ca6cc..3c3a5d2197cfbc33fcedc7d6c2fb21ebaac2a74d 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -28,11 +28,7 @@ from ._hardware import get_max_active_clusters
@@ -435,7 +435,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
  
  from .decode import (
      _WorkspaceSection,
-@@ -1133,11 +1129,35 @@ def _make_mla_decode_compile_spec(
+@@ -1155,11 +1151,35 @@ def _make_mla_decode_compile_spec(
      )
  
  
@@ -476,7 +476,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
  
      import cutlass
      import cutlass.cute as cute
-@@ -1776,7 +1796,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1798,7 +1818,7 @@ class BatchMLADecodePagedTSWrapper:
              use_kv_bounds=use_kv_bounds,
          )
  
@@ -485,7 +485,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
      def run(
          self,
          query: torch.Tensor,
-@@ -1905,7 +1925,7 @@ class BatchMLADecodePagedTSWrapper:
+@@ -1927,7 +1947,7 @@ class BatchMLADecodePagedTSWrapper:
          )
  
  
@@ -494,7 +494,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
  def batch_mla_decode_with_paged_kv_cache(
      query: torch.Tensor,
      kv_cache: torch.Tensor,
-@@ -2284,6 +2304,7 @@ def _prepare_sparse_output_quant(
+@@ -2306,6 +2326,7 @@ def _prepare_sparse_output_quant(
      )
  
  
@@ -502,7 +502,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
  def _resolve_sparse_mla_plan(
      device,
      batch_size,
-@@ -2304,17 +2325,17 @@ def _resolve_sparse_mla_plan(
+@@ -2326,17 +2347,17 @@ def _resolve_sparse_mla_plan(
  ):
      """Resolve sparse geometry and scratch sizing without allocation/compilation."""
      import cutlass
@@ -524,7 +524,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
          MlaDecodeTs,
      )
  
-@@ -2449,6 +2470,9 @@ def _resolve_sparse_mla_plan(
+@@ -2471,6 +2492,9 @@ def _resolve_sparse_mla_plan(
      return device, profile, spec, sections, byte_end, capacity, output_quant
  
  
@@ -534,7 +534,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
  class BatchSparseMLADecodePagedTSWrapper:
      """Plan native BF16/E4M3 attention, then bind one or two source index lists.
  
-@@ -2482,6 +2506,11 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2504,6 +2528,11 @@ class BatchSparseMLADecodePagedTSWrapper:
          self._workspace_buffer = workspace_buffer
          self._state = None
          self._scalar_cache = {}
@@ -546,7 +546,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
          self.workspace_size_bytes = 0
  
      def plan(
-@@ -2571,6 +2600,7 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2593,6 +2622,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                  kernel_signature=_mla_kernel_compile_signature(static_kernel),
              )
          )
@@ -554,7 +554,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
          self._state = dict(
              device=device,
              batch=batch_size,
-@@ -2793,6 +2823,38 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2815,6 +2845,38 @@ class BatchSparseMLADecodePagedTSWrapper:
          state = self._state
          if state is None:
              raise RuntimeError("plan() must be called before run()")
@@ -593,7 +593,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
          _validate_query(
              query,
              packed_query=state["packed"],
-@@ -2966,10 +3028,125 @@ class BatchSparseMLADecodePagedTSWrapper:
+@@ -2988,10 +3050,126 @@ class BatchSparseMLADecodePagedTSWrapper:
                  if static_scales
                  else state["compiled"],
              )
@@ -711,6 +711,7 @@ index 7ea49a00d3ed6a236bd9da2854b45a985e23d4a5..f0a6e9ddf697fc80748b859fd2818f68
 +            (indices, ci, lengths, cl, s0, s1, sinks),
 +            bmm1,
 +            bmm2,
++            None,
 +            None,
 +            None,
 +        )

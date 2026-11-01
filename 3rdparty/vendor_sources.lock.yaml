@@ -21,8 +21,8 @@ vendors:
     include:
     - '**/*.py'
     patch: 3rdparty/vendor_patches/flashinfer-prims-ts.patch
-    patch_digest: sha256:27cc330c1eff406250b2ea7212d7a3200773a4c2d9eaacd57e57033344d39f3c
-    digest: sha256-tree-v1:ba233486a857302bc90ca13de3448c2f78c437a83afb253e118bb36403133306
+    patch_digest: sha256:011e0dab0ea60efff540c3ce80a96970f1be9c85f6f5b67522d157c31fa710fa
+    digest: sha256-tree-v1:5e79472af6592b6030d60e51d8498cb0f45fd55c5b974625cafa966ad2e58a39
   openengine-proto:
     url: https://github.com/ai-dynamo/openengine.git
     tag: v0.1.0
