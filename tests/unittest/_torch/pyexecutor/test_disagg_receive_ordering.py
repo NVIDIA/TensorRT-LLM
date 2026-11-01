@@ -52,6 +52,7 @@ def _manager() -> Mock:
     """Run the real admission and resource hooks with mocked cache allocation."""
     manager = Mock(spec=KVCacheManagerV2)
     manager._sharing = None  # no lender: free_resources closes and removes the cache itself
+    manager._host_history_reservations = None
     manager.impl = Mock()
     manager._stream = Mock()
     manager._disagg_receive_ready = {}
@@ -66,6 +67,9 @@ def _manager() -> Mock:
     manager.kv_cache_map = {}
     manager.prepare_context_cache.return_value = 0
     manager.prepare_disagg_gen_init = MethodType(KVCacheManagerV2.prepare_disagg_gen_init, manager)
+    manager._prepare_disagg_gen_init_cache = MethodType(
+        KVCacheManagerV2._prepare_disagg_gen_init_cache, manager
+    )
     manager.prepare_resources = MethodType(KVCacheManagerV2.prepare_resources, manager)
     return manager
 
