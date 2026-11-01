@@ -394,6 +394,7 @@ def _active_compressed_position_ids(
     metadata.cu_new_comp_kv_cuda = {
         compress_ratio: torch.empty(batch_size + 1, dtype=torch.int32, device=DEVICE)
     }
+    metadata.gen_position_params_cuda = torch.empty(3, dtype=torch.int32, device=DEVICE)
 
     ctx_comp = (
         (kv_lens[:num_contexts] // compress_ratio)
@@ -512,6 +513,108 @@ def test_compressed_mask_static_shapes_no_recompile():
     with torch._dynamo.config.patch(error_on_recompile=True):
         for case in cases[1:]:
             run(case)
+
+
+def _reference_gen_position_ids(
+    cu: List[int],
+    past: List[int],
+    num_contexts: int,
+    num_generations: int,
+    num_gen_tokens_per_seq: int,
+    compress_ratio: int,
+) -> Dict[int, int]:
+    """Slot -> position ID for every generation output slot of one ratio."""
+    batch_size = num_contexts + num_generations
+    output_offset = cu[num_contexts]
+    gen_comp = num_generations * ((num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio)
+    expected = {}
+    for slot in range(output_offset, output_offset + gen_comp):
+        req = bisect.bisect_right(cu[: batch_size + 1], slot) - 1
+        req = min(max(req, num_contexts), batch_size - 1)
+        expected[slot] = (past[req] + slot - cu[req]) * compress_ratio
+    return expected
+
+
+def test_gen_compressed_position_ids_static_shapes_no_recompile():
+    """One compiled graph must serve every mix of context and generation requests.
+
+    Serving reaches context+generation compositions that warmup never runs, so
+    any per-batch Python int in the signature recompiles mid-serving.
+    """
+    ratios = [4, 128]
+    max_seqs, capacity = 8, 64
+    past_bufs = {r: torch.empty(max_seqs, dtype=torch.int32, device=DEVICE) for r in ratios}
+    cu_bufs = {r: torch.empty(max_seqs + 1, dtype=torch.int32, device=DEVICE) for r in ratios}
+    pos_bufs = {r: torch.empty(capacity, dtype=torch.int32, device=DEVICE) for r in ratios}
+    gen_params = torch.empty(3, dtype=torch.int32, device=DEVICE)
+
+    def run(num_contexts, num_generations, num_gen_tokens_per_seq, new_comp, past):
+        batch_size = num_contexts + num_generations
+        for r in ratios:
+            counts = torch.tensor(new_comp[r], dtype=torch.int32, device=DEVICE)
+            # Poison the tails: stale entries must not change the result.
+            past_bufs[r].fill_(1000)
+            cu_bufs[r].fill_(1)
+            past_bufs[r][:batch_size] = torch.tensor(past[r], dtype=torch.int32, device=DEVICE)
+            cu_bufs[r][: batch_size + 1] = F.pad(torch.cumsum(counts, 0), (1, 0)).to(torch.int32)
+            pos_bufs[r].fill_(-7)
+        gen_params[0].fill_(num_contexts)
+        gen_params[1].fill_(num_generations)
+        gen_params[2].fill_(num_gen_tokens_per_seq)
+        DeepseekV4TrtllmAttentionMetadata._compute_gen_compressed_position_ids(
+            past_bufs, cu_bufs, pos_bufs, gen_params, ratios
+        )
+        for r in ratios:
+            cu = [0]
+            for count in new_comp[r]:
+                cu.append(cu[-1] + count)
+            expected = _reference_gen_position_ids(
+                cu, past[r], num_contexts, num_generations, num_gen_tokens_per_seq, r
+            )
+            actual = pos_bufs[r].tolist()
+            for slot, value in enumerate(actual):
+                # Context prefix and tail slots are owned by other writers.
+                assert value == expected.get(slot, -7), (r, slot, value, expected.get(slot))
+
+    cases = [
+        # (num_contexts, num_generations, next_n, new_comp per ratio, past per ratio)
+        (0, 1, 6, {4: [2], 128: [0]}, {4: [3], 128: [0]}),
+        (0, 4, 6, {4: [1, 2, 2, 1], 128: [0, 1, 0, 0]}, {4: [5, 9, 1, 2], 128: [0, 7, 1, 0]}),
+        (1, 1, 6, {4: [3, 2], 128: [1, 0]}, {4: [0, 4], 128: [0, 2]}),
+        (
+            4,
+            1,
+            6,
+            {4: [5, 2, 0, 7, 1], 128: [0, 1, 0, 0, 1]},
+            {4: [0, 1, 2, 3, 4], 128: [0, 0, 0, 0, 3]},
+        ),
+        (
+            4,
+            3,
+            6,
+            {4: [5, 2, 3, 7, 2, 2, 1], 128: [0, 0, 1, 0, 0, 1, 0]},
+            {4: [0, 0, 0, 0, 6, 8, 9], 128: [0, 0, 0, 0, 1, 1, 1]},
+        ),
+        (
+            3,
+            5,
+            6,
+            {4: [7, 7, 7, 2, 1, 2, 2, 1], 128: [0, 0, 0, 1, 0, 0, 0, 1]},
+            {4: [0, 0, 0, 10, 11, 12, 13, 14], 128: [0, 0, 0, 2, 2, 2, 2, 3]},
+        ),
+        (
+            2,
+            6,
+            1,
+            {4: [9, 4, 1, 0, 0, 1, 0, 0], 128: [0, 0, 0, 0, 0, 0, 1, 0]},
+            {4: [0, 0, 3, 4, 5, 6, 7, 8], 128: [0, 0, 0, 0, 0, 0, 0, 0]},
+        ),
+        (0, 8, 2, {4: [1] * 8, 128: [0] * 8}, {4: list(range(8)), 128: [0] * 8}),
+    ]
+    run(*cases[0])
+    with torch._dynamo.config.patch(error_on_recompile=True):
+        for case in cases[1:]:
+            run(*case)
 
 
 @pytest.mark.parametrize(

@@ -191,6 +191,7 @@ class DecoderMetadata:
             "compressed_position_ids_cuda",
             "cu_new_comp_kv_cuda",
             "batch_size_cuda",
+            "gen_position_params_cuda",
             "max_draft_tokens",
             "new_comp_kv_lens_cuda",
             "past_kv_lens_cuda",
@@ -219,9 +220,9 @@ class DecoderMetadata:
         compress_ratios = [int(ratio) for ratio in metadata._compress_ratios_sorted]
         tokens_per_generation = 1 + int(metadata.max_draft_tokens)
         total_compressed_tokens = {}
-        gen_output_offsets = {ratio: 0 for ratio in compress_ratios}
         prepared_ratios = []
         original_batch_size = metadata.batch_size_cuda.clone()
+        original_gen_params = metadata.gen_position_params_cuda.clone()
         try:
             for ratio in compress_ratios:
                 compressed_tokens_per_generation = (tokens_per_generation + ratio - 1) // ratio
@@ -260,15 +261,16 @@ class DecoderMetadata:
                 "DSpark ragged metadata warmup: compiling one non-graph "
                 f"shape with {num_generations} generation requests"
             )
+            gen_params = metadata.gen_position_params_cuda
+            gen_params[0].fill_(0)
+            gen_params[1].fill_(num_generations)
+            gen_params[2].fill_(tokens_per_generation)
             metadata._compute_gen_compressed_position_ids(
                 metadata.past_kv_lens_cuda,
                 metadata.cu_new_comp_kv_cuda,
                 metadata.compressed_position_ids_cuda,
-                0,
-                num_generations,
-                tokens_per_generation,
+                gen_params,
                 compress_ratios,
-                gen_output_offsets,
             )
             metadata.batch_size_cuda.fill_(num_generations)
             metadata._compute_compressed_mask(
@@ -281,6 +283,7 @@ class DecoderMetadata:
             torch.cuda.synchronize()
         finally:
             metadata.batch_size_cuda.copy_(original_batch_size)
+            metadata.gen_position_params_cuda.copy_(original_gen_params)
             for ratio in prepared_ratios:
                 total_tokens = total_compressed_tokens[ratio]
                 metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()
