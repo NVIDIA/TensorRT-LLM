@@ -9,6 +9,9 @@ from typing import Optional
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.sparse_reference import (
+    validate_sparse_selection,
+)
 
 from ..triton_sparse_decode import minimax_m3_sparse_attn_decode
 from .m3_sparse_decode_lc import PAGE, sparse_attention_reference
@@ -183,33 +186,9 @@ class M3SparseDecode(OpWrapper):
         num_topk_chunks: Optional[int] = None,
         identity_blocks: bool = False,
     ) -> None:
-        """The inputs this call takes and answers wrongly.
-
-        Every producer walks a token's first ``min(topk, ceil(kv_len / 128))``
-        table entries and indexes the block table with them unchecked, so they
-        must be real blocks of the request. ``identity_blocks`` is a promise the
-        multi-query producer relies on: every token of a request reads the same
-        blocks, all of them. Reads ``topk_idx`` and ``seq_lens`` back to the
-        host: a test-only cost.
-        """
-        total_q = q.shape[0]
-        seq = seq_lens.tolist()
-        max_topk = topk_idx.shape[-1]
-        for tok in range(total_q):
-            req, offset = divmod(tok, decode_query_len)
-            kv_len = max(seq[req] - decode_query_len + offset + 1, 0)
-            nblocks = (kv_len + PAGE - 1) // PAGE
-            ids = topk_idx[:, tok, : min(max_topk, nblocks)]
-            assert bool(((ids >= 0) & (ids < min(nblocks, block_table.shape[1]))).all()), (
-                f"token {tok}: the first min(topk, block count) selected ids must be blocks of the request; "
-                "the block table is indexed with them unchecked"
-            )
-            if identity_blocks:
-                assert nblocks <= max_topk and bool(
-                    (ids == torch.arange(nblocks, device=ids.device, dtype=ids.dtype)).all()
-                ), (
-                    f"token {tok}: identity_blocks promises the table holds every block of the request in order"
-                )
+        validate_sparse_selection(
+            q, topk_idx, block_table, seq_lens, decode_query_len, identity_blocks, PAGE
+        )
 
 
 m3_sparse_decode = M3SparseDecode()

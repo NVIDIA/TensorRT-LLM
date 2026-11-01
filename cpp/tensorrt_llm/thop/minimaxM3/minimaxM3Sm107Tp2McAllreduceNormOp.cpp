@@ -16,7 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp2/mcAllreduceNormTp2.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/mcAllreduceNorm.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -70,13 +70,13 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp2McAllreduceNorm(torch::Tensor const&
     int const sm = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sm == 107, "minimax_m3_sm107_tp2_mc_allreduce_norm requires SM107, got SM", sm);
     TORCH_CHECK(cluster == kCluster, "minimax_m3_sm107_tp2_mc_allreduce_norm: only cluster 8 is built, got ", cluster);
-    TORCH_CHECK(tensorrt_llm::kernels::isMinimaxM3Sm107Tp2McAllreduceNormSupported(
+    TORCH_CHECK(tensorrt_llm::kernels::isMinimaxM3Sm107McAllreduceNormSupported(
                     static_cast<int32_t>(maxt), static_cast<int32_t>(opts)),
         "minimax_m3_sm107_tp2_mc_allreduce_norm: unsupported (bucket ", maxt, ", opts ", opts, ")");
     TORCH_CHECK(
         world >= 1 && world <= kMaxWorld && rank >= 0 && rank < world, "invalid rank ", rank, " / world ", world);
 
-    tensorrt_llm::kernels::MinimaxM3Sm107Tp2McAllreduceNormParams p;
+    tensorrt_llm::kernels::MinimaxM3Sm107McAllreduceNormParams p;
     if (x2.has_value())
     {
         TORCH_CHECK(x2->scalar_type() == at::kBFloat16 && x2->is_contiguous() && x2->sizes() == residual.sizes(),
@@ -153,7 +153,7 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp2McAllreduceNorm(torch::Tensor const&
         p.capWeight = reinterpret_cast<__nv_bfloat16 const*>(capW->data_ptr());
         p.capEps = static_cast<float>(capEps);
     }
-    tensorrt_llm::kernels::invokeMinimaxM3Sm107Tp2McAllreduceNorm(p, static_cast<int32_t>(maxt),
+    tensorrt_llm::kernels::invokeMinimaxM3Sm107McAllreduceNorm(p, static_cast<int32_t>(maxt),
         static_cast<int32_t>(opts), pdl, at::cuda::getCurrentCUDAStream(residual.get_device()));
     if (quant)
     {

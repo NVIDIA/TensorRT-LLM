@@ -203,7 +203,7 @@ def _target(ar: Any, x: torch.Tensor, residual: torch.Tensor, w: torch.Tensor):
     from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_fused_add_rmsnorm import (  # noqa: E501
         flashinfer_fused_add_rmsnorm,
     )
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_allreduce import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.comm.m3_allreduce import (  # noqa: E501
         m3_allreduce,
     )
 
@@ -211,14 +211,14 @@ def _target(ar: Any, x: torch.Tensor, residual: torch.Tensor, w: torch.Tensor):
 
 
 def _check_cells(mapping: Any) -> None:
-    """Every cell of ``m3_allreduce.CELLS`` (AUTO strategy, as the target builds it) against the entry's reference:
+    """Every cell of ``m3_allreduce.CELLS_BY_TP[2]`` (target AUTO strategy) against the entry's reference:
     rank-order fp32 sums with one BF16 rounding of the sum and one of the norm. A strategy may round the cross-rank sum
     to BF16 before adding the residual, so the residual sum is bounded at its operands' magnitude
     u = ulp(max(|residual|, |sum|)): half an ulp for that rounding plus half an output ulp for each of the two final
     roundings, an output ulp being at most 2u, so 2.5u (where the two cancel, the output's own ulp is far smaller).
     The normed rows are the norm of the op's own residual sum, within 2 ulps of the reference norm of that sum."""
 
-    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.comm.m3_allreduce import (  # noqa: E501
+    from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.comm.m3_allreduce import (  # noqa: E501
         m3_allreduce,
     )
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
@@ -228,7 +228,7 @@ def _check_cells(mapping: Any) -> None:
     from _validating import validating
 
     ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.AUTO, dtype=torch.bfloat16)
-    for i, cell in enumerate(m3_allreduce.CELLS):
+    for i, cell in enumerate(m3_allreduce.CELLS_BY_TP[2]):
         spec = cell.spec
         xs, residual, w = _random(200 + i, spec["m"], 1.0, 4.0, False)
         params = (
@@ -396,14 +396,7 @@ def _spawn_ranks() -> None:
         TLLM_DISABLE_MPI="1",
     )
     env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
-    children = [
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
-            env=dict(env, RANK=str(r), LOCAL_RANK=str(r)),
-            start_new_session=True,
-        )
-        for r in range(world_size)
-    ]
+    children = []
 
     def _kill_all() -> None:
         for p in children:
@@ -414,25 +407,35 @@ def _spawn_ranks() -> None:
         for p in children:
             p.wait()
 
-    deadline = time.monotonic() + DEADLINE_S
-    live = set(range(world_size))
-    failure: Optional[str] = None
-    while live and failure is None:
-        if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
-            break
-        for r in sorted(live):
-            code = children[r].poll()
-            if code is None:
-                continue
-            live.discard(r)
-            if code != 0:
-                failure = f"rank {r} exited {code}"
+    try:
+        for r in range(world_size):
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
+                    env=dict(env, RANK=str(r), LOCAL_RANK=str(r)),
+                    start_new_session=True,
+                )
+            )
+        deadline = time.monotonic() + DEADLINE_S
+        live = set(range(world_size))
+        failure: Optional[str] = None
+        while live and failure is None:
+            if time.monotonic() > deadline:
+                failure = f"did not finish in {DEADLINE_S}s (wedged)"
                 break
-        time.sleep(0.5)
-    if failure is not None:
+            for r in sorted(live):
+                code = children[r].poll()
+                if code is None:
+                    continue
+                live.discard(r)
+                if code != 0:
+                    failure = f"rank {r} exited {code}"
+                    break
+            time.sleep(0.5)
+        if failure is not None:
+            raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+    finally:
         _kill_all()
-        raise AssertionError(f"the {world_size}-rank run failed: {failure}")
 
 
 if __name__ == "__main__":

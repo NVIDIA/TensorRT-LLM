@@ -18,7 +18,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import FlashInferMXFP8GemmRunner
 
-__extra_import_path__ = ["../../../..", "."]
+__extra_import_path__ = ["../../../..", ".", "../.."]
 from _m3_mxfp8_operands import mxfp8  # noqa: E402
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 

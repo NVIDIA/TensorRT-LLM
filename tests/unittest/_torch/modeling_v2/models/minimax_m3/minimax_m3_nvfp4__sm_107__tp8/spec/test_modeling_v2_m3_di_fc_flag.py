@@ -67,6 +67,7 @@ def test_wait_releases_on_graph_replays() -> None:
         dst.copy_(src)
         main.wait_stream(aux)
 
+    cap.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(cap):
         body()  # eager warm-up (compiles the wait kernel outside capture)
     torch.cuda.synchronize()

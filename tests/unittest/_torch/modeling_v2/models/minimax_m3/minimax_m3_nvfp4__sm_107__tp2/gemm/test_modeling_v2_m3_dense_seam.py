@@ -78,11 +78,12 @@ def op_calls(monkeypatch):
     real = modeling.m3_dense_swiglu
 
     class _Recording:
-        CELLS = real.CELLS
+        CELLS = real.CELLS_BY_TP[2]
+        CELLS_BY_TP = real.CELLS_BY_TP
 
-        def __call__(self, gu, *args):
+        def __call__(self, gu: torch.Tensor, *args, tp_size: int = 2) -> torch.Tensor | None:
             calls.append(gu.shape[0])
-            return real(gu, *args)
+            return real(gu, *args, tp_size=tp_size)
 
     monkeypatch.setattr(modeling, "m3_dense_swiglu", _Recording())
     return calls

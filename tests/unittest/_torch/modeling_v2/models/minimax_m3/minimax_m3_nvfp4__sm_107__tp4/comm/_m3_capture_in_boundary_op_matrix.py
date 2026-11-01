@@ -263,14 +263,7 @@ def _spawn_ranks() -> None:
         TLLM_DISABLE_MPI="1",
     )
     env = {k: v for k, v in env.items() if not k.startswith(("PMIX_", "PMI_", "OMPI_", "SLURM_"))}
-    children = [
-        subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
-            env=dict(env, RANK=str(r), LOCAL_RANK=str(r)),
-            start_new_session=True,
-        )
-        for r in range(world_size)
-    ]
+    children = []
 
     def _kill_all() -> None:
         for p in children:
@@ -281,25 +274,35 @@ def _spawn_ranks() -> None:
         for p in children:
             p.wait()
 
-    deadline = time.monotonic() + DEADLINE_S
-    live = set(range(world_size))
-    failure: Optional[str] = None
-    while live and failure is None:
-        if time.monotonic() > deadline:
-            failure = f"did not finish in {DEADLINE_S}s (wedged)"
-            break
-        for r in sorted(live):
-            code = children[r].poll()
-            if code is None:
-                continue
-            live.discard(r)
-            if code != 0:
-                failure = f"rank {r} exited {code}"
+    try:
+        for r in range(world_size):
+            children.append(
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), _WORKER_FLAG],
+                    env=dict(env, RANK=str(r), LOCAL_RANK=str(r)),
+                    start_new_session=True,
+                )
+            )
+        deadline = time.monotonic() + DEADLINE_S
+        live = set(range(world_size))
+        failure: Optional[str] = None
+        while live and failure is None:
+            if time.monotonic() > deadline:
+                failure = f"did not finish in {DEADLINE_S}s (wedged)"
                 break
-        time.sleep(0.5)
-    if failure is not None:
+            for r in sorted(live):
+                code = children[r].poll()
+                if code is None:
+                    continue
+                live.discard(r)
+                if code != 0:
+                    failure = f"rank {r} exited {code}"
+                    break
+            time.sleep(0.5)
+        if failure is not None:
+            raise AssertionError(f"the {world_size}-rank run failed: {failure}")
+    finally:
         _kill_all()
-        raise AssertionError(f"the {world_size}-rank run failed: {failure}")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/producerPw4.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/producerPw.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -33,7 +33,7 @@ namespace torch_ext
 namespace
 {
 
-namespace pw = tensorrt_llm::kernels::minimaxM3Sm107Tp4::producerPw4;
+namespace pw = tensorrt_llm::kernels::minimaxM3Sm107::producerPw;
 
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kPageSize = 128;
@@ -70,9 +70,9 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp4ProducerPw(torch::Tensor const& pack
     c10::cuda::CUDAGuard const deviceGuard{packed.device()};
     static int const sSmVersion = tensorrt_llm::common::getSMVersion();
     TORCH_CHECK(sSmVersion >= 100, "minimax_m3_sm107_tp4_producer_pw requires SM100 or newer");
-    int64_t const headsQ = pw::kHeadsQ;
-    int64_t const headsKV = pw::kHeadsKV;
-    int64_t const headsIndex = pw::kHeadsIndex;
+    int64_t const headsQ = pw::kHeadsQ<4>;
+    int64_t const headsKV = pw::kHeadsKV<4>;
+    int64_t const headsIndex = pw::kHeadsIndex<4>;
     int64_t const totalHeads = headsQ + 2 * headsKV + headsIndex + 1;
     TORCH_CHECK(packed.scalar_type() == at::kBFloat16 && packed.dim() == 2 && packed.size(1) == totalHeads * kHeadDim
             && packed.is_contiguous(),
@@ -156,7 +156,7 @@ std::vector<torch::Tensor> minimaxM3Sm107Tp4ProducerPw(torch::Tensor const& pack
     p.indexKWeight = reinterpret_cast<__nv_bfloat16 const*>(indexKWeight.data_ptr());
     p.rotaryCosSin = rotaryCosSin.data_ptr<float>();
     p.positionIds = positionIds.data_ptr<int>();
-    cudaError_t const err = pw::invokeProducerPw4(p, static_cast<int>(numTokens), pdl, early, prewaitStepInputs,
+    cudaError_t const err = pw::invokeProducerPw<4>(p, static_cast<int>(numTokens), pdl, early, prewaitStepInputs,
         at::cuda::getCurrentCUDAStream(packed.get_device()));
     if (err != cudaSuccess)
     {

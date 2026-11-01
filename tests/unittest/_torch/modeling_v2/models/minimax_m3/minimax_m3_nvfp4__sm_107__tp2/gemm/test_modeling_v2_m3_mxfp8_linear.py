@@ -8,11 +8,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_mxfp8_linear import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_linear import (  # noqa: E501
     m3_mxfp8_linear as op,
 )
 
-__extra_import_path__ = ["../../../..", "."]
+__extra_import_path__ = ["../../../..", ".", "../.."]
 from _m3_mxfp8_operands import mxfp8  # noqa: E402
 from _validating import assert_within_ulp, validating  # noqa: E402 — needs the path declared above
 
@@ -26,7 +26,7 @@ _FLAGS = {
 }
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[2], ids=[c.why[:48] for c in op.CELLS_BY_TP[2]])
 def test_certified_cells(cell) -> None:
     """The activation's MXFP8 round trip is exact on both sides (same block rule); then the accumulation order and
     one bf16 rounding: at most 2 units of ULP[bf16] of the row, RMS well under one."""

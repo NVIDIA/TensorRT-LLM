@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.activation.m3_silu_and_mul import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (  # noqa: E501
     m3_silu_and_mul as op,
 )
 
@@ -29,7 +29,7 @@ def _build(spec, seed):
     return (x, *OAI) if spec["oai"] else (x, None, None, None)
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[8], ids=[c.why[:48] for c in op.CELLS_BY_TP[8]])
 def test_certified_cells(cell) -> None:
     """fp32 arithmetic and one bf16 rounding on both sides: the kernel's fast sigmoid moves the fp32 value by a few
     fp32 ulps, which flips the bf16 rounding of an element by at most one step (1 unit of ULP[bf16] of the row);
@@ -43,7 +43,7 @@ def test_certified_cells(cell) -> None:
 
 def test_the_gate_sees_a_missing_clamp() -> None:
     """Dropping the SwiGLU-OAI clamps moves every element whose gate or up passed the limit far outside the band."""
-    spec = op.CELLS[0].spec
+    spec = op.CELLS_BY_TP[8][0].spec
     x, *oai = _build(dict(spec, m=64), 3)
     out = op(x, *oai)
     with pytest.raises(AssertionError):

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/foldTail.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/foldTail.h"
 #include "tensorrt_llm/thop/minimaxM3/minimaxM3Sm107Tp4FoldTailParams.h"
 
 #include <ATen/cuda/CUDAContext.h>
@@ -39,8 +39,8 @@ static void foldTailImpl(bool oneWarp, torch::Tensor const& ctrl, torch::Tensor 
         srcDraft, dstDraft, srcLens, dstLens, ids, draftIds, posOff, kvOff, tokensPerStep);
     auto const stream = at::cuda::getCurrentCUDAStream(ctrl.get_device());
     auto const err = oneWarp
-        ? tensorrt_llm::kernels::minimaxM3Sm107Tp4::invokeFoldTailOneWarp(p, stream)
-        : tensorrt_llm::kernels::minimaxM3Sm107Tp4::invokeFoldTail(p, static_cast<int32_t>(rows), stream);
+        ? tensorrt_llm::kernels::minimaxM3Sm107::invokeFoldTailOneWarp(p, stream)
+        : tensorrt_llm::kernels::minimaxM3Sm107::invokeFoldTail(p, static_cast<int32_t>(rows), stream);
     TORCH_CHECK(err == cudaSuccess, "minimax_m3_sm107_tp4_fold_tail launch failed: ", cudaGetErrorString(err));
 }
 

@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.spec.m3_step_gather import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_step_gather import (  # noqa: E501
     m3_step_gather as op,
 )
 
@@ -60,7 +60,7 @@ def _case(spec, seed):
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[4], ids=[c.why[:44] for c in op.CELLS_BY_TP[4]])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Index copies: exact, including the zero-filled offsets and the untouched rest of ids / draft."""
     args = _case(cell.spec, seed_of(cell.why))
@@ -78,7 +78,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_guard_refuses_a_slot_past_the_store() -> None:
-    args = list(_case(op.CELLS[0].spec, 1))
+    args = list(_case(op.CELLS_BY_TP[4][0].spec, 1))
     args[3] = args[3].clone()
     args[3][0] = 8
     with pytest.raises(AssertionError, match="slots must index the store"):

@@ -16,17 +16,16 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4 import (  # noqa: E501
     modeling as dispatch,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_dense_decode import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
     CAPPED,
     HEAD_DIM,
     HEADS,
     KV_HEADS,
     MODEL_MAX,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_dense_decode import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (  # noqa: E501
     m3_dense_decode as op,
 )
-from tensorrt_llm._torch.attention.backends.fmha.msa_decode import dense_decode_max_seq_len
 
 __extra_import_path__ = ["../../../.."]
 from _validating import assert_within_ulp, certifying, validating  # noqa: E402, F401
@@ -133,6 +132,10 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 def test_the_cap_is_the_dispatch_constant() -> None:
     """The entry's capped cells run at the split the target hands trtllm-gen at one request, and the in-tree step
     resolves the cap from the attention module only at the request counts it names."""
+    # Only targets with a certified cap need this optional backend helper.
+    # Keep its import behind the existing cap-availability skip.
+    from tensorrt_llm._torch.attention.backends.fmha.msa_decode import dense_decode_max_seq_len
+
     assert dict(dispatch.DENSE_DECODE_MAX_SEQ_LEN_BY_BATCH) == {1: CAPPED}
     attn = type(
         "Attn",

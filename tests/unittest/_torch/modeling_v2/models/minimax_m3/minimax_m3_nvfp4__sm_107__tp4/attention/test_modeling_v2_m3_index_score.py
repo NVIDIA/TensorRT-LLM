@@ -20,6 +20,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_index_score import (  # noqa: E501
     m3_index_score as op,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_index_score import (  # noqa: E501
+    IndexScoreRunner as TargetIndexScoreRunner,
+)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402, F401
@@ -68,8 +71,8 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     score = _score(stride, idx_q.shape[0])
     args = (idx_q, index_k, block_table, seq, score, qlen, SPLIT_K, spec["early"])
     certifying(op)
-    ref = op.reference(*args)
-    op(*args)
+    ref = op.reference(*args, runner=TargetIndexScoreRunner)
+    op(*args, runner=TargetIndexScoreRunner)
     stock = _score(stride, idx_q.shape[0])
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
         idx_q, index_k, block_table, seq, stock, qlen, SPLIT_K
@@ -105,8 +108,8 @@ def test_two_request_early_issue_is_the_in_tree_scorer(seq_lens, why) -> None:
     idx_q, index_k, block_table, seq, stride = _inputs(seq_lens, 4, zlib.crc32(why.encode()))
     score, stock = _score(stride, idx_q.shape[0]), _score(stride, idx_q.shape[0])
     args = (idx_q, index_k, block_table, seq, score, 4, SPLIT_K, True)
-    ref = op.reference(*args)
-    op(*args)
+    ref = op.reference(*args, runner=TargetIndexScoreRunner)
+    op(*args, runner=TargetIndexScoreRunner)
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
         idx_q, index_k, block_table, seq, stock, 4, SPLIT_K
     )
@@ -119,7 +122,7 @@ def test_two_request_early_issue_is_the_in_tree_scorer(seq_lens, why) -> None:
 def test_bf16_index_is_the_in_tree_scorer(early) -> None:
     idx_q, index_k, block_table, seq, stride = _inputs((5000,), 4, 11, dtype=torch.bfloat16)
     score, stock = _score(stride, 4), _score(stride, 4)
-    op(idx_q, index_k, block_table, seq, score, 4, SPLIT_K, early)
+    op(idx_q, index_k, block_table, seq, score, 4, SPLIT_K, early, runner=TargetIndexScoreRunner)
     torch.ops.trtllm.cute_dsl_minimax_m3_index_decode_score(
         idx_q, index_k, block_table, seq, stock, 4, SPLIT_K
     )
@@ -131,4 +134,14 @@ def test_guard_refuses_a_request_past_its_block_table() -> None:
     seq = seq + 4 * PAGE
     with pytest.raises(AssertionError, match="past its block-table row"):
         with validating(op):
-            op(idx_q, index_k, block_table, seq, _score(stride + 16, 1), 1, SPLIT_K, True)
+            op(
+                idx_q,
+                index_k,
+                block_table,
+                seq,
+                _score(stride + 16, 1),
+                1,
+                SPLIT_K,
+                True,
+                runner=TargetIndexScoreRunner,
+            )

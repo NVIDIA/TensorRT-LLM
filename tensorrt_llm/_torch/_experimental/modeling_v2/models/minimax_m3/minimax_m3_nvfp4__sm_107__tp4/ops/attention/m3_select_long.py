@@ -4,10 +4,19 @@
 
 from __future__ import annotations
 
+import sys
+from typing import cast
+
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.select_reference import (
+    SelectReferenceTarget,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.select_reference import (
+    select_reference as _shared_select_reference,
+)
 
 #: Blocks per decode row the op covers (9 keys per thread of one 1024-thread CTA).
 MAX_BLOCKS = 9216
@@ -127,32 +136,18 @@ class M3SelectLong(OpWrapper):
         (score descending, block ascending). ``out``, ``use_pdl``, ``early_trigger`` and
         ``trigger_phase`` and ``fast_tail`` only say where and how the op writes; they do not enter the result.
         """
-        num_kv_heads, num_blocks, total_q = scores.shape
-        device = scores.device
-        blocks = torch.arange(num_blocks, device=device, dtype=torch.int64)
-        raw = n_valid_blocks[:total_q].to(torch.int64)
-        valid = raw.clamp(0, num_blocks)
-        local_start = (raw - local_blocks).clamp_min(0)
-        result = torch.full((total_q, num_kv_heads, TOPK), -1, dtype=torch.int32, device=device)
-        for head in range(num_kv_heads):
-            forced = scores[head].float().t().clone()  # [total_q, num_blocks]
-            forced = torch.where(blocks[None, :] < init_blocks, INIT_SCORE, forced)
-            forced = torch.where(blocks[None, :] >= local_start[:, None], LOCAL_SCORE, forced)
-            bits = forced.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-            key = torch.where(bits >= 0x80000000, bits, (~bits) & 0x7FFFFFFF)
-            in_row = blocks[None, :] < valid[:, None]
-            packed = torch.where(
-                in_row, (key << 16) | blocks[None, :], torch.iinfo(torch.int64).max
-            )
-            k = min(TOPK, num_blocks)
-            picked = torch.topk(packed, k, dim=1, largest=False).values
-            picked_key = picked >> 16
-            keep = (picked != torch.iinfo(torch.int64).max) & (picked_key != 0xFF800000)
-            ids = torch.where(keep, picked & 0xFFFF, torch.iinfo(torch.int64).max)
-            ids = ids.sort(dim=1).values
-            ids = torch.where(ids == torch.iinfo(torch.int64).max, -1, ids)
-            result[:, head, :k] = ids.to(torch.int32)
-        return result
+        return _shared_select_reference(
+            self,
+            _SELECT_REFERENCE_TARGET,
+            scores,
+            n_valid_blocks,
+            out,
+            init_blocks,
+            local_blocks,
+            use_pdl,
+            early_trigger,
+            trigger_phase,
+        )
 
     def is_valid(
         self,
@@ -184,3 +179,5 @@ class M3SelectLong(OpWrapper):
 
 
 m3_select_long = M3SelectLong()
+
+_SELECT_REFERENCE_TARGET = cast(SelectReferenceTarget, sys.modules[__name__])

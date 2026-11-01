@@ -14,7 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 class M3StepPrologue(OpWrapper):
     """``StepInputPack``'s early-copy prologue as one single-CTA C++ launch
-    (trtllm::minimax_m3_sm107_tp2_step_prologue, minimaxM3Sm107Tp2/stepPrologue.cu).
+    (trtllm::minimax_m3_sm107_tp2_step_prologue, minimaxM3Sm107/stepPrologue.cu).
 
     ``window`` is the pack's device window (``gdev``): an int64 header ``[host copies, device copies]``, then one
     ``(dst, src, bytes)`` descriptor per copy, host copies first (a host copy's ``src`` is a byte offset into the

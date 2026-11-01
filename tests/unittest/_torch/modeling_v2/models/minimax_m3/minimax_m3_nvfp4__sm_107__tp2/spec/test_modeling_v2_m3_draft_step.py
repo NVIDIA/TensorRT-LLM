@@ -21,10 +21,6 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops import (  # noqa: E501
     m3_draft_step as draft_step_kernels,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_target_head import (  # noqa: E501
-    encode_chunked,
-    round_trip_ok,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.spec.m3_draft_step import (  # noqa: E501
     DRAFT_LEN,
     DRAFT_SHARD,
@@ -42,6 +38,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     exchange_tokens,
     local_argmax,
     make_keys,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (  # noqa: E501
+    encode_chunked,
+    round_trip_ok,
 )
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelWorker
 

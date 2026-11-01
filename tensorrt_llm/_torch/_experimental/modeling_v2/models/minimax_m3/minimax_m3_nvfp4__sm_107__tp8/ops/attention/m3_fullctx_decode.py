@@ -8,12 +8,15 @@ from __future__ import annotations
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_dense_decode import (
+    dense_attention_reference,
+    gather_paged_kv,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
     fp8_e4m3_saturate,
 )
 
 from .. import m3_fullctx_decode as kernel
-from .m3_dense_decode import dense_attention_reference, gather_paged_kv
 
 __all__ = ["m3_fullctx_decode"]
 

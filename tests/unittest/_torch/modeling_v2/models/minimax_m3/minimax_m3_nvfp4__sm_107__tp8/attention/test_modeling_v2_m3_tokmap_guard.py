@@ -36,8 +36,17 @@ _TAKEN = []
 
 @pytest.fixture(scope="module", autouse=True)
 def _installed():
-    guard.install(_DEV, 48, _TAKEN.append)
-    yield
+    # Preserve both the process-wide callable and this target's installation state.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            thop, "trtllm_gen_generation_preprocess", thop.trtllm_gen_generation_preprocess
+        )
+        for name in ("_original", "_max_rows", "_on_taken", "_on_missed"):
+            patch.setattr(guard, name, getattr(guard, name))
+        patch.setattr(guard, "_maps", dict(guard._maps))
+        patch.setattr(guard, "_offsets", dict(guard._offsets))
+        guard.install(_DEV, 48, _TAKEN.append)
+        yield
 
 
 class _Step:

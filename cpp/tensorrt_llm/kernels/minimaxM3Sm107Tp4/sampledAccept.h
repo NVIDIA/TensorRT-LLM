@@ -18,6 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/sampledAccept.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -40,39 +41,7 @@ constexpr int kMaxWorld = 8;  // TP ranks
 constexpr int kMaxVs = 51200; // vocab shard width (TP4: 200064 / 4 = 50016)
 constexpr int kIdBits = 18;   // token ids < 2^18
 
-struct Args
-{
-    __nv_bfloat16 const* logits; // [rows, Vs] this rank's shard
-    long long ld;
-    int rows, Vs, vocab_offset;
-    float const* temperatures;
-    float const* top_ps;
-    long long const* seeds;
-    long long const* offsets;
-    unsigned long long* ws_uc;
-    unsigned long long* ws_mc;
-    unsigned int* counters; // [0] finished rows, [1] call
-    int* tokens;            // [rows] sampled token per row
-    int* extra_attempts;    // optional [1]: rounds beyond the second, summed over rows
-    int rank, world;
-    int const* draft;
-    int const* batch_idx;
-    int* acc_tokens;
-    int* num_acc;
-    long long* gather_ids;
-    int draft_len, nreq, force_total;
-    int* next_new;
-    int next_stride;
-    int const* force_vec;
-    int prewait_params; // nonzero: the row's sampling parameters load before the PDL dependency wait
-    int early_trigger;  // nonzero: dependents are released right after the dependency wait, not at the epilogue
-    // SA-1R (one-round decision): 0 the two-round kernel; 9 each CTA's top-9 logits ride its round-0 record; 82 pooled
-    // (each thread's top 2, the CTA lists the pool's top 8 plus the bound of everything unlisted). A row whose first
-    // candidate is provably in the nucleus then decides in round 0, with the same token as the two-round kernel.
-    int one_round_k;
-    int* decided; // optional [1]: rows decided in round 0 (SA-1R), summed
-    int ilp_walk; // nonzero: the owner walk takes its tokens 8 at a time (same weights, same summation order)
-};
+using Args = minimaxM3Sm107::sampledAccept::Args;
 
 //! Words (uint64) of the multicast exchange workspace for `world` ranks and SA-1R variant `oneRoundK`: two call halves.
 long long sampledAcceptWsWords(int world, int oneRoundK = 0);

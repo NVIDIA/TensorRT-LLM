@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/foldTail.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/foldTail.h"
 
 #include <limits>
 #include <torch/extension.h>
@@ -45,7 +45,7 @@ inline void check1d(torch::Tensor const& t, char const* name)
 
 //! The fold tail's operands checked and packed (the standalone fold tail op and any op that runs the tail in-kernel,
 //! e.g. the drafter's last-pass draft_step, build them identically).
-inline tensorrt_llm::kernels::minimaxM3Sm107Tp4::FoldTailParams buildParams(torch::Tensor const& ctrl,
+inline tensorrt_llm::kernels::minimaxM3Sm107::FoldTailParams buildParams(torch::Tensor const& ctrl,
     torch::Tensor const& slots, int64_t rows, torch::Tensor const& srcNew, torch::Tensor& dstNew,
     torch::Tensor const& srcNext, torch::Tensor& dstNext, torch::Tensor const& srcDraft, torch::Tensor& dstDraft,
     torch::Tensor const& srcLens, torch::Tensor& dstLens, torch::Tensor& ids, torch::Tensor& draftIds,
@@ -78,7 +78,7 @@ inline tensorrt_llm::kernels::minimaxM3Sm107Tp4::FoldTailParams buildParams(torc
     TORCH_CHECK(ids.numel() >= rows * tokensPerStep && posOff.numel() >= rows * tokensPerStep
             && draftIds.numel() >= rows * (tokensPerStep - 1),
         "minimax_m3_sm107_tp4_fold_tail: staging outputs are too small for rows * tokens_per_step");
-    tensorrt_llm::kernels::minimaxM3Sm107Tp4::FoldTailParams p{};
+    tensorrt_llm::kernels::minimaxM3Sm107::FoldTailParams p{};
     p.maxRows = static_cast<int32_t>(rows);
     p.ctrl = ctrl.data_ptr<int32_t>();
     p.slots = slots.data_ptr<int64_t>();

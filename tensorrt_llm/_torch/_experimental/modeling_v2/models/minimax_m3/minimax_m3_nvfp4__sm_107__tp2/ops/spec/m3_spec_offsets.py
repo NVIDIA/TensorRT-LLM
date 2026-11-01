@@ -16,7 +16,7 @@ _ENGAGED: list = []
 
 class M3SpecOffsets(OpWrapper):
     """``positions += position_offsets`` and ``kv_lens += kv_lens_offsets`` (int32, contiguous 1-D views, equal lengths
-    per pair) in one plain launch: trtllm::minimax_m3_sm107_tp2_spec_offsets (minimaxM3Sm107Tp2/specOffsets.cu), the
+    per pair) in one plain launch: trtllm::minimax_m3_sm107_tp2_spec_offsets (minimaxM3Sm107/specOffsets.cu), the
     same wrapping int32 adds the two ATen ops do. ``__call__`` returns False, having written nothing, for other
     layouts (the caller runs the ATen adds)."""
 

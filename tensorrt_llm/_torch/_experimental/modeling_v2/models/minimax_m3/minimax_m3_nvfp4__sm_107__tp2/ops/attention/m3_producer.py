@@ -2,14 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """The sparse layers' NVFP4 QKV + indexer RMSNorm / RoPE / KV-insert producer at the TP2 heads, with its constant loads
 staged before the PDL grid-dependency wait and an early dependents trigger
-(``kernels/minimaxM3Sm107Tp2/producerPw2.cu``)."""
+(``kernels/minimaxM3Sm107/producerPw.cu``)."""
 
 from __future__ import annotations
+
+import sys
+from typing import cast
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention import (
+    producer_reference as _producer_shared,
+)
 
 __all__ = ["m3_producer"]
 
@@ -32,29 +38,20 @@ def _norm_rope(
 ):
     """Gemma RMSNorm (``x * rsqrt(mean(x^2) + eps) * (1 + w)``) then NeoX RoPE on the first 64 dims, in fp32.
     x [T, 128] fp32; cos / sin [T, 32]."""
-    y = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + weight.float())
-    lo, hi, rest = y[:, :32], y[:, 32:64], y[:, 64:]
-    return torch.cat([lo * cos - hi * sin, hi * cos + lo * sin, rest], dim=-1)
+    return _producer_shared._norm_rope(_REFERENCE_TARGET, x, weight, cos, sin, eps)
 
 
 def decode_nvfp4_token(
     data: torch.Tensor, scales: torch.Tensor, quant_scale: float
 ) -> torch.Tensor:
     """fp32 [128] of one token's packed E2M1 row (64 bytes, low nibble first) and its 8 E4M3 block scales."""
-    table = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=data.device)
-    nib = torch.stack([data & 0xF, data >> 4], dim=-1).reshape(-1).long()
-    vals = table[nib & 7] * torch.where(nib >= 8, -1.0, 1.0)
-    s = scales.view(torch.float8_e4m3fn).float() / quant_scale
-    return vals * s.repeat_interleave(FP4_BLOCK)
+    return _producer_shared.decode_nvfp4_token(_REFERENCE_TARGET, data, scales, quant_scale)
 
 
 def scale_index(within_page: int, plane: int) -> torch.Tensor:
     """Positions of a token's 8 block scales in its page's [128 * 8] scale plane: row-major for K, the 4-token
     swizzle for V."""
-    cols = torch.arange(8)
-    if plane == 0:
-        return within_page * 8 + cols
-    return (within_page // 4) * 32 + cols * 4 + within_page % 4
+    return _producer_shared.scale_index(_REFERENCE_TARGET, within_page, plane)
 
 
 class M3Producer(OpWrapper):
@@ -158,27 +155,27 @@ class M3Producer(OpWrapper):
         """fp32 values before their quantization: "q" [T, 32, 128], "index_q" [T, 2, 128], per token and KV head "k"
         and "v" [T, 2, 128], and "index_k" [T, 128] (the values written to the token's slot). The caches, ``pdl``,
         ``early`` and ``prewait_step_inputs`` do not change them."""
-        t = packed.shape[0]
-        x = packed.float().view(t, HEADS_PACKED, HEAD_DIM)
-        rope = rotary_cos_sin[position_ids[:t].long()]
-        cos, sin = rope[:, 0], rope[:, 1]
-
-        def heads(first, count, weight):
-            return torch.stack(
-                [_norm_rope(x[:, h], weight, cos, sin, eps) for h in range(first, first + count)],
-                dim=1,
-            )
-
-        k0 = HEADS_Q
-        v0 = k0 + HEADS_KV
-        iq0 = v0 + HEADS_KV
-        return {
-            "q": heads(0, HEADS_Q, q_weight),
-            "k": heads(k0, HEADS_KV, k_weight),
-            "v": x[:, v0 : v0 + HEADS_KV],
-            "index_q": heads(iq0, HEADS_INDEX, index_q_weight),
-            "index_k": _norm_rope(x[:, iq0 + HEADS_INDEX], index_k_weight, cos, sin, eps),
-        }
+        return _producer_shared.producer_reference_multi_kv(
+            self,
+            _REFERENCE_TARGET,
+            packed,
+            kv_data,
+            kv_scale,
+            index_k,
+            out_cache_loc,
+            kv_quant_scale,
+            eps,
+            q_weight,
+            k_weight,
+            index_q_weight,
+            index_k_weight,
+            rotary_cos_sin,
+            position_ids,
+            heads_q,
+            pdl,
+            early,
+            prewait_step_inputs,
+        )
 
     def is_valid(
         self,
@@ -201,16 +198,29 @@ class M3Producer(OpWrapper):
         prewait_step_inputs: bool = False,
     ) -> None:
         assert heads_q == HEADS_Q, f"the producer is built for {HEADS_Q} query heads, not {heads_q}"
-        t = packed.shape[0]
-        # The RoPE row is read at the position with no bound.
-        pos = position_ids[:t]
-        assert bool(((pos >= 0) & (pos < rotary_cos_sin.shape[0])).all()), (
-            "position_ids must index rotary_cos_sin"
+        return _producer_shared.validate_producer(
+            self,
+            _REFERENCE_TARGET,
+            packed,
+            kv_data,
+            kv_scale,
+            index_k,
+            out_cache_loc,
+            kv_quant_scale,
+            eps,
+            q_weight,
+            k_weight,
+            index_q_weight,
+            index_k_weight,
+            rotary_cos_sin,
+            position_ids,
+            heads_q,
+            pdl,
+            early,
+            prewait_step_inputs,
         )
-        # Two tokens writing one slot race.
-        slots = out_cache_loc[:t]
-        live = slots[(slots >= 0) & (slots < kv_data.shape[0] * PAGE)]
-        assert live.unique().numel() == live.numel(), "out_cache_loc must not repeat a slot"
 
 
 m3_producer = M3Producer()
+
+_REFERENCE_TARGET = cast(_producer_shared.ProducerTarget, sys.modules[__name__])

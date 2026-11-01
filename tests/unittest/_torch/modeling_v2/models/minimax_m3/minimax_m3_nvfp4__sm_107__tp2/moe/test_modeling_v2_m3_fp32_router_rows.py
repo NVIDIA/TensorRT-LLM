@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_fp32_linear import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_fp32_linear import (  # noqa: E501
     m3_fp32_linear,
 )
 from tensorrt_llm._utils import get_sm_version

@@ -27,9 +27,12 @@ from typing import Optional
 
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    encode_chunked,
+    round_trip_ok,
+)
 from tensorrt_llm.logger import logger
 
-from ..ops.gemm.m3_target_head import encode_chunked, round_trip_ok
 from ..ops.spec.m3_draft_step import MAX_TILES_PER_CTA, MAX_TOKENS, bf16_fragments
 from ..ops.spec.m3_draft_step import m3_draft_step as _draft_step_op
 from . import m3_report

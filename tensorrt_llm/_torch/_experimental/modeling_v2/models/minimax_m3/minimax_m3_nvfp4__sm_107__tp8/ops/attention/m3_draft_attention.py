@@ -4,17 +4,24 @@
 
 from __future__ import annotations
 
-import torch
+import torch as torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    PredefinedAttentionMask,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.draft_attention import (
+    GroupedDraftAttentionBase,
 )
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs as AttentionForwardArgs,
+)
+from tensorrt_llm._torch.attention.backends.interface import (
+    PredefinedAttentionMask as PredefinedAttentionMask,
+)
+from tensorrt_llm.functional import PositionEmbeddingType as PositionEmbeddingType
+from tensorrt_llm.functional import RotaryScalingType as RotaryScalingType
 
 
-class M3DraftAttention(OpWrapper):
+class M3DraftAttention(GroupedDraftAttentionBase):
     """The drafter layer's attention over its fused QKV rows ``qkv`` [T, (q + 2 kv) heads x 128] (bf16): the
     backend applies the drafter's RoPE (fused), appends K / V to the drafter layer's paged cache (FP8, the target's
     NVFP4 cache keeps its draft layer in FP8) and runs causal attention over the step's live rows (``metadata``
@@ -37,95 +44,6 @@ class M3DraftAttention(OpWrapper):
     ``kv_scale_quant_orig``). What remains between the two is the FMHA's own arithmetic (Q's rounding to the
     kernel's input precision, its P rounding and accumulation order), which the test bounds.
     """
-
-    def __call__(self, backend, qkv: torch.Tensor, metadata) -> torch.Tensor:
-        num_tokens = metadata.num_tokens
-        out = backend.forward(
-            qkv[:num_tokens, :],
-            None,
-            None,
-            metadata,
-            forward_args=AttentionForwardArgs(attention_mask=PredefinedAttentionMask.CAUSAL),
-        )
-        return out[0] if isinstance(out, tuple) else out
-
-    def reference(self, backend, qkv: torch.Tensor, metadata) -> torch.Tensor:
-        """The call's [num_tokens, q heads x 128] output, in ``qkv``'s dtype.
-
-        Query token ``j`` of request ``r`` sits at position ``cached_r + j`` (the metadata's cached lengths) and
-        attends positions up to it. Its Q is rotated here; every K / V row, the step's own included, is read from
-        the drafter layer's paged cache at the slots the metadata's KV cache manager holds, so this is evaluated
-        after the call (whose roped, quantized append it then reads back; the test checks that append itself).
-        Mirrors grouped KV heads (query head h reads KV head h // (heads / kv heads); two per rank at tp2) and
-        un-scaled NeoX RoPE, the drafter's configuration.
-        """
-        manager = metadata.kv_cache_manager
-        layer = backend.layer_idx
-        heads, dim = backend.num_heads, backend.head_dim
-        kv_heads = int(backend.num_kv_heads)
-        assert heads % kv_heads == 0
-        group = heads // kv_heads
-        rope = backend.rope_params
-        assert backend.position_embedding_type == int(PositionEmbeddingType.rope_gpt_neox)
-        assert rope.scale_type == RotaryScalingType.none and rope.alpha == 1.0
-        page = int(manager.tokens_per_block)
-        sm_scale = dim**-0.5 / float(backend.q_scaling)
-        kv_scale = float(backend.kv_scale_quant_orig.reshape(-1)[0])
-        num_seqs = int(metadata.num_seqs)
-        qlens = [int(n) for n in metadata.seq_lens[:num_seqs].tolist()]
-        cached = [int(c) for c in metadata.kv_cache_params.num_cached_tokens_per_seq[:num_seqs]]
-        total = int(metadata.num_tokens)
-        assert sum(qlens) == total
-        device = qkv.device
-
-        rot = int(rope.dim)
-        inv_freq = float(rope.theta) ** (
-            -torch.arange(0, rot, 2, dtype=torch.float64, device=device) / rot
-        )
-        pool = manager.get_buffers(layer, "HND")
-        q = qkv[:total, : heads * dim].to(torch.float64).reshape(total, heads, dim)
-        out = torch.zeros(total, heads, dim, dtype=torch.float64, device=device)
-        first = 0
-        for row, request_id in enumerate(list(metadata.request_ids)[:num_seqs]):
-            n, length = qlens[row], cached[row] + qlens[row]
-            pages = torch.tensor(
-                manager.get_batch_cache_indices([request_id], layer_idx=layer)[0][
-                    : (length + page - 1) // page
-                ],
-                dtype=torch.int64,
-                device=device,
-            )
-            # [kv heads, tokens, dim]: each KV head's rows in token order across the pages.
-            keys = (
-                pool[pages, 0]
-                .to(torch.float64)
-                .transpose(0, 1)
-                .reshape(kv_heads, -1, dim)[:, :length]
-                * kv_scale
-            )
-            values = (
-                pool[pages, 1]
-                .to(torch.float64)
-                .transpose(0, 1)
-                .reshape(kv_heads, -1, dim)[:, :length]
-                * kv_scale
-            )
-            keys = keys.repeat_interleave(group, dim=0)  # [heads, tokens, dim]
-            values = values.repeat_interleave(group, dim=0)
-            qpos = cached[row] + torch.arange(n, device=device)
-            angles = qpos.to(torch.float64)[:, None] * inv_freq[None, :]
-            cos, sin = angles.cos()[:, None, :], angles.sin()[:, None, :]
-            rows = q[first : first + n]
-            x1, x2 = rows[..., : rot // 2], rows[..., rot // 2 : rot]
-            rows = torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin, rows[..., rot:]], dim=-1)
-            allowed = torch.arange(length, device=device)[None, :] <= qpos[:, None]
-            logits = torch.einsum("thd,hkd->thk", rows, keys) * sm_scale
-            logits = logits.masked_fill(~allowed[:, None, :], float("-inf"))
-            out[first : first + n] = torch.einsum(
-                "thk,hkd->thd", torch.softmax(logits, dim=-1), values
-            )
-            first += n
-        return out.reshape(total, heads * dim).to(qkv.dtype)
 
 
 m3_draft_attention = M3DraftAttention()

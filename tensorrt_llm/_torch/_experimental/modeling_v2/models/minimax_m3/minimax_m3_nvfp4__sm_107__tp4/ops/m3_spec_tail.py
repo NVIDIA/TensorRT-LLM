@@ -15,11 +15,21 @@ import torch
 
 # The kernels are compiled into TensorRT-LLM (cpp/tensorrt_llm/kernels/minimaxM3/specTail.cu) and reached through the
 # ops/spec entries.
-from ..ops.spec.m3_capture_norm import m3_capture_norm as _capture_norm_op
-from ..ops.spec.m3_chunk_norm import m3_chunk_norm as _chunk_norm_op
-from ..ops.spec.m3_draft_input import m3_draft_input as _draft_input_op
-from ..ops.spec.m3_slot_scatter import m3_slot_scatter as _slot_scatter_op
-from ..ops.spec.m3_step_gather import m3_step_gather as _step_gather_op
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (
+    m3_capture_norm as _capture_norm_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_chunk_norm import (
+    m3_chunk_norm as _chunk_norm_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_draft_input import (
+    m3_draft_input as _draft_input_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_slot_scatter import (
+    m3_slot_scatter as _slot_scatter_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_step_gather import (
+    m3_step_gather as _step_gather_op,
+)
 
 
 def draft_input(

@@ -18,7 +18,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/foldTail.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/foldTail.h"
 
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -90,7 +90,7 @@ struct Params
     CodedArgs cd;
     // The step's forward-tail store + next-step staging (foldTail.h), run by the last CTA after this pass's
     // tokens and bookkeeping: set on the drafter's last pass only (dispatch.DRAFT_STEP_FOLD_TAIL).
-    FoldTailParams fold{};
+    minimaxM3Sm107::FoldTailParams fold{};
     bool hasFold = false;
     // D-FIX: sum the pieces of a tile that several warps stream in warp order (deterministic) instead of by
     // shared-memory atomics in arrival order (dispatch.DRAFT_STEP_FIXED_ORDER).

@@ -12,13 +12,30 @@ arithmetic in another summation order. The kernel is compiled into TensorRT-LLM
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, cast
 
 import torch
 
-from ..ops.gemm.m3_target_head import CTA_WARPS, MAX_ROWS, encode_chunked, round_trip_ok
-from ..ops.gemm.m3_target_head import m3_target_head as _target_head_op
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm import (
+    target_head_state as _head_shared,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    CTA_WARPS as CTA_WARPS,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    MAX_ROWS as MAX_ROWS,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    encode_chunked as encode_chunked,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    m3_target_head as _target_head_op,  # noqa: F401 — used by the bound family implementation
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    round_trip_ok as round_trip_ok,
+)
 
 
 @dataclass(eq=False)
@@ -43,71 +60,24 @@ _NUM_SMS: Optional[int] = None
 
 
 def _num_sms() -> int:
-    global _NUM_SMS
-    if _NUM_SMS is None:
-        _NUM_SMS = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-    return _NUM_SMS
+    return _head_shared._num_sms(_HEAD_TARGET)
 
 
 def head_supported(lm_head) -> bool:
     """A bias-free 2-D BF16 head of whole 16-row tiles whose K the coding covers (a multiple of 64)."""
-    weight = getattr(lm_head, "weight", None)
-    if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
-        return False
-    return (
-        getattr(lm_head, "bias", None) is None
-        and weight.shape[0] % 16 == 0
-        and weight.shape[1] % 64 == 0
-    )
+    return _head_shared.head_supported(_HEAD_TARGET, lm_head)
 
 
 def prepare_head(lm_head, grid: Optional[int] = None) -> TargetHead:
     """Code ``lm_head``'s local shard and check it decodes to the BF16 weight bit for bit (fails closed: a shard that
     does not is returned with ``coded=False`` and nothing kept). Built once, eagerly, before the executor's warmup
     (``M3Eagle3Worker.prebuild_target_head``)."""
-    weight = lm_head.weight
-    with torch.no_grad():
-        w = weight.detach()
-        packed, base, exc_off, exc_pos, exc_w = encode_chunked(w)
-        if not round_trip_ok(packed, base, exc_off, exc_pos, exc_w, w):
-            return TargetHead(weight=weight, coded=False)
-    if grid is None:
-        grid = _num_sms()
-    n = weight.shape[0]
-    return TargetHead(
-        weight=weight,
-        coded=True,
-        w=packed,
-        base=base,
-        exc_off=exc_off,
-        exc_pos=exc_pos,
-        exc_w=exc_w.view(-1),
-        part=torch.zeros(grid * CTA_WARPS * 2 * 4 * 32, dtype=torch.float32, device=weight.device),
-        counter=torch.zeros((n + 15) // 16, dtype=torch.int32, device=weight.device),
-        grid=grid,
-    )
+    return _head_shared.prepare_head(_HEAD_TARGET, lm_head, grid)
 
 
 def logits(head: TargetHead, x: torch.Tensor, use_pdl: bool = True) -> torch.Tensor:
     """This rank's BF16 logits shard [rows, n] of the rows x [rows <= MAX_ROWS, K] (BF16) from the coded shard."""
-    assert head.coded and 1 <= x.shape[0] <= MAX_ROWS, (head.coded, x.shape)
-    if x.stride(1) != 1 or x.stride(0) % 8 or x.data_ptr() % 16:
-        x = x.contiguous()
-    n = head.weight.shape[0]
-    out = torch.empty((x.shape[0], n), dtype=torch.bfloat16, device=x.device)
-    return _target_head_op(
-        head.w,
-        x,
-        out,
-        head.part,
-        head.counter,
-        head.exc_off,
-        head.exc_pos,
-        head.exc_w,
-        head.base,
-        n,
-        head.grid,
-        use_pdl,
-    )
+    return _head_shared.logits(_HEAD_TARGET, head, x, use_pdl)
+
+
+_HEAD_TARGET = cast(_head_shared.HeadTarget, sys.modules[__name__])

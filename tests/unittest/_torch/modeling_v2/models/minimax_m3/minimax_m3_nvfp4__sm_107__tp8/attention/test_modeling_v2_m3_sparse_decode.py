@@ -14,6 +14,9 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401  (registers torch.ops.trtllm)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.attention.triton_sparse_decode_mq import (  # noqa: E501
+    launch_mq_producer,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8 import (
     modeling,  # noqa: E501
 )
@@ -25,9 +28,6 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.attention.m3_sparse_decode import (  # noqa: E501
     m3_sparse_decode as op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.triton_sparse_decode_mq import (  # noqa: E501
-    launch_mq_producer,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.triton_sparse_decode import (
     minimax_m3_sparse_attn_decode as stock_decode,

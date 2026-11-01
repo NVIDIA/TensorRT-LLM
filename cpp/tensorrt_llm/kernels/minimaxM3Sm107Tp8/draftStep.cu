@@ -629,7 +629,7 @@ __global__ void __launch_bounds__(kWarps * 32, 1)
         __syncthreads();
         if (threadIdx.x < 32)
         {
-            foldTailWarp(p.fold, static_cast<int>(threadIdx.x));
+            minimaxM3Sm107::foldTailWarp(p.fold, static_cast<int>(threadIdx.x));
         }
     }
 #endif

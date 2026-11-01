@@ -6,19 +6,23 @@ bookkeeping in one kernel (``m3_draft_step.draft_step``)."""
 
 from __future__ import annotations
 
-from typing import Optional
+import sys
+from typing import Optional, cast
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
+    true_fp32_matmul as true_fp32_matmul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_target_head import (
+    decode as decode_coded,  # noqa: F401 — used by the bound family implementation
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec import (
+    draft_head_reference as _draft_head_shared,
 )
 
-from ..gemm.m3_target_head import decode as decode_coded
 from .m3_shard_accept import exchange_tokens, local_argmax, make_keys
 
 #: Requests (head rows) per pass, and exchange rows per call half of the workspace.
@@ -37,18 +41,12 @@ def bf16_fragments(weight: torch.Tensor) -> torch.Tensor:
     One lane's 16 bytes of a 16-row tile's k16 step are the m16n8k16 A fragment: element (row h * 8 + g, k ks * 16 +
     hk * 8 + jj * 2 + e) goes to [tile][ks][g][jj][hk][h][e] (lane = g * 4 + jj).
     """
-    n, k = weight.shape
-    assert n % 16 == 0 and k % 16 == 0 and weight.dtype == torch.bfloat16, (n, k, weight.dtype)
-    q = weight.view(n // 16, 2, 8, k // 16, 2, 4, 2).permute(0, 3, 2, 5, 4, 1, 6).contiguous()
-    return q.view(n // 16, k // 16, 256)
+    return _draft_head_shared.bf16_fragments(_DRAFT_HEAD_TARGET, weight)
 
 
 def from_fragments(wf: torch.Tensor) -> torch.Tensor:
     """The inverse of ``bf16_fragments``: [N / 16, K / 16, 256] -> [N, K]."""
-    tiles, ks, _ = wf.shape
-    return (
-        wf.view(tiles, ks, 8, 4, 2, 2, 2).permute(0, 5, 2, 1, 4, 3, 6).reshape(tiles * 16, ks * 16)
-    )
+    return _draft_head_shared.from_fragments(_DRAFT_HEAD_TARGET, wf)
 
 
 def head_weight(
@@ -61,10 +59,9 @@ def head_weight(
 ) -> torch.Tensor:
     """The BF16 head shard [N, K] the kernel multiplies by: the fragment-ordered copy, or (``exc_off`` given) the
     12-bit coded stream with its exception lists decoded."""
-    if exc_off is None:
-        return from_fragments(wf)
-    n = (exc_off.numel() - 1) * 16
-    return decode_coded(wf, exp_base, exc_off, exc_pos, exc_w, n, k)
+    return _draft_head_shared.head_weight(
+        _DRAFT_HEAD_TARGET, wf, k, exc_off, exc_pos, exc_w, exp_base
+    )
 
 
 def shard_logits(
@@ -77,10 +74,9 @@ def shard_logits(
 ) -> torch.Tensor:
     """The in-tree head's BF16 logits of the rows x [M, K] against the shard (``head_weight``): the fp32 product,
     rounded once to BF16 (the BF16 GEMM's output), as fp32."""
-    w = head_weight(wf, x.shape[1], exc_off, exc_pos, exc_w, exp_base)
-    with true_fp32_matmul():
-        logits = x.float() @ w.float().t()
-    return logits.to(torch.bfloat16).float()
+    return _draft_head_shared.shard_logits(
+        _DRAFT_HEAD_TARGET, x, wf, exc_off, exc_pos, exc_w, exp_base
+    )
 
 
 class M3DraftStep(OpWrapper):
@@ -430,3 +426,5 @@ class M3DraftStep(OpWrapper):
 
 
 m3_draft_step = M3DraftStep()
+
+_DRAFT_HEAD_TARGET = cast(_draft_head_shared.DraftHeadTarget, sys.modules[__name__])

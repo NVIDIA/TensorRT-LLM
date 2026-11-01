@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/kernels/minimaxM3Sm107/foldTail.h"
 #include "tensorrt_llm/kernels/minimaxM3Sm107Tp2/foldTail.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -37,39 +38,7 @@ __global__ void __launch_bounds__(32) foldTailKernel(FoldTailParams const p)
     {
         return;
     }
-    int64_t const s = p.slots[i];
-    int32_t const nw = c < p.snW ? p.srcNew[i * p.sn0 + c * p.sn1] : 0;
-    if (c < p.dnW)
-    {
-        p.dstNew[s * p.dn0 + c * p.dn1] = nw;
-    }
-    int32_t const nxt = c < p.sxW ? p.srcNext[i * p.sx0 + c * p.sx1] : 0;
-    if (c < p.dxW)
-    {
-        p.dstNext[s * p.dx0 + c * p.dx1] = nxt;
-    }
-    int32_t const drf = c < p.sdW ? p.srcDraft[i * p.sd0 + c * p.sd1] : 0;
-    if (c < p.ddW)
-    {
-        p.dstDraft[s * p.dd0 + c * p.dd1] = drf;
-    }
-    int32_t const ln = p.srcLens[i];
-    int32_t const t = p.tokensPerStep;
-    int32_t const d = t - 1;
-    if (c == 0)
-    {
-        p.dstLens[s] = ln;
-        p.kvOff[i] = ln - t;
-    }
-    if (c < t)
-    {
-        p.ids[i * t + c] = c < p.dxW ? nxt : 0;
-        p.posOff[i * t + c] = ln;
-    }
-    if (c < d)
-    {
-        p.draftIds[i * d + c] = c < p.ddW ? drf : 0;
-    }
+    minimaxM3Sm107::foldTailRow(p, i, c);
 }
 
 } // namespace

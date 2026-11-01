@@ -95,9 +95,13 @@ class M3DraftLowM(OpWrapper):
 
             run_direct_dense(x, weight.t(), out, use_pdl, DirectTactic(*tactic))
         elif own_splitk:
-            # This target's copy of the split-K kernel (ops/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
+            # The shared split-K kernel (kernels/gemm/m3_lowm_splitk): bit for bit FlashInfer's; with ``ar``
             # it also pushes the rows into a drafter boundary all-reduce (modeling.DRAFT_AR_PUSH).
-            from ..m3_lowm_splitk import SplitKTactic, run_splitk_dense, run_splitk_dense_push
+            from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm.m3_lowm_splitk import (
+                SplitKTactic,
+                run_splitk_dense,
+                run_splitk_dense_push,
+            )
 
             if ar is not None:
                 run_splitk_dense_push(x, weight.t(), out, use_pdl, SplitKTactic(*tactic), ar)

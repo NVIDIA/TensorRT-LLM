@@ -40,6 +40,7 @@ import torch
 
 from .op import (
     HIDDEN,
+    INTER,
     SHARED_CTAS,
     SHARED_INTER,
     U1,
@@ -222,6 +223,7 @@ class M3Moe16State:
             e_score_correction_bias,
             router_weight,
             fc31_input_scale,
+            inter=INTER,
         )
         layer.shared_weights = _shared_views(shared_weights, "m3_moe16")
         layer.shared_mxfp8 = tuple(shared_weights)

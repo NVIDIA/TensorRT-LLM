@@ -4,17 +4,24 @@
 
 from __future__ import annotations
 
-import torch
+import torch as torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    PredefinedAttentionMask,
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.draft_attention import (
+    DraftAttentionBase,
 )
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs as AttentionForwardArgs,
+)
+from tensorrt_llm._torch.attention.backends.interface import (
+    PredefinedAttentionMask as PredefinedAttentionMask,
+)
+from tensorrt_llm.functional import PositionEmbeddingType as PositionEmbeddingType
+from tensorrt_llm.functional import RotaryScalingType as RotaryScalingType
 
 
-class M3DraftAttention(OpWrapper):
+class M3DraftAttention(DraftAttentionBase):
     """The drafter layer's attention over its fused QKV rows ``qkv`` [T, (q + 2 kv) heads x 128] (bf16): the
     backend applies the drafter's RoPE (fused), appends K / V to the drafter layer's paged cache (FP8, the target's
     NVFP4 cache keeps its draft layer in FP8) and runs causal attention over the step's live rows (``metadata``
@@ -37,17 +44,6 @@ class M3DraftAttention(OpWrapper):
     ``kv_scale_quant_orig``). What remains between the two is the FMHA's own arithmetic (Q's rounding to the
     kernel's input precision, its P rounding and accumulation order), which the test bounds.
     """
-
-    def __call__(self, backend, qkv: torch.Tensor, metadata) -> torch.Tensor:
-        num_tokens = metadata.num_tokens
-        out = backend.forward(
-            qkv[:num_tokens, :],
-            None,
-            None,
-            metadata,
-            forward_args=AttentionForwardArgs(attention_mask=PredefinedAttentionMask.CAUSAL),
-        )
-        return out[0] if isinstance(out, tuple) else out
 
     def reference(self, backend, qkv: torch.Tensor, metadata) -> torch.Tensor:
         """The call's [num_tokens, q heads x 128] output, in ``qkv``'s dtype.

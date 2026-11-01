@@ -2934,11 +2934,12 @@ class DecoderInputPreparer:
         # RuntimeHooks.kv_lens_update_once, a step that corrects the KV lengths below (and then calls it again) calls
         # it only there: the second call rewrites everything the first one writes, and nothing reads the metadata
         # in between.
-        if attn_meta is not None and not (
-            self.runtime_hooks.kv_lens_update_once
-            and self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
-        ):
-            attn_meta.on_update_kv_lens()
+        if attn_meta is not None:
+            if not (
+                self.runtime_hooks.kv_lens_update_once
+                and self._kv_lens_corrected_in_preprocess(inputs, enable_spec_decode)
+            ):
+                attn_meta.on_update_kv_lens()
 
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will

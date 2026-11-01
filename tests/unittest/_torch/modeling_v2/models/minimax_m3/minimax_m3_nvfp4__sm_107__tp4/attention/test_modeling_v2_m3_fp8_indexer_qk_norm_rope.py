@@ -9,7 +9,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.attention.m3_fp8_indexer_qk_norm_rope import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_fp8_indexer_qk_norm_rope import (  # noqa: E501
     m3_fp8_indexer_qk_norm_rope as op,
 )
 
@@ -28,7 +28,7 @@ def _bytes_close(a: torch.Tensor, b: torch.Tensor) -> None:
     assert differ <= (a.numel() - 1) // 1000, f"{differ} of {a.numel()} E4M3 bytes differ"
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[4], ids=[c.why[:44] for c in op.CELLS_BY_TP[4]])
 def test_certified_cells(cell) -> None:
     m, heads = cell.spec["m"], cell.spec["heads"]
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)

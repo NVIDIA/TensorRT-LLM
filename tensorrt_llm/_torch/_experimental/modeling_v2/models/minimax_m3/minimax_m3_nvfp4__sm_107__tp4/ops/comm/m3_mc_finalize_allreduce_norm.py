@@ -4,40 +4,20 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
 
-from .m3_mc_allreduce_norm import boundary
-
-
-def finalize_partial(
-    fc2: torch.Tensor, perm: torch.Tensor, scales: torch.Tensor, shared: Optional[torch.Tensor]
-) -> torch.Tensor:
-    """One rank's BF16 partial: ``bf16(bf16(sum_k scale_k * fc2[perm_k]) + shared)``, the routed sum in FP32 in k
-    order and rounded to BF16, then the shared expert added as stock adds it (one more BF16 rounding).
-
-    The kernel's per-k step is a fused multiply-add; it is reproduced exactly by the float64 product (exact for two
-    FP32 operands) plus the FP32 accumulator, rounded back to FP32. Dropped entries (perm -1) are skipped.
-    """
-    m, topk = perm.shape
-    acc = torch.zeros(m, fc2.shape[1], dtype=torch.float32, device=fc2.device)
-    sc = scales.reshape(m, topk).float()
-    for k in range(topk):
-        rows = perm[:, k].long()
-        keep = (rows >= 0).unsqueeze(-1)
-        gathered = fc2[rows.clamp_min(0)].double()
-        step = (gathered * sc[:, k : k + 1].double() + acc.double()).float()
-        acc = torch.where(keep, step, acc)
-    if shared is not None:
-        acc = acc.to(torch.bfloat16).float() + shared.float()
-    return acc.to(torch.bfloat16)
+from ....ops.comm.reference import McFinalizeAllreduceNormReference
+from ....ops.comm.reference import boundary as boundary
+from ....ops.comm.reference import finalize_partial as finalize_partial
 
 
-class M3McFinalizeAllreduceNorm(OpWrapper):
+class M3McFinalizeAllreduceNorm(McFinalizeAllreduceNormReference):
     """The MoE boundary with the routed experts' finalize folded in.
 
     Per rank the partial is ``bf16(bf16(sum_k scales[t, k] * fc2[perm[t, k]]) + shared[t])`` (``perm`` -1 = dropped,
@@ -131,30 +111,6 @@ class M3McFinalizeAllreduceNorm(OpWrapper):
             0,
             opts,
         )
-
-    def reference(
-        self,
-        per_rank_fc2: Sequence[torch.Tensor],
-        per_rank_perm: Sequence[torch.Tensor],
-        per_rank_scales: Sequence[torch.Tensor],
-        per_rank_shared: Optional[Sequence[torch.Tensor]],
-        residual: torch.Tensor,
-        norm_w: torch.Tensor,
-        eps: float,
-        quant: bool,
-    ) -> tuple[torch.Tensor, ...]:
-        """The boundary the group is supposed to compute, from every rank's MoE outputs in rank order (the
-        collective exception, as in ``m3_mc_allreduce_norm.reference``)."""
-        partials = [
-            finalize_partial(
-                fc2,
-                per_rank_perm[r],
-                per_rank_scales[r],
-                None if per_rank_shared is None else per_rank_shared[r],
-            )
-            for r, fc2 in enumerate(per_rank_fc2)
-        ]
-        return boundary(partials, residual, norm_w, eps, quant)
 
     def is_valid(
         self,

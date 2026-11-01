@@ -10,7 +10,7 @@ import pytest
 import torch
 from cutlass.cute.runtime import from_dlpack
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.mx_gemv.m3_mx_gemv_kernel import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm.m3_mx_gemv_kernel import (  # noqa: E501
     SWIGLU_OAI_ALPHA,
     SWIGLU_OAI_LIMIT,
     _swiglu_oai_bf16x2,

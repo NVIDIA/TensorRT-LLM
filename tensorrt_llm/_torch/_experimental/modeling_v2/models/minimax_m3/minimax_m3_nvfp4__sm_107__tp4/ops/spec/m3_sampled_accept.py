@@ -5,14 +5,18 @@
 
 from __future__ import annotations
 
-from typing import Optional
+import sys
+from typing import Optional, cast
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec import (
+    sampling_reference as _sampling_shared,
+)
 
-from .m3_shard_accept import strict_accept
+from .m3_shard_accept import strict_accept as strict_accept
 
 #: Verify rows per call.
 MAX_ROWS = 48
@@ -25,25 +29,7 @@ def nucleus_probs(
 ) -> torch.Tensor:
     """Per-row sampling distribution [rows, Vs] (fp32): w = exp(x / (T + 1e-6) - max), kept iff the mass strictly
     above its weight is at most top_p * sum(w) (ties included), renormalized over the kept tokens."""
-    inv = 1.0 / (temperatures.float() + TEMP_EPSILON)
-    x = logits.float() * inv[:, None]
-    w = torch.exp(x - x.max(dim=1, keepdim=True).values).double()
-    z = w.sum(dim=1, keepdim=True)
-    order = torch.sort(w, dim=1, descending=True)
-    sw = order.values
-    # mass strictly above each sorted weight: the cumulative sum before the first entry of its tie group
-    csum = torch.cumsum(sw, dim=1) - sw
-    first = torch.ones_like(sw, dtype=torch.bool)
-    first[:, 1:] = sw[:, 1:] != sw[:, :-1]
-    group = torch.cumsum(first.long(), dim=1) - 1
-    starts = torch.zeros_like(csum)
-    starts.scatter_reduce_(1, group, csum, reduce="amin", include_self=False)
-    above = torch.gather(starts, 1, group)
-    keep_sorted = above <= top_ps.double()[:, None] * z
-    keep = torch.zeros_like(keep_sorted)
-    keep.scatter_(1, order.indices, keep_sorted)
-    p = torch.where(keep, w, torch.zeros_like(w))
-    return (p / p.sum(dim=1, keepdim=True)).float()
+    return _sampling_shared.nucleus_probs(_REFERENCE_TARGET, logits, temperatures, top_ps)
 
 
 class M3SampledAccept(OpWrapper):
@@ -215,13 +201,34 @@ class M3SampledAccept(OpWrapper):
         """{"probs": the per-row nucleus distribution over this shard [rows, Vs] (global id = vocab_offset +
         column), "accept": tokens -> the strict acceptance outputs}. The draw itself is random; ``seeds`` /
         ``offsets`` select it and do not change the distribution. World 1: this shard is the whole vocabulary."""
-        rows = logits.shape[0]
-        probs = nucleus_probs(logits, temperatures[:rows], top_ps[:rows])
-
-        def accept(drawn: torch.Tensor) -> dict[str, torch.Tensor]:
-            return strict_accept(drawn, draft, batch_idx, force_total, next_new, force_vec)
-
-        return {"probs": probs, "accept": accept}
+        return _sampling_shared.sampled_reference(
+            self,
+            _REFERENCE_TARGET,
+            logits,
+            vocab_offset,
+            temperatures,
+            top_ps,
+            seeds,
+            offsets,
+            ws_uc,
+            ws_mc_ptr,
+            counters,
+            tokens,
+            rank,
+            world,
+            draft,
+            batch_idx,
+            acc_tokens,
+            num_acc,
+            gather_ids,
+            force_total,
+            next_new,
+            force_vec,
+            extra_attempts,
+            use_pdl,
+            top_ks,
+            min_ps,
+        )
 
     def is_valid(
         self,
@@ -255,35 +262,36 @@ class M3SampledAccept(OpWrapper):
         decided: Optional[torch.Tensor] = None,
         ilp_walk: bool = False,
     ) -> None:
-        rows = logits.shape[0]
-        # top-k and min-p are not applied: a row that has them gets a token outside its real sampling set.
-        if top_ks is not None:
-            k = top_ks[:rows]
-            assert bool(((k <= 0) | (k >= logits.shape[1] * world)).all()), (
-                "top-k rows must take the generic path"
-            )
-        if min_ps is not None:
-            assert not bool((min_ps[:rows] > 0).any()), "min-p rows must take the generic path"
-        # Rows are request-major verify rows: tokens[b * (D + 1) + k]; a mismatched layout pairs drafts with the
-        # wrong rows.
-        assert rows == draft.shape[0] * (draft.shape[1] + 1), (
-            "logits rows must be nreq * (draft_len + 1)"
-        )
-        # Per-row parameters are read at the row index, unchecked.
-        for t in (temperatures, top_ps, seeds, offsets):
-            assert t.numel() >= rows and t.is_contiguous(), (
-                "per-row parameters must cover every row"
-            )
-        assert temperatures.dtype == torch.float32 and top_ps.dtype == torch.float32, (
-            "fp32 sampling parameters"
-        )
-        assert seeds.dtype == torch.int64 and offsets.dtype == torch.int64, (
-            "int64 Philox seeds / offsets"
-        )
-        # The finished-row counter elects the CTA that runs the acceptance.
-        assert int(counters[0].item()) == 0, (
-            "counters[0] (finished rows) must be zero between calls"
+        return _sampling_shared.validate_sampling(
+            self,
+            _REFERENCE_TARGET,
+            logits,
+            vocab_offset,
+            temperatures,
+            top_ps,
+            seeds,
+            offsets,
+            ws_uc,
+            ws_mc_ptr,
+            counters,
+            tokens,
+            rank,
+            world,
+            draft,
+            batch_idx,
+            acc_tokens,
+            num_acc,
+            gather_ids,
+            force_total,
+            next_new,
+            force_vec,
+            extra_attempts,
+            use_pdl,
+            top_ks,
+            min_ps,
         )
 
 
 m3_sampled_accept = M3SampledAccept()
+
+_REFERENCE_TARGET = cast(_sampling_shared.SamplingTarget, sys.modules[__name__])

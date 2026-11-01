@@ -8,7 +8,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.embedding.m3_embedding import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.embedding.m3_embedding import (  # noqa: E501
     m3_embedding as op,
 )
 
@@ -21,7 +21,7 @@ if not torch.cuda.is_available():
 VOCAB, HIDDEN = 4096, 6144
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[8], ids=[c.why[:48] for c in op.CELLS_BY_TP[8]])
 def test_certified_cells(cell) -> None:
     spec = cell.spec
     g = torch.Generator(device="cuda").manual_seed(zlib.crc32(cell.why.encode()) % 2**31)

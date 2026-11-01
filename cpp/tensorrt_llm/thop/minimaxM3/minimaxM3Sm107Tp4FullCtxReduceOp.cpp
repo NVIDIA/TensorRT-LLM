@@ -16,7 +16,7 @@
  */
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/fullCtxReduce.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/fullCtxReduce.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -29,7 +29,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-namespace fcr = tensorrt_llm::kernels::minimaxM3Sm107Tp4::fullCtxReduce;
+namespace fcr = tensorrt_llm::kernels::minimaxM3Sm107::fullCtxReduce;
 
 //! Merges the PrimTS split-KV decode scratch (partial_o [B, Hkv, S, R, 128] 16-bit, partial_stats [B, Hkv, S, R]
 //! fp32 log2-LSE) of the MiniMax-M3 TP4 full-context decode into out (BF16 [B * SQ, Hkv * hR, 128]); with q8 / sf

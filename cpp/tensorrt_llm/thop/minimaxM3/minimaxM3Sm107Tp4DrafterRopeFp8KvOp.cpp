@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/minimaxM3Sm107Tp4/drafterRopeFp8Kv.h"
+#include "tensorrt_llm/kernels/minimaxM3Sm107/drafterRopeFp8Kv.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -28,9 +28,9 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-namespace drk = tensorrt_llm::kernels::minimaxM3Sm107Tp4::drafterRopeFp8Kv;
+namespace drk = tensorrt_llm::kernels::minimaxM3Sm107::drafterRopeFp8Kv;
 
-//! The MiniMax-M3 TP4 drafter layer's generation preprocess (kernels/minimaxM3Sm107Tp4/drafterRopeFp8Kv.h): RoPE on
+//! The MiniMax-M3 TP4 drafter layer's generation preprocess (kernels/minimaxM3Sm107/drafterRopeFp8Kv.h): RoPE on
 //! the packed BF16 qkv rows, the E4M3 query into q_out, and the step's K / V rows into the paged E4M3 cache kv_pages
 //! ([sub-pages, Hkv, tokens_per_block, 128]) at the sub-pages block_tables ([requests, 2, max blocks]) names.
 void minimaxM3Sm107Tp4DrafterRopeFp8Kv(torch::Tensor const& qkv, torch::Tensor const& cosSin,

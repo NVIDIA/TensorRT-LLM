@@ -8,15 +8,22 @@ Compiled on the first call per (rows, id dtype, table shape, PDL), which must ha
 (:class:`DecodeEmbedding` compiles at construction).
 """
 
+import sys
 import threading
-from typing import Dict, Tuple
+from typing import Dict, Tuple, cast
 
-import cuda.bindings.driver as cuda_driver
-import cutlass.cute as cute
+import cuda.bindings.driver as cuda_driver  # noqa: F401 — used by the bound family implementation
+import cutlass.cute as cute  # noqa: F401 — used by the bound family implementation
 import torch
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack as from_dlpack
 
-from .m3_embedding_firstnorm_kernel import m3_embed_norm as _m3_embed_norm_jit
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.embedding import (
+    decode_embedding as _embedding_shared,
+)
+
+from ....kernels.embedding_firstnorm.m3_embedding_firstnorm_kernel import (  # noqa: F401
+    m3_embed_norm as _m3_embed_norm_jit,
+)
 
 HIDDEN = 6144  # capacity: fixed: the checkpoint's hidden size
 MAX_ROWS = 32  # capacity: fixed: the kernel's built rows (decode steps)
@@ -26,12 +33,7 @@ _compiled: Dict[tuple, object] = {}
 
 
 def arg(tensor):
-    return from_dlpack(
-        tensor.detach(),
-        assumed_align=tensor.element_size()
-        if tensor.ndim == 1 and tensor.dtype in (torch.int32, torch.int64)
-        else 16,
-    )
+    return _embedding_shared.arg(_EMBED_TARGET, tensor)
 
 
 def _check(ids, table, weight, raw, out) -> None:
@@ -58,32 +60,7 @@ def _check(ids, table, weight, raw, out) -> None:
 
 
 def _compile(ids, table, weight, eps, raw, out, use_pdl: bool):
-    key = (ids.shape[0], ids.dtype, tuple(table.shape), table.device, bool(use_pdl))
-    fn = _compiled.get(key)
-    if fn is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "m3_embed_norm compiles on its first call per shape: call it once before capture"
-            )
-        with _lock:
-            fn = _compiled.get(key)
-            if fn is None:
-                stream = cuda_driver.CUstream(torch.cuda.current_stream(table.device).cuda_stream)
-                fn = _compiled[key] = cute.compile(
-                    _m3_embed_norm_jit,
-                    arg(ids),
-                    arg(table),
-                    arg(weight),
-                    arg(raw),
-                    arg(out),
-                    int(table.shape[0]),
-                    float(eps),
-                    ids.shape[0],
-                    HIDDEN,
-                    bool(use_pdl),
-                    stream,
-                )
-    return fn
+    return _embedding_shared._compile(_EMBED_TARGET, ids, table, weight, eps, raw, out, use_pdl)
 
 
 def m3_embed_norm(
@@ -97,20 +74,9 @@ def m3_embed_norm(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Write ``table[ids]`` into ``raw`` (a zero row for an id outside ``[0, V)``) and its RMSNorm with ``weight`` /
     ``eps`` into ``out``; returns ``(out, raw)``."""
-    _check(ids, table, weight, raw, out)
-    fn = _compile(ids, table, weight, eps, raw, out, use_pdl)
-    stream = cuda_driver.CUstream(torch.cuda.current_stream(ids.device).cuda_stream)
-    fn(
-        arg(ids),
-        arg(table),
-        arg(weight),
-        arg(raw),
-        arg(out),
-        int(table.shape[0]),
-        float(eps),
-        stream,
+    return _embedding_shared.m3_embed_norm(
+        _EMBED_TARGET, ids, table, weight, eps, raw, out, use_pdl
     )
-    return out, raw
 
 
 class DecodeEmbedding:
@@ -119,25 +85,12 @@ class DecodeEmbedding:
     ``eps``. Built (and compiled) before CUDA-graph capture."""
 
     def __init__(self, table, weight, eps, rows, id_dtype, use_pdl=True):
-        assert not torch.cuda.is_current_stream_capturing()
-        assert table.dtype == torch.bfloat16 and table.is_contiguous() and table.shape[1] == HIDDEN
-        assert weight.dtype == torch.bfloat16 and weight.shape == (HIDDEN,)
-        assert 1 <= rows <= MAX_ROWS and id_dtype in (torch.int32, torch.int64)
-        self.table, self.weight, self.rows, self.id_dtype, self.use_pdl = (
-            table,
-            weight,
-            rows,
-            id_dtype,
-            use_pdl,
+        _embedding_shared.init_decode_embedding(
+            self, _EMBED_TARGET, table, weight, eps, rows, id_dtype, use_pdl
         )
-        self.eps = float(eps)
-        self.raw = torch.empty(rows, HIDDEN, device=table.device, dtype=torch.bfloat16)
-        self.output = torch.empty_like(self.raw)
-        ids = torch.empty(rows, device=table.device, dtype=id_dtype)
-        _compile(ids, table, weight, self.eps, self.raw, self.output, use_pdl)
 
     def __call__(self, ids):
-        assert ids.shape == (self.rows,) and ids.dtype == self.id_dtype and ids.is_contiguous()
-        return m3_embed_norm(
-            ids, self.table, self.weight, self.eps, self.raw, self.output, self.use_pdl
-        )
+        return _embedding_shared.call_decode_embedding(self, _EMBED_TARGET, ids)
+
+
+_EMBED_TARGET = cast(_embedding_shared.EmbeddingTarget, sys.modules[__name__])

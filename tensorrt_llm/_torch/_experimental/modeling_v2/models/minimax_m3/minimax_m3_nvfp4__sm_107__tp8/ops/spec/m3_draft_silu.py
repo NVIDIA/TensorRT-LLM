@@ -14,7 +14,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 
 class M3DraftSilu(OpWrapper):
     """``silu(g) * u`` of a bf16 [rows, 2d] gate | up tensor, rounded once to bf16:
-    trtllm::minimax_m3_sm107_tp8_silu_and_mul (minimaxM3Sm107Tp8/siluAndMul.cu), bit for bit the Triton
+    trtllm::minimax_m3_sm107_tp8_silu_and_mul (minimaxM3Sm107/siluAndMul.cu), bit for bit the Triton
     ``torch.ops.trtllm.silu_and_mul`` at its defaults (no limit, alpha 1, beta 0), the activation the drafter's GatedMLP
     runs. Contiguous, 16-byte aligned rows and d a multiple of 8; ``__call__`` returns None otherwise (the caller runs
     the Triton op)."""

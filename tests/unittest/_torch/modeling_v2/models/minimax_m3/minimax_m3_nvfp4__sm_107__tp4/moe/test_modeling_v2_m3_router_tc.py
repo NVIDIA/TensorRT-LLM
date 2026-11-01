@@ -18,7 +18,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("cell", tc.CELLS, ids=[c.why[:48] for c in tc.CELLS])
+@pytest.mark.parametrize("cell", tc.CELLS_BY_TP[4], ids=[c.why[:48] for c in tc.CELLS_BY_TP[4]])
 def test_tc_certified_cells(cell) -> None:
     spec = cell.spec
     x, w = _build(spec["m"], 128, spec["k"], _seed(cell))

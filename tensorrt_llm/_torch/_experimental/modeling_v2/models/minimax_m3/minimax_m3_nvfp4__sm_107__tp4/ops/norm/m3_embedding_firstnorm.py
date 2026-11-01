@@ -9,6 +9,9 @@ from typing import Tuple
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.embedding.decode_embedding import (
+    embedding_firstnorm_reference as _embedding_reference,
+)
 
 from ..embedding_firstnorm.op import DecodeEmbedding, m3_embed_norm
 
@@ -75,13 +78,7 @@ class M3EmbeddingFirstnorm(OpWrapper):
         use_pdl: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """New tensors (``raw`` / ``out`` are not written); `use_pdl` is ignored."""
-        valid = (ids >= 0) & (ids < table.shape[0])
-        rows = table[torch.where(valid, ids, torch.zeros_like(ids)).long()] * valid.unsqueeze(1).to(
-            table.dtype
-        )
-        x = rows.double()
-        rstd = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
-        return (x * rstd * weight.double()).to(torch.bfloat16), rows
+        return _embedding_reference(ids, table, weight, eps)
 
 
 m3_embedding_firstnorm = M3EmbeddingFirstnorm()

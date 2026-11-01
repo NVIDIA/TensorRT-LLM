@@ -50,8 +50,18 @@ _TOKMAP_TAKEN = []
 def _tokmap_guard_installed():
     # A one-request spec pass places its rows by the workspace token map, which the op builds only for several
     # requests; without the guard the call reads whatever the workspace holds.
-    tokmap_guard.install(torch.device("cuda"), dispatch.DECODE_MAX_TOKENS, _TOKMAP_TAKEN.append)
-    yield
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            tokmap_guard.thop,
+            "trtllm_gen_generation_preprocess",
+            tokmap_guard.thop.trtllm_gen_generation_preprocess,
+        )
+        for name in ("_original", "_max_rows", "_on_taken", "_on_missed"):
+            patch.setattr(tokmap_guard, name, getattr(tokmap_guard, name))
+        patch.setattr(tokmap_guard, "_maps", dict(tokmap_guard._maps))
+        patch.setattr(tokmap_guard, "_offsets", dict(tokmap_guard._offsets))
+        tokmap_guard.install(torch.device("cuda"), dispatch.DECODE_MAX_TOKENS, _TOKMAP_TAKEN.append)
+        yield
 
 
 def _persistent(name: str, make):

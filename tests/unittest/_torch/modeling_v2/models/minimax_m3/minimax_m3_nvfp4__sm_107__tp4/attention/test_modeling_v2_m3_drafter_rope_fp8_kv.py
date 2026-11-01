@@ -22,6 +22,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
     m3_fullctx_decode as fullctx,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops import (  # noqa: E501
+    m3_tokmap_guard as tokmap_guard,
+)
 from tensorrt_llm._torch.attention.backends.fmha.utils import (
     get_attention_chunk_size,
     get_bmm1_scale,
@@ -40,6 +43,21 @@ MAX_LEN = 1 << 20
 FP8_KV_QUANT_MODE = 128
 ROPE_GPT_NEOX = 2
 _PERSISTENT = {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _tokmap_guard_installed():
+    # One-request speculative passes use the same prepared token map as the model.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            thop, "trtllm_gen_generation_preprocess", thop.trtllm_gen_generation_preprocess
+        )
+        for name in ("_original", "_max_rows", "_on_taken", "_on_missed"):
+            patch.setattr(tokmap_guard, name, getattr(tokmap_guard, name))
+        patch.setattr(tokmap_guard, "_maps", dict(tokmap_guard._maps))
+        patch.setattr(tokmap_guard, "_offsets", dict(tokmap_guard._offsets))
+        tokmap_guard.install(torch.device("cuda"), dispatch.DECODE_MAX_TOKENS, lambda rows: None)
+        yield
 
 
 def _persistent(name, make):

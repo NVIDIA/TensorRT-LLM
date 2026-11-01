@@ -10,7 +10,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.attention.m3_qk_norm_rope_fp8 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_qk_norm_rope_fp8 import (  # noqa: E501
     m3_qk_norm_rope_fp8 as op,
 )
 
@@ -57,7 +57,7 @@ def _args(spec, seed):
     )
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[2], ids=[c.why[:48] for c in op.CELLS_BY_TP[2]])
 def test_certified_cells(cell) -> None:
     args = _args(cell.spec, zlib.crc32(cell.why.encode()) % 2**31)
     before = args[0].clone()

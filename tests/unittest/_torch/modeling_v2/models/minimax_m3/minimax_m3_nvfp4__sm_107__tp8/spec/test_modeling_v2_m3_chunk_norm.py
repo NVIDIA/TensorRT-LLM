@@ -5,7 +5,7 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_chunk_norm import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_chunk_norm import (  # noqa: E501
     m3_chunk_norm as op,
 )
 
@@ -33,7 +33,7 @@ def _case(spec, seed):
     return (src, w, EPS, dst, True)
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[8], ids=[c.why[:44] for c in op.CELLS_BY_TP[8]])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Within one bf16 ulp per element on at most 0.1% of the elements (fp32 statistic, rsqrtf)."""
     args = _case(cell.spec, seed_of(cell.why))
@@ -43,7 +43,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_guard_refuses_a_strided_weight() -> None:
-    src, w, eps, dst, pdl = _case(op.CELLS[0].spec, 1)
+    src, w, eps, dst, pdl = _case(op.CELLS_BY_TP[8][0].spec, 1)
     wt = torch.empty((w.shape[1], w.shape[0]), dtype=w.dtype, device="cuda").t()
     wt.copy_(w)
     with pytest.raises(AssertionError, match="dense"):

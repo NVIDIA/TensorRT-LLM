@@ -23,6 +23,7 @@ the real method unbound against a minimal fake ``self`` and check that:
 from __future__ import annotations
 
 import types
+from unittest.mock import Mock
 
 import pytest
 
@@ -111,3 +112,21 @@ def test_runtime_hooks_choose_the_schedule():
 
     assert _emitted_iters(20, plain) == [1, 20, 40, 60]
     assert _emitted_iters(20, m3) == [1, 2, 20, 40, 60]
+
+
+@pytest.mark.parametrize("decoding_iter", [1, 2, 19])
+@pytest.mark.parametrize("emit_first_iter", [False, True])
+@pytest.mark.parametrize("first_gen_emit", [False, True])
+def test_first_generation_content_preserves_early_emit_suppression(
+    decoding_iter, emit_first_iter, first_gen_emit
+):
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.stream_interval = 20
+    executor.first_content_emit_iters = 1
+    request = Mock(
+        spec_set=["py_decoding_iter", "is_finished"],
+        py_decoding_iter=decoding_iter,
+        is_finished=False,
+    )
+    expected = emit_first_iter if decoding_iter == 1 else first_gen_emit
+    assert executor._should_emit_response(request, emit_first_iter, first_gen_emit) is expected

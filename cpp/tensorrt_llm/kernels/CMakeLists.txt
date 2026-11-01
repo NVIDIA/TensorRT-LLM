@@ -93,7 +93,7 @@ list(FILTER SRC_CU EXCLUDE REGEX
      "minimaxM3/(fusedDecodeAttn|attnMega|attnC1)\\.cu$")
 # The MiniMax-M3 sm_107 decode kernels are built as their own sm_107-only OBJECT
 # library below.
-list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107Tp[248]/.*")
+list(FILTER SRC_CU EXCLUDE REGEX "minimaxM3Sm107(Tp[248])?/.*")
 
 if(NOT ENABLE_MULTI_DEVICE)
   list(FILTER SRC_CU EXCLUDE REGEX "customAllReduceKernels*.*cu$")
@@ -151,8 +151,8 @@ set_cuda_architectures(minimax_m3_attn_src 100 103)
 # the older ones. A build without an sm_10x architecture compiles them for
 # sm_107a: their torch ops link against the host launchers, and only the sm_107
 # targets launch them.
-file(GLOB MINIMAX_M3_SM107_SRC minimaxM3Sm107Tp2/*.cu minimaxM3Sm107Tp4/*.cu
-     minimaxM3Sm107Tp8/*.cu)
+file(GLOB MINIMAX_M3_SM107_SRC minimaxM3Sm107/*.cu minimaxM3Sm107Tp2/*.cu
+     minimaxM3Sm107Tp4/*.cu minimaxM3Sm107Tp8/*.cu)
 add_library(minimax_m3_sm107_src OBJECT ${MINIMAX_M3_SM107_SRC})
 set_property(TARGET minimax_m3_sm107_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET minimax_m3_sm107_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS

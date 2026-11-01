@@ -8,16 +8,25 @@ from typing import Optional
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa import (
+    MsaAttentionBase,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.msa import (
+    _selected_blocks as _selected_blocks,
+)
 from tensorrt_llm._torch.attention.backends.interface import (
-    AttentionForwardArgs,
-    SparseBackendForwardArgs,
+    AttentionForwardArgs as AttentionForwardArgs,
+)
+from tensorrt_llm._torch.attention.backends.interface import (
+    SparseBackendForwardArgs as SparseBackendForwardArgs,
 )
 
-from .m3_sparse_decode_lc import dequant_nvfp4_pages
+from .m3_sparse_decode_lc import dequant_nvfp4_pages as dequant_nvfp4_pages
 
 
-class M3MsaAttention(OpWrapper):
+class M3MsaAttention(MsaAttentionBase):
     """One layer's attention core on the MSA backend (``MiniMaxM3MsaSparseAttention``), written into ``output``
     [T, heads * 128] (bf16, the step's live rows).
 
@@ -61,35 +70,6 @@ class M3MsaAttention(OpWrapper):
     cast, which the reference applies too. What remains between the two is the FMHA's own arithmetic (its P
     rounding and accumulation order), which the test bounds.
     """
-
-    def __call__(
-        self,
-        backend,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        idx_q: Optional[torch.Tensor],
-        metadata,
-        output: torch.Tensor,
-        sparse: bool,
-        kv_scale_orig_quant: Optional[torch.Tensor],
-        kv_scale_quant_orig: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        if k is not None:
-            backend.write_layer_caches(
-                k, v, None, metadata, kv_scale_orig_quant=kv_scale_orig_quant
-            )
-        if sparse:
-            blocks = backend.run_indexer(idx_q, None, metadata, idx_k_prewritten=True)
-            args = AttentionForwardArgs(
-                output=output, sparse_backend_args=SparseBackendForwardArgs(topk_indices=blocks)
-            )
-        else:
-            args = AttentionForwardArgs(output=output)
-        args.kv_scale_orig_quant = kv_scale_orig_quant
-        args.kv_scale_quant_orig = kv_scale_quant_orig
-        backend.forward(q, None, None, metadata, forward_args=args)
-        return output
 
     def reference(
         self,
@@ -181,44 +161,6 @@ class M3MsaAttention(OpWrapper):
                 out[first + lo : first + hi] = torch.softmax(logits, dim=-1) @ values
             first += n
         return out.reshape(total, heads * dim).to(output.dtype)
-
-
-def _selected_blocks(
-    idx_q: torch.Tensor,
-    idx_keys: torch.Tensor,
-    allowed: torch.Tensor,
-    qpos: torch.Tensor,
-    page: int,
-    config,
-) -> torch.Tensor:
-    """The blocks each query token of one request attends, [n, blocks] bool.
-
-    A block's score is the maximum, over the KV head's index heads and the block's causally visible keys, of
-    ``idx_q . idx_k``. Of the token's ``ceil((pos + 1) / page)`` valid blocks the first ``init_blocks`` and the last
-    ``local_blocks`` are forced in, and the ``topk`` highest-scoring are kept, ties to the lower block (the
-    backend's ``select_blocks_from_maxscore`` rule). The positive score scale the scorers apply does not change the
-    ranking, so none is applied.
-    """
-    n, length = allowed.shape
-    blocks = (length + page - 1) // page
-    scores = torch.einsum("thd,kd->thk", idx_q, idx_keys).amax(dim=1)
-    scores = scores.masked_fill(~allowed, float("-inf"))
-    padded = torch.full((n, blocks * page), float("-inf"), dtype=scores.dtype, device=scores.device)
-    padded[:, :length] = scores
-    block_scores = padded.view(n, blocks, page).amax(dim=-1)
-    ids = torch.arange(blocks, device=scores.device)[None, :]
-    n_valid = torch.div(qpos + page, page, rounding_mode="floor")[:, None]
-    block_scores = block_scores.masked_fill(ids >= n_valid, float("-inf"))
-    forced = (ids < torch.clamp(n_valid, max=config.init_blocks)) | (
-        (ids >= n_valid - config.local_blocks) & (ids < n_valid)
-    )
-    block_scores = block_scores.masked_fill(forced, float("inf"))
-    order = torch.sort(block_scores, dim=1, descending=True, stable=True).indices[:, : config.topk]
-    keep = torch.arange(order.shape[1], device=scores.device)[None, :] < n_valid
-    chosen = torch.zeros(n, blocks, dtype=torch.bool, device=scores.device)
-    rows = torch.arange(n, device=scores.device)[:, None].expand_as(order)
-    chosen[rows[keep], order[keep]] = True
-    return chosen
 
 
 m3_msa_attention = M3MsaAttention()

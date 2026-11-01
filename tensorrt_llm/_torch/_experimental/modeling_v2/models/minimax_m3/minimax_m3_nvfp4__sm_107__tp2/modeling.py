@@ -63,9 +63,9 @@ tower is not built and a step carrying image input raises).
 from __future__ import annotations
 
 import atexit
-import copy
 import dataclasses
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -81,6 +81,7 @@ from typing import (
     Mapping,
     Optional,
     Tuple,
+    cast,
 )
 
 import torch
@@ -108,6 +109,98 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsno
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.quantization.fp4_quantize import (
     fp4_quantize,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import (
+    modeling_support as _modeling_support,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3 import reporting as _reporting
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
+    _is_vl_config as _is_vl_config,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
+    _moe_layer_ids as _moe_layer_ids,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
+    _sparse_layer_ids as _sparse_layer_ids,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
+    _text_model_config as _text_model_config,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
+    _validate_runtime as _validate_runtime,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
+    m3_silu_and_mul,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention import (
+    msa_kv_update_hook as _msa_kv_update_kernel,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_fp8_indexer_qk_norm_rope import (
+    m3_fp8_indexer_qk_norm_rope as m3_fp8_indexer_qk_norm_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_qk_norm_rope_fp8 import (
+    m3_qk_norm_rope_fp8,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_qkv_insert import (
+    m3_qkv_insert,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.attention.m3_select_blocks import (
+    m3_select_blocks,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.comm.m3_allreduce import (
+    m3_allreduce,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.embedding.m3_embedding import (
+    m3_embedding,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_bf16_linear import (
+    m3_bf16_linear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_dense_swiglu import (
+    ALPHA as DENSE_ALPHA,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_dense_swiglu import (
+    BETA as DENSE_BETA,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_dense_swiglu import (
+    LIMIT as DENSE_LIMIT,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_dense_swiglu import (
+    m3_dense_swiglu,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_fp32_linear import (
+    m3_fp32_linear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_gemm import (
+    m3_mxfp8_gemm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_mxfp8_linear import (
+    m3_mxfp8_linear as m3_mxfp8_linear,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.mxfp8_state import (
+    MxMode as MxMode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.mxfp8_state import (
+    _mx_mode as _mx_mode,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.mxfp8_state import (
+    _Mxfp8GemmState as _Mxfp8GemmState,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.moe.m3_router_tc import (
+    m3_router_tc,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (
+    m3_capture_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_chunk_norm import (
+    m3_chunk_norm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_draft_input import (
+    m3_draft_input,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_force_vec import (
+    m3_force_vec,
+    m3_force_vec_req,
+)
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
@@ -121,22 +214,27 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cach
 )
 from tensorrt_llm._torch.attention.backends.utils import create_attention
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
-    FlashInferMXFP8GemmRunner,
-    MXFP8QuantizeRunner,
+    FlashInferMXFP8GemmRunner as FlashInferMXFP8GemmRunner,
+)
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    MXFP8QuantizeRunner as MXFP8QuantizeRunner,
 )
 from tensorrt_llm._torch.distributed import AllReduce, AllReduceFusionOp, AllReduceParams
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_speculative import (
     _ensure_draft_vocab_size,
-    _get_requested_draft_moe_backend,
-    _set_draft_kv_cache_quant_algo,
     _slice_spec_position_ids,
+)
+from tensorrt_llm._torch.models.modeling_speculative import (
+    _get_requested_draft_moe_backend as _get_requested_draft_moe_backend,
+)
+from tensorrt_llm._torch.models.modeling_speculative import (
+    _set_draft_kv_cache_quant_algo as _set_draft_kv_cache_quant_algo,
 )
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.embedding import LMHead
 from tensorrt_llm._torch.modules.linear import (
-    MXFP8LinearMethod,
     TensorParallelMode,
     flashinfer_mxfp8_autotune_active,
     flashinfer_mxfp8_decode_graph_capture_active,
@@ -157,7 +255,9 @@ from tensorrt_llm._torch.speculative.interface import (
     _FORCE_ACCEPT_RNG_COUNTER_STRIDE,
     _FORCE_ACCEPT_RNG_POOL_SIZE,
     _FORCE_ACCEPT_RNG_SLOT_STRIDE,
-    should_use_separate_draft_kv_cache,
+)
+from tensorrt_llm._torch.speculative.interface import (
+    should_use_separate_draft_kv_cache as should_use_separate_draft_kv_cache,
 )
 from tensorrt_llm._torch.utils import ActType_TrtllmGen, get_model_extra_attrs
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
@@ -179,35 +279,21 @@ from .ops import m3_fullctx_decode as m3_fullctx_decode_kernel
 from .ops import m3_index_score as _index_score_kernel
 from .ops import m3_sampled_accept as m3_sampled_accept_kernel
 from .ops import m3_shard_accept as m3_shard_accept_kernel
-from .ops import msa_kv_update as _msa_kv_update_kernel
 from .ops import triton_sparse_decode as _sparse_decode_kernel
-from .ops.activation.m3_silu_and_mul import m3_silu_and_mul
 from .ops.attention.m3_draft_attention import m3_draft_attention
-from .ops.attention.m3_fp8_indexer_qk_norm_rope import m3_fp8_indexer_qk_norm_rope
 from .ops.attention.m3_fullctx_decode import m3_fullctx_decode
 from .ops.attention.m3_index_score import m3_index_score
 from .ops.attention.m3_msa_attention import m3_msa_attention
 from .ops.attention.m3_producer import m3_producer
-from .ops.attention.m3_qk_norm_rope_fp8 import m3_qk_norm_rope_fp8
-from .ops.attention.m3_qkv_insert import m3_qkv_insert
-from .ops.attention.m3_select_blocks import m3_select_blocks
 from .ops.attention.m3_select_long import m3_select_long
 from .ops.attention.m3_select_long_dsl import m3_select_long_dsl
 from .ops.attention.m3_sparse_decode import m3_sparse_decode
 from .ops.attention.m3_sparse_decode_lc import m3_sparse_decode_lc
-from .ops.comm.m3_allreduce import m3_allreduce
 from .ops.comm.m3_mc_allreduce_norm import m3_mc_allreduce_norm
 from .ops.comm.m3_mc_finalize_allreduce_norm import m3_mc_finalize_allreduce_norm
-from .ops.embedding.m3_embedding import m3_embedding
 from .ops.gemm import m3_ugpu_head as m3_ugpu_head_op
-from .ops.gemm.m3_bf16_linear import m3_bf16_linear
-from .ops.gemm.m3_dense_swiglu import ALPHA as DENSE_ALPHA
-from .ops.gemm.m3_dense_swiglu import BETA as DENSE_BETA
-from .ops.gemm.m3_dense_swiglu import LIMIT as DENSE_LIMIT
-from .ops.gemm.m3_dense_swiglu import m3_dense_swiglu
 from .ops.gemm.m3_draft_lowm import ROWS as DRAFT_LOWM_TACTIC_ROWS
 from .ops.gemm.m3_draft_lowm import m3_draft_lowm, tactic_for
-from .ops.gemm.m3_fp32_linear import m3_fp32_linear
 from .ops.gemm.m3_mx_gemv import (
     DENSE_DOWN,
     DENSE_GATE_UP,
@@ -220,21 +306,14 @@ from .ops.gemm.m3_mx_gemv import (
     served_max_rows,
 )
 from .ops.gemm.m3_mx_gemv_bf16 import m3_mx_gemv_bf16
-from .ops.gemm.m3_mxfp8_gemm import m3_mxfp8_gemm
-from .ops.gemm.m3_mxfp8_linear import m3_mxfp8_linear
 from .ops.gemm.m3_ugpu_head import m3_ugpu_head
 from .ops.long_select import long_select_blocks
 from .ops.m3_moe_finalize import m3_moe_finalize
 from .ops.moe.m3_moe_engine import M3MoeState, ar_push_desc, m3_moe_engine
-from .ops.moe.m3_router_tc import m3_router_tc
 from .ops.mx_gemv import op as mx_gemv
 from .ops.norm.m3_embedding_firstnorm import DecodeEmbedding, m3_embedding_firstnorm
-from .ops.spec.m3_capture_norm import m3_capture_norm
-from .ops.spec.m3_chunk_norm import m3_chunk_norm
-from .ops.spec.m3_draft_input import m3_draft_input
 from .ops.spec.m3_draft_silu import m3_draft_silu
 from .ops.spec.m3_draft_step import m3_draft_step
-from .ops.spec.m3_force_vec import m3_force_vec, m3_force_vec_req
 from .ops.spec.m3_sampled_accept import m3_sampled_accept
 from .ops.spec.m3_shard_accept import m3_shard_accept
 from .ops.spec.m3_spec_offsets import m3_spec_offsets
@@ -564,7 +643,7 @@ CHUNK_NORM_MAX_ROWS = SPEC_TAIL_MAX_TOKENS
 # (The drafter epilogue, opts bit 16, is built for the 8-token bucket only: a B4 spec-tail first pass of 16 / 32 rows
 # takes the built-in all-reduce + RMSNorm; its later passes of up to 8 rows stay multicast.)
 DRAFT_MC_AR_MAX_ROWS = 8  # capacity: fixed: the drafter epilogue's 8-token bucket
-# The drafter's o_proj and down projection, on the copied split-K kernel (DRAFT_LOWM_OWN_SPLITK), also push their rows
+# The drafter's o_proj and down projection, on the shared split-K kernel (DRAFT_LOWM_OWN_SPLITK), push their rows
 # into the drafter boundary all-reduce's exchange (the canonical words its own push would store, at the call parity),
 # which then runs prepushed 2 instead of pushing x itself; the copy releases its dependents only after its own grid
 # wait and the pushes (the prepushed >= 2 contract). Bitwise. TP2: the 4-row first pass only (its 1-row linears run
@@ -608,7 +687,7 @@ DRAFT_STEP_MAX_REQUESTS = min(SPEC_TAIL_MAX_REQUESTS, 8)  # capacity: fixed: the
 # keep the in-tree cuBLAS GEMM. 0:. Rubin TP2 (mclk locked, 4 rotating sets) at 1 row: qkv 13.18 -> 9.71,
 # o 7.17 -> 5.33, gate_up 22.27 -> 17.70, down 12.52 -> 9.76, fc 21.50 -> 17.77 us.
 DRAFT_LOWM_MAX_ROWS = 4  # capacity: fixed: the certified low-M rows
-# The split-K ('s') tactics run this target's copy of FlashInfer's kernel (ops/m3_lowm_splitk): bit for bit the
+# The split-K ('s') tactics run the shared FlashInfer kernel (kernels/gemm/m3_lowm_splitk): bit for bit the
 # same output at every certified cell (spec/test_modeling_v2_m3_lowm_splitk.py); the seam for the drafter-boundary push
 # epilogue and the down projection's SwiGLU prologue. False: (FlashInfer's kernel).
 DRAFT_LOWM_OWN_SPLITK = True
@@ -801,7 +880,9 @@ class RowRange:
         return key in self.keys
 
     def certified(self) -> FrozenSet[Key]:
-        return frozenset(k for cell in self.entry.CELLS for k in self.certifies(cell.spec))
+        cells_by_tp = getattr(self.entry, "CELLS_BY_TP", None)
+        cells = self.entry.CELLS if cells_by_tp is None else cells_by_tp[2]
+        return frozenset(k for cell in cells for k in self.certifies(cell.spec))
 
 
 def _rows(lo: int, hi: int) -> FrozenSet[int]:
@@ -1142,7 +1223,7 @@ def moe_path(num_tokens: int) -> Optional[str]:
 MX_GEMV_PATH = MX_GEMV.path
 MX_GEMV_BF16_PATH = MX_GEMV_BF16.path
 # The dense layers' swigluoai activation as this target's C++ op (ops/gemm/m3_dense_swiglu,
-# minimaxM3Sm107Tp2/swigluOai.cu, LongAttn c267035d2f: bit for bit the Triton silu_and_mul at limit 7, alpha 1.702,
+# minimaxM3Sm107/swigluOai.cu, LongAttn c267035d2f: bit for bit the Triton silu_and_mul at limit 7, alpha 1.702,
 # beta 1), PDL-launched with an early release so the down GEMV stages its weights during it; the down GEMV reads the
 # activation only after its own grid wait. Indexer kdev17 783285 (TP2 chain): -0.69 us per dense layer vs the Triton
 # kernel; LongAttn gate a 783511 (oracle 23/23). False runs the Triton kernel.
@@ -1183,58 +1264,36 @@ class FastPathUnavailable(RuntimeError):
 _lock = threading.Lock()
 _require = [False]
 _logged: set = set()
+_POLICY_TARGET = cast(_reporting.ReportingTarget, sys.modules[__name__])
 
 
 def set_require(require: bool) -> None:
     """Whether a miss raises (``modeling_v2='require'``); set by the target at construction."""
-    _require[0] = bool(require)
+    return _reporting.set_require(_POLICY_TARGET, require)
 
 
 def require_mode() -> bool:
-    return _require[0]
+    return _reporting.require_mode(_POLICY_TARGET)
 
 
 def _log_once(level: Callable[[str], None], path: str, reason: str, message: str) -> None:
-    key = (path, reason)
-    with _lock:
-        if key in _logged:
-            return
-        _logged.add(key)
-    level(message)
+    return _reporting._log_once(_POLICY_TARGET, level, path, reason, message)
 
 
 def missed(path: str, rows: Optional[int], reason: str) -> None:
     """``path`` covers this step but cannot run: raise under require, else log once; the caller falls back."""
-    at = "" if rows is None else f" at {rows} rows"
-    if _require[0]:
-        raise FastPathUnavailable(
-            f"modeling_v2='require': the MiniMax-M3 decode path {path!r} covers this step{at} but cannot run: "
-            f"{reason}"
-        )
-    _log_once(
-        logger.warning,
-        path,
-        reason,
-        f"[M3 dispatch] {path}{at}: {reason}; falling back (logged once per reason)",
-    )
+    return _reporting.missed(_POLICY_TARGET, path, rows, reason)
 
 
 def capture_missed(path: str, rows: Optional[int], what: str) -> None:
     """``what`` is built on eager steps but a CUDA-graph capture found it missing (see ``missed``)."""
-    missed(path, rows, f"{what} is not built and a CUDA graph is being captured")
+    return _reporting.capture_missed(_POLICY_TARGET, path, rows, what)
 
 
 def taken(path: str, rows: Optional[int], what: str = "") -> None:
     """``path`` ran on this rank at ``rows``: one rank-tagged info line per (path, rows, what), the engagement line
     every GEN rank prints for each fast path it takes (``what``: an optional detail, e.g. the projection)."""
-    at = "" if rows is None else f" at {rows} rows"
-    detail = f" ({what})" if what else ""
-    _log_once(
-        logger.info,
-        path,
-        f"taken: {rows}" + (f": {what}" if what else ""),
-        f"[M3 dispatch] rank {mpi_rank()}: {path} taken{at}{detail}",
-    )
+    return _reporting.taken(_POLICY_TARGET, path, rows, what)
 
 
 def long_select_covers(num_blocks: int) -> bool:
@@ -1275,13 +1334,12 @@ def long_select_fallback(num_blocks: int, rows: int) -> None:
 
 def uncovered(path: str, reason: str) -> None:
     """The step is outside ``path``'s covered shapes: log once per (path, reason); the generic path runs."""
-    _log_once(logger.info, path, reason, f"[M3 dispatch] {path} not taken: {reason} (logged once)")
+    return _reporting.uncovered(_POLICY_TARGET, path, reason)
 
 
 def reset_logged() -> None:
     """Forget which (path, reason) pairs were logged."""
-    with _lock:
-        _logged.clear()
+    return _reporting.reset_logged(_POLICY_TARGET)
 
 
 # Kernel modules report from inside their calls through ops/m3_report: the same policy.
@@ -1339,132 +1397,6 @@ if _VALUE_DUMP:
     atexit.register(_print_values)
 
 
-def _is_vl_config(pretrained_config: PretrainedConfig) -> bool:
-    model_type = getattr(pretrained_config, "model_type", None)
-    if model_type == "minimax_m3_vl":
-        return True
-    if model_type == "minimax_m3":
-        return False
-    return any(
-        "ForConditionalGeneration" in a
-        for a in (getattr(pretrained_config, "architectures", None) or [])
-    )
-
-
-def _text_model_config(model_config: ModelConfig) -> ModelConfig:
-    """The model config with the language model's ``text_config`` as its pretrained config.
-
-    The checkpoint declares the vision-language wrapper; its ``text_config`` arrives as a plain dict (no typed
-    sub-config is registered), so it is materialized into a ``PretrainedConfig`` with the wrapper's dtype and
-    embedding tie carried over. A text config is returned unchanged.
-    """
-    if not _is_vl_config(model_config.pretrained_config):
-        return model_config
-    cfg = copy.deepcopy(model_config)
-    text = getattr(cfg.pretrained_config, "text_config", None)
-    if text is None:
-        raise ValueError("MiniMax-M3 VL config has no `text_config`")
-    if isinstance(text, dict):
-        out = PretrainedConfig()
-        for k, v in text.items():
-            setattr(out, k, v)
-        text = out
-    if (
-        getattr(text, "torch_dtype", None) is None
-        and getattr(cfg.pretrained_config, "torch_dtype", None) is not None
-    ):
-        text.torch_dtype = cfg.pretrained_config.torch_dtype
-    if (
-        getattr(text, "tie_word_embeddings", None) is None
-        and getattr(cfg.pretrained_config, "tie_word_embeddings", None) is not None
-    ):
-        text.tie_word_embeddings = cfg.pretrained_config.tie_word_embeddings
-    return dataclasses.replace(cfg, pretrained_config=text)
-
-
-def _validate_runtime(model_config: ModelConfig) -> None:
-    """The runtime this target is written for. It is set by engine arguments rather than the checkpoint, so routing
-    sees only its KV cache algorithm; this check at construction refuses every other runtime.
-
-    The MiniMax-M3 MSA backend (it owns the step metadata and the index-K cache), the fused five-way QKV/index
-    projection or the separate QKV and index projections, an FP8 indexer and an FP8 or NVFP4 main KV cache.
-    """
-    sparse = model_config.sparse_attention_config
-    if (
-        sparse is None
-        or getattr(sparse, "algorithm", None) != "minimax_m3"
-        or sparse.implementation != "msa"
-    ):
-        raise ValueError(
-            "this MiniMax-M3 target requires sparse_attention_config.algorithm='minimax_m3' with implementation='msa'"
-        )
-    if getattr(sparse, "indexer_kv_dtype", None) != "fp8":
-        raise ValueError(
-            "this MiniMax-M3 target requires sparse_attention_config.indexer_kv_dtype='fp8'"
-        )
-    mode = model_config.quant_config.quant_mode
-    if mode is None or not (mode.has_fp8_kv_cache() or mode.has_fp4_kv_cache()):
-        raise ValueError("this MiniMax-M3 target requires an FP8 or NVFP4 KV cache")
-
-
-def _sparse_layer_ids(cfg: PretrainedConfig) -> List[int]:
-    freq = cfg.sparse_attention_config["sparse_attention_freq"]
-    return [i for i, f in enumerate(freq) if int(f) != 0]
-
-
-def _moe_layer_ids(cfg: PretrainedConfig) -> List[int]:
-    freq = getattr(cfg, "moe_layer_freq", None)
-    if freq is None:
-        return list(range(cfg.num_hidden_layers))
-    return [i for i, f in enumerate(freq) if int(f) != 0]
-
-
-class _Mxfp8GemmState(nn.Module):
-    """The MXFP8 GEMM backend state the engine's warmup drives.
-
-    The engine finds MXFP8 projections by a module's ``quant_method`` and, for every one, opts it into native GEMM
-    tuning and (on decode CUDA graphs) the auto-dispatched FlashInfer GEMM, then marks each tuned. Every projection of
-    this target dispatches identically, so one method object carries that state for all of them; the forward reads it
-    at each call (``_mx_mode``) and passes the resolved backend to the GEMM entries.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.quant_method = MXFP8LinearMethod()
-
-
-@dataclass(frozen=True)
-class MxMode:
-    """The MXFP8 GEMM dispatch of one call, resolved from ``_Mxfp8GemmState`` and the engine's contexts."""
-
-    decode_graph: bool  # inside a decode CUDA-graph warmup or capture
-    autotune: bool  # inside the engine's FlashInfer MXFP8 tuning pass
-    tuned_quantize_gemm: (
-        bool  # per-bucket tuned quantize + GEMM (decode graphs, tune_decode_graph_backends)
-    )
-    flashinfer: bool  # FlashInfer's MXFP8 GEMM on the quantized activation
-    native_tuning: (
-        bool  # the native GEMM through the autotuner (warmup, before its tactics are registered)
-    )
-
-
-def _mx_mode(state: _Mxfp8GemmState) -> MxMode:
-    method = state.quant_method
-    decode_graph = flashinfer_mxfp8_decode_graph_capture_active()
-    autotune = flashinfer_mxfp8_autotune_active()
-    return MxMode(
-        decode_graph=decode_graph,
-        autotune=autotune,
-        tuned_quantize_gemm=method.tune_decode_graph_backends and decode_graph,
-        flashinfer=method.backend == "flashinfer"
-        or (
-            method.backend == "auto"
-            and (autotune or (method._flashinfer_autotuned and decode_graph))
-        ),
-        native_tuning=method.needs_native_autotune,
-    )
-
-
 # --------------------------------------------------------------------------------------------------------------------
 # Projections: the MXFP8 GEMM dispatch (``linear_path``) and its hand-offs
 # --------------------------------------------------------------------------------------------------------------------
@@ -1474,50 +1406,27 @@ def _mxfp8_linear(
     core, x: torch.Tensor, w: torch.Tensor, s: torch.Tensor, mode: MxMode
 ) -> torch.Tensor:
     """One MXFP8 projection on the engine-tuned path: MXFP8 quantize + GEMM, backend per ``mode``."""
-    _record(
-        "m3_mxfp8_linear",
-        tuple(w.shape),
-        mode.tuned_quantize_gemm,
-        mode.flashinfer,
-        mode.native_tuning,
-    )
-    return m3_mxfp8_linear(
-        x.contiguous(),
-        w,
-        s,
-        core.mx_alpha,
-        torch.bfloat16,
-        mode.tuned_quantize_gemm,
-        mode.autotune,
-        mode.flashinfer,
-        mode.native_tuning,
-    )
+    return _modeling_support._mxfp8_linear(_SUPPORT_TARGET, core, x, w, s, mode)
 
 
 _PINNED_RUNNERS: dict = {}
 
 
 def _pinned_runner(cls, dtype):
-    runner = _PINNED_RUNNERS.get((cls, dtype))
-    if runner is None:
-        runner = _PINNED_RUNNERS[(cls, dtype)] = cls(dtype)
-    return runner
+    return _modeling_support._pinned_runner(_SUPPORT_TARGET, cls, dtype)
 
 
 def _pinned_mxfp8_gemm(act, act_scale, weight, weight_scale, out_dtype):
     """The decode-graph MXFP8 GEMM at the target's fixed tactic (``MXFP8_DECODE_GEMM_TACTIC``), no AutoTuner: the
     same choice on every rank and every start."""
-    _record("pinned_mxfp8_gemm", tuple(weight.shape), act.shape[0], MXFP8_DECODE_GEMM_TACTIC)
-    runner = _pinned_runner(FlashInferMXFP8GemmRunner, out_dtype)
-    return runner.forward([act, act_scale, weight, weight_scale], tactic=MXFP8_DECODE_GEMM_TACTIC)
+    return _modeling_support._pinned_mxfp8_gemm(
+        _SUPPORT_TARGET, act, act_scale, weight, weight_scale, out_dtype
+    )
 
 
 def _pinned_mxfp8_quantize(x):
     """The decode-graph MXFP8 activation quantize at the target's fixed tactic (``MXFP8_DECODE_QUANT_TACTIC``)."""
-    _record("pinned_mxfp8_quantize", x.shape[0], MXFP8_DECODE_QUANT_TACTIC)
-    return _pinned_runner(MXFP8QuantizeRunner, x.dtype).forward(
-        [x], tactic=MXFP8_DECODE_QUANT_TACTIC
-    )
+    return _modeling_support._pinned_mxfp8_quantize(_SUPPORT_TARGET, x)
 
 
 _MX_TAC_ENGAGED: set = set()
@@ -1882,8 +1791,7 @@ def _routed_experts(core, i: int, x, x_sf, router_logits, do_finalize: bool):
 
 def _split_chunk(rows: int, num_chunks: int) -> List[int]:
     """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row."""
-    base, extra = divmod(rows, num_chunks)
-    return [base + 1] * extra + [base] * (num_chunks - extra)
+    return _modeling_support._split_chunk(_SUPPORT_TARGET, rows, num_chunks)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -1892,7 +1800,7 @@ def _split_chunk(rows: int, num_chunks: int) -> List[int]:
 
 
 def _nvfp4_layer(manager, i: int) -> bool:
-    return bool(getattr(manager, "is_nvfp4_layer", lambda _layer_idx: False)(i))
+    return _modeling_support._nvfp4_layer(_SUPPORT_TARGET, manager, i)
 
 
 def _producer_covered(core) -> bool:
@@ -1919,31 +1827,7 @@ def _producer_layout(kv_data, kv_scale) -> bool:
 
 def _nvfp4_fused_write_layout(data: torch.Tensor, scales: torch.Tensor, num_heads: int) -> bool:
     """Reject invalid HND pools; select the fused producer only for its packed layout."""
-    if (
-        data.dim() != 5
-        or scales.dim() != 5
-        or data.shape[0] <= 0
-        or data.shape[0] != scales.shape[0]
-        or tuple(data.shape[1:]) != (2, num_heads, 128, 64)
-        or tuple(scales.shape[1:]) != (2, num_heads, 128, 8)
-        or data.dtype not in (torch.int8, torch.uint8)
-        or scales.dtype != torch.uint8
-    ):
-        raise ValueError("MiniMax-M3 NVFP4 data and scale caches must have matching HND geometry")
-    for cache in (data, scales):
-        if (
-            cache.stride(4) != 1
-            or cache.stride(3) != cache.shape[4]
-            or cache.stride(2) < 128 * cache.stride(3)
-            or cache.stride(1) < num_heads * cache.stride(2)
-            or cache.stride(0) < 2 * cache.stride(1)
-        ):
-            raise ValueError(
-                "MiniMax-M3 NVFP4 cache rows must be packed and heads/planes/pages must not overlap"
-            )
-    if scales.stride(2) != 128 * 8:
-        raise ValueError("MiniMax-M3 NVFP4 MSA scale cache must have packed head blocks")
-    return data.stride(2) == 128 * 64 and data.stride(0) % 2 == 0 and data.stride(1) % 2 == 0
+    return _modeling_support._nvfp4_fused_write_layout(_SUPPORT_TARGET, data, scales, num_heads)
 
 
 #: The step phases ("decode" / "prefill") whose producer engagement has been logged, once per process.
@@ -2191,14 +2075,14 @@ def _dense_qk_norm_rope_fp8(
 
 
 def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
-    """The dense MLP's SwiGLU-OAI activation: this target's C++ op (``m3_dense_swiglu``, minimaxM3Sm107Tp2/
+    """The dense MLP's SwiGLU-OAI activation: this target's C++ op (``m3_dense_swiglu``, minimaxM3Sm107/
     swigluOai.cu: bit for bit the Triton silu_and_mul at limit 7, alpha 1.702, beta 1, PDL-launched with an early
     release so the down GEMV stages its weights during it) at the rows its cells certify, in any graph or eager step;
     otherwise the Triton kernel (``m3_silu_and_mul``). Indexer kdev17 (TP2 chain): -0.69 us per dense layer vs the
     Triton kernel. Every decline is logged once."""
     path = DENSE_SWIGLU_CPP_PATH
     rows = gu.shape[0]
-    max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS)
+    max_rows = max(cell.spec["rows"] for cell in m3_dense_swiglu.CELLS_BY_TP[2])
     params = (core.swiglu_alpha, core.swiglu_limit, core.swiglu_beta)
     act = None
     if rows > max_rows:
@@ -2207,7 +2091,12 @@ def _dense_swiglu(core, gu: torch.Tensor) -> torch.Tensor:
         uncovered(path, f"activation parameters {params}")
     else:
         act = m3_dense_swiglu(
-            gu, core.swiglu_limit, core.swiglu_alpha, core.swiglu_beta, get_env_enable_pdl()
+            gu,
+            core.swiglu_limit,
+            core.swiglu_alpha,
+            core.swiglu_beta,
+            get_env_enable_pdl(),
+            tp_size=2,
         )
         if act is None:
             uncovered(path, "the gate_up layout")
@@ -2225,31 +2114,9 @@ def _fp8_index_qk_norm_rope(
     """The index branch of an unfused sparse layer: index-Q in FP8 out, index-K into the FP8 index-K cache, normed and
     roped in one kernel (the built-in ``_fused_fp8_index_qk_norm_rope``). ``msa_idx_k_cache`` / ``msa_out_cache_loc``
     are the calling target's ``step_args`` entries."""
-    if position_ids is None or idx_qk.dtype != torch.bfloat16:
-        raise NotImplementedError(
-            "MiniMax-M3 fused FP8 indexer requires BF16 activations and position_ids."
-        )
-    index_k_cache = msa_idx_k_cache(i)
-    if index_k_cache.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "MiniMax-M3 fused FP8 indexer requires an E4M3 index-K cache, "
-            f"got {index_k_cache.dtype}."
-        )
-    rows = int(idx_qk.shape[0])
-    _record("m3_fp8_indexer_qk_norm_rope", rows)
-    return m3_fp8_indexer_qk_norm_rope(
-        idx_qk.contiguous(),
-        index_k_cache,
-        msa_out_cache_loc[:rows],
-        core.index_heads,
-        core.index_dim,
-        core.rotary_dim,
-        core.rms_eps,
-        core.w[f"l{i}_idx_q_norm"],
-        core.w[f"l{i}_idx_k_norm"],
-        core.rope_theta,
-        position_ids.reshape(-1).contiguous().to(torch.int32),
-    ).flatten(1)
+    return _modeling_support._fp8_index_qk_norm_rope(
+        _SUPPORT_TARGET, core, i, idx_qk, position_ids, msa_idx_k_cache, msa_out_cache_loc
+    )
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -4225,6 +4092,7 @@ class DecodeTarget:
                 qlen,
                 split_k,
                 early,
+                runner=_index_score_kernel.IndexScoreRunner,
             )
             taken(INDEX_SCORE_PATH, rows)
         else:
@@ -4627,8 +4495,8 @@ class M3Eagle3Draft(nn.Module):
     (``ops/gemm/m3_draft_lowm``, the TP8 port) at the rows ``DRAFT_LOWM`` covers, compiled before the warmup
     (``prebuild_linears``); every other call is the in-tree cuBLAS GEMM. Rubin TP2 (mclk locked, 4 rotating sets) at
     1 row: qkv 13.18 -> 9.71, o 7.17 -> 5.33, gate_up 22.27 -> 17.70, down 12.52 -> 9.76, fc 21.50 -> 17.77 us. The
-    split-K ('s') tactics run this target's copy of FlashInfer's kernel (``ops/m3_lowm_splitk``, bit for bit the
-    same output); with ``DRAFT_AR_PUSH`` the o_proj and down projection of the fused draft loop also push their rows
+    split-K ('s') tactics run the shared FlashInfer kernel (``kernels/gemm/m3_lowm_splitk``, bit for bit the
+    same output); with ``DRAFT_AR_PUSH`` the o_proj and down projection of the fused draft loop push their rows
     into the drafter boundary all-reduce's exchange (``arm_push`` / ``take_pushed``), as do the direct ('d') 1-row
     linears through this target's copy of the direct kernel (``ops/m3_lowm_direct``; o_proj 9.22 -> 8.09 us,
     down 13.81 -> 12.72 us per 1-row boundary).
@@ -4803,8 +4671,11 @@ class M3Eagle3Draft(nn.Module):
     def prebuild_linears(self) -> int:
         """Compile (and run once) every covered row count of every drafter projection, outside capture, on the
         current stream, before the executor's warmup. Returns the number of calls compiled."""
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.gemm.m3_lowm_splitk import (
+            compile_push,
+        )
+
         from .ops.m3_lowm_direct import compile_direct_push
-        from .ops.m3_lowm_splitk import compile_push
 
         use_pdl = get_env_enable_pdl()
         built = 0
@@ -4900,7 +4771,7 @@ class M3Eagle3Draft(nn.Module):
 
     def mlp(self, h: torch.Tensor, reduce: bool, cpp_silu: bool = False) -> torch.Tensor:
         """gate_up, the plain SwiGLU, down (all-reduced unless ``reduce`` is False). ``cpp_silu`` (the fused draft
-        loop): the SwiGLU on this target's C++ op (``ops/spec/m3_draft_silu``, minimaxM3Sm107Tp2/siluAndMul.cu), bit
+        loop): the SwiGLU on this target's C++ op (``ops/spec/m3_draft_silu``, minimaxM3Sm107/siluAndMul.cu), bit
         for bit the in-tree Triton silu_and_mul in one launch either way (no Triton on the GEN decode path)."""
         gu = self.linear(h, "gu")
         act = None
@@ -4968,41 +4839,14 @@ def _eagle3_capture(spec_metadata, layer_id: int, hidden_states, residual, captu
     in-tree capture's bf16 add, then the in-tree fc_norm arithmetic), which the fused first drafter inputs read as is;
     otherwise it is the in-tree capture.
     """
-    if capture_norm is None:
-        spec_metadata.maybe_capture_hidden_states(layer_id, hidden_states, residual)
-        return
-    for i, captured_layer_id in enumerate(spec_metadata.layers_to_capture):
-        if captured_layer_id == layer_id:
-            assert spec_metadata.hidden_states is not None
-            num_tokens = spec_metadata.num_capture_tokens
-            if num_tokens > spec_metadata.hidden_states.shape[0]:
-                raise RuntimeError(
-                    "EAGLE3 hidden-state capture token count exceeds buffer capacity: "
-                    f"num_tokens={num_tokens}, capacity={spec_metadata.hidden_states.shape[0]}"
-                )
-            if num_tokens > hidden_states.shape[0]:
-                raise RuntimeError(
-                    "EAGLE3 hidden-state capture token count exceeds available hidden states: "
-                    f"num_tokens={num_tokens}, hidden_states={hidden_states.shape[0]}"
-                )
-            hidden_size = spec_metadata.hidden_size
-            m3_spec_tail.capture_norm(
-                hidden_states[:num_tokens],
-                residual[:num_tokens] if residual is not None else None,
-                capture_norm[0][i],
-                capture_norm[1],
-                spec_metadata.hidden_states[:num_tokens, i * hidden_size : (i + 1) * hidden_size],
-            )
-            break
+    return _modeling_support._eagle3_capture(
+        _SUPPORT_TARGET, spec_metadata, layer_id, hidden_states, residual, capture_norm
+    )
 
 
 def _sharded_head(lm_head: nn.Module) -> bool:
     """A vocab-sharded TP head without padding (the fused kernels read the local shard)."""
-    return (
-        getattr(lm_head, "tp_mode", None) == TensorParallelMode.COLUMN
-        and getattr(lm_head, "padding_size", 0) == 0
-        and getattr(lm_head, "tp_size", 1) > 1
-    )
+    return _modeling_support._sharded_head(_SUPPORT_TARGET, lm_head)
 
 
 class _M3ShardDraftLogits(nn.Module):
@@ -5219,6 +5063,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 max_draft_len=runtime_draft_len,
             )
 
+        next_new_tokens = None
         if self._uses_external_shared_target_kv:
             next_draft_tokens = self._forward_external_shared_target_kv_draft_loop(
                 position_ids=position_ids,
@@ -5232,6 +5077,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size=batch_size,
             )
         else:
+            # Retain the pre-draft tensor before metadata is replaced, as in the parent worker.
+            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
             # Save the old attn_metadata and spec_metadata
             self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
@@ -5254,7 +5101,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
             # Get the draft KV cache manager if using separate layouts
             draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            next_draft_tokens = self._forward_draft_loop(
+            next_draft_tokens, next_new_tokens = self._forward_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -5266,6 +5113,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
                 resource_manager,
+                accepted_tokens,
+                pre_draft_seq_lens,
             )
             # restore attn_metadata to support cuda graph
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -5277,7 +5126,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         if self._m3_next_new_tokens is not None:
             # Filled in place by the fused verify or the seed (column 0) and the fused draft passes (columns 1..).
             next_new_tokens = self._m3_next_new_tokens
-        else:
+        elif next_new_tokens is None:
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
                 next_draft_tokens,
@@ -5958,11 +5807,13 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         num_accepted_tokens,
         original_all_rank_num_tokens,
         resource_manager,
+        accepted_tokens,
+        pre_draft_seq_lens,
     ):
         """The fused draft loop on a step it covers (``_m3_fused_loop_ok``), else the in-tree loop (W2b: drafting from
         the head's local shard where ``_m3_wide_draft_logits_ok``)."""
         if self._m3_fused_loop_ok(attn_metadata, spec_metadata, batch_size, draft_model):
-            return self._m3_fused_draft_loop(
+            next_draft_tokens = self._m3_fused_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -5971,6 +5822,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 batch_size,
                 num_accepted_tokens,
             )
+            return next_draft_tokens, None
         # W2b: on a step the fused loop declines, the drafter head returns this rank's BF16 vocab shard (not the
         # gathered fp32 logits), so the greedy top-1 runs the fused shard argmax (greedy_sample_draft_with_tp_gather).
         swap = self._m3_wide_draft_logits_ok(spec_metadata, draft_model)
@@ -5990,6 +5842,8 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
                 resource_manager,
+                accepted_tokens,
+                pre_draft_seq_lens,
             )
         finally:
             if swap:
@@ -6167,40 +6021,7 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
 def _build_speculation(shell, model_config: ModelConfig):
     """The drafter config, the drafter and the worker of one-model Eagle3 (the in-tree one-engine construction for
     the llama3 drafter architecture)."""
-    spec = model_config.spec_config
-    if (
-        not spec.spec_dec_mode.use_one_engine()
-        or not spec.spec_dec_mode.is_eagle3_one_model()
-        or spec.eagle3_model_arch != "llama3"
-        or getattr(spec, "use_dynamic_tree", False)
-    ):
-        raise ValueError(
-            "this MiniMax-M3 target speculates with linear one-model Eagle3 (llama3 drafter) only"
-        )
-    draft_config = ModelConfig.from_pretrained(
-        spec.speculative_model,
-        trust_remote_code=True,
-        attn_backend=model_config.attn_backend,
-        moe_backend=_get_requested_draft_moe_backend(model_config, spec),
-        mapping=model_config.mapping,
-        spec_config=model_config.spec_config,
-        max_num_tokens=model_config.max_num_tokens,
-        moe_max_num_tokens=model_config.moe_max_num_tokens,
-    )
-    _set_draft_kv_cache_quant_algo(draft_config, model_config)
-    draft_config.extra_attrs = model_config.extra_attrs
-    use_separate = should_use_separate_draft_kv_cache(spec)
-    draft = M3Eagle3Draft(
-        shell.model,
-        draft_config,
-        model_config.pretrained_config.num_hidden_layers,
-        spec.num_capture_layers,
-    )
-    worker = M3Eagle3Worker(spec, model_config.mapping, use_separate_draft_kv_cache=use_separate)
-    worker.set_draft_model(draft)
-    shell.epilogue.append(draft)
-    shell.epilogue.append(worker)
-    return draft_config, draft, worker, use_separate
+    return _modeling_support._build_speculation(_SUPPORT_TARGET, shell, model_config)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -6451,3 +6272,6 @@ class ModelingV2MiniMaxM3Nvfp4Sm107Tp2(
             # at its tail (one launch inside the step graph).
             spec_fold.store_in_forward(outputs)
         return outputs
+
+
+_SUPPORT_TARGET = cast(_modeling_support.PinnedModelingSupport, sys.modules[__name__])

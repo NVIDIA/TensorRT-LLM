@@ -33,6 +33,9 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
     SHARED_DOWN,
     SHARED_GATE_UP,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.m3_index_score import (  # noqa: E501
+    IndexScoreRunner as TargetIndexScoreRunner,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp4.ops.mx_gemv import (  # noqa: E501
     op as mx_gemv,
 )
@@ -311,5 +314,6 @@ def test_scorer_after_prebuild_never_compiles(monkeypatch, indexer_kv_dtype) -> 
             qlen,
             split_k,
             early,
+            runner=TargetIndexScoreRunner,
         )
     torch.cuda.synchronize()

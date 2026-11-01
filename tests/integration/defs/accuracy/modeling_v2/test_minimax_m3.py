@@ -26,6 +26,8 @@ GSM8K without speculation and with one-model Eagle3, where a chat-GSM8K acceptan
 """
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -44,6 +46,7 @@ from tensorrt_llm.quantization import QuantAlgo
 
 from ...conftest import llm_models_root
 from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ._env import scoped_env_overrides
 
 # The targets assert their own SM at construction: certification is per GPU architecture.
 skip_not_sm103 = pytest.mark.skipif(
@@ -77,33 +80,38 @@ class _MiniMaxM3Target(LlmapiAccuracyTestHarness):
     EAGLE_PATH = f"{llm_models_root()}/MiniMax-M3-EAGLE3-GQA"
     TP = 4
 
-    def _llm(self, eagle3: bool) -> LLM:
+    @contextmanager
+    def _llm(self, eagle3: bool) -> Iterator[LLM]:
         spec = (
             Eagle3DecodingConfig(max_draft_len=3, speculative_model=self.EAGLE_PATH)
             if eagle3
             else None
         )
-        return LLM(
-            self.MODEL_PATH,
-            tensor_parallel_size=self.TP,
-            moe_expert_parallel_size=1,
-            kv_cache_config=KvCacheConfig(
-                free_gpu_memory_fraction=0.6, enable_block_reuse=False, dtype="nvfp4"
-            ),
-            sparse_attention_config=MiniMaxM3SparseAttentionConfig(
-                implementation="msa", indexer_kv_dtype="fp8", fuse_qkv_index_projection=True
-            ),
-            moe_config=MoeConfig(backend="TRTLLM"),
-            max_seq_len=4096,
-            max_batch_size=64,
-            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
-            speculative_config=spec,
-            enable_iter_perf_stats=eagle3,
-            max_stats_len=5000,
-            trust_remote_code=True,
-            modeling_v2="require",
-            env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-        )
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                tensor_parallel_size=self.TP,
+                moe_expert_parallel_size=1,
+                kv_cache_config=KvCacheConfig(
+                    free_gpu_memory_fraction=0.6, enable_block_reuse=False, dtype="nvfp4"
+                ),
+                sparse_attention_config=MiniMaxM3SparseAttentionConfig(
+                    implementation="msa", indexer_kv_dtype="fp8", fuse_qkv_index_projection=True
+                ),
+                moe_config=MoeConfig(backend="TRTLLM"),
+                max_seq_len=4096,
+                max_batch_size=64,
+                cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=64),
+                speculative_config=spec,
+                enable_iter_perf_stats=eagle3,
+                max_stats_len=5000,
+                trust_remote_code=True,
+                modeling_v2="require",
+                env_overrides=rank_env,
+            ) as llm,
+        ):
+            yield llm
 
     def _gsm8k(self, eagle3: bool) -> None:
         with self._llm(eagle3) as llm:

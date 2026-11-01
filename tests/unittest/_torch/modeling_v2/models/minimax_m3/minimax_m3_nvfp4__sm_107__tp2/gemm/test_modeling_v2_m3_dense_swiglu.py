@@ -13,7 +13,7 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (  # noqa: E501
     modeling,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_dense_swiglu import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_dense_swiglu import (  # noqa: E501
     ALPHA,
     BETA,
     LIMIT,
@@ -38,7 +38,7 @@ def _triton(x: torch.Tensor) -> torch.Tensor:
 
 
 def _op(x: torch.Tensor, pdl: bool = True) -> torch.Tensor:
-    out = m3_dense_swiglu(x, LIMIT, ALPHA, BETA, pdl)
+    out = m3_dense_swiglu(x, LIMIT, ALPHA, BETA, pdl, tp_size=2)
     assert out is not None, "the op declined a contiguous bf16 [rows, 2d] input"
     return out
 
@@ -124,14 +124,14 @@ def test_dense_shape_eager_and_graph_are_bitwise_the_triton_kernel(rows: int, pd
 
 def test_the_op_declines_other_parameters_and_layouts() -> None:
     x = torch.zeros(2, 2 * DENSE_D, dtype=torch.bfloat16, device="cuda")
-    assert m3_dense_swiglu(x, 8.0, ALPHA, BETA, True) is None
-    assert m3_dense_swiglu(x, LIMIT, 1.0, BETA, True) is None
-    assert m3_dense_swiglu(x, LIMIT, ALPHA, 0.0, True) is None
-    assert m3_dense_swiglu(x.float(), LIMIT, ALPHA, BETA, True) is None
-    assert m3_dense_swiglu(x[:, : 2 * DENSE_D - 2], LIMIT, ALPHA, BETA, True) is None
+    assert m3_dense_swiglu(x, 8.0, ALPHA, BETA, True, tp_size=2) is None
+    assert m3_dense_swiglu(x, LIMIT, 1.0, BETA, True, tp_size=2) is None
+    assert m3_dense_swiglu(x, LIMIT, ALPHA, 0.0, True, tp_size=2) is None
+    assert m3_dense_swiglu(x.float(), LIMIT, ALPHA, BETA, True, tp_size=2) is None
+    assert m3_dense_swiglu(x[:, : 2 * DENSE_D - 2], LIMIT, ALPHA, BETA, True, tp_size=2) is None
 
 
-@pytest.mark.parametrize("cell", m3_dense_swiglu.CELLS, ids=lambda c: c.why)
+@pytest.mark.parametrize("cell", m3_dense_swiglu.CELLS_BY_TP[2], ids=lambda c: c.why)
 def test_every_cell_is_bitwise_the_triton_kernel(cell) -> None:
     """Each declared cell (the dense MLP's activation at its decode rows) through the op, bit for bit the Triton
     kernel on gate_up rows in a GEMV output's range plus values past the clamps."""

@@ -7,8 +7,9 @@ from __future__ import annotations
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
-
-from ..m3_force_vec import force_vec_req_kernel
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.kernels.spec.m3_force_vec import (
+    force_vec_req_kernel,
+)
 
 
 class M3ForceVecReq(OpWrapper):

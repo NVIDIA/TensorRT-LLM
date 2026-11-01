@@ -74,7 +74,7 @@ def draft_linear(
     weight: torch.Tensor, x: torch.Tensor, bias: Optional[torch.Tensor]
 ) -> Optional[torch.Tensor]:
     """x [M, K] @ weight^T through the low-M kernel when the target covers it (``prebuild``'s keys); None for the
-    plain GEMM. The split-K ('s') tactics run this target's copy of FlashInfer's kernel (ops/m3_lowm_splitk, bit
+    plain GEMM. The split-K ('s') tactics run the shared FlashInfer kernel (kernels/gemm/m3_lowm_splitk, bit
     for bit the same output at every certified cell), which also carries the drafter-boundary push epilogue."""
     if bias is not None or x.dim() != 2:
         return None
@@ -135,7 +135,7 @@ def prebuild(weights: Iterable[torch.Tensor], keys: Iterable[Tuple[Tuple[int, in
             if kind == "s":
                 # The push variant a boundary all-reduce may arm (o_proj / down): compiled only, never run here
                 # (its pushes need the all-reduce's exchange and a matching call).
-                from .m3_lowm_splitk import compile_push
+                from ...kernels.gemm.m3_lowm_splitk import compile_push
 
                 compile_push(x, weight.t(), out, use_pdl, tactic)
             _BUILT.add((n, k, m, use_pdl))

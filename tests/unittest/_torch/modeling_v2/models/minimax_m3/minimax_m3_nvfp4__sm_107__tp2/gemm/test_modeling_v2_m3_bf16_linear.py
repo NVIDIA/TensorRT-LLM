@@ -7,7 +7,7 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2.ops.gemm.m3_bf16_linear import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.gemm.m3_bf16_linear import (  # noqa: E501
     m3_bf16_linear as op,
 )
 
@@ -18,7 +18,7 @@ if not torch.cuda.is_available():
     pytest.skip("m3_bf16_linear requires a CUDA device", allow_module_level=True)
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:48] for c in op.CELLS])
+@pytest.mark.parametrize("cell", op.CELLS_BY_TP[2], ids=[c.why[:48] for c in op.CELLS_BY_TP[2]])
 def test_certified_cells(cell) -> None:
     """Accumulation order (cuBLAS split-K) then one bf16 rounding on both sides: at most 2 units of ULP[bf16] of the
     row, RMS well under one; measured on GB300: worst 0.5 unit."""

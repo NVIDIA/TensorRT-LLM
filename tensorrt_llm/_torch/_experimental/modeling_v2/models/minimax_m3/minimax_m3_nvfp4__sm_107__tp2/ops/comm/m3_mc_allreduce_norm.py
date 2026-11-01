@@ -4,85 +4,23 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 
 import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import OpWrapper as OpWrapper
 
-_E4M3_MAX = 448.0
-
-
-def mxfp8_rows(normed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """MXFP8 of BF16 rows as ``trtllm::mxfp8_quantize(normed, True)``: E4M3 [M, H] and 128x4-swizzled UE8M0 bytes.
-
-    One scale per 32 columns, the smallest power of two at or above ``amax / 448`` (biased exponent, round up),
-    data = row / scale rounded to nearest E4M3. The scale buffer is padded to 128 rows, padding bytes left as the
-    op leaves them (the comparison masks them out).
-    """
-    m, h = normed.shape
-    blocks = normed.float().view(m, h // 32, 32)
-    amax = blocks.abs().amax(-1)
-    bits = (amax / _E4M3_MAX).view(torch.int32)
-    byte = (((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) > 0).to(torch.int32)).clamp(0, 254)
-    scale = torch.exp2(byte.float() - 127.0).unsqueeze(-1)
-    data = torch.where(amax.unsqueeze(-1) != 0, blocks / scale, torch.zeros_like(blocks))
-    data = data.view(m, h).to(torch.float8_e4m3fn)
-    return data, swizzle_sf(byte.to(torch.uint8))
+from ....ops.comm.reference import _E4M3_MAX as _E4M3_MAX
+from ....ops.comm.reference import McAllreduceNormReference
+from ....ops.comm.reference import boundary as boundary
+from ....ops.comm.reference import mxfp8_rows as mxfp8_rows
+from ....ops.comm.reference import sf_written as sf_written
+from ....ops.comm.reference import swizzle_sf as swizzle_sf
 
 
-def swizzle_sf(byte: torch.Tensor) -> torch.Tensor:
-    """Scatter [rows, H / 32] scale bytes into the 128x4-swizzled buffer the op writes (zero padding)."""
-    rows, cols = byte.shape
-    padded_rows = (rows + 127) // 128 * 128
-    r = torch.arange(rows, device=byte.device).view(-1, 1)
-    c = torch.arange(cols, device=byte.device).view(1, -1)
-    index = (
-        (c % 4) + (c // 4) * 512 + (r % 32) * 16 + ((r % 128) // 32) * 4 + (r // 128) * (128 * cols)
-    )
-    out = torch.zeros(padded_rows * cols, dtype=torch.uint8, device=byte.device)
-    out[index.reshape(-1)] = byte.reshape(-1)
-    return out
-
-
-def sf_written(rows: int, cols: int, device) -> torch.Tensor:
-    """Mask of the swizzled scale bytes the op writes for ``rows`` rows (the padding rows are left unwritten)."""
-    return swizzle_sf(torch.ones(rows, cols, dtype=torch.uint8, device=device)).bool()
-
-
-def boundary(
-    partials: Sequence[torch.Tensor],
-    residual: torch.Tensor,
-    norm_w: torch.Tensor,
-    eps: float,
-    quant: bool,
-    drafter: bool = False,
-) -> tuple[torch.Tensor, ...]:
-    """The boundary arithmetic once each rank's BF16 partial is known (shared with the finalize entry).
-
-    ``drafter``: the Eagle3 drafter boundary (opts bit 16), whose stock is a plain BF16 all-reduce, then FlashInfer
-    fused_add_rmsnorm: the RMS statistic and the normalization take the unrounded FP32 sum bf16(rank sum) + residual;
-    only the stored residual is rounded to BF16.
-
-    The stock rounding points of this target (a BF16 all-reduce, then the fused residual add + RMSNorm): ranks are
-    summed in FP32 in rank order and rounded to BF16, the residual added and rounded to BF16 again; the RMS statistic
-    and the normalization are done in float64 and rounded to BF16 once.
-    """
-    total = torch.zeros(partials[0].shape, dtype=torch.float32, device=residual.device)
-    for p in partials:
-        total = total + p.float()
-    pre = total.to(torch.bfloat16).float() + residual.float()
-    updated = pre.to(torch.bfloat16)
-    u = pre.double() if drafter else updated.double()
-    inv = torch.rsqrt(u.pow(2).mean(-1, keepdim=True) + eps)
-    normed = (u * inv * norm_w.double()).to(torch.bfloat16)
-    if not quant:
-        return normed, updated
-    return (normed, updated, *mxfp8_rows(normed))
-
-
-class M3McAllreduceNorm(OpWrapper):
+class M3McAllreduceNorm(McAllreduceNormReference):
     """One TP group's boundary: ``updated = bf16(residual + bf16(sum_r bf16(x_r + x2_r)))``, ``normed =
     RMSNorm(updated)``: bitwise the stock all-reduce + fused residual RMSNorm (+ mxfp8_quantize) of SM107 TP2.
 
@@ -251,29 +189,6 @@ class M3McAllreduceNorm(OpWrapper):
             cap_w,
             cap_eps,
         )
-
-    def reference(
-        self,
-        per_rank_x: Sequence[torch.Tensor],
-        per_rank_x2: Optional[Sequence[torch.Tensor]],
-        residual: torch.Tensor,
-        norm_w: torch.Tensor,
-        eps: float,
-        quant: bool,
-        drafter: bool = False,
-    ) -> tuple[torch.Tensor, ...]:
-        """The boundary the group is supposed to compute (``drafter``: the opts-16 drafter boundary).
-
-        The documented collective exception: it takes every rank's ``x`` (and ``x2``) in rank order, not the calling
-        rank's. Each rank's partial is ``bf16(x + x2)`` (``x`` alone without ``x2``), whatever pushed it.
-        """
-        partials = []
-        for r, x in enumerate(per_rank_x):
-            if per_rank_x2 is None:
-                partials.append(x)
-            else:
-                partials.append((x.float() + per_rank_x2[r].float()).to(torch.bfloat16))
-        return boundary(partials, residual, norm_w, eps, quant, drafter)
 
     def is_valid(
         self,

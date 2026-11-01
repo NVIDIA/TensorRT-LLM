@@ -5,7 +5,10 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.ops.spec.m3_capture_norm import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (
+    CELLS_BY_TP as M3_CAPTURE_NORM_CELLS_BY_TP,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.spec.m3_capture_norm import (  # noqa: E501
     m3_capture_norm as op,
 )
 
@@ -37,7 +40,9 @@ def _case(spec, seed):
     return (h, r, w, EPS, dst), buf
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize(
+    "cell", M3_CAPTURE_NORM_CELLS_BY_TP[8], ids=[c.why[:44] for c in M3_CAPTURE_NORM_CELLS_BY_TP[8]]
+)
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Within one bf16 ulp per element on at most 0.1% of the elements; the other layer slots of the buffer
     untouched."""
@@ -51,7 +56,7 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
 
 
 def test_guard_refuses_a_strided_weight() -> None:
-    (h, r, w, eps, dst), _ = _case(op.CELLS[0].spec, 1)
+    (h, r, w, eps, dst), _ = _case(M3_CAPTURE_NORM_CELLS_BY_TP[8][0].spec, 1)
     w2 = torch.stack([w, w], dim=1)[:, 0]
     with pytest.raises(AssertionError, match="dense"):
         with validating(op):
