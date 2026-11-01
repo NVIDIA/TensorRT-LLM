@@ -303,10 +303,11 @@ class _GateKernels:
 
 
 def _init_process_group(rank: int, world: int) -> None:
+    """A gloo group over the MPI world; rank 0's host serves the store, on any node."""
     store = None
     if rank == 0:
-        store = dist.TCPStore("0.0.0.0", 0, world, is_master=True, wait_for_workers=False)
-    host = socket.gethostbyname(socket.gethostname())
+        host = socket.gethostbyname(socket.gethostname())
+        store = dist.TCPStore(host, 0, world, is_master=True, wait_for_workers=False)
     host, port = MPI.COMM_WORLD.bcast((host, store.port) if store is not None else None, root=0)
     if store is None:
         store = dist.TCPStore(host, port, world, is_master=False, wait_for_workers=False)
@@ -628,33 +629,35 @@ def _case_alternating_layers(layers: _Layers) -> list:
 def _case_resident_repeat(layers: _Layers) -> list:
     """T1-5 (a, b): repeated routes copy nothing and keep the rows, even a row a test overwrote.
 
-    Rank 1's resident helper row 0 is overwritten with a sentinel; the repeat
-    keeps it, because the relay skips it. Once the table is reset (the weight
-    reload hook), the next call restores the owner's bytes.
+    The first rank that received an expert into helper slot 0 overwrites that
+    row with a sentinel; the repeat keeps it, because the relay skips it. Once
+    the table is reset (the weight reload hook), the next call restores the
+    owner's bytes.
     """
     rank = layers.rank
     main = torch.cuda.Stream()
     failures = []
     routes = layers.routes(0, layers.max_tokens)
     failures += layers.check(0, routes, layers.call(0, routes, main))
-    holds = layers.tables[0][1][0] >= 0
+    holders = [d for d in range(layers.ep) if layers.tables[0][d][0] >= 0]
+    if not holders:
+        return failures + [f"rank {rank}: no rank received an expert, so the case is void"]
+    sentinel_rank = holders[0]
     bound = layers.arenas[0].bound.base
     nbytes = int(bound.plane_bytes[0])
     address = int(bound.local_plane_views[0].data_ptr()) + _HOME_EXPERTS * nbytes
     sentinel = torch.full((nbytes,), 0x5A, dtype=torch.uint8, device=layers.device)
-    if rank == 1 and holds:
+    if rank == sentinel_rank:
         _row(address, nbytes, layers.device).copy_(sentinel)
     torch.cuda.synchronize()
     MPI.COMM_WORLD.Barrier()
     layers.call(0, routes, main)
-    # Rank 1's row holds the sentinel, so only the model is updated here.
+    # The sentinel row no longer holds the expert, so only the model is updated here.
     layers._apply(0, routes)
     if layers.last_copies:
         failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
-    if rank == 1 and holds and not torch.equal(_row(address, nbytes, layers.device), sentinel):
+    if rank == sentinel_rank and not torch.equal(_row(address, nbytes, layers.device), sentinel):
         failures.append(f"rank {rank}: the repeated call rewrote a resident helper row")
-    if not holds:
-        failures.append(f"rank {rank}: rank 1 received no expert, so the sentinel case is void")
     layers.groups[0].forget_helper_residency()
     layers.tables[0] = [[-1] * _HELPER_SLOTS for _ in range(layers.ep)]
     MPI.COMM_WORLD.Barrier()
