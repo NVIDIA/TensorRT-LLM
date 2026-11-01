@@ -99,7 +99,7 @@ def test_forward_core_channel_last_matches_channel_major(ctx_lens, n_dec):
             ),
         )
         md.prepare(attn)
-        mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
+        mixed_qkv, z, a, b, _ = mixer._compute_tokenwise_inputs(x)
         out = mixer.forward_core(mixed_qkv, a, b, attn, md)
         torch.cuda.synchronize()
         return out.float().clone(), conv, ssm

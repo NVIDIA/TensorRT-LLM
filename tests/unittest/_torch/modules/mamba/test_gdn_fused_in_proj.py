@@ -45,7 +45,7 @@ def _make_mixer():
 
 
 def _projections(mixer, x):
-    mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
+    mixed_qkv, z, a, b, _ = mixer._compute_tokenwise_inputs(x)
     return [t.float().clone() for t in (mixed_qkv, z, a, b)]
 
 
@@ -88,7 +88,7 @@ def test_fused_projection_matches_the_two_linears(monkeypatch):
         for name, r, g in zip(("mixed_qkv", "z", "a", "b"), ref, got):
             assert r.shape == g.shape, name
             torch.testing.assert_close(g, r, atol=2e-2, rtol=2e-2, msg=name)
-        mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
+        mixed_qkv, z, a, b, _ = mixer._compute_tokenwise_inputs(x)
         assert a.data_ptr() % 32 == 0 and b.data_ptr() % 32 == 0, (
             "gate slices aligned for the decode kernel"
         )
@@ -118,7 +118,7 @@ def test_in_place_weight_updates_reach_the_fused_weight():
     assert torch.equal(fused_before[b_col : b_col + n], new_ba[:n].to(torch.bfloat16))
     assert torch.equal(fused_before[a_col : a_col + n], new_ba[n:].to(torch.bfloat16))
     x = torch.randn(4, mixer.hidden_size, device="cuda", dtype=torch.bfloat16)
-    _, _, a, b = mixer._compute_tokenwise_inputs(x)
+    _, _, a, b, _ = mixer._compute_tokenwise_inputs(x)
     ref = torch.nn.functional.linear(x, new_ba.to(torch.bfloat16)).float()
     torch.testing.assert_close(b.float(), ref[:, :n], atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(a.float(), ref[:, n:], atol=2e-2, rtol=2e-2)

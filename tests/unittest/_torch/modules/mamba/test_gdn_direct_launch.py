@@ -133,7 +133,7 @@ def test_forward_core_direct_launches_match_generic_entries(monkeypatch, ctx_len
             else:
                 m.setattr(gm, "chunk_gated_delta_rule_indexed_direct", lambda *a, **k: False)
                 m.setattr(gm, "flashinfer_gdn_decode_direct_available", lambda *a: False)
-            mixed_qkv, z, a, b = mixer._compute_tokenwise_inputs(x)
+            mixed_qkv, z, a, b, _ = mixer._compute_tokenwise_inputs(x)
             mixer.forward_core(mixed_qkv, a, b, attn, md, output=out)
         torch.cuda.synchronize()
         return out.float().clone(), conv, ssm
