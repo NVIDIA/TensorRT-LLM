@@ -9,7 +9,8 @@ the existing load-balancer seams: ``manager`` owns the layers and their GPU
 resources for the whole model, ``layer`` is the per-layer handle that plans each
 route and releases its plan, ``arena`` allocates the live-weight storage,
 ``planner`` submits HALO-Q and the TMA copy of its plan, and ``halo_r_planner``
-submits HALO-R and its relay copy.
+submits HALO-R and its relay copy as one kernel behind the same scheduler-group
+contract.
 """
 
 from .layer import PerLayerDynamicMoeLayerLoadBalancer
