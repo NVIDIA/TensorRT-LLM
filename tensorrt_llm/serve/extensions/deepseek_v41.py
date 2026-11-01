@@ -14,13 +14,13 @@
 # limitations under the License.
 """Serving extension for DeepSeek-V4.1 checkpoints (``model_type == "deepseek_v41"``).
 
-Prompts are rendered by the ``deepseek_v41`` custom tokenizer, so the only
-serving behavior declared here is which token runs mark a generation that has
-broken down.
+Preserve namespaces for the checkpoint prompt renderer and declare token runs
+that mark a generation that has broken down.
 """
 
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
+from tensorrt_llm.serve.openai_protocol import NamespacedFunctionToolParam
 from tensorrt_llm.serve.serving_extensions import (
     DegenerateTokens,
     ServingExtension,
@@ -47,3 +47,30 @@ class DeepseekV41ServingExtension(ServingExtension):
         candidates = (pad_token_id, last_vocabulary_id(hf_config))
         token_ids = tuple(dict.fromkeys(i for i in candidates if i is not None))
         return DegenerateTokens(token_ids=token_ids) if token_ids else None
+
+    def serialize_tool(self, tool) -> Dict[str, Any]:
+        """Dump a namespaced tool with its namespace, any other tool as usual.
+
+        The checkpoint's encoder reads a ``namespace`` (name and description)
+        beside ``function``. It shows the tool as ``<namespace>::<name>``, the
+        name the model was trained to call it by, and puts the namespace
+        description in front of the tool's own. A tool without a namespace is
+        dumped exactly as on the generic path.
+        """
+        dumped = tool.model_dump()
+        if not isinstance(tool, NamespacedFunctionToolParam):
+            return dumped
+        if "::" in tool.namespace or "::" in tool.declared_name:
+            # The encoder rejects such a name; the flattened one renders.
+            return dumped
+        function = dumped["function"]
+        function["name"] = tool.declared_name
+        function["description"] = tool.declared_description
+        return {
+            "type": dumped["type"],
+            "namespace": {
+                "name": tool.namespace,
+                "description": tool.namespace_description,
+            },
+            "function": function,
+        }

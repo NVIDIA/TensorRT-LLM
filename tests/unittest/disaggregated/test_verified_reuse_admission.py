@@ -61,7 +61,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
-from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+from tensorrt_llm._torch.disaggregation.transceiver import (
+    KvCacheTransceiverV2,
+    _chunk_bytes_by_kind,
+)
 
 pytestmark = pytest.mark.cpu_only
 
@@ -504,7 +507,7 @@ def _ignored_role_page_table() -> KVCachePageTable:
 
 def _expected_write_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:
     """The receiver-side expectation, exactly as the transceiver computes it."""
-    return KvCacheTransceiverV2._chunk_num_bytes(SimpleNamespace(_page_table=page_table), chunk)
+    return sum(_chunk_bytes_by_kind(page_table, chunk))
 
 
 def _summed_sender_bytes(page_table: KVCachePageTable, chunk: Chunk) -> int:

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -287,10 +287,8 @@ struct CudaDataType<__nv_bfloat16>
 #endif
 
 /// @brief Get the SM version of the current device.
-/// @param queryRealSmArch Whether to query the real SM architecture. example usage: use real sm arch when do LUT tuning
-/// and use fake sm arch when reuse sm120 code on sm121 devices.
 /// @return The SM version of the current device.
-inline int getSMVersion(bool queryRealSmArch = false)
+inline int getSMVersion()
 {
     int device{-1};
     check_cuda_error(cudaGetDevice(&device));
@@ -298,12 +296,7 @@ inline int getSMVersion(bool queryRealSmArch = false)
     int sm_minor = 0;
     check_cuda_error(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
     check_cuda_error(cudaDeviceGetAttribute(&sm_minor, cudaDevAttrComputeCapabilityMinor, device));
-    int sm = sm_major * 10 + sm_minor;
-    if (sm == 121 && !queryRealSmArch)
-    {
-        return 120;
-    }
-    return sm;
+    return sm_major * 10 + sm_minor;
 }
 
 inline bool isSM100Family(std::optional<int> sm = std::nullopt)
@@ -312,6 +305,12 @@ inline bool isSM100Family(std::optional<int> sm = std::nullopt)
     // would still trigger a device query (which throws with no device present).
     int smVersion = sm.has_value() ? *sm : getSMVersion();
     return smVersion >= 100 && smVersion < 110;
+}
+
+inline bool isSM120Family(std::optional<int> sm = std::nullopt)
+{
+    int smVersion = sm.has_value() ? *sm : getSMVersion();
+    return smVersion >= 120 && smVersion < 130;
 }
 
 inline int getDevice()

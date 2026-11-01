@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.custom import fused_compute_probs_from_logits
+from tensorrt_llm._torch.pyexecutor.sampler.ops.triton import selected_raw_logprobs
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import Logprob, ScheduledRequests, TorchSampler
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -575,9 +576,12 @@ def test_logprobs_against_logits(
                 f"Sampled token {sampled_token_id} is not a valid key in the first entry "
                 f"of the generation logprob dict: {list(first_generation_logprob.keys())}"
             )
+            # Context and selected generation logprobs use different FP32 reductions.
             torch.testing.assert_close(
                 last_context_logprob[sampled_token_id].logprob,
                 first_generation_logprob[sampled_token_id].logprob,
+                atol=2e-6,
+                rtol=1e-6,
                 msg=(
                     f"logprob {last_context_logprob[sampled_token_id].logprob} in the last "
                     f"entry of the context logprob dict does not match the corresponding "
@@ -594,6 +598,8 @@ def test_logprobs_against_logits(
                 torch.testing.assert_close(
                     expected_logprob,
                     compare_logprob,
+                    atol=2e-6,
+                    rtol=1e-6,
                     msg=(
                         f"logprob {expected_logprob} does not match the corresponding "
                         f"logprob {compare_logprob} in the other dict for token {token_id}"
@@ -1175,6 +1181,8 @@ class TestLogsprobsInBatchedSampling:
         *,
         seq_slots: list[int],
         draft_lens: list[int],
+        max_new_tokens: int | None = None,
+        is_streaming: bool = False,
     ) -> ScheduledRequests:
         """Build a batch of test requests consumable by sample_async."""
         with torch.inference_mode(True):
@@ -1187,11 +1195,11 @@ class TestLogsprobsInBatchedSampling:
             scheduled_requests.generation_requests = [
                 LlmRequest(
                     request_id=seq_slot,
-                    max_new_tokens=draft_len,
+                    max_new_tokens=draft_len if max_new_tokens is None else max_new_tokens,
                     input_tokens=[],  # not used by tested code
                     sampling_config=SamplingConfig(sampling_params._get_sampling_config()),
                     seq_slot=seq_slot,
-                    is_streaming=False,  # not relevant for tested code
+                    is_streaming=is_streaming,
                     draft_tokens=(  # 'len(.py_draft_tokens)' is inspected by get_draft_token_length
                         torch.testing.make_tensor(
                             (draft_len,),
@@ -1477,6 +1485,24 @@ class TestLogsprobsInBatchedSampling:
             sampler, "_collect_new_requests_for_setup", _eager_collect_new_requests_for_setup
         )
 
+        sample_batched = sampler._sample_batched_by_strategy
+
+        def _check_logprobs_capacity(logits_cuda, requests, **kwargs):
+            result = sample_batched(logits_cuda, requests, **kwargs)
+            if any(req.py_return_log_probs for req in requests):
+                expected_rows = sum(
+                    get_draft_token_length(req) + 1
+                    for req in requests
+                    if req.py_return_log_probs
+                    and req.py_beam_width == 1
+                    and req.py_logprobs_mode == LogprobMode.PROCESSED
+                )
+                assert result.logprobs_cuda.shape == (expected_rows, vocab_size)
+            else:
+                assert result.logprobs_cuda is None
+            return result
+
+        monkeypatch.setattr(sampler, "_sample_batched_by_strategy", _check_logprobs_capacity)
         sampler.setup_sampler_step(mock_requests)
 
         sample_state = sampler.sample_async(
@@ -1492,3 +1518,90 @@ class TestLogsprobsInBatchedSampling:
             model_outputs=model_outputs,
             sampler=sampler,
         )
+
+        requests = mock_requests.all_requests()
+        if len(requests) == 1 and requests[0].py_beam_width > 1 and requests[0].py_return_log_probs:
+            # Keep the request active so logprobs come from the step store rather
+            # than beam-history finalization, which supplies its own token IDs.
+            request = requests[0]
+            active_requests = self._build_mock_requests(
+                sampling_params_list,
+                seq_slots=[request.py_seq_slot],
+                draft_lens=[0],
+                max_new_tokens=2,
+                is_streaming=True,
+            )
+            sampler.store.log_probs_store.sampled_log_prob_indices[request.py_seq_slot].fill_(-1)
+            sampler.setup_sampler_step(active_requests)
+            active_state = sampler.sample_async(
+                active_requests, model_outputs, num_context_logits_prefix_sum=[0]
+            )
+            sampler.update_requests(active_state)
+            assert active_requests.all_requests()[0].state == LlmRequestState.GENERATION_IN_PROGRESS
+            self._validate_logprobs(
+                mock_requests=active_requests, model_outputs=model_outputs, sampler=sampler
+            )
+
+
+def test_selected_raw_logprobs():
+    generator = torch.Generator(device="cuda").manual_seed(123)
+    for vocab_size in (123, 4099, 131072):
+        logits = torch.randn((4, vocab_size + 7), device="cuda", generator=generator)
+        logits = logits[:, :vocab_size]
+        logits[1].zero_()
+        logits[2, ::2] = -torch.inf
+        logits[3].fill_(-torch.inf)
+        logits[3, 0] = 0
+        rows = torch.tensor([2, 1, 0, 2, 3], device="cuda")
+        tokens = torch.tensor([3, 10, 9, 0, 0], device="cuda")
+        reference = logits[rows].log_softmax(-1)
+        sampled = reference.gather(1, tokens[:, None]).squeeze(1)
+        ranks = (reference > sampled[:, None]).sum(-1, dtype=torch.int32)
+        for num_rows, top_k in ((5, 0), (5, 3), (5, 100), (1, 100)):
+            reference_rows = reference[:num_rows]
+            values, actual_ranks, top_values, top_tokens = selected_raw_logprobs(
+                logits, rows[:num_rows], tokens[:num_rows], top_k
+            )
+            torch.testing.assert_close(values, sampled[:num_rows], atol=2e-6, rtol=1e-6)
+            torch.testing.assert_close(actual_ranks, ranks[:num_rows], atol=0, rtol=0)
+            torch.testing.assert_close(
+                top_values, reference_rows.topk(top_k).values, atol=2e-6, rtol=1e-6
+            )
+            torch.testing.assert_close(
+                top_values, reference_rows.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+            )
+            sorted_tokens = top_tokens.sort(-1).values
+            assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()
+
+        sparse_logits = logits[:1].expand(65, -1)
+        values, _, top_values, top_tokens = selected_raw_logprobs(
+            sparse_logits, rows.new_zeros(1), tokens[:1], 100
+        )
+        sparse_reference = logits[:1].log_softmax(-1)
+        torch.testing.assert_close(values, sparse_reference[:, tokens[0]], atol=2e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            top_values, sparse_reference.topk(100).values, atol=2e-6, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            top_values, sparse_reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+        )
+
+    # Sparse selection above 16 rows exercises the 512-token tile top-k path.
+    sparse_logits = torch.randn((65, 4099), device="cuda", generator=generator)
+    sparse_rows = torch.arange(17, device="cuda") * 3
+    sparse_tokens = torch.arange(17, device="cuda") * 7
+    reference = sparse_logits[sparse_rows].log_softmax(-1)
+    sampled = reference.gather(1, sparse_tokens[:, None]).squeeze(1)
+    values, ranks, top_values, top_tokens = selected_raw_logprobs(
+        sparse_logits, sparse_rows, sparse_tokens, 100
+    )
+    torch.testing.assert_close(values, sampled, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        ranks, (reference > sampled[:, None]).sum(-1, dtype=torch.int32), atol=0, rtol=0
+    )
+    torch.testing.assert_close(top_values, reference.topk(100).values, atol=2e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        top_values, reference.gather(1, top_tokens.long()), atol=2e-6, rtol=1e-6
+    )
+    sorted_tokens = top_tokens.sort(-1).values
+    assert (sorted_tokens[:, 1:] != sorted_tokens[:, :-1]).all()

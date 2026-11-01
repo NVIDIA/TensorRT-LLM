@@ -447,7 +447,13 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         conversation = kwargs.get("conversation", messages)
         messages = list(conversation)
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            # The checkpoint's encoder renders tools from the system or developer
+            # message that leads the conversation, after its content.
+            first_role = messages[0].get("role") if messages else None
+            if first_role in ("system", "developer") and not messages[0].get("tools"):
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = _encode_messages(
             messages=messages,

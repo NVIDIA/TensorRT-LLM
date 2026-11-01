@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -48,7 +49,13 @@ from cbts.rules.visual_gen import _is_vg_claim
 pytestmark = pytest.mark.cpu_only
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_CPU_STAGE_NAMES = {"CPU-Generic-x86-1", "CPU-Generic-arm-1"}
+_CPU_STAGE_NAMES = set(
+    re.findall(
+        r'^\s*"(CPU-Generic-[^"]+)":\s*\["cpu",',
+        (_REPO_ROOT / "jenkins/L0_Test.groovy").read_text(),
+        re.MULTILINE,
+    )
+)
 
 
 def _docs_rule() -> DocsRule:
@@ -207,7 +214,6 @@ def test_docs_stage_matches_jenkins_stage_key() -> None:
 @pytest.mark.parametrize(
     "path",
     (
-        "tests/integration/defs/verl/.gitignore",
         "tests/integration/test_lists/qa/.gitignore",
         "tests/unittest/new/nested/.gitignore",
     ),
@@ -575,7 +581,6 @@ def test_out_of_scope_rule_preserves_non_lint_and_ambiguous_toml_impact(
         "cpp/kernels/fmha_v2/.gitignore",
         "cpp/tests/resources/.gitignore",
         "scripts/attribution/sbom/.gitignore",
-        "tests/integration/defs/verl/.gitignore",
         "new/nested/.gitignore",
         ".github/ISSUE_TEMPLATE/01-installation.yml",
         ".github/ISSUE_TEMPLATE/02-new-model.yml",

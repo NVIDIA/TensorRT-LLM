@@ -34,6 +34,7 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
+from .model_config import resolve_top_level_model_type
 # yapf: disable
 from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          MultimodalItemMetadata, _as_cpu_tensor,
@@ -46,7 +47,7 @@ from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
                          validate_mm_inputs)
 # yapf: enable
 from .multimodal_data import MEDIA_MODALITIES, serialize_item
-from .prefix_token_cache import create_prefix_token_cache
+from .prefix_token_cache import PrefixTokenCache, create_prefix_token_cache
 from .tokenization import tokenize_prompt
 
 N = TypeVar("N", bound=Type[nn.Module])
@@ -98,6 +99,14 @@ class InputProcessor(Protocol):
         - Inherit this class and implement the forward() method.
         - Register the inherited class to the model class using @register_input_processor(...)
     """
+
+    supports_token_ids_input: bool = True
+    """Whether pre-tokenized prompts are accepted; encoder-driven processors may opt out."""
+
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Media accepted by this processor instance; text-only by default."""
+        return frozenset()
 
     model_path: any
     config: any
@@ -155,6 +164,15 @@ class BaseMultimodalInputProcessor(ABC):
     processes the multimodal inputs.
     """
 
+    @property
+    def supported_modalities(self) -> frozenset[str]:
+        """Registered modalities, narrowed by checkpoint-specific overrides."""
+        config = getattr(self, "config", None)
+        if config is None:
+            return frozenset()
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_modalities(
+            resolve_top_level_model_type(config))
+
     # Whether multimodal soft-token runs need bidirectional attention spanning
     # the full block. When True, the chunked-prefill scheduler must keep each
     # MM block intact within a single iteration (snap-up or snap-down at chunk
@@ -172,6 +190,15 @@ class BaseMultimodalInputProcessor(ABC):
     # Whether the subclass takes `enable_tokenization_cache` in `__init__` and
     # uses `_init_tokenization_cache` and `_encode_with_tokenization_cache`.
     supports_tokenization_cache: ClassVar[bool] = False
+
+    # Set by `_init_tokenization_cache`; None (no cache) for a processor that
+    # never calls it.
+    _prefix_token_cache: Optional[PrefixTokenCache] = None
+    _prefix_token_cache_tokenizer: Optional[PreTrainedTokenizerBase] = None
+
+    def get_preferred_media_io_kwargs(self) -> dict[str, dict[str, Any]]:
+        """Return per-modality decode defaults, below server and request overrides."""
+        return {}
 
     def get_mm_item_metadata(
         self,
@@ -212,10 +239,18 @@ class BaseMultimodalInputProcessor(ABC):
                                     if enable_tokenization_cache else None)
 
     def _encode_with_tokenization_cache(
-            self, prompt: str,
-            sampling_params: Optional[SamplingParams]) -> Optional[List[int]]:
-        if (self._prefix_token_cache is None or sampling_params is None
-                or sampling_params.add_special_tokens
+        self,
+        prompt: str,
+        sampling_params: Optional[SamplingParams],
+        adds_no_special_tokens: bool = False,
+    ) -> Optional[List[int]]:
+        """Cached ids of `prompt`, or None to tokenize it in full.
+
+        `adds_no_special_tokens`: the caller verified that its tokenizer adds no
+        special tokens, so `add_special_tokens=True` does not change the ids.
+        """
+        if (self._prefix_token_cache is None or sampling_params is None or
+            (sampling_params.add_special_tokens and not adds_no_special_tokens)
                 or sampling_params.truncate_prompt_tokens is not None):
             return None
         return self._prefix_token_cache.encode(
@@ -499,6 +534,16 @@ class BaseMultimodalInputProcessor(ABC):
             f"Cannot determine vocab_size from {self.__class__.__name__}. "
             "Please override this method to provide the vocabulary size. ")
         return None
+
+    def requires_input_placeholders(self, *, tokenized: bool = False) -> bool:
+        """Whether the selected input path needs caller-supplied media markers."""
+        if tokenized and self.supports_token_id_mm_expansion:
+            return True
+        model_type = getattr(type(self), "_registered_model_type", None)
+        if model_type is None:
+            model_type = resolve_top_level_model_type(self.config)
+        return MULTIMODAL_PLACEHOLDER_REGISTRY.get_content_format(
+            model_type) != ContentFormat.PASSTHROUGH
 
     def get_mm_token_ids(self) -> Optional[Tensor]:
         """Token IDs for a logical multimodal unit; include framing tokens for one contiguous span per unit.
@@ -884,6 +929,13 @@ class MultimodalPlaceholderRegistry:
             raise ValueError(f"Model type '{model_type}' is not registered")
         del self._multimodal_placeholder_by_model_type[model_type]
 
+    def get_registered_modalities(self, model_type: str) -> frozenset[str]:
+        """Return registered media types, or an empty set for an unknown model."""
+        self._ensure_provider_imported(model_type)
+        metadata = self._multimodal_placeholder_by_model_type.get(model_type)
+        return frozenset(
+            metadata.placeholder_map) if metadata is not None else frozenset()
+
     def is_valid(self, model_type: str, modality: str) -> bool:
         self._ensure_provider_imported(model_type)
         return model_type in self._multimodal_placeholder_by_model_type and \
@@ -1072,8 +1124,10 @@ def create_input_processor(
     Args:
         model_path_or_dir: Path or repo id used to locate pretrained config/tokenizer.
         tokenizer: Tokenizer instance.
-        checkpoint_format: Checkpoint format identifier. "HF" uses Hugging Face-style
-            config loading; any other value skips HF config loading. Default is "HF".
+        checkpoint_format: Checkpoint format identifier. "HF" and "MX" use Hugging
+            Face-style config loading, because MX loads Hugging Face-format
+            checkpoints; "mistral" and "mistral_large_3" use the native Mistral
+            config; any other value skips HF config loading. Default is "HF".
         trust_remote_code: Whether Hugging Face config/processor loading may run
             model-provided Python code.
         enable_tokenization_cache: Whether the ``DefaultInputProcessor`` caches
@@ -1092,7 +1146,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format == "HF":
+    if checkpoint_format in ("HF", "MX"):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1130,6 +1184,12 @@ def create_input_processor(
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache
+            elif enable_tokenization_cache:
+                logger.warning_once(
+                    f"enable_tokenization_cache is ignored: "
+                    f"{input_processor_cls.__name__} does not support the "
+                    "prefix tokenization cache.",
+                    key="tokenization_cache_unsupported_processor")
             # Input processors build an AutoTokenizer/AutoProcessor with
             # trust_remote_code; doing so copies the checkpoint's .py files
             # into the shared HF module cache non-atomically, and a rank that
@@ -1299,8 +1359,9 @@ def create_input_processor_with_hash(
         positions, and masks on top.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
-        When a UUID is provided for a multimodal item, it will be used as the
-        cache identifier and returned in KV cache events instead of the content hash.
+        When a UUID is provided for a multimodal item, it contributes to the
+        derived cache digest and is preserved as the external identity in KV
+        cache events.
         """
         assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
         mm_data = inputs['multi_modal_data']

@@ -145,11 +145,14 @@ def _prepare_qwen_vl_mrope_config(
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
+    supports_tokenization_cache = True
+
     def __init__(self,
                  model_path: str,
                  config: PretrainedConfig,
                  tokenizer: AutoTokenizer,
                  trust_remote_code: bool = True,
+                 enable_tokenization_cache: bool = False,
                  **kwargs):
         _install_processor_output_validation_filter()
         super().__init__(model_path=model_path,
@@ -160,6 +163,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self._dtype = self._config.torch_dtype
         self._tokenizer = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(
             model_path)
+        # The text-only path tokenizes with special tokens and the cache
+        # without, so their ids match only for a tokenizer that adds none.
+        self._init_tokenization_cache(
+            enable_tokenization_cache
+            and self._tokenizer.num_special_tokens_to_add() == 0,
+            self._tokenizer)
         self._model_path = model_path
         self._processor = AutoProcessor.from_pretrained(
             model_path,
@@ -1284,6 +1293,12 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         # serving the prefill worker re-registers that tensor as a CUDA IPC
         # handle no one ever consumes.
         if not mm_data:
+            # The cache exists only for a tokenizer that adds no special
+            # tokens (__init__), so add_special_tokens cannot change the ids.
+            ids = self._encode_with_tokenization_cache(
+                text_prompt, sampling_params, adds_no_special_tokens=True)
+            if ids is not None:
+                return ids, None
             input_ids = self.tokenizer(text_prompt,
                                        return_tensors="pt").input_ids
             return input_ids[0].to(torch.int32).tolist(), None
@@ -1568,7 +1583,8 @@ class Qwen2_5_VLVisionAttention(Attention):
                    v: Optional[torch.Tensor],
                    position_ids: Optional[torch.IntTensor] = None,
                    position_embeddings: Optional[Tuple[torch.Tensor,
-                                                       torch.Tensor]] = None):
+                                                       torch.Tensor]] = None,
+                   packed_qk: Optional[torch.Tensor] = None):
         seq_len, _ = q.size()
         cos, sin = position_embeddings
 
@@ -1614,6 +1630,15 @@ class Qwen2_5_VLVisionAttention(Attention):
             k.copy_(
                 RotaryEmbedding.apply_rotary_pos_emb(
                     k.unsqueeze(0), cos, sin, unsqueeze_dim=1).squeeze(0))
+        elif packed_qk is not None:
+            # The caller supplies the Q/K prefix of the fused projection, so
+            # its provenance is explicit and the excluded V suffix is untouched.
+            qk = packed_qk.view(1, seq_len, 2 * q.shape[1], self.head_dim)
+            _flash_attn_apply_rotary(qk,
+                                     cos,
+                                     sin,
+                                     interleaved=False,
+                                     inplace=True)
         else:
             # flash_attn Triton kernel: single launch per tensor. cos/sin
             # are expected as `[seqlen, head_dim/2]`. The PyTorch path
@@ -1653,7 +1678,14 @@ class Qwen2_5_VLVisionAttention(Attention):
         q, k, v = qkv, None, None
         q, k, v = self.split_qkv(q, k, v)
 
-        q, k, v = self.apply_rope(q, k, v, position_ids, position_embeddings)
+        packed_qk = (qkv[..., :self.q_size +
+                         self.kv_size] if q.shape == k.shape else None)
+        q, k, v = self.apply_rope(q,
+                                  k,
+                                  v,
+                                  position_ids,
+                                  position_embeddings,
+                                  packed_qk=packed_qk)
         reuse_qkv = False
         if self.support_fused_qkv:
             # Only reuse the projection when RoPE preserves every original
