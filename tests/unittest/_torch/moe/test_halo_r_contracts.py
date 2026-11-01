@@ -761,6 +761,49 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready():
     assert "cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes)" in prepare
 
 
+def test_every_scheduler_role_failure_traps_the_launch():
+    """Each wait of the scheduler role that times out, and the planner, fails the launch the same way.
+
+    A failure that returned instead of trapping would leave MAIN waiting for
+    a route release that never comes.
+    """
+    kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
+    reasons = re.findall(r'return RoleResult\{"([^"]+)", [^}]+\};', kernel_source)
+    assert sorted(reasons) == sorted(
+        [
+            "READY drain timeout",
+            "count exchange timeout",
+            "planner status",
+            "worker rendezvous timeout",
+            "plan wait timeout",
+            "route prefix wait timeout",
+            "grid rendezvous timeout",
+        ]
+    )
+    # Every RoleResult reaches the kernel through schedulerRole, which returns its roles' results.
+    assert re.findall(r"\b(planAndPublish|mapRoutes)\(p, epoch\)", kernel_source) == [
+        "planAndPublish",
+        "mapRoutes",
+    ]
+    role = _function_body(kernel_source, "RoleResult schedulerRole(")
+    _assert_in_order(
+        role,
+        (
+            'return RoleResult{"grid rendezvous timeout", 0};',
+            "return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);",
+        ),
+    )
+    assert kernel_source.count("schedulerRole(p)") == 1
+    # The kernel traps on any failure and returns before the route release.
+    kernel = _function_body(kernel_source, "void haloRFusedKernel(")
+    assert re.search(
+        r"if \(role\.reason != nullptr\)\s*\{\s*trapLaunch\(p, role\.reason, role\.detail\);\s*return;\s*\}",
+        kernel,
+    )
+    trap = _function_body(kernel_source, "void trapLaunch(")
+    assert 'asm volatile("trap;" ::: "memory");' in trap
+
+
 def test_no_timing_probe_or_programmatic_launch_remains():
     sources = [
         _KERNELS / "moeRebalanceHaloR.cu",
