@@ -24,6 +24,7 @@ import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
     _get_kimi_k3_mxfp8_tuning_buckets,
     _kimi_k3_mxfp8_tuning_bucket,
@@ -78,6 +79,124 @@ def test_forward_matches_bf16(m, out_features, in_features):
     x = torch.randn((m, in_features), device="cuda", dtype=torch.bfloat16)
     out = mod(x)
     _check(out, _ref(x, w), f"m={m} n={out_features} k={in_features}")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
+@pytest.mark.parametrize(
+    "m,n,k", [(m, n, 1536) for m in (1, 8, 32) for n in (128, 512)] + [(8, 512, 2048)]
+)
+def test_fine_grained_mxfp8_preserves_cancellation(m: int, n: int, k: int) -> None:
+    """Keep a representable residual when large K partitions cancel."""
+    x = torch.ones((m, k), device="cuda", dtype=torch.bfloat16)
+    weight = torch.ones((n, k), device="cuda", dtype=torch.bfloat16)
+    weight[:, k // 2 :] = -1
+    weight[:, -1] = -0.5
+    # All operands are exactly representable in E4M3 with power-of-two scales.
+    # The full dot product is 0.5, but rounding large partials to BF16 loses it.
+    activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
+    weight_fp8, weight_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(weight)
+    expected = torch.full((m, n), 0.5, device="cuda", dtype=torch.bfloat16)
+
+    tuner = AutoTuner.get()
+    with tuner.capture() as tactics:
+        actual = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    num_tactics = 0
+    for config in tactics:
+        with tuner.replay(config):
+            actual = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+            )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if m == 8:
+            graph = torch.cuda.CUDAGraph()
+            with tuner.replay(config), torch.cuda.graph(graph):
+                replayed = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                    activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+                )
+            for _ in range(2):
+                graph.replay()
+                torch.testing.assert_close(replayed, expected, rtol=0, atol=0)
+        num_tactics += 1
+    assert num_tactics > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
+@pytest.mark.parametrize("m", [8, 65])
+def test_fine_grained_mxfp8_tactics_match_reference(m: int) -> None:
+    """Check split-plane addressing with distinct rows and columns, including tails."""
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    x = torch.randint(-2, 3, (m, 1536), generator=generator, device="cuda").to(torch.bfloat16)
+    weight = torch.randint(-2, 3, (512, 1536), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    # Integer operands and their dot products are exact in FP8 and FP32,
+    # respectively, so only the final BF16 conversion may round.
+    expected = (x.float() @ weight.float().T).to(torch.bfloat16)
+    activation, activation_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(x)
+    weight_fp8, weight_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(weight)
+    tuner = AutoTuner.get()
+    with tuner.capture() as tactics:
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+        )
+    num_tactics = 0
+    for config in tactics:
+        with tuner.replay(config):
+            first = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+            )
+            second = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+                activation, weight_fp8, activation_scale, weight_scale, fine_grained_m=True
+            )
+        torch.testing.assert_close(first, expected, rtol=0, atol=0)
+        torch.testing.assert_close(second, first, rtol=0, atol=0)
+        num_tactics += 1
+    assert num_tactics > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
+def test_fine_grained_mxfp8_bounds_cached_workspace() -> None:
+    """A tactic selected at a smaller M must respect the runtime memory bound."""
+    n, k = 7168, 7168
+    weight = torch.ones((n, k), device="cuda", dtype=torch.bfloat16)
+    small = torch.ones((512, k), device="cuda", dtype=torch.bfloat16)
+    large = torch.ones((768, k), device="cuda", dtype=torch.bfloat16)
+    weight_fp8, weight_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(weight)
+    small_fp8, small_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(small)
+    large_fp8, large_scale = torch.ops.trtllm.fp8_quantize_1x128_cutedsl_ue8m0(large)
+    tuner = AutoTuner.get()
+    with tuner.capture() as tactics:
+        torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            small_fp8, weight_fp8, small_scale, weight_scale, fine_grained_m=True
+        )
+    for config in tactics:
+        tactic = config[0][1]
+        if tactic[0] == "base" and tactic[-1] == 4:
+            break
+    else:
+        pytest.fail("No split-K=4 tactic available for the smaller workload")
+
+    torch.cuda.synchronize()
+    allocated_before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    with tuner.replay(config):
+        output = torch.ops.trtllm.cute_dsl_mxfp8_gemm_rubin(
+            large_fp8, weight_fp8, large_scale, weight_scale, fine_grained_m=True
+        )
+    torch.cuda.synchronize()
+    temporary_bytes = (
+        torch.cuda.max_memory_allocated()
+        - allocated_before
+        - output.numel() * output.element_size()
+    )
+    assert temporary_bytes <= 64 * 1024 * 1024
+    torch.testing.assert_close(output, torch.full_like(output, k), rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
