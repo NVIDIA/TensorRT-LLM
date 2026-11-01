@@ -80,6 +80,7 @@ def _args() -> SimpleNamespace:
         enable_iter_perf_stats=True,
         guided_decoding_backend=None,
         reasoning_parser=None,
+        num_postprocess_workers=0,
         max_seq_len=100,
         max_batch_size=8,
         max_num_tokens=100,
