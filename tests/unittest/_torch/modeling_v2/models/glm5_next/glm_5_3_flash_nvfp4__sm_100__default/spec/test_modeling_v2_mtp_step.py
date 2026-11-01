@@ -302,3 +302,31 @@ def test_unsupported_speculation_is_refused(overrides, refused):
 def test_supported_speculation_is_admitted():
     _check_speculation(None)
     _check_speculation(MTPDecodingConfig(max_draft_len=3))
+
+
+@pytest.mark.parametrize("greedy", [True, False], ids=["greedy", "sampled"])
+def test_vocab_head_step_matches_stock_worker(greedy):
+    """With a vocab head the step selects from the verify logits' vocab shard (one shard here: the selection
+    kernels and the pair layout are the ones a TP group runs). A greedy batch keeps the shard and flags it; any other
+    batch gathers first. Tokens and drafts match the stock worker on the gathered logits either way."""
+    from tensorrt_llm._torch.modules.embedding import LMHead
+    from tensorrt_llm._torch.modules.linear import TensorParallelMode
+    from tensorrt_llm._torch.speculative.vocab_parallel import VocabParallelHead
+
+    batch = _batch(11, (4,), 3, 3, (3, 0, 2), greedy=greedy)
+    head = LMHead(_VOCAB, _HIDDEN, dtype=torch.float32, mapping=Mapping(),
+                  tensor_parallel_mode=TensorParallelMode.COLUMN, gather_output=True).cuda()  # fmt: skip
+    with torch.no_grad():
+        head.weight.copy_(batch["draft_model"].lm_head.weight)
+    vocab_head = VocabParallelHead(head)
+    stock_in, fused_in = _copy(batch), _copy(batch)
+    fused_in["logits"] = vocab_head.local_logits(
+        batch["hidden_states"][batch["spec_metadata"].gather_ids]
+    )
+    stock = _run_stock(stock_in, 3)
+    fused = Glm5NextMtpStep(Mapping(), _VOCAB, vocab_head)(**fused_in)
+
+    for key in ("new_tokens_lens", "next_draft_tokens", "next_new_tokens"):
+        assert torch.equal(stock[key], fused[key]), key
+    assert fused.get("logits_vocab_shard", False) is greedy
+    assert torch.equal(stock["logits"], fused["logits"])

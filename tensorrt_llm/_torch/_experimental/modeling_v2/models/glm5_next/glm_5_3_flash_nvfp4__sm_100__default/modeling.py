@@ -51,7 +51,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool import (
     glm_kpool_cache_row_dim,
 )
 from tensorrt_llm._torch.attention.backends.utils import create_attention
-from tensorrt_llm._torch.distributed import AllReduceStrategy
+from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
 from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.glm5_next_weight_mapper import (
@@ -79,6 +79,7 @@ from tensorrt_llm._torch.speculative.interface import (
 )
 from tensorrt_llm._torch.speculative.spec_tail_kernels import strict_accept
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
+from tensorrt_llm._torch.speculative.vocab_parallel import VocabParallelHead, _PairExchange
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import async_tensor_h2d
 from tensorrt_llm.logger import logger
@@ -148,6 +149,8 @@ UNCERTIFIED_GENERIC_CALLS = (
     "tensorrt_llm._torch.pyexecutor.sampler.ops.custom",
     "tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer",
     "tensorrt_llm._torch.speculative.spec_tail_kernels.strict_accept",
+    "tensorrt_llm._torch.speculative.vocab_parallel.VocabParallelHead",
+    "tensorrt_llm._torch.speculative.vocab_parallel._PairExchange",
     # The A/B escape hatch's stock MTP-Eagle worker (TLLM_GLM5_NEXT_MTP_STOCK_WORKER=1).
     "tensorrt_llm._torch.speculative.utils.get_spec_worker",
     "tensorrt_llm._torch.distributed.ops.allgather",
@@ -628,7 +631,14 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
                 self.spec_worker.set_target_model(self)
                 self.epilogue.append(self.spec_worker)
             else:
-                self.mtp_step = Glm5NextMtpStep(model_config.mapping, int(text_config.vocab_size))
+                vocab_head = (
+                    _NcclVocabParallelHead(self.lm_head)
+                    if VocabParallelHead.supports(self.lm_head)
+                    else None
+                )
+                self.mtp_step = Glm5NextMtpStep(
+                    model_config.mapping, int(text_config.vocab_size), vocab_head
+                )
             logger.info(
                 "glm5_next MTP step: "
                 + (
@@ -698,9 +708,14 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         if attn_metadata.padded_num_tokens is not None:
             input_ids = input_ids[: attn_metadata.num_tokens]
             position_ids = position_ids[..., : attn_metadata.num_tokens]
-        logits = self.logits_processor.forward(
-            hidden_states[spec_metadata.gather_ids], self.lm_head, attn_metadata, True
-        )
+        vocab_head = None if self.mtp_step is None else self.mtp_step.vocab_head
+        if vocab_head is not None:
+            # This rank's vocab shard of the verify logits; the step selects the target tokens from it.
+            logits = vocab_head.local_logits(hidden_states[spec_metadata.gather_ids])
+        else:
+            logits = self.logits_processor.forward(
+                hidden_states[spec_metadata.gather_ids], self.lm_head, attn_metadata, True
+            )
         if self.spec_worker is not None:
             return self.spec_worker(
                 input_ids=input_ids,
@@ -2528,6 +2543,25 @@ def _check_speculation(spec_config: Any) -> None:
         )
 
 
+class _NcclVocabParallelHead(VocabParallelHead):
+    """Vocab-parallel token selection whose (value, index) pair exchange is a plain NCCL all-reduce.
+
+    The pairs are a few floats per row, so the strategy's latency is what matters, not its bandwidth; NCCL is
+    deterministic in which path it takes on every rank, captures in CUDA graphs, and sums the zero-padded pair buffer
+    exactly. (AUTO may take an opportunistic fast path whose selection during warmup autotuning can differ across
+    ranks, which hangs the group.)
+    """
+
+    def __init__(self, lm_head: nn.Module) -> None:
+        super().__init__(lm_head)
+        mapping = lm_head.mapping
+        self._exchange = _PairExchange(
+            AllReduce(mapping, strategy=AllReduceStrategy.NCCL, dtype=torch.float32),
+            mapping.tp_size,
+            mapping.tp_rank,
+        )
+
+
 class Glm5NextDraftModel(nn.Module):
     """The drafter: the checkpoint's one MTP layer, with the target's LM head and embedding (shared, not copied)."""
 
@@ -2555,9 +2589,15 @@ class Glm5NextMtpStep:
     one CUDA graph with the target.
     """
 
-    def __init__(self, mapping: Mapping, vocab_size: int) -> None:
+    def __init__(
+        self, mapping: Mapping, vocab_size: int, vocab_head: VocabParallelHead | None = None
+    ) -> None:
+        """``vocab_head``: the target LM head's vocab-parallel token selection (tensor parallelism without attention
+        DP). With it the forward hands this step the rank's vocab shard of the verify logits; a greedy batch takes its
+        target and draft tokens from the shards without gathering the vocabulary."""
         self.mapping = mapping
         self.vocab_size = vocab_size
+        self.vocab_head = vocab_head
         self.force_num_accepted_tokens = get_force_num_accepted_tokens_float()
         self._force_pool: torch.Tensor | None = None
         self._force_counter: torch.Tensor | None = None
@@ -2577,7 +2617,9 @@ class Glm5NextMtpStep:
         """Returns ``logits`` (the verify logits, as given), ``new_tokens [B, K+1]`` (accepted tokens; a context
         request defines column 0 only), ``new_tokens_lens [B]`` (1 + accepted drafts), ``next_draft_tokens [B, K]``
         and ``next_new_tokens [B, K+1]`` (each request's last accepted token, then its drafts: the next step's input
-        under the overlap scheduler)."""
+        under the overlap scheduler). With a vocab head, ``logits`` is this rank's vocab shard: a greedy batch returns
+        it as is with ``logits_vocab_shard`` (the engine gathers it only for a logits post-processor), any other
+        batch gathers it first."""
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
         if spec_metadata.is_ragged_verify:
@@ -2588,9 +2630,16 @@ class Glm5NextMtpStep:
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
         draft_len = spec_metadata.runtime_draft_len
-        target_tokens = self._sample_target(logits, spec_metadata)
+        sharded = self.vocab_head is not None
+        if sharded and not spec_metadata.is_all_greedy_sample:
+            logits = self.vocab_head.gather_logits(logits)
+            sharded = False
+        if sharded:
+            target_tokens = self.vocab_head.argmax(logits)
+        else:
+            target_tokens = self._sample_target(logits, spec_metadata)
         if draft_len == 0:
-            return self._without_drafts(logits, target_tokens, batch_size)
+            return self._without_drafts(logits, target_tokens, batch_size, sharded)
 
         if num_gens > 0:
             draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, draft_len)
@@ -2633,13 +2682,16 @@ class Glm5NextMtpStep:
         ]
         next_new_tokens = torch.cat([last_accepted.unsqueeze(1), next_draft_tokens], dim=1)
         attn_metadata.use_spec_decoding = True
-        return {
+        outputs = {
             "logits": logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        if sharded:
+            outputs["logits_vocab_shard"] = True
+        return outputs
 
     # -- acceptance ---------------------------------------------------------
 
@@ -2666,11 +2718,11 @@ class Glm5NextMtpStep:
 
     @staticmethod
     def _without_drafts(
-        logits: torch.Tensor, target_tokens: torch.Tensor, batch_size: int
+        logits: torch.Tensor, target_tokens: torch.Tensor, batch_size: int, sharded: bool
     ) -> dict[str, torch.Tensor]:
         """A step with no drafts (runtime draft length 0): the target token alone."""
         tokens = target_tokens[:batch_size].to(torch.int32).unsqueeze(1)
-        return {
+        outputs = {
             "logits": logits,
             "new_tokens": tokens,
             "new_tokens_lens": torch.ones(batch_size, dtype=torch.int32, device=logits.device),
@@ -2679,6 +2731,9 @@ class Glm5NextMtpStep:
             ),
             "next_new_tokens": tokens.clone(),
         }
+        if sharded:
+            outputs["logits_vocab_shard"] = True
+        return outputs
 
     def _force_accepted(
         self,
@@ -2822,7 +2877,9 @@ class Glm5NextMtpStep:
     def _draft_argmax(self, logits: torch.Tensor) -> torch.Tensor:
         """Each row's draft token: the argmax over the full vocabulary. Under tensor parallelism (without attention
         DP) the head yields this rank's vocabulary shard, so each rank contributes its (global index, max) pair and
-        every rank picks the same global argmax."""
+        every rank picks the same global argmax: through the vocab head's pair exchange when there is one."""
+        if self.vocab_head is not None and logits.shape[-1] == self.vocab_head.shard_width:
+            return self.vocab_head.argmax(logits, out_dtype=torch.int32)
         mapping = self.mapping
         if (
             mapping.tp_size > 1
