@@ -70,7 +70,9 @@ def _use_flashinfer_gdn_prefill() -> bool:
 # Upper bound for each of the two persistent FlashInfer prefill state buffers.
 # Only prefill requests stage their states there, and a batch with more prefill
 # requests than fit runs in sequence groups, so this scratch does not grow with
-# max_num_sequences and take memory from the KV cache.
+# max_num_sequences and take memory from the KV cache. A Qwen3.5-122B-A10B state
+# at TP4 is 16 heads x 128 x 128 x fp32 = 1 MiB, so 32 prefill requests fit;
+# only batches of many short prompts with a large max_num_tokens hold more.
 _PREFILL_STATE_WORKSPACE_BYTES = 32 * 2**20
 
 

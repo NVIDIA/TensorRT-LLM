@@ -415,9 +415,12 @@ def test_state_workspace_smaller_than_batch(capacity, inplace):
     group_sizes = [c.kwargs["cu_seqlens"].shape[0] - 1 for c in call.call_args_list]
     assert sum(group_sizes) == num_seqs and max(group_sizes) - min(group_sizes) <= 1
     assert max(group_sizes) <= capacity
-    # The kernel's arithmetic depends on the batch it runs, so a group matches the
-    # whole-batch call to accumulation error rather than bitwise. These bounds are
-    # far tighter than the adapter's parity tolerances against the Triton kernel.
+    # FlashInfer runs a call on its chunk-parallel kernel when the call has few
+    # sequence-heads for the SM count, and sizes the chunks from the call's tokens
+    # and sequences. A group can therefore run a different kernel or chunking than
+    # one call over the batch, so groups match the whole-batch call to accumulation
+    # error rather than bitwise. These bounds are far tighter than the adapter's
+    # parity tolerances against the Triton kernel.
     torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1.6e-2)
     state_tolerance = dict(atol=2e-3, rtol=1.6e-2)
     if inplace:
