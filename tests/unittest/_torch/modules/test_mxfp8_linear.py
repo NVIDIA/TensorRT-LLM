@@ -75,6 +75,8 @@ def test_mxfp8_dispatch_returns_mxfp8_method(monkeypatch):
     This is a pure dispatch check; no CUDA required.
     """
     monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    # GPUs that can only use FlashInfer default to it; check the native default.
+    monkeypatch.setattr(linear_module, "_mxfp8_flashinfer_only", lambda: False)
     qc = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
     method = get_quant_method(qc)
     assert isinstance(method, MXFP8LinearMethod)
@@ -566,6 +568,28 @@ def test_mxfp8_native_autotuner_rejects_mismatched_k(monkeypatch):
         MXFP8GemmRunner.sync_all_tactic_caches(tuner)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", [None, "flashinfer", "trtllm", "auto"])
+def test_mxfp8_flashinfer_only_gpu_backend(monkeypatch, backend):
+    """Without the native GEMM, FlashInfer is the default and the only accepted backend."""
+    if backend is None:
+        monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", backend)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
+    monkeypatch.setattr(linear_module, "_mxfp8_flashinfer_only", lambda: True)
+    monkeypatch.setitem(sys.modules, "flashinfer", SimpleNamespace(autotune=Mock()))
+    _mock_mxfp8_ops(monkeypatch)
+    if backend in ("trtllm", "auto"):
+        with pytest.raises(ValueError, match="SM100-family GPUs only"):
+            MXFP8LinearMethod()
+    else:
+        method = MXFP8LinearMethod()
+        assert method.use_cutlass
+        assert method.backend == "flashinfer"
+        assert method._flashinfer_mxfp8 is not None
+
+
 def test_mxfp8_rejects_unknown_backend(monkeypatch):
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "unknown")
     with pytest.raises(ValueError, match="TRTLLM_MXFP8_GEMM_BACKEND"):
@@ -607,14 +631,14 @@ def test_mxfp8_linear_reference_matches_dequant():
 def _mxfp8_cutlass_op_available():
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] < 10:
+    if torch.cuda.get_device_capability()[0] != 10:
         return False
     return hasattr(torch.ops.trtllm, "mxfp8_mxfp8_gemm")
 
 
 @pytest.mark.skipif(
     not _mxfp8_cutlass_op_available(),
-    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+    reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
 )
 def test_mxfp8_linear_cutlass_matches_reference():
     """End-to-end CUTLASS path: must agree with the dequant reference."""
@@ -643,7 +667,7 @@ def test_mxfp8_linear_cutlass_matches_reference():
 
 @pytest.mark.skipif(
     not _mxfp8_cutlass_op_available(),
-    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+    reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
 )
 @pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
 def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
@@ -708,7 +732,7 @@ def test_mxfp8_flashinfer_decode_graph_matches_native(monkeypatch, batch_size):
 
 @pytest.mark.skipif(
     not _mxfp8_cutlass_op_available(),
-    reason="MXFP8xMXFP8 GEMM op not compiled or sm < 100",
+    reason="MXFP8xMXFP8 GEMM op not compiled or not SM100 family",
 )
 @pytest.mark.parametrize("batch_size", (1, 8, 16, 32))
 def test_mxfp8_decode_graph_backend_tuning_matches_native(monkeypatch, batch_size):

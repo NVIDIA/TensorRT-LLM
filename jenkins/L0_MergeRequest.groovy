@@ -1880,7 +1880,6 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/test_lists/test-db/l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node8_gpu32.yml",
         "tests/integration/test_lists/test-db/l0_model_express.yml",
         "tests/integration/test_lists/test-db/l0_rtx_pro_6000.yml",
-        "tests/integration/test_lists/test-db/l0_verl.yml",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/moe/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
@@ -3008,6 +3007,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 "nightly-release" :
                                 (env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge"),
                             'register_images': runMode == "nightly_release" || (env.JOB_NAME ==~ /.*PostMerge.*/),
+                            'useWheelFromBuildStage': (env.JOB_NAME ==~ /.*PostMerge.*/),
                             'defaultTag': defaultTag,
                             // Canonical images carry BOLT profiles: the raw build is
                             // published as <tag>-noprofiles and <tag> is produced by the

@@ -8,6 +8,7 @@ authors = [
 license = "Apache-2.0"
 requires-python = ">=3.10,<3.13"
 dependencies = [
+    "filelock (==3.20.3)",
     "accelerate (>=1.7.0)",
     "build (>=1.6.1,<2.0.0)",
     "colored (>=2.3.2,<3.0.0)",
@@ -20,7 +21,7 @@ dependencies = [
     "mpi4py (>=4.1.2,<5.0.0)",
     "numpy (>=2.0.0,<2.4)",
     "graphviz (>=0.21,<0.22)",
-    "openai (>=3.40.0,<4.0.0)",
+    "openai (>=3.42.0,<4.0.0)",
     "polygraphy (>=0.53.6,<0.54.0)",
     "psutil (>=7.2.2,<8.0.0)",
     "nvidia-ml-py (>=13)",
@@ -28,7 +29,7 @@ dependencies = [
     "strenum (>=0.4.15,<0.5.0)",
     "sentencepiece (>=0.1.99)",
     "torch (>=2.14.0a0,<=2.14.0)",
-    "torchvision (>=0.29.1,<0.30.0)",
+    "torchvision (>=0.29.2,<0.30.0)",
     "nvidia-nccl-cu13 (>=2.30.7,<=2.31.2)",
     "nccl4py (>=0.4,<=0.5)",
     "transformers (==5.5.4)",
@@ -56,7 +57,7 @@ dependencies = [
     "patchelf (>=0.19.1.0,<0.20.0.0)",
     "einops (>=0.8.2,<0.9.0)",
     "fla-core (==0.5.2)",
-    "flashinfer-python (==0.6.18)",
+    "flashinfer-python (==0.7.2)",
     "xgrammar (==0.2.8)",
     "llguidance (==0.7.29)",
     "jsonschema (>=4.26.0,<5.0.0)",

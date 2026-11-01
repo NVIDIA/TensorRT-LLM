@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
 
@@ -45,6 +46,43 @@ class _MinimalFmha(Fmha):
         forward_args: AttentionForwardArgs,
     ) -> None:
         pass
+
+
+@pytest.mark.parametrize(
+    "is_cross,update_kv_cache,expected",
+    [(False, False, False), (False, True, True), (True, False, True)],
+)
+def test_fallback_support_matches_thop_kv_update_contract(
+    is_cross: bool, update_kv_cache: bool, expected: bool
+) -> None:
+    attn = FakeAttention()
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
+    forward_args = AttentionForwardArgs(is_fused_qkv=True, update_kv_cache=update_kv_cache)
+    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
+
+
+def test_fallback_rejects_raw_fp8_input() -> None:
+    attn = FakeAttention()
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
+    q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
+    assert not fmha.is_supported(q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True))
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "mla", "cross", "sage"])
+def test_fallback_separate_qkv_support(mode: str) -> None:
+    attn = FakeAttention()
+    attn.is_mla_enable = mode == "mla"
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(
+        is_cross=mode == "cross", helix_position_offsets=None, num_contexts=0
+    )
+    forward_args = AttentionForwardArgs(
+        is_fused_qkv=False, sage_attn_num_elts_per_blk_q=2 if mode == "sage" else 0
+    )
+    q = torch.empty((1, 128), dtype=torch.bfloat16)
+    assert fmha.is_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
 
 
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
@@ -118,6 +156,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     metadata.presented_token_major.assert_called_once_with(None)
     attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
     fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
+    assert forward_args.sparse_runtime_params is sparse_params
     assert not forward_args.is_fused_qkv
     assert forward_args.update_kv_cache
     assert output is forward_args.output
