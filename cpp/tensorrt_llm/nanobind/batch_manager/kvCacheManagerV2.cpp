@@ -1976,7 +1976,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("enable_stats") = true, nb::arg("text_only") = false, nb::arg("enable_partial_commit") = true,
             nb::arg("pool_rebalance") = kv::PoolRebalanceConfig{},
             nb::arg("cold_tier_offload_min_priority") = tensorrt_llm::batch_manager::kDefaultColdTierOffloadMinPriority,
-            nb::arg("host_sparse_pool_quota").none() = std::nullopt, nb::arg("max_live_kv_caches").none() = std::nullopt)
+            nb::arg("host_sparse_pool_quota").none() = std::nullopt,
+            nb::arg("max_live_kv_caches").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)

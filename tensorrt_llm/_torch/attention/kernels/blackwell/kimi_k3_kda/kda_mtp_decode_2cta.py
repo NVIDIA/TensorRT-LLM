@@ -899,14 +899,18 @@ def kda_decode_mtp_2cta_kernel(
         t_c = commit_len + 1 + p
         st_row4(k_cache, (replay_slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sK, t_c * K + k4)))
         st_row4(g_cache, (replay_slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sG, t_c * K + k4)))
-        st_row4(v_cache, (replay_slot, p, hv_off + k4), _ld_shared_f32x4(saddr(sVall, t_c * V + k4)))
+        st_row4(
+            v_cache, (replay_slot, p, hv_off + k4), _ld_shared_f32x4(saddr(sVall, t_c * V + k4))
+        )
         # draft p is new token 1 + p
         wq = _ld_shared_b32x2(saddr(sXnq, (1 + p) * K + k4))
         st_global_b32x2(gaddr(cs_q, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wq[0], wq[1])
         wk = _ld_shared_b32x2(saddr(sXnk, (1 + p) * K + k4))
         st_global_b32x2(gaddr(cs_k, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wk[0], wk[1])
         wvv = _ld_shared_b32x2(saddr(sXnv, (1 + p) * V + k4))
-        st_global_b32x2(gaddr(cs_v, (replay_slot, hv_off + k4, KERNEL_WIDTH - 1 + p)), wvv[0], wvv[1])
+        st_global_b32x2(
+            gaddr(cs_v, (replay_slot, hv_off + k4, KERNEL_WIDTH - 1 + p)), wvv[0], wvv[1]
+        )
         if in_warp_tid == 0:
             beta_cache[replay_slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
     # committed window: raw rows commit_len + 1 + w (w = 2 is new token 0)

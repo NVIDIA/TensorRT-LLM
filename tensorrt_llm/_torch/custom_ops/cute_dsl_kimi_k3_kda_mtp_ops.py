@@ -887,10 +887,7 @@ def _select_verify_kernel(
     contract whose operands fail ``operands_ok`` (`_verify_operands_ok`, evaluated last) is
     rejected."""
     if not (
-        packed_token_layout
-        and fuse_output_norm
-        and not bf16_math
-        and num_spec <= MAX_NUM_SPEC
+        packed_token_layout and fuse_output_norm and not bf16_math and num_spec <= MAX_NUM_SPEC
     ):
         return "v1"
     if not operands_ok():

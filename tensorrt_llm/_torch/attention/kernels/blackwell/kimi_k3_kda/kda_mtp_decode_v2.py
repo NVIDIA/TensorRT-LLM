@@ -975,9 +975,15 @@ def kda_decode_mtp_v2_kernel(
         if (warp_idx >= 1) & (warp_idx <= NUM_SPEC):
             p = warp_idx - 1
             t_c = commit_len + 1 + p
-            st_row4(k_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, t_c * K + k4)))
-            st_row4(g_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, t_c * K + k4)))
-            st_row4(v_cache, (replay_slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, t_c * V + k4)))
+            st_row4(
+                k_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sK, t_c * K + k4))
+            )
+            st_row4(
+                g_cache, (replay_slot, p, hk_off + k4), ld_shared_f32x4(saddr(sG, t_c * K + k4))
+            )
+            st_row4(
+                v_cache, (replay_slot, p, hv_off + k4), ld_shared_f32x4(saddr(sVall, t_c * V + k4))
+            )
             st_row4(
                 cs_q,
                 (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p),

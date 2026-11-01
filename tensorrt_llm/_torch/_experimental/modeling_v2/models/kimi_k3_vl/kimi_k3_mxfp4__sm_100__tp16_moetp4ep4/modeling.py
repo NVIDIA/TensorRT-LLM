@@ -2300,9 +2300,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # their own.
         replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
         if replay_slots is None:
-            replay_slots = getattr(mamba_metadata, "replay_state_indices", mamba_metadata.state_indices)[
-                : x.shape[0]
-            ]
+            replay_slots = getattr(
+                mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
+            )[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(
@@ -2359,7 +2359,9 @@ class K3DecodeKDA(KimiKDALinearAttention):
             f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which only "
             "the decode kernels write, and this layer has no fused projection weight or buffers"
         )
-        assert replay_slot_indices is None or replay_slot_indices.data_ptr() == slot_indices.data_ptr(), (
+        assert (
+            replay_slot_indices is None or replay_slot_indices.data_ptr() == slot_indices.data_ptr()
+        ), (
             f"Kimi K3 KDA layer {self.layer_idx}: the decode kernels address the replay caches by the state slot"
         )
         core = self._k3_verify(x2d, num_steps, layer_cache, ssm_pool, slot_indices)
