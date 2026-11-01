@@ -1884,7 +1884,11 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 description="Run the tests",
                 parameters={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                        },
+                    },
                 },
             ),
         )
@@ -1909,7 +1913,11 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 description="Run the tests",
                 parameters={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                        },
+                    },
                 },
             ),
         )
@@ -1939,7 +1947,11 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 description="Run the tests",
                 parameters={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                        },
+                    },
                 },
             ),
         )
@@ -1969,7 +1981,11 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 description="Run the tests",
                 parameters={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                        },
+                    },
                 },
             ),
         )
@@ -2006,7 +2022,11 @@ class TestQwen3CoderToolParser(BaseToolParserTestClass):
                 description="Run the tests",
                 parameters={
                     "type": "object",
-                    "properties": {},
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                        },
+                    },
                 },
             ),
         )
