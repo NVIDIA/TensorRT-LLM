@@ -265,6 +265,7 @@ def _qk_norm_rope_fp8_split(
         descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
     weights = (weight_q, weight_k, weight_q)
     rot = cos.shape[-1]
+    sat = _sat_buffer(qkv.device, 3)
     if not static:
         for i in range(3):
             _tensor_amax_kernel[grid](
@@ -292,11 +293,13 @@ def _qk_norm_rope_fp8_split(
             amax[i : i + 1],
             descale[i : i + 1],
             outs[i],
+            sat[i : i + 1] if sat is not None else descale,
             s,
             eps,
             NORM_ROPE=i < 2,
             OUT_FP8=True,
             STATIC=static,
+            SAT_COUNT=sat is not None,
             H=h,
             D=d,
             ROT=rot,
@@ -304,7 +307,7 @@ def _qk_norm_rope_fp8_split(
             ROW_STRIDE=3 * width,
             num_warps=num_warps,
         )
-    return descale, static
+    return descale, static, sat
 
 
 @torch.library.custom_op("h3_lever8::qk_norm_rope_fp8", mutates_args=())
@@ -340,7 +343,7 @@ def qk_norm_rope_fp8(
     block_h, num_warps = _launch_config()
     grid = (rows,)
     if _split_launch():
-        descale, static = _qk_norm_rope_fp8_split(
+        descale, static, sat = _qk_norm_rope_fp8_split(
             qkv,
             weight_q,
             weight_k,
@@ -358,6 +361,8 @@ def qk_norm_rope_fp8(
         )
         if _AMAX_LOG is not None and not static:
             _record_descale(layer_idx, descale)
+        if sat is not None:
+            _record_sat(layer_idx, sat)
         return q8, k8, v8, descale
     if static_descale is None:
         amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
@@ -477,11 +482,13 @@ def _tensor_cast_kernel(
     amax_ptr,
     descale_ptr,
     out_ptr,
+    sat_ptr,
     S,
     eps,
     NORM_ROPE: tl.constexpr,
     OUT_FP8: tl.constexpr,
     STATIC: tl.constexpr,
+    SAT_COUNT: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
     ROT: tl.constexpr,
@@ -507,6 +514,8 @@ def _tensor_cast_kernel(
             if r == 0:
                 tl.store(descale_ptr, s)
         f = _div_rn(1.0, s)
+    if SAT_COUNT:
+        nsat = tl.zeros((BLOCK_H, D), dtype=tl.int32)
     for h0 in range(0, H, BLOCK_H):
         h = h0 + hh
         mask = (h < H)[:, None] & (d < D)[None, :]
@@ -519,9 +528,15 @@ def _tensor_cast_kernel(
         else:
             y = tl.load(row + offs, mask=mask, other=0.0).to(tl.float32)
         if OUT_FP8:
-            tl.store(out_row + offs, (y * f).to(tl.float8e4nv), mask=mask)
+            scaled = y * f
+            if SAT_COUNT:
+                # Elements beyond the E4M3 range are clamped by the saturating cast.
+                nsat += (tl.abs(scaled) > 448.0).to(tl.int32)
+            tl.store(out_row + offs, scaled.to(tl.float8e4nv), mask=mask)
         else:
             tl.store(out_row + offs, y.to(tl.bfloat16), mask=mask)
+    if SAT_COUNT:
+        tl.atomic_add(sat_ptr, tl.sum(tl.sum(nsat, axis=1), axis=0))
 
 
 @torch.library.custom_op("h3_lever8::norm_rope_fp8_tensor", mutates_args=())
@@ -593,11 +608,13 @@ def norm_rope_fp8_tensor(
         amax,
         descale,
         out,
+        descale,
         s,
         eps,
         NORM_ROPE=norm_rope,
         OUT_FP8=out_fp8,
         STATIC=static,
+        SAT_COUNT=False,
         H=h,
         D=d,
         ROT=rot,
@@ -698,7 +715,28 @@ def static_descale(layer_idx: int, device: torch.device) -> torch.Tensor:
 
 
 _AMAX_LOG = os.environ.get("H3_FP8_AMAX_LOG") or None
+_SAT_LOG = os.environ.get("H3_FP8_SAT_LOG") or None
 _RUNNING: Dict[int, torch.Tensor] = {}
+_SAT: Dict[int, torch.Tensor] = {}
+_SAT_CALLS: Dict[int, int] = {}
+
+
+def _sat_buffer(device: torch.device, n: int) -> Optional[torch.Tensor]:
+    """Per-call saturation counters (elements clipped at +-448), only with ``H3_FP8_SAT_LOG``."""
+    if _SAT_LOG is None:
+        return None
+    return torch.zeros(n, dtype=torch.int32, device=device)
+
+
+def _record_sat(layer_idx: int, sat: torch.Tensor) -> None:
+    total = _SAT.get(layer_idx)
+    if total is None:
+        _SAT[layer_idx] = sat.to(torch.int64)
+    else:
+        total += sat
+    _SAT_CALLS[layer_idx] = _SAT_CALLS.get(layer_idx, 0) + 1
+
+
 _CALLS: Dict[int, int] = {}
 
 
@@ -727,4 +765,18 @@ def _dump_amax_log() -> None:
         json.dump(payload, f, indent=1)
 
 
+def _dump_sat_log() -> None:
+    if _SAT_LOG is None or not _SAT:
+        return
+    table = {str(k): [int(x) for x in v.cpu().tolist()] for k, v in sorted(_SAT.items())}
+    payload = {
+        "saturated_elements": table,
+        "calls": {str(k): v for k, v in sorted(_SAT_CALLS.items())},
+        "note": "elements with |x / scale| > 448 before the saturating FP8 cast, run total; q, k, v per layer",
+    }
+    with open(_SAT_LOG, "w") as f:
+        json.dump(payload, f, indent=1)
+
+
 atexit.register(_dump_amax_log)
+atexit.register(_dump_sat_log)
