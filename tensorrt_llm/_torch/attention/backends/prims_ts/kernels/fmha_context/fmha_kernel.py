@@ -751,6 +751,7 @@ def build_context_task_manager(
     output_scale: cute.Tensor | None = None,
     softmax_stats: cute.Tensor | None = None,
     g_block_tables: cute.Pointer | None = None,
+    stats_scale: cute.Tensor | None = None,
     block_table_row_stride: int | Int32 = 0,
     g_seq_lens_kv: cute.Pointer | None = None,
     max_seq_len_kv: int | Int32 | None = None,
@@ -1275,6 +1276,7 @@ def build_context_task_manager(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
         cum_seqlen_q=cum_seqlen_q,
         q_half=0,
         name="tmem_vec0",
@@ -1364,6 +1366,7 @@ def build_context_task_manager(
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
             cum_seqlen_q=cum_seqlen_q,
             q_half=1,
             name="tmem_vec1",
@@ -2676,6 +2679,7 @@ def build_fmha_task_manager(
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
     exhaustive_deadlock_race_check: bool = True,
+    stats_scale: cute.Tensor | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -2761,6 +2765,7 @@ def build_fmha_task_manager(
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         softmax_stats=softmax_stats,
+        stats_scale=stats_scale,
         g_block_tables=g_block_tables,
         block_table_row_stride=block_table_row_stride,
         g_seq_lens_kv=g_seq_lens_kv,
@@ -3153,6 +3158,7 @@ class FmhaTs:
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
+        stats_scale: cute.Tensor | None = None,
     ) -> None:
         """Set up TMA descriptors, compute grid, and launch the kernel.
 
@@ -3487,6 +3493,7 @@ class FmhaTs:
             Int32(s_q),
             self.is_persistent,
             self.is_clc_dynamic,
+            stats_scale=stats_scale,
         ).launch(
             grid=grid,
             block=[block_size, 1, 1],
@@ -3528,6 +3535,7 @@ class FmhaTs:
         variable_window_q_stride: Int32,
         is_persistent: cutlass.Constexpr[bool] = True,
         is_clc_dynamic: cutlass.Constexpr[bool] = False,
+        stats_scale: cute.Tensor | None = None,
     ) -> None:
         """Warp-specialised persistent FMHA TS kernel.
 
@@ -3591,6 +3599,7 @@ class FmhaTs:
             scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
             q_offset=q_offset,
             is_persistent=is_persistent,
             is_clc_dynamic=is_clc_dynamic,

@@ -4655,6 +4655,7 @@ class TmemStatsResource(MemoryResource):
     scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
     output_scale: cute.Tensor | None = field(init=False, default=None)
     softmax_stats: cute.Tensor | None = field(init=False, default=None)
+    stats_scale: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     q_half: Constexpr[int] = 0
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
@@ -4677,6 +4678,7 @@ class TmemStatsResource(MemoryResource):
         scale_softmax_log2: cute.Tensor | None = None,
         output_scale: cute.Tensor | None = None,
         softmax_stats: cute.Tensor | None = None,
+        stats_scale: cute.Tensor | None = None,
         cum_seqlen_q: cute.Tensor | None = None,
         q_half: int = 0,
         **kwargs: Any,
@@ -4688,6 +4690,7 @@ class TmemStatsResource(MemoryResource):
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
         self.softmax_stats = softmax_stats
+        self.stats_scale = stats_scale
         self.cum_seqlen_q = cum_seqlen_q
         self.q_half = q_half
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
@@ -4904,7 +4907,7 @@ class TmemStatsResource(MemoryResource):
             )
             # Softmax uses exp2(raw_score * scale_log2). The chunk merger
             # expects maxima in natural-log units, not raw QK scores or LSE.
-            maximum = row_max * self.scale_softmax_log2[0] * Float32(0.6931471805599453)
+            maximum = row_max * self.stats_scale[0]
             # FP8 PV stores exp(logit - maximum) scaled by 448. Export the
             # unscaled denominator; keep the internal correction stats intact.
             denominator = row_sum / Float32(self.cfg.pv_p_scale)

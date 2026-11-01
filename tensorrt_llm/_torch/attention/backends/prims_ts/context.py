@@ -157,6 +157,7 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
+    softmax_scale: Optional[torch.Tensor] = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +195,7 @@ class _PagedContextPlanState:
     output_scale: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
+    softmax_scale: Optional[torch.Tensor] = None
 
 
 _ContextScheduler = Literal[
@@ -1847,6 +1849,7 @@ def _get_compiled_context(
         static_packed: cutlass.Constexpr[bool],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_seq_len_k: cutlass.Constexpr[int],
+        stats_scale: cute.Tensor | None,
     ) -> None:
         """Adapt torch TVM-FFI tensors to the FmhaTs host entry point."""
 
@@ -1868,6 +1871,7 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
         else:
             fmha(
@@ -1883,6 +1887,7 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 softmax_stats=softmax_stats,
+                stats_scale=stats_scale,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1966,6 +1971,7 @@ def _get_compiled_context(
             packed,
             max_seq_len_q,
             max_seq_len_k,
+            scale_fake if compile_spec.store_softmax_stats else None,
             options=_COMPILE_OPTIONS,
         )
 
@@ -2079,6 +2085,7 @@ def _get_compiled_paged_context(
         static_max_active_clusters: cutlass.Constexpr[int],
         static_max_seq_len_q: cutlass.Constexpr[int],
         static_max_kv_len: cutlass.Constexpr[int],
+        stats_scale: cute.Tensor | None,
     ) -> None:
         fmha(
             q,
@@ -2095,6 +2102,7 @@ def _get_compiled_paged_context(
             block_tables=block_tables,
             seq_lens_kv=seq_lens_kv,
             softmax_stats=softmax_stats,
+            stats_scale=stats_scale,
         )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -2155,6 +2163,7 @@ def _get_compiled_paged_context(
             max_active_clusters,
             max_seq_len_q,
             max_kv_len,
+            scale_fake if compile_spec.store_softmax_stats else None,
             options=_COMPILE_OPTIONS,
         )
 
@@ -2694,6 +2703,11 @@ class BatchPrefillTSWrapper:
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
+        softmax_scale_tensor = (
+            torch.tensor([sm_scale], dtype=torch.float32, device=geometry.device)
+            if geometry.store_softmax_stats
+            else None
+        )
         output_scale_tensor = torch.tensor(
             [output_scale], dtype=torch.float32, device=geometry.device
         )
@@ -2727,6 +2741,7 @@ class BatchPrefillTSWrapper:
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             scale_softmax_log2=scale_tensor,
+            softmax_scale=softmax_scale_tensor,
             output_scale=output_scale_tensor,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -2749,6 +2764,7 @@ class BatchPrefillTSWrapper:
         variable_window_cta_starts: Optional[torch.Tensor] = None,
         out: Optional[torch.Tensor] = None,
         softmax_stats: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         validate: bool = True,
@@ -2783,6 +2799,12 @@ class BatchPrefillTSWrapper:
             ``output_scale``; merged outputs must use a common output scale.
             Must not overlap ``out``, any live input, or a plan-owned buffer;
             storage overlap is a caller precondition and is not checked.
+        softmax_scale : torch.Tensor, optional
+            Natural-log one-element float32 scale for exported statistics.
+            Defaults to the exact plan scale. With statistics enabled, a
+            runtime overrides must supply both this and ``scale_softmax_log2``;
+            callers must keep their values consistent before graph replay.
+            With ``validate=False``, no tensor value is read back to the host.
         scale_softmax_log2 : torch.Tensor, optional
             Per-run one-element float32 softmax scale in base-2 form. Defaults
             to the scale retained by the plan.
@@ -2877,6 +2899,20 @@ class BatchPrefillTSWrapper:
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
             runtime_window_cta_starts = state.empty_i32
+        if geometry.store_softmax_stats:
+            if (softmax_scale is None) != (scale_softmax_log2 is None):
+                raise ValueError(
+                    "softmax_scale and scale_softmax_log2 must be overridden together "
+                    "when store_softmax_stats=True"
+                )
+            if softmax_scale is None:
+                softmax_scale = state.softmax_scale
+            elif validate:
+                _validate_runtime_scale_tensor(
+                    softmax_scale, "softmax_scale", device=geometry.device
+                )
+        elif softmax_scale is not None:
+            raise ValueError("softmax_scale requires store_softmax_stats=True")
         if scale_softmax_log2 is None:
             scale_softmax_log2 = state.scale_softmax_log2
         elif validate:
@@ -2920,6 +2956,7 @@ class BatchPrefillTSWrapper:
             runtime_window_ends,
             runtime_window_cta_starts,
             softmax_stats,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return out
 
@@ -3106,11 +3143,16 @@ class BatchPrefillPagedTSWrapper:
         scale_tensor = torch.tensor(
             [scale_softmax_log2], dtype=torch.float32, device=geometry.device
         )
+        softmax_scale_tensor = (
+            torch.tensor([sm_scale], dtype=torch.float32, device=geometry.device)
+            if geometry.store_softmax_stats
+            else None
+        )
         output_scale_tensor = torch.tensor(
             [output_scale], dtype=torch.float32, device=geometry.device
         )
 
-        # Keep the two plan-owned scalar allocations ahead of CUTLASS JIT,
+        # Keep plan-owned scalar allocations ahead of CUTLASS JIT,
         # matching the compute-sanitizer-safe ordering of the other wrapper.
         compiled, policy = _get_compiled_paged_context(
             _paged_context_compile_spec(geometry)
@@ -3119,6 +3161,7 @@ class BatchPrefillPagedTSWrapper:
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
             scale_softmax_log2=scale_tensor,
+            softmax_scale=softmax_scale_tensor,
             output_scale=output_scale_tensor,
             compiled=compiled,
             policy=policy,
@@ -3136,6 +3179,7 @@ class BatchPrefillPagedTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
         softmax_stats: Optional[torch.Tensor] = None,
+        softmax_scale: Optional[torch.Tensor] = None,
         scale_softmax_log2: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         validate: bool = True,
@@ -3194,6 +3238,12 @@ class BatchPrefillPagedTSWrapper:
             ``sum(exp(logit - m))``, without internal probability scaling.
             Must not overlap output, inputs, or plan buffers; overlap is not
             checked. CUDA graphs retain this buffer's address.
+        softmax_scale : torch.Tensor, optional
+            Natural-log one-element float32 scale for exported statistics.
+            Defaults to the exact plan scale. With statistics enabled, a
+            runtime overrides must supply both this and ``scale_softmax_log2``;
+            callers must keep their values consistent before graph replay.
+            With ``validate=False``, no tensor value is read back to the host.
         scale_softmax_log2 : torch.Tensor, optional
             Per-run one-element float32 softmax scale in base-2 form. Defaults
             to the scale retained by the plan.
@@ -3235,6 +3285,20 @@ class BatchPrefillPagedTSWrapper:
                 total_q=int(q.shape[0]),
                 num_physical_pages=int(k_cache.shape[0]),
             )
+        if geometry.store_softmax_stats:
+            if (softmax_scale is None) != (scale_softmax_log2 is None):
+                raise ValueError(
+                    "softmax_scale and scale_softmax_log2 must be overridden together "
+                    "when store_softmax_stats=True"
+                )
+            if softmax_scale is None:
+                softmax_scale = state.softmax_scale
+            elif validate:
+                _validate_runtime_scale_tensor(
+                    softmax_scale, "softmax_scale", device=geometry.device
+                )
+        elif softmax_scale is not None:
+            raise ValueError("softmax_scale requires store_softmax_stats=True")
         if scale_softmax_log2 is None:
             scale_softmax_log2 = state.scale_softmax_log2
         elif validate:
@@ -3267,6 +3331,7 @@ class BatchPrefillPagedTSWrapper:
             block_tables,
             seq_lens_kv,
             softmax_stats,
+            softmax_scale if geometry.store_softmax_stats else None,
         )
         return out
 

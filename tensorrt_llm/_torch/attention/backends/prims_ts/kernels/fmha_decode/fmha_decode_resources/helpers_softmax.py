@@ -389,6 +389,7 @@ def _attention_sink_for_local_head(
     h_r: Int32,
     num_heads_kv: Int32,
     local_head_idx: Int32,
+    stats_scale: Float32 | None = None,
 ) -> Float32:
     """Return the attention-sink denominator contribution for one local head."""
     # Attention sinks add a synthetic key/value entry to the normalization
@@ -406,10 +407,15 @@ def _attention_sink_for_local_head(
         dtype=Float32,
     )
     sink_val = sink_ptr.load(count=1, alignment=4)[0]
-    sink_exp = cute.math.exp2(
-        sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2,
-        fastmath=True,
-    )
+    if cutlass.const_expr(cfg.store_softmax_stats):
+        # Center in natural-log units before the base conversion so exported
+        # statistics and normalization share the exact original FP32 anchor.
+        sink_delta = (sink_val - max_val * stats_scale) * Float32(1.4426950408889634)
+    else:
+        sink_delta = (
+            sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2
+        )
+    sink_exp = cute.math.exp2(sink_delta, fastmath=True)
     if cutlass.const_expr(cfg.use_fp8_pv):
         sink_exp = sink_exp * Float32(cfg.fp8_p_quant_scale)
     return sink_exp
@@ -427,6 +433,7 @@ def _attention_sink_for_scale_idx(
     logical_q_group_idx: Int32,
     col_group_idx: Int32,
     scale_idx: Constexpr[int],
+    stats_scale: Float32 | None = None,
 ) -> Float32:
     """Map a softmax scale group to its attention-sink contribution."""
     tile_row_idx = (
@@ -450,4 +457,5 @@ def _attention_sink_for_scale_idx(
         head_stride,
         num_heads_kv,
         local_head_idx,
+        stats_scale=stats_scale,
     )
