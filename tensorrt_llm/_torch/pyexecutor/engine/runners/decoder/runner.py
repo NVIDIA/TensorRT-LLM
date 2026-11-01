@@ -1061,7 +1061,7 @@ class DecoderRunner(ScheduledModelRunner):
         vocab], the shape its own processors see, and a view into the step's
         logits tensor, so the callback's in-place edits land there. The stream
         is the one the logits live on (None off CUDA, which only tests do),
-        for processors written against the TensorRT backend's contract.
+        for processors that synchronize on it as the interface documents.
         """
         device = logits[0].device
         stream_ptr = (
@@ -1216,9 +1216,9 @@ class DecoderRunner(ScheduledModelRunner):
                         logits_row_offset += row_stride
                         continue
 
-                    # The request's rows, reshaped to the TRT backend's
-                    # [beam_width, 1, vocab] so the same processors serve both
-                    # backends; a view, so edits land in the step's logits.
+                    # The request's rows as [beam_width, 1, vocab], the shape
+                    # the LogitsProcessor interface documents; a view, so
+                    # edits land in the step's logits.
                     logits_rows = logits_tensor[
                         logits_row_offset : logits_row_offset + beam_width
                     ].view(beam_width, 1, -1)
