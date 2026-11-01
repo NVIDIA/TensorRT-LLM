@@ -25,6 +25,7 @@ import torch
 from .utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
 
 _SCOPED_MODULE_MARKER = "_trtllm_nccl_window_tensor_scoped"
+_SCALAR_TYPES = frozenset({type(None), bool, int, float, complex, str, bytes})
 _ModuleType = TypeVar("_ModuleType", bound=type[torch.nn.Module])
 
 
@@ -47,6 +48,9 @@ def _cuda_tensors(
     tensors: list[torch.Tensor],
     visited: set[int] | None = None,
 ) -> None:
+    if type(value) in _SCALAR_TYPES:
+        return
+
     if isinstance(value, torch.Tensor):
         if value.is_cuda:
             tensors.append(value)
