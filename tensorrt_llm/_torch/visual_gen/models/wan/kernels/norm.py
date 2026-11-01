@@ -34,7 +34,7 @@ from cutlass._mlir_helpers.op import dsl_user_op
 
 from ..jit_norm import MID_NONE, MID_NORM_SILU, OUT_ROWS, OUT_WINOGRAD, Variant
 from .common import (
-    VEC,
+    CHANNELS_PER_VECTOR,
     bf16_hi,
     bf16_lo,
     compile_cached,
@@ -143,8 +143,8 @@ class _Plan:
         self.R = v.order
         self.L = v.lanes
         self.K = v.k
-        self.C = v.lanes * v.k * VEC
-        self.NV = self.C // VEC
+        self.C = v.lanes * v.k * CHANNELS_PER_VECTOR
+        self.NV = self.C // CHANNELS_PER_VECTOR
         self.T = BFloat16
         self.TD = Float16 if v.fp16_winograd else BFloat16
         self.TIN = self.TD if v.in_wino else self.T
@@ -365,7 +365,9 @@ class VaeNormKernel:
             if cutlass.const_expr((it + 1) * THREADS > C):
                 in_range = ch < C
             if in_range:
-                idx = (((ch % VEC) // 4) * NV + ch // VEC) * 4 + ch % 4
+                idx = (
+                    ((ch % CHANNELS_PER_VECTOR) // 4) * NV + ch // CHANNELS_PER_VECTOR
+                ) * 4 + ch % 4
                 g = Float32(0.0)
                 if cutlass.const_expr(v.mid != MID_NONE):
                     g = Float32(g_gamma[ch])
@@ -411,8 +413,8 @@ class VaeNormKernel:
 
         # Register buffers: three input slices (inputs x terms) and their residual slices. The
         # row being normalized travels between the passes as packed bf16 pairs.
-        c.in_buf = [cute.make_rmem_tensor((VEC, p.num_in), p.TIN) for _ in range(3)]
-        c.res_buf = [cute.make_rmem_tensor((VEC,), p.T) for _ in range(3)]
+        c.in_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR, p.num_in), p.TIN) for _ in range(3)]
+        c.res_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), p.T) for _ in range(3)]
 
         prefetched = cutlass.Boolean(False)
         src_in = Int64(0)
@@ -753,7 +755,7 @@ class VaeNormKernel:
         ins = [c.in_buf[b][(None, q)].load().to(Float32) for q in range(n_in)]
         res = c.res_buf[b].load().to(Float32) if v.has_residual else None
         words = []
-        for i in range(VEC // 2):
+        for i in range(CHANNELS_PER_VECTOR // 2):
             pair = []
             for e in (2 * i, 2 * i + 1):
                 val = ins[0][e]
@@ -794,7 +796,7 @@ class VaeNormKernel:
         gmv = self._const_at(c, 0, kk, lig_f)
         bsv = self._const_at(c, 1, kk, lig_f)
         out = []
-        for i in range(VEC // 2):
+        for i in range(CHANNELS_PER_VECTOR // 2):
             pair = []
             for e, x in ((2 * i, bf16_lo(words[i])), (2 * i + 1, bf16_hi(words[i]))):
                 if v.reference:
@@ -831,7 +833,7 @@ class VaeNormKernel:
                 ws = load_words(c.uhist, vi)
                 hs[fi] = [f for w in ws for f in (bf16_lo(w), bf16_hi(w))]
         out = []
-        for i in range(VEC // 2):
+        for i in range(CHANNELS_PER_VECTOR // 2):
             pair = []
             for e in (2 * i, 2 * i + 1):
                 acc = None

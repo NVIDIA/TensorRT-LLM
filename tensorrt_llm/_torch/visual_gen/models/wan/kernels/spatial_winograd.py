@@ -10,10 +10,9 @@ C]`` (frame ``n`` is pair ``n % pairs`` of component ``n // pairs``) or, with st
 may come from up to three buffers (segments: zero frames, the causal history, the new frame).
 Output transform: ``y = A^T M A (+ bias)`` per tile, written into frames ``[N, H, W, C]``.
 
-F(2x2, 3x3): Lavin & Gray, points (0, +-1, inf). F(4x4, 3x3): points (0, +-3/2, +-5/8, inf);
-B^T and A^T entries are dyadic. The arithmetic (separable passes, rows of B^T and A^T as written
-in :func:`_bt` / :func:`_at`, the products fused into an fma) is the one the outputs are defined
-by; every other add and multiply rounds on its own.
+F(2x2, 3x3) runs on the points (0, +-1, inf), F(4x4, 3x3) on (0, +-P, +-Q, inf); see the
+comment above ``P`` and ``Q`` for the matrices. Both transforms are separable: rows of B^T (or
+A^T) along one axis of the window, then along the other.
 
 The input transform with ``C % 64 == 0`` (every production layer) stages a block's window rows
 in shared memory: one tile row x 8 tiles x 64 channels per block, 16-byte loads, then one
@@ -30,61 +29,129 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64
-from cutlass._mlir_helpers.math import RoundingMode
+from cutlass.base_dsl.typing import Vector
 
-from .common import VEC, compile_cached, pack2
+from .common import CHANNELS_PER_VECTOR, compile_cached, flat_view, pack2
 
 THREADS = 256
 STAGED_TILES = 8
 STAGED_CHANNELS = 64
-_RN = RoundingMode.NEAREST_EVEN
-_FAR = 1 << 40  # extent of the flat views (indexing is unchecked)
+
+# F(4x4, 3x3) interpolation points, besides 0 and infinity: +-P and +-Q. Chosen for low fp16
+# rounding error; both are dyadic (3/2, 5/8), so every product of them used below is exact in
+# fp32 and folds into a single constant at trace time.
+#
+# Where the coefficients come from (Toom-Cook on the points 0, -P, +P, -Q, +Q, inf):
+#
+#   Each row of B^T holds the coefficients (of x^0 .. x^5, applied to d0 .. d5) of the
+#   polynomial that vanishes on all finite points but one:
+#     row 0 drops 0:   (x^2 - P^2)(x^2 - Q^2) = P^2 Q^2 - (P^2 + Q^2) x^2 + x^4
+#                      -> [P^2 Q^2, 0, -(P^2 + Q^2), 0, 1, 0]
+#     rows 1, 2 drop one of +-P:  x (x^2 - Q^2)(x +- P) -> [0, -+P Q^2, -Q^2, +-P, 1, 0]
+#     rows 3, 4 drop one of +-Q:  the same with P and Q swapped
+#     row 5 (infinity): row 0 times x, i.e. shifted by one.
+#   Rows 1 and 2 share an even part (d4 - Q^2 d2) and an odd part (P d3 - P Q^2 d1) and take
+#   their sum and difference; rows 3 and 4 likewise.
+#
+#   A^T row r evaluates the m outputs at the points: [0^r, P^r, (-P)^r, Q^r, (-Q)^r, inf],
+#   where 0^0 = 1 and the infinity column is 1 only in the last row r = 3:
+#     row 0: t0 + t1 + t2 + t3 + t4
+#     row r: P^r (t1 +- t2) + Q^r (t3 +- t4)  (+ for even r, - for odd r), plus t5 for r = 3.
+#
+# The filter transform G (scaled so that A^T [(G g) * (B^T d)] is the convolution) and these
+# same B^T / A^T are tabulated in ``wino_tables.SPATIAL_WINO``; the kernel tests check the two
+# agree.
+P = 3 / 2
+Q = 5 / 8
 
 
-def _add(a, b):
-    return cute.math.add(a, b, rounding=_RN)
+class _Pair:
+    """The fp32 values of two channels in one 64-bit register pair. ``+`` and ``-`` are single
+    packed instructions (FADD2) for both channels; ``k * pair`` with a Python constant ``k``
+    stays pending (:class:`_Scaled`) until it meets a ``+`` or ``-``, which then emits one
+    packed fma (FFMA2). :func:`_bt` and :func:`_at` are written with plain operators and run
+    on pairs unchanged."""
+
+    def __init__(self, v: Vector) -> None:
+        self.v = v
+
+    @staticmethod
+    def of(lo, hi) -> "_Pair":
+        return _Pair(Vector.from_elements((Float32(lo), Float32(hi)), Float32))
+
+    @property
+    def lo(self):
+        return Float32(self.v[0])
+
+    @property
+    def hi(self):
+        return Float32(self.v[1])
+
+    def __rmul__(self, k: float) -> "_Scaled":
+        return _Scaled(k, self)
+
+    def __add__(self, o):
+        if isinstance(o, _Scaled):
+            return o.fma(self)
+        return _Pair(cute.arch.add_packed_f32x2(self.v, o.v))
+
+    def __sub__(self, o):
+        if isinstance(o, _Scaled):
+            return _Scaled(-o.k, o.x).fma(self)
+        return _Pair(cute.arch.sub_packed_f32x2(self.v, o.v))
 
 
-def _sub(a, b):
-    return cute.math.add(a, -b, rounding=_RN)
+class _Scaled:
+    """``k * x`` for a Python constant ``k`` and a :class:`_Pair` ``x``, not yet emitted."""
 
+    def __init__(self, k: float, x: _Pair) -> None:
+        self.k = k
+        self.x = x
 
-def _mul(k: float, a):
-    return cute.math.mul(Float32(k), a, rounding=_RN)
+    def _const(self, k: float) -> Vector:
+        return Vector.from_elements((Float32(k), Float32(k)), Float32)
 
+    def fma(self, c: _Pair) -> _Pair:
+        """``k * x + c`` in one packed fma."""
+        return _Pair(cute.arch.fma_packed_f32x2(self._const(self.k), self.x.v, c.v))
 
-def _fma(k: float, a, c):
-    return cute.math.fma(Float32(k), a, c)
+    def value(self) -> _Pair:
+        return _Pair(cute.arch.mul_packed_f32x2(self._const(self.k), self.x.v))
+
+    def __add__(self, o):
+        return self.fma(o.value() if isinstance(o, _Scaled) else o)
+
+    def __sub__(self, o):
+        if isinstance(o, _Scaled):
+            return self.fma(_Scaled(-o.k, o.x).value())
+        raise NotImplementedError("k * x - pair is not used by the transforms")
 
 
 def _bt(m: int, x: int, d: list):
     """Row ``x`` of B^T applied to the ``m + 2`` values ``d``."""
     if m == 2:
-        return (_sub(d[0], d[2]), _add(d[1], d[2]), _sub(d[2], d[1]), _sub(d[1], d[3]))[x]
+        return (d[0] - d[2], d[1] + d[2], d[2] - d[1], d[1] - d[3])[x]
     if x == 0:
-        return _add(_fma(0.87890625, d[0], _mul(-2.640625, d[2])), d[4])
+        return (P * Q) ** 2 * d[0] - (P * P + Q * Q) * d[2] + d[4]
     if x == 5:
-        return _add(_fma(0.87890625, d[1], _mul(-2.640625, d[3])), d[5])
-    if x in (1, 2):
-        e = _fma(-0.390625, d[2], d[4])
-        o = _fma(1.5, d[3], _mul(-0.5859375, d[1]))
-    else:
-        e = _fma(-2.25, d[2], d[4])
-        o = _fma(0.625, d[3], _mul(-1.40625, d[1]))
-    return _add(e, o) if x in (1, 3) else _sub(e, o)
+        return (P * Q) ** 2 * d[1] - (P * P + Q * Q) * d[3] + d[5]
+    a, b = (P, Q) if x in (1, 2) else (Q, P)
+    even = d[4] - b * b * d[2]
+    odd = a * d[3] - a * b * b * d[1]
+    return even + odd if x in (1, 3) else even - odd
 
 
 def _at(m: int, r: int, t: list):
     """Row ``r`` of A^T applied to the ``m + 2`` values ``t``."""
     if m == 2:
-        return _add(_add(t[0], t[1]), t[2]) if r == 0 else _sub(_sub(t[1], t[2]), t[3])
+        return t[0] + t[1] + t[2] if r == 0 else t[1] - t[2] - t[3]
     if r == 0:
-        return _add(_add(_add(_add(t[0], t[1]), t[2]), t[3]), t[4])
-    if r == 1:
-        return _fma(1.5, _sub(t[1], t[2]), _mul(0.625, _sub(t[3], t[4])))
-    if r == 2:
-        return _fma(2.25, _add(t[1], t[2]), _mul(0.390625, _add(t[3], t[4])))
-    return _add(_fma(3.375, _sub(t[1], t[2]), _mul(0.244140625, _sub(t[3], t[4]))), t[5])
+        return t[0] + t[1] + t[2] + t[3] + t[4]
+    if r % 2 == 0:
+        y = P**r * (t[1] + t[2]) + Q**r * (t[3] + t[4])
+    else:
+        y = P**r * (t[1] - t[2]) + Q**r * (t[3] - t[4])
+    return y + t[5] if r == 3 else y
 
 
 def _udiv(a, b):
@@ -115,6 +182,9 @@ class InputTransformKernel:
         # fp32 values has to stay in registers).
         self.lanes = 4 if m == 2 else 2
         self.cols = m * STAGED_TILES + 2
+        # The staged m = 4 window (26 KB) fits 4 blocks per SM; ask ptxas for a register count
+        # that fits 4 as well (64 registers), so shared memory stays the only occupancy limit.
+        self.min_blocks = 4 if staged and m == 4 else 0
 
     @cute.jit
     def wrapper(
@@ -143,7 +213,11 @@ class InputTransformKernel:
         self.kernel(
             v_ptr, seg0, seg1, seg2, n0, n1, frames, height, width, channels, components, row0, row1
         ).launch(
-            grid=[grid_x, row1 - row0, frames], block=[THREADS, 1, 1], smem=smem, stream=stream
+            grid=[grid_x, row1 - row0, frames],
+            block=[THREADS, 1, 1],
+            smem=smem,
+            stream=stream,
+            min_blocks_per_mp=self.min_blocks,
         )
 
     @cute.kernel
@@ -163,15 +237,12 @@ class InputTransformKernel:
         row0: Int32,
         row1: Int32,
     ):
-        m, A, cols = self.m, self.A, self.cols
         tid, _, _ = cute.arch.thread_idx()
         bx, by, bz = cute.arch.block_idx()
         tid, bx, n = Int32(tid), Int32(bx), Int32(bz)
-        tw = _udiv(width + m - 1, m)
+        tw = _udiv(width + self.m - 1, self.m)
         tiles = Int64(row1 - row0) * tw
-        pairs = _udiv(frames, components)
-        comp = _udiv(n, pairs)
-        pair = n - comp * pairs
+        i = row0 + Int32(by)
         # The frame's buffer and its index inside it (block-uniform); address 0: zero frames.
         addr = seg0
         local = n
@@ -181,141 +252,158 @@ class InputTransformKernel:
             if n >= n0 + n1:
                 addr = seg2
                 local = n - n0 - n1
-        present = addr != 0
-        frame_elems = Int64(height) * width * channels
-        i = row0 + Int32(by)
+        # First pixel of the frame, in pixels of its own buffer.
+        frame_pixel = Int64(local) * (height * width)
+        geom = (addr != 0, frame_pixel, i, height, width)
+
+        half_ch = channels >> 1
         if cutlass.const_expr(self.stacked):
-            coord_words = tiles * frames * channels // 2
+            coord_words = tiles * frames * half_ch
         else:
-            coord_words = tiles * pairs * channels // 2
-        v_out = cute.make_tensor(cute.recast_ptr(v_ptr, dtype=Int32), cute.make_layout((_FAR,)))
+            coord_words = tiles * _udiv(frames, components) * half_ch
+        v_out = flat_view(cute.recast_ptr(v_ptr, dtype=Int32), 1)
 
         if cutlass.const_expr(self.staged):
-            ch = STAGED_CHANNELS
             groups = _udiv(tw + STAGED_TILES - 1, STAGED_TILES)
             chunk = _udiv(bx, groups)
             j0 = (bx - chunk * groups) * STAGED_TILES
-            src = cute.make_tensor(
-                cute.make_ptr(self.dtype, addr, cute.AddressSpace.gmem, assumed_align=16),
-                cute.make_layout((VEC, _FAR), stride=(1, VEC)),
-            )
-            smem = cute.arch.get_dyn_smem(self.dtype, alignment=16)
-            win = cute.make_tensor(
-                smem, cute.make_layout((VEC, A * cols * ch // VEC), stride=(1, VEC))
-            )
-            win2 = cute.make_tensor(smem, cute.make_layout((2, A * cols * ch // 2), stride=(1, 2)))
-            # Copy phase: 16-byte chunks over (window row, window column, 8-channel chunk), all
-            # loads issued before the first shared-memory store; zero outside the frame.
-            per_pixel = ch // VEC
-            total = A * cols * per_pixel
-            bufs = []
-            for it in cutlass.range_constexpr((total + THREADS - 1) // THREADS):
-                q = tid + it * THREADS
-                cc = q % per_pixel
-                pix = q // per_pixel
-                a = pix // cols
-                b = pix - a * cols
-                row = m * i - 1 + a
-                col = m * j0 - 1 + b
-                inside = (
-                    present and q < total and row >= 0 and row < height and col >= 0 and col < width
-                )
-                g = (
-                    Int64(local) * frame_elems
-                    + (Int64(row) * width + col) * channels
-                    + chunk * ch
-                    + cc * VEC
-                ) // VEC
-                buf = cute.make_rmem_tensor((VEC,), self.dtype)
-                buf.store(cute.full((VEC,), 0.0, Float32).to(self.dtype))
-                if inside:
-                    buf.store(src[(None, g)].load())
-                bufs.append(buf)
-            for it in cutlass.range_constexpr((total + THREADS - 1) // THREADS):
-                q = tid + it * THREADS
-                if q < total:
-                    win[(None, q)].store(bufs[it].load())
-            cute.arch.sync_threads()
-
-            # Transform phase: thread -> (tile within the group, channel pair).
-            tt = tid // (ch // 2)
-            pp = tid - tt * (ch // 2)
+            win = self._stage_window(addr, geom, tid, j0, chunk, channels)
+            # Transform: thread -> (tile within the group, channel pair).
+            tt = tid // (STAGED_CHANNELS // 2)
+            pp = tid - tt * (STAGED_CHANNELS // 2)
             j = j0 + tt
             if j < tw:
-                window = []
-                for a in cutlass.range_constexpr(A):
-                    row_vals = []
-                    for b in cutlass.range_constexpr(A):
-                        pv = win2[(None, ((a * cols + m * tt + b) * ch + 2 * pp) // 2)].load()
-                        row_vals.append(pv.to(Float32))
-                    window.append(row_vals)
+                vals = self._staged_window_pair(win, tt, pp)
                 tile = Int64(i - row0) * tw + j
-                base = self._v_word(
-                    tile, chunk * ch + 2 * pp, n, comp, pair, pairs, frames, channels, tiles
-                )
-                out = [
-                    _transform2(m, _bt, [[window[a][b][e] for b in range(A)] for a in range(A)])
-                    for e in range(2)
-                ]
-                for x in cutlass.range_constexpr(A):
-                    for y in cutlass.range_constexpr(A):
-                        v_out[base + (x * A + y) * coord_words] = pack2(
-                            out[0][x][y], out[1][x][y], True
-                        )
+                c0 = chunk * STAGED_CHANNELS + 2 * pp
+                base = self._v_word(tile, c0, n, frames, components, half_ch, tiles)
+                self._transform_store(v_out, base, coord_words, vals, 1)
         else:
-            lanes = self.lanes
-            cvec = _udiv(channels, lanes)
+            cvecs = _udiv(channels, self.lanes)
             blk = _udiv(bx, tw)
             j = bx - blk * tw
             cv = blk * THREADS + tid
-            if cv < cvec:
-                c0 = cv * lanes
-                src = cute.make_tensor(
-                    cute.make_ptr(
-                        self.dtype, addr, cute.AddressSpace.gmem, assumed_align=2 * lanes
-                    ),
-                    cute.make_layout((lanes, _FAR), stride=(1, lanes)),
-                )
-                window = []
-                for a in cutlass.range_constexpr(A):
-                    row = m * i - 1 + a
-                    row_vals = []
-                    for b in cutlass.range_constexpr(A):
-                        col = m * j - 1 + b
-                        inside = present and row >= 0 and row < height and col >= 0 and col < width
-                        g = (
-                            Int64(local) * frame_elems + (Int64(row) * width + col) * channels + c0
-                        ) // lanes
-                        buf = cute.make_rmem_tensor((lanes,), self.dtype)
-                        buf.store(cute.full((lanes,), 0.0, Float32).to(self.dtype))
-                        if inside:
-                            buf.store(src[(None, g)].load())
-                        row_vals.append(buf)
-                    window.append(row_vals)
+            if cv < cvecs:
+                vals = self._register_window(addr, geom, j, cv, cvecs)
                 tile = Int64(i - row0) * tw + j
-                base = self._v_word(tile, c0, n, comp, pair, pairs, frames, channels, tiles)
-                vals = [[window[a][b].load().to(Float32) for b in range(A)] for a in range(A)]
-                for e2 in cutlass.range_constexpr(lanes // 2):
-                    out = [
-                        _transform2(
-                            m, _bt, [[vals[a][b][2 * e2 + e] for b in range(A)] for a in range(A)]
-                        )
-                        for e in range(2)
-                    ]
-                    for x in cutlass.range_constexpr(A):
-                        for y in cutlass.range_constexpr(A):
-                            v_out[base + e2 + (x * A + y) * coord_words] = pack2(
-                                out[0][x][y], out[1][x][y], True
-                            )
+                base = self._v_word(tile, cv * self.lanes, n, frames, components, half_ch, tiles)
+                self._transform_store(v_out, base, coord_words, vals, self.lanes // 2)
 
-    def _v_word(self, tile, c0, n, comp, pair, pairs, frames, channels, tiles):
+    @cute.jit
+    def _stage_window(self, addr, geom, tid, j0, chunk, channels):
+        """Copies the block's ``A x cols`` window (one tile row, ``STAGED_TILES`` tiles, 64
+        channels) into shared memory as 16-byte vectors, zero outside the frame; all global
+        loads are issued before the first shared-memory store. Returns the window viewed as
+        channel pairs."""
+        m, A, cols, ch = self.m, self.A, self.cols, STAGED_CHANNELS
+        present, frame_pixel, i, height, width = geom
+        src = flat_view(
+            cute.make_ptr(self.dtype, addr, cute.AddressSpace.gmem, assumed_align=16),
+            CHANNELS_PER_VECTOR,
+        )
+        smem = cute.arch.get_dyn_smem(self.dtype, alignment=16)
+        win = flat_view(smem, CHANNELS_PER_VECTOR)
+        per_pixel = ch // CHANNELS_PER_VECTOR
+        cvecs = _udiv(channels, CHANNELS_PER_VECTOR)
+        total = A * cols * per_pixel
+        bufs = []
+        for it in cutlass.range_constexpr((total + THREADS - 1) // THREADS):
+            q = tid + it * THREADS
+            cc = q % per_pixel
+            pix = q // per_pixel
+            a = pix // cols
+            b = pix - a * cols
+            row = m * i - 1 + a
+            col = m * j0 - 1 + b
+            inside = (
+                present and q < total and row >= 0 and row < height and col >= 0 and col < width
+            )
+            g = (frame_pixel + (row * width + col)) * cvecs + chunk * per_pixel + cc
+            buf = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), self.dtype)
+            buf.fill(0.0)
+            if inside:
+                buf.store(src[(None, g)].load())
+            bufs.append(buf)
+        for it in cutlass.range_constexpr((total + THREADS - 1) // THREADS):
+            q = tid + it * THREADS
+            if q < total:
+                win[(None, q)].store(bufs[it].load())
+        cute.arch.sync_threads()
+        return flat_view(smem, 2)
+
+    def _staged_window_pair(self, win, tt, pp) -> list:
+        """The ``A x A`` window of tile ``tt`` of the staged group at channel pair ``pp``, as
+        fp32 pairs."""
+        m, A, cols, ch = self.m, self.A, self.cols, STAGED_CHANNELS
+        return [
+            [
+                win[(None, ((a * cols + m * tt + b) * ch + 2 * pp) // 2)].load().to(Float32)
+                for b in range(A)
+            ]
+            for a in range(A)
+        ]
+
+    @cute.jit
+    def _register_window(self, addr, geom, j, cv, cvecs) -> list:
+        """The ``A x A`` window of tile ``j`` at channel vector ``cv`` (``lanes`` channels) read
+        straight from global memory, zero outside the frame, as fp32 vectors."""
+        m, A, lanes = self.m, self.A, self.lanes
+        present, frame_pixel, i, height, width = geom
+        src = flat_view(
+            cute.make_ptr(self.dtype, addr, cute.AddressSpace.gmem, assumed_align=2 * lanes), lanes
+        )
+        window = []
+        for a in cutlass.range_constexpr(A):
+            row = m * i - 1 + a
+            for b in cutlass.range_constexpr(A):
+                col = m * j - 1 + b
+                inside = present and row >= 0 and row < height and col >= 0 and col < width
+                g = (frame_pixel + (row * width + col)) * cvecs + cv
+                buf = cute.make_rmem_tensor((lanes,), self.dtype)
+                buf.fill(0.0)
+                if inside:
+                    buf.store(src[(None, g)].load())
+                window.append(buf)
+        return [[window[a * A + b].load().to(Float32) for b in range(A)] for a in range(A)]
+
+    def _transform_store(self, v_out, base, coord_words, vals, npairs: int) -> None:
+        """``B^T d B`` of each channel of ``vals`` (``A x A`` fp32 vectors of ``2 * npairs``
+        channels), stored as fp16 pairs: coordinate ``(x, y)`` of pair ``e2`` at word
+        ``base + e2 + (x * A + y) * coord_words``."""
+        m, A = self.m, self.A
+        for e2 in range(npairs):
+            lo, hi = 2 * e2, 2 * e2 + 1
+            if m == 4:
+                # The 6x6 transform on packed pairs: half the fp32 instructions (FFMA2, FADD2).
+                out = _transform2(
+                    m,
+                    _bt,
+                    [
+                        [_Pair.of(vals[a][b][lo], vals[a][b][hi]) for b in range(A)]
+                        for a in range(A)
+                    ],
+                )
+                halves = [[(o.lo, o.hi) for o in row] for row in out]
+            else:
+                # F(2x2) is a few adds per value; scalar code keeps fewer registers live and
+                # measures faster.
+                out_lo = _transform2(m, _bt, [[vals[a][b][lo] for b in range(A)] for a in range(A)])
+                out_hi = _transform2(m, _bt, [[vals[a][b][hi] for b in range(A)] for a in range(A)])
+                halves = [[(out_lo[x][y], out_hi[x][y]) for y in range(A)] for x in range(A)]
+            for x in range(A):
+                for y in range(A):
+                    v_out[base + e2 + (x * A + y) * coord_words] = pack2(*halves[x][y], True)
+
+    def _v_word(self, tile, c0, n, frames, components, half_ch, tiles):
         """Word index (fp16 pairs) of channel ``c0`` (even) of coordinate 0 of ``tile``."""
-        if self.stacked:
-            off = tile * (Int64(frames) * channels) + Int64(n) * channels + c0
+        if cutlass.const_expr(self.stacked):
+            row = tile * frames + n
         else:
-            row = Int64(comp) * (self.A * self.A) * (tiles * pairs) + Int64(pair) * tiles + tile
-            off = row * channels + c0
-        return off // 2
+            pairs = _udiv(frames, components)
+            comp = _udiv(n, pairs)
+            pair = n - comp * pairs
+            row = (comp * (self.A * self.A) * pairs + pair) * tiles + tile
+        return row * half_ch + (c0 >> 1)
 
 
 class OutputTransformKernel:
@@ -329,7 +417,6 @@ class OutputTransformKernel:
         self.fp16 = fp16_frames
         self.has_bias = has_bias
         self.lanes = 4 if m == 2 else 2
-        self.lane_shift = self.lanes.bit_length() - 1
 
     @cute.jit
     def wrapper(
@@ -376,38 +463,33 @@ class OutputTransformKernel:
         j = bx - blk * tw
         cv = blk * THREADS + tid
         if cv < cvec:
-            c0 = cv * lanes
             i = row0 + Int32(by)
             tiles = Int64(row1 - row0) * tw
             pairs = _udiv(frames, components)
             comp = _udiv(n, pairs)
             pair = n - comp * pairs
-            gm = cute.make_tensor(m_ptr, cute.make_layout((lanes, _FAR), stride=(1, lanes)))
-            gb = cute.make_tensor(bias_ptr, cute.make_layout((lanes, _FAR), stride=(1, lanes)))
+            gm = flat_view(m_ptr, lanes)
+            gb = flat_view(bias_ptr, lanes)
             # Output pixels as vectors of lanes / 2 packed pairs (one 8- or 4-byte store each).
             half = lanes // 2
-            gy = cute.make_tensor(
-                cute.recast_ptr(y_ptr, dtype=Int32),
-                cute.make_layout((half, _FAR), stride=(1, half)),
-            )
+            gy = flat_view(cute.recast_ptr(y_ptr, dtype=Int32), half)
+            # The bias first: its load does not wait for the coordinate addresses.
+            bias = None
+            if cutlass.const_expr(self.has_bias):
+                bias = gb[(None, cv)].load().to(Float32)
             tile = Int64(i - row0) * tw + j
-            row = Int64(comp) * (A * A) * (tiles * pairs) + Int64(pair) * tiles + tile
-            first = (row * channels + c0) >> self.lane_shift
+            row = (comp * (A * A) * pairs + pair) * tiles + tile
+            first = row * cvec + cv
             coord_vecs = tiles * pairs * cvec
             # The coordinates are read-only for the kernel's lifetime: non-coherent loads.
             nc = cute.make_copy_atom(
                 cute.nvgpu.CopyG2ROp(), Float16, num_bits_per_copy=16 * lanes, invariant=True
             )
             coords = []
-            idx = first
             for k in cutlass.range_constexpr(A * A):
                 frag = cute.make_rmem_tensor((lanes,), Float16)
-                cute.copy(nc, gm[(None, idx)], frag)
+                cute.copy(nc, gm[(None, first + k * coord_vecs)], frag)
                 coords.append(frag.load().to(Float32))
-                idx = idx + coord_vecs
-            bias = None
-            if cutlass.const_expr(self.has_bias):
-                bias = gb[(None, cv)].load().to(Float32)
             frame0 = Int64(n) * height * width
             outs = []
             for ch in cutlass.range_constexpr(lanes):
@@ -415,7 +497,7 @@ class OutputTransformKernel:
                     m, _at, [[coords[x * A + b][ch] for b in range(A)] for x in range(A)]
                 )
                 if cutlass.const_expr(self.has_bias):
-                    y = [[_add(y[r][s], bias[ch]) for s in range(m)] for r in range(m)]
+                    y = [[y[r][s] + bias[ch] for s in range(m)] for r in range(m)]
                 outs.append(y)
             # Output vector index of pixel (m*i, m*j) and the steps to the next pixel and row; the
             # frame-edge tests once per row and per column.

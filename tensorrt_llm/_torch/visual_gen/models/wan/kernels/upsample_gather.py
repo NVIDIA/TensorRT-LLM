@@ -23,7 +23,16 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64
 
-from .common import VEC, bf16_hi, bf16_lo, compile_cached, pack2, store_words, u32_view, vec_view
+from .common import (
+    CHANNELS_PER_VECTOR,
+    bf16_hi,
+    bf16_lo,
+    compile_cached,
+    pack2,
+    store_words,
+    u32_view,
+    vec_view,
+)
 
 THREADS = 256
 
@@ -41,8 +50,8 @@ class UpsampleGatherKernel:
         self.has_bias = has_bias
         # Shortcut channels of one thread: a contiguous span of 8 * factor / repeats values
         # (at least one), loaded in chunks of up to one 16-byte vector.
-        self.span = max(1, VEC * self.factor // repeats)
-        self.chunk = min(self.span, VEC)
+        self.span = max(1, CHANNELS_PER_VECTOR * self.factor // repeats)
+        self.chunk = min(self.span, CHANNELS_PER_VECTOR)
 
     @cute.jit
     def wrapper(
@@ -92,9 +101,9 @@ class UpsampleGatherKernel:
                 sc_ptr, cute.make_layout((self.chunk, 1 << 40), stride=(1, self.chunk))
             )
             ft = self.factor_t
-            cvec = cout // VEC
+            cvec = cout // CHANNELS_PER_VECTOR
             ov = idx % cvec
-            o = ov * VEC
+            o = ov * CHANNELS_PER_VECTOR
             pix = idx // cvec
             j = pix % width
             pix = pix // width
@@ -109,7 +118,7 @@ class UpsampleGatherKernel:
                 # Scalars extracted here, once: an element read from the vector inside the frame
                 # branches would be materialized in the first branch only.
                 loaded_bias = gb[(None, ov)].load().to(Float32)
-                bias = [loaded_bias[k] for k in range(VEC)]
+                bias = [loaded_bias[k] for k in range(CHANNELS_PER_VECTOR)]
             span = []
             if cutlass.const_expr(self.shortcut):
                 pix_base = ((Int64(b) * frames_r + tr) * height + i) * width + j
@@ -144,17 +153,20 @@ class UpsampleGatherKernel:
                 for ph in cutlass.range_constexpr(4):
                     pp, qq = ph // 2, ph % 2
                     v = phases[a * 4 + ph]
-                    vals = [v[k] for k in range(VEC)]
+                    vals = [v[k] for k in range(CHANNELS_PER_VECTOR)]
                     if cutlass.const_expr(self.has_bias):
-                        vals = self._round8([vals[k] + bias[k] for k in range(VEC)])
+                        vals = self._round8([vals[k] + bias[k] for k in range(CHANNELS_PER_VECTOR)])
                     if cutlass.const_expr(self.shortcut):
                         s = (a * 2 + pp) * 2 + qq
                         vals = [
                             vals[k] + span[(k * self.factor + s) // self.repeats]
-                            for k in range(VEC)
+                            for k in range(CHANNELS_PER_VECTOR)
                         ]
                     words_ph.append(
-                        [pack2(vals[2 * w], vals[2 * w + 1], self.fp16) for w in range(VEC // 2)]
+                        [
+                            pack2(vals[2 * w], vals[2 * w + 1], self.fp16)
+                            for w in range(CHANNELS_PER_VECTOR // 2)
+                        ]
                     )
                 if f >= 0:
                     for ph in cutlass.range_constexpr(4):
@@ -167,15 +179,15 @@ class UpsampleGatherKernel:
         (already packed)."""
         if not self.fp16:
             out = []
-            for w in range(VEC // 2):
+            for w in range(CHANNELS_PER_VECTOR // 2):
                 word = pack2(vals[2 * w], vals[2 * w + 1])
                 out += [bf16_lo(word), bf16_hi(word)]
             return out
-        t = cute.make_rmem_tensor((VEC,), Float32)
-        for k in range(VEC):
+        t = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), Float32)
+        for k in range(CHANNELS_PER_VECTOR):
             t[k] = vals[k]
         r = t.load().to(Float16).to(Float32)
-        return [r[k] for k in range(VEC)]
+        return [r[k] for k in range(CHANNELS_PER_VECTOR)]
 
 
 @functools.lru_cache(maxsize=None)
@@ -258,7 +270,7 @@ def upsample_gather(
         memory_format=torch.channels_last_3d,
     )
     frames_r = (frames + crop) // factor_t
-    items = batch * frames_r * height * width * (cout // VEC)
+    items = batch * frames_r * height * width * (cout // CHANNELS_PER_VECTOR)
     if items == 0:
         return out
     if items >= 2**31:

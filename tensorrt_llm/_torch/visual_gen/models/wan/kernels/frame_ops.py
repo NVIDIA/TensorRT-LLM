@@ -27,7 +27,7 @@ import torch
 from cutlass import BFloat16, Float32, Int32
 
 from .common import (
-    VEC,
+    CHANNELS_PER_VECTOR,
     compile_cached,
     load_words,
     pack2,
@@ -50,7 +50,7 @@ class AvgDownAddKernel:
         self.group_size = group_size
         self.per_input = self.factor // group_size  # output channels per input channel
         self.has_bias = has_bias
-        self.cvec = cin // VEC
+        self.cvec = cin // CHANNELS_PER_VECTOR
 
     @cute.jit
     def wrapper(
@@ -110,30 +110,36 @@ class AvgDownAddKernel:
                 for b in cutlass.range_constexpr(fs):
                     for d in cutlass.range_constexpr(fs):
                         row = (t_in * in_rows + i_out * fs + b) * in_width + j_out * fs + d
-                        buf = cute.make_rmem_tensor((VEC,), BFloat16)
+                        buf = cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), BFloat16)
                         if t_in >= 0:
                             buf.store(gr[(None, cutlass.Int64(row) * self.cvec + cv)].load())
                         else:
-                            buf.store(cute.full((VEC,), 0.0, Float32).to(BFloat16))
+                            buf.store(cute.full((CHANNELS_PER_VECTOR,), 0.0, Float32).to(BFloat16))
                         taps.append(buf.load().to(Float32))
 
             inv = Float32(1.0 / self.group_size)
             for w in cutlass.range_constexpr(self.per_input):
-                ov = cutlass.Int64(pix) * (self.cout // VEC) + cv * self.per_input + w
+                ov = (
+                    cutlass.Int64(pix) * (self.cout // CHANNELS_PER_VECTOR)
+                    + cv * self.per_input
+                    + w
+                )
                 xs = unpack_bf16(load_words(ux, ov))
                 bs = None
                 if cutlass.const_expr(self.has_bias):
                     bs = unpack_bf16(load_words(ub, cv * self.per_input + w))
                 means = []
-                for k in cutlass.range_constexpr(VEC):
-                    o = w * VEC + k  # output channel, counted from this thread's first one
+                for k in cutlass.range_constexpr(CHANNELS_PER_VECTOR):
+                    o = (
+                        w * CHANNELS_PER_VECTOR + k
+                    )  # output channel, counted from this thread's first one
                     e, q = o // self.per_input, o % self.per_input
                     acc = Float32(0.0)
                     for g in cutlass.range_constexpr(self.group_size):
                         acc = acc + taps[q * self.group_size + g][e]
                     means.append(acc * inv)
                 words = []
-                for i in cutlass.range_constexpr(VEC // 2):
+                for i in cutlass.range_constexpr(CHANNELS_PER_VECTOR // 2):
                     mw = pack2(means[2 * i], means[2 * i + 1])
                     rounded = unpack_bf16([mw])
                     s = []
@@ -192,7 +198,12 @@ def avg_down_add(
         raise ValueError("x positions must equal out_height * out_width")
     if in_frames + pad_t != out_frames * factor_t:
         raise ValueError("frame counts do not match the temporal factor")
-    if cin * factor != cout * group_size or factor % group_size or cin % VEC or cout % VEC:
+    if (
+        cin * factor != cout * group_size
+        or factor % group_size
+        or cin % CHANNELS_PER_VECTOR
+        or cout % CHANNELS_PER_VECTOR
+    ):
         raise ValueError(
             "avg_down_add needs cin * factor == cout * group_size, group_size dividing factor "
             "and channel counts that are multiples of 8"
@@ -200,7 +211,7 @@ def avg_down_add(
     if bias is not None and bias.numel() != cout:
         raise ValueError("bias must have cout values")
     y = torch.empty_like(x)
-    items = out_frames * out_positions * (cin // VEC)
+    items = out_frames * out_positions * (cin // CHANNELS_PER_VECTOR)
     if items == 0:
         return y
     if items >= 2**31:
@@ -229,7 +240,7 @@ class InterleaveBiasKernel:
     thread per 16-byte output vector."""
 
     def __init__(self, channels: int, has_bias: bool) -> None:
-        self.cvec = channels // VEC
+        self.cvec = channels // CHANNELS_PER_VECTOR
         self.has_bias = has_bias
 
     @cute.jit
@@ -278,7 +289,7 @@ class InterleaveBiasKernel:
                 vs = unpack_bf16(words)
                 bs = unpack_bf16(load_words(ub, half * self.cvec + cv))
                 words = []
-                for i in cutlass.range_constexpr(VEC // 2):
+                for i in cutlass.range_constexpr(CHANNELS_PER_VECTOR // 2):
                     words.append(pack2(vs[2 * i] + bs[2 * i], vs[2 * i + 1] + bs[2 * i + 1]))
             store_words(uy, cutlass.Int64(idx), words)
 
@@ -311,7 +322,7 @@ def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
         if bias.numel() != c2 or bias.dtype != torch.bfloat16 or not bias.is_contiguous():
             raise ValueError("bias must be 2C contiguous bf16 values")
     y = torch.empty((2 * frames, positions, c2 // 2), dtype=u.dtype, device=u.device)
-    items = 2 * frames * positions * (c2 // 2 // VEC)
+    items = 2 * frames * positions * (c2 // 2 // CHANNELS_PER_VECTOR)
     if items == 0:
         return y
     if items >= 2**31:

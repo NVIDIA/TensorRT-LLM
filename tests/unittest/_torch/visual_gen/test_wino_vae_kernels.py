@@ -737,7 +737,7 @@ _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], 
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
 
 
-# F(4x4, 3x3) on points (0, +-3/2, +-5/8, inf), as in the CUDA op and the sm100 path.
+# F(4x4, 3x3) on points (0, +-3/2, +-5/8, inf), as in kernels.spatial_winograd and the sm100 path.
 _BT4 = torch.tensor(
     [
         [225 / 256, 0, -169 / 64, 0, 1, 0],

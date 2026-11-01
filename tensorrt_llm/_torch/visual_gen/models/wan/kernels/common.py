@@ -12,8 +12,10 @@ from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir_helpers.op import dsl_user_op
 
-VEC = 8  # 16-byte vectors of 16-bit elements
-EXTENT = 1 << 40  # extent of the flat vector views (indexing is unchecked)
+# bf16 / fp16 channels in one 16-byte load or store; the kernels are channels-last, so a vector
+# is 8 consecutive channels of one pixel.
+CHANNELS_PER_VECTOR = 8
+_UNBOUNDED = 1 << 40  # extent of the flat views: indexing is unchecked, callers bound it
 
 
 @dsl_user_op
@@ -58,16 +60,20 @@ def unpack_bf16(words: list) -> list:
     return [f for w in words for f in (bf16_lo(w), bf16_hi(w))]
 
 
+def flat_view(ptr: cute.Pointer, width: int) -> cute.Tensor:
+    """A flat buffer as ``[width, n]``: column ``i`` is elements ``width * i .. width * i +
+    width - 1``, ``n`` unbounded."""
+    return cute.make_tensor(ptr, cute.make_layout((width, _UNBOUNDED), stride=(1, width)))
+
+
 def vec_view(ptr: cute.Pointer) -> cute.Tensor:
-    """A flat 16-bit buffer as ``[VEC, n]`` 16-byte vectors (column i is elements 8i .. 8i+7)."""
-    return cute.make_tensor(ptr, cute.make_layout((VEC, EXTENT), stride=(1, VEC)))
+    """A flat 16-bit buffer as 16-byte vectors (column i is elements 8i .. 8i+7)."""
+    return flat_view(ptr, CHANNELS_PER_VECTOR)
 
 
 def u32_view(ptr: cute.Pointer) -> cute.Tensor:
     """A flat 16-bit buffer as ``[4, n]`` packed pairs (column i is the 16-byte vector i)."""
-    return cute.make_tensor(
-        cute.recast_ptr(ptr, dtype=Int32), cute.make_layout((4, EXTENT), stride=(1, 4))
-    )
+    return flat_view(cute.recast_ptr(ptr, dtype=Int32), 4)
 
 
 def load_words(view: cute.Tensor, idx) -> list:
