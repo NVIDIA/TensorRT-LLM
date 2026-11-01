@@ -23,6 +23,7 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import runtime_hooks_of
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     warmup_sampling_module,
     warmup_topk_module,
@@ -1173,6 +1174,13 @@ class DecoderWarmup:
             ran_flashinfer_forward = run_autotuner_pass(
                 flashinfer_mxfp8_autotune(), synchronize_trtllm_cache=False
             )
+        # The model's declared hooks (the all-off default when it declares none): the warmup passes also run on
+        # engines built without the runner's constructor.
+        if runtime_hooks_of(self.model).merge_tuned_tactics_across_ranks:
+            # Rank-local profiling noise must not leave tensor-parallel peers
+            # serving different tactics for one shape: keep the fastest everywhere.
+            # Collective; before the native MXFP8 cache below registers the tactics.
+            AutoTuner.get().post_tune_merge_tactics()
 
         if enable_flashinfer_mxfp8_autotuner:
             if ran_flashinfer_forward:

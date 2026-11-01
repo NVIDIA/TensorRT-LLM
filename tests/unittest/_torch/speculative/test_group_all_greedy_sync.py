@@ -14,10 +14,13 @@ stand-in, mirroring test_rejection_buffers_guard.py, so no GPU or full
 SpecMetadata construction is needed.
 """
 
+import itertools
 import types
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
+
+_request_ids = itertools.count()
 
 
 def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
@@ -30,6 +33,7 @@ def _fake_request(temperature=None, top_k=None, top_p=None, min_p=None, slot=0):
         ),
         state=LlmRequestState.GENERATION_IN_PROGRESS,
         py_seq_slot=slot,
+        py_request_id=next(_request_ids),
     )
 
 
@@ -40,6 +44,8 @@ def _fake_meta(group_all_greedy_sample=None):
         dummy_slot_row=0,
         spec_dec_mode=types.SimpleNamespace(use_one_engine=lambda: True),
         group_all_greedy_sample=group_all_greedy_sample,
+        temperature_only_graphs=False,
+        _sampling_scan_cache=None,
     )
     # update_is_all_greedy_sample dispatches through self, so the stand-in needs the
     # method bound to itself -- calling the unbound SpecMetadata function with a plain

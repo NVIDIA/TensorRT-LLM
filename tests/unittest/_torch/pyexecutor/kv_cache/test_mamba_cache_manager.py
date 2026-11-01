@@ -52,6 +52,7 @@ from tensorrt_llm._torch.modules.mamba.cache_manager import (
     ReplayStateUpdateMetadata,
     _advance_replay_state,
 )
+from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.pyexecutor._util import (
     KvCacheCreator,
@@ -70,6 +71,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
     CppMambaHybridCacheManager,
+    InforwardSnapshotEntry,
     MambaCacheManager,
     MambaHybridCacheManagerV2,
     MambaRole,
@@ -768,6 +770,16 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
         pretrained_config=pretrained_config,
         quant_config=None,
     )
+    # A model whose GDN layer verifies drafts with the fused kernels.
+    gdn = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(gdn)
+    gdn.fused_verify = True
+    model_engine = SimpleNamespace(
+        model=torch.nn.ModuleList([gdn]),
+        attn_runtime_features=SimpleNamespace(chunked_prefill=False),
+        max_cuda_graph_batch_size=None,
+        input_processor=MagicMock(spec=BaseMultimodalInputProcessor),
+    )
     mamba_params = MambaKVCacheParams(
         state_size=8,
         conv_kernel=4,
@@ -794,7 +806,7 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     )
 
     common_kwargs = dict(
-        model_engine=None,
+        model_engine=model_engine,
         mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
         tokens_per_block=32,
         max_seq_len=2048,
@@ -826,6 +838,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     )
 
     assert captured_cpp["use_replay_state_update"] is None
+    assert captured_cpp["gdn_fused_verify"] is True
+    assert "gdn_fused_verify" not in captured_mixed
+    assert captured_v2["gdn_fused_verify"] is True
     assert captured_cpp["model_type"] == "qwen3_next"
     assert captured_cpp["max_num_tokens"] == 256
     assert "vocab_size" not in captured_cpp
@@ -1861,6 +1876,65 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
     assert kwargs["dummy_request_mask"].tolist() == [False, True]
     assert kwargs["replay_step_width"] == 4
     assert kwargs["replay_history_size"] == MIN_REPLAY_HISTORY_SIZE
+
+
+@skip_no_cuda
+def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
+    """The one-launch promotion leaves the conv states and replay bookkeeping of the
+    per-step reference (_advance_replay_state, then per-layer promotion)."""
+    from tensorrt_llm._torch.modules.fla import cache_manager as fla_cache_manager
+
+    num_layers, batch_size = 3, 4
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=batch_size,
+        num_mamba_layers=num_layers,
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        speculative_state=GDNReplayState(4),
+        conv_state_layout="q_k_v",
+    )
+    try:
+        state = mgr._speculative_state
+        assert isinstance(state, GDNReplayState)
+        assert state._stacked_conv is not None
+        torch.manual_seed(0)
+        state.intermediate_conv.normal_()
+        for conv in mgr.all_conv_states:
+            conv.normal_()
+        slots = torch.tensor([1, 3, 0, 2], dtype=torch.int32, device="cuda")
+        state.prev_num_accepted_tokens.copy_(
+            torch.randint(0, state.replay_history_size, state.prev_num_accepted_tokens.shape)
+        )
+        state.cache_buf_idx.copy_(torch.randint(0, 2, state.cache_buf_idx.shape))
+        mgr._dummy_request_mask[:batch_size] = torch.tensor([False, False, True, False])
+        num_accepted = torch.tensor([1, 4, 2, 3], dtype=torch.int32, device="cuda")
+
+        ref_conv = [conv.clone() for conv in mgr.all_conv_states]
+        ref_meta = fla_cache_manager.ReplayStateUpdateMetadata(
+            state.prev_num_accepted_tokens.clone(),
+            state.cache_buf_idx.clone(),
+            state.replay_step_width,
+            state.replay_history_size,
+        )
+        fla_cache_manager._advance_replay_state(
+            ref_meta, slots, num_accepted, mgr._dummy_request_mask[:batch_size].clone()
+        )
+        for layer, dst in enumerate(ref_conv):
+            for g in range(batch_size):
+                dst[slots[g]] = state.intermediate_conv[layer, g, num_accepted[g] - 1]
+
+        state.commit_all_layers = MagicMock()
+        mgr.update_mamba_states(
+            SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+            num_accepted,
+            state_indices=slots,
+        )
+        torch.cuda.synchronize()
+        for conv, ref in zip(mgr.all_conv_states, ref_conv):
+            assert torch.equal(conv, ref)
+        assert torch.equal(state.prev_num_accepted_tokens, ref_meta.prev_num_accepted_tokens)
+        assert torch.equal(state.cache_buf_idx, ref_meta.cache_buf_idx)
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda
@@ -3340,7 +3414,7 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
         is_dummy_request=False,
         is_dummy=False,
         py_request_id=0,
-        get_tokens=lambda beam_idx: token_ids,
+        get_tokens_view=lambda beam_idx: token_ids,
     )
     kv_cache = SimpleNamespace(
         num_committed_tokens=0,
@@ -3671,6 +3745,7 @@ def _build_v2_hybrid_with_mamba_layer(
     is_disagg=False,
     enable_stats=False,
     model_manager_cls=None,
+    supports_inforward_snapshot=None,
     kv_cache_config: KvCacheConfig | None = None,
     mamba_d_state: int = 8,
     mamba_head_dim: int = 8,
@@ -3739,6 +3814,8 @@ def _build_v2_hybrid_with_mamba_layer(
                 validate_gdn_layout(self, speculative_state)
             return speculative_state
 
+    if supports_inforward_snapshot is not None:
+        ModelStateManager._supports_inforward_snapshot = supports_inforward_snapshot
     manager_cls = ModelStateManager
     return manager_cls(
         mamba_d_state=mamba_d_state,
@@ -3831,6 +3908,100 @@ def _run_v2_hybrid_context(
     request.context_current_position = request.prompt_len
     assert request.context_remaining_length == 0
     manager.update_context_resources(batch)
+
+
+def _build_v2_inforward_snapshot_manager():
+    return _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=2,
+        num_mamba_layers=2,
+        enable_block_reuse=True,
+        block_reuse_policy="per_request",
+        additional_snapshot_offsets_from_end=[2],
+        conv_state_layout="q_k_v",
+        supports_inforward_snapshot=True,
+    )
+
+
+def _make_v2_prompt_request(request_id: int, tokens: list[int]) -> LlmRequest:
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
+    # The snapshot at P = prompt_len - 2 holds the state the GDN layers left in the live slot;
+    # the live slot gets the staged prompt-end state.
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        assert mgr.inforward_snapshot_rows == 2  # max_batch_size
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        mgr.prepare_expect_snapshot_points([request])
+        assert request.expect_snapshot_points == [64]
+        assert mgr.prepare_context(request)
+        assert mgr.resize_context(request, num_tokens=66)
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        mgr.prepare_resources(batch)
+        assert mgr.inforward_snapshot_plan == {1: InforwardSnapshotEntry(0, 64, 64, 2)}
+        assert request.py_mamba_inforward_snapshot_point is None
+
+        # The forward: live slot = state at P, staging row 0 = state at the prompt end.
+        slot = mgr.state_index(1)
+        for layer in range(2):
+            mgr.get_ssm_states(layer)[slot].fill_(1.0)
+            mgr.get_conv_states(layer)[slot].fill_(1.0)
+            stage_ssm, stage_conv = mgr.inforward_snapshot_stage_views(layer)
+            stage_ssm[0].fill_(2.0)
+            stage_conv[0].fill_(2.0)
+        mgr.finish_inforward_snapshots(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        torch.cuda.synchronize()
+        request.context_current_position = 66
+        mgr.update_context_resources(batch)
+        assert mgr.kv_cache_map[1].num_committed_tokens == 64
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[slot] == 2.0)
+            assert torch.all(mgr.get_conv_states(layer)[slot] == 2.0)
+
+        # A sibling that shares the first 64 tokens resumes from the snapshot at P.
+        sibling = _make_v2_prompt_request(2, list(range(1, 65)) + [500, 501, 502, 503])
+        mgr.prepare_expect_snapshot_points([sibling])
+        assert mgr.prepare_context(sibling)
+        assert sibling.context_current_position == 64
+        batch = ScheduledRequests()
+        batch.append_context_request(sibling)
+        mgr.prepare_resources(batch)
+        torch.cuda.synchronize()
+        sibling_slot = mgr.state_index(2)
+        assert sibling_slot != slot
+        for layer in range(2):
+            assert torch.all(mgr.get_ssm_states(layer)[sibling_slot] == 1.0)
+            assert torch.all(mgr.get_conv_states(layer)[sibling_slot] == 1.0)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
+    mgr = _build_v2_inforward_snapshot_manager()
+    try:
+        request = _make_v2_prompt_request(1, list(range(1, 67)))
+        request.expect_snapshot_points = [64]
+        request.context_chunk_size = 66
+        request.py_mamba_inforward_snapshot_point = 64
+        batch = SimpleNamespace(context_requests=[request], generation_requests=[object()])
+        mgr._plan_inforward_snapshots(batch)
+        assert mgr.inforward_snapshot_plan == {}
+        assert request.py_mamba_inforward_snapshot_point is None
+    finally:
+        mgr.shutdown()
 
 
 def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
@@ -4475,12 +4646,14 @@ def _fake_context_request(
     context_current_position=0,
     is_dummy_request=False,
     expect_snapshot_points=None,
+    is_disagg_generation_init_state=False,
 ):
     return SimpleNamespace(
         py_request_id=rid,
         prompt_len=prompt_len,
         context_current_position=context_current_position,
         is_dummy_request=is_dummy_request,
+        is_disagg_generation_init_state=is_disagg_generation_init_state,
         expect_snapshot_points=list(expect_snapshot_points or []),
     )
 
@@ -4643,14 +4816,17 @@ def test_branch_snapshot_points_match_on_attention_only_pp_rank():
     assert attention_mgr._page_pruned_tokens_total == 0
 
 
-def test_branch_snapshot_skipped_for_dummy_requests():
+# A disagg generation request receives its prompt state and never prefills here.
+@pytest.mark.parametrize("flag", ["is_dummy_request", "is_disagg_generation_init_state"])
+def test_branch_snapshot_skipped_for_requests_without_prefill(flag):
     mgr = _branch_snapshot_manager()
-    request = _fake_context_request(prompt_len=256, is_dummy_request=True)
+    request = _fake_context_request(prompt_len=256, **{flag: True})
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     mgr._record_branch_snapshot_point(request, kv_cache, num_lookup_tokens=255)
 
     assert mgr._branch_snapshot_points == {}
+    assert request.expect_snapshot_points == []
     assert mgr._branch_snapshots_taken_total == 0
     assert mgr._branch_snapshots_skipped_total == {}
     assert mgr._snapshot_pruned_tokens_total == 0
@@ -4693,7 +4869,7 @@ def test_branch_snapshot_taken_counts_successful_commit_once():
     mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
     request = _fake_context_request(prompt_len=256, context_current_position=64)
     request.context_remaining_length = 192
-    request.get_tokens = lambda beam_idx: list(range(256))
+    request.get_tokens_view = lambda beam_idx: list(range(256))
     kv_cache = _fake_reuse_match(divergence=192, hybrid=64, reused=64)
 
     def commit(tokens):
@@ -4889,7 +5065,7 @@ def test_v2_hybrid_saves_conversation_plan_only_after_final_context_chunk():
         expect_snapshot_points=[128],
         prompt_len=128,
         is_last_context_chunk=True,
-        get_tokens=lambda beam_idx: list(range(128)),
+        get_tokens_view=lambda beam_idx: list(range(128)),
     )
     kv_cache = SimpleNamespace(
         is_active=True,

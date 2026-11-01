@@ -168,7 +168,9 @@ def test_decoder_runner_validates_compiled_body_at_initialization(
     torch.nn.Module.__init__(model)
     wrapper, _, _ = _create_prefill_compiled_model()
     model.model = wrapper if has_wrapper else torch.nn.Identity()
-    config = SimpleNamespace(compile_only_piecewise_graphs=enabled, max_beam_width=1)
+    config = SimpleNamespace(
+        compile_only_piecewise_graphs=enabled, max_beam_width=1, is_spec_decode=False
+    )
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import runner as runner_module
 
     for component in ("DecoderInputBuffers", "DecoderMetadata", "DecoderWarmup"):

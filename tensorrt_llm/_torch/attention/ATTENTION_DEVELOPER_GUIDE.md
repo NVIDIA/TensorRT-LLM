@@ -512,14 +512,17 @@ leaving the caller's `sparse_runtime_params` unchanged. The carrier holds both f
 `BlockSparseForwardInputs` in its nested `block_sparse_inputs` field.
 `Fmha.is_supported()` rejects a request that carries routes for every library
 that does not declare `supports_block_sparse_inputs`, so no dense kernel can
-silently drop the routing semantics.
+silently drop the routing semantics. Likewise a generation call whose
+QK-norm / RoPE / KV-append prologue the attention module deferred
+(`AttentionForwardArgs.kv_append.fold`, query = raw QKV projection) reaches only
+libraries that declare `supports_deferred_prologue`.
 For mixed non-MLA batches, the manager checks each active phase
 independently with `is_supported(..., phase=...)`; a phased library accepts only
 phases backed by its corresponding `run_*()` entry point.
 
 `Fmha` owns both entry points. Libraries declare shared capabilities through
 class attributes, such as `supports_skip_correction`, `supports_block_sparse_inputs`,
-and `supports_fp4_mla`, and override only
+`supports_fp4_mla` and `supports_deferred_prologue`, and override only
 `_is_available()` and `_is_supported()` for implementation-specific checks.
 `is_available()` rejects unsupported static capabilities before calling
 `_is_available()`. `is_supported()` provides the same boundary for shared
@@ -650,6 +653,13 @@ The FMHA package is split by role:
   MiniMax-M3 decode kernels for the generation phase.
 - `fmha/flashinfer_sparse_mla.py` implements the FlashInfer SM120/SM121 sparse
   MLA FMHA library.
+- `fmha/gqa_decode.py` serves the layers built with a `GqaDecodeSetup`:
+  `gqa_decode` is trtllm-gen that also consumes the module's FP8 KV append and
+  deferred prologue, and `gqa_kv_replica_fused`, `gqa_kv_replica`,
+  `gqa_split_kv` and `gqa_segmented` take the generation calls their
+  `_is_supported` declares with dedicated kernels (`fmha/gqa_*.py`). Their
+  size conditions are evaluated at the upper bound of the selection-cache
+  cell (`generation_selection_cell`).
 - `fmha/flashinfer_trtllm_gen.py` implements the FlashInfer trtllm-gen FMHA
   library.
 - `fmha/fallback.py` implements the fallback library on the native phased

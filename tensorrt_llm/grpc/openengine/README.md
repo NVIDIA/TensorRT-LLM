@@ -177,6 +177,8 @@ Placement exchange occurs only during OpenEngine executor startup. Metadata RPCs
 
 Events report full-block radix-cache residency; the streaming sink does not report live GPU-versus-cold-tier movement. Load snapshots independently report GPU block usage. The upstream sink emits signed 64-bit hashes from the first eight bytes of each V2 radix key, regardless of `kv_cache_event_hash_algo`. `ServerInfo.extra.trtllm_kv_event_hash_algo` advertises `v2_sha256_64` when streaming is enabled. These hashes identify blocks in event parent chains and removals. A router can derive its own request-compatible token hashes from the stored block `token_ids`, as Dynamo does.
 
+See [KV-cache streaming events](../../../docs/source/features/kvcache.md#streaming-path-prototype) for cache-reset behavior and delivery guarantees.
+
 Consumers must track rank-local sequence numbers and resynchronize on gaps. Publisher queue drops and failed sends leave sequence gaps, but native capture overflow is logged without a wire gap. Replay retains only the configured number of batches; a slow replay client can lose its replay response and must retry. Replay is sent in bounded, nonblocking chunks so it cannot stall live publication. The upstream publisher emits no idle heartbeat, so source health cannot be inferred from silence alone. A reset or restart does not reconstruct already-resident cache contents, and recovery can temporarily under-report cache affinity.
 
 Direct ZMQ sockets are unauthenticated. Keep them on a trusted network and restrict access to intended subscribers.

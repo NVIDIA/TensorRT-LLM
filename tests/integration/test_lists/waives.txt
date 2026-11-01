@@ -155,6 +155,7 @@ unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::te
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/dsa/test_modeling_v2_hist_topk_op_matrix.py::test_hist_topk_op_matrix SKIP (https://nvbugs/7004363)
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_ehproj_table.py::test_draft_ehproj_table_op_matrix SKIP (https://nvbugs/7004363)
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_sample_glue.py::test_draft_sample_glue_op_matrix SKIP (https://nvbugs/7004363)
+unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py SKIP (https://nvbugs/7024242)
 unittest/_torch/modules/mamba/test_flashinfer_gdn_decode.py::test_fi_decode_misaligned_index_slice SKIP (https://nvbugs/6842831)
 unittest/_torch/modules/tests_lora_modules/test_nemotron_h_lora_sanity.py::TestNemotronHLoRA::test_lora_pp2_sanity SKIP (https://nvbugs/6428124)
 unittest/_torch/moe/test_moe_backend.py::test_moe_backend[act=Relu2-e60_k4_h2048_i1408-seq=8-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize] SKIP (https://nvbugs/5989912)

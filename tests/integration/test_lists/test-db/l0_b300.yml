@@ -141,7 +141,8 @@ l0_b300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
   # TIMEOUT measured: 3122 cases in 13m54s on one GB300 (the cpu_only files run on the CPU
   # stage instead), so 30 is 2.2x headroom.
-  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/kimi_k3_vl TIMEOUT (30)
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/kimi_k3_vl --ignore=unittest/_torch/modeling_v2/models/minimax_m3 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_cluster_waits.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv.py

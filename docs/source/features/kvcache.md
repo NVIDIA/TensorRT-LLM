@@ -407,14 +407,16 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`, or over the
 `/kv_cache_events` endpoint of `trtllm-serve`.
 
+Reset does not flush buffered events; they are published at a subsequent iteration boundary.
+
 #### Streaming path (prototype)
 
 Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local native event source, converts the events to
-wire structs and enqueues one batch at the iteration boundary. A background thread performs
-msgpack encoding and socket I/O.
+LLM API. Each emitting rank drains its local native event source, converts the events to wire
+structs and attempts to enqueue a batch at iteration boundaries and when a prefix-cache reset
+completes. A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -433,10 +435,22 @@ kv_cache_config = KvCacheConfig(
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
+A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or
+removed events. A populated reset also emits `BlockRemoved` for previously published resident
+blocks before `AllBlocksCleared`; consumers should accept both even though the reset marker
+already invalidates the whole index. Each rank attempts to enqueue its reset events without
+waiting for another inference iteration, including while inference is idle or paused, and
+without a cross-rank event gather. Publishing happens asynchronously. A successfully
+published marker is retained in bounded replay history and does not change the engine
+lifetime ID.
+Orderly engine shutdown also clears the reuse tree and queues a final `AllBlocksCleared`
+before publisher teardown.
+The best-effort delivery guarantees below apply to reset and shutdown events too.
+
 Streaming exposes only the full-block residency information external routers need, using the
-attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
-centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
-contained and avoiding Python callbacks from native cache operations.
+attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and
+`AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping
+internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
 **Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
@@ -461,18 +475,23 @@ have no port, each rank appends a `_dp<rank>` suffix instead.
 
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
-`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored` or `BlockRemoved` — carrying int64 block hashes derived from the V2 radix block
-keys. This is the format documented for custom router backends; it differs from vLLM's
-positional-array encoding of the individual events, though the batch envelope is positional in
-both.
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key:
+`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64
+block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional
+fields. This is the format documented for custom router backends; it differs from vLLM's
+positional-array encoding of the individual events, though the batch envelope is positional
+in both.
 
 **Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
 (```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
 treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
 producer-side safety-cap drop is reported in the producer's logs and counters but does not
-create a sequence gap.
+create a sequence gap. If the last batch is dropped while the engine remains idle, a
+subscriber cannot detect its sequence gap until a later batch arrives. The
+[Dynamo TensorRT-LLM sidecar](https://github.com/ai-dynamo/dynamo/blob/e5a2ef3fcc2cc6e12a9185e39c98141a983eaeab/lib/llm/src/kv_router/publisher/zmq_listener.rs#L183-L208)
+currently logs source sequence gaps without automatically resynchronizing, so a lost reset
+marker can leave its routing index stale even after later events arrive.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and

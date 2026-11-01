@@ -745,6 +745,13 @@ def is_sm_100f(sm_version=None):
     return sm_version >= 100 and sm_version < 110
 
 
+def is_blackwell_datacenter(sm_version=None):
+    """SM 10.0 or SM 10.3 (B200 / B300 class); unlike ``is_sm_100f``, not SM 10.7."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return sm_version in (100, 103)
+
+
 @lru_cache(maxsize=1)
 def is_sm_120f(sm_version=None):
     if sm_version is None:
