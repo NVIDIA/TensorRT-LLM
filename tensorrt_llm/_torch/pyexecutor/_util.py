@@ -41,7 +41,7 @@ from tensorrt_llm._torch.peft.lora.manager import (load_torch_lora,
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.quantization import QuantAlgo
-from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionReusePolicy
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from ..attention.backends import get_sparse_attn_kv_cache_manager
 from ..attention.backends.sparse.params import \
@@ -2387,7 +2387,7 @@ class KvCacheCreator:
                 buffer_roles=self._layer_spec_roles(target_dtype,
                                                     k_only=target_k_only),
                 sliding_window_size=window,
-                reuse_policy=AttentionReusePolicy.REQUIRED,
+                reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(target_local_ids, target_windows)
         ]
         specs.extend(
@@ -2400,7 +2400,7 @@ class KvCacheCreator:
                 buffer_roles=self._layer_spec_roles(draft_dtype,
                                                     k_only=draft_k_only),
                 sliding_window_size=window,
-                reuse_policy=AttentionReusePolicy.REQUIRED,
+                reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
         return tuple(specs)
 
