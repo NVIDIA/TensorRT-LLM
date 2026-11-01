@@ -63,6 +63,11 @@ class TestGreedyTokensUsable:
             pytest.param(
                 {}, _set("py_logits_post_processors", [print]), id="logits_post_processor"
             ),
+            pytest.param(
+                {},
+                _set("py_apply_batched_logits_processor", True),
+                id="batched_logits_processor",
+            ),
             pytest.param({"return_log_probs": True}, None, id="log_probs"),
             pytest.param({"return_generation_logits": True}, None, id="generation_logits"),
             pytest.param({"stop_words_list": [[13, 14]]}, None, id="multi_token_stop_word"),

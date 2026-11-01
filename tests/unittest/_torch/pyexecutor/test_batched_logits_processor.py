@@ -14,6 +14,8 @@ import torch
 
 import tensorrt_llm._torch.distributed as distributed
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
+from tensorrt_llm._torch.pyexecutor.py_executor import _register_batched_logits_processor
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm import BaseLLM
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -44,9 +46,11 @@ def _request(
     admitted_beam_width=None,
     tokens=(1, 2, 3),
     orig_prompt_len=None,
+    is_last_context_chunk=True,
 ):
     tokens = list(tokens)
     return SimpleNamespace(
+        is_last_context_chunk=is_last_context_chunk,
         py_request_id=req_id,
         py_client_id=100 + req_id,
         py_logits_post_processors=processors,
@@ -147,15 +151,28 @@ def test_beam_rows_and_histories_reach_the_batched_processor():
     assert torch.equal(logits[:, 0], torch.tensor([1.0, 2.0, 2.0, 3.0, 5.0, 5.0, 6.0, 7.0]))
 
 
-def test_an_unfinished_context_chunk_is_not_handed_over():
+@pytest.mark.parametrize(
+    "chunk_kwargs",
+    [
+        # get_tokens(0) is the whole prompt during chunked prefill, so only
+        # the request's own chunk bookkeeping tells a middle chunk apart.
+        pytest.param({"is_last_context_chunk": False}, id="middle_chunk"),
+        pytest.param({"orig_prompt_len": 2}, id="prompt_shorter_than_tokens"),
+    ],
+)
+def test_an_unfinished_context_chunk_is_not_handed_over(chunk_kwargs):
     processor = _Recorder()
-    chunk = _request(1, batched=True, tokens=(1, 2, 3), orig_prompt_len=2)
+    chunk = _request(1, batched=True, tokens=(1, 2, 3), **chunk_kwargs)
+    last = _request(2, batched=True, tokens=(4, 5))
 
+    logits = _logits(2)
     _engine(processor)._execute_logit_post_processors(
-        _scheduled(context=[chunk]), {"logits": _logits(1)}
+        _scheduled(context=[chunk, last]), {"logits": logits}
     )
 
-    assert processor.calls == []
+    # The last chunk's row still reaches the processor, at its own offset.
+    assert [call[0] for call in processor.calls] == [[2]]
+    assert torch.equal(logits[:, 0], torch.tensor([0.0, 2.0]))
 
 
 def test_ragged_verification_is_refused_for_batched_only_requests():
@@ -234,11 +251,21 @@ def test_sharded_logits_are_gathered_for_the_batched_processor(monkeypatch):
     assert [tuple(r.shape) for r in processor.calls[0][1]] == [(1, 1, 32)]
 
 
-def test_the_flag_is_refused_without_a_batched_processor_on_the_llm():
-    llm = SimpleNamespace(
-        args=SimpleNamespace(batched_logits_processor=None, enable_chunked_prefill=False),
+def _llm(**args):
+    defaults = dict(
+        backend="pytorch",
+        batched_logits_processor=None,
+        enable_chunked_prefill=False,
+        speculative_config=None,
+    )
+    return SimpleNamespace(
+        args=SimpleNamespace(**{**defaults, **args}),
         _check_one_model_speculative_sampling=lambda params: None,
     )
+
+
+def test_the_flag_is_refused_without_a_batched_processor_on_the_llm():
+    llm = _llm()
     params = SamplingParams(apply_batched_logits_processor=True)
 
     with pytest.raises(ValueError, match="batched_logits_processor"):
@@ -246,3 +273,41 @@ def test_the_flag_is_refused_without_a_batched_processor_on_the_llm():
 
     llm.args.batched_logits_processor = _Recorder()
     BaseLLM._check_arguments(llm, 3, params, is_gen_only=True)
+
+
+def test_the_flag_is_refused_with_speculative_decoding():
+    """One-model workers sample before the walk; drafter modes sample rows the walk misaligns."""
+    llm = _llm(batched_logits_processor=_Recorder(), speculative_config=object())
+    params = SamplingParams(apply_batched_logits_processor=True)
+
+    with pytest.raises(RequestError, match="speculative decoding"):
+        BaseLLM._check_arguments(llm, 3, params, is_gen_only=True)
+
+    # A request without the flag is unaffected, and so is the flag once
+    # speculative decoding is off.
+    BaseLLM._check_arguments(llm, 3, SamplingParams(), is_gen_only=True)
+    llm.args.speculative_config = None
+    BaseLLM._check_arguments(llm, 3, params, is_gen_only=True)
+
+
+def test_the_executor_registers_the_processor_with_the_engine():
+    processor = _Recorder()
+    registered = []
+    engine = SimpleNamespace(register_batched_logits_processor=registered.append)
+
+    _register_batched_logits_processor(SimpleNamespace(batched_logits_processor=processor), engine)
+
+    assert registered == [processor]
+
+
+def test_the_executor_refuses_an_engine_without_a_post_processor_walk():
+    """Fail at construction rather than serve requests nothing would process."""
+    engine = SimpleNamespace()  # no register_batched_logits_processor
+
+    with pytest.raises(ValueError, match="SimpleNamespace"):
+        _register_batched_logits_processor(
+            SimpleNamespace(batched_logits_processor=_Recorder()), engine
+        )
+
+    # Without a processor there is nothing to register, whatever the engine.
+    _register_batched_logits_processor(SimpleNamespace(batched_logits_processor=None), engine)
