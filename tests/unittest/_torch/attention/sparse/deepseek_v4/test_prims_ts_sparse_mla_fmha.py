@@ -479,7 +479,7 @@ def test_reloaded_kernel_accepts_the_same_launch():
     production restarts) reload the exported TVM-FFI kernels, whose positional
     entry has no Python defaults. Drop the in-process kernel memo after the
     first run so the second plan takes the reload path, and require identical
-    output.
+    output from both the full and prepared launches.
     """
     _skip_unless_toolchain()
     from tensorrt_llm._torch.attention.backends.prims_ts import mla_decode
@@ -508,7 +508,22 @@ def test_reloaded_kernel_accepts_the_same_launch():
             output_scale=1.0,
             out=out,
         )
+        prepared_out = torch.empty_like(out)
+        wrapper.run(
+            query,
+            pool,
+            indices,
+            lengths,
+            extra_pool,
+            extra_indices=extra_indices,
+            extra_lengths=extra_lengths,
+            softmax_scale=LATENT**-0.5,
+            output_scale=1.0,
+            out=prepared_out,
+            validate=False,
+        )
         torch.cuda.synchronize()
+        torch.testing.assert_close(prepared_out, out, rtol=0, atol=0)
         return out
 
     first = run_fresh_plan()
