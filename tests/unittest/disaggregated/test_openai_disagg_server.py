@@ -26,6 +26,7 @@ from starlette.datastructures import Headers
 from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole, extract_disagg_cfg
 from tensorrt_llm.serve import anthropic_adapter, openai_disagg_server
+from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
@@ -437,8 +438,8 @@ class _Workers:
         return stream()
 
 
-def _messages_app(schedule_style: str, workers: _Workers) -> FastAPI:
-    """The /v1/messages route of a disaggregated server in front of ``workers``."""
+def _messages_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
+    """A disaggregated server in front of ``workers``."""
     config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
     service = OpenAIDisaggregatedService(
         config, DisaggCoordinatorService(config, client_factory=Mock()), client_factory=Mock()
@@ -457,6 +458,12 @@ def _messages_app(schedule_style: str, workers: _Workers) -> FastAPI:
     server._perf_metrics_collector = Mock()
     server._allow_request_chat_template = False
     server._collect_perf_metrics = False
+    return server
+
+
+def _messages_app(schedule_style: str, workers: _Workers) -> FastAPI:
+    """The /v1/messages route of a disaggregated server in front of ``workers``."""
+    server = _messages_server(schedule_style, workers)
     app = FastAPI()
     app.add_middleware(ServerArrivalTimeMiddleware)
     app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
@@ -682,15 +689,12 @@ async def test_messages_stream_with_a_late_context_failure_ends_with_an_error_ev
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
-@pytest.mark.parametrize("leave", ["before_the_response_starts", "once_the_response_starts"])
-async def test_client_leaving_during_the_context_phase_cancels_it(
-    monkeypatch, schedule_style, leave
-):
+async def test_client_leaving_after_the_response_starts_cancels_the_context_phase(
+    monkeypatch, schedule_style
+) -> None:
     _short_waits(monkeypatch)
     workers = _Workers(_waits_for(asyncio.Event()))
     left = asyncio.Event()
-    if leave == "before_the_response_starts":
-        left.set()
 
     def on_send(message):
         if message["type"] == "http.response.start":
@@ -699,3 +703,42 @@ async def test_client_leaving_during_the_context_phase_cancels_it(
     await _post_messages(_messages_app(schedule_style, workers), on_send=on_send, leave=left)
 
     await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_cancelling_the_messages_handler_during_its_wait_cancels_the_context_phase(
+    monkeypatch, schedule_style
+) -> None:
+    monkeypatch.setattr(openai_disagg_server, "_MESSAGES_STREAM_START_WAIT_S", 60)
+    context_started = asyncio.Event()
+    release_context = asyncio.Event()
+
+    async def context_phase() -> None:
+        context_started.set()
+        await release_context.wait()
+
+    workers = _Workers(context_phase)
+    server = _messages_server(schedule_style, workers)
+    request = AnthropicMessagesRequest(
+        model=_MODEL,
+        max_tokens=16,
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    raw_request = Request({"type": "http", "headers": []})
+    raw_request.state.server_arrival_time = 0
+    handler = asyncio.create_task(server.anthropic_messages(request, raw_request))
+    try:
+        await asyncio.wait_for(context_started.wait(), 2)
+        assert not handler.done()
+        handler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        assert not workers.context_done.is_set()
+    finally:
+        release_context.set()
+        handler.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await handler
