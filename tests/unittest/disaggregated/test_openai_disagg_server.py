@@ -402,6 +402,7 @@ class _Workers:
         self.context_phase = context_phase
         self.context_done = asyncio.Event()
         self.context_cancelled = asyncio.Event()
+        self.generation_cancelled = asyncio.Event()
 
     async def send_context_request(self, request, server=None, hooks=None, req_id=None):
         try:
@@ -431,9 +432,13 @@ class _Workers:
 
     async def send_generation_request(self, request, server=None, hooks=None, req_id=None):
         async def stream():
-            await self.context_done.wait()
-            for frame in _generation_frames():
-                yield frame
+            try:
+                await self.context_done.wait()
+                for frame in _generation_frames():
+                    yield frame
+            except asyncio.CancelledError:
+                self.generation_cancelled.set()
+                raise
 
         return stream()
 
@@ -742,3 +747,55 @@ async def test_cancelling_the_messages_handler_during_its_wait_cancels_the_conte
         handler.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
+async def test_disconnect_before_the_messages_body_starts_cancels_context(
+    monkeypatch, schedule_style, asgi_version
+) -> None:
+    """Response cleanup must run even if the streaming iterator never starts."""
+    from starlette.requests import ClientDisconnect
+
+    _short_waits(monkeypatch)
+    release_context = asyncio.Event()
+    workers = _Workers(_waits_for(release_context))
+    server = _messages_server(schedule_style, workers)
+    request = AnthropicMessagesRequest(
+        model=_MODEL,
+        max_tokens=16,
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    raw_request = Request({"type": "http", "headers": []})
+    raw_request.state.server_arrival_time = 0
+    response = await server.anthropic_messages(request, raw_request)
+    response_started = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        response_started.set()
+        if asgi_version == "2.4":
+            raise OSError("client disconnected")
+        await asyncio.Event().wait()
+
+    async def receive():
+        await response_started.wait()
+        return {"type": "http.disconnect"}
+
+    try:
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
+        if asgi_version == "2.4":
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+        else:
+            await response(scope, receive, send)
+        assert [message["type"] for message in sent] == ["http.response.start"]
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        if schedule_style == "generation_first":
+            await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
+        assert not workers.context_done.is_set()
+    finally:
+        release_context.set()

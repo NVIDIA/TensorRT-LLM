@@ -67,7 +67,8 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
@@ -218,6 +219,20 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     # Not a body this server recognises. Report the status only: anything else
     # in `raw` may still carry the upstream URL.
     return f"context worker rejected the request with status {error.status}"
+
+
+class _MessagesStreamingResponse(ClosingStreamingResponse):
+    """Cancel the chat pipeline even when a disconnect precedes body iteration."""
+
+    def __init__(self, chat: asyncio.Future, content: AsyncIterator[str]) -> None:
+        super().__init__(content=content, media_type="text/event-stream")
+        self._chat = chat
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._chat.cancel()
 
 
 class OpenAIDisaggServer:
@@ -491,11 +506,11 @@ class OpenAIDisaggServer:
                 raise
             if not chat.done():
                 # The reframer pings while it waits for the pipeline.
-                return StreamingResponse(
+                return _MessagesStreamingResponse(
+                    chat=chat,
                     content=reframe_openai_stream(
                         self._openai_stream_when_done(chat),
                         model=request.model),
-                    media_type="text/event-stream",
                 )
 
         answer = await self._messages_answer(chat)
