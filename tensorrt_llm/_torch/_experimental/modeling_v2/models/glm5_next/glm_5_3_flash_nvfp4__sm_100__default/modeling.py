@@ -2451,8 +2451,15 @@ class Glm5NextMTP(nn.Module):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: list[int] | None = None,
         spec_metadata: Any = None,
+        pick_rows: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        """The MTP layer's normalized hidden rows.
+
+        ``pick_rows``: run the attention on every input row (it writes the layer's KV for all of them), then the MoE
+        and the head norm on these rows only; the result has one row per entry. ``all_rank_num_tokens`` then counts
+        the picked rows.
+        """
         del position_ids, kwargs  # NoPE
         if all_rank_num_tokens is None:
             all_rank_num_tokens = attn_metadata.all_rank_num_tokens
@@ -2470,6 +2477,8 @@ class Glm5NextMTP(nn.Module):
         attn_in = self.input_layernorm(hidden_states)
         attn_out = self.self_attn(attn_in, attn_metadata, runtime_ctx=runtime_ctx)
         hidden_states = residual + attn_out
+        if pick_rows is not None:
+            hidden_states = hidden_states[pick_rows]
 
         residual = hidden_states
         hidden_states = self.mlp(self.post_attention_layernorm(hidden_states), all_rank_num_tokens)
@@ -2819,22 +2828,20 @@ class Glm5NextMtpStep:
 
         drafts = []
         for step in range(draft_len):
-            all_rank_num_tokens = (
-                spec_metadata.all_rank_num_tokens
-                if step == 0
-                else spec_metadata.subseq_all_rank_num_tokens
-            )
-            out = mtp_layer(
+            # Step 0's attention runs on the verify layout (it writes the MTP layer's KV of every row); its MoE, head
+            # norm and draft head only on each request's drafting row. Every later step feeds one row per request.
+            # Either way the MoE sees one row per request.
+            rows = step0_rows if step == 0 else slice(0, batch_size)
+            request_hidden = mtp_layer(
                 embed_tokens=draft_model.embed_tokens,
-                all_rank_num_tokens=all_rank_num_tokens,
+                all_rank_num_tokens=spec_metadata.subseq_all_rank_num_tokens,
                 input_ids=step_ids,
                 position_ids=step_positions,
                 hidden_states=step_hidden,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
+                pick_rows=step0_rows if step == 0 else None,
             )
-            rows = step0_rows if step == 0 else slice(0, batch_size)
-            request_hidden = out[rows]
             draft_logits = mtp_layer.shared_head(
                 request_hidden, draft_model.lm_head, attn_metadata, True
             )

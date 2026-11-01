@@ -126,7 +126,9 @@ class _ToyMtpLayer(nn.Module):
         self.calls = []
 
     def forward(self, embed_tokens, all_rank_num_tokens, input_ids, position_ids, hidden_states, attn_metadata,
-                spec_metadata):  # fmt: skip
+                spec_metadata, pick_rows=None):  # fmt: skip
+        """``pick_rows`` (the in-model step's step 0): every row is computed, as the attention is, and the rows
+        after it are the picked ones -- per-row arithmetic, so the picked rows equal the stock worker's gather."""
         self.calls.append(dict(attn_metadata.snapshot(), input_ids=input_ids.tolist(),
                                position_ids=position_ids.tolist()))  # fmt: skip
         mixed = (
@@ -134,7 +136,8 @@ class _ToyMtpLayer(nn.Module):
             + hidden_states @ self.mix
             + 0.01 * position_ids.float().unsqueeze(-1)
         )
-        return torch.tanh(mixed)
+        out = torch.tanh(mixed)
+        return out if pick_rows is None else out[pick_rows]
 
     def shared_head(self, hidden_states, lm_head, attn_metadata, return_context_logits):
         return lm_head(hidden_states).float()
