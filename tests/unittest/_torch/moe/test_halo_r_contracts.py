@@ -687,3 +687,27 @@ def test_no_timing_probe_or_programmatic_launch_remains():
             "%globaltimer",
         ):
             assert marker not in text, (path.name, marker)
+
+
+def test_kernel_runs_in_the_remote_memory_sync_domain():
+    kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
+    prepare = _function_body(
+        kernel_source, "MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch("
+    )
+    _assert_in_order(
+        prepare,
+        (
+            "cudaDevAttrMemSyncDomainCount",
+            "launch.attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;",
+            "launch.attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;",
+            "launch.attributeCount = 2;",
+        ),
+    )
+    launch = _function_body(kernel_source, "cudaError_t launchMoeRebalanceHaloR(")
+    assert "config.numAttrs = launch.attributeCount;" in launch
+    # Every edge out of the remote domain is system scope.
+    assert '"red.release.sys.global.add.u64 [%0], 1;"' in kernel_source
+    publish = _function_body(kernel_source, "void publishReady(")
+    _assert_in_order(
+        publish, ('"fence.release.sys;"', '"multimem.st.release.sys.global.u64 [%0], %1;"')
+    )

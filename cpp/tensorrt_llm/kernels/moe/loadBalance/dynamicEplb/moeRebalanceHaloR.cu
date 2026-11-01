@@ -489,6 +489,19 @@ MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int 
     MoeRebalanceHaloRLaunch launch;
     launch.ctas = ctas;
     launch.dynamicSharedBytes = static_cast<int>(bytes);
+    // The relay's NVLink traffic runs in the remote memory-sync domain, so fences and completions of kernels in the
+    // default domain do not wait for it. Every edge to another domain is system scope already: the route release, the
+    // READY publication and its release fence.
+    int domains = 0;
+    if (cudaDeviceGetAttribute(&domains, cudaDevAttrMemSyncDomainCount, device) == cudaSuccess && domains >= 2)
+    {
+        launch.attributes[0].id = cudaLaunchAttributeMemSyncDomain;
+        launch.attributes[0].val.memSyncDomain = cudaLaunchMemSyncDomainRemote;
+        launch.attributes[1].id = cudaLaunchAttributeMemSyncDomainMap;
+        launch.attributes[1].val.memSyncDomainMap.default_ = 0;
+        launch.attributes[1].val.memSyncDomainMap.remote = 1;
+        launch.attributeCount = 2;
+    }
     return launch;
 }
 
@@ -500,6 +513,8 @@ cudaError_t launchMoeRebalanceHaloR(
     config.blockDim = dim3(kFusedThreads);
     config.dynamicSmemBytes = static_cast<std::size_t>(launch.dynamicSharedBytes);
     config.stream = stream;
+    config.attrs = const_cast<cudaLaunchAttribute*>(launch.attributes);
+    config.numAttrs = launch.attributeCount;
     void* arguments[] = {const_cast<MoeRebalanceHaloRParams*>(&params)};
     return cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(&haloRFusedKernel), arguments);
 }

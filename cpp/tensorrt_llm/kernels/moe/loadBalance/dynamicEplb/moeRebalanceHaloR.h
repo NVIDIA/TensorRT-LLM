@@ -106,6 +106,9 @@ struct MoeRebalanceHaloRLaunch
 {
     int ctas = 0;
     int dynamicSharedBytes = 0;
+    //! The remote memory-sync domain and its map, when the device has more than one domain.
+    cudaLaunchAttribute attributes[2]{};
+    unsigned attributeCount = 0;
 };
 
 //! Minimum routeAux entries for a given geometry.
