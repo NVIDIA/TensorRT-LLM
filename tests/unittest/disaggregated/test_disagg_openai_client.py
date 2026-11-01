@@ -18,6 +18,7 @@ import json
 import socket
 import struct
 import zlib
+from collections.abc import AsyncIterator
 from contextlib import aclosing
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -424,8 +425,11 @@ class TestOpenAIHttpClient:
         assert INTERNAL_DISAGG_AUTH_HEADER not in headers
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content_type", ["application/json", "application/json; x-type=text/event-stream"]
+    )
     async def test_non_streaming_completion_request(
-        self, openai_client, completion_request, mock_session, mock_router
+        self, content_type, openai_client, completion_request, mock_session, mock_router
     ):
         """Test non-streaming completion request end-to-end."""
         mock_response = self.dummy_response()
@@ -433,7 +437,7 @@ class TestOpenAIHttpClient:
         # Mock HTTP response
         mock_http_response = AsyncMock()
         mock_http_response.status = 200
-        mock_http_response.headers = {"Content-Type": "application/json"}
+        mock_http_response.headers = {"Content-Type": content_type}
         mock_http_response.json = AsyncMock(return_value=mock_response.model_dump())
         mock_http_response.raise_for_status = Mock()
         mock_http_response.__aenter__ = AsyncMock(return_value=mock_http_response)
@@ -453,14 +457,22 @@ class TestOpenAIHttpClient:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "text/event-stream",
+            "text/event-stream; charset=utf-8",
+            " Text/Event-Stream ; charset=UTF-8",
+        ],
+    )
     async def test_streaming_completion_request(
-        self, openai_client, streaming_completion_request, mock_session, mock_router
+        self, content_type, openai_client, streaming_completion_request, mock_session, mock_router
     ):
         """Test streaming completion request end-to-end."""
         # Mock HTTP streaming response
         mock_http_response = AsyncMock()
         mock_http_response.status = 200
-        mock_http_response.headers = {"Content-Type": "text/event-stream"}
+        mock_http_response.headers = {"Content-Type": content_type}
 
         dummy_data = [
             b'data: "Hello"\n\n',
@@ -1090,15 +1102,48 @@ class TestWorkerErrorStatus:
         assert session.post.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_a_streamed_2xx_that_is_not_an_event_stream_is_a_protocol_error(self):
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            "application/json",
+            "application/json; x-type=text/event-stream",
+            "text/event-stream-invalid",
+        ],
+    )
+    async def test_a_streamed_2xx_that_is_not_an_event_stream_is_a_protocol_error(
+        self, content_type: str
+    ) -> None:
         session = AsyncMock(spec=aiohttp.ClientSession)
-        session.post.return_value = self._response(200)
+        session.post.return_value = self._response(200, content_type)
         client, router = self._make_client(session)
 
-        with pytest.raises(ValueError, match="'application/json' although request stream was True"):
+        async def chunks() -> AsyncIterator[bytes]:
+            yield b"data: [DONE]\n\n"
+
+        session.post.return_value.content.iter_any = chunks
+        with pytest.raises(ValueError, match="although request stream was True"):
             await self._send(client, stream=True)
 
         assert session.post.call_count == 1
+        router.finish_request.assert_awaited_once()
+        assert router.finish_request.await_args.kwargs["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content_type", ["text/event-stream", "Text/Event-Stream; charset=utf-8"]
+    )
+    async def test_a_non_streamed_request_rejects_an_event_stream(self, content_type: str) -> None:
+        session = AsyncMock(spec=aiohttp.ClientSession)
+        session.post.return_value = self._response(200, content_type)
+        session.post.return_value.json.side_effect = AssertionError(
+            "An event-stream response must not be decoded as JSON"
+        )
+        client, router = self._make_client(session)
+
+        with pytest.raises(ValueError, match="request stream was False"):
+            await self._send(client, stream=False)
+
+        session.post.assert_called_once()
         router.finish_request.assert_awaited_once()
         assert router.finish_request.await_args.kwargs["success"] is False
 

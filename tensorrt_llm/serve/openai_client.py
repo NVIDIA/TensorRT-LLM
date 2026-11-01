@@ -573,6 +573,7 @@ class OpenAIHttpClient(OpenAIClient):
                             http_response.headers, start_time, destination_time
                         )
                     content_type = http_response.headers.get("Content-Type", "")
+                    media_type = content_type.split(";", 1)[0].strip().lower()
                     if self._request_perf_metrics:
                         role = _metrics_phase(self._role)
                         disagg_params = getattr(request, "disaggregated_params", None)
@@ -626,12 +627,12 @@ class OpenAIHttpClient(OpenAIClient):
                             message=f"{http_response.reason}: {error_body[:2048]}",
                             headers=http_response.headers,
                         ) from read_error
-                    if not is_stream and "text/event-stream" in content_type:
+                    if not is_stream and media_type == "text/event-stream":
                         raise ValueError(
                             "Received an event-stream although request stream was False"
                         )
                     if is_stream:
-                        if "text/event-stream" not in content_type:
+                        if media_type != "text/event-stream":
                             raise ValueError(
                                 f"Received Content-Type {content_type!r} although request "
                                 "stream was True"
