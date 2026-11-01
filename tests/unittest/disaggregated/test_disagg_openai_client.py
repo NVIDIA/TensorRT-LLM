@@ -944,6 +944,10 @@ class TestWorkerErrorStatus:
 
     _BODY = '{"object": "error", "message": "bad field X", "type": "BadRequestError"}'
 
+    @pytest.fixture(autouse=True)
+    def _enable_retries(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("TRTLLM_DISAGG_NO_RETRY", raising=False)
+
     @classmethod
     def _response(cls, status: int, content_type: str = "application/json") -> AsyncMock:
         response = AsyncMock()
