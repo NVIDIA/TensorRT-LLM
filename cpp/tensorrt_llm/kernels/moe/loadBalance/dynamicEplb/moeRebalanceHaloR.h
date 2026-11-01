@@ -29,7 +29,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-//! Status words of the HALO-R scheduler. Each word holds the epoch of its most recent failure, or 0.
+//! Status words of the HALO-R kernel. Each word holds the epoch of its most recent failure, or 0. A launch traps
+//! before it releases any route once any word is nonzero, so a nonzero word never outlives the launch that set it.
 enum MoeRebalanceHaloRStatus : int
 {
     kHaloRStatusExchangeTimeout = 0,
@@ -38,35 +39,57 @@ enum MoeRebalanceHaloRStatus : int
     kHaloRStatusInvalidRoute = 3,
     kHaloRStatusSlotOutsideMask = 5,
     kHaloRStatusPlanner = 6,
-    //! Sticky READY error: (kind << 28) | (epoch & 0x0fffffff); kind 1 = a READY cell carried the error bit,
-    //! 2 = a READY cell did not arrive in time.
-    kHaloRStatusReady = 7,
+    //! Words of the status buffer, the CUDA scheduler's: the words above and two unused ones.
     kHaloRStatusWords = 8,
 };
 
-//! HALO-R scheduler for one MoE layer on one EP rank: routed-token count exchange, greedy replica plan and physical
-//! slot of every route. Collective over the EP group; every rank launches it once per layer forward.
+//! Diagnostic counters of one layer, int64 each; read only by tests and at teardown.
+enum MoeRebalanceHaloRCounter : int
+{
+    kHaloRCounterLaunches = 0,       //!< Launches of the layer's kernel, eager and replayed.
+    kHaloRCounterReceiverCopies = 1, //!< Sum over the plans' broadcasts of the receivers that were copied to.
+    kHaloRCounterReceiverSkips = 2,  //!< Sum over the plans' broadcasts of the receivers that were skipped.
+    kHaloRCounters = 3,
+};
+
+//! One launch of the fused HALO-R kernel for one MoE layer on one EP rank. The kernel runs on `ctas` CTAs, one per
+//! SM, on the copy stream; every rank launches it once per layer forward, ranks without tokens included.
 //!
-//! The relay copy that follows it on the same stream may be a programmatic dependent launch. Worker CTAs trigger it at
-//! entry and CTA 0 right after it releases the plan epoch, so the relay starts while the workers still write routes.
-//! The trigger carries no memory ordering: the relay acquires the plan through the plan epoch and waits for the
-//! scheduler grid to complete before it reads the status words (moeRebalanceRelay.cu).
+//!   1. Scheduler role. CTA 0 exchanges the routed-token counts with every EP rank, plans the layer's replicas with one
+//!      warp and builds the route prefix of every selected expert; the other CTAs compute stable per-expert ordinals
+//!      and write the physical slot of every route.
+//!   2. Route release. Each CTA checks every status word and then adds 1 to `routeCounter` with a system-scope
+//!      release. A route consumer on another stream waits until the counter has grown by `ctas`.
+//!   3. Relay. Each CTA copies its share of the expert bundles this rank receives: the receivers of a bundle split it
+//!      into slices, and each pulls its slices from the owner and stores them into the helper slot of every receiver.
+//!   4. Completion. The last CTA to finish its copies publishes `readyValue` into this rank's READY cell on every rank.
+//!
+//! Any failure traps before the failing CTA releases its routes, so a consumer never reads routes of a failed launch
+//! and no READY is published for it.
 struct MoeRebalanceHaloRParams
 {
-    int const* routes;              //!< [validRouteCount] global logical expert ids, -1 for padding.
-    int* outSlots;                  //!< [routeCapacity] physical slot ids; entries past the valid routes become -1.
-    int* outIds;                    //!< [helpers] expert held by each local helper slot, or -1.
-    int* outOwners;                 //!< [helpers] owner rank of that expert, or -1.
-    std::uint64_t const* peerBases; //!< [ep] symmetric count-exchange buffer of every rank, mapped locally.
-    int* status;                    //!< [kHaloRStatusWords]
-    int* partial;                   //!< [ctas * experts] per-CTA histograms.
-    int* routeAux;                  //!< Worker rendezvous, per-worker totals and selected-route indices.
-    int* gridSync;                  //!< [4] grid rendezvous words and the route-prefix publication epoch.
-    int* plan;                      //!< [halo_r::kPlanWords] plan published to the relay copy.
-    int* routePrefix;               //!< [384 * (ep + 1)] per-broadcast destination prefix of this rank's routes.
-    std::uint64_t* readyFlags;      //!< [ep] this layer's READY row on this rank; drained before each exchange.
-    unsigned* relayResidentCtas;    //!< [1] the relay copy's residency counter, zeroed at entry, before the CTA's
-                                    //!< programmatic launch trigger; may be null.
+    int const* routes;                //!< [validRouteCount] global logical expert ids, -1 for padding.
+    int* outSlots;                    //!< [routeCapacity] physical slot ids; entries past the valid routes become -1.
+    int* outIds;                      //!< [helpers] expert held by each local helper slot, or -1.
+    int* outOwners;                   //!< [helpers] owner rank of that expert, or -1.
+    std::uint64_t const* peerBases;   //!< [ep] symmetric count-exchange buffer of every rank, mapped locally.
+    int* status;                      //!< [kHaloRStatusWords]
+    int* partial;                     //!< [ctas * experts] per-CTA histograms.
+    int* routeAux;                    //!< Worker rendezvous, per-worker totals and selected-route indices.
+    int* gridSync;                    //!< [4] grid rendezvous words and the route-prefix publication epoch.
+    int* plan;                        //!< [halo_r::kPlanWords] the layer's plan; word 0 is its publication epoch.
+    int* routePrefix;                 //!< [384 * (ep + 1)] per-broadcast destination prefix of this rank's routes.
+    unsigned long long* routeCounter; //!< Route release counter; only grows, by `ctas` per launch.
+    std::uint64_t const* sourceTable; //!< [experts * planes] address of each expert's plane in its owner's home
+                                      //!< rows.
+    std::uint64_t const* destinationTable; //!< [ep * planes] address A such that A + row * planeBytes[p] is row `row`
+                                           //!< of rank d's plane p.
+    std::uint64_t const* planeBytes;       //!< [planes] bytes of one expert in each plane.
+    unsigned* completedCtas;               //!< [1] zero before the first launch; every launch leaves it zero.
+    long long* counters;                   //!< [kHaloRCounters] diagnostic counters.
+    std::uint64_t* readyFlagMc;            //!< This rank's READY cell through the multicast view of the READY rows.
+    std::uint64_t readyValue;              //!< READY generation this launch publishes.
+    unsigned long long spinCycles;         //!< Bound of every cross-rank and cross-CTA wait, in SM clock cycles.
     int ep;
     int experts;
     int helpers;
@@ -75,17 +98,31 @@ struct MoeRebalanceHaloRParams
     int localRank;
     int routeCapacity;
     int validRouteCount;
-    int ctas;
-    std::uint64_t spinNs; //!< Wall-clock bound of every device wait, in nanoseconds.
+    int planes;
 };
 
-//! Dynamic shared memory of the scheduler kernel for a given geometry.
-std::size_t getMoeRebalanceHaloRSharedMemoryBytes(int ep, int experts);
+//! Launch configuration of the fused kernel, prepared once per layer context.
+struct MoeRebalanceHaloRLaunch
+{
+    int ctas = 0;
+    int dynamicSharedBytes = 0;
+};
 
 //! Minimum routeAux entries for a given geometry.
 std::int64_t getMoeRebalanceHaloRRouteAuxEntries(int experts, int ctas, int routeCapacity);
 
-void invokeMoeRebalanceHaloR(MoeRebalanceHaloRParams const& params, cudaStream_t stream);
+//! Throws unless the bound arguments of `params` describe a geometry the kernel supports. Routes, the valid route
+//! count, the spin bound and the READY value are per launch and not checked.
+void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int ctas);
+
+//! Loads the fused kernel on the current device, reserves its local memory and sizes its shared memory, so that the
+//! first launch does not wait for the device; throws unless exactly one CTA fits each SM. Called once per context, at
+//! bind time: a launch-time module load or stack resize would wait for kernels that spin on work queued after it.
+MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int ctas);
+
+//! Enqueues one launch on `stream`; returns the launch error, if any.
+cudaError_t launchMoeRebalanceHaloR(
+    MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params, cudaStream_t stream);
 
 } // namespace kernels
 

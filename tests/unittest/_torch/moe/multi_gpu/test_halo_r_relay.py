@@ -1,22 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Four-rank HALO-R scheduler and relay copy on a real shared-slot arena.
+"""Four-rank HALO-R kernel on a real shared-slot arena.
 
 Every rank fills its home experts with a byte pattern unique to (expert,
-plane, layer) and runs HALO-R layer calls: eagerly, from a captured CUDA
-graph, and over three layers that alternate the two shared helper banks.
-After each call it checks:
+plane, layer) and runs HALO-R layer calls through the scheduler group:
+eagerly, over three layers that alternate the two shared helper banks, with
+ranks that have no tokens and with a plan that moves nothing. After each call
+it checks:
 - the plan words equal the pure-Python reference plan of the global routes;
 - every route lands on its owner's home slot or a receiver's helper slot, and
   the routes per (expert, rank) add up to the plan's quota;
 - every helper row this rank received equals the owner's expert bytewise;
-- the READY row holds the current epoch on every cell, without the error bit,
-  and every status word is clear.
-A negative case records a scheduler failure on one rank and expects the error
-bit in that rank's READY cell on every rank. The residency cases put a
-full-device kernel that spins on the READY row, like MegaMoE's gate, on MAIN
-right after the route wait, while the relay is starved of SMs, and expect it
-to pass its gate in eager mode and under graph replay.
+- the READY row holds the call's generation on every cell, and every status
+  word is clear;
+- the relay counters count every launch and every receiver of every broadcast.
+The residency case puts a full-device kernel that spins on the READY row, like
+MegaMoE's gate, on MAIN right after the route wait, while a hog holds every
+SM but the HALO-R kernel's, and expects it to pass its gate every time.
 """
 
 import ctypes
@@ -47,7 +47,7 @@ _HOME_EXPERTS = 8
 _HELPER_SLOTS = 2
 _TOPK = 4
 _MAX_TOKENS = 256
-_AUXILIARY_SMS = 8
+_AUXILIARY_SMS = 4
 # Small planes stay in the per-layer record pages; the weight planes exceed
 # them and live in the shared helper banks, so both relay paths are covered.
 _HIDDEN = 256
@@ -55,7 +55,7 @@ _INTERMEDIATE = 128
 _WORKER_TIMEOUT_S = 300
 # The READY-gate stand-in gives up after this long; the relay finishes in milliseconds.
 _GATE_TIMEOUT_NS = 5_000_000_000
-# The SM hog outlives the scheduler, so the relay is pending when its SMs free up.
+# The SM hog outlives the HALO-R kernel's scheduler role.
 _HOG_NS = 300_000_000
 
 
@@ -111,6 +111,12 @@ def _routes(step: int, rank: int, num_tokens: int, experts: int, device: int) ->
     return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
 
 
+def _uniform_routes(rank: int, num_tokens: int, experts: int, device: int) -> torch.Tensor:
+    """Every expert gets the same routed-token count on every rank, so the plan moves nothing."""
+    rows = [[(token * _TOPK + k) % experts for k in range(_TOPK)] for token in range(num_tokens)]
+    return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
+
+
 def _init_process_group(rank: int) -> None:
     store = None
     if rank == 0:
@@ -127,7 +133,7 @@ def _halo_r_ops_available() -> bool:
     # cloudpickle try to serialize torch's op-namespace object.
     trtllm_ops = getattr(getattr(torch, "ops"), "trtllm")
     return hasattr(trtllm_ops, "moe_rebalance_halo_r_create") and hasattr(
-        trtllm_ops, "moe_rebalance_halo_r_submit"
+        trtllm_ops, "moe_rebalance_halo_r_submit_fused"
     )
 
 
@@ -165,10 +171,10 @@ extern "C" __global__ void smHog(unsigned long long ns)
     }
 }
 
-// MegaMoE's helper-weight READY gate: hold the SM until every cell of this rank's READY row carries a
-// generation or the error bit. Gives up after `timeoutNs` and counts the CTA in `timedOut`.
-extern "C" __global__ void readyGate(
-    unsigned long long const* ready, int cells, unsigned long long timeoutNs, int* timedOut)
+// MegaMoE's helper-weight READY gate: hold the SM until every cell of this rank's READY row reaches the
+// expected generation. Gives up after `timeoutNs` and counts the CTA in `timedOut`.
+extern "C" __global__ void readyGate(unsigned long long const* ready, int cells, unsigned long long expected,
+    unsigned long long timeoutNs, int* timedOut)
 {
     extern __shared__ unsigned char smem[];
     if (threadIdx.x != 0)
@@ -184,7 +190,7 @@ extern "C" __global__ void readyGate(
         {
             unsigned long long value;
             asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(ready + c) : "memory");
-            open = open && value != 0;
+            open = open && value >= expected;
         }
         if (open)
         {
@@ -205,7 +211,7 @@ class _GateKernels:
     """A READY-gate stand-in on every SM and an SM hog, both one CTA per SM.
 
     Each CTA takes over half of an SM's shared memory, so neither shares an SM
-    with the other or with a relay CTA, which takes nearly all of it.
+    with the other or with a HALO-R CTA, which takes nearly all of it.
     """
 
     def __init__(self, device: int) -> None:
@@ -276,44 +282,62 @@ class _GateKernels:
             )
         )
 
-    def launch_hog(self, stream: torch.cuda.Stream) -> None:
-        # Leave only the scheduler's SMs free: fewer than the relay's CTAs.
+    def launch_hog(self, stream: torch.cuda.Stream, auxiliary_sms: int) -> None:
+        # Leave only the HALO-R kernel's SMs free, as the shared expert's
+        # reservation does.
         args = ((_HOG_NS,), (ctypes.c_ulonglong,))
-        self._launch(self.hog, self.sms - _AUXILIARY_SMS, args, stream)
+        self._launch(self.hog, self.sms - auxiliary_sms, args, stream)
 
-    def launch_gate(self, ready: torch.Tensor, stream: torch.cuda.Stream) -> None:
+    def launch_gate(self, ready: torch.Tensor, generation: int, stream: torch.cuda.Stream) -> None:
         args = (
-            (ready.data_ptr(), ready.numel(), _GATE_TIMEOUT_NS, self.timed_out.data_ptr()),
-            (ctypes.c_void_p, ctypes.c_int, ctypes.c_ulonglong, ctypes.c_void_p),
+            (
+                ready.data_ptr(),
+                ready.numel(),
+                generation,
+                _GATE_TIMEOUT_NS,
+                self.timed_out.data_ptr(),
+            ),
+            (
+                ctypes.c_void_p,
+                ctypes.c_int,
+                ctypes.c_ulonglong,
+                ctypes.c_ulonglong,
+                ctypes.c_void_p,
+            ),
         )
         self._launch(self.gate, self.sms, args, stream)
 
 
-def _check_call(group, arena, routes: torch.Tensor, epoch: int, rank: int, layer: int = 0) -> list:
+def _check_call(
+    group, arena, routes: torch.Tensor, generation: int, rank: int, layer: int = 0
+) -> list:
     """Compare one finished layer call with the reference; returns failure strings."""
     failures = []
     experts = _HOME_EXPERTS * _EP_SIZE
     local_slots = _HOME_EXPERTS + _HELPER_SLOTS
+    scheduler = group.scheduler
     counts = torch.bincount(routes.flatten().long(), minlength=experts).cpu().tolist()
     histogram = [sum(c) for c in zip(*MPI.COMM_WORLD.allgather(counts))]
     plan = halo_r_reference.plan_halo_r(
         histogram, _EP_SIZE, _HELPER_SLOTS, send_count=4, send_weight=0
     )
 
-    words = group.plan_words.cpu().tolist()
-    if words != plan.plan_words(epoch=epoch):
-        failures.append(f"rank {rank}: plan words differ from the reference at epoch {epoch}")
-    if group.hot_expert_ids.cpu().tolist() != plan.helper_table[rank]:
+    # Every launch of the layer is one scheduler epoch, so the plan's epoch is the generation.
+    words = scheduler.plan_workspace.cpu().tolist()
+    if words != plan.plan_words(epoch=generation):
+        failures.append(
+            f"rank {rank}: plan words differ from the reference at generation {generation}"
+        )
+    if scheduler.outputs.hot_expert_ids.cpu().tolist() != plan.helper_table[rank]:
         failures.append(f"rank {rank}: helper experts differ from the reference")
-    if any(group.status.cpu().tolist()):
-        failures.append(f"rank {rank}: status words {group.status.cpu().tolist()}")
-    # A cell with the error bit set reads as a negative int64 and never matches.
+    if any(scheduler.status.cpu().tolist()):
+        failures.append(f"rank {rank}: status words {scheduler.status.cpu().tolist()}")
     ready = arena.terminal_flags_tensor().view(torch.int64).cpu().tolist()
-    if ready != [epoch] * _EP_SIZE:
-        failures.append(f"rank {rank}: READY row {ready}, expected epoch {epoch}")
+    if ready != [generation] * _EP_SIZE:
+        failures.append(f"rank {rank}: READY row {ready}, expected generation {generation}")
 
     # Every route goes to its owner or to a receiver's helper slot of its expert.
-    slots = group.physical_slot_ids[: routes.shape[0]].cpu().flatten().tolist()
+    slots = scheduler.outputs.physical_slot_ids[: routes.shape[0]].cpu().flatten().tolist()
     moved = {}
     for expert, slot in zip(routes.flatten().cpu().tolist(), slots):
         destination, local = divmod(slot, local_slots)
@@ -346,7 +370,7 @@ def _check_call(group, arena, routes: torch.Tensor, epoch: int, rank: int, layer
                 failures.append(
                     f"rank {rank}: layer {layer} helper {helper} plane {plane} != expert {expert}"
                 )
-    return failures
+    return failures, sum(len(b.rows) for b in plan.broadcasts)
 
 
 # A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use.
@@ -356,7 +380,7 @@ _PLACEHOLDER_MESSAGE = "HALO-R requires CUDA 13.1+"
 class _Layers:
     """HALO-R groups of consecutive MoE layers on one model-level manager."""
 
-    def __init__(self, rank: int, count: int) -> None:
+    def __init__(self, rank: int, count: int, auxiliary_sms: int) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
         )
@@ -369,7 +393,7 @@ class _Layers:
         self.experts = _HOME_EXPERTS * _EP_SIZE
         config = SimpleNamespace(
             num_slots=self.experts + _EP_SIZE * _HELPER_SLOTS,
-            auxiliary_sms=_AUXILIARY_SMS,
+            auxiliary_sms=auxiliary_sms,
             helper_slot_mode="shared_banks",
             planner="halo_r",
         )
@@ -400,7 +424,7 @@ class _Layers:
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
         self.groups = []
-        self.epochs = []
+        self.receiver_copies = []
 
     def build_groups(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
@@ -421,55 +445,55 @@ class _Layers:
                     layer_idx=layer,
                 )
             )
-            # The constructor's warmup is epoch 1 of each layer.
-            self.epochs.append(1)
+            self.receiver_copies.append(0)
 
     def call(self, layer: int, routes: torch.Tensor, stream: torch.cuda.Stream) -> int:
         group = self.groups[layer]
         with torch.cuda.stream(stream):
             _, generation = group.plan(routes, defer_wait=False)
-            assert generation == 1
             group.finish()
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        self.epochs[layer] += 1
-        return self.epochs[layer]
+        return generation
+
+    def check(self, layer: int, routes: torch.Tensor, generation: int) -> list:
+        group, arena = self.groups[layer], self.arenas[layer]
+        failures, copies = _check_call(group, arena, routes, generation, self.rank, layer=layer)
+        self.receiver_copies[layer] += copies
+        counts = group.broadcaster.relay_counts()
+        expected = (generation, self.receiver_copies[layer], 0)
+        if counts != expected:
+            failures.append(f"rank {self.rank}: layer {layer} relay counts {counts} != {expected}")
+        return failures
 
     def shutdown(self) -> None:
         torch.cuda.synchronize()
         self.manager.shutdown(local_safe=True)
 
 
-def _case_single_layer(layers: _Layers, use_graph: bool) -> list:
+def _case_single_layer(layers: _Layers) -> list:
     rank, experts = layers.rank, layers.experts
-    group, arena = layers.groups[0], layers.arenas[0]
     main = torch.cuda.Stream()
     failures = []
-    for step in range(2):
+    for step in range(3):
         # Ranks submit different token counts; the last rank has none on step 1.
         tokens = 0 if step == 1 and rank == _EP_SIZE - 1 else _MAX_TOKENS - 17 * rank
         routes = _routes(step, rank, tokens, experts, rank)
-        epoch = layers.call(0, routes, main)
-        failures += _check_call(group, arena, routes, epoch, rank)
-    if not use_graph:
-        return failures
-    static_routes = _routes(2, rank, _MAX_TOKENS, experts, rank)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        group.plan(static_routes, defer_wait=False)
-        group.finish()
-    for step in range(3, 6):
-        static_routes.copy_(_routes(step, rank, _MAX_TOKENS, experts, rank))
-        graph.replay()
-        torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
-        layers.epochs[0] += 1
-        failures += _check_call(group, arena, static_routes, layers.epochs[0], rank)
-    # Eager calls and replays share the device epoch.
-    routes = _routes(6, rank, _MAX_TOKENS // 2, experts, rank)
-    epoch = layers.call(0, routes, main)
-    failures += _check_call(group, arena, routes, epoch, rank)
-    graph.reset()
+        failures += layers.check(0, routes, layers.call(0, routes, main))
+    return failures
+
+
+def _case_empty_plan(layers: _Layers) -> list:
+    """Balanced routes plan no broadcast, and ranks without tokens still publish READY."""
+    rank, experts = layers.rank, layers.experts
+    main = torch.cuda.Stream()
+    failures = []
+    for tokens in (_MAX_TOKENS, 0):
+        routes = _uniform_routes(rank, tokens, experts, rank)
+        generation = layers.call(0, routes, main)
+        if int(layers.groups[0].scheduler.plan_workspace[1]) != 0:
+            failures.append(f"rank {rank}: a balanced load planned broadcasts")
+        failures += layers.check(0, routes, generation)
     return failures
 
 
@@ -480,106 +504,46 @@ def _case_alternating_banks(layers: _Layers) -> list:
     failures = [] if banks == [0, 1, 0] else [f"rank {rank}: helper banks {banks}"]
     main = torch.cuda.Stream()
     for step in range(2):
-        for layer, (group, arena) in enumerate(zip(layers.groups, layers.arenas)):
+        for layer in range(len(layers.groups)):
             routes = _routes(10 * step + layer, rank, _MAX_TOKENS, experts, rank)
-            epoch = layers.call(layer, routes, main)
-            failures += _check_call(group, arena, routes, epoch, rank, layer=layer)
+            failures += layers.check(layer, routes, layers.call(layer, routes, main))
     return failures
 
 
-def _case_error_bit(layers: _Layers) -> list:
-    """A recorded scheduler failure on one rank sets the error bit of that rank's READY cell everywhere."""
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
-        HALO_R_STATUS_GRID_TIMEOUT,
-    )
-
-    rank, experts = layers.rank, layers.experts
-    failed_rank = 1
-    main = torch.cuda.Stream()
-    routes = _routes(0, rank, _MAX_TOKENS, experts, rank)
-    failures = _check_call(
-        layers.groups[0], layers.arenas[0], routes, layers.call(0, routes, main), rank
-    )
-    if rank == failed_rank:
-        layers.groups[0].status[HALO_R_STATUS_GRID_TIMEOUT] = 7
-    torch.cuda.synchronize()
-    MPI.COMM_WORLD.Barrier()
-    epoch = layers.call(0, _routes(1, rank, _MAX_TOKENS, experts, rank), main)
-    ready = layers.arenas[0].terminal_flags_tensor().view(torch.int64).cpu().tolist()
-    for source, value in enumerate(value & ((1 << 64) - 1) for value in ready):
-        error = bool(value >> 63)
-        if error != (source == failed_rank) or (value & ((1 << 63) - 1)) != epoch:
-            failures.append(f"rank {rank}: READY cell {source} = {value:#x} at epoch {epoch}")
-    return failures
-
-
-def _starve_relay(layers: _Layers) -> None:
-    """Give COPY the lowest stream priority, below the MAIN of the residency cases.
-
-    Production gives COPY the highest priority, which only orders CTAs that
-    are still pending; inverting it makes MegaMoE win every SM that frees up
-    once the relay is pending. Must run before the groups are built.
-    """
-    least, _ = torch.cuda.Stream.priority_range()
-    copy_stream = torch.cuda.Stream(device=layers.rank, priority=least)
-    layers.manager.get_copy_stream = lambda device: copy_stream
-
-
-def _case_relay_residency(layers: _Layers, use_graph: bool) -> list:
+def _case_relay_residency(layers: _Layers, auxiliary_sms: int) -> list:
     """MegaMoE's full grid, queued right after the route wait, must not starve the relay.
 
-    A hog holds every SM but the scheduler's, so the relay is still short of
-    SMs when the hog retires; with COPY below MAIN, a gate kernel that MAIN
-    has already released takes those SMs first. The calls use the native ops
-    directly: the group's Python check rejects a MAIN above COPY.
+    A hog holds every SM but the HALO-R kernel's, and COPY runs below MAIN, so
+    a gate kernel that MAIN has released takes every SM that frees up first.
+    The route wait passes only once every HALO-R CTA has released its routes,
+    after the grid rendezvous, so the relay already holds its SMs.
     """
     rank, experts = layers.rank, layers.experts
-    group, arena = layers.groups[0], layers.arenas[0]
-    ops = getattr(getattr(torch, "ops"), "trtllm")
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
-        HALO_R_SPIN_BUDGET_NS,
-    )
-
+    group = layers.groups[0]
     kernels = _GateKernels(rank)
-    ready = arena.terminal_flags_tensor().view(torch.int64)
+    ready = layers.arenas[0].terminal_flags_tensor().view(torch.int64)
     _, greatest = torch.cuda.Stream.priority_range()
     main = torch.cuda.Stream(device=rank, priority=greatest)
     side = torch.cuda.Stream(device=rank)
-    routes = _routes(0, rank, _MAX_TOKENS, experts, rank)
-
-    def layer_call() -> None:
-        ops.moe_rebalance_halo_r_submit(group._handle, routes, HALO_R_SPIN_BUDGET_NS)
-        ops.moe_rebalance_halo_r_wait_routes(group._handle)
-        kernels.launch_gate(ready, torch.cuda.current_stream())
-        ops.moe_rebalance_halo_r_release(group._handle, 0)
-
-    graph = None
-    if use_graph:
-        main.wait_stream(torch.cuda.current_stream())
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=main):
-            layer_call()
+    # The group accepts only a MAIN below COPY; bind this MAIN directly.
+    group._execution_stream_handle = int(main.cuda_stream)
     failures = []
-    for step in range(1, 4):
-        routes.copy_(_routes(step, rank, _MAX_TOKENS, experts, rank))
+    for step in range(1, 51):
+        routes = _routes(step, rank, _MAX_TOKENS, experts, rank)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        kernels.launch_hog(side)
+        kernels.launch_hog(side, auxiliary_sms)
         with torch.cuda.stream(main):
-            if graph is not None:
-                graph.replay()
-            else:
-                layer_call()
+            _, generation = group.plan(routes, defer_wait=False)
+            kernels.launch_gate(ready, generation, main)
+            group.finish()
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        layers.epochs[0] += 1
         timed_out = int(kernels.timed_out.item())
         if timed_out:
             failures.append(f"rank {rank}: step {step}: {timed_out} gate CTAs timed out on READY")
             kernels.timed_out.zero_()
-        failures += _check_call(group, arena, routes, layers.epochs[0], rank)
-    if graph is not None:
-        graph.reset()
+        failures += layers.check(0, routes, generation)
     return failures
 
 
@@ -594,23 +558,24 @@ def _run_worker(case: str):
         if any(reasons):
             return "; ".join(sorted({r for r in reasons if r})), []
         _init_process_group(rank)
-        layers = _Layers(rank, 3 if case == "banks" else 1)
+        auxiliary_sms = 16 if case.endswith("_16") else _AUXILIARY_SMS
+        layers = _Layers(rank, 3 if case == "banks" else 1, auxiliary_sms)
         if case.startswith("residency"):
             _starve_relay(layers)
         try:
             layers.build_groups()
         except RuntimeError as error:
-            # Every rank reaches the first kernel launch together, so every rank skips.
+            # Every rank reaches the native context creation together, so every rank skips.
             if _PLACEHOLDER_MESSAGE in str(error):
                 return f"placeholder build: {error}", []
             raise
         if case == "banks":
             return None, _case_alternating_banks(layers)
-        if case == "error_bit":
-            return None, _case_error_bit(layers)
+        if case == "empty_plan":
+            return None, _case_empty_plan(layers)
         if case.startswith("residency"):
-            return None, _case_relay_residency(layers, use_graph=case == "residency_cuda_graph")
-        return None, _case_single_layer(layers, use_graph=case == "cuda_graph")
+            return None, _case_relay_residency(layers, auxiliary_sms)
+        return None, _case_single_layer(layers)
     except Exception:
         traceback.print_exc()
         MPI.COMM_WORLD.Abort(1)
@@ -623,10 +588,21 @@ def _run_worker(case: str):
         faulthandler.cancel_dump_traceback_later()
 
 
+def _starve_relay(layers: _Layers) -> None:
+    """Give COPY the lowest stream priority, below the MAIN of the residency cases.
+
+    Production gives COPY the highest priority, which only orders CTAs that
+    are still pending; inverting it makes MegaMoE win every SM that frees up
+    while the HALO-R kernel is pending. Must run before the groups are built.
+    """
+    least, _ = torch.cuda.Stream.priority_range()
+    copy_stream = torch.cuda.Stream(device=layers.rank, priority=least)
+    layers.manager.get_copy_stream = lambda device: copy_stream
+
+
 @pytest.mark.skipif(torch.cuda.device_count() < _EP_SIZE, reason="Requires 4 GPUs")
 @pytest.mark.parametrize(
-    "case",
-    ["eager", "cuda_graph", "banks", "error_bit", "residency_eager", "residency_cuda_graph"],
+    "case", ["eager", "eager_16", "empty_plan", "banks", "residency", "residency_16"]
 )
 def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):
     results = list(halo_r_mpi_pool.map(_run_worker, [case] * _EP_SIZE))

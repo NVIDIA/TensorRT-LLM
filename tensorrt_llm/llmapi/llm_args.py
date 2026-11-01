@@ -1956,8 +1956,16 @@ class MoeLoadBalancerConfig(_MoeLoadBalancerConfigBase):
 
 # HALO-R stores a receiver's helper slot index in two bits.
 _HALO_R_MAX_HELPER_SLOTS = 4
+# Each overloaded rank offers its 4 hottest experts to the HALO-R planner.
+_HALO_R_MIN_HOME_EXPERTS = 4
+# One HALO-R planner warp covers up to 32 EP ranks; the CUDA scheduler needs an even EP size.
+_HALO_R_MAX_EP = 32
 # The HALO-R scheduler plans on CTA 0 and maps routes on the others.
 _HALO_R_MIN_AUXILIARY_SMS = 2
+# HALO-R's relay copy runs on the auxiliary SMs; its bandwidth grows with them up to about 16.
+_HALO_R_MAX_AUXILIARY_SMS = 16
+# HALO-Q's in-switch TMA copy runs on at most 8 SMs.
+_HALO_Q_MAX_AUXILIARY_SMS = 8
 
 
 class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
@@ -1975,9 +1983,9 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     auxiliary_sms: int = Field(
         default=4,
         ge=1,
-        le=8,
+        le=_HALO_R_MAX_AUXILIARY_SMS,
         description=
-        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
+        "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the replica planner and then the copy of its plan on the copy stream, one CTA per SM: the HALO-Q scheduler and the in-switch TMA copy (1 to 8 SMs), or the HALO-R scheduler and its relay copy (2 to 16 SMs). Must be smaller than the device SM count.",
         status="prototype")
     helper_slot_mode: Literal["per_layer_resident", "shared_banks"] = Field(
         default="per_layer_resident",
@@ -1987,18 +1995,23 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
     planner: Literal["halo_q", "halo_r"] = Field(
         default="halo_q",
         description=
-        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the lowest-indexed ranks with room for them below the balanced load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler on `auxiliary_sms` CTAs (at least 2) and its relay copy on 16, supports up to 4 helper slots per rank and requires `helper_slot_mode: shared_banks`.",
+        "Replica planner and its helper-weight copy. `halo_q` plans hierarchical broadcast groups and copies helper weights with the TMA copy kernel. `halo_r` moves the routed tokens of each overloaded rank's hottest experts to the lowest-indexed ranks with room for them below the balanced load and copies those experts with a unicast relay over NVLink, in which each receiver pulls its share of the expert from the owner and writes it to every receiver. `halo_r` runs its scheduler and relay copy on `auxiliary_sms` CTAs (2 to 16), supports up to 4 helper slots per rank, an even EP size from 2 to 32 and at least 4 experts per rank, and requires `helper_slot_mode: shared_banks`.",
         status="prototype")
 
     @model_validator(mode="after")
     def validate_planner_helper_slot_mode(
             self) -> 'MoePerLayerDynamicLoadBalancerConfig':
-        """Check the HALO-R requirements on the shared per-layer fields.
+        """Check each planner's requirements on the shared per-layer fields.
 
-        HALO-R relays helper weights into the two shared helper banks, and its
-        scheduler plans on CTA 0 while the other CTAs map routes.
+        HALO-Q's TMA copy runs on at most 8 SMs. HALO-R relays helper weights
+        into the two shared helper banks, and its scheduler plans on CTA 0
+        while the other CTAs map routes.
         """
         if self.planner != "halo_r":
+            if self.auxiliary_sms > _HALO_Q_MAX_AUXILIARY_SMS:
+                raise ValueError(
+                    f"`planner: {self.planner}` supports `auxiliary_sms` up to "
+                    f"{_HALO_Q_MAX_AUXILIARY_SMS}; got {self.auxiliary_sms}.")
             return self
         if self.helper_slot_mode != "shared_banks":
             raise ValueError(
@@ -2024,13 +2037,25 @@ class MoePerLayerDynamicLoadBalancerConfig(_MoeLoadBalancerConfigBase):
             raise ValueError(
                 f"`num_slots` ({self.num_slots}) must exceed `num_experts` "
                 f"({num_experts}) for per-layer dynamic EPLB.")
+        if self.planner != "halo_r":
+            return
         helper_slots = (self.num_slots - num_experts) // self._ep_size
-        if self.planner == "halo_r" and helper_slots > _HALO_R_MAX_HELPER_SLOTS:
+        if helper_slots > _HALO_R_MAX_HELPER_SLOTS:
             raise ValueError(
                 f"`planner: halo_r` supports at most {_HALO_R_MAX_HELPER_SLOTS} "
                 f"helper slots per rank; `num_slots` ({self.num_slots}) gives "
                 f"{helper_slots} for {num_experts} experts on {self._ep_size} "
                 "EP ranks.")
+        if self._ep_size % 2 or not 2 <= self._ep_size <= _HALO_R_MAX_EP:
+            raise ValueError(
+                f"`planner: halo_r` supports an even EP size from 2 to "
+                f"{_HALO_R_MAX_EP}; got {self._ep_size}.")
+        if num_experts // self._ep_size < _HALO_R_MIN_HOME_EXPERTS:
+            raise ValueError(
+                f"`planner: halo_r` needs at least {_HALO_R_MIN_HOME_EXPERTS} "
+                f"experts per EP rank; {num_experts} experts on "
+                f"{self._ep_size} EP ranks give "
+                f"{num_experts // self._ep_size}.")
 
 
 MoeLoadBalancerConfigType = Annotated[
@@ -8302,24 +8327,13 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
-        """Restrict CUDA graphs with per-layer dynamic EPLB.
-
-        Only the HALO-R planner keeps its READY generations on the device,
-        so only it can be captured, and only in breakable prefill graphs,
-        whose eager breaks leave the MoE layers in captured segments.
-        """
-        load_balancer = self.moe_config.load_balancer
-        if getattr(load_balancer, "mode", None) != "per_layer_dynamic":
+        """Per-layer dynamic EPLB plans cannot be captured in CUDA graphs."""
+        if getattr(self.moe_config.load_balancer, "mode",
+                   None) != "per_layer_dynamic":
             return self
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
-            capturable = (getattr(load_balancer, "planner", "halo_q")
-                          == "halo_r" and self.prefill_cuda_graph_backend
-                          == PrefillCudaGraphBackend.BREAKABLE)
-            if not capturable:
-                raise ValueError(
-                    "per-layer dynamic EPLB does not support prefill CUDA "
-                    "graphs except with planner='halo_r' and "
-                    "prefill_cuda_graph_backend='breakable'")
+            raise ValueError(
+                "per-layer dynamic EPLB does not support prefill CUDA graphs")
         if self.cuda_graph_config is not None:
             logger.warning("per-layer dynamic EPLB does not support CUDA "
                            "graphs; setting cuda_graph_config to None.")

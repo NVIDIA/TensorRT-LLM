@@ -16,20 +16,15 @@
  */
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloR.h"
-#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceRelay.h"
 
 #include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <cuda.h>
 #include <torch/custom_class.h>
 #include <torch/extension.h>
 
 #include <climits>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -76,41 +71,30 @@ T* checkedPointer(std::int64_t value, char const* name)
     return reinterpret_cast<T*>(static_cast<std::uintptr_t>(value));
 }
 
-//! TRTLLM_HALO_R_RELAY_PDL=0 launches the relay copy plainly after the scheduler instead of as its programmatic
-//! dependent. Read when a layer's context is bound.
-bool relayProgrammaticLaunchEnabled()
-{
-    char const* value = std::getenv("TRTLLM_HALO_R_RELAY_PDL");
-    return value == nullptr || std::strcmp(value, "0") != 0;
-}
-
 } // namespace
 
-//! One layer's HALO-R scheduler and relay copy on one EP rank. It binds every argument the per-layer launches share,
-//! the copy stream (COPY) and the four events that fork COPY from the calling stream (MAIN) and join it back, so a
-//! layer call makes one native call per step:
+//! One layer's fused HALO-R kernel on one EP rank (moeRebalanceHaloR.h). It binds every argument the per-layer
+//! launches share, the copy stream (COPY) and the event that forks COPY from the calling stream (MAIN), and prepares
+//! the launch, so that a layer call makes one native call:
 //!
-//!     submit:      MAIN record input_ready; COPY wait input_ready -> scheduler -> record plan_ready -> relay copy
-//!     wait_routes: MAIN wait plan_ready; MAIN wait relay_resident >= relay CTAs
-//!     release:     COPY wait the consumer (consumer_done on MAIN, or the caller's event) -> record copy_idle;
-//!                  MAIN wait copy_idle
+//!     submit_fused: MAIN record input_ready; COPY wait input_ready -> fused kernel
 //!
-//! The relay copy is a programmatic dependent launch of the scheduler unless TRTLLM_HALO_R_RELAY_PDL=0: it starts
-//! once the scheduler has published the plan, while the scheduler's workers finish the routes. plan_ready still
-//! fires at scheduler completion, so MAIN's route reads are unaffected. Under stream capture the record adds no node
-//! and the relay gets a programmatic edge from the scheduler node; whether an eager event record between the two
-//! launches still lets them overlap is up to the driver, and the relay is correct either way.
+//! The caller then waits on MAIN for the route counter, which the kernel raises once per CTA, before it reads the
+//! routes. Every launch follows the MAIN work queued before it, which includes the previous consumer of the helper
+//! slots this launch overwrites.
+//!
+//! A CUDA error in any call poisons the context: every later submit fails with it, and the owner rebuilds the group.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
 {
 public:
     MoeRebalanceHaloRState(torch::Tensor outSlots, torch::Tensor outIds, torch::Tensor outOwners,
         torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
-        torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, std::int64_t readyFlagsPtr,
+        torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
         torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-        torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, torch::Tensor relayResidentCtas,
-        std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue,
-        std::int64_t sendCountValue, std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
-        std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t relayCtasValue, std::int64_t copyStream)
+        torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::int64_t readyFlagMcPtr,
+        std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue, std::int64_t sendCountValue,
+        std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
+        std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t copyStream)
     {
         int const ep = checkedInt(epValue, "ep");
         int const experts = checkedInt(expertsValue, "experts");
@@ -126,8 +110,6 @@ public:
         TORCH_CHECK(topk > 0 && routeCapacity > 0 && routeCapacity % topk == 0,
             "route_capacity must be a positive multiple of topk");
         TORCH_CHECK(copyStream != 0, "copy_stream must be a non-default CUDA stream");
-        // wait_routes waits for every relay CTA to be resident, so a relay of zero CTAs would order nothing.
-        TORCH_CHECK(relayCtasValue >= 1, "relay_ctas must be positive");
         int const planes = checkedInt(relayPlaneBytes.numel(), "planes");
 
         c10::Device const device = plan.device();
@@ -143,16 +125,16 @@ public:
         checkCudaTensor(gridSync, device, torch::kInt32, 4, "grid_sync");
         checkCudaTensor(plan, device, torch::kInt32, kPlanWords, "plan");
         checkCudaTensor(routePrefix, device, torch::kInt32, kPlanFieldStride * (ep + 1), "route_prefix");
+        checkCudaTensor(routeCounter, device, torch::kInt64, 1, "route_counter");
         checkCudaTensor(
-            relaySources, device, torch::kInt64, static_cast<std::int64_t>(experts) * planes, "source_table");
+            relaySources, device, torch::kInt64, static_cast<std::int64_t>(experts) * planes, "relay_sources");
         checkCudaTensor(
-            relayDestinations, device, torch::kInt64, static_cast<std::int64_t>(ep) * planes, "destination_table");
-        checkCudaTensor(relayPlaneBytes, device, torch::kInt64, planes, "plane_bytes");
-        checkCudaTensor(relayCompletedCtas, device, torch::kInt32, 1, "completed_ctas");
-        checkCudaTensor(relayLaunchCount, device, torch::kInt32, 1, "launch_count");
-        checkCudaTensor(relayResidentCtas, device, torch::kInt32, 1, "resident_ctas");
+            relayDestinations, device, torch::kInt64, static_cast<std::int64_t>(ep) * planes, "relay_destinations");
+        checkCudaTensor(relayPlaneBytes, device, torch::kInt64, planes, "relay_plane_bytes");
+        checkCudaTensor(relayCompletedCtas, device, torch::kInt32, 1, "relay_completed_ctas");
+        checkCudaTensor(relayCounters, device, torch::kInt64, kernels::kHaloRCounters, "relay_counters");
 
-        mScheduler = kernels::MoeRebalanceHaloRParams{
+        mParams = kernels::MoeRebalanceHaloRParams{
             nullptr,
             outSlots.data_ptr<int>(),
             outIds.data_ptr<int>(),
@@ -164,8 +146,15 @@ public:
             gridSync.data_ptr<int>(),
             plan.data_ptr<int>(),
             routePrefix.data_ptr<int>(),
-            checkedPointer<std::uint64_t>(readyFlagsPtr, "ready_flags_ptr"),
-            reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>()),
+            reinterpret_cast<unsigned long long*>(routeCounter.data_ptr<std::int64_t>()),
+            reinterpret_cast<std::uint64_t const*>(relaySources.data_ptr<std::int64_t>()),
+            reinterpret_cast<std::uint64_t const*>(relayDestinations.data_ptr<std::int64_t>()),
+            reinterpret_cast<std::uint64_t const*>(relayPlaneBytes.data_ptr<std::int64_t>()),
+            reinterpret_cast<unsigned*>(relayCompletedCtas.data_ptr<int>()),
+            reinterpret_cast<long long*>(relayCounters.data_ptr<std::int64_t>()),
+            checkedPointer<std::uint64_t>(readyFlagMcPtr, "ready_flag_mc_ptr"),
+            0,
+            0,
             ep,
             experts,
             helpers,
@@ -174,46 +163,22 @@ public:
             checkedInt(localRankValue, "local_rank"),
             routeCapacity,
             0,
-            ctas,
-            0,
-        };
-        mRelay = kernels::MoeRebalanceRelayParams{
-            plan.data_ptr<int>(),
-            reinterpret_cast<std::uint64_t const*>(relaySources.data_ptr<std::int64_t>()),
-            reinterpret_cast<std::uint64_t const*>(relayDestinations.data_ptr<std::int64_t>()),
-            reinterpret_cast<std::uint64_t const*>(relayPlaneBytes.data_ptr<std::int64_t>()),
-            status.data_ptr<int>(),
-            reinterpret_cast<unsigned*>(relayCompletedCtas.data_ptr<int>()),
-            reinterpret_cast<unsigned*>(relayLaunchCount.data_ptr<int>()),
-            reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>()),
-            checkedPointer<std::uint64_t>(readyFlagMcPtr, "ready_flag_mc_ptr"),
-            ep,
-            experts,
-            checkedInt(localRankValue, "local_rank"),
             planes,
-            checkedInt(relayCtasValue, "relay_ctas"),
-            relayProgrammaticLaunchEnabled(),
         };
+        kernels::checkMoeRebalanceHaloRParams(mParams, ctas);
         mDevice = device.index();
         mTopk = topk;
         mCopyStream = reinterpret_cast<cudaStream_t>(copyStream);
 
         c10::cuda::CUDAGuard const deviceGuard(device);
-        for (cudaEvent_t& event : mEvents)
-        {
-            cudaError_t const error = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
-            if (error != cudaSuccess)
-            {
-                event = nullptr;
-                releaseEvents();
-                checkCudaResult(error, "cudaEventCreate(HALO-R)");
-            }
-        }
+        mLaunch = kernels::prepareMoeRebalanceHaloRLaunch(ep, experts, ctas);
+        checkCudaResult(
+            cudaEventCreateWithFlags(&mInputReady, cudaEventDisableTiming), "cudaEventCreate(HALO-R input ready)");
         // The launches read and write these by address; retaining them prevents allocator reuse.
         mTensors = {std::move(outSlots), std::move(outIds), std::move(outOwners), std::move(peerBases),
             std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync), std::move(plan),
-            std::move(routePrefix), std::move(relaySources), std::move(relayDestinations), std::move(relayPlaneBytes),
-            std::move(relayCompletedCtas), std::move(relayLaunchCount), std::move(relayResidentCtas)};
+            std::move(routePrefix), std::move(routeCounter), std::move(relaySources), std::move(relayDestinations),
+            std::move(relayPlaneBytes), std::move(relayCompletedCtas), std::move(relayCounters)};
         mBound = true;
     }
 
@@ -225,91 +190,56 @@ public:
         releaseEvents();
     }
 
-    //! Forks COPY from the current stream and enqueues the scheduler, the plan_ready record and the relay copy.
-    void submit(torch::Tensor const& routes, std::int64_t spinNs)
+    //! Forks COPY from the current stream and enqueues the fused kernel of generation `generation()`, whose READY
+    //! value it is. The routes must stay unmodified until the caller's route wait.
+    void submitFused(torch::Tensor const& routes, std::int64_t spinCycles)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireBound();
+        TORCH_CHECK(mPoison == cudaSuccess, "HALO-R context is poisoned by an earlier CUDA error (",
+            cudaGetErrorString(mPoison), "); a quiesced group rebuild is required");
         TORCH_CHECK_VALUE(routes.is_cuda() && routes.get_device() == mDevice
                 && routes.scalar_type() == at::ScalarType::Int && routes.is_contiguous() && routes.dim() == 2
-                && routes.size(1) == mTopk && routes.numel() <= mScheduler.routeCapacity,
+                && routes.size(1) == mTopk && routes.numel() <= mParams.routeCapacity,
             "routes must be a contiguous CUDA int32 [tokens, ", mTopk, "] tensor on device ", mDevice, " with at most ",
-            mScheduler.routeCapacity / mTopk, " tokens");
-        TORCH_CHECK_VALUE(spinNs > 0, "spin_ns must be positive");
-        auto scheduler = mScheduler;
-        scheduler.validRouteCount = static_cast<int>(routes.numel());
-        scheduler.routes = scheduler.validRouteCount > 0 ? routes.data_ptr<int>() : nullptr;
-        scheduler.spinNs = static_cast<std::uint64_t>(spinNs);
+            mParams.routeCapacity / mTopk, " tokens");
+        TORCH_CHECK_VALUE(spinCycles > 0, "spin_cycles must be positive");
+        auto params = mParams;
+        params.validRouteCount = static_cast<int>(routes.numel());
+        params.routes = params.validRouteCount > 0 ? routes.data_ptr<int>() : nullptr;
+        params.spinCycles = static_cast<unsigned long long>(spinCycles);
+        params.readyValue = mGeneration;
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
         cudaStream_t const execution = currentExecutionStream();
         cudaStreamCaptureStatus capture{cudaStreamCaptureStatusNone};
-        checkCudaResult(cudaStreamIsCapturing(execution, &capture), "cudaStreamIsCapturing(HALO-R)");
-        if (capture == cudaStreamCaptureStatusNone)
-        {
-            // COPY reads the routes after MAIN may free them. A captured route tensor lives in the graph's pool for
-            // the graph's lifetime.
-            c10::cuda::CUDACachingAllocator::recordStream(routes.storage().data_ptr(),
-                c10::cuda::getStreamFromExternal(mCopyStream, static_cast<c10::DeviceIndex>(mDevice)));
-        }
-        checkCudaResult(cudaEventRecord(mEvents[kInputReady], execution), "cudaEventRecord(HALO-R input ready)");
-        checkCudaResult(
-            cudaStreamWaitEvent(mCopyStream, mEvents[kInputReady], 0), "cudaStreamWaitEvent(HALO-R input ready)");
-        kernels::invokeMoeRebalanceHaloR(scheduler, mCopyStream);
-        checkCudaResult(cudaEventRecord(mEvents[kPlanReady], mCopyStream), "cudaEventRecord(HALO-R plan ready)");
-        kernels::invokeMoeRebalanceRelay(mRelay, mCopyStream);
+        poisonOnError(cudaStreamIsCapturing(execution, &capture), "cudaStreamIsCapturing(HALO-R)");
+        // A captured READY generation would replay a stale value, so capture is refused before COPY joins it.
+        TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
+            "HALO-R submit: ", cudaGetErrorString(cudaErrorStreamCaptureUnsupported));
+        poisonOnError(cudaEventRecord(mInputReady, execution), "cudaEventRecord(HALO-R input ready)");
+        poisonOnError(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(HALO-R input ready)");
+        poisonOnError(kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream), "HALO-R kernel launch");
+        ++mGeneration;
     }
 
-    //! Orders the current stream after the scheduler of the last submit and after every relay CTA is resident,
-    //! without a host wait.
-    //!
-    //! MegaMoE's full grid blocks at the READY gate that the relay opens, and a relay CTA needs a whole SM. Stream
-    //! priority does not preempt resident CTAs, and graph nodes may not keep it, so MAIN must not release MegaMoE
-    //! until the relay holds its SMs. Each relay CTA adds 1 to relay_resident first; MAIN waits for the CTA count.
-    //! The scheduler zeroes the counter at entry, so the target is a constant that a replayed graph reproduces. The
-    //! reset precedes this launch's increments (the relay is stream-ordered after the scheduler) and follows the
-    //! previous launch's (the scheduler is stream-ordered after the previous relay). The value wait is queued behind
-    //! the plan_ready wait, so it cannot read the previous launch's count before the scheduler has zeroed it.
-    //! While MAIN waits, MegaMoE is not launched and no queued kernel blocks on READY, so the relay's CTAs become
-    //! resident as earlier kernels retire. The scheduler never overlaps them: both run on COPY, in stream order.
-    void waitRoutes()
+    //! Waits for COPY and returns the diagnostic counters (launches, receiver copies, receiver skips). For tests and
+    //! teardown only.
+    std::vector<std::int64_t> relayCounts()
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireBound();
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
-        cudaStream_t const execution = currentExecutionStream();
-        checkCudaResult(
-            cudaStreamWaitEvent(execution, mEvents[kPlanReady], 0), "cudaStreamWaitEvent(HALO-R plan ready)");
-        CUresult const result = cuStreamWaitValue32(reinterpret_cast<CUstream>(execution),
-            reinterpret_cast<CUdeviceptr>(mRelay.residentCtas), static_cast<cuuint32_t>(mRelay.ctas),
-            CU_STREAM_WAIT_VALUE_GEQ);
-        TORCH_CHECK(result == CUDA_SUCCESS, "cuStreamWaitValue32(HALO-R relay resident) failed with CUresult ",
-            static_cast<int>(result));
+        long long counters[kernels::kHaloRCounters]{};
+        poisonOnError(
+            cudaMemcpyAsync(counters, mParams.counters, sizeof(counters), cudaMemcpyDeviceToHost, mCopyStream),
+            "cudaMemcpyAsync(HALO-R counters)");
+        poisonOnError(cudaStreamSynchronize(mCopyStream), "cudaStreamSynchronize(HALO-R copy stream)");
+        return {counters[kernels::kHaloRCounterLaunches], counters[kernels::kHaloRCounterReceiverCopies],
+            counters[kernels::kHaloRCounterReceiverSkips]};
     }
 
-    //! Orders COPY after the consumer: `completionEvent` when nonzero, otherwise the work already queued on the
-    //! current stream. Then joins COPY back into the current stream.
-    void release(std::int64_t completionEvent)
-    {
-        std::lock_guard<std::mutex> lock(mMutex);
-        requireBound();
-        c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
-        cudaStream_t const execution = currentExecutionStream();
-        cudaEvent_t consumer = mEvents[kConsumerDone];
-        if (completionEvent == 0)
-        {
-            checkCudaResult(cudaEventRecord(consumer, execution), "cudaEventRecord(HALO-R consumer done)");
-        }
-        else
-        {
-            consumer = reinterpret_cast<cudaEvent_t>(completionEvent);
-        }
-        checkCudaResult(cudaStreamWaitEvent(mCopyStream, consumer, 0), "cudaStreamWaitEvent(HALO-R consumer)");
-        checkCudaResult(cudaEventRecord(mEvents[kCopyIdle], mCopyStream), "cudaEventRecord(HALO-R copy idle)");
-        checkCudaResult(cudaStreamWaitEvent(execution, mEvents[kCopyIdle], 0), "cudaStreamWaitEvent(HALO-R copy idle)");
-    }
-
-    //! Releases the events and the bound tensors; the caller has drained the device work that uses them.
+    //! Releases the event and the bound tensors; the caller has drained the device work that uses them.
     void destroy()
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -320,21 +250,21 @@ public:
     }
 
 private:
-    enum EventIndex : int
-    {
-        kInputReady = 0,
-        kPlanReady = 1,
-        kConsumerDone = 2,
-        kCopyIdle = 3,
-        kEventCount = 4,
-    };
-
     void requireBound() const
     {
         TORCH_CHECK(mBound, "HALO-R state is destroyed");
     }
 
-    // The stream whose queued work a launch or release follows; it must differ from the copy stream.
+    void poisonOnError(cudaError_t error, char const* operation)
+    {
+        if (error != cudaSuccess)
+        {
+            mPoison = error;
+            checkCudaResult(error, operation);
+        }
+    }
+
+    // The stream whose queued work a launch follows; it must differ from the copy stream.
     cudaStream_t currentExecutionStream() const
     {
         cudaStream_t const stream = at::cuda::getCurrentCUDAStream(mDevice).stream();
@@ -344,25 +274,25 @@ private:
 
     void releaseEvents() noexcept
     {
-        // Pending records complete normally after an event is destroyed.
-        for (cudaEvent_t& event : mEvents)
+        // A pending record completes normally after its event is destroyed.
+        if (mInputReady != nullptr)
         {
-            if (event != nullptr)
-            {
-                static_cast<void>(cudaEventDestroy(event));
-                event = nullptr;
-            }
+            static_cast<void>(cudaEventDestroy(mInputReady));
+            mInputReady = nullptr;
         }
     }
 
     mutable std::mutex mMutex;
-    kernels::MoeRebalanceHaloRParams mScheduler{};
-    kernels::MoeRebalanceRelayParams mRelay{};
+    kernels::MoeRebalanceHaloRParams mParams{};
+    kernels::MoeRebalanceHaloRLaunch mLaunch{};
     std::vector<torch::Tensor> mTensors;
     int mDevice{-1};
     int mTopk{0};
+    //! READY value of the next launch; the caller's generation count starts at 1 too.
+    std::uint64_t mGeneration{1};
     cudaStream_t mCopyStream{nullptr};
-    cudaEvent_t mEvents[kEventCount]{};
+    cudaEvent_t mInputReady{nullptr};
+    cudaError_t mPoison{cudaSuccess};
     bool mBound{false};
 };
 
@@ -370,22 +300,21 @@ using MoeRebalanceHaloRStatePtr = c10::intrusive_ptr<MoeRebalanceHaloRState>;
 
 MoeRebalanceHaloRStatePtr moeRebalanceHaloRCreate(torch::Tensor outSlots, torch::Tensor outIds, torch::Tensor outOwners,
     torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
-    torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, std::int64_t readyFlagsPtr,
+    torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
     torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-    torch::Tensor relayCompletedCtas, torch::Tensor relayLaunchCount, torch::Tensor relayResidentCtas,
-    std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts, std::int64_t helpers, std::int64_t sendCount,
-    std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas,
-    std::int64_t relayCtas, std::int64_t copyStream)
+    torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::int64_t readyFlagMcPtr, std::int64_t ep,
+    std::int64_t experts, std::int64_t helpers, std::int64_t sendCount, std::int64_t sendWeight, std::int64_t localRank,
+    std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t copyStream)
 {
     return c10::make_intrusive<MoeRebalanceHaloRState>(std::move(outSlots), std::move(outIds), std::move(outOwners),
         std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync),
-        std::move(plan), std::move(routePrefix), readyFlagsPtr, std::move(relaySources), std::move(relayDestinations),
-        std::move(relayPlaneBytes), std::move(relayCompletedCtas), std::move(relayLaunchCount),
-        std::move(relayResidentCtas), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight, localRank, topk,
-        routeCapacity, ctas, relayCtas, copyStream);
+        std::move(plan), std::move(routePrefix), std::move(routeCounter), std::move(relaySources),
+        std::move(relayDestinations), std::move(relayPlaneBytes), std::move(relayCompletedCtas),
+        std::move(relayCounters), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight, localRank, topk,
+        routeCapacity, ctas, copyStream);
 }
 
-// The per-layer ops take this handle instead of the custom class, whose conversion costs several microseconds of
+// The per-layer op takes this handle instead of the custom class, whose conversion costs several microseconds of
 // host time per operator call. The caller keeps the state alive while it uses the handle.
 std::int64_t moeRebalanceHaloRHandle(MoeRebalanceHaloRStatePtr const& state)
 {
@@ -404,19 +333,15 @@ MoeRebalanceHaloRState& stateFromHandle(std::int64_t handle)
 
 } // namespace
 
-void moeRebalanceHaloRSubmit(std::int64_t handle, torch::Tensor const& routes, std::int64_t spinNs)
+void moeRebalanceHaloRSubmitFused(std::int64_t handle, torch::Tensor const& routes, std::int64_t spinCycles)
 {
-    stateFromHandle(handle).submit(routes, spinNs);
+    stateFromHandle(handle).submitFused(routes, spinCycles);
 }
 
-void moeRebalanceHaloRWaitRoutes(std::int64_t handle)
+std::vector<std::int64_t> moeRebalanceHaloRRelayCounts(MoeRebalanceHaloRStatePtr const& state)
 {
-    stateFromHandle(handle).waitRoutes();
-}
-
-void moeRebalanceHaloRRelease(std::int64_t handle, std::int64_t completionEvent)
-{
-    stateFromHandle(handle).release(completionEvent);
+    TORCH_CHECK(state, "HALO-R state is null");
+    return state->relayCounts();
 }
 
 void moeRebalanceHaloRDestroy(MoeRebalanceHaloRStatePtr const& state)
@@ -435,17 +360,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "moe_rebalance_halo_r_create(Tensor out_slots, Tensor out_ids, Tensor out_owners, Tensor peer_bases, "
         "Tensor status, Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan, Tensor route_prefix, "
-        "int ready_flags_ptr, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
-        "Tensor relay_completed_ctas, Tensor relay_launch_count, Tensor relay_resident_ctas, int ready_flag_mc_ptr, "
-        "int ep, int experts, int helpers, int send_count, int send_weight, int local_rank, int topk, "
-        "int route_capacity, int ctas, int relay_ctas, int copy_stream) -> "
+        "Tensor route_counter, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
+        "Tensor relay_completed_ctas, Tensor relay_counters, int ready_flag_mc_ptr, int ep, int experts, int helpers, "
+        "int send_count, int send_weight, int local_rank, int topk, int route_capacity, int ctas, int copy_stream) -> "
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState");
     m.def(
         "moe_rebalance_halo_r_handle("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> int");
-    m.def("moe_rebalance_halo_r_submit(int handle, Tensor routes, int spin_ns) -> ()");
-    m.def("moe_rebalance_halo_r_wait_routes(int handle) -> ()");
-    m.def("moe_rebalance_halo_r_release(int handle, int completion_event) -> ()");
+    m.def("moe_rebalance_halo_r_submit_fused(int handle, Tensor routes, int spin_cycles) -> ()");
+    m.def(
+        "moe_rebalance_halo_r_relay_counts("
+        "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> int[]");
     m.def(
         "moe_rebalance_halo_r_destroy("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> ()");
@@ -455,8 +380,7 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
 {
     m.impl("moe_rebalance_halo_r_create", &tensorrt_llm::torch_ext::moeRebalanceHaloRCreate);
     m.impl("moe_rebalance_halo_r_handle", &tensorrt_llm::torch_ext::moeRebalanceHaloRHandle);
-    m.impl("moe_rebalance_halo_r_submit", &tensorrt_llm::torch_ext::moeRebalanceHaloRSubmit);
-    m.impl("moe_rebalance_halo_r_wait_routes", &tensorrt_llm::torch_ext::moeRebalanceHaloRWaitRoutes);
-    m.impl("moe_rebalance_halo_r_release", &tensorrt_llm::torch_ext::moeRebalanceHaloRRelease);
+    m.impl("moe_rebalance_halo_r_submit_fused", &tensorrt_llm::torch_ext::moeRebalanceHaloRSubmitFused);
+    m.impl("moe_rebalance_halo_r_relay_counts", &tensorrt_llm::torch_ext::moeRebalanceHaloRRelayCounts);
     m.impl("moe_rebalance_halo_r_destroy", &tensorrt_llm::torch_ext::moeRebalanceHaloRDestroy);
 }

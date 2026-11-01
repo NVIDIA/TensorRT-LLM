@@ -164,6 +164,7 @@ def generate_serve_schema() -> dict:
                 },
                 "required": ["helper_slot_mode"],
             },
+            "else": {"properties": {"auxiliary_sms": {"maximum": 8}}},
         }
     )
     # These object/Any annotations are Python API hooks, not arbitrary YAML mappings.

@@ -15,26 +15,25 @@
  * limitations under the License.
  */
 
-// HALO-R scheduler kernel. CTA 0 exchanges the routed-token counts with every EP rank, plans the layer's replicas
-// with one warp and builds the route prefix of every selected expert; the worker CTAs compute stable per-expert
-// ordinals, write the home slot of every unselected route and, once the prefix is published, the slot of every
-// selected route.
-//
-// READY protocol. The MegaMoE READY gate passes when every cell of the layer's uint64[EP] READY row is at least the
-// expected generation and carries no error bit. HALO-R hands the gate the constant generation 1 and keeps the
-// protocol on the device, so that a captured layer replays without host bookkeeping:
-//   - the relay copy of epoch g publishes g into its cell on every rank (bit 63 set on any detected error);
-//   - before the count exchange of epoch g > 1, CTA 0 waits until every cell of this rank's row is nonzero (every
-//     rank's epoch g - 1 copy has published here), records an error bit or a timeout in the sticky READY status word,
-//     zeroes the row and only then arrives at the exchange. A peer's epoch g copy starts after that exchange, so the
-//     gate of epoch g cannot pass on a value of epoch g - 1.
-// A missing cell of this rank's own copy traps: the zeroed row would otherwise let this rank's gate read stale weights.
+// Fused HALO-R kernel: the HALO-R scheduler and the relay copy of its plan in one grid of `auxiliary_sms` CTAs, one
+// CTA per SM, on the copy stream (moeRebalanceHaloR.h). It follows the fused HALO-Q + TMA kernel
+// (moeRebalanceTma.cu) and reuses its scheduler passes (moeRebalanceHaloQKernel.cuh), with three differences:
+//   - The plan is HALO-R's own (moeRebalanceHaloRPlanner.h): arbitrary receiver masks, each receiver with its own
+//     helper slot, copied with the unicast relay (moeRebalanceRelay.cuh) instead of multicast.
+//   - A CTA starts its relay share right after releasing its routes, without waiting for the other CTAs: CTA 0
+//     publishes the plan only once it is complete, and the grid rendezvous already proved every CTA resident.
+//   - A failing CTA traps before it releases its routes: every timeout, a planner status other than OK and any
+//     nonzero status word, which also catches the invalid routes and unmappable slots that the route passes record
+//     and continue past. The route consumer therefore never passes its wait for a failed launch, and the last CTA,
+//     which re-checks the status words before it publishes READY, publishes nothing.
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQKernel.cuh"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloR.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloRPlanner.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceRelay.cuh"
+#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
 
 #include <cuda_runtime.h>
 
@@ -42,11 +41,10 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <map>
-#include <mutex>
+#include <cstdio>
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
-#error "The HALO-R scheduler requires SM90 or newer"
+#error "The HALO-R kernel requires SM90 or newer"
 #endif
 
 TRTLLM_NAMESPACE_BEGIN
@@ -58,19 +56,12 @@ namespace
 {
 
 //! The shared passes partition routes over 16 warps per CTA, and one CTA must fit an SM for the grid rendezvous.
-constexpr int kSchedulerThreads = 512;
-constexpr int kSchedulerWarps = kSchedulerThreads / 32;
-constexpr int kMinSchedulerCtas = 2;
-constexpr int kMaxSchedulerCtas = 128;
+constexpr int kFusedThreads = 512;
+constexpr int kFusedWarps = kFusedThreads / 32;
+constexpr int kMinCtas = 2;
+constexpr int kMaxCtas = 128;
 constexpr int kMinEp = 2;
 constexpr unsigned kFullWarpMask = 0xffffffffU;
-
-//! The MegaMoE READY gate reserves bit 63 of a READY cell for errors.
-constexpr std::uint64_t kReadyErrorBit = 1ULL << 63;
-constexpr int kReadyStatusKindShift = 28;
-constexpr int kReadyStatusErrorBit = 1 << kReadyStatusKindShift;
-constexpr int kReadyStatusTimeout = 2 << kReadyStatusKindShift;
-constexpr int kReadyStatusEpochMask = (1 << kReadyStatusKindShift) - 1;
 
 static_assert(halo_r::kPlanFieldStride == kMaxBroadcasts, "HALO-R uses the shared plan field stride");
 static_assert(static_cast<int>(halo_r::PlanField::kExpert) == kPlanExpert,
@@ -115,69 +106,36 @@ struct DeviceWarp
     }
 };
 
-__device__ __forceinline__ void systemFence()
+//! Why a CTA's scheduler role failed, uniform across the CTA; `reason` is null on success.
+struct RoleResult
 {
-    asm volatile("fence.proxy.alias;" ::: "memory");
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    char const* reason;
+    int detail;
+};
+
+//! Thread 0 reports why this launch fails and traps, which faults the context. The calling CTA has not released its
+//! routes and publishes no READY.
+__device__ __noinline__ void trapLaunch(MoeRebalanceHaloRParams const& p, char const* reason, int detail)
+{
+    if (threadIdx.x == 0)
+    {
+        printf("HALO-R rank %d CTA %d: %s (%d); no routes or READY are published\n", p.localRank,
+            static_cast<int>(blockIdx.x), reason, detail);
+        asm volatile("trap;" ::: "memory");
+    }
 }
 
-__device__ __forceinline__ std::uint64_t globalTimerNs()
+//! Index of the first nonzero status word, or -1. Thread 0, after a block barrier that orders this CTA's own records.
+__device__ int firstFailedStatus(int const* status)
 {
-    std::uint64_t now;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
-    return now;
-}
-
-//! Lets the relay copy, a programmatic dependent launch, start once every CTA of this grid has triggered or exited
-//! (cudaTriggerProgrammaticLaunchCompletion). It orders no memory; a no-op without a dependent launch.
-__device__ __forceinline__ void triggerDependentLaunch()
-{
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-}
-
-//! Wait for every cell of this rank's READY row, record errors and zero the row. One thread. The wait is bounded in
-//! wall-clock time (%globaltimer), independent of the SM clock.
-__device__ void drainAndResetReadyRow(
-    std::uint64_t* row, int ep, int localRank, int epoch, std::uint64_t spinNs, int* status)
-{
-    int kind = 0;
-    std::uint64_t const start = globalTimerNs();
-    for (int source = 0; source < ep; ++source)
+    for (int word = 0; word < kHaloRStatusWords; ++word)
     {
-        std::uint64_t value;
-        for (;;)
+        if (*reinterpret_cast<int const volatile*>(status + word) != 0)
         {
-            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(row + source) : "memory");
-            if (value != 0 || globalTimerNs() - start > spinNs)
-            {
-                break;
-            }
-        }
-        if (value == 0)
-        {
-            if (source == localRank)
-            {
-                __trap();
-            }
-            kind |= kReadyStatusTimeout;
-        }
-        else if (value & kReadyErrorBit)
-        {
-            kind |= kReadyStatusErrorBit;
+            return word;
         }
     }
-    // Acquire the values published through the multicast alias before resetting through the unicast alias.
-    systemFence();
-    if (kind)
-    {
-        atomicCAS(status + kHaloRStatusReady, 0, kind | (epoch & kReadyStatusEpochMask));
-    }
-    for (int source = 0; source < ep; ++source)
-    {
-        asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(row + source), "l"(0ULL) : "memory");
-    }
-    // Order the reset before this CTA's exchange arrival; a peer's next READY store follows its acquire of it.
-    systemFence();
+    return -1;
 }
 
 //! This warp's selected routes, as compacted by pre_materialize_and_compact_worker_routes: their route indices are
@@ -237,25 +195,8 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
     }
 }
 
-//! Timeout fail safe after the compaction: the owner's resident slot for every selected route of this worker's span,
-//! which still holds a stable ordinal.
-__device__ void materializeSelectedRoutesHome(int const* routes, int* output, int const* routeAux, int routeCount,
-    int ep, int experts, int helpers, int worker, int workers)
-{
-    int const lane = threadIdx.x & 31;
-    int const* hotIndices = routeAux + 2 + workers * (experts + 1);
-    int const home = experts / ep;
-    auto const [begin, hotCount] = warpSelectedRoutes(routeCount, experts, worker, workers);
-    for (int offset = lane; offset < hotCount; offset += 32)
-    {
-        int const index = hotIndices[begin + offset];
-        output[index] = halo_r::homeSlot(routes[index], home, home + helpers);
-    }
-}
-
-//! CTA 0: count exchange, plan, plan publication and route prefix. Returns after publishing the prefix epoch.
-//! Triggers the relay copy right after the plan epoch; an early return triggers it by exiting.
-__device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, unsigned long long spinCycles)
+//! CTA 0: count exchange, plan, plan publication and route prefix.
+__device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch)
 {
     extern __shared__ int shared[];
     int* counts = shared;
@@ -264,15 +205,10 @@ __device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, un
     auto* scratch = reinterpret_cast<halo_r::PlannerScratch*>(quota + halo_r::kMaxBroadcasts * p.ep);
     __shared__ int planStatus;
 
-    if (threadIdx.x == 0 && epoch > 1)
-    {
-        drainAndResetReadyRow(p.readyFlags, p.ep, p.localRank, static_cast<int>(epoch), p.spinNs, p.status);
-    }
-    __syncthreads();
     if (!exchange_counts(reinterpret_cast<unsigned long long const*>(p.peerBases), p.partial, shared, p.ep, p.experts,
-            p.localRank, p.ctas, epoch, spinCycles, p.status))
+            p.localRank, static_cast<int>(gridDim.x), epoch, p.spinCycles, p.status))
     {
-        return;
+        return RoleResult{"count exchange timeout", static_cast<int>(epoch)};
     }
     for (int expert = threadIdx.x; expert < p.experts; expert += blockDim.x)
     {
@@ -300,39 +236,58 @@ __device__ void planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch, un
         }
     }
     __syncthreads();
+    // Valid input never yields another status (moeRebalanceHaloRPlanner.h), so it is a bug, not a load condition.
     if (planStatus != static_cast<int>(halo_r::PlanStatus::kOk))
     {
-        // Fail safe: no replicas, every route stays on its owner.
-        if (threadIdx.x == 0)
-        {
-            p.plan[1] = 0;
-        }
-        if (threadIdx.x < p.helpers)
-        {
-            p.outIds[threadIdx.x] = -1;
-            p.outOwners[threadIdx.x] = -1;
-        }
-        __syncthreads();
+        return RoleResult{"planner status", planStatus};
     }
     int const broadcasts = p.plan[1];
     if (threadIdx.x == 0)
     {
         store_release_device(p.plan, epoch);
     }
-    // The relay needs only the plan. It acquires it through the epoch released above, so the trigger, which orders no
-    // memory, only has to follow that release in program order.
     __syncthreads();
-    triggerDependentLaunch();
     build_route_prefix(counts, quota, p.routePrefix, p.plan, broadcasts, p.ep, p.experts, p.localRank, blockDim.x);
     __syncthreads();
     if (threadIdx.x == 0)
     {
         store_release_device(p.gridSync + 2, epoch);
     }
+    return RoleResult{nullptr, 0};
 }
 
-//! The scheduler's work. Every return is uniform across the CTA.
-__device__ __forceinline__ void schedulerBody(MoeRebalanceHaloRParams const& p, unsigned long long spinCycles)
+//! A worker CTA: stable ordinals, the home slot of every unselected route and, once the prefix is published, the slot
+//! of every selected route. Each wait has one spin bound.
+__device__ RoleResult mapRoutes(MoeRebalanceHaloRParams const& p, Epoch epoch)
+{
+    int const worker = static_cast<int>(blockIdx.x) - 1;
+    int const workers = static_cast<int>(gridDim.x) - 1;
+    if (!stable_worker_ordinal_pass(
+            p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, p.spinCycles))
+    {
+        return RoleResult{"worker rendezvous timeout", static_cast<int>(epoch)};
+    }
+    int* expertLut = worker_expert_lut(p.experts);
+    prepare_worker_default_slots(expertLut, p.ep, p.experts, p.helpers);
+    __shared__ int planReady;
+    if (!wait_for_plan_epoch(p.plan, epoch, p.spinCycles, p.status, &planReady))
+    {
+        return RoleResult{"plan wait timeout", static_cast<int>(epoch)};
+    }
+    prepare_worker_selected_experts(expertLut, p.plan);
+    pre_materialize_and_compact_worker_routes(
+        p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
+    if (!wait_for_plan_epoch(p.gridSync + 2, epoch, p.spinCycles, p.status, &planReady))
+    {
+        return RoleResult{"route prefix wait timeout", static_cast<int>(epoch)};
+    }
+    materializeSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.plan, p.routeAux, p.status, p.validRouteCount,
+        p.ep, p.experts, p.helpers, worker, workers, epoch);
+    return RoleResult{nullptr, 0};
+}
+
+//! Phase 1. Every return is uniform across the CTA.
+__device__ RoleResult schedulerRole(MoeRebalanceHaloRParams const& p)
 {
     // Only the caller's valid prefix is readable; clear the rest of the output capacity in the same kernel.
     for (int index = p.validRouteCount + blockIdx.x * blockDim.x + threadIdx.x; index < p.routeCapacity;
@@ -340,187 +295,213 @@ __device__ __forceinline__ void schedulerBody(MoeRebalanceHaloRParams const& p, 
     {
         p.outSlots[index] = -1;
     }
-    local_histogram_pass(p.routes, p.partial, p.validRouteCount, p.experts, p.ctas);
+    local_histogram_pass(p.routes, p.partial, p.validRouteCount, p.experts, static_cast<int>(gridDim.x));
     Epoch epoch;
-    if (!grid_rendezvous(p.gridSync, p.ctas, spinCycles, p.status, &epoch))
+    if (!grid_rendezvous(p.gridSync, static_cast<int>(gridDim.x), p.spinCycles, p.status, &epoch))
     {
-        if (blockIdx.x == 0 && threadIdx.x == 0)
+        return RoleResult{"grid rendezvous timeout", 0};
+    }
+    return blockIdx.x == 0 ? planAndPublish(p, epoch) : mapRoutes(p, epoch);
+}
+
+__device__ __forceinline__ void publishReady(std::uint64_t* flag, std::uint64_t value)
+{
+    asm volatile("fence.proxy.alias;" ::: "memory");
+    asm volatile("fence.release.sys;" ::: "memory");
+    asm volatile("multimem.st.release.sys.global.u64 [%0], %1;" ::"l"(flag), "l"(value) : "memory");
+    asm volatile("fence.proxy.alias;" ::: "memory");
+}
+
+//! Thread 0 of the last CTA, after READY: one launch, and every receiver of every broadcast of its plan copied.
+__device__ void countLaunch(MoeRebalanceHaloRParams const& p)
+{
+    int const broadcasts = p.plan[1];
+    int const* masks = halo_r::planField(p.plan, halo_r::PlanField::kDestinationMask);
+    long long copies = 0;
+    for (int b = 0; b < broadcasts; ++b)
+    {
+        copies += __popc(static_cast<unsigned>(masks[b]));
+    }
+    p.counters[kHaloRCounterLaunches] += 1;
+    p.counters[kHaloRCounterReceiverCopies] += copies;
+}
+
+//! Phase 4: a release/acquire chain over the CTAs elects the last one, which publishes READY. No CTA waits for
+//! another, and a rank with nothing to copy joins the chain all the same.
+__device__ void completeLaunch(MoeRebalanceHaloRParams const& p)
+{
+    __shared__ int last;
+    if (threadIdx.x == 0)
+    {
+        unsigned previous;
+        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(p.completedCtas) : "memory");
+        last = previous == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last || threadIdx.x != 0)
+    {
+        return;
+    }
+    int const word = firstFailedStatus(p.status);
+    if (word >= 0)
+    {
+        trapLaunch(p, "status word set before READY", word);
+        return;
+    }
+    // Every CTA has arrived; the next launch is stream-ordered after this one, so the counter can be rearmed.
+    asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(p.completedCtas) : "memory");
+    publishReady(p.readyFlagMc, p.readyValue);
+    countLaunch(p);
+}
+
+__global__ __launch_bounds__(kFusedThreads, 1) void haloRFusedKernel(MoeRebalanceHaloRParams const p)
+{
+    RoleResult const role = schedulerRole(p);
+    if (role.reason != nullptr)
+    {
+        trapLaunch(p, role.reason, role.detail);
+        return;
+    }
+
+    // Phase 2. The barrier orders every thread's route writes before thread 0's system-scope release. Some failures
+    // are recorded by passes that continue, so the release also waits for every status word to be clear.
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        int const word = firstFailedStatus(p.status);
+        if (word >= 0)
         {
-            // The epoch that timed out still resets the READY row, so this rank's gate cannot pass on the previous
-            // epoch's values, and the sticky status makes every later READY publication carry the error bit.
-            int const failed = *reinterpret_cast<int const volatile*>(p.status + kHaloRStatusGridTimeout);
-            if (failed > 1)
-            {
-                drainAndResetReadyRow(p.readyFlags, p.ep, p.localRank, failed, p.spinNs, p.status);
-            }
-            atomicCAS(p.status + kHaloRStatusReady, 0, kReadyStatusTimeout | (failed & kReadyStatusEpochMask));
+            trapLaunch(p, "status word set before route release", word);
         }
+        else
+        {
+            asm volatile("red.release.sys.global.add.u64 [%0], 1;" ::"l"(p.routeCounter) : "memory");
+        }
+    }
+
+    // Phase 3. The barrier hands the scheduler role's dynamic shared memory to the relay.
+    __syncthreads();
+    if (!relayCopy(p))
+    {
+        trapLaunch(p, "no relay issuer fits the shared memory", 0);
         return;
     }
 
-    if (blockIdx.x == 0)
-    {
-        planAndPublish(p, epoch, spinCycles);
-        return;
-    }
-
-    // On a worker timeout, the ordinal pass has already written stable ordinals into the output, which MegaMoE would
-    // read as slots. The worker routes its span to the owners' resident slots instead. The sticky status word still
-    // sets the READY error bit, so the gate rejects every helper tile of the layer.
-    int const worker = blockIdx.x - 1;
-    int const workers = p.ctas - 1;
-    bool const ordinalsReady = stable_worker_ordinal_pass(
-        p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, spinCycles);
-    int* expertLut = worker_expert_lut(p.experts);
-    prepare_worker_default_slots(expertLut, p.ep, p.experts, p.helpers);
-    // Before it publishes the plan, CTA 0 may spend up to spinNs draining READY and spinCycles on the count exchange,
-    // and then runs the planner. spinCycles lasts at least spinNs, so two budgets cover both waits and the third
-    // covers the planner. The host check on spinNs keeps spinCycles at most ULLONG_MAX / 10^6 + 1, so the product
-    // cannot overflow.
-    constexpr unsigned long long kPlanWaitBudgets = 3;
-    __shared__ int planReady;
-    if (!ordinalsReady || !wait_for_plan_epoch(p.plan, epoch, kPlanWaitBudgets * spinCycles, p.status, &planReady))
-    {
-        // The expert LUT holds only the default slots, so every route of the span goes to its owner.
-        pre_materialize_and_compact_worker_routes(
-            p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
-        return;
-    }
-    prepare_worker_selected_experts(expertLut, p.plan);
-    pre_materialize_and_compact_worker_routes(
-        p.routes, p.outSlots, p.routeAux, p.status, p.validRouteCount, p.experts, worker, workers, epoch);
-    if (!wait_for_plan_epoch(p.gridSync + 2, epoch, spinCycles, p.status, &planReady))
-    {
-        materializeSelectedRoutesHome(
-            p.routes, p.outSlots, p.routeAux, p.validRouteCount, p.ep, p.experts, p.helpers, worker, workers);
-        return;
-    }
-    materializeSelectedRoutes(p.routes, p.outSlots, p.routePrefix, p.plan, p.routeAux, p.status, p.validRouteCount,
-        p.ep, p.experts, p.helpers, worker, workers, epoch);
+    completeLaunch(p);
 }
 
-//! spinCycles bounds the shared passes, which count SM clock cycles. It is the wall-clock budget converted at the
-//! maximum SM clock, so those waits last at least params.spinNs; they all end before the routes are published.
-__global__ __launch_bounds__(kSchedulerThreads, 1) void haloRSchedulerKernel(
-    MoeRebalanceHaloRParams const p, unsigned long long const spinCycles)
+//! Dynamic shared memory of the scheduler role.
+std::size_t schedulerSharedBytes(int ep, int experts)
 {
-    // The relay copy launched after this kernel counts its resident CTAs from zero (see moeRebalanceRelay.h). The zero
-    // comes first, ahead of every trigger of the relay's programmatic launch.
-    if (p.relayResidentCtas != nullptr && blockIdx.x == 0 && threadIdx.x == 0)
-    {
-        *p.relayResidentCtas = 0;
-    }
-    // The workers write nothing the relay reads, so they trigger at once; the relay starts once CTA 0 has triggered
-    // too, after publishing the plan (planAndPublish).
-    if (blockIdx.x != 0)
-    {
-        triggerDependentLaunch();
-    }
-    schedulerBody(p, spinCycles);
-}
-
-//! Per-device launch limits, queried once per device.
-struct SchedulerDeviceLimits
-{
-    int smCount = 0;
-    int clockKhz = 0;
-    std::size_t sharedBytesLimit = 0; //!< Opt-in dynamic shared memory left after the kernel's static shared memory.
-    std::size_t configuredSharedBytes = 0;
-};
-
-SchedulerDeviceLimits& schedulerDeviceLimits(int device, std::mutex& mutex)
-{
-    static std::map<int, SchedulerDeviceLimits> limits;
-    std::lock_guard<std::mutex> lock(mutex);
-    auto [entry, inserted] = limits.try_emplace(device);
-    if (inserted)
-    {
-        int optinBytes = 0;
-        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&entry->second.smCount, cudaDevAttrMultiProcessorCount, device));
-        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&entry->second.clockKhz, cudaDevAttrClockRate, device));
-        TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&optinBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
-        cudaFuncAttributes attributes{};
-        TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attributes, haloRSchedulerKernel));
-        entry->second.sharedBytesLimit = static_cast<std::size_t>(optinBytes) > attributes.sharedSizeBytes
-            ? static_cast<std::size_t>(optinBytes) - attributes.sharedSizeBytes
-            : 0;
-        TLLM_CHECK_WITH_INFO(entry->second.clockKhz > 0, "Invalid SM clock rate %d kHz", entry->second.clockKhz);
-    }
-    return entry->second;
-}
-
-} // namespace
-
-std::size_t getMoeRebalanceHaloRSharedMemoryBytes(int ep, int experts)
-{
-    std::size_t const workerInts = static_cast<std::size_t>(kSchedulerWarps) * (experts + 1) + experts;
+    std::size_t const workerInts = static_cast<std::size_t>(kFusedWarps) * (experts + 1) + experts;
     std::size_t const plannerInts = static_cast<std::size_t>(ep) * experts + experts
         + static_cast<std::size_t>(halo_r::kMaxBroadcasts) * ep + sizeof(halo_r::PlannerScratch) / sizeof(int);
     return std::max(workerInts, plannerInts) * sizeof(int);
 }
 
+} // namespace
+
 std::int64_t getMoeRebalanceHaloRRouteAuxEntries(int experts, int ctas, int routeCapacity)
 {
     std::int64_t const bins = static_cast<std::int64_t>(experts) + 1;
-    std::int64_t const passEntries = static_cast<std::int64_t>(ctas) * kSchedulerWarps * bins;
+    std::int64_t const passEntries = static_cast<std::int64_t>(ctas) * kFusedWarps * bins;
     std::int64_t const workerEntries = 2 + static_cast<std::int64_t>(ctas - 1) * bins + routeCapacity;
     return std::max(passEntries, workerEntries);
 }
 
-void invokeMoeRebalanceHaloR(MoeRebalanceHaloRParams const& params, cudaStream_t stream)
+void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int ctas)
 {
-    TLLM_CHECK_WITH_INFO((params.routes != nullptr || params.validRouteCount == 0) && params.outSlots != nullptr
-            && params.outIds != nullptr && params.outOwners != nullptr && params.peerBases != nullptr
-            && params.status != nullptr && params.partial != nullptr && params.routeAux != nullptr
-            && params.gridSync != nullptr && params.plan != nullptr && params.routePrefix != nullptr
-            && params.readyFlags != nullptr,
-        "HALO-R scheduler buffers must not be null");
+    TLLM_CHECK_WITH_INFO(params.outSlots != nullptr && params.outIds != nullptr && params.outOwners != nullptr
+            && params.peerBases != nullptr && params.status != nullptr && params.partial != nullptr
+            && params.routeAux != nullptr && params.gridSync != nullptr && params.plan != nullptr
+            && params.routePrefix != nullptr && params.routeCounter != nullptr && params.sourceTable != nullptr
+            && params.destinationTable != nullptr && params.planeBytes != nullptr && params.completedCtas != nullptr
+            && params.counters != nullptr && params.readyFlagMc != nullptr,
+        "HALO-R kernel buffers must not be null");
     halo_r::PlannerConfig const cfg{
         params.ep, params.experts, params.helpers, params.sendCount, params.sendWeight, params.localRank};
     TLLM_CHECK_WITH_INFO(params.ep >= kMinEp && halo_r::validPlannerConfig(cfg),
         "Invalid HALO-R planner configuration: ep=%d experts=%d helpers=%d send_count=%d send_weight=%d "
         "local_rank=%d",
         params.ep, params.experts, params.helpers, params.sendCount, params.sendWeight, params.localRank);
-    TLLM_CHECK_WITH_INFO(params.routeCapacity > 0 && params.validRouteCount >= 0
-            && params.validRouteCount <= params.routeCapacity && params.routeCapacity <= INT_MAX / params.ep,
-        "Invalid HALO-R route capacity %d or valid route count %d", params.routeCapacity, params.validRouteCount);
+    TLLM_CHECK_WITH_INFO(params.routeCapacity > 0 && params.routeCapacity <= INT_MAX / params.ep,
+        "Invalid HALO-R route capacity %d", params.routeCapacity);
     // A candidate key stores weighted rows above the order byte; an expert's rows are bounded by all routed tokens.
     TLLM_CHECK_WITH_INFO(
         static_cast<long long>(params.ep) * params.routeCapacity * (1 + params.sendWeight) < halo_r::kMaxWeightedRows,
         "HALO-R route capacity %d at ep=%d and send_weight=%d overflows the planner's candidate keys",
         params.routeCapacity, params.ep, params.sendWeight);
-    TLLM_CHECK_WITH_INFO(params.ctas >= kMinSchedulerCtas && params.ctas <= kMaxSchedulerCtas,
-        "HALO-R scheduler needs between %d and %d CTAs, got %d", kMinSchedulerCtas, kMaxSchedulerCtas, params.ctas);
+    TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= halo_r::kRelayMaxPlanes,
+        "HALO-R relay supports 1 to %d weight planes, got %d", halo_r::kRelayMaxPlanes, params.planes);
+    TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlagMc) % sizeof(std::uint64_t) == 0
+            && reinterpret_cast<std::uintptr_t>(params.routeCounter) % sizeof(std::uint64_t) == 0,
+        "HALO-R READY cell and route counter must be 8-byte aligned");
+    TLLM_CHECK_WITH_INFO(ctas >= kMinCtas && ctas <= kMaxCtas, "HALO-R kernel needs between %d and %d CTAs, got %d",
+        kMinCtas, kMaxCtas, ctas);
+}
 
+MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int ctas)
+{
     int device = -1;
     TLLM_CUDA_CHECK(cudaGetDevice(&device));
-    static std::mutex limitsMutex;
-    SchedulerDeviceLimits& limits = schedulerDeviceLimits(device, limitsMutex);
+    int smCount = 0;
+    int optinBytes = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&smCount, cudaDevAttrMultiProcessorCount, device));
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&optinBytes, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
     // The grid rendezvous needs every CTA resident at once, one CTA per SM.
-    TLLM_CHECK_WITH_INFO(params.ctas <= limits.smCount, "HALO-R scheduler CTAs (%d) exceed the device SM count (%d)",
-        params.ctas, limits.smCount);
-    std::size_t const sharedBytes = getMoeRebalanceHaloRSharedMemoryBytes(params.ep, params.experts);
-    TLLM_CHECK_WITH_INFO(sharedBytes <= limits.sharedBytesLimit,
-        "HALO-R scheduler needs %zu bytes of shared memory, the device allows %zu", sharedBytes,
-        limits.sharedBytesLimit);
-    {
-        std::lock_guard<std::mutex> lock(limitsMutex);
-        if (limits.configuredSharedBytes < sharedBytes)
-        {
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(
-                haloRSchedulerKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(sharedBytes)));
-            limits.configuredSharedBytes = sharedBytes;
-        }
-    }
-    TLLM_CHECK_WITH_INFO(params.spinNs > 0 && params.spinNs <= ULLONG_MAX / static_cast<unsigned>(limits.clockKhz),
-        "HALO-R spin budget must be positive and convertible to SM clock cycles");
-    // kHz are cycles per millisecond; round up so that the shared passes wait at least the wall-clock budget.
-    unsigned long long const spinCycles
-        = (static_cast<unsigned long long>(params.spinNs) * static_cast<unsigned>(limits.clockKhz) + 999'999ULL)
-        / 1'000'000ULL;
+    TLLM_CHECK_WITH_INFO(ctas >= kMinCtas && ctas <= std::min(kMaxCtas, smCount),
+        "HALO-R kernel CTAs (%d) must be between %d and the device SM count (%d)", ctas, kMinCtas, smCount);
 
-    haloRSchedulerKernel<<<params.ctas, kSchedulerThreads, sharedBytes, stream>>>(params, spinCycles);
-    TLLM_CUDA_CHECK(cudaGetLastError());
+    void const* kernel = reinterpret_cast<void const*>(&haloRFusedKernel);
+    cudaFuncAttributes attributes{};
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attributes, kernel));
+    std::size_t stack = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetLimit(&stack, cudaLimitStackSize));
+    if (stack < attributes.localSizeBytes)
+    {
+        TLLM_CUDA_CHECK(cudaDeviceSetLimit(cudaLimitStackSize, attributes.localSizeBytes));
+    }
+    TLLM_CHECK_WITH_INFO(attributes.maxThreadsPerBlock >= kFusedThreads,
+        "HALO-R kernel needs %d threads per CTA, the device allows %d", kFusedThreads, attributes.maxThreadsPerBlock);
+
+    // The relay takes the shared memory of the TMA copy's slots; the scheduler role reuses the same allocation.
+    int const available = std::max(0, optinBytes - static_cast<int>(attributes.sharedSizeBytes));
+    std::size_t const slotBytes = MEGAMOE_TMA_COPY_SLOT_DATA_BYTES + MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES;
+    std::size_t const relayBytes
+        = (static_cast<std::size_t>(megamoe_tma_copy_total_slots(available)) * slotBytes + 127) & ~std::size_t{127};
+    std::size_t const minRelayBytes = kRelayWorkBytes + kRelayMinSlotsPerIssuer * kRelaySlotBytes;
+    TLLM_CHECK_WITH_INFO(relayBytes >= minRelayBytes,
+        "HALO-R relay needs at least %zu bytes of dynamic shared memory, the device provides %zu", minRelayBytes,
+        relayBytes);
+    std::size_t const bytes = std::max(relayBytes, schedulerSharedBytes(ep, experts));
+    TLLM_CHECK_WITH_INFO(bytes <= static_cast<std::size_t>(available),
+        "HALO-R kernel needs %zu bytes of dynamic shared memory, the device allows %d", bytes, available);
+
+    TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes)));
+    TLLM_CUDA_CHECK(
+        cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared));
+    int active = 0;
+    TLLM_CUDA_CHECK(
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, kernel, kFusedThreads, static_cast<int>(bytes)));
+    // One CTA per SM: fewer cannot launch, and a second one would share the SM that the rendezvous counts on.
+    TLLM_CHECK_WITH_INFO(active == 1, "HALO-R kernel must fit exactly one CTA per SM, got %d", active);
+
+    MoeRebalanceHaloRLaunch launch;
+    launch.ctas = ctas;
+    launch.dynamicSharedBytes = static_cast<int>(bytes);
+    return launch;
+}
+
+cudaError_t launchMoeRebalanceHaloR(
+    MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params, cudaStream_t stream)
+{
+    cudaLaunchConfig_t config{};
+    config.gridDim = dim3(static_cast<unsigned>(launch.ctas));
+    config.blockDim = dim3(kFusedThreads);
+    config.dynamicSmemBytes = static_cast<std::size_t>(launch.dynamicSharedBytes);
+    config.stream = stream;
+    void* arguments[] = {const_cast<MoeRebalanceHaloRParams*>(&params)};
+    return cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(&haloRFusedKernel), arguments);
 }
 
 } // namespace kernels

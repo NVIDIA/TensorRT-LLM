@@ -36,8 +36,7 @@ endif()
 
 if(DYNAMIC_EPLB_ARCHS AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL
                           13.1)
-  list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceTma.cu moeRebalanceHaloR.cu
-       moeRebalanceRelay.cu)
+  list(APPEND DYNAMIC_EPLB_SOURCES moeRebalanceTma.cu moeRebalanceHaloR.cu)
 else()
   list(APPEND DYNAMIC_EPLB_SOURCES moeRebalancePlaceholder.cpp)
   list(APPEND DYNAMIC_EPLB_DEFINITIONS TRTLLM_DYNAMIC_EPLB_PLACEHOLDER_TMA

@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloQ.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceHaloR.h"
-#include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceRelay.h"
 #include "tensorrt_llm/kernels/moe/loadBalance/dynamicEplb/moeRebalanceTma.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -56,34 +55,24 @@ namespace
 
 } // namespace
 
-std::size_t getMoeRebalanceHaloRSharedMemoryBytes(int, int)
-{
-    throwHaloRUnsupported();
-}
-
 std::int64_t getMoeRebalanceHaloRRouteAuxEntries(int, int, int)
 {
     throwHaloRUnsupported();
 }
 
-void invokeMoeRebalanceHaloR(MoeRebalanceHaloRParams const&, cudaStream_t)
+void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const&, int)
 {
     throwHaloRUnsupported();
 }
 
-std::size_t getMoeRebalanceRelaySharedMemoryBytes()
+MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int, int, int)
 {
     throwHaloRUnsupported();
 }
 
-int getMoeRebalanceRelayThreads()
+cudaError_t launchMoeRebalanceHaloR(MoeRebalanceHaloRLaunch const&, MoeRebalanceHaloRParams const&, cudaStream_t)
 {
-    throwHaloRUnsupported();
-}
-
-void invokeMoeRebalanceRelay(MoeRebalanceRelayParams const&, cudaStream_t)
-{
-    throwHaloRUnsupported();
+    return cudaErrorNotSupported;
 }
 
 } // namespace kernels

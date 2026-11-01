@@ -316,6 +316,35 @@ def test_branch_snapshot_field_types(
             },
             False,
         ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 16,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            True,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "auxiliary_sms": 17,
+                "helper_slot_mode": "shared_banks",
+                "planner": "halo_r",
+            },
+            False,
+        ),
+        (
+            {
+                "mode": "per_layer_dynamic",
+                "num_slots": 320,
+                "planner": "halo_q",
+                "auxiliary_sms": 9,
+            },
+            False,
+        ),
         # HALO-R relays into the shared helper banks only.
         ({"mode": "per_layer_dynamic", "num_slots": 320, "planner": "halo_r"}, False),
         (

@@ -342,20 +342,21 @@ TEST(MoeRebalanceHaloRSlotTest, SelectedRoutesGoToOwnerOrHelperSlot)
     EXPECT_EQ(halo_r::helperIndex(1U << 5, 1U << 5, 5), 3);
 }
 
-TEST(MoeRebalanceHaloRSlotTest, TimeoutFallbackUsesTheOwnerResidentSlot)
+TEST(MoeRebalanceHaloRSlotTest, OwnerRoutesKeepTheirResidentSlot)
 {
     int const ep = 4;
     int const home = 4;
     int const localSlots = home + 2;
-    // A scheduler worker that times out routes every expert to the slot its owner keeps when nothing is rebalanced.
-    EXPECT_EQ(halo_r::homeSlot(0, home, localSlots), 0);
-    EXPECT_EQ(halo_r::homeSlot(9, home, localSlots), 2 * localSlots + 1);
-    EXPECT_EQ(halo_r::homeSlot(ep * home - 1, home, localSlots), (ep - 1) * localSlots + home - 1);
+    // A selected route that the prefix leaves on the owner goes to the slot the owner keeps when nothing is
+    // rebalanced, whatever the receivers.
+    unsigned const mask = (1U << 0) | (1U << 3);
     for (int expert = 0; expert < ep * home; ++expert)
     {
         int const owner = expert / home;
-        EXPECT_EQ(halo_r::homeSlot(expert, home, localSlots),
-            halo_r::selectedRouteSlot(expert, owner, owner, 0U, 0U, 0U, home, localSlots));
+        int const resident = owner * localSlots + expert - owner * home;
+        EXPECT_EQ(halo_r::selectedRouteSlot(expert, owner, owner, 0U, 0U, 0U, home, localSlots), resident);
+        EXPECT_EQ(halo_r::selectedRouteSlot(expert, owner, owner, mask & ~(1U << owner), 1U << 3, 0U, home, localSlots),
+            resident);
     }
 }
 

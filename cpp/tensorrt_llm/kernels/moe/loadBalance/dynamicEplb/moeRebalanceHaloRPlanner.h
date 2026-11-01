@@ -165,13 +165,6 @@ TLLM_HALO_R_HOST_DEVICE inline int helperIndex(unsigned lowMask, unsigned highMa
     return static_cast<int>((((highMask >> rank) & 1U) << 1) | ((lowMask >> rank) & 1U));
 }
 
-//! Resident slot of `expert` on its owner, where a route goes when it is not rebalanced.
-TLLM_HALO_R_HOST_DEVICE inline int homeSlot(int expert, int homeExperts, int localSlots)
-{
-    int const owner = expert / homeExperts;
-    return owner * localSlots + expert - owner * homeExperts;
-}
-
 //! Physical slot of a selected route of `expert` that the route prefix assigned to `destination`: the owner's home
 //! slot, or the destination's helper slot. Returns -1 when the destination is neither the owner nor a receiver.
 TLLM_HALO_R_HOST_DEVICE inline int selectedRouteSlot(int expert, int destination, int owner, unsigned destinationMask,
@@ -554,7 +547,9 @@ TLLM_HALO_R_HOST_DEVICE inline void writeBroadcastTables(int const* histogram, P
 }
 
 //! Plan one layer from the global routed-token histogram. Called by all 32 lanes of one warp; returns a warp-uniform
-//! status. On a non-OK status the plan and outputs are unspecified and the caller must keep every route home.
+//! status. On a non-OK status the plan and outputs are unspecified. A valid configuration always plans: the receiver
+//! ballot excludes kNoDestination and kOverBudget, and each move fills one of at most kMaxRanks * kMaxHelperSlots
+//! receive slots, which excludes kIterationCap.
 template <typename Warp>
 TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(
     int const* histogram, PlannerConfig const& cfg, PlannerScratch* s, PlannerOutputs const& out)

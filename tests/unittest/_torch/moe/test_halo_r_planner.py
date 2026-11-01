@@ -3,8 +3,6 @@
 """CPU contract tests of the HALO-R planner reference and its group selection."""
 
 import random
-import re
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,8 +16,6 @@ from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
 )
 from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
     HALO_R_SEND_COUNT,
-    HALO_R_SPIN_BUDGET_NS,
-    HaloRSlotSchedulerGroup,
     validate_halo_r_geometry,
 )
 
@@ -81,26 +77,38 @@ def test_plans_respect_helper_budget_and_conserve_routes(seed):
 
 
 @pytest.mark.parametrize(
-    "ep_size, home_experts, helper_slots, message",
+    "ep_size, home_experts, helper_slots, auxiliary_sms, message",
     [
-        pytest.param(1, 12, 2, "EP ranks", id="single-rank"),
-        pytest.param(64, 6, 2, "EP ranks", id="above-one-warp"),
-        pytest.param(8, 48, 5, "helper slots", id="five-helpers"),
-        pytest.param(8, 3, 2, "experts per rank", id="fewer-home-experts-than-sends"),
-        pytest.param(32, 16, 2, "at most 384 experts", id="too-many-experts"),
+        pytest.param(1, 12, 2, 4, "EP ranks", id="single-rank"),
+        pytest.param(6, 12, 2, 4, None, id="even-ep"),
+        pytest.param(7, 12, 2, 4, "even number", id="odd-ep"),
+        pytest.param(64, 6, 2, 4, "EP ranks", id="above-one-warp"),
+        pytest.param(8, 48, 5, 4, "helper slots", id="five-helpers"),
+        pytest.param(8, 3, 2, 4, "experts per rank", id="fewer-home-experts-than-sends"),
+        pytest.param(32, 16, 2, 4, "at most 384 experts", id="too-many-experts"),
+        pytest.param(8, 48, 2, 1, "auxiliary_sms", id="one-cta"),
     ],
 )
 def test_geometry_validation_rejects_unsupported_shapes(
-    ep_size, home_experts, helper_slots, message
+    ep_size, home_experts, helper_slots, auxiliary_sms, message
 ):
-    with pytest.raises(ValueError, match=message):
+    def validate():
         validate_halo_r_geometry(
-            ep_size=ep_size, home_experts=home_experts, helper_slots=helper_slots
+            ep_size=ep_size,
+            home_experts=home_experts,
+            helper_slots=helper_slots,
+            auxiliary_sms=auxiliary_sms,
         )
+
+    if message is None:
+        validate()
+    else:
+        with pytest.raises(ValueError, match=message):
+            validate()
 
 
 def test_geometry_validation_accepts_ep32_two_helper_slots():
-    validate_halo_r_geometry(ep_size=32, home_experts=12, helper_slots=2)
+    validate_halo_r_geometry(ep_size=32, home_experts=12, helper_slots=2, auxiliary_sms=2)
 
 
 class _Config:
@@ -227,242 +235,3 @@ def test_reference_plan_words_have_the_kernel_layout():
     assert len(words) == 2 + 6 * 384
     assert words[:2] == [7, 1]
     assert words[2 + 2 * 384] == (1 << 1) | (1 << 4) | (1 << 5)
-
-
-_HALO_R_OP_SOURCE = (
-    Path(__file__).resolve().parents[4]
-    / "cpp/tensorrt_llm/thop/moe/loadBalance/moeRebalanceHaloROp.cpp"
-)
-
-
-def _halo_r_op_parameters(name):
-    """Parameter names of a registered moe_rebalance_halo_r operator schema."""
-    op_source = _HALO_R_OP_SOURCE.read_text()
-    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op_source.split("m.def(")[1:]]
-    schema = next(text for text in schemas if text.startswith(f"{name}("))
-    parameters = re.fullmatch(rf"{name}\((.*)\) -> \(\)", schema).group(1)
-    return [parameter.split()[-1] for parameter in parameters.split(",")]
-
-
-def test_per_layer_ops_take_the_context_handle():
-    # The context binds every shared argument; a custom-class argument would
-    # cost microseconds of dispatch per call.
-    assert _halo_r_op_parameters("moe_rebalance_halo_r_submit") == ["handle", "routes", "spin_ns"]
-    assert _halo_r_op_parameters("moe_rebalance_halo_r_wait_routes") == ["handle"]
-    assert _halo_r_op_parameters("moe_rebalance_halo_r_release") == [
-        "handle",
-        "completion_event",
-    ]
-
-
-class _FakeRoutes:
-    """Just enough of a CUDA int32 [tokens, topk] tensor for the host checks."""
-
-    ndim = 2
-
-    def __init__(self, fake_torch, tokens, topk):
-        self.shape = (tokens, topk)
-        self.dtype = fake_torch.int32
-        self.device = "cuda:0"
-
-    def is_contiguous(self):
-        return True
-
-
-class _FakeSlots(_FakeRoutes):
-    def __getitem__(self, index):
-        return ("slots", index)
-
-
-def _fake_torch(calls, main_handle=11):
-    def op(name):
-        return lambda *args: calls.append((name, *args))
-
-    fake = SimpleNamespace(int32=object())
-    fake.Tensor = _FakeRoutes
-    fake.cuda = SimpleNamespace(
-        current_device=lambda: 0,
-        current_stream=lambda device: SimpleNamespace(cuda_stream=main_handle, priority=0),
-    )
-    fake.ops = SimpleNamespace(
-        trtllm=SimpleNamespace(
-            moe_rebalance_halo_r_submit=op("submit"),
-            moe_rebalance_halo_r_wait_routes=op("wait_routes"),
-            moe_rebalance_halo_r_release=op("release"),
-        )
-    )
-    return fake
-
-
-def _bound_group(fake_torch, handle=0x1234):
-    """A group past construction: bound to a native context with ``handle``."""
-    group = HaloRSlotSchedulerGroup.__new__(HaloRSlotSchedulerGroup)
-    group.device = 0
-    group.topk = 2
-    group.max_tokens_per_rank = 8
-    group.copy_stream = SimpleNamespace(priority=-1)
-    group.physical_slot_ids = _FakeSlots(fake_torch, 8, 2)
-    group.plan_calls = 0
-    group._handle = handle
-    group._copy_handle = 22
-    group._closed = False
-    group._validated_streams = set()
-    group._call_stream_handle = None
-    group._pending_tokens = None
-    group._routes_waited = False
-    group._planned = False
-    group._part = None
-    return group
-
-
-def test_layer_call_makes_one_native_call_per_step(monkeypatch):
-    calls = []
-    fake_torch = _fake_torch(calls)
-    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
-    group = _bound_group(fake_torch)
-    routes = _FakeRoutes(fake_torch, 5, 2)
-
-    slots, generation = group.plan(routes)
-    group.finish()
-
-    assert (slots, generation) == (("slots", slice(None, 5)), 1)
-    # The native calls carry the whole fork/join; no event, stream or driver
-    # call is made from Python.
-    assert calls == [
-        ("submit", 0x1234, routes, HALO_R_SPIN_BUDGET_NS),
-        ("wait_routes", 0x1234),
-        ("release", 0x1234, 0),
-    ]
-
-
-def test_deferred_route_wait_is_enqueued_once_and_release_takes_the_event(monkeypatch):
-    calls = []
-    fake_torch = _fake_torch(calls)
-    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
-    group = _bound_group(fake_torch)
-    routes = _FakeRoutes(fake_torch, 0, 2)
-
-    part = group.plan_schedule(routes)
-    group.plan_finish(part, defer_wait=True)
-    assert [call[0] for call in calls] == ["submit"]
-    group.wait_for_routes()
-    group.wait_for_routes()
-    group.finish(SimpleNamespace(cuda_event=0x99))
-
-    assert calls[1:] == [("wait_routes", 0x1234), ("release", 0x1234, 0x99)]
-    with pytest.raises(ValueError, match="CUDA event"):
-        group.plan(routes)
-        group.finish(SimpleNamespace(cuda_event=0))
-
-
-def test_layer_call_rejects_the_copy_stream(monkeypatch):
-    calls = []
-    fake_torch = _fake_torch(calls, main_handle=22)
-    monkeypatch.setattr(halo_r_planner, "torch", fake_torch)
-    group = _bound_group(fake_torch)
-
-    with pytest.raises(RuntimeError, match="distinct from the higher-priority COPY"):
-        group.plan(_FakeRoutes(fake_torch, 1, 2))
-    assert calls == []
-
-
-_DYNAMIC_EPLB_SOURCE = (
-    Path(__file__).resolve().parents[4] / "cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb"
-)
-
-
-def _function_body(source, signature):
-    """Text between the braces of the first function whose header contains ``signature``."""
-    start = source.index("{", source.index(signature))
-    depth = 0
-    for index in range(start, len(source)):
-        depth += {"{": 1, "}": -1}.get(source[index], 0)
-        if depth == 0:
-            return source[start : index + 1]
-    raise ValueError(f"unbalanced body of {signature}")
-
-
-def test_route_wait_follows_relay_residency():
-    # MegaMoE's full grid blocks at the READY gate the relay opens, so MAIN may
-    # release it only once every relay CTA holds its SM, as HALO-Q gates on
-    # its route epoch. A plan_ready-only wait lets MegaMoE take every SM first.
-    op = _HALO_R_OP_SOURCE.read_text()
-    wait = _function_body(op, "void waitRoutes()")
-    stream_wait = re.search(
-        r"cuStreamWaitValue32\(\s*reinterpret_cast<CUstream>\(execution\),\s*"
-        r"reinterpret_cast<CUdeviceptr>\(mRelay\.residentCtas\),\s*"
-        r"static_cast<cuuint32_t>\(mRelay\.ctas\),\s*CU_STREAM_WAIT_VALUE_GEQ\)",
-        wait,
-    )
-    assert stream_wait is not None
-    # The value wait is queued behind plan_ready, which follows the reset.
-    assert wait.index("mEvents[kPlanReady]") < stream_wait.start()
-    # The scheduler and the relay share the one counter.
-    assert op.count("reinterpret_cast<unsigned*>(relayResidentCtas.data_ptr<int>())") == 2
-
-    # The scheduler zeroes the counter before anything else, so the target
-    # stays the constant CTA count across graph replays.
-    scheduler = _function_body(
-        (_DYNAMIC_EPLB_SOURCE / "moeRebalanceHaloR.cu").read_text(), "void haloRSchedulerKernel("
-    )
-    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index("schedulerBody(")
-    # Every relay CTA reports residency before it does any copy work.
-    relay = _function_body(
-        (_DYNAMIC_EPLB_SOURCE / "moeRebalanceRelay.cu").read_text(), "void haloRRelayKernel("
-    )
-    increment = relay.index('"red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas)')
-    assert increment < relay.index("prepareRelayWork(") < relay.index("relayIssue(")
-
-
-def test_relay_is_a_programmatic_dependent_of_the_scheduler():
-    # The relay may start while the scheduler's workers still write routes, so
-    # it must take nothing from the scheduler through the launch order alone.
-    halo_r = (_DYNAMIC_EPLB_SOURCE / "moeRebalanceHaloR.cu").read_text()
-    scheduler = _function_body(halo_r, "void haloRSchedulerKernel(")
-    # The residency zero precedes every trigger, so no relay add can precede it.
-    assert scheduler.index("*p.relayResidentCtas = 0;") < scheduler.index(
-        "triggerDependentLaunch();"
-    )
-    # CTA 0 triggers only after it releases the plan epoch that the relay acquires.
-    publish = _function_body(halo_r, "void planAndPublish(")
-    assert publish.count("triggerDependentLaunch();") == 1
-    assert publish.index("store_release_device(p.plan, epoch);") < publish.index(
-        "triggerDependentLaunch();"
-    )
-
-    relay_source = (_DYNAMIC_EPLB_SOURCE / "moeRebalanceRelay.cu").read_text()
-    relay = _function_body(relay_source, "void haloRRelayKernel(")
-    increment = relay.index('"red.release.gpu.global.add.u32 [%0], 1;" ::"l"(p.residentCtas)')
-    # The plan is acquired before the residency add (ordered after the zero)
-    # and before the work table reads it.
-    assert relay.index("acquirePlan(p)") < increment < relay.index("prepareRelayWork(")
-    acquire = _function_body(relay_source, "bool acquirePlan(")
-    assert '"ld.acquire.gpu.global.u32 %0, [%1];"' in acquire
-    assert acquire.index("kRelayPlanPollNs") < acquire.index("waitForScheduler();")
-    # The status words are final only at scheduler exit: READY waits for it,
-    # and nothing else in the kernel does, so the copy overlaps the route tail.
-    assert relay.count("waitForScheduler();") == 1
-    assert (
-        relay.index("relayIssue(")
-        < relay.index("waitForScheduler();")
-        < relay.index("relayReadyValue(")
-    )
-
-    invoke = _function_body(relay_source, "void invokeMoeRebalanceRelay(")
-    assert "cudaLaunchAttributeProgrammaticStreamSerialization" in invoke
-    assert "params.programmaticLaunch && programmaticLaunchSupported(device)" in invoke
-    op = _HALO_R_OP_SOURCE.read_text()
-    assert 'std::getenv("TRTLLM_HALO_R_RELAY_PDL")' in op
-    assert "relayProgrammaticLaunchEnabled()," in op
-
-
-def test_context_binds_the_relay_residency_counter():
-    op = _HALO_R_OP_SOURCE.read_text()
-    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op.split("m.def(")[1:]]
-    create = next(text for text in schemas if text.startswith("moe_rebalance_halo_r_create("))
-    assert "Tensor relay_launch_count, Tensor relay_resident_ctas, int ready_flag_mc_ptr" in create
-    planner = Path(halo_r_planner.__file__).read_text()
-    assert re.search(
-        r"self\.relay_launch_count,\s*self\.relay_resident_ctas,\s*self\._ready_flag_mc_ptr,",
-        planner,
-    )

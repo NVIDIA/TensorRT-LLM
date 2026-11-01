@@ -70,16 +70,8 @@ def _register_fake():
     ) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_submit")
-    def _(handle: int, routes: torch.Tensor, spin_ns: int) -> None:
-        return None
-
-    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_wait_routes")
-    def _(handle: int) -> None:
-        return None
-
-    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_release")
-    def _(handle: int, completion_event: int) -> None:
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_submit_fused")
+    def _(handle: int, routes: torch.Tensor, spin_cycles: int) -> None:
         return None
 
     @torch.library.register_fake("trtllm::allreduce")
