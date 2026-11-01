@@ -8,14 +8,24 @@
 #   FAT_CONTAINER_DIR       - scratch path for enroot base .sqsh files
 #   FAT_CONTAINER           - docker URI (urm.nvidia.com#...) for the base image
 #   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
-#   FAT_LLM_TARFILE         - HTTPS URL of the TRT-LLM wheel tarball
+#   FAT_LLM_TAR_ARTIFACT_PATH - artifact path of the TRT-LLM tarball, read with FAT_FETCH_HELPER_PATH
 #   FAT_LLM_DOCKER_IMAGE    - full docker image tag (used for cache-key hashing)
 #   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the SLURM node
 #   FAT_TAR_NAME            - tarball filename (e.g. TensorRT-LLM.tar.gz)
+#   FAT_FETCH_HELPER_PATH   - path to fetch_build_artifact.sh on the SLURM node
+#   LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC, ARTIFACTORY_CREDENTIAL_ID
+#                           - read by fetch_build_artifact.sh; ARTIFACTORY_NETRC is deleted on exit
 
 set -euo pipefail
 trap 'rc=$?; echo "Error on line $LINENO: exit $rc"; exit $rc' ERR
 export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
+# fat_build_inline.sh deletes the netrc after its download; this covers every other way out.
+removeNetrc() {
+    if [ -n "${ARTIFACTORY_NETRC:-}" ]; then
+        rm -f "$ARTIFACTORY_NETRC"
+    fi
+}
+trap removeNetrc EXIT
 
 # Resolve base sqsh using image digest (shared cache, same logic as srunPrologue).
 mkdir -p "${FAT_CONTAINER_DIR}"
@@ -68,10 +78,10 @@ mkdir -p "${FAT_SQSH_DIR}"
 # Only writer of the cache; the formula is mirrored in prepare_container.sh and
 # computeFatSqshPath() in L0_Test.groovy. Change all three together.
 fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
-fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
+fatHash=$(printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 if [ -f "$fatSqshPath" ]; then
     echo "[fat_build_sbatch] Fat sqsh already exists: $fatSqshPath"
     exit 0
 fi
-bash "${FAT_BUILD_SCRIPT_PATH}" "$fatSqshPath" "$baseSqshPath" "${FAT_LLM_TARFILE}" "${FAT_TAR_NAME}" || echo "[fat_build_sbatch] Build failed (non-fatal); GPU job will fall back to base sqsh + full install"
+bash "${FAT_BUILD_SCRIPT_PATH}" "$fatSqshPath" "$baseSqshPath" "${FAT_LLM_TAR_ARTIFACT_PATH}" "${FAT_TAR_NAME}" || echo "[fat_build_sbatch] Build failed (non-fatal); GPU job will fall back to base sqsh + full install"

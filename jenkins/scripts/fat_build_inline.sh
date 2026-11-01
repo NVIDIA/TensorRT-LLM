@@ -20,7 +20,11 @@
 # (--dependency=afterok) and then uses the fat sqsh directly (SKIP_INSTALL=1).
 #
 # Usage:
-#   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tarfile_url> <tar_name>
+#   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tar_artifact_path> <tar_name>
+#
+# The tarball is read on the host with fetch_build_artifact.sh (FAT_FETCH_HELPER_PATH), which
+# takes LLM_ARTIFACTS_PRIMARY, ARTIFACTORY_NETRC and ARTIFACTORY_CREDENTIAL_ID from the
+# environment. ARTIFACTORY_NETRC is deleted as soon as the download ends.
 #
 # Exits 0 on success (fat sqsh written atomically to <fat_sqsh_path>).
 # The caller uses || true so failures are non-fatal; the GPU test job will then
@@ -30,10 +34,15 @@ set -euo pipefail
 
 FAT_SQSH_PATH="$1"
 BASE_SQSH_PATH="$2"
-LLM_TARFILE_URL="$3"
+LLM_TAR_ARTIFACT_PATH="$3"
 TAR_NAME="$4"
+: "${FAT_FETCH_HELPER_PATH:?FAT_FETCH_HELPER_PATH is required}"
+# The read helper's exit status for a transfer that still failed after its own retries; its
+# other failures, such as an absent package or a rejected credential, are final.
+FETCH_TRANSFER_FAILED=4
+FETCH_MAX_ATTEMPTS=3
 
-FAT_HASH=$(printf '%s' "$LLM_TARFILE_URL" | sha256sum | cut -d' ' -f1 | head -c 16)
+FAT_HASH=$(printf '%s' "$LLM_TAR_ARTIFACT_PATH" | sha256sum | cut -d' ' -f1 | head -c 16)
 FAT_CONTAINER="fat_build_${FAT_HASH}_${SLURM_JOB_ID:-$$}"
 WORK_DIR=$(mktemp -d /tmp/fat_build_XXXXXX)
 FAT_TMP="${FAT_SQSH_PATH}.${SLURM_JOB_ID:-$$}.tmp"
@@ -46,26 +55,46 @@ trap cleanup EXIT
 
 echo "[fat_build] Starting: $FAT_SQSH_PATH"
 echo "[fat_build] Base sqsh: $BASE_SQSH_PATH"
-echo "[fat_build] LLM tarfile: ${LLM_TARFILE_URL%%\?*}"
+echo "[fat_build] LLM tarball: $LLM_TAR_ARTIFACT_PATH"
+
+removeNetrc() {
+    if [ -n "${ARTIFACTORY_NETRC:-}" ]; then
+        rm -f "$ARTIFACTORY_NETRC"
+    fi
+}
+
+# Download on the host into WORK_DIR, so the netrc never enters the container.
+echo "[fat_build] Downloading $TAR_NAME..."
+attempt=1
+while true; do
+    status=0
+    bash "$FAT_FETCH_HELPER_PATH" "$LLM_TAR_ARTIFACT_PATH" "$WORK_DIR/$TAR_NAME" || status=$?
+    if [ "$status" -eq 0 ]; then
+        break
+    fi
+    if [ "$status" -ne "$FETCH_TRANSFER_FAILED" ] || [ "$attempt" -ge "$FETCH_MAX_ATTEMPTS" ]; then
+        echo "[fat_build] Download failed (exit $status) after $attempt attempt(s)"
+        removeNetrc
+        exit 1
+    fi
+    echo "[fat_build] Download failed (exit $status), attempt $attempt of $FETCH_MAX_ATTEMPTS; retrying in 60s..."
+    attempt=$((attempt + 1))
+    sleep 60
+done
+removeNetrc
 
 # Write the install script into WORK_DIR (mounted as /work inside the container).
-# Quoted heredoc (<<'INSTALL_EOF') prevents outer-shell expansion of LLM_TARFILE_URL
+# Quoted heredoc (<<'INSTALL_EOF') prevents outer-shell expansion of LLM_TAR_ARTIFACT_PATH
 # and TAR_NAME; values are passed as positional arguments when the script is invoked.
 # All work is done inside /tmp/ in the container filesystem (not in the /work mount),
 # so the source tree (/tmp/TensorRT-LLM/) and installed packages are baked into the exported sqsh image.
 cat > "$WORK_DIR/install.sh" <<'INSTALL_EOF'
 #!/bin/bash
 set -euo pipefail
-LLM_TARFILE_URL="$1"
+LLM_TAR_ARTIFACT_PATH="$1"
 TAR_NAME="$2"
 cd /tmp
-echo "[fat_build] Downloading $TAR_NAME..."
-# -O for the same reason the callers in L0_Test.groovy use it: a second wget
-# process (a retried builder job) would otherwise save to $TAR_NAME.1 and leave
-# the tar below unpacking whatever the first attempt got.
-wget -nv --tries=5 --retry-connrefused --waitretry=30 --timeout=300 -O "$TAR_NAME" "$LLM_TARFILE_URL"
-tar -zxf "$TAR_NAME"
-rm -f "$TAR_NAME"
+tar -zxf "/work/$TAR_NAME"
 echo "[fat_build] Python/pip versions:"
 python3 --version
 pip3 --version
@@ -92,7 +121,7 @@ echo "[fat_build] Installing ray (required for --run-ray test jobs)..."
 pip3 install --no-user --retries 10 "ray[default]==2.55.1"
 echo "[fat_build] Installed TensorRT-LLM version:"
 pip3 show tensorrt-llm || true
-echo "$LLM_TARFILE_URL" > /tmp/trtllm_installed.txt
+echo "$LLM_TAR_ARTIFACT_PATH" > /tmp/trtllm_installed.txt
 echo "[fat_build] Install complete."
 INSTALL_EOF
 
@@ -103,7 +132,7 @@ echo "[fat_build] Running install inside container..."
 enroot start \
     --rw \
     --mount "$WORK_DIR:/work" \
-    "$FAT_CONTAINER" -- bash /work/install.sh "$LLM_TARFILE_URL" "$TAR_NAME"
+    "$FAT_CONTAINER" -- bash /work/install.sh "$LLM_TAR_ARTIFACT_PATH" "$TAR_NAME"
 
 echo "[fat_build] Exporting fat sqsh..."
 enroot export --output "$FAT_TMP" "$FAT_CONTAINER"

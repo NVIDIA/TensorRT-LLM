@@ -7,14 +7,24 @@
 # following required environment variables:
 #
 #   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
-#   FAT_LLM_TARFILE         - HTTPS URL of the TRT-LLM wheel tarball (for cache-key hashing)
+#   FAT_LLM_TAR_ARTIFACT_PATH - artifact path of the TRT-LLM tarball (for cache-key hashing)
 #   FAT_LLM_DOCKER_IMAGE    - full docker image tag (for cache-key hashing)
 #   FAT_BUILD_SCRIPT_PATH   - path to fat_build_inline.sh on the login node (for cache-key hashing)
 #   FAT_BUILD_SBATCH_PATH   - path to the fat_build_sbatch.sh wrapper on the login node
 #   FAT_BUILD_LOG_TEMPLATE  - SLURM log path template (may contain %j for job ID)
+#   FAT_ARTIFACTORY_NETRC   - netrc that the builder this stage submits reads the tarball with
 
 set -euo pipefail
 echo "=== [Prepare Container] STAGE START: $(date '+%Y-%m-%d %H:%M:%S') on $(hostname) ==="
+
+# Only a builder that this stage submits reads FAT_ARTIFACTORY_NETRC, and it deletes the file
+# itself, so every way out of this script that submits no builder deletes it here.
+removeUnusedNetrc() {
+    if [ -n "${FAT_ARTIFACTORY_NETRC:-}" ]; then
+        rm -f "$FAT_ARTIFACTORY_NETRC"
+    fi
+}
+trap removeUnusedNetrc EXIT
 
 if ! mkdir -p "${FAT_SQSH_DIR}" 2>&1; then
     echo "Warning: mkdir -p ${FAT_SQSH_DIR} failed; fat sqsh will not be built on this run."
@@ -32,7 +42,7 @@ if [ -z "${FAT_BUILD_SCRIPT_PATH:-}" ] || [ ! -f "${FAT_BUILD_SCRIPT_PATH}" ]; t
     exit 0
 fi
 fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)
-fatHash=$(printf '%s' "${FAT_LLM_TARFILE}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
+fatHash=$(printf '%s' "${FAT_LLM_TAR_ARTIFACT_PATH}|${FAT_LLM_DOCKER_IMAGE}|${fatBuildScriptHash}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${FAT_SQSH_DIR}/fat-${fatHash}.sqsh"
 
 if [ -f "$fatSqshPath" ]; then
@@ -65,6 +75,7 @@ if [ -z "$EXISTING" ]; then
 fi
 if [ -n "$EXISTING" ]; then
     echo "Fat sqsh builder already running as job $EXISTING, will wait for it"
+    removeUnusedNetrc
     BUILDER_ID="$EXISTING"
     actualFatBuildLogPath=$(fatBuilderLogPath "$BUILDER_ID")
 else
@@ -79,6 +90,7 @@ else
     BUILDER_ID=$(printf '%s\n' "$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
     if [ "$BUILDER_RC" -eq 0 ] && [ -n "$BUILDER_ID" ]; then
         echo "Submitted fat sqsh builder as cpu_builder_job_id=$BUILDER_ID at $(date '+%Y-%m-%d %H:%M:%S')"
+        trap - EXIT
         _fatLogTemplate="${FAT_BUILD_LOG_TEMPLATE}"
         actualFatBuildLogPath="${_fatLogTemplate//%j/$BUILDER_ID}"
     else
