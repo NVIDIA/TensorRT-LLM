@@ -226,12 +226,36 @@ def _minimax_h3_adaln_fp4_kernel(
         if HAS_RES:
             ar = a_ptr + r64 * a_stride
             gb = gmod_ptr + mrow * gmod_stride + gate_off
-            x0 = (x0 + _ld(gb, 0 * CH, D, CH) * _ld(ar, 0 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
-            x1 = (x1 + _ld(gb, 1 * CH, D, CH) * _ld(ar, 1 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
-            x2 = (x2 + _ld(gb, 2 * CH, D, CH) * _ld(ar, 2 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
-            x3 = (x3 + _ld(gb, 3 * CH, D, CH) * _ld(ar, 3 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
-            x4 = (x4 + _ld(gb, 4 * CH, D, CH) * _ld(ar, 4 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
-            x5 = (x5 + _ld(gb, 5 * CH, D, CH) * _ld(ar, 5 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
+            x0 = (
+                (x0 + _ld(gb, 0 * CH, D, CH) * _ld(ar, 0 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            x1 = (
+                (x1 + _ld(gb, 1 * CH, D, CH) * _ld(ar, 1 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            x2 = (
+                (x2 + _ld(gb, 2 * CH, D, CH) * _ld(ar, 2 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            x3 = (
+                (x3 + _ld(gb, 3 * CH, D, CH) * _ld(ar, 3 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            x4 = (
+                (x4 + _ld(gb, 4 * CH, D, CH) * _ld(ar, 4 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
+            x5 = (
+                (x5 + _ld(gb, 5 * CH, D, CH) * _ld(ar, 5 * CH, D, CH))
+                .to(tl.bfloat16)
+                .to(tl.float32)
+            )
             o1 = x1_ptr + r64 * x1_stride
             _st(o1, 0 * CH, D, x0, CH)
             _st(o1, 1 * CH, D, x1, CH)
@@ -279,7 +303,7 @@ def _minimax_h3_swiglu_fp4_kernel(
     sf_ptr,
     gs_ptr,
     rows,
-    I,
+    inter,
     h_stride,
     xq_stride,
     SF_KTILES,
@@ -293,16 +317,26 @@ def _minimax_h3_swiglu_fp4_kernel(
     r64 = row.to(tl.int64)
     sf_base = _sf_row_base(r64, SF_KTILES)
     if row >= rows:
-        _zero_sf_chunk(col0, I, sf_ptr, sf_base)
+        _zero_sf_chunk(col0, inter, sf_ptr, sf_base)
     else:
         hr = h_ptr + r64 * h_stride
-        a = _ld(hr, col0, I, CH)
-        b = _ld(hr + I, col0, I, CH)
+        a = _ld(hr, col0, inter, CH)
+        b = _ld(hr + inter, col0, inter, CH)
         result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
         gs = tl.load(gs_ptr).to(tl.float32)
         rcp_gs = _rcp_approx(gs)
         rcp6 = _rcp_approx(gs * 0.0 + 6.0)
-        _quant_chunk(_round_bf16(result), col0, I, gs, rcp_gs, rcp6, xq_ptr + r64 * xq_stride, sf_ptr, sf_base)
+        _quant_chunk(
+            _round_bf16(result),
+            col0,
+            inter,
+            gs,
+            rcp_gs,
+            rcp6,
+            xq_ptr + r64 * xq_stride,
+            sf_ptr,
+            sf_base,
+        )
 
 
 # -------------------------------------------------------------------------- launchers
@@ -314,7 +348,9 @@ def _alloc(rows, k, device):
     return xq, sf
 
 
-def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, num_warps=None, gate_mod=None):
+def _launch_adaln(
+    x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, num_warps=None, gate_mod=None
+):
     D = x.shape[-1]
     if D > 6 * _CH or D % 16:
         raise ValueError(f"hidden size {D} is not supported by the fused NVFP4 AdaLN kernel")
@@ -371,24 +407,24 @@ def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, nu
 
 
 def _launch_swiglu(h, gs, num_warps=None):
-    I = h.shape[-1] // 2
-    if I % 16:
-        raise ValueError(f"intermediate size {I} is not a multiple of 16")
-    h2 = h.reshape(-1, 2 * I)
+    inter = h.shape[-1] // 2
+    if inter % 16:
+        raise ValueError(f"intermediate size {inter} is not a multiple of 16")
+    h2 = h.reshape(-1, 2 * inter)
     if h2.stride(-1) != 1:
         h2 = h2.contiguous()
     rows = h2.shape[0]
-    xq, sf = _alloc(rows, I, h.device)
-    _minimax_h3_swiglu_fp4_kernel[(swizzled_sf_rows(rows), triton.cdiv(I, _CH))](
+    xq, sf = _alloc(rows, inter, h.device)
+    _minimax_h3_swiglu_fp4_kernel[(swizzled_sf_rows(rows), triton.cdiv(inter, _CH))](
         h2,
         xq,
         sf,
         gs,
         rows,
-        I,
+        inter,
         h2.stride(0),
         xq.stride(0),
-        swizzled_sf_ktiles(I),
+        swizzled_sf_ktiles(inter),
         swiglu_alpha=1.0,
         swiglu_beta=0.0,
         CH=_CH,
@@ -477,19 +513,19 @@ def _(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, gate_mod=None)
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 def h3_swiglu_fp4(h: torch.Tensor, gs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """h [..., 2I] bf16 = [gate | up] -> NVFP4 of silu(gate) * up: (codes [..., I/2] u8, swizzled e4m3 scales)."""
-    I = h.shape[-1] // 2
+    """h [..., 2I] bf16 = [gate | up] -> NVFP4 of silu(gate) * up: (codes [..., inter/2] u8, swizzled e4m3 scales)."""
+    inter = h.shape[-1] // 2
     xq, sf = _launch_swiglu(h, gs)
-    return xq.view(*h.shape[:-1], I // 2), sf
+    return xq.view(*h.shape[:-1], inter // 2), sf
 
 
 @h3_swiglu_fp4.register_fake
 def _(h, gs):
-    I = h.shape[-1] // 2
+    inter = h.shape[-1] // 2
     rows = h.numel() // h.shape[-1]
     return (
-        h.new_empty((*h.shape[:-1], I // 2), dtype=torch.uint8),
-        h.new_empty((sf_numel(rows, I),), dtype=torch.uint8),
+        h.new_empty((*h.shape[:-1], inter // 2), dtype=torch.uint8),
+        h.new_empty((sf_numel(rows, inter),), dtype=torch.uint8),
     )
 
 
