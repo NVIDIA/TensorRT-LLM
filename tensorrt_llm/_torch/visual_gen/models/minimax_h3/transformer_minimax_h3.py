@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.hf_parameter_utils import get_parameter_device
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
@@ -47,6 +48,13 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .fused_quant import (
+    FUSED_QUANT_ENABLED,
+    h3_gate_res_norm_mod_fp4,
+    h3_norm_mod_fp4,
+    h3_swiglu_fp4,
+    static_nvfp4_input,
+)
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -181,19 +189,24 @@ class MiniMaxH3Attention(Attention):
             if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
                 return False
         cos, sin = rotary_emb
+        # A pre-quantized activation (fused_quant.py) carries its BF16 origin implicitly;
+        # the layout checks read its packed codes.
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            probe, is_bf16 = hidden_states.fp4_tensor, True
+        else:
+            probe, is_bf16 = hidden_states, hidden_states.dtype == torch.bfloat16
         if (
-            not hidden_states.is_cuda
-            or hidden_states.dtype != torch.bfloat16
-            or hidden_states.ndim != 3
-            or cos.shape != (hidden_states.shape[1], cos.shape[-1])
+            not probe.is_cuda
+            or not is_bf16
+            or probe.ndim != 3
+            or cos.shape != (probe.shape[1], cos.shape[-1])
             or sin.shape != cos.shape
             or cos.shape[-1] % 32
             or cos.shape[-1] > self.head_dim
         ):
             return False
         if torch.is_grad_enabled() and any(
-            t.requires_grad
-            for t in (hidden_states, cos, sin, self.norm_q.weight, self.norm_k.weight)
+            t.requires_grad for t in (probe, cos, sin, self.norm_q.weight, self.norm_k.weight)
         ):
             return False
         return True
@@ -632,6 +645,10 @@ class MiniMaxH3TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
+        if self._fuse_nvfp4_quantize():
+            return self._forward_fused_adaln_nvfp4(
+                hidden_states, mod, adaln_indices, rotary_emb, key_padding_mask, timestep
+            )
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
@@ -650,6 +667,68 @@ class MiniMaxH3TransformerBlock(nn.Module):
         ff_output = self.ff(
             norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
         ).reshape_as(norm_hidden_states)
+        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def _fuse_nvfp4_quantize(self) -> bool:
+        """Whether the norm and SwiGLU producers quantize straight into their NVFP4 Linears.
+
+        Needs the fused-QKV attention and the fused gate/up MLP over static-NVFP4 Linears
+        (``fused_quant.static_nvfp4_input``); ``H3_FUSED_QUANT=0`` keeps the unfused path.
+        """
+        if not FUSED_QUANT_ENABLED or getattr(self.ff, "split_gate_up", False):
+            return False
+        qkv_proj = getattr(self.attn, "qkv_proj", None)
+        return (
+            qkv_proj is not None
+            and static_nvfp4_input(qkv_proj)
+            and static_nvfp4_input(self.ff.gate_up_proj)
+            and static_nvfp4_input(self.ff.down_proj)
+        )
+
+    def _forward_fused_adaln_nvfp4(
+        self,
+        hidden_states: torch.Tensor,
+        mod: torch.Tensor,
+        adaln_indices: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+        timestep: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """``_forward_fused_adaln`` with the producers emitting the Linears' NVFP4 inputs directly."""
+        hidden_size = hidden_states.shape[-1]
+        codes, scales = h3_norm_mod_fp4(
+            hidden_states,
+            self.norm1.weight,
+            mod,
+            adaln_indices,
+            self.attn.qkv_proj.input_scale,
+            self.norm1.variance_epsilon,
+            1,
+            0,
+        )
+        attn_output = self.attn(
+            Fp4QuantizedTensor(codes, scales), rotary_emb, key_padding_mask, timestep
+        )
+        hidden_states, codes, scales = h3_gate_res_norm_mod_fp4(
+            hidden_states,
+            attn_output,
+            self.norm2.weight,
+            mod,
+            adaln_indices,
+            self.ff.gate_up_proj.input_scale,
+            self.norm2.variance_epsilon,
+            2,
+            4,
+            3,
+        )
+        gate_up = self.ff.gate_up_proj(
+            Fp4QuantizedTensor(codes.reshape(-1, codes.shape[-1]), scales)
+        )
+        codes, scales = h3_swiglu_fp4(gate_up, self.ff.down_proj.input_scale)
+        ff_output = self.ff.down_proj(
+            Fp4QuantizedTensor(codes, scales), layer_idx=self.ff.layer_idx
+        ).reshape_as(hidden_states)
         gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
         return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
