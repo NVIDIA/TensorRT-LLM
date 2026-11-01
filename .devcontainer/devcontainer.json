@@ -20,6 +20,8 @@
   // global (/usr/bin/python). In this case, pip will default to a local user path which is not
   // by default in the PATH. In interactive devcontainer shells, .profile is sourced by default.
   "postCreateCommand": "mkdir -p $HOME/.local/bin && source $HOME/.profile && pip install -r requirements-dev.txt && pre-commit install --install-hooks",
+  // VS Code's zsh integration resets HISTFILE before loading .zshrc and Oh My Zsh.
+  "postStartCommand": "mkdir -p .cache && printf '%s\\n' 'HISTFILE=\"${containerWorkspaceFolder}/.cache/._bash_history\"' > \"$HOME/.oh-my-zsh/custom/devcontainer-history.zsh\"",
   "customizations": {
     "vscode": {
       "extensions": [
