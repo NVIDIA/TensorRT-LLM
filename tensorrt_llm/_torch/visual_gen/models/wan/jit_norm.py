@@ -1,35 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Runtime compilation of the Wan VAE position-walk kernel (``cuda/vae_norm_kernel.cuh``).
+"""The Wan VAE position-walk kernel (:mod:`.cute_norm`): call-site interface.
 
-One kernel template covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input
-producer and product consumer, order 2 or 4) and the Winograd combine; its parameters (dtypes,
-order, lane layout, mode flags, stages) are all known at the call site. Instead of
-instantiating every combination ahead of time, this module compiles the one a call needs on
-first use (nvcc from the toolkit, a few seconds), caches the cubin in memory and on disk, and
-launches it through the driver API on the current torch stream (CUDA-graph safe).
+One kernel covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input producer
+and product consumer, order 2 or 4) and the Winograd combine; its parameters (dtypes, order,
+lane layout, mode flags) are all known at the call site. Each combination is compiled with the
+CuTe DSL on first use (cached on disk across processes) and launched on the current torch
+stream, so it is CUDA-graph safe.
 """
 
 from __future__ import annotations
 
-import ctypes
 import functools
-import hashlib
-import os
-import pathlib
-import subprocess
-import tempfile
 from dataclasses import dataclass, field
 
 import torch
 
-_SRC_DIR = pathlib.Path(__file__).parent / "cuda"
-_HEADERS = (
-    "packed_vector.cuh",
-    "vae_norm_common.cuh",
-    "vae_wino_tables.cuh",
-    "vae_norm_kernel.cuh",
-)
 _THREADS = 256
 _WARPS = _THREADS // 32
 _VEC = 8  # 16-byte vectors of 16-bit elements
@@ -105,47 +91,9 @@ def _map_args(geo: FrameGeometry | None) -> tuple[int, int, int]:
     return (geo.frame, geo.cols, geo.offset) if geo is not None else (0, 0, 0)
 
 
-def _check(result, what: str):
-    err, *values = result
-    if int(err) != 0:
-        raise RuntimeError(f"{what} failed: {err}")
-    return values[0] if len(values) == 1 else values
-
-
-@functools.lru_cache(maxsize=None)
-def _cuda_home() -> str:
-    from torch.utils.cpp_extension import CUDA_HOME
-
-    if CUDA_HOME is None:
-        raise RuntimeError("CUDA_HOME is needed to compile the VAE norm kernel at run time")
-    return CUDA_HOME
-
-
-@functools.lru_cache(maxsize=None)
-def _arch(device: int) -> str:
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
-
-
 @functools.lru_cache(maxsize=None)
 def _sm_count(device: int) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
-
-
-@functools.lru_cache(maxsize=None)
-def _sources() -> dict[str, str]:
-    return {name: (_SRC_DIR / name).read_text() for name in _HEADERS}
-
-
-def _extra_defines() -> list[str]:
-    """Experiment knobs for the kernel source (``-D`` flags), from TRTLLM_VAE_JIT_DEFINES."""
-    raw = os.environ.get("TRTLLM_VAE_JIT_DEFINES", "")
-    return [f"-D{d}" for d in raw.split(",") if d]
-
-
-def _cache_dir() -> pathlib.Path:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
-    return pathlib.Path(base) / "tensorrt_llm" / "vae_jit"
 
 
 def row_layout(channels: int, fold_single: bool = True) -> tuple[int, int]:
@@ -166,22 +114,6 @@ def row_layout(channels: int, fold_single: bool = True) -> tuple[int, int]:
     return lanes, k
 
 
-def blocks_per_sm(k: int, in_wino: bool, order: int, out: int) -> int:
-    """Resident blocks per SM the kernel is compiled for (mirrors ``blocksPerSm`` in the
-    kernel source, including the ``VAEWINO_IN_BLOCKS`` experiment knob)."""
-    if out == OUT_ROWS:
-        return 4 if k <= 2 else 3
-    if in_wino and order == 4:
-        for d in _extra_defines():
-            if d.startswith("-DVAEWINO_IN_BLOCKS="):
-                knob = int(d.split("=", 1)[1])
-                if knob:
-                    return knob
-    if k >= 4 or order == 4:
-        return 2
-    return 4 if (not in_wino and k <= 2) else 3
-
-
 @dataclass(frozen=True, kw_only=True)
 class Variant:
     fp16_winograd: bool
@@ -200,28 +132,6 @@ class Variant:
     out_map: bool = False
     halo: bool = False
 
-    def name(self) -> str:
-        def b(v: bool) -> str:
-            return "true" if v else "false"
-
-        td = "__half" if self.fp16_winograd else "__nv_bfloat16"
-        return (
-            f"vaewino::vaeNormKernel<__nv_bfloat16, {td}, {self.order}, {_VEC}, {self.lanes}, {self.k}, "
-            f"{b(self.reference)}, {b(self.has_bias)}, {b(self.has_in_bias)}, {b(self.has_residual)}, "
-            f"{b(self.in_wino)}, {self.mid}, {self.out}, {b(self.padded)}, {b(self.in_map)}, "
-            f"{b(self.out_map)}, {b(self.halo)}>"
-        )
-
-    def signature(self) -> str:
-        t, td = "__nv_bfloat16", "__half" if self.fp16_winograd else "__nv_bfloat16"
-        return (
-            f"({t} const*, {td} const*, {td}*, long long, long long, {t} const*, {t} const*, {t} const*, "
-            f"{t} const*, "
-            f"{t} const*, {t}*, {t}*, {t}*, long long, int, int, int, int, int, int, int, long long, int, int, "
-            f"long long, int, int, float, float, "
-            f"void*, void*, long long, long long, long long, long long, int, int, int)"
-        )
-
     @property
     def positions_per_block(self) -> int:
         return (32 // self.lanes) * _WARPS
@@ -233,119 +143,6 @@ class Variant:
             else 0
         )
         return 3 * channels * 4 + ring
-
-
-class _Kernel:
-    def __init__(self, function, module, variant: Variant) -> None:
-        self.function = function
-        self.module = module
-        self.variant = variant
-        self.smem_configured = 0
-
-
-def _compile_cubin(variant: Variant, arch: str) -> tuple[bytes, str]:
-    """nvcc compiles one explicit instantiation; the mangled name comes from the cubin."""
-    cuda_home = _cuda_home()
-    nvcc = os.path.join(cuda_home, "bin", "nvcc")
-    if not os.path.exists(nvcc):
-        raise RuntimeError(
-            f"nvcc not found at {nvcc}; the runtime-compiled VAE norm kernel needs the CUDA toolkit"
-        )
-    name = variant.name()
-    src = (
-        '#include "vae_norm_kernel.cuh"'
-        + "\n"
-        + f"template __global__ void {name}{variant.signature()};"
-        + "\n"
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        cu = os.path.join(tmp, "vae_norm_kernel_inst.cu")
-        cubin = os.path.join(tmp, "k.cubin")
-        pathlib.Path(cu).write_text(src)
-        cmd = [
-            nvcc,
-            "-cubin",
-            f"-arch={arch}",
-            "--std=c++17",
-            "-O3",
-            *_extra_defines(),
-            f"-I{_SRC_DIR}",
-            f"-I{os.path.join(cuda_home, 'include', 'cccl')}",
-            "-o",
-            cubin,
-            cu,
-        ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        if res.returncode != 0:
-            raise RuntimeError(f"nvcc failed for {name}: {res.stderr[-4000:]}")
-        data = pathlib.Path(cubin).read_bytes()
-        dump = subprocess.run(
-            [os.path.join(cuda_home, "bin", "cuobjdump"), "--dump-resource-usage", cubin],
-            capture_output=True,
-            text=True,
-        ).stdout
-    lowered = None
-    for line in dump.splitlines():
-        line = line.strip()
-        if line.startswith("Function ") and "vaeNormKernel" in line:
-            lowered = line[len("Function ") :].rstrip(":")
-            break
-    if lowered is None:
-        raise RuntimeError(f"could not find the kernel symbol in the cubin for {name}")
-    return data, lowered
-
-
-@functools.lru_cache(maxsize=None)
-def _kernel(device: int, variant: Variant) -> _Kernel:
-    from cuda.bindings import driver as cuda
-
-    arch = _arch(device)
-    name = variant.name()
-    digest = hashlib.sha256()
-    for h in _HEADERS:
-        digest.update(_sources()[h].encode())
-    digest.update(f"{name}|{arch}|{'|'.join(_extra_defines())}|v3".encode())
-    cache = _cache_dir() / f"{digest.hexdigest()[:32]}.cubin"
-    lowered_path = cache.with_suffix(".name")
-    if cache.exists() and lowered_path.exists():
-        cubin = cache.read_bytes()
-        lowered = lowered_path.read_text()
-    else:
-        cubin, lowered = _compile_cubin(variant, arch)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        # Several processes (the ranks of a sharded run) may compile the same variant at once:
-        # each writes its own temporary and the rename is atomic, so the cache stays consistent.
-        tmp = cache.with_suffix(f".{os.getpid()}.tmp")
-        tmp.write_bytes(cubin)
-        os.replace(tmp, cache)
-        tmp_name = lowered_path.with_suffix(f".{os.getpid()}.tmp")
-        tmp_name.write_text(lowered)
-        os.replace(tmp_name, lowered_path)
-    torch.cuda.set_device(device)
-    torch.cuda.current_stream(device)  # make sure the primary context exists
-    module = _check(cuda.cuModuleLoadData(cubin), "cuModuleLoadData")
-    function = _check(cuda.cuModuleGetFunction(module, lowered.encode()), "cuModuleGetFunction")
-    return _Kernel(function, module, variant)
-
-
-_ARG_TYPES = (
-    *(ctypes.c_void_p,) * 3,
-    ctypes.c_longlong,
-    ctypes.c_longlong,
-    *(ctypes.c_void_p,) * 8,
-    ctypes.c_longlong,
-    *(ctypes.c_int,) * 7,
-    ctypes.c_longlong,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_longlong,
-    *(ctypes.c_int,) * 2,
-    ctypes.c_float,
-    ctypes.c_float,
-    *(ctypes.c_void_p,) * 2,
-    *(ctypes.c_longlong,) * 4,
-    *(ctypes.c_int,) * 3,
-)
 
 
 def _addr(t: torch.Tensor | None) -> int:
@@ -408,60 +205,59 @@ def _launch(
 ) -> None:
     from cuda.bindings import driver as cuda
 
-    kernel = _kernel(device, variant)
-    smem = variant.shared_bytes(channels)
-    if smem > kernel.smem_configured:
-        _check(
-            cuda.cuFuncSetAttribute(
-                kernel.function,
-                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                smem,
-            ),
-            "cuFuncSetAttribute",
-        )
-        kernel.smem_configured = smem
+    from . import cute_norm
+
     out_positions = (height + pad_h) * (width + pad_w) if variant.padded else positions
     if out_positions <= 0:
         return
-    steps = -(-out_positions // variant.positions_per_block)
-    persistent = _sm_count(device) * blocks_per_sm(
-        variant.k, variant.in_wino, variant.order, variant.out
-    )
-    blocks = int(min(steps, persistent))
-    args = (
-        _addr(x),
-        m_ptr,
-        _addr(d),
-        comp_stride,
-        in_comp_stride,
-        _addr(residual),
-        _addr(in_bias),
-        _addr(cache) if cache_frames else 0,
-        _addr(gamma),
-        _addr(bias),
-        _addr(out_sum),
-        _addr(y_tail),
-        _addr(y),
-        positions,
-        channels,
-        frames,
-        cache_frames,
-        height,
-        width,
-        pad_h,
-        pad_w,
-        *_map_args(in_geo),
-        *_map_args(out_geo),
-        float(scale),
-        1e-12,
-        *_halo_args(out_geo.push if out_geo is not None else None, channels),
-    )
-    stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
-    _check(
-        cuda.cuLaunchKernel(
-            kernel.function, blocks, 1, 1, _THREADS, 1, 1, smem, stream, (args, _ARG_TYPES), 0
+    halo = _halo_args(out_geo.push if out_geo is not None else None, channels)
+    in_map, out_map = _map_args(in_geo), _map_args(out_geo)
+    cute_norm.launch(
+        variant,
+        device,
+        out_sum is not None,
+        -(-out_positions // variant.positions_per_block),
+        _sm_count(device),
+        dict(
+            x=_addr(x),
+            m=m_ptr,
+            d=_addr(d),
+            residual=_addr(residual),
+            in_bias=_addr(in_bias),
+            cache=_addr(cache) if cache_frames else 0,
+            gamma=_addr(gamma),
+            bias=_addr(bias),
+            sum=_addr(out_sum),
+            y_tail=_addr(y_tail),
+            y=_addr(y),
+            halo_l=halo[0],
+            halo_r=halo[1],
+            halo_frame_l=halo[2],
+            halo_frame_r=halo[3],
+            halo_comp_l=halo[4] // _VEC,
+            halo_comp_r=halo[5] // _VEC,
+            halo_step_l=halo[6],
+            halo_step_r=halo[7],
+            halo_axis=halo[8],
+            comp_vecs=comp_stride // _VEC,
+            in_comp_vecs=in_comp_stride // _VEC,
+            in_frame=in_map[0],
+            in_w=in_map[1],
+            in_off=in_map[2],
+            out_frame=out_map[0],
+            out_w=out_map[1],
+            out_off=out_map[2],
+            positions=positions,
+            frames=frames,
+            cache_frames=cache_frames,
+            height=height,
+            width=width,
+            pad_h=pad_h,
+            pad_w=pad_w,
+            scale=float(scale),
+            eps=1e-12,
         ),
-        "cuLaunchKernel",
+        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
     )
 
 

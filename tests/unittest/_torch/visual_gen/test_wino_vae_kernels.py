@@ -173,7 +173,7 @@ def _require_sm100() -> None:
     assert sm100_wino_available(), "nvidia-cutlass-dsl (a declared requirement) does not import"
 
 
-cuda_op = _built(cuda_op_available(), "runtime compilation of the norm kernels (nvcc, cuda-python)")
+cuda_op = _built(cuda_op_available(), "the CuTe DSL kernels (nvidia-cutlass-dsl, cuda-python)")
 
 
 @cuda_op
@@ -349,12 +349,11 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
 
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    cuda_upsample_available,
     pack_upsample_weights,
     upsample_gather_cuda,
 )
 
-upsample_op = _built(cuda_upsample_available(), "trtllm::vae_upsample_gather")
+upsample_op = cuda_op
 
 
 def _eager_upsample(x4: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
@@ -610,12 +609,11 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
 # ---------------------------------------------------------------------------
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    cuda_frame_ops_available,
     interleave_bias_cuda,
     wino_combine_cuda,
 )
 
-frame_ops = _built(cuda_frame_ops_available(), "trtllm::vae_interleave_bias")
+frame_ops = cuda_op
 
 
 @cuda_op
@@ -729,10 +727,12 @@ def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
 
 # --- spatial Winograd F(2x2, 3x3) transforms -------------------------------------------
 
-spatial_op = _built(
-    hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in"),
-    "trtllm::vae_wino_spatial_in",
+from tensorrt_llm._torch.visual_gen.models.wan.cute_spatial import (  # noqa: E402
+    wino_spatial_in,
+    wino_spatial_out,
 )
+
+spatial_op = cuda_op
 _BT = torch.tensor([[1, 0, -1, 0], [0, 1, 1, 0], [0, -1, 1, 0], [0, 1, 0, -1]], dtype=torch.float32)
 _AT = torch.tensor([[1, 1, 1, 0], [0, 1, -1, -1]], dtype=torch.float32)
 
@@ -817,7 +817,7 @@ def test_spatial_winograd_transforms(
     if row1 > -(-h // tile):
         pytest.skip("strip past the last tile row")
     frames = torch.randn(n, h, w, C, device="cuda").to(torch.bfloat16)
-    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, row0, row1, tile)
+    v = wino_spatial_in(frames, components, row0, row1, tile)
     v_ref = _ref_spatial_in(frames, components, row0, row1, tile)
     assert v.shape == v_ref.shape
     assert v.dtype == torch.float16
@@ -832,7 +832,7 @@ def test_spatial_winograd_transforms(
     coords = (tile + 2) ** 2
     m = torch.randn(components * coords, v.shape[1], C, device="cuda").to(torch.float16)
     out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, components, row0, row1, tile)
+    wino_spatial_out(m, out, components, row0, row1, tile)
     got = out[:, tile * row0 : min(tile * row1, h)].float()
     ref = _ref_spatial_out(m, n, h, w, components, row0, row1, tile)
     if tile == 2:
@@ -858,7 +858,7 @@ def test_spatial_winograd_transforms_large_frames(
     n, components = 2, 1
     row1 = -(-h // tile)
     frames = torch.randn(n, h, w, C, device="cuda").to(torch.bfloat16)
-    v = torch.ops.trtllm.vae_wino_spatial_in(frames, components, 0, row1, tile)
+    v = wino_spatial_in(frames, components, 0, row1, tile)
     v_ref = _ref_spatial_in(frames, components, 0, row1, tile).to(torch.float16)
     assert v.shape == v_ref.shape
     if tile == 2:
@@ -871,7 +871,7 @@ def test_spatial_winograd_transforms_large_frames(
         assert (v != v_ref).float().mean().item() < 2e-4
     del v_ref
     out = torch.full((n, h, w, C), float("nan"), device="cuda", dtype=torch.bfloat16)
-    torch.ops.trtllm.vae_wino_spatial_out(v, out, components, 0, row1, tile)
+    wino_spatial_out(v, out, components, 0, row1, tile)
     ref = _ref_spatial_out(v, n, h, w, components, 0, row1, tile)
     assert not torch.isnan(out.float()).any()
     if tile == 2:
@@ -1253,10 +1253,7 @@ def test_sm100_fused_needs_two_cin_chunks() -> None:
     assert not sm100_fused_eligible(96, 128, 8, 32)
 
 
-frame_ops_op = _built(
-    hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp"),
-    "trtllm::vae_unpatchify_clamp",
-)
+frame_ops_op = cuda_op
 
 
 @frame_ops_op

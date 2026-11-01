@@ -208,7 +208,6 @@ else:
     ]
 
 package_data += [
-    '_torch/visual_gen/models/wan/cuda/*.cuh',
     'bindings/*.pyi',
     'bindings/**/*.pyi',
     'evaluate/lm_eval_tasks/**/*',

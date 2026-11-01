@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel wrappers for WinoVae: the runtime-compiled CUDA norm kernels (:mod:`jit_norm`) and
-their eager references, the compiled ``trtllm::vae_*`` ops and
-the sm100 CuTe DSL pipeline. Each wrapper states its layout, dtype and shape preconditions;
-choosing a fallback when they do not hold is the caller's job (``can_*`` / ``*_available``
-predicates), not the wrapper's."""
+"""Kernel wrappers for WinoVae: the CuTe DSL norm kernel (:mod:`jit_norm`, :mod:`cute_norm`),
+the compiled ``trtllm::vae_*`` ops and the sm100 CuTe DSL pipeline. Each wrapper states its
+layout, dtype and shape preconditions; choosing a fallback when they do not hold is the
+caller's job (``can_*`` / ``*_available`` predicates), not the wrapper's."""
 
 from __future__ import annotations
 
@@ -23,7 +22,7 @@ from .wino_tables import SPATIAL_WINO
 
 
 def cuda_op_available() -> bool:
-    """The runtime-compiled norm / Winograd norm / combine kernel (:mod:`jit_norm`) can run."""
+    """The norm / Winograd norm / combine kernel (:mod:`jit_norm`) can run."""
     return jit_norm_available()
 
 
@@ -62,7 +61,7 @@ def rms_norm_silu_cuda(
     silu: bool = True,
     out_geometry: FrameGeometry | None = None,
 ) -> torch.Tensor:
-    """The CUDA kernel (:mod:`jit_norm` in row mode): RMSNorm over channels (+ SiLU) of a
+    """The norm kernel (:mod:`jit_norm` in row mode): RMSNorm over channels (+ SiLU) of a
     channels-last bf16 CUDA tensor whose channel count is a multiple of 8
     (``can_use_cuda_rms_norm_silu``); fp32 arithmetic, bf16 result of ``x``'s shape.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
@@ -158,7 +157,7 @@ def apply_in_bias(x: torch.Tensor, in_bias: torch.Tensor | None) -> torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-# Temporal Winograd F(order, 3) transforms, mirrored in cuda/vae_wino_tables.cuh. Order 2 is the
+# Temporal Winograd F(order, 3) transforms (the norm kernel reads BT and AT from here). Order 2 is the
 # classic F(2,3); order 4 uses the points (0, 1, -1, 2, -1/2, inf), whose output transform AT
 # holds only powers of two (exact products) and whose input transform BT holds multiples of
 # 1/2 (exact products of 16-bit values in fp32).
@@ -210,7 +209,7 @@ def winograd_weights(
 
 # Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (:mod:`wino_tables`, shared with
 # the sm100 path), applied in fp64 and rounded once. The matching B^T and A^T live in
-# cpp/tensorrt_llm/kernels/vaeWinoSpatialKernel.cu.
+# cute_spatial.py.
 _WINO_G = {tile: torch.tensor(SPATIAL_WINO[tile]["G"], dtype=torch.float64) for tile in (2, 4)}
 
 
@@ -218,7 +217,7 @@ def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2, order: int = 2
     """``[Cout, Cin, 3, 3, 3]`` -> ``U [(order+2) * (tile+2)^2, Cin, Cout]`` fp16: the temporal
     components of :func:`winograd_weights`, each transformed as ``G g G^T`` for spatial
     F(tile x tile, 3x3), ordered ``component * (tile+2)^2 + row * (tile+2) + col`` to match
-    ``trtllm::vae_wino_spatial_in``. The transformed data is fp16 end to end (V, U, M)."""
+    :func:`cute_spatial.wino_spatial_in`. The transformed data is fp16 end to end (V, U, M)."""
     taps = weight.detach().double()  # [Cout, Cin, 3, 3, 3]
     gt = torch.tensor(TEMPORAL_WINO[order]["G"], dtype=torch.float64, device=weight.device)
     comps = torch.einsum("kt,oitab->koiab", gt, taps)  # [comps, Cout, Cin, 3, 3]
@@ -255,12 +254,12 @@ def wino_spatial_conv_frames(
     taps, _, cin = frames.shape
     tile = spatial_tile_of(u, 1)
     tile_rows = -(-height // tile)
-    v = torch.ops.trtllm.vae_wino_spatial_in(
-        frames.view(taps, height, width, cin), 1, 0, tile_rows, tile, taps > 1
-    )
+    from .cute_spatial import wino_spatial_in, wino_spatial_out
+
+    v = wino_spatial_in(frames.view(taps, height, width, cin), 1, 0, tile_rows, tile, taps > 1)
     m = torch.bmm(v, u)
     out = torch.empty((1, height, width, u.shape[2]), dtype=frames.dtype, device=frames.device)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
+    wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
     return out.view(height * width, u.shape[2])
 
 
@@ -279,7 +278,9 @@ def wino_spatial_conv_taps(
     tile = spatial_tile_of(u, 1)
     tile_rows = -(-height // tile)
     cout = u.shape[2]
-    v = torch.ops.trtllm.vae_wino_spatial_in_taps(
+    from .cute_spatial import wino_spatial_in_taps, wino_spatial_out
+
+    v = wino_spatial_in_taps(
         [t.view(t.shape[0], height, width, t.shape[-1]) for t in taps],
         zero_front,
         0,
@@ -288,7 +289,7 @@ def wino_spatial_conv_taps(
     )
     out = torch.empty((1, height, width, cout), dtype=taps[0].dtype, device=taps[0].device)
     m = torch.bmm(v, u)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
+    wino_spatial_out(m, out, 1, 0, tile_rows, tile, bias)
     return out.view(height * width, cout)
 
 
@@ -297,25 +298,15 @@ def spatial_tile_of(u: torch.Tensor, components: int = 4) -> int:
     return int(round((u.shape[0] // components) ** 0.5)) - 2
 
 
-def cuda_wino_spatial_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_wino_spatial_in")
-
-
 @functools.lru_cache(maxsize=None)
 def jit_norm_available() -> bool:
-    """cuda-python and a CUDA toolkit (nvcc) for the runtime-compiled norm kernel."""
+    """cuda-python and the CuTe DSL (``nvidia-cutlass-dsl``) for the norm kernel, and a GPU."""
     try:
+        import cutlass.cute  # noqa: F401
         from cuda.bindings import driver  # noqa: F401
-        from torch.utils.cpp_extension import CUDA_HOME
     except ImportError:
         return False
-    import os
-
-    return (
-        CUDA_HOME is not None
-        and os.path.exists(os.path.join(CUDA_HOME, "bin", "nvcc"))
-        and torch.cuda.is_available()
-    )
+    return torch.cuda.is_available()
 
 
 @functools.lru_cache(maxsize=None)
@@ -383,28 +374,28 @@ def wino_spatial_conv_cuda(
     """3x3 conv (padding 1) of each of the ``order + 2`` Winograd inputs (4 or 6) by its filter as
     spatial Winograd: ``D [comps, pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [comps, pairs, H*W,
     Cout]`` in ``D``'s dtype (bias-free, fp32 accumulate).
-    Input transform and output transform are CUDA kernels; the batched GEMMs are one cuBLAS
-    call. The tile size (2 or 4) follows the filters ``u``."""
+    Input and output transforms are CuTe DSL kernels (:mod:`cute_spatial`); the batched GEMMs
+    are one cuBLAS call. The tile size (2 or 4) follows the filters ``u``."""
     comps, pairs, positions, cin = d.shape
     tile = spatial_tile_of(u, comps)
     frames = d.view(comps * pairs, height, width, cin)
     tile_rows = -(-height // tile)
-    v = torch.ops.trtllm.vae_wino_spatial_in(frames, comps, 0, tile_rows, tile)
+    from .cute_spatial import wino_spatial_in, wino_spatial_out
+
+    v = wino_spatial_in(frames, comps, 0, tile_rows, tile)
     m = torch.bmm(v, u)
     out = torch.empty((comps * pairs, height, width, u.shape[2]), dtype=d.dtype, device=d.device)
-    torch.ops.trtllm.vae_wino_spatial_out(m, out, comps, 0, tile_rows, tile)
+    wino_spatial_out(m, out, comps, 0, tile_rows, tile)
     return out.view(comps, pairs, positions, u.shape[2])
-
-
-def unpatchify_clamp_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_unpatchify_clamp")
 
 
 def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, patch: int) -> None:
     """Write ``clamp(unpatchify(chunk), -1, 1)`` into ``out[:, :, frame0:frame0 + t]``: ``chunk``
     ``[1, C*patch*patch, t, H, W]`` and ``out`` ``[1, C, T, H*patch, W*patch]``, both channels-last
     bf16. Same element mapping as :func:`wan_vae.unpatchify`."""
-    torch.ops.trtllm.vae_unpatchify_clamp(chunk, out, frame0, patch)
+    from .cute_frame_ops import unpatchify_clamp_into as kernel
+
+    kernel(chunk, out, frame0, patch)
 
 
 def frames_view(x: torch.Tensor) -> torch.Tensor:
@@ -434,11 +425,6 @@ def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
     if rows is None:
         raise ValueError("images_to_pairs needs a channels-last CUDA tensor")
     return rows.view(m.shape[0], m.shape[2] * m.shape[3], m.shape[1])
-
-
-def cuda_frame_ops_available() -> bool:
-    """The prebuilt frame ops (time interleave, AvgDown shortcut add)."""
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_interleave_bias")
 
 
 def wino_combine_cuda(
@@ -486,25 +472,18 @@ def avg_down_add_cuda(
 ) -> torch.Tensor:
     """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``;
     ``bias`` is the downsample conv's bias when that conv ran without it."""
-    return torch.ops.trtllm.vae_avg_down_add(
-        x,
-        r,
-        out_height,
-        out_width,
-        in_width,
-        factor_t,
-        factor_s,
-        group_size,
-        pad_t,
-        bias.reshape(-1).contiguous() if bias is not None else None,
+    from .cute_frame_ops import avg_down_add
+
+    return avg_down_add(
+        x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t, bias
     )
 
 
 def interleave_bias_cuda(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
-    return torch.ops.trtllm.vae_interleave_bias(
-        u, bias.reshape(-1).contiguous() if bias is not None else None
-    )
+    from .cute_frame_ops import interleave_bias
+
+    return interleave_bias(u, bias)
 
 
 def wino_norm_silu_cuda(
@@ -554,19 +533,13 @@ def wino_norm_silu_cuda(
 # ---------------------------------------------------------------------------
 
 
-def cuda_upsample_available() -> bool:
-    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "vae_upsample_gather")
-
-
 def can_use_cuda_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
-    """Mirror of the kernel's instantiation table."""
-    return (
-        cuda_upsample_available()
-        and cout % 8 == 0
-        and factor_t in (1, 2)
-        and 1 <= repeats <= 32
-        and repeats & (repeats - 1) == 0
-    )
+    """The gather kernel runs and covers these shapes (:func:`cute_upsample.can_upsample_gather`)."""
+    if not cuda_op_available():
+        return False
+    from .cute_upsample import can_upsample_gather
+
+    return can_upsample_gather(cout, factor_t, repeats)
 
 
 def pack_upsample_weights(
@@ -606,14 +579,8 @@ def upsample_gather_cuda(
     crop: int = 0,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """CUDA phase gather with the conv bias and the DupUp3D shortcut add folded in."""
-    return torch.ops.trtllm.vae_upsample_gather(
-        temp,
-        shortcut,
-        batch,
-        frames,
-        factor_t,
-        repeats,
-        crop,
-        bias.contiguous() if bias is not None else None,
-    )
+    """Phase gather (:mod:`cute_upsample`) with the conv bias and the DupUp3D shortcut add
+    folded in."""
+    from .cute_upsample import upsample_gather
+
+    return upsample_gather(temp, shortcut, batch, frames, factor_t, repeats, crop, bias)

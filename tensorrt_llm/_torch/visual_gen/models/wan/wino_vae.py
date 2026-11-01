@@ -18,7 +18,7 @@
 ``WinoVae`` mirrors ``WanVAE`` module for module and loads the same state dict. On CUDA it
 runs the fused norm kernels, temporal and spatial Winograd convolutions, frame buffers for
 the causal history and the fused frame operations, in bf16 on CUDA; where a kernel cannot
-run (no CUDA toolkit for the runtime-compiled kernels, an unsupported shape or batch) the
+run (no CuTe DSL for the norm kernels, an unsupported shape or batch) the
 module falls back to the eager computation of ``WanVAE``.
 """
 
@@ -65,9 +65,7 @@ from .wino_vae_kernels import (
     avg_down_add_cuda,
     can_use_cuda_rms_norm_silu,
     can_use_cuda_upsample_gather,
-    cuda_frame_ops_available,
     cuda_op_available,
-    cuda_wino_spatial_available,
     frames_to_video,
     frames_view,
     images_to_pairs,
@@ -80,7 +78,6 @@ from .wino_vae_kernels import (
     sm100_spatial_eligible,
     sm100_spatial_filters,
     sm100_wino_available,
-    unpatchify_clamp_available,
     unpatchify_clamp_into,
     upsample_gather_cuda,
     wino_combine_cuda,
@@ -259,8 +256,8 @@ class PendingAdd:
         )
 
     def can_fuse(self) -> bool:
-        """Whether the CUDA kernels can consume this pending add directly (batch 1, the
-        runtime-compiled kernels available): the consumer norm adds it while reading and
+        """Whether the norm kernels can consume this pending add directly (batch 1, the
+        kernels available): the consumer norm adds it while reading and
         ``materialize`` uses the combine kernel."""
         return (
             cuda_op_available() and self.shape[0] == 1 and (self.b is None or self.b.shape[0] == 1)
@@ -1128,7 +1125,7 @@ class WinoVaeResample(WanResample):
             )
         if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
             cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
-        fuse_interleave = cuda_frame_ops_available() and batch_size == 1
+        fuse_interleave = cuda_op_available() and batch_size == 1
         self.time_conv.defer_bias = fuse_interleave
         if feat_cache[idx] == "Rep":
             x = self.time_conv(x)
@@ -1164,7 +1161,7 @@ class WinoVaeResample(WanResample):
         defer = (
             self.defer_bias_to_consumer
             and conv.bias is not None
-            and cuda_frame_ops_available()
+            and cuda_op_available()
             and batch_size == 1
         )
         self.pending_bias = conv.bias if defer else None
@@ -1262,7 +1259,7 @@ class WinoVaeResidualBlock(WanResidualBlock):
         self._merged_bias: tuple[int, int, torch.Tensor] | None = None
         # Spatial Winograd applies to both convs on every path (frame pairs, cached single
         # frames), so it is fixed here, not when a path first runs.
-        spatial = cuda_op_available() and cuda_wino_spatial_available()
+        spatial = cuda_op_available()
         for conv in (self.conv1, self.conv2):
             conv.spatial_winograd = spatial
             conv.cudnn_frontend = True
@@ -1591,7 +1588,7 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
         # absorbs it in downsample3d).
         bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
         dup = self.avg_shortcut
-        if cuda_frame_ops_available() and x.shape[0] == 1:
+        if cuda_op_available() and x.shape[0] == 1:
             residual = _channels_last_3d_if_needed(residual)
             t_in = residual.shape[2]
             pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
@@ -2063,9 +2060,7 @@ class WinoVae(WanVAE):
         return _channels_last_3d_if_needed(F.conv3d(z, w, b))
 
     def _use_fused_output(self, x: torch.Tensor) -> bool:
-        return (
-            self.config.patch_size is not None and x.shape[0] == 1 and unpatchify_clamp_available()
-        )
+        return self.config.patch_size is not None and x.shape[0] == 1 and cuda_op_available()
 
     def _decode_impl(
         self, z: torch.Tensor, return_dict: bool, temporal_chunk_size: int

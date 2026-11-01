@@ -7,8 +7,8 @@
 tensors from them. Tile 2 is Lavin & Gray's F(2,3) on the points (0, +-1, inf). Tile 4 is F(4,3)
 on the points (0, +-3/2, +-5/8, inf), chosen for low fp16 rounding sensitivity; its ``B^T`` and
 ``A^T`` entries are dyadic, so their products with bf16 / fp16 inputs are exact in fp32. The
-portable CUDA transform kernels (``vaeWinoSpatialKernel.cu``) carry the same ``B^T`` / ``A^T``
-and are checked against this module's ``G`` by the cross-backend kernel tests.
+portable transform kernels (``cute_spatial``) carry the same ``B^T`` / ``A^T`` and are checked
+against this module's ``G`` by the cross-backend kernel tests.
 """
 
 SPATIAL_WINO = {
