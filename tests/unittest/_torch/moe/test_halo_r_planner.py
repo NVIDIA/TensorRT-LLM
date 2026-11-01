@@ -251,6 +251,24 @@ def test_manager_keeps_halo_r_helper_slots_resident_per_layer():
     assert manager.helper_residency
 
 
+def test_reference_keeps_resident_experts_in_their_slots():
+    histogram = [0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200]
+    ascending = plan_halo_r(histogram, ep=4, helper_slots=4, send_count=4)
+    assert ascending.helper_table[0] == [5, 10, 15, -1]
+    unknown = [[-1] * 4 for _ in range(4)]
+    assert plan_halo_r(histogram, 4, 4, 4, residency=unknown) == ascending
+    # Experts 15 and 10 stay where they are (10 in the lowest slot holding it);
+    # expert 5 takes the lowest free slot.
+    residency = [[-1, 15, 10, 10]] + unknown[1:]
+    plan = plan_halo_r(histogram, 4, 4, 4, residency=residency)
+    assert plan.helper_table[0] == [5, 15, 10, -1]
+    assert [b.helper[0] for b in plan.broadcasts] == [0, 2, 1]
+    assert [(b.expert, b.rows) for b in plan.broadcasts] == [
+        (b.expert, b.rows) for b in ascending.broadcasts
+    ]
+    assert plan.load_after == ascending.load_after
+
+
 def test_reference_plan_words_have_the_kernel_layout():
     plan = plan_halo_r(WORKED_EXAMPLE, ep=8, helper_slots=2, send_count=4)
     words = plan.plan_words(epoch=7)

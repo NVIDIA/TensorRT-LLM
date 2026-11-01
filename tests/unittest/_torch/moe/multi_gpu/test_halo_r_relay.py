@@ -312,7 +312,13 @@ class _GateKernels:
 
 
 def _check_call(
-    group, arena, routes: torch.Tensor, generation: int, rank: int, layer: int = 0
+    group,
+    arena,
+    routes: torch.Tensor,
+    generation: int,
+    rank: int,
+    layer: int = 0,
+    residency: list | None = None,
 ) -> list:
     """Compare one finished layer call with the reference; returns failure strings."""
     failures = []
@@ -322,7 +328,7 @@ def _check_call(
     counts = torch.bincount(routes.flatten().long(), minlength=experts).cpu().tolist()
     histogram = [sum(c) for c in zip(*MPI.COMM_WORLD.allgather(counts))]
     plan = halo_r_reference.plan_halo_r(
-        histogram, _EP_SIZE, _HELPER_SLOTS, send_count=4, send_weight=0
+        histogram, _EP_SIZE, _HELPER_SLOTS, send_count=4, send_weight=0, residency=residency
     )
 
     # Every launch of the layer is one scheduler epoch, so the plan's epoch is the generation.
@@ -491,10 +497,10 @@ class _Layers:
     def check(self, layer: int, routes: torch.Tensor, generation: int) -> list:
         """Check one finished call; return the failures and the receivers it copied to."""
         group, arena = self.groups[layer], self.arenas[layer]
-        failures, plan = _check_call(
-            group, arena, routes, generation, self.rank, layer=self.weights[layer]
-        )
         table = self.tables[layer]
+        failures, plan = _check_call(
+            group, arena, routes, generation, self.rank, layer=self.weights[layer], residency=table
+        )
         copies = 0
         for b in plan.broadcasts:
             for destination, slot in b.helper.items():
@@ -584,6 +590,28 @@ def _case_resident_repeat(layers: _Layers) -> list:
         failures += layers.check(0, routes, layers.call(0, routes, main))
         if index == 1 and layers.last_copies:
             failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
+    return failures
+
+
+def _case_stable_slot(layers: _Layers) -> list:
+    """A resident expert keeps its slot when a lower-id expert joins its receiver.
+
+    Route step 2 sends expert 10 to slot 0 of rank 3. Step 13 sends experts 1
+    and 10 there: in ascending order expert 10 would move to slot 1 and be
+    copied again; resident-first keeps it in slot 0 and skips its copy.
+    """
+    rank, experts = layers.rank, layers.experts
+    main = torch.cuda.Stream()
+    failures = []
+    for step in (2, 13):
+        routes = _routes(step, rank, _MAX_TOKENS, experts, rank)
+        skips = layers.receiver_skips[0]
+        failures += layers.check(0, routes, layers.call(0, routes, main))
+    hot = layers.groups[0].scheduler.outputs.hot_expert_ids.cpu().tolist()
+    if layers.tables[0][3] != [10, 1] or (rank == 3 and hot != [10, 1]):
+        failures.append(f"rank {rank}: rank 3's helper slots {layers.tables[0][3]}, here {hot}")
+    if layers.receiver_skips[0] == skips:
+        failures.append(f"rank {rank}: the resident expert was copied again")
     return failures
 
 
@@ -677,6 +705,8 @@ def _run_worker(case: str):
             return None, _case_resident_repeat(layers)
         if case == "resident_reload":
             return None, _case_resident_reload(layers)
+        if case == "resident_stable_slot":
+            return None, _case_stable_slot(layers)
         if case.startswith("hog"):
             return None, _case_gate_under_hog(layers, auxiliary_sms)
         return None, _case_single_layer(layers)
@@ -717,6 +747,7 @@ def _starve_relay(layers: _Layers) -> None:
         "resident",
         "resident_layers",
         "resident_reload",
+        "resident_stable_slot",
     ],
 )
 def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):

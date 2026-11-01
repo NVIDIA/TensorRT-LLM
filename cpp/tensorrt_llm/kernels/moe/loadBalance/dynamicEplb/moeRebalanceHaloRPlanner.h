@@ -387,10 +387,14 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus runGreedyMoves(int const* histogram, P
     return status;
 }
 
-//! Each rank's distinct received experts in ascending order, one per helper slot. Returns kOverBudget on any rank
+//! Each rank's distinct received experts, one per helper slot. With a residency table [rank][helper slot] (`resident`,
+//! -1 for unknown), a received expert that a slot of the rank already holds keeps the lowest such slot, so its copy is
+//! skipped; the other received experts, in ascending order, fill the remaining slots in ascending order. Without a
+//! table, or with nothing resident, the experts fill the slots in ascending order. Returns kOverBudget on any rank
 //! that would receive more distinct experts than it has helper slots.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline PlanStatus buildHelperTable(PlannerConfig const& cfg, int moves, PlannerScratch* s)
+TLLM_HALO_R_HOST_DEVICE inline PlanStatus buildHelperTable(
+    PlannerConfig const& cfg, int moves, int const* resident, PlannerScratch* s)
 {
     int const lane = Warp::lane();
     bool overBudget = false;
@@ -432,9 +436,42 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus buildHelperTable(PlannerConfig const& 
                     received[q - 1] = t;
                 }
             }
+            int* hot = s->hot + lane * kMaxHelperSlots;
             for (int q = 0; q < cfg.helperSlots; ++q)
             {
-                s->hot[lane * kMaxHelperSlots + q] = q < used ? received[q] : -1;
+                hot[q] = -1;
+            }
+            // Resident experts first: each keeps the lowest slot that holds it.
+            bool placed[kMaxHelperSlots] = {};
+            if (resident != nullptr)
+            {
+                int const* row = resident + lane * cfg.helperSlots;
+                for (int r = 0; r < used; ++r)
+                {
+                    for (int q = 0; q < cfg.helperSlots; ++q)
+                    {
+                        if (hot[q] < 0 && row[q] == received[r])
+                        {
+                            hot[q] = received[r];
+                            placed[r] = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            // The others in ascending order into the free slots in ascending order.
+            int q = 0;
+            for (int r = 0; r < used; ++r)
+            {
+                if (placed[r])
+                {
+                    continue;
+                }
+                while (hot[q] >= 0)
+                {
+                    ++q;
+                }
+                hot[q] = received[r];
             }
         }
     }
@@ -546,13 +583,14 @@ TLLM_HALO_R_HOST_DEVICE inline void writeBroadcastTables(int const* histogram, P
     }
 }
 
-//! Plan one layer from the global routed-token histogram. Called by all 32 lanes of one warp; returns a warp-uniform
-//! status. On a non-OK status the plan and outputs are unspecified. A valid configuration always plans: the receiver
-//! ballot excludes kNoDestination and kOverBudget, and each move fills one of at most kMaxRanks * kMaxHelperSlots
-//! receive slots, which excludes kIterationCap.
+//! Plan one layer from the global routed-token histogram and, optionally, the residency table [rank][helper slot] of
+//! the layer's helper slots (`resident`, -1 for unknown), which only decides which helper slot receives an expert.
+//! Called by all 32 lanes of one warp; returns a warp-uniform status. On a non-OK status the plan and outputs are
+//! unspecified. A valid configuration always plans: the receiver ballot excludes kNoDestination and kOverBudget, and
+//! each move fills one of at most kMaxRanks * kMaxHelperSlots receive slots, which excludes kIterationCap.
 template <typename Warp>
-TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(
-    int const* histogram, PlannerConfig const& cfg, PlannerScratch* s, PlannerOutputs const& out)
+TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(int const* histogram, PlannerConfig const& cfg, PlannerScratch* s,
+    PlannerOutputs const& out, int const* resident = nullptr)
 {
     if (!validPlannerConfig(cfg))
     {
@@ -576,7 +614,7 @@ TLLM_HALO_R_HOST_DEVICE inline PlanStatus planHaloR(
     {
         return status;
     }
-    status = buildHelperTable<Warp>(cfg, moves, s);
+    status = buildHelperTable<Warp>(cfg, moves, resident, s);
     if (status != PlanStatus::kOk)
     {
         return status;

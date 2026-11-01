@@ -24,6 +24,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <cstring>
 #include <random>
@@ -128,7 +129,8 @@ struct PlanResult
     std::vector<int> loadAfter;
 };
 
-PlanResult runPlanner(std::vector<int> const& histogram, halo_r::PlannerConfig const& cfg)
+PlanResult runPlanner(
+    std::vector<int> const& histogram, halo_r::PlannerConfig const& cfg, std::vector<int> const* resident = nullptr)
 {
     PlanResult result;
     result.plan.assign(halo_r::kPlanWords, -7);
@@ -153,7 +155,8 @@ PlanResult runPlanner(std::vector<int> const& histogram, halo_r::PlannerConfig c
             [&, lane]
             {
                 HostWarp::laneId = lane;
-                statuses[lane] = halo_r::planHaloR<HostWarp>(histogram.data(), cfg, &scratch, outputs);
+                statuses[lane] = halo_r::planHaloR<HostWarp>(
+                    histogram.data(), cfg, &scratch, outputs, resident != nullptr ? resident->data() : nullptr);
             });
     }
     for (auto& thread : lanes)
@@ -494,4 +497,134 @@ TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedI
     EXPECT_GT(emptyNeedSets, 0) << "the trials must cover broadcasts that copy nothing";
     // Without a residency table every receiver needs the copy.
     EXPECT_EQ(halo_r::relayNeedMask(0b1010U, 0U, 0U, 5, nullptr, 2), 0b1010U);
+}
+
+namespace
+{
+
+//! A skewed random histogram: a few hot experts on random ranks over a random background.
+std::vector<int> randomHistogram(std::mt19937& rng, int experts)
+{
+    std::vector<int> histogram(experts);
+    for (int& count : histogram)
+    {
+        count = rng() % 4 == 0 ? 0 : static_cast<int>(rng() % 200);
+    }
+    for (int hot = 0; hot < 1 + static_cast<int>(rng() % 6); ++hot)
+    {
+        histogram[rng() % experts] += static_cast<int>(rng() % 4000);
+    }
+    return histogram;
+}
+
+std::vector<int> hotRow(PlanResult const& r, halo_r::PlannerConfig const& cfg, int rank)
+{
+    auto const begin = r.hotTable.begin() + rank * cfg.helperSlots;
+    return std::vector<int>(begin, begin + cfg.helperSlots);
+}
+
+} // namespace
+
+TEST(MoeRebalanceHaloRPlannerTest, ResidentExpertsKeepTheirSlotsAndNothingElseChanges)
+{
+    std::mt19937 rng(4);
+    int hits = 0;
+    for (int trial = 0; trial < 300; ++trial)
+    {
+        int const ep = 2 * (1 + static_cast<int>(rng() % 16));
+        int const home = 4 + static_cast<int>(rng() % 9);
+        if (ep * home > halo_r::kPlanFieldStride)
+        {
+            continue;
+        }
+        int const helpers = 1 + static_cast<int>(rng() % halo_r::kMaxHelperSlots);
+        halo_r::PlannerConfig cfg{ep, ep * home, helpers, 4, 0, static_cast<int>(rng() % ep)};
+        std::vector<int> const histogram = randomHistogram(rng, cfg.experts);
+        PlanResult const ascending = runPlanner(histogram, cfg);
+        ASSERT_EQ(ascending.status, halo_r::PlanStatus::kOk);
+
+        // Nothing resident: bitwise the ascending rule.
+        std::vector<int> const unknown(static_cast<std::size_t>(ep) * helpers, -1);
+        PlanResult const none = runPlanner(histogram, cfg, &unknown);
+        ASSERT_EQ(none.plan, ascending.plan) << "trial " << trial;
+        ASSERT_EQ(none.quota, ascending.quota);
+        ASSERT_EQ(none.outIds, ascending.outIds);
+        ASSERT_EQ(none.hotTable, ascending.hotTable);
+
+        // A random table that holds some received experts, in any slot, sometimes twice.
+        std::vector<int> table(unknown.size());
+        for (int d = 0; d < ep; ++d)
+        {
+            std::vector<int> const row = hotRow(ascending, cfg, d);
+            for (int q = 0; q < helpers; ++q)
+            {
+                int const pick = static_cast<int>(rng() % 3);
+                int const received = row[rng() % helpers];
+                table[d * helpers + q]
+                    = pick == 0 ? -1 : (pick == 1 ? received : static_cast<int>(rng() % cfg.experts));
+            }
+        }
+        PlanResult const r = runPlanner(histogram, cfg, &table);
+        ASSERT_EQ(r.status, halo_r::PlanStatus::kOk);
+        // Moves, rows, quotas and load are unchanged; only the helper slot bits may move.
+        ASSERT_EQ(r.plan[1], ascending.plan[1]);
+        for (auto field : {halo_r::PlanField::kExpert, halo_r::PlanField::kOwner, halo_r::PlanField::kDestinationMask,
+                 halo_r::PlanField::kRows})
+        {
+            for (int b = 0; b < halo_r::kPlanFieldStride; ++b)
+            {
+                ASSERT_EQ(
+                    halo_r::planField(r.plan.data(), field)[b], halo_r::planField(ascending.plan.data(), field)[b]);
+            }
+        }
+        ASSERT_EQ(r.quota, ascending.quota);
+        ASSERT_EQ(r.loadAfter, ascending.loadAfter);
+        for (int d = 0; d < ep; ++d)
+        {
+            std::vector<int> row = hotRow(r, cfg, d);
+            std::vector<int> sortedRow = row;
+            std::vector<int> sortedAscending = hotRow(ascending, cfg, d);
+            std::sort(sortedRow.begin(), sortedRow.end());
+            std::sort(sortedAscending.begin(), sortedAscending.end());
+            ASSERT_EQ(sortedRow, sortedAscending) << "the same experts, possibly in other slots";
+            for (int q = 0; q < helpers; ++q)
+            {
+                int const expert = row[q];
+                if (expert < 0)
+                {
+                    continue;
+                }
+                ASSERT_EQ(std::count(row.begin(), row.end(), expert), 1) << "an expert holds one slot of a row";
+                int lowest = -1;
+                for (int k = 0; k < helpers && lowest < 0; ++k)
+                {
+                    lowest = table[d * helpers + k] == expert ? k : -1;
+                }
+                if (lowest >= 0)
+                {
+                    ASSERT_EQ(q, lowest) << "a resident expert keeps the lowest slot that holds it";
+                    ++hits;
+                }
+            }
+        }
+        // The plan's helper bits agree with the table of slots.
+        for (int b = 0; b < r.plan[1]; ++b)
+        {
+            unsigned const mask = static_cast<unsigned>(field(r, halo_r::PlanField::kDestinationMask, b));
+            for (int d = 0; d < ep; ++d)
+            {
+                if ((mask >> d) & 1U)
+                {
+                    int const slot
+                        = halo_r::helperIndex(static_cast<unsigned>(field(r, halo_r::PlanField::kHelperLowMask, b)),
+                            static_cast<unsigned>(field(r, halo_r::PlanField::kHelperHighMask, b)), d);
+                    ASSERT_EQ(r.hotTable[d * helpers + slot], field(r, halo_r::PlanField::kExpert, b));
+                }
+            }
+        }
+        // Every simulated rank computes the same plan from the same table.
+        cfg.localRank = (cfg.localRank + 1) % ep;
+        ASSERT_EQ(runPlanner(histogram, cfg, &table).plan, r.plan);
+    }
+    EXPECT_GT(hits, 0) << "the trials must cover resident experts";
 }

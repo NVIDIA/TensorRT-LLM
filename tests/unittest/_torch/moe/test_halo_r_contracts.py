@@ -908,3 +908,22 @@ def test_weight_reload_without_residency_is_free(monkeypatch):
     # An aborted group is rebuilt, not reset.
     with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
         env.group.forget_helper_residency()
+
+
+def test_planner_reads_the_residency_table_from_shared_memory():
+    kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
+    publish = _function_body(kernel_source, "RoleResult planAndPublish(")
+    _assert_in_order(
+        publish,
+        (
+            "__shared__ int resident[halo_r::kMaxRanks * halo_r::kMaxHelperSlots];",
+            "resident[entry] = p.residency[entry];",
+            "p.residency != nullptr ? resident : nullptr",
+        ),
+    )
+    load = publish.index("resident[entry] = p.residency[entry];")
+    assert publish.index("__syncthreads();", load) < publish.index("? resident : nullptr")
+    planner = (_KERNELS / "moeRebalanceHaloRPlanner.h").read_text()
+    build = _function_body(planner, "inline PlanStatus buildHelperTable(")
+    # Resident experts are placed before the others fill the free slots.
+    _assert_in_order(build, ("row[q] == received[r]", "placed[r] = true;", "while (hot[q] >= 0)"))

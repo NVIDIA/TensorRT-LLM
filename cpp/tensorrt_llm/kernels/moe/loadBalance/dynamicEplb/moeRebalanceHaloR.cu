@@ -222,11 +222,23 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     }
     __syncthreads();
 
+    // The residency table, which the previous launch of the layer updated before its READY, keeps a resident helper
+    // expert in its slot.
+    __shared__ int resident[halo_r::kMaxRanks * halo_r::kMaxHelperSlots];
+    if (p.residency != nullptr)
+    {
+        for (int entry = threadIdx.x; entry < p.ep * p.helpers; entry += blockDim.x)
+        {
+            resident[entry] = p.residency[entry];
+        }
+        __syncthreads();
+    }
     if (threadIdx.x < 32)
     {
         halo_r::PlannerConfig const cfg{p.ep, p.experts, p.helpers, p.sendCount, p.sendWeight, p.localRank};
         halo_r::PlannerOutputs const outputs{p.plan, quota, p.outIds, p.outOwners, nullptr, nullptr, nullptr};
-        halo_r::PlanStatus const result = halo_r::planHaloR<DeviceWarp>(histogram, cfg, scratch, outputs);
+        halo_r::PlanStatus const result = halo_r::planHaloR<DeviceWarp>(
+            histogram, cfg, scratch, outputs, p.residency != nullptr ? resident : nullptr);
         if (threadIdx.x == 0)
         {
             planStatus = static_cast<int>(result);

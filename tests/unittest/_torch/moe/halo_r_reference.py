@@ -10,7 +10,7 @@ equal the kernel's word for word.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 ORDER_BITS = 8
 ORDER_OPEN = 1 << (ORDER_BITS - 1)
@@ -69,9 +69,20 @@ def _as_int32(value: int) -> int:
 
 
 def plan_halo_r(
-    histogram: Sequence[int], ep: int, helper_slots: int, send_count: int, send_weight: int = 0
+    histogram: Sequence[int],
+    ep: int,
+    helper_slots: int,
+    send_count: int,
+    send_weight: int = 0,
+    residency: Optional[Sequence[Sequence[int]]] = None,
 ) -> Plan:
-    """Plan one layer from the global routed-token count of every expert."""
+    """Plan one layer from the global routed-token count of every expert.
+
+    ``residency[rank][slot]`` is the expert each helper slot holds (-1 for
+    unknown), or None without per-layer helper slots. It only decides which
+    slot receives an expert: a received expert keeps the lowest slot that holds
+    it, and the others fill the free slots in ascending order.
+    """
     histogram = [int(x) for x in histogram]
     home = len(histogram) // ep
     hottest = [
@@ -145,7 +156,18 @@ def plan_halo_r(
         experts = sorted({expert for expert, dest, _ in moves if dest == rank})
         if len(experts) > helper_slots:
             raise AssertionError(f"rank {rank} receives more experts than helper slots")
-        helper_table.append(experts + [-1] * (helper_slots - len(experts)))
+        held = list(residency[rank]) if residency is not None else [-1] * helper_slots
+        row = [-1] * helper_slots
+        others = []
+        for expert in experts:
+            if expert in held:
+                row[held.index(expert)] = expert
+            else:
+                others.append(expert)
+        free = [slot for slot in range(helper_slots) if row[slot] < 0]
+        for slot, expert in zip(free, others):
+            row[slot] = expert
+        helper_table.append(row)
     broadcasts = []
     for expert in sorted({expert for expert, _, _ in moves}):
         b = Broadcast(expert=expert, owner=expert // home)
