@@ -10,20 +10,26 @@ import math
 import os
 import socket
 import tempfile
+import threading
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from concurrent.futures import Executor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
+    Callable,
     ClassVar,
     Dict,
     Generic,
     List,
     Mapping,
     Optional,
+    Protocol,
     Tuple,
     Type,
     TypeVar,
@@ -42,6 +48,55 @@ from PIL import Image
 
 from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
+
+
+class MediaFetchError(RuntimeError):
+    """A transient failure while fetching remote media."""
+
+
+class _DecodedMemoryReservation(Protocol):
+    def check_cancelled(self) -> None: ...
+
+    def shrink(self, retained_bytes: int) -> None: ...
+
+    def commit(self, retained_bytes: int) -> None: ...
+
+    def release(self) -> None: ...
+
+
+_DecodedMemoryReserver = Callable[[int, int], _DecodedMemoryReservation]
+
+
+def _decoded_video_bytes(video: Any) -> int:
+    """Return bytes retained by decoded video frames and optional audio."""
+    if not isinstance(video, VideoData):
+        raise TypeError(f"unsupported decoded video type: {type(video).__name__}")
+
+    if isinstance(video.frames, np.ndarray):
+        total = video.frames.nbytes
+    elif isinstance(video.frames, list):
+        total = 0
+        for frame in video.frames:
+            if isinstance(frame, torch.Tensor):
+                total += frame.numel() * frame.element_size()
+            elif isinstance(frame, np.ndarray):
+                total += frame.nbytes
+            elif isinstance(frame, Image.Image):
+                total += frame.width * frame.height * len(frame.getbands())
+            else:
+                raise TypeError(f"unsupported decoded video frame type: {type(frame).__name__}")
+    else:
+        raise TypeError(f"unsupported decoded video frames type: {type(video.frames).__name__}")
+
+    if video.audio is not None:
+        samples = video.audio.samples
+        if isinstance(samples, torch.Tensor):
+            total += samples.numel() * samples.element_size()
+        elif isinstance(samples, np.ndarray):
+            total += samples.nbytes
+        else:
+            raise TypeError(f"unsupported decoded audio type: {type(samples).__name__}")
+    return total
 
 
 def rgba_to_rgb(
@@ -79,18 +134,37 @@ _SUPPORTED_IMAGE_FORMATS = ("pt", "np", "pil")
 # `_load_video_by_cv2` for the per-format contract.
 _SUPPORTED_VIDEO_FORMATS = ("pt", "np", "pil")
 
-# Module-level aiohttp session shared across all media fetch calls.
-# Created lazily on first use inside the async event loop, then reused so that
-# TCP connections are kept alive and not re-established per request.
-_global_aiohttp_session: aiohttp.ClientSession | None = None
+# One aiohttp session per event loop. Media loading can run on multiple live
+# loops in one process. Live sessions must only be used and closed from their
+# owning loop; closed-loop entries are disposed on the next lookup.
+_aiohttp_sessions: dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = {}
+_aiohttp_sessions_lock = threading.Lock()
 
 
 async def _get_aiohttp_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp.ClientSession, creating it on first call."""
-    global _global_aiohttp_session
-    if _global_aiohttp_session is None or _global_aiohttp_session.closed:
-        _global_aiohttp_session = aiohttp.ClientSession()
-    return _global_aiohttp_session
+    """Return the aiohttp session owned by the current event loop."""
+    current_loop = asyncio.get_running_loop()
+    with _aiohttp_sessions_lock:
+        stale_sessions = [
+            _aiohttp_sessions.pop(loop) for loop in list(_aiohttp_sessions) if loop.is_closed()
+        ]
+        session = _aiohttp_sessions.get(current_loop)
+        if session is None or session.closed:
+            connector = aiohttp.TCPConnector(resolver=_ValidatingResolver())
+            session = aiohttp.ClientSession(connector=connector)
+            _aiohttp_sessions[current_loop] = session
+    for stale_session in stale_sessions:
+        await stale_session.close()
+    return session
+
+
+async def _close_aiohttp_session() -> None:
+    """Close and forget the media session owned by the current event loop."""
+    current_loop = asyncio.get_running_loop()
+    with _aiohttp_sessions_lock:
+        session = _aiohttp_sessions.pop(current_loop, None)
+    if session is not None and not session.closed:
+        await session.close()
 
 
 # Maximum allowed response size and encoded video input size (200 MiB).
@@ -130,6 +204,48 @@ def _allow_private_urls() -> bool:
     return True
 
 
+def _validate_resolved_address(address: str) -> None:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError as exc:
+        raise MediaFetchError(f"DNS resolver returned an invalid address: {address!r}") from exc
+    if ip.is_multicast:
+        raise RuntimeError(f"URL resolves to a multicast address ({ip})")
+    if not ip.is_global and not _allow_private_urls():
+        raise RuntimeError(
+            f"URL resolves to a non-public address ({ip}); set "
+            f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
+            f"in trusted network environments"
+        )
+
+
+def _dns_resolution_error(host: str, error: OSError) -> RuntimeError:
+    if isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN:
+        return MediaFetchError(f"Could not resolve hostname {host!r}")
+    return RuntimeError(f"Could not resolve hostname {host!r}")
+
+
+class _ValidatingResolver(aiohttp.abc.AbstractResolver):
+    """Reject unsafe addresses in the DNS result used by the TCP connector."""
+
+    def __init__(self) -> None:
+        self._resolver = aiohttp.DefaultResolver()
+
+    async def resolve(
+        self, host: str, port: int = 0, family: int = socket.AF_INET
+    ) -> List[Dict[str, Any]]:
+        try:
+            addresses = await self._resolver.resolve(host, port, family)
+        except OSError as exc:
+            raise _dns_resolution_error(host, exc) from exc
+        for address in addresses:
+            _validate_resolved_address(address["host"])
+        return addresses
+
+    async def close(self) -> None:
+        await self._resolver.close()
+
+
 def _validate_url(url: str) -> None:
     """Validate that *url* points to a public, non-internal HTTP(S) resource.
 
@@ -139,11 +255,9 @@ def _validate_url(url: str) -> None:
     rejection (scheme, hostname, and multicast checks still apply); see
     ``_ALLOW_PRIVATE_URLS_ENV`` above for the security tradeoff.
 
-    Note: validation is performed at DNS-resolution time. A DNS-rebinding
-    attack (TTL=0, resolves to a public IP during validation then a private IP
-    during the actual TCP connect) could bypass this check. For strict
-    isolation, supplement with network-level egress filtering that blocks
-    non-global address ranges at the host firewall.
+    Async fetches repeat the address check in the resolver used by their TCP
+    connector, so the address admitted here cannot be replaced with an unsafe
+    one before connection.
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -157,19 +271,10 @@ def _validate_url(url: str) -> None:
     try:
         infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
-        raise RuntimeError(f"Could not resolve hostname {hostname!r}") from exc
+        raise _dns_resolution_error(hostname, exc) from exc
 
-    allow_private = _allow_private_urls()
     for _family, _type, _proto, _canon, sockaddr in infos:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_multicast:
-            raise RuntimeError(f"URL resolves to a multicast address ({ip})")
-        if not ip.is_global and not allow_private:
-            raise RuntimeError(
-                f"URL resolves to a non-public address ({ip}); set "
-                f"{_ALLOW_PRIVATE_URLS_ENV}=1 to allow private media URLs "
-                f"in trusted network environments"
-            )
+        _validate_resolved_address(sockaddr[0])
 
 
 def _buffer_requests_response(resp: "requests.Response") -> "requests.Response":
@@ -243,19 +348,15 @@ async def _read_aiohttp_content(response: aiohttp.ClientResponse) -> bytes:
         content.write(chunk)
 
 
-async def _safe_aiohttp_get(
-    url: str, timeout_sec: int = 30, session: Optional[aiohttp.ClientSession] = None
-) -> bytes:
+async def _safe_aiohttp_get(url: str, timeout_sec: int = 30) -> bytes:
     """Aiohttp GET wrapper that validates every redirect hop before following."""
     await asyncio.to_thread(_validate_url, url)
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
-
-    async def _fetch(fetch_session: aiohttp.ClientSession) -> bytes:
-        current_url = url
-        for _ in range(_MAX_REDIRECTS + 1):
-            async with fetch_session.get(
-                current_url, timeout=timeout, allow_redirects=False
-            ) as response:
+    session = await _get_aiohttp_session()
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            async with session.get(current_url, timeout=timeout, allow_redirects=False) as response:
                 if response.status in _REDIRECT_STATUSES:
                     redirect_url = response.headers.get("Location", "")
                     current_url = urljoin(current_url, redirect_url)
@@ -265,13 +366,19 @@ async def _safe_aiohttp_get(
                 if asyncio.iscoroutine(maybe_coro):
                     await maybe_coro
                 return await _read_aiohttp_content(response)
-        raise RuntimeError("Too many redirects")
-
-    if session is not None:
-        return await _fetch(session)
-
-    async with aiohttp.ClientSession(timeout=timeout) as owned_session:
-        return await _fetch(owned_session)
+        except MediaFetchError:
+            raise
+        except aiohttp.ClientResponseError as error:
+            if error.status in (408, 429) or error.status >= 500:
+                raise MediaFetchError(
+                    f"remote media server returned HTTP {error.status}"
+                ) from error
+            raise
+        except (aiohttp.InvalidURL, aiohttp.ClientSSLError):
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+            raise MediaFetchError(f"remote media fetch failed: {error}") from error
+    raise RuntimeError("Too many redirects")
 
 
 def _load_and_convert_image(image):
@@ -363,12 +470,12 @@ def _audio_frame_to_array(frame, mono: bool) -> np.ndarray:
     return chunk
 
 
-# TODO(TRTLLM-12001): Add unit tests for this.
 def extract_audio_from_video(
     source: Union[str, BytesIO],
     *,
     sr: Optional[float] = None,
     mono: bool = True,
+    decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> Tuple[np.ndarray, int]:
     """Extract the audio track from a video file using PyAV.
 
@@ -376,6 +483,8 @@ def extract_audio_from_video(
         source: File path, URL, or BytesIO containing the video.
         sr: Target sample rate. If `None`, the native sample rate is kept.
         mono: If `True` (default), average channels to produce a mono waveform.
+        decoded_memory_reserver: Shared budget for retained chunks and the final
+            concatenation buffer. Codec and resampler working memory is excluded.
 
     Returns:
         `(waveform, sample_rate)` where *waveform* is a 1-D float32
@@ -394,51 +503,85 @@ def extract_audio_from_video(
     except ImportError:
         raise ImportError("PyAV is required for audio extraction from video but is not installed.")
 
+    chunks: List[np.ndarray] = []
+    reservations: List[Tuple[_DecodedMemoryReservation, int]] = []
+    concatenation_reservation: Optional[_DecodedMemoryReservation] = None
+
+    def append_frame(frame) -> None:
+        if decoded_memory_reserver is not None:
+            channels = 1 if mono else len(frame.layout.channels)
+            retained_bytes = frame.samples * channels * np.dtype(np.float32).itemsize
+            reservation = decoded_memory_reserver(retained_bytes, retained_bytes)
+            reservations.append((reservation, retained_bytes))
+        chunk = _audio_frame_to_array(frame, mono)
+        if decoded_memory_reserver is not None and (
+            chunk.dtype != np.float32 or chunk.nbytes != retained_bytes
+        ):
+            raise ValueError("Decoded audio chunk does not match its float32 reservation")
+        chunks.append(chunk)
+
     try:
-        with av.open(source) as container:
-            if not container.streams.audio:
-                raise ValueError("No audio stream found in the video.")
-            stream = container.streams.audio[0]
-            stream.thread_type = "AUTO"
-            native_sr = stream.rate
-            target_sr = int(sr) if sr is not None else native_sr
+        try:
+            with av.open(source) as container:
+                if not container.streams.audio:
+                    raise ValueError("No audio stream found in the video.")
+                stream = container.streams.audio[0]
+                stream.thread_type = "AUTO"
+                native_sr = stream.rate
+                target_sr = int(sr) if sr is not None else native_sr
 
-            chunks: List[np.ndarray] = []
-            target_layout = "mono" if mono else stream.layout.name
-            needs_resampling = (
-                not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
-                or stream.format.name != "fltp"
-                or stream.layout.name != target_layout
-            )
-            resampler = (
-                av.AudioResampler(
-                    format="fltp",
-                    layout=target_layout,
-                    rate=target_sr,
+                target_layout = "mono" if mono else stream.layout.name
+                needs_resampling = (
+                    not math.isclose(float(target_sr), float(native_sr), rel_tol=0.0, abs_tol=1e-6)
+                    or stream.format.name != "fltp"
+                    or stream.layout.name != target_layout
                 )
-                if needs_resampling
-                else None
+                resampler = (
+                    av.AudioResampler(
+                        format="fltp",
+                        layout=target_layout,
+                        rate=target_sr,
+                    )
+                    if needs_resampling
+                    else None
+                )
+                for frame in container.decode(stream):
+                    if needs_resampling:
+                        for out_frame in resampler.resample(frame):
+                            append_frame(out_frame)
+                    else:
+                        append_frame(frame)
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(
+                "Invalid or corrupted video data when extracting audio. "
+                "Ensure the input is a valid video file."
+            ) from e
+
+        if not chunks:
+            raise ValueError("No audio frames decoded from the video.")
+
+        if decoded_memory_reserver is not None:
+            concatenation_reservation = decoded_memory_reserver(
+                sum(chunk.nbytes for chunk in chunks), 0
             )
-            for frame in container.decode(stream):
-                if needs_resampling:
-                    for out_frame in resampler.resample(frame):
-                        chunks.append(_audio_frame_to_array(out_frame, mono))
-                else:
-                    chunks.append(_audio_frame_to_array(frame, mono))
-    except ValueError:
-        raise
-    except Exception as e:
-        raise ValueError(
-            "Invalid or corrupted video data when extracting audio. "
-            "Ensure the input is a valid video file."
-        ) from e
+        audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+            concatenation_reservation = None
+        # The waveform replaces the chunks without changing retained-byte ownership.
+        for reservation, retained_bytes in reservations:
+            reservation.commit(retained_bytes)
 
-    if not chunks:
-        raise ValueError("No audio frames decoded from the video.")
-
-    audio = np.concatenate(chunks, axis=-1).astype(np.float32, copy=False)
-
-    return audio, target_sr
+        return audio, target_sr
+    finally:
+        chunks.clear()
+        if concatenation_reservation is not None:
+            concatenation_reservation.release()
+        for reservation, _ in reservations:
+            reservation.release()
 
 
 def _get_cv2():
@@ -682,6 +825,8 @@ def _load_video_by_cv2(
     extract_audio: bool = False,
     cv2_backend: Optional[int] = None,
     raw_bytes_hash: Optional[str] = None,
+    max_decoded_frame_bytes: Optional[int] = None,
+    decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
 ) -> VideoData:
     """Decode a video and return sampled frames as a list.
 
@@ -699,6 +844,13 @@ def _load_video_by_cv2(
                 contiguous 4D buffer that HF video processors pass through
                 without an extra frame-by-frame copy.
       `"pil"` - list[PIL.Image], one per sampled frame.
+
+    When `max_decoded_frame_bytes` or `decoded_memory_reserver` is set, the
+    counted peak frame buffers are sized from the first decoded frame and
+    checked before the frame stack is allocated. This covers buffers allocated
+    here, not codec state, compressed input, Python overhead, or the process's
+    complete memory peak. The reserver receives peak and retained byte estimates
+    and may wait for sibling conversions to release their temporary buffers.
     """
     assert format in ("pt", "np", "pil"), "format must be one of 'pt', 'np', 'pil'"
 
@@ -722,6 +874,7 @@ def _load_video_by_cv2(
     else:
         vidcap = cv2.VideoCapture(video)
 
+    decoded_memory_reservation: Optional[_DecodedMemoryReservation] = None
     try:
         if not vidcap.isOpened():
             src_repr = (
@@ -763,15 +916,54 @@ def _load_video_by_cv2(
         # affected (e.g. every frame retrieves with a drifted shape).
         skip_warned = False
         frame_idx = 0
-        while frame_idx <= max_idx and vidcap.grab():
+        while frame_idx <= max_idx:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
+            if not vidcap.grab():
+                break
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.check_cancelled()
             if frame_idx in target_set:
                 # Reuse a single BGR buffer across retrieves; cv2 replaces its
                 # contents in place when the argument is shape-compatible.
                 ok, bgr_scratch = vidcap.retrieve(bgr_scratch)
+                if decoded_memory_reservation is not None:
+                    decoded_memory_reservation.check_cancelled()
                 if ok:
                     fh, fw = bgr_scratch.shape[:2]
                     if stacked_rgb is None:
                         H, W = fh, fw
+                        frame_values = num_frames_to_sample * H * W * 3
+                        retained_frame_bytes = frame_values * (4 if format == "pt" else 1)
+                        if format == "pt":
+                            # uint8 RGB stack + float32 NumPy normalization
+                            # buffer + contiguous float32 CHW tensor. A
+                            # non-CPU destination briefly adds another tensor.
+                            peak_item_size = (
+                                np.dtype(np.uint8).itemsize + 2 * np.dtype(np.float32).itemsize
+                            )
+                            peak_item_size += (
+                                np.dtype(np.float32).itemsize
+                                if torch.device(device).type != "cpu"
+                                else 0
+                            )
+                        else:
+                            # RGB stack plus PIL copies or a compact truncated ndarray.
+                            peak_item_size = 2 * np.dtype(np.uint8).itemsize
+                        peak_decoded_frame_bytes = frame_values * peak_item_size
+                        if (
+                            max_decoded_frame_bytes is not None
+                            and peak_decoded_frame_bytes > max_decoded_frame_bytes
+                        ):
+                            raise ValueError(
+                                "Decoded video frame buffers require "
+                                f"{peak_decoded_frame_bytes} bytes, "
+                                f"exceeding the limit of {max_decoded_frame_bytes} bytes."
+                            )
+                        if decoded_memory_reserver is not None:
+                            decoded_memory_reservation = decoded_memory_reserver(
+                                peak_decoded_frame_bytes, retained_frame_bytes
+                            )
                         stacked_rgb = np.empty((num_frames_to_sample, H, W, 3), dtype=np.uint8)
                     if (fh, fw) == (H, W):
                         cv2.cvtColor(
@@ -792,11 +984,16 @@ def _load_video_by_cv2(
                     )
                     skip_warned = True
             frame_idx += 1
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.check_cancelled()
         vidcap.release()
 
         if stacked_rgb is None or not valid_indices:
             raise ValueError("Video has no readable frames.")
-        stacked_rgb = stacked_rgb[: len(valid_indices)]
+        if format == "np" and len(valid_indices) < num_frames_to_sample:
+            stacked_rgb = stacked_rgb[: len(valid_indices)].copy()
+        else:
+            stacked_rgb = stacked_rgb[: len(valid_indices)]
 
         if format == "pt":
             stacked_f32 = stacked_rgb.astype(np.float32)
@@ -805,10 +1002,14 @@ def _load_video_by_cv2(
             if device != "cpu":
                 tensor_nchw = tensor_nchw.to(device)
             loaded_frames = list(torch.unbind(tensor_nchw, dim=0))
+            del tensor_nchw
+            del stacked_f32
+            del stacked_rgb
         elif format == "np":
             loaded_frames = stacked_rgb
         else:  # "pil"
             loaded_frames = [Image.fromarray(frame) for frame in stacked_rgb]
+            del stacked_rgb
 
         metadata = {
             "total_num_frames": frame_count,
@@ -816,36 +1017,54 @@ def _load_video_by_cv2(
             "duration": duration,
             "frames_indices": valid_indices,
         }
+    except BaseException:
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.release()
+        raise
     finally:
         # Release the OpenCV handle before any downstream re-open (e.g. PyAV
         # audio extraction on Windows) and to avoid leaking descriptors.
         vidcap.release()
 
-    audio = None
-    if extract_audio:
-        # extract_audio_from_video accepts Union[str, BytesIO]. When the
-        # in-memory cv2 path was taken, `video` is still the original
-        # bytes parameter — wrap in a fresh BytesIO (the one consumed by
-        # cv2 is at end-of-stream). When the tempfile fallback was used,
-        # `video` is the file path string and is passed through as-is.
-        audio_source = (
-            BytesIO(bytes(video)) if isinstance(video, (bytes, bytearray, memoryview)) else video
-        )
-        try:
-            audio_samples, audio_sample_rate = extract_audio_from_video(audio_source)
-            audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
-        except ValueError as e:
-            if "No audio stream found" in str(e):
-                logger.warning("Video has no audio track, skipping audio extraction.")
-            else:
-                raise
-
-    return VideoData(
+    video_data = VideoData(
         frames=loaded_frames,
         metadata=metadata,
-        audio=audio,
         raw_bytes_hash=raw_bytes_hash,
     )
+    try:
+        frame_bytes = (
+            _decoded_video_bytes(video_data) if decoded_memory_reservation is not None else 0
+        )
+        if extract_audio:
+            if decoded_memory_reservation is not None:
+                decoded_memory_reservation.shrink(frame_bytes)
+            # extract_audio_from_video accepts Union[str, BytesIO]. When the
+            # in-memory cv2 path was taken, `video` is still the original
+            # bytes parameter — wrap in a fresh BytesIO (the one consumed by
+            # cv2 is at end-of-stream). When the tempfile fallback was used,
+            # `video` is the file path string and is passed through as-is.
+            audio_source = (
+                BytesIO(bytes(video))
+                if isinstance(video, (bytes, bytearray, memoryview))
+                else video
+            )
+            try:
+                audio_samples, audio_sample_rate = extract_audio_from_video(
+                    audio_source, decoded_memory_reserver=decoded_memory_reserver
+                )
+                video_data.audio = AudioData(samples=audio_samples, sample_rate=audio_sample_rate)
+            except ValueError as e:
+                if "No audio stream found" in str(e):
+                    logger.warning("Video has no audio track, skipping audio extraction.")
+                else:
+                    raise
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.commit(frame_bytes)
+    except BaseException:
+        if decoded_memory_reservation is not None:
+            decoded_memory_reservation.release()
+        raise
+    return video_data
 
 
 def _normalize_file_uri(uri: str) -> str:
@@ -931,6 +1150,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     # Servers can publish a dedicated pool via `set_executor` so
     # media decoding does not contend with unrelated `to_thread` callers.
     _executor: ClassVar[Optional[Executor]] = None
+    _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
+        "media_io_executor", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -946,6 +1168,16 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         than once replaces the previously configured executor.
         """
         BaseMediaIO._executor = executor
+
+    @classmethod
+    @contextmanager
+    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+        """Scope decode work to a server-owned executor without replacing other servers' pools."""
+        token = BaseMediaIO._request_executor.set(executor)
+        try:
+            yield
+        finally:
+            BaseMediaIO._request_executor.reset(token)
 
     @classmethod
     def create(
@@ -1001,8 +1233,7 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         """
         parsed = urlparse(url)
         if parsed.scheme in ("http", "https"):
-            session = await _get_aiohttp_session()
-            data = await _safe_aiohttp_get(url, session=session)
+            data = await _safe_aiohttp_get(url)
             return await self._run_in_executor(self.load_bytes, data)
         elif parsed.scheme == "data":
             data_spec, b64_data = parsed.path.split(",", 1)
@@ -1023,13 +1254,18 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
         else:
             raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
 
+    async def async_load_bytes(self, data: bytes) -> _MediaT:
+        """Decode in-memory media without blocking the event loop."""
+        return await self._run_in_executor(self.load_bytes, data)
+
     @staticmethod
     async def _run_in_executor(fn, *args, **kwargs):
         """Run a blocking decode callable on the configured executor."""
         if kwargs:
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(BaseMediaIO._executor, fn, *args)
+        executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
+        return await loop.run_in_executor(executor, fn, *args)
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
@@ -1089,29 +1325,59 @@ class AudioMediaIO(BaseMediaIO[Tuple[np.ndarray, int]]):
 
     _data_uri_mime_prefix: ClassVar[Optional[str]] = "audio/"
 
-    def __init__(self, **kwargs) -> None:
-        # AudioMediaIO has no configurable parameters. An explicit __init__
-        # is needed so that BaseMediaIO.create() does not crash when kwargs
-        # are present (e.g. via --media_io_kwargs or the per-request API).
+    def __init__(
+        self, decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None, **kwargs
+    ) -> None:
+        self._decoded_memory_reserver = decoded_memory_reserver
         if kwargs:
             logger.warning(
-                "AudioMediaIO received unexpected kwargs %s — audio loading "
-                "has no configurable parameters; kwargs will be ignored.",
+                "AudioMediaIO received unexpected kwargs %s; kwargs will be ignored.",
                 sorted(kwargs),
             )
 
     def load_bytes(self, data: bytes) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(data))
+        return self._read(BytesIO(data))
 
     def load_base64(self, media_type: str, data: str) -> Tuple[np.ndarray, int]:
-        return soundfile.read(BytesIO(base64.b64decode(data)))
+        return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> Tuple[np.ndarray, int]:
         # Strip `file://` and unquote the path for `file:` URIs; pass
         # empty-scheme URLs through verbatim.
         parsed = urlparse(url)
         path = _normalize_file_uri(url) if parsed.scheme == "file" else url
-        return soundfile.read(path)
+        return self._read(path)
+
+    def _read(self, source: Union[BytesIO, str]) -> Tuple[np.ndarray, int]:
+        if self._decoded_memory_reserver is None:
+            return soundfile.read(source)
+
+        reservation = None
+        try:
+            # Read metadata and samples from the same handle. Reserve the float64
+            # output before allocation; libsndfile's internal buffers are excluded.
+            with soundfile.SoundFile(source) as audio:
+                frames, channels = audio.frames, audio.channels
+                if frames < 0 or channels < 1:
+                    raise ValueError("invalid audio frame or channel count")
+                decoded_bytes = frames * channels * np.dtype(np.float64).itemsize
+                reservation = self._decoded_memory_reserver(decoded_bytes, decoded_bytes)
+                shape = (frames,) if channels == 1 else (frames, channels)
+                samples = np.empty(shape, dtype=np.float64)
+                decoded = audio.read(frames=frames, out=samples)
+                if decoded.shape != samples.shape:
+                    # Compressed headers may overestimate frames. Drop the decoder's
+                    # view before shrinking the owning allocation and its budget.
+                    decoded_shape = decoded.shape
+                    decoded = None
+                    samples.resize(decoded_shape)
+                sample_rate = audio.samplerate
+            reservation.commit(samples.nbytes)
+            return samples, sample_rate
+        finally:
+            samples = decoded = None
+            if reservation is not None:
+                reservation.release()
 
 
 class VideoMediaIO(BaseMediaIO[VideoData]):
@@ -1126,17 +1392,23 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         format: str = "pt",
         device: str = "cpu",
         extract_audio: bool = False,
+        max_decoded_frame_bytes: Optional[int] = None,
+        decoded_memory_reserver: Optional[_DecodedMemoryReserver] = None,
     ) -> None:
         # `"pt"` is the safe default every video model handles; models tuned
         # for the uint8-HWC path opt into `"np"` via
         # InputProcessor.get_preferred_media_io_kwargs().
         if format not in _SUPPORTED_VIDEO_FORMATS:
             raise ValueError(f"format must be one of {_SUPPORTED_VIDEO_FORMATS}, got {format!r}")
+        if max_decoded_frame_bytes is not None and max_decoded_frame_bytes <= 0:
+            raise ValueError("max_decoded_frame_bytes must be positive")
         self._num_frames = num_frames
         self._fps = fps
         self._format = format
         self._device = device
         self._extract_audio = extract_audio
+        self._max_decoded_frame_bytes = max_decoded_frame_bytes
+        self._decoded_memory_reserver = decoded_memory_reserver
 
     @classmethod
     def merge_kwargs(
@@ -1176,6 +1448,8 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 extract_audio=self._extract_audio,
                 cv2_backend=cv2_backend,
                 raw_bytes_hash=raw_bytes_hash,
+                max_decoded_frame_bytes=self._max_decoded_frame_bytes,
+                decoded_memory_reserver=self._decoded_memory_reserver,
             )
         with tempfile.NamedTemporaryFile(suffix=".mp4", dir=_VIDEO_TEMPFILE_DIR) as tmp:
             tmp.write(data)
@@ -1188,6 +1462,8 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
                 self._device,
                 extract_audio=self._extract_audio,
                 raw_bytes_hash=raw_bytes_hash,
+                max_decoded_frame_bytes=self._max_decoded_frame_bytes,
+                decoded_memory_reserver=self._decoded_memory_reserver,
             )
 
     def load_base64(self, media_type: str, data: str) -> VideoData:

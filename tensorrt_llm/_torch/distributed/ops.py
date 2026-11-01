@@ -377,7 +377,7 @@ def _get_or_scale_allreduce_mnnvl_workspace(
                 f"[MNNVL] AllReduce workspace must grow to {buffer_size_bytes} "
                 "bytes inside a torch.compile'd region, but allocation cannot "
                 "run under tracing. Pre-scale the workspace before compiling "
-                "via MNNVLAllReduce.prescale_workspace (PyTorchModelEngine "
+                "via MNNVLAllReduce.prescale_workspace (ModelEngine "
                 "does this for max_num_tokens x hidden_size).")
         # Initial buffer to be large enough to support 1024 tokens * 8192 hidden_dim
         init_buffer_size_bytes = max(1024 * 8192 * elem_size, buffer_size_bytes
@@ -1309,6 +1309,25 @@ class AllReduce(nn.Module):
 
         if all_reduce_params is None:
             all_reduce_params = AllReduceParams()
+
+        use_torch_distributed_allreduce = self._disable_mpi and (
+            getattr(self.mapping, "_use_torch_distributed_allreduce", False)
+            or getattr(self.mapping, "_tp_group_pg", None) is not None)
+
+        if use_torch_distributed_allreduce:
+            if all_reduce_params.fusion_op != AllReduceFusionOp.NONE or any(
+                    value is not None for value in (
+                        all_reduce_params.residual,
+                        all_reduce_params.norm_weight,
+                        all_reduce_params.scale,
+                        all_reduce_params.bias,
+                    )):
+                raise NotImplementedError(
+                    "Torch distributed all-reduce fallback supports only "
+                    "plain all-reduce.")
+            output = input.clone()
+            torch.distributed.all_reduce(output, group=self.mapping.tp_group_pg)
+            return output
 
         # Try Symmetric Memory AllReduce first if available
         # Note: Currently only supports NONE fusion op (plain allreduce)

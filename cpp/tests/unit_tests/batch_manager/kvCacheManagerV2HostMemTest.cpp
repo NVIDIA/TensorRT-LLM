@@ -104,9 +104,9 @@ void* countMemset(void* ptr, int value, size_t size)
 
 TEST(KvCacheManagerV2HostMemTest, SelectsConfiguredPageMode)
 {
-    hostMadvisePageMode(MemAddress{1}, HostMem::kAlignment, true, captureMadvise);
+    hostMadvisePageMode(MemAddress{1}, HostMem::sizeGranularity(), true, captureMadvise);
     EXPECT_EQ(gCapturedAdvice, MADV_HUGEPAGE);
-    hostMadvisePageMode(MemAddress{1}, HostMem::kAlignment, false, captureMadvise);
+    hostMadvisePageMode(MemAddress{1}, HostMem::sizeGranularity(), false, captureMadvise);
     EXPECT_EQ(gCapturedAdvice, MADV_NOHUGEPAGE);
 
     ScopedEnv defaultThp("TLLM_KV_CACHE_MANAGER_V2_THP", std::nullopt);
@@ -127,7 +127,7 @@ class PrefaultFallbackTest : public testing::TestWithParam<int>
 
 TEST_P(PrefaultFallbackTest, TouchesMemory)
 {
-    std::vector<unsigned char> data(HostMem::kAlignment, 0xFF);
+    std::vector<unsigned char> data(HostMem::sizeGranularity(), 0xFF);
     gMadviseErrno = GetParam();
     gMemsetCalls = 0;
     hostPrefaultChunk(reinterpret_cast<MemAddress>(data.data()), data.size(), failMadvise, countMemset);
@@ -139,7 +139,7 @@ INSTANTIATE_TEST_SUITE_P(UnsupportedPopulateWrite, PrefaultFallbackTest, testing
 
 TEST(KvCacheManagerV2HostMemTest, ConvertsPrefaultEnomem)
 {
-    std::vector<unsigned char> data(HostMem::kAlignment);
+    std::vector<unsigned char> data(HostMem::sizeGranularity());
     gMadviseErrno = ENOMEM;
     EXPECT_THROW(hostPrefaultChunk(reinterpret_cast<MemAddress>(data.data()), data.size(), failMadvise, countMemset),
         HostOOMError);
@@ -147,7 +147,7 @@ TEST(KvCacheManagerV2HostMemTest, ConvertsPrefaultEnomem)
 
 TEST(KvCacheManagerV2HostMemTest, PropagatesOtherPrefaultErrors)
 {
-    std::vector<unsigned char> data(HostMem::kAlignment);
+    std::vector<unsigned char> data(HostMem::sizeGranularity());
     gMadviseErrno = EIO;
     try
     {
@@ -168,11 +168,11 @@ TEST_P(HostMemPageModeTest, AllocatesAndResizes)
 {
     ScopedEnv thp("TLLM_KV_CACHE_MANAGER_V2_THP", std::string(GetParam()));
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    HostMem memory(4 * HostMem::kAlignment, HostMem::kAlignment);
+    HostMem memory(4 * HostMem::sizeGranularity(), HostMem::sizeGranularity());
     EXPECT_NE(memory.address(), 0);
-    EXPECT_EQ(memory.size(), HostMem::kAlignment);
-    memory.resize(2 * HostMem::kAlignment);
-    EXPECT_EQ(memory.size(), 2 * HostMem::kAlignment);
+    EXPECT_EQ(memory.size(), HostMem::sizeGranularity());
+    memory.resize(2 * HostMem::sizeGranularity());
+    EXPECT_EQ(memory.size(), 2 * HostMem::sizeGranularity());
 }
 
 INSTANTIATE_TEST_SUITE_P(ThpModes, HostMemPageModeTest, testing::Values("0", "1"));
@@ -190,7 +190,7 @@ TEST(KvCacheManagerV2HostMemTest, AllocationSupportsGpuRoundTrip)
     ASSERT_EQ(cudaMalloc(&devicePtr, kSize), cudaSuccess);
     // A copy at a time, because the backing registers the range unit by unit and
     // the driver rejects one that straddles two registrations.
-    size_t const unit = HostMem::kAlignment;
+    size_t const unit = HostMem::sizeGranularity();
     for (size_t offset = 0; offset < kSize; offset += unit)
     {
         ASSERT_EQ(cudaMemcpy(static_cast<unsigned char*>(devicePtr) + offset,
@@ -218,7 +218,7 @@ TEST(KvCacheManagerV2HostMemTest, DestructionAfterPoisonDoesNotTerminate)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     {
-        HostMem memory(HostMem::kAlignment);
+        HostMem memory(HostMem::sizeGranularity());
         Poison::set("DestructionAfterPoisonDoesNotTerminate", "simulated invariant violation");
         ASSERT_TRUE(Poison::poisoned());
     }
@@ -230,10 +230,11 @@ TEST(KvCacheManagerV2HostMemTest, DestructionAfterPoisonDoesNotTerminate)
 TEST(KvCacheManagerV2HostMemTest, SingleSizeConstructorRoundsUpToAlignment)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    for (size_t const requested : {size_t{8}, HostMem::kAlignment + 12})
+    for (size_t const requested : {size_t{8}, HostMem::sizeGranularity() + 12})
     {
         HostMem memory(requested);
-        size_t const expected = (requested + HostMem::kAlignment - 1) / HostMem::kAlignment * HostMem::kAlignment;
+        size_t const expected
+            = (requested + HostMem::sizeGranularity() - 1) / HostMem::sizeGranularity() * HostMem::sizeGranularity();
         EXPECT_EQ(memory.size(), expected);
         std::memset(reinterpret_cast<void*>(memory.address()), 0xA5, memory.size());
     }
@@ -272,55 +273,18 @@ TEST(KvCacheManagerV2HostMemTest, ResizeGrowPreservesContentsAndAddress)
     EXPECT_TRUE(std::all_of(tail, tail + (kGrown - kInitial), [](unsigned char v) { return v == 0xC3; }));
 }
 
-//! Sizes are quantized to the unit memory is allocated in, which grows with the
-//! tier. Nothing rounds to the fill chunk -- the last fill step is just short.
-TEST(KvCacheManagerV2HostMemTest, GranularityGrowsWithTierSize)
+//! One unit for every host tier, whatever its quota. madvise and mprotect take any
+//! page-aligned range, so nothing about a larger tier asks for a larger unit -- unlike
+//! the device tier, where the unit is also the mapping granularity.
+TEST(KvCacheManagerV2HostMemTest, HostGranularityDoesNotFollowTierSize)
 {
-    // Below the first threshold every tier shares the minimum unit.
-    EXPECT_EQ(tierAllocationGranularity(CacheTier::HOST_MEM, 256 << 20), HostMem::kAlignment);
-    // Above it the unit grows, and stops growing once the per-allocation cost
-    // has been amortized away.
-    EXPECT_GT(tierAllocationGranularity(CacheTier::HOST_MEM, size_t{4} << 30), HostMem::kAlignment);
-    EXPECT_EQ(tierAllocationGranularity(CacheTier::HOST_MEM, size_t{1} << 40), size_t{32} << 20);
+    EXPECT_EQ(tierAllocationGranularity(CacheTier::HOST_MEM, 256 << 20), HostMem::sizeGranularity());
+    EXPECT_EQ(tierAllocationGranularity(CacheTier::HOST_MEM, size_t{4} << 30), HostMem::sizeGranularity());
+    EXPECT_EQ(tierAllocationGranularity(CacheTier::HOST_MEM, size_t{1} << 40), HostMem::sizeGranularity());
+    // The device tier does follow it: there the unit is what a mapping costs.
+    EXPECT_GT(tierAllocationGranularity(CacheTier::GPU_MEM, size_t{1} << 40), HostMem::sizeGranularity());
 }
 
-//! A commit unit larger than kAlignment must work end to end. Tiers of a few
-//! GiB and up get one, so a size rounded to kAlignment instead would be
-//! rejected by HostMem for every realistic host tier.
-TEST(KvCacheManagerV2HostMemTest, HonoursCommitUnitLargerThanAlignment)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    constexpr size_t kUnit = size_t{32} << 20;
-    ASSERT_GT(kUnit, HostMem::kAlignment);
-
-    HostMem memory(4 * kUnit, 2 * kUnit, HostMemBackingOptions{kUnit});
-    EXPECT_EQ(memory.size(), 2 * kUnit);
-    auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
-    std::memset(bytes, 0x3C, 2 * kUnit);
-    EXPECT_TRUE(std::all_of(bytes, bytes + 2 * kUnit, [](unsigned char v) { return v == 0x3C; }));
-
-    // A size that is only kAlignment-aligned is not a valid size for this unit.
-    EXPECT_THROW(memory.resize(2 * kUnit + HostMem::kAlignment), std::exception);
-}
-
-//! The pool must quantize its size to the same unit, or constructing any tier
-//! whose granularity exceeds kAlignment throws.
-TEST(KvCacheManagerV2HostMemTest, SlotPoolAlignsToCommitUnit)
-{
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    size_t const unit = tierAllocationGranularity(CacheTier::HOST_MEM, size_t{8} << 30);
-    ASSERT_GT(unit, HostMem::kAlignment);
-
-    // A slot size that divides kAlignment but not the larger unit, so a pool
-    // rounding to the wrong one produces a size HostMem rejects.
-    constexpr size_t kSlotSize = 1 << 20;
-    HostSlotPool pool(kSlotSize, SlotCount{3}, /*vmSize=*/unit * 4, HostMemBackingOptions{unit});
-    EXPECT_GE(pool.numSlots(), SlotCount{3});
-    EXPECT_NE(std::get<MemAddress>(pool.slotAddress(SlotId{0})), MemAddress{0});
-}
-
-//! The reservation is a hard bound. Serving a larger resize would mean moving
-//! the base address, which callers are entitled to assume never happens.
 TEST(KvCacheManagerV2HostMemTest, ResizeBeyondReservationIsRejected)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
@@ -330,7 +294,7 @@ TEST(KvCacheManagerV2HostMemTest, ResizeBeyondReservationIsRejected)
 
     EXPECT_EQ(memory.vmSize(), kMax);
     EXPECT_NO_THROW(memory.resize(kMax));
-    EXPECT_THROW(memory.resize(kMax + HostMem::kAlignment), std::exception);
+    EXPECT_THROW(memory.resize(kMax + HostMem::sizeGranularity()), std::exception);
 
     // The rejected resize left the object usable and unmoved.
     EXPECT_EQ(memory.address(), base);
@@ -445,24 +409,25 @@ TEST(KvCacheManagerV2HostMemTest, ConcurrentWaitUsableFromManyThreads)
 TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    constexpr size_t kChunk = HostMem::kFillChunkSize;
-    constexpr size_t kSize = 4 * kChunk;
+    // A fill advances the watermark one commit step at a time.
+    size_t const kChunk = HostMemBacking::commitChunkSize();
+    size_t const kSize = 4 * kChunk;
 
     HostMem memory(kSize, kSize, HostMemBackingOptions{}, /*waitForFill=*/false);
     auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
     auto const pattern
-        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::kAlignment) * 5 + 3); };
+        = [](size_t offset) { return static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 5 + 3); };
     for (size_t chunkEnd = kChunk; chunkEnd <= kSize; chunkEnd += kChunk)
     {
         memory.waitUsable(chunkEnd);
-        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::kAlignment)
+        for (size_t offset = chunkEnd - kChunk; offset < chunkEnd; offset += HostMem::sizeGranularity())
         {
             bytes[offset] = pattern(offset);
         }
     }
 
     memory.waitUsable(kSize);
-    for (size_t offset = 0; offset < kSize; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kSize; offset += HostMem::sizeGranularity())
     {
         ASSERT_EQ(bytes[offset], pattern(offset)) << "byte at " << offset << " lost during the fill";
     }
@@ -474,23 +439,23 @@ TEST(KvCacheManagerV2HostMemTest, DeferredParallelFillKeepsEarlyWrites)
 TEST(KvCacheManagerV2HostMemTest, ParallelInitialFillThenGrow)
 {
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-    constexpr size_t kChunk = HostMem::kFillChunkSize;
-    constexpr size_t kInitial = 2 * kChunk + kChunk / 2;
-    constexpr size_t kGrown = 4 * kChunk + kChunk / 4;
+    size_t const kChunk = HostMemBacking::commitChunkSize();
+    size_t const kInitial = 2 * kChunk + kChunk / 2;
+    size_t const kGrown = 4 * kChunk + kChunk / 4;
 
     HostMem memory(kGrown, kInitial);
     auto* bytes = reinterpret_cast<unsigned char*>(memory.address());
-    for (size_t offset = 0; offset < kInitial; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kInitial; offset += HostMem::sizeGranularity())
     {
-        bytes[offset] = static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1);
+        bytes[offset] = static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 7 + 1);
     }
 
     memory.resize(kGrown);
-    for (size_t offset = 0; offset < kGrown; offset += HostMem::kAlignment)
+    for (size_t offset = 0; offset < kGrown; offset += HostMem::sizeGranularity())
     {
         if (offset < kInitial)
         {
-            ASSERT_EQ(bytes[offset], static_cast<unsigned char>((offset / HostMem::kAlignment) * 7 + 1))
+            ASSERT_EQ(bytes[offset], static_cast<unsigned char>((offset / HostMem::sizeGranularity()) * 7 + 1))
                 << "byte at " << offset << " lost by the grow";
         }
         else

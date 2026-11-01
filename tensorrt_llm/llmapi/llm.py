@@ -55,10 +55,11 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
+from ._load_balance_env import LAUNCH_QUEUES_ENV, configure_moe_launch_queues
 from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
-                       RuntimeMemoryStatus, TorchLlmArgs,
+                       MoeConfig, RuntimeMemoryStatus, TorchLlmArgs,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -384,7 +385,21 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
+            # Rebalance validation and launch-queue setup read process state.
+            # Apply caller overrides before either one observes that state.
             self._process_env_overrides(env_overrides)
+            if kwargs.get("backend") == "pytorch":
+                # This must precede TorchLlmArgs validators and GPU probes.
+                moe_config = kwargs.get("moe_config")
+                if isinstance(moe_config, dict):
+                    moe_config = MoeConfig(**moe_config)
+                    kwargs["moe_config"] = moe_config
+                queue_overrides = configure_moe_launch_queues(
+                    moe_config, env_overrides, initial_setting=launch_queues)
+                if queue_overrides is not env_overrides:
+                    kwargs["env_overrides"] = queue_overrides
+                    env_overrides = queue_overrides
 
             backend = kwargs.get('backend', None)
             if backend == "pytorch":
@@ -720,7 +735,7 @@ class BaseLLM:
             lora_request (tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest], optional):
                 LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
-                Prompt Adapter request to use for generation, if any. Defaults to None.
+                Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
                 Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
@@ -816,7 +831,7 @@ class BaseLLM:
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
-            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
@@ -995,7 +1010,7 @@ class BaseLLM:
                 # BaseWorker resolves embedding handles to local tensor views.
                 multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    # NOTE: `ModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
                     mrope_config = {}
                     mrope_config[
@@ -1017,7 +1032,7 @@ class BaseLLM:
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # PyTorchModelEngine assumes both are present when using mrope.
+                # ModelEngine assumes both are present when using mrope.
                 if disaggregated_params.mrope_position_deltas_handle is None:
                     raise RuntimeError(
                         "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
@@ -2035,7 +2050,7 @@ class _TorchLLM(BaseLLM):
     def _reject_token_encoder_config_without_buckets(self) -> None:
         """Reject a bucket-less token-encoder config before weights load.
 
-        `PyTorchModelEngine.__init__` asks the instantiated model and keeps the
+        `ModelEngine.__init__` asks the instantiated model and keeps the
         last word; this asks the class its architecture resolves to. It defers
         wherever that class might not be the one the engine builds, so it can
         only reject earlier, never differently. A model that installs

@@ -1138,12 +1138,14 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
     ):
         mixed_qkv, z, a, b = self._compute_tokenwise_inputs(hidden_states)
+        # Have prefill and decode write into disjoint slices of the same buffer, avoiding
+        # concatenation when eager execution mixes both kinds of requests.
+        attn_out = mixed_qkv.new_empty(
+            (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
+        )
 
         use_breakable_cuda_graph = not is_torch_compiling() and is_in_breakable_cuda_graph()
         if self.register_to_config and (is_torch_compiling() or use_breakable_cuda_graph):
-            attn_out = mixed_qkv.new_empty(
-                (1, mixed_qkv.shape[0], self.num_v_heads_per_tp, self.head_v_dim)
-            )
             maybe_bcg_gdn_custom_op_inplace(mixed_qkv, a, b, self.layer_idx_str, attn_out)
         else:
             attn_out = self.forward_core(
@@ -1153,6 +1155,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 attn_metadata,
                 mamba_metadata,
                 spec_metadata=spec_metadata,
+                output=attn_out,
             )
 
         return self._postprocess_gdn_output(attn_out, z, all_reduce_params)

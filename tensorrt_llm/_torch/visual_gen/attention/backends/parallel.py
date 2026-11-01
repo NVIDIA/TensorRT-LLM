@@ -371,7 +371,9 @@ class UlyssesAttention(AttentionBackend):
     Not a standalone backend -- compose around a real backend (VANILLA/TRTLLM).
     Backend-specific kwargs are forwarded to the inner backend. Sequence
     lengths are updated after all-to-all, and VSA gates are redistributed with
-    the same sequence/head mapping as Q before they are forwarded.
+    the same sequence/head mapping as Q before they are forwarded. A ``kv`` plan
+    (a forward over a K/V cache) is passed through untouched: its token count is
+    the real tokens of all ranks, and rows past it after the exchange are padding.
 
     Architecture:
         Input:  [B, S/P, H, D] (sequence sharded across P processes)
@@ -389,6 +391,7 @@ class UlyssesAttention(AttentionBackend):
       have the same BF16 CUDA shape and the post-unscatter kernel constraints
       are satisfied. It uses 1 fused 5D all-to-all, then a native post-unscatter
       layout conversion before calling the inner backend with separate Q/K/V.
+    Grouped-query attention and the K/V cache path always use the unfused mode.
     """
 
     # One side stream shared across all UlyssesAttention instances on the
@@ -465,9 +468,24 @@ class UlyssesAttention(AttentionBackend):
                 f"by world_size ({self.world_size})."
             )
 
-        if self.inner_backend.support_fused_qkv():
+        if kwargs.get("kv") is not None:
+            # The plan counts the real tokens of the whole sequence and rows past it are
+            # padding. Only the upper bound can be checked here: a heavily padded short
+            # chunk is indistinguishable from a shard length.
+            rows = q.shape[1] * self.world_size
+            num_tokens = kwargs["kv"].num_tokens
+            if not 0 < num_tokens <= rows:
+                raise ValueError(
+                    f"the plan's {num_tokens} tokens must count the real tokens of the whole "
+                    f"sequence: at least 1, at most the {rows} rows after the exchange"
+                )
+        # The fused modes stack q/k/v on one axis, which needs equal head counts;
+        # grouped-query models take the per-tensor path, and so does the K/V cache
+        # path, whose backends take q, k, v separately.
+        kv = kwargs.get("kv")
+        if self.inner_backend.support_fused_qkv() and q.shape[2] == k.shape[2] and kv is None:
             out = self._forward_fused(q, k, v, **kwargs)
-        elif self._supports_packed_self_attention(q, k, v, kwargs):
+        elif kv is None and self._supports_packed_self_attention(q, k, v, kwargs):
             out = self._forward_packed_self_attention(q, k, v, **kwargs)
         else:
             out = self._forward_unfused(q, k, v, **kwargs)
@@ -771,6 +789,8 @@ class UlyssesAttention(AttentionBackend):
         makes default wait on the last push.
         Post-attention permute / SDPA / reverse A2A run in the caller's outer
         compile region for additional inductor fusion."""
+        if attn_kwargs.get("kv") is not None:
+            raise NotImplementedError("The async Ulysses path does not support a K/V cache.")
         P = self.world_size
 
         # Issue the closures in issue_order. Order is correctness-neutral (_join_async
@@ -871,6 +891,14 @@ class UlyssesAttention(AttentionBackend):
     @classmethod
     def support_fused_qkv(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        return self.inner_backend.support_kv_cache()
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        return self.inner_backend.support_kv_cache_page_size(tokens_per_page, dtype)
 
 
 class Attention2DAttention(AttentionBackend):

@@ -308,7 +308,10 @@ class FmhaManager:
         # normal forwarding never pays for an environment lookup.
         self._cache_sanity_check_enabled = _is_fmha_cache_sanity_check_enabled()
         self.fmha_libs: list[Fmha] = []
-        for fmha_cls in get_enabled_fmha_lib_classes():
+        for fmha_cls in (
+            *getattr(attn, "prepended_fmha_lib_classes", ()),
+            *get_enabled_fmha_lib_classes(),
+        ):
             if fmha_cls.is_available(attn):
                 self.fmha_libs.append(fmha_cls(attn))
         self._layer_idx = getattr(attn, "layer_idx", None)

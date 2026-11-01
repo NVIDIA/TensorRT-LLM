@@ -52,11 +52,11 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, BlockReuseConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
                                           EncodeCudaGraphConfig,
-                                          ExecutorMemoryType,
-                                          ExtendedRuntimePerfKnobConfig,
-                                          KvCacheConfig, MambaStateConfig,
-                                          MoeConfig, MTPDecodingConfig,
-                                          MultimodalConfig,
+                                          ExecutorMemoryType, KvCacheConfig,
+                                          MambaStateConfig, MoeConfig,
+                                          MoeLoadBalancerConfig,
+                                          MoePerLayerDynamicLoadBalancerConfig,
+                                          MTPDecodingConfig, MultimodalConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           NGramDecodingConfig, PeftCacheConfig,
                                           PrefillCudaGraphBackend, PybindMirror,
@@ -249,6 +249,230 @@ moe_backend: TRTLLM
                                 speculative_config=spec_config)
 
         assert llm_args.speculative_config.moe_backend == "CUTLASS"
+
+
+@pytest.mark.cpu_only
+class TestMoeConfigPerLayerDynamicEplb:
+
+    @staticmethod
+    def _per_layer_dynamic() -> dict[str, object]:
+        return {"mode": "per_layer_dynamic", "num_slots": 72}
+
+    @pytest.mark.parametrize("backend", ["CUTLASS", "DEEPGEMM"])
+    def test_rejects_explicit_incompatible_backend(self, backend: str) -> None:
+        with pytest.raises(ValidationError,
+                           match=r"EPLB requires backend='MEGAMOE_CUTEDSL'"):
+            MoeConfig(backend=backend, load_balancer=self._per_layer_dynamic())
+
+    @pytest.mark.parametrize("backend", [None, "AUTO", "MEGAMOE_CUTEDSL"])
+    def test_resolves_auto_and_accepts_compatible_backend(
+            self, backend: str | None) -> None:
+        kwargs = {} if backend is None else {"backend": backend}
+
+        config = MoeConfig(load_balancer=self._per_layer_dynamic(), **kwargs)
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == "MEGAMOE_CUTEDSL"
+        assert config.load_balancer.auxiliary_sms == 4
+        assert config.load_balancer.helper_slot_mode == "per_layer_resident"
+
+    @pytest.mark.parametrize(
+        "num_experts, message",
+        [
+            pytest.param(0, "must be positive", id="zero-experts"),
+            pytest.param(65, "must be divisible", id="non-divisible-experts"),
+            pytest.param(72, "must exceed", id="no-helper-capacity"),
+            pytest.param(80, "must exceed", id="negative-helper-capacity"),
+        ],
+    )
+    def test_validates_physical_slot_capacity_after_setup(
+            self, num_experts: int, message: str) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        with pytest.raises(ValueError, match=message):
+            config.validate_expert_capacity(num_experts)
+
+    def test_accepts_positive_helper_capacity_after_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        config.setup(ep_rank=0, ep_size=8)
+
+        config.validate_expert_capacity(num_experts=64)
+        assert config.num_local_slots == 9
+
+    def test_expert_capacity_requires_setup(self) -> None:
+        config = MoePerLayerDynamicLoadBalancerConfig(num_slots=72)
+        with pytest.raises(ValueError, match=r"Call setup\(\)"):
+            config.validate_expert_capacity(num_experts=64)
+
+    def test_legacy_dictionary_defaults_to_standard_mode(self) -> None:
+        config = MoeConfig(
+            backend="CUTLASS",
+            load_balancer={
+                "num_slots": 64,
+                "layer_updates_per_iter": 2
+            },
+        )
+
+        assert isinstance(config.load_balancer, MoeLoadBalancerConfig)
+        assert config.load_balancer.mode == "standard"
+        assert config.load_balancer.layer_updates_per_iter == 2
+        assert config.backend == "CUTLASS"
+
+    @pytest.mark.parametrize("field", ["num_slots", "auxiliary_sms"])
+    def test_per_layer_dynamic_positive_fields(self, field: str) -> None:
+        values = self._per_layer_dynamic()
+        values[field] = 0
+        with pytest.raises(ValidationError, match=field):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("auxiliary_sms", [1, 8])
+    def test_per_layer_dynamic_accepts_other_auxiliary_sm_budgets(
+            self, auxiliary_sms: int) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = auxiliary_sms
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.auxiliary_sms == auxiliary_sms
+
+    def test_per_layer_dynamic_rejects_more_than_fused_copy_sm_limit(
+            self) -> None:
+        values = self._per_layer_dynamic()
+        values["auxiliary_sms"] = 9
+        with pytest.raises(ValidationError, match="auxiliary_sms"):
+            MoeConfig(load_balancer=values)
+
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_per_layer_dynamic_accepts_helper_slot_modes(self,
+                                                         mode: str) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = mode
+        config = MoeConfig(load_balancer=values)
+        assert config.load_balancer.helper_slot_mode == mode
+
+    def test_per_layer_dynamic_rejects_unknown_helper_slot_mode(self) -> None:
+        values = self._per_layer_dynamic()
+        values["helper_slot_mode"] = "per_layer"
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(load_balancer=values)
+
+    def test_standard_mode_rejects_helper_slot_mode(self) -> None:
+        with pytest.raises(ValidationError, match="helper_slot_mode"):
+            MoeConfig(backend="CUTLASS",
+                      load_balancer={
+                          "mode": "standard",
+                          "num_slots": 64,
+                          "helper_slot_mode": "shared_banks",
+                      })
+
+    def test_per_layer_dynamic_disables_decode_cuda_graph(self) -> None:
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": self._per_layer_dynamic()})
+        assert args.cuda_graph_config is None
+
+    def test_per_layer_dynamic_rejects_prefill_cuda_graph(self) -> None:
+        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                prefill_cuda_graph_backend=PrefillCudaGraphBackend.PIECEWISE,
+                moe_config={"load_balancer": self._per_layer_dynamic()})
+
+    def test_legacy_yaml_defaults_to_standard_mode(self,
+                                                   tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer, MoeLoadBalancerConfig)
+        assert args.moe_config.load_balancer.mode == "standard"
+
+    def test_per_layer_dynamic_yaml_sets_backend(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            moe_config={"load_balancer": str(config_path)},
+        )
+
+        assert isinstance(args.moe_config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert args.moe_config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_per_layer_dynamic_yaml_is_typed_by_moe_config_before_llm_args(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+
+        config = MoeConfig(load_balancer=str(config_path))
+
+        assert isinstance(config.load_balancer,
+                          MoePerLayerDynamicLoadBalancerConfig)
+        assert config.backend == "MEGAMOE_CUTEDSL"
+
+    def test_per_layer_dynamic_yaml_configures_queue_before_cuda_init(
+            self, tmp_path: Path, monkeypatch) -> None:
+        from tensorrt_llm.llmapi._load_balance_env import \
+            configure_moe_launch_queues
+
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("mode: per_layer_dynamic\nnum_slots: 72\n")
+        # The code under test writes os.environ. Seed the key first so that
+        # monkeypatch records the caller's state and removes "4x" on teardown;
+        # delenv alone records nothing when the key is absent.
+        monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "")
+        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES")
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: False)
+
+        config = MoeConfig(load_balancer=str(config_path))
+        overrides = configure_moe_launch_queues(config, {"KEEP": "value"})
+
+        assert overrides == {
+            "KEEP": "value",
+            "CUDA_SCALE_LAUNCH_QUEUES": "4x",
+        }
+        assert config.load_balancer.mode == "per_layer_dynamic"
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+        assert configure_moe_launch_queues(config, overrides) == overrides
+
+    def test_standard_yaml_does_not_configure_launch_queues(
+            self, tmp_path: Path, monkeypatch) -> None:
+        from tensorrt_llm.llmapi._load_balance_env import \
+            configure_moe_launch_queues
+
+        config_path = tmp_path / "eplb.yaml"
+        config_path.write_text("num_slots: 64\nlayer_updates_per_iter: 2\n")
+        monkeypatch.delenv("CUDA_SCALE_LAUNCH_QUEUES", raising=False)
+        monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+
+        config = MoeConfig(load_balancer=str(config_path))
+        original = {"KEEP": "value"}
+
+        assert configure_moe_launch_queues(config, original) is original
+        assert "CUDA_SCALE_LAUNCH_QUEUES" not in original
+
+    def test_yaml_resolution_preserves_missing_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "missing.yaml"
+
+        with pytest.raises(FileNotFoundError,
+                           match=r"MoE load balancer config file not found:"):
+            MoeConfig(load_balancer=str(config_path))
+
+    def test_yaml_resolution_preserves_invalid_file_error(
+            self, tmp_path: Path) -> None:
+        config_path = tmp_path / "invalid.yaml"
+        config_path.write_text("mode: per_layer_dynamic\n")
+
+        with pytest.raises(
+                ValidationError,
+                match=r"Failed to load MoE load balancer config file:"):
+            MoeConfig(load_balancer=str(config_path))
 
 
 @pytest.mark.cpu_only
@@ -1049,8 +1273,9 @@ class TestKvCacheManagerV2AutoResolution:
                          id="disagg-nixl-python"),
         ],
     )
-    def test_required_v2_resolves_on_supported_routes(self,
-                                                      cache_transceiver_config):
+    def test_required_v2_resolves_on_supported_routes(
+            self,
+            cache_transceiver_config: CacheTransceiverConfig | None) -> None:
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2="auto"),
@@ -1064,7 +1289,8 @@ class TestKvCacheManagerV2AutoResolution:
         pytest.param("NIXL", "CPP", id="nixl-cpp"),
         pytest.param("UCX", "PYTHON", id="ucx-python"),
     ])
-    def test_required_v2_refuses_incompatible_disagg(self, backend, runtime):
+    def test_required_v2_refuses_incompatible_disagg(self, backend: str,
+                                                     runtime: str) -> None:
         """A required V2 is refused on the demotion arm, never demoted."""
         llm_args = TorchLlmArgs(
             model="/tmp/dummy_model",
@@ -3374,21 +3600,6 @@ class TestStrictBaseModelArbitraryArgs:
                           non_existent_field="should_fail")
         assert "non_existent_field" in str(exc_info.value)
 
-    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
-        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
-        # Valid arguments should work
-        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                               cuda_graph_mode=False)
-        assert config.multi_block_mode == True
-        assert config.cuda_graph_mode == False
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
-                                          bogus_setting="should_fail")
-        assert "bogus_setting" in str(exc_info.value)
-
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
@@ -4142,7 +4353,6 @@ class TestPydanticBestPractices:
             "drafter",  # abstract base class type
             "resource_manager",  # abstract base class type
         ],
-        MoeConfig: ["load_balancer"],  # allows multiple types including dict
         RayPlacementConfig: ["placement_groups"],  # contains Ray-specific types
     }
 

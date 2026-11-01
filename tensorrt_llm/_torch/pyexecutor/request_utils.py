@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
 
-import torch
+import numpy as np
 
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.mapping import CpType
@@ -37,7 +37,7 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str, include_none: bool = False
+    requests: List, attribute_name: str, include_none: bool = False, *, allow_missing: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
@@ -45,7 +45,9 @@ def collect_py_objects_from_requests(
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
         include_none: Include requests whose attribute value is None. When
-            enabled, the source request must have the attribute.
+            enabled, the source request must have the attribute unless
+            allow_missing is True.
+        allow_missing: Skip absent attributes when include_none is enabled.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -56,6 +58,8 @@ def collect_py_objects_from_requests(
             continue
         if item.request:
             if include_none:
+                if allow_missing and not hasattr(item.request, attribute_name):
+                    continue
                 req_id_to_obj[item.id] = getattr(item.request, attribute_name)
             else:
                 obj = getattr(item.request, attribute_name, None)
@@ -194,12 +198,15 @@ def get_from_waiting_queue(
 
 
 def partition_context_for_helix(
-    input_token_ids: List[int], cp_rank: int, cp_size: int, tokens_per_block: int
+    input_token_ids: np.ndarray, cp_rank: int, cp_size: int, tokens_per_block: int
 ) -> Tuple[List[int], List[int], int, int]:
     """Partition context for Helix CP.
 
+    Only this rank's ~input_len / cp_size tokens are turned into Python ints.
+
     Args:
-        input_token_ids: List of input token IDs.
+        input_token_ids: Input token IDs as a 1-D integer numpy array
+            (``Request.get_input_token_ids_array()``).
         cp_rank: Current CP rank.
         cp_size: Total number of CP ranks.
         tokens_per_block: Number of tokens per block.
@@ -215,8 +222,7 @@ def partition_context_for_helix(
     Raises:
         ValueError: If the prompt is empty (no blocks to distribute).
     """
-    all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
-    input_len = all_input_ids.shape[-1]
+    input_len = len(input_token_ids)
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
     if num_total_blocks == 0:
@@ -227,37 +233,24 @@ def partition_context_for_helix(
     # during cache transmission. Rank 0 always owns global block 0, so the combine
     # denominator is never zero.
 
-    # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
-    padding_len = 0
-    if input_len % tokens_per_block != 0:
-        padding_len = tokens_per_block - (input_len % tokens_per_block)
-        padding_ids = torch.zeros([1, padding_len], dtype=torch.int64)
-        all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
-    all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
+    # The last (partial) block counts as padded to tokens_per_block; its padding
+    # never reaches the outputs.
+    padding_len = -input_len % tokens_per_block
 
     # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
     # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
     # tokens this rank processes correspond to the KV blocks it received from the context server.
-    input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
-    position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
-
-    curank_input_blocks = input_id_blocks[cp_rank::cp_size]
-    curank_position_blocks = position_id_blocks[cp_rank::cp_size]
+    block_starts = np.arange(
+        cp_rank * tokens_per_block, input_len, cp_size * tokens_per_block, dtype=np.int64
+    )
     # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
-    if len(curank_input_blocks) == 0:
+    if block_starts.size == 0:
         return [], [], input_len, padding_len
 
-    input_ids_this_rank = torch.cat(curank_input_blocks, dim=-1).flatten().tolist()
-    position_ids_this_rank = torch.cat(curank_position_blocks, dim=-1).flatten().tolist()
-
-    # The (single) padded block is the global last block; under round-robin it is owned by rank
-    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
-    last_block_owner = (num_total_blocks - 1) % cp_size
-    if cp_rank == last_block_owner and padding_len > 0:
-        input_ids_this_rank = input_ids_this_rank[:-padding_len]
-        position_ids_this_rank = position_ids_this_rank[:-padding_len]
-
-    return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
+    positions = (block_starts[:, None] + np.arange(tokens_per_block, dtype=np.int64)).reshape(-1)
+    positions = positions[positions < input_len]
+    input_ids_this_rank = input_token_ids[positions].tolist()
+    return input_ids_this_rank, positions.tolist(), input_len, padding_len
 
 
 def merge_requests_to_llm_requests(
@@ -309,7 +302,7 @@ def merge_helix_requests(
 
     for req_item in new_requests:
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
-            req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
+            req_item.request.get_input_token_ids_array(), cp_rank, cp_size, tokens_per_block
         )
 
         req = executor_request_to_llm_request(
@@ -521,38 +514,33 @@ class RequestBroadcaster:
 
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
-        py_logits_post_processors = collect_py_objects_from_requests(
-            new_requests, "py_logits_post_processors"
-        )
-        py_multimodal_data = collect_py_objects_from_requests(new_requests, "py_multimodal_data")
-        py_scheduling_params = collect_py_objects_from_requests(
-            new_requests, "py_scheduling_params"
-        )
-        py_num_logprobs = collect_py_objects_from_requests(new_requests, "py_num_logprobs")
-        py_disaggregated_params = collect_py_objects_from_requests(
-            new_requests, "py_disaggregated_params"
-        )
-        py_conversation_params = collect_py_objects_from_requests(
-            new_requests, "py_conversation_params", include_none=True
-        )
-        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
-        py_lora_ckpt_source = collect_py_objects_from_requests(new_requests, "py_lora_ckpt_source")
-
-        return tuple(
-            filter(
-                None,
-                [
-                    py_logits_post_processors,
-                    py_multimodal_data,
-                    py_scheduling_params,
-                    py_num_logprobs,
-                    py_disaggregated_params,
-                    py_conversation_params,
-                    py_lora_path,
-                    py_lora_ckpt_source,
-                ],
+        py_objects = [
+            collect_py_objects_from_requests(new_requests, attribute_name)
+            for attribute_name in (
+                "py_logits_post_processors",
+                "py_multimodal_data",
+                "py_scheduling_params",
+                "py_num_logprobs",
+                "py_disaggregated_params",
+                "py_lora_path",
+                "py_lora_ckpt_source",
+                "py_logprobs_mode",
+                "py_logprobs_simple_format",
+                "py_return_routed_experts",
+                "py_arrival_time",
             )
+        ]
+        py_objects.extend(
+            [
+                collect_py_objects_from_requests(
+                    new_requests, "py_conversation_params", include_none=True
+                ),
+                collect_py_objects_from_requests(
+                    new_requests, "py_original_end_id", include_none=True, allow_missing=True
+                ),
+            ]
         )
+        return tuple(filter(None, py_objects))
 
     @nvtx_range("broadcast_requests")
     def _broadcast_requests(
