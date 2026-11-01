@@ -47,6 +47,7 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .fused_fp8_qk import fusion_mode, static_descale
 
 MINIMAX_H3_MODALITY_NUM = 3
 
@@ -210,6 +211,39 @@ class MiniMaxH3Attention(Attention):
                 hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
             )
         batch_size, sequence_length = hidden_states.shape[:2]
+        if rotary_emb is not None and self._use_fused_fp8_qk(hidden_states, rotary_emb):
+            # cuDNN FP8 attention: one pass normalises and rotates Q and K from the packed
+            # projection output and casts Q, K and V to FP8 with their per-tensor scales
+            # (fused_fp8_qk.py); the backend receives FP8 inputs and the descales.
+            qkv = self.qkv_proj(hidden_states)
+            cos, sin = rotary_emb
+            descale_in = (
+                static_descale(self.layer_idx, hidden_states.device)
+                if fusion_mode() == "static"
+                else None
+            )
+            query, key, value, descales = torch.ops.h3_lever8.qk_norm_rope_fp8(
+                qkv,
+                self.norm_q.weight,
+                self.norm_k.weight,
+                cos,
+                sin,
+                descale_in,
+                float(self.norm_q.variance_epsilon),
+                self.local_num_attention_heads,
+                self.head_dim,
+                int(self.layer_idx),
+            )
+            hidden_states = self._attn_impl(
+                query,
+                key,
+                value,
+                key_padding_mask=key_padding_mask,
+                discard_padded_queries=True,
+                timestep=timestep,
+                fp8_descales=descales,
+            )
+            return self.to_out[0](hidden_states)
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
             # One launch normalizes and rotates Q and K from the packed projection
             # output; V stays a view of the same buffer.
@@ -249,6 +283,42 @@ class MiniMaxH3Attention(Attention):
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
+
+    def _use_fused_fp8_qk(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Select the fused QK-norm + RoPE + FP8 cast (H3_FP8_SCALE_FUSION) for the cuDNN
+        per-tensor FP8 recipe on a packed BF16 projection with equal Q / K head counts."""
+        if fusion_mode() == "off" or self.qkv_mode != QKVMode.FUSE_QKV or not self.qk_norm:
+            return False
+        backend = getattr(self.attn, "inner_backend", self.attn)
+        if getattr(backend, "quant_dtype", None) != "fp8":
+            return False
+        if self.local_num_attention_heads != self.local_num_key_value_heads:
+            return False
+        for norm in (self.norm_q, self.norm_k):
+            if (
+                getattr(norm, "allreduce", None) is not None
+                or getattr(norm, "use_gemma", False)
+                or norm.weight.dtype != torch.bfloat16
+                or norm.weight.numel() != self.head_dim
+            ):
+                return False
+        cos, sin = rotary_emb
+        rot = cos.shape[-1]
+        return (
+            hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.ndim == 3
+            and cos.shape == (hidden_states.shape[1], rot)
+            and sin.shape == cos.shape
+            and rot % 2 == 0
+            and rot <= self.head_dim
+            and (self.head_dim & (self.head_dim - 1)) == 0
+            and not torch.is_grad_enabled()
+        )
 
     def forward_async(
         self,

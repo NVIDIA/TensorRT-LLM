@@ -801,13 +801,25 @@ class CuDNNAttention(AttentionBackend):
         v: torch.Tensor,
         is_causal: bool,
         with_lse: bool,
+        fp8_descales: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         self._validate_inputs(q, k, v)
         b, s_q, h_q, d_qk = q.shape
         _, s_kv, h_kv, d_v = v.shape
         device = q.device
         out_dtype = self._out_dtype()
-        q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
+        # Pre-quantized inputs: the producer already cast Q / K / V to FP8 E4M3 with per-tensor
+        # scales (MiniMax-H3's fused QK-norm + RoPE + cast) and hands the three descales over.
+        pre_quantized = q.dtype == torch.float8_e4m3fn
+        if pre_quantized:
+            if self.quant_dtype != "fp8" or fp8_descales is None or fp8_descales.numel() != 3:
+                raise ValueError(
+                    "FP8 q / k / v need the per-tensor 'fp8' recipe and fp8_descales of 3 values."
+                )
+            if k.dtype != q.dtype or v.dtype != q.dtype:
+                raise ValueError("FP8 q, k and v must all be float8_e4m3fn.")
+        else:
+            q, k, v = q.to(out_dtype), k.to(out_dtype), v.to(out_dtype)
 
         # Q/K/V arrive as NHD [B, S, H, D]. cuDNN wants a [B, H, S, D] *logical* tensor,
         # but takes the strides explicitly, so `.transpose(1, 2)` stays a view and the
@@ -820,7 +832,13 @@ class CuDNNAttention(AttentionBackend):
                 v=v.contiguous().transpose(1, 2),
             )
         elif self.quant_dtype == "fp8":
-            if d_qk == d_v and is_fused_qkv(q, k, v):
+            if pre_quantized:
+                q_q, k_q, v_q = q.contiguous(), k.contiguous(), v.contiguous()
+                descales = fp8_descales.to(torch.float32)
+                descale_q = descales[0:1].reshape(1, 1, 1, 1)
+                descale_k = descales[1:2].reshape(1, 1, 1, 1)
+                descale_v = descales[2:3].reshape(1, 1, 1, 1)
+            elif d_qk == d_v and is_fused_qkv(q, k, v):
                 # One amax+cast over the packed buffer for fused-QKV, mirroring TransformerEngine's
                 # handling of same-layout buffers.
                 qkv_q, descale = _quantize_fp8(as_fused_qkv(q, k, v))
@@ -935,6 +953,7 @@ class CuDNNAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         key_padding_mask: torch.Tensor,
+        fp8_descales: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Attend each batch item over its valid prefix; padded output rows are zero.
 
@@ -960,6 +979,7 @@ class CuDNNAttention(AttentionBackend):
                     v[item, :length],
                     is_causal=False,
                     with_lse=False,
+                    fp8_descales=fp8_descales,
                 )
                 output = torch.nn.functional.pad(output, (0, 0, 0, 0, 0, seq_len - length))
             outputs.append(output)
@@ -1013,9 +1033,16 @@ class CuDNNAttention(AttentionBackend):
                 raise ValueError(
                     "cuDNN padding requires dense self-attention with discarded padded queries."
                 )
-            return self._forward_padded_self_attention(q, k, v, key_padding_mask)
+            return self._forward_padded_self_attention(
+                q, k, v, key_padding_mask, fp8_descales=kwargs.get("fp8_descales")
+            )
         output, _ = self._run(
-            q, k, v, is_causal=attention_mask == PredefinedAttentionMask.CAUSAL, with_lse=False
+            q,
+            k,
+            v,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            with_lse=False,
+            fp8_descales=kwargs.get("fp8_descales"),
         )
         return output
 
@@ -1042,7 +1069,12 @@ class CuDNNAttention(AttentionBackend):
                 "have no log-sum-exp for the Ring / Attention2D merge."
             )
         output, lse = self._run(
-            q, k, v, is_causal=attention_mask == PredefinedAttentionMask.CAUSAL, with_lse=True
+            q,
+            k,
+            v,
+            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            with_lse=True,
+            fp8_descales=kwargs.get("fp8_descales"),
         )
         assert lse is not None, "cuDNN graph was built with stats but returned none."
         return output, lse
