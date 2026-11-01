@@ -34,7 +34,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 BASELINE_FILE = Path(__file__).resolve().with_name("private_access_baseline.yaml")
 SCOPES = ("tensorrt_llm/serve/", "tensorrt_llm/commands/", "tensorrt_llm/grpc/")
 EXCLUDED = ("tensorrt_llm/serve/scripts/", "tensorrt_llm/grpc/openengine/_generated/")
-VISUAL_GEN_SCOPE = "tensorrt_llm/serve/api/visual_gen/"
 OPENENGINE_SCOPE = "tensorrt_llm/grpc/openengine/"
 
 # Lower this when you remove accesses; never raise it.
@@ -92,6 +91,12 @@ OVERRIDES = {
     ("tensorrt_llm/grpc/openengine/request_mapping.py", "_cancelled"): (
         "same-package",
         "grpc/openengine/request_mapping.py _DecodedMediaBudget._cancelled",
+    ),
+    # servicer.py calls the static method of its own _PreprocessingWork class;
+    # `_release` is also defined in other packages, so the index cannot tell.
+    ("tensorrt_llm/grpc/openengine/servicer.py", "_release"): (
+        "same-package",
+        "grpc/openengine/servicer.py _PreprocessingWork._release",
     ),
 }
 
@@ -262,7 +267,13 @@ def scan(root=REPO_ROOT, prefixes=SCOPES):
 
 def load_baseline():
     data = yaml.safe_load(BASELINE_FILE.read_text())
-    return {(e["path"], e["scope"], e["member"]): e for e in data["entries"]}
+    baseline = {}
+    for entry in data["entries"]:
+        key = (entry["path"], entry["scope"], entry["member"])
+        if key in baseline:
+            raise ValueError(f"Duplicate baseline entry: {key}")
+        baseline[key] = entry
+    return baseline
 
 
 def _compare(rows, baseline, prefix=""):
@@ -315,8 +326,9 @@ def test_no_new_cross_package_private_access():
 
 def test_baseline_only_shrinks():
     total = sum(e["count"] for e in load_baseline().values())
-    assert total <= MAX_TOTAL, (
-        f"{BASELINE_FILE.name} lists {total} accesses, more than MAX_TOTAL={MAX_TOTAL}. "
+    assert total == MAX_TOTAL, (
+        f"{BASELINE_FILE.name} lists {total} accesses but MAX_TOTAL={MAX_TOTAL}. "
+        "Lower MAX_TOTAL when the total shrinks. "
         f"The baseline only shrinks. {FIX_HINT}"
     )
 
@@ -336,6 +348,66 @@ def test_counting_rule(source, expected):
     visitor = _Candidates()
     visitor.visit(ast.parse(source))
     assert sorted(row[1] for row in visitor.rows) == sorted(expected)
+
+
+def test_duplicate_baseline_keys_are_rejected(tmp_path, monkeypatch):
+    baseline_file = tmp_path / "baseline.yaml"
+    entry = {"path": "tensorrt_llm/serve/server.py", "scope": "f", "member": "_x", "count": 1}
+    baseline_file.write_text(yaml.safe_dump({"entries": [entry, {**entry, "count": 2}]}))
+    monkeypatch.setattr(sys.modules[__name__], "BASELINE_FILE", baseline_file)
+    with pytest.raises(ValueError, match="Duplicate baseline entry"):
+        load_baseline()
+
+
+def test_baseline_total_cannot_leave_unused_allowance(tmp_path, monkeypatch):
+    baseline_file = tmp_path / "baseline.yaml"
+    baseline_file.write_text("entries: []\n")
+    monkeypatch.setattr(sys.modules[__name__], "BASELINE_FILE", baseline_file)
+    monkeypatch.setattr(sys.modules[__name__], "MAX_TOTAL", 1)
+    with pytest.raises(AssertionError, match="Lower MAX_TOTAL"):
+        test_baseline_only_shrinks()
+
+
+def test_scanner_ownership_and_comparison(tmp_path, monkeypatch):
+    frontend = "tensorrt_llm/serve/server.py"
+    sources = {
+        frontend: (
+            "class Server:\n    _ambiguous = None\n"
+            "def f(obj):\n    obj._external\n    obj._ambiguous\n"
+            "    obj._third_party\n    obj._override\n"
+        ),
+        "tensorrt_llm/executor/engine.py": (
+            "class Engine:\n    _external = None\n    _ambiguous = None\n    _override = None\n"
+        ),
+    }
+    for rel, source in sources.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    overrides = {(frontend, "_override"): ("same-package", "test receiver")}
+    monkeypatch.setattr(sys.modules[__name__], "OVERRIDES", overrides)
+    rows = scan(tmp_path, prefixes=("tensorrt_llm/serve/",))
+    assert {row[2]: row[5] for row in rows} == {
+        "_external": "cross",
+        "_ambiguous": "unresolved",
+        "_third_party": "third-party",
+        "_override": "same-package",
+    }
+    errors = _compare(rows, {})
+    assert len(errors) == 2
+    assert any("New private access to `_external`" in error for error in errors)
+    assert any("Cannot classify `obj._ambiguous`" in error for error in errors)
+
+    baseline = {
+        (frontend, "f", "_external"): {"count": 2},
+        ("tensorrt_llm/grpc/server.py", "f", "_other"): {"count": 1},
+    }
+    overrides[(frontend, "_removed")] = ("same-package", "removed test receiver")
+    errors = _compare(rows, baseline, prefix="tensorrt_llm/serve/")
+    assert len(errors) == 3
+    assert any("Stale baseline entry" in error and "`_external`" in error for error in errors)
+    assert any("Stale OVERRIDES entry" in error and "`_removed`" in error for error in errors)
+    assert not any("_other" in error for error in errors)
 
 
 if __name__ == "__main__":
