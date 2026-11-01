@@ -237,15 +237,21 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
     )
     graphs.preallocate_padding_dummies = Mock()
     warmup = object.__new__(DecoderWarmup)
+    warmup.model = model
     warmup.mapping = SimpleNamespace(cp_size=1, has_cp_helix=lambda: False)
     warmup.sparse_attention_config = None
     warmup._inputs = SimpleNamespace(guided_decoder=None)
     warmup._metrics = {}
-    warmup._config = SimpleNamespace(max_beam_width=1)
+    warmup._config = SimpleNamespace(
+        max_beam_width=1, max_batch_size=8, max_num_tokens=64, max_seq_len=128
+    )
     warmup._warmup_timer = _WarmupTimer(rank=0)
     warmup._agreement = SimpleNamespace(agree_flag=lambda value: value, agree_shapes=lambda s: s)
     warmup._graphs = graphs
-    warmup._metadata = SimpleNamespace(_warmup_dspark_ragged_compressor_metadata=Mock())
+    warmup._metadata = SimpleNamespace(
+        attn_metadata=object(), _warmup_dspark_ragged_compressor_metadata=Mock()
+    )
+    warmup._prims_ts_dense_mla_warmup = SimpleNamespace(run=Mock())
     warmup._context_warmups_supported = True
     warmup._context_logits_heads = ()
     warmup._torch_compile_bypass = runner._bypass_torch_compile
@@ -312,6 +318,13 @@ def test_decoder_runner_warmup_bypasses_only_auxiliary_phases(monkeypatch, enabl
         ("_general_warmup", not enabled),
     ]
     assert not model._bypass_active
+    warmup._prims_ts_dense_mla_warmup.run.assert_called_once_with(
+        model,
+        warmup._metadata.attn_metadata,
+        max_batch_size=8,
+        max_num_tokens=64,
+        max_seq_len=128,
+    )
 
 
 @skip_pre_hopper
