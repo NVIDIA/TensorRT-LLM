@@ -3210,14 +3210,17 @@ class TmemSPResource(MemoryResource):
         *,
         causal_loop_mask: cutlass.Constexpr[bool] = False,
         q_offset: Int32 = 0,
+        dense_k_mask: cutlass.Constexpr[bool] = False,
+        seqlen_k: Int32 = 0,
+        section: cutlass.Constexpr[FmhaStage] = FmhaStage.Loop,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """LDTM.STAT: fuse S load and per-chunk row_max via tcgen05.ld.red.max.
 
         Instead of loading each S chunk with ``tcgen05.ld`` and then folding
         a per-lane max in registers, use ``tcgen05.ld.red.max`` so the
-        reduction happens as part of the TMEM load. For causal loop masking,
-        only tiles crossing the runtime right bound need a software reduction
-        of masked scores; wholly visible tiles retain the hardware maximum.
+        reduction happens as part of the TMEM load. For causal or packed dense
+        masking, only tiles crossing the runtime right bound need a software
+        reduction of masked scores; full tiles retain the hardware maximum.
         """
         tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
         tmem_x = self.cfg.tmem_x_load_s
@@ -3265,6 +3268,34 @@ class TmemSPResource(MemoryResource):
                         Int32(tmem_x),
                     )
                     mask = cutlass.vector.create_mask([tmem_x], [num_valid])
+                    neg_inf = cutlass.vector.full_like(
+                        s_data[chunk_idx], Float32(-Float32.inf)
+                    )
+                    s_data[chunk_idx] = cutlass.vector.where(
+                        mask, s_data[chunk_idx], neg_inf
+                    )
+                    masked_row_max = cute.math.max(
+                        masked_row_max, s_data[chunk_idx].reduce("max")
+                    )
+                row_max = masked_row_max
+        elif cutlass.const_expr(dense_k_mask):
+            if cutlass.const_expr(section == FmhaStage.Loop):
+                kv_tile_idx = stage_info.loop_offset
+            else:
+                kv_tile_idx = stage_info.loop_end
+            kv_base = kv_tile_idx * self.cfg.kv_tile_n
+            kv_end = kv_base + Int32(self.cfg.kv_tile_n)
+            if seqlen_k < kv_end:
+                # Invalid lanes can contain another request's scores or TMA
+                # padding. Neither may contribute to the maximum or softmax.
+                masked_row_max = old_row_max
+                for chunk_idx in cutlass.range_constexpr(num_chunks):
+                    chunk_base = kv_base + Int32(chunk_idx * tmem_x)
+                    valid_in_chunk = cute.math.min(
+                        cute.math.max(seqlen_k - chunk_base, Int32(0)),
+                        Int32(tmem_x),
+                    )
+                    mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
                     neg_inf = cutlass.vector.full_like(
                         s_data[chunk_idx], Float32(-Float32.inf)
                     )
@@ -3926,6 +3957,14 @@ class TmemSPResource(MemoryResource):
         section: cutlass.Constexpr[FmhaStage],
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Mask scores beyond one packed request's K/V right edge."""
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            return self._load_s_chunks_and_reduce_row_max(
+                stage_info,
+                row_max,
+                dense_k_mask=True,
+                seqlen_k=seqlen_k,
+                section=section,
+            )
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         s_data = self._load_s_chunks(stage_info)
