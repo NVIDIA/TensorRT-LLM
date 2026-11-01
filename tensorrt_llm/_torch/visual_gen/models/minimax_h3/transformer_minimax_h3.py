@@ -218,7 +218,9 @@ class MiniMaxH3Attention(Attention):
             qkv = self.qkv_proj(hidden_states)
             cos, sin = rotary_emb
             descale_in = (
-                static_descale(self.layer_idx, hidden_states.device)
+                static_descale(
+                    self.layer_idx, getattr(hidden_states, "fp4_tensor", hidden_states).device
+                )
                 if fusion_mode() == "static"
                 else None
             )
@@ -308,11 +310,16 @@ class MiniMaxH3Attention(Attention):
                 return False
         cos, sin = rotary_emb
         rot = cos.shape[-1]
+        # The NVFP4 producer fusion (lever 9) hands an Fp4QuantizedTensor (codes + scales):
+        # read device, rank and sequence length from the codes; the projection output is BF16
+        # either way.
+        codes = getattr(hidden_states, "fp4_tensor", None)
+        x = codes if codes is not None else hidden_states
         return (
-            hidden_states.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and hidden_states.ndim == 3
-            and cos.shape == (hidden_states.shape[1], rot)
+            x.is_cuda
+            and (codes is not None or hidden_states.dtype == torch.bfloat16)
+            and x.ndim == 3
+            and cos.shape == (x.shape[1], rot)
             and sin.shape == cos.shape
             and rot % 2 == 0
             and rot <= self.head_dim
@@ -1076,6 +1083,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 )
             # FA4 seqused_k and the cuDNN prefix trimming require valid tokens to form a
             # prefix. Ulysses appends padding in this layout.
+            interior_padding = bool(
+                ((token_tags_for_mask[:-1] < 0) & (token_tags_for_mask[1:] >= 0)).any()
+            )
             if self._attn_backend in ("FA4", "CUDNN") and interior_padding:
                 raise NotImplementedError(
                     f"{self._attn_backend} requires trailing packed-row padding; "
