@@ -32,9 +32,11 @@
 # entries with the current full scan. Pass --diff-base REF (or set
 # MYPY_DIFF_BASE=REF) to keep only diagnostics on added lines relative to REF.
 # Changed-file checks default to HEAD; pass --no-diff-filter for file-level output.
+# Changes to mypy configuration or helper scripts trigger a full-project check
+# without diff-line filtering, including when discovered without explicit paths.
 #
-# Set MYPY_REQUIRE_BINDINGS=1 to record a failed check when the compiled
-# bindings cannot be imported.
+# Set MYPY_REQUIRE_BINDINGS=1 to return failure when the compiled bindings
+# cannot be imported; mypy and baseline diagnostics remain advisory.
 #
 # Importing the bindings needs no GPU, but it does need libcuda.so.1 to resolve;
 # on a driverless machine this script falls back to the CUDA stub library (see
@@ -96,6 +98,7 @@ REPORT_FILE="${MYPY_REPORT_PATH:-$PROJECT_DIR/mypy_final_report.txt}"
 STUB_DIR=""
 MYPY_OUTPUT=""
 MYPY_CONFIG_DIR=""
+BINDINGS_CHECK_STATUS=0
 cleanup_stub_dir() {
     local check_status=$?
     if [[ -n "$STUB_DIR" ]]; then
@@ -111,7 +114,7 @@ cleanup_stub_dir() {
     cat "$REPORT_FILE" >&3 || true
     printf 'mypy report: %s (check status: %s)\n' "$REPORT_FILE" "$check_status" >&3 || true
     trap - EXIT
-    exit 0
+    exit "$BINDINGS_CHECK_STATUS"
 }
 printf '%s\n' \
     '# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.' \
@@ -124,6 +127,11 @@ trap cleanup_stub_dir EXIT
 
 EXCLUSIONS_CONFIG="$SCRIPT_DIR/mypy_exclusion.json"
 BASELINE_FILE="$SCRIPT_DIR/mypy_baseline.txt"
+CHECK_CONFIG_FILES=(
+    pyproject.toml .pre-commit-config.yaml
+    scripts/mypy_exclusion.json scripts/mypy_baseline.txt
+    scripts/run_mypy.sh scripts/mypy_exclusion.py scripts/diff_line_filter.py
+)
 cd "$PROJECT_DIR"
 EXCLUDE_REGEX="$(python3 "$SCRIPT_DIR/mypy_exclusion.py" exclusions \
     --project-root "$PROJECT_DIR" "$EXCLUSIONS_CONFIG")"
@@ -142,8 +150,10 @@ if (( FULL_PROJECT && $# > 0 )); then
 fi
 if (( ! FULL_PROJECT && $# == 0 )); then
     CHANGED_PATHS_FILE="$(mktemp)"
-    if ! git diff --name-only -z HEAD -- tensorrt_llm > "$CHANGED_PATHS_FILE" ||
-        ! git ls-files --others --exclude-standard -z -- tensorrt_llm >> "$CHANGED_PATHS_FILE"; then
+    if ! git diff --name-only -z HEAD -- tensorrt_llm "${CHECK_CONFIG_FILES[@]}" \
+        > "$CHANGED_PATHS_FILE" ||
+        ! git ls-files --others --exclude-standard -z -- tensorrt_llm "${CHECK_CONFIG_FILES[@]}" \
+            >> "$CHANGED_PATHS_FILE"; then
         rm -f "$CHANGED_PATHS_FILE"
         echo "ERROR: could not discover changed files" >&2
         exit 2
@@ -156,13 +166,29 @@ if (( ! FULL_PROJECT && $# == 0 )); then
     set -- "${changed_paths[@]+"${changed_paths[@]}"}"
 fi
 
-FILTERED_ARGS=()
-KEPT_SOURCES=0
+CONFIG_CHANGED=0
 for argument in "$@"; do
     if [[ "$argument" == --* ]]; then
         echo "ERROR: unknown option: $argument" >&2
         exit 2
     fi
+    for config_file in "${CHECK_CONFIG_FILES[@]}"; do
+        if [[ "$argument" == "$config_file" ]]; then
+            CONFIG_CHANGED=1
+            break
+        fi
+    done
+done
+if (( CONFIG_CHANGED )); then
+    echo "Mypy configuration changed; checking the full project without diff-line filtering"
+    FULL_PROJECT=1
+    DIFF_BASE=""
+    set --
+fi
+
+FILTERED_ARGS=()
+KEPT_SOURCES=0
+for argument in "$@"; do
     if (( ! FULL_PROJECT )) && [[ "$argument" != tensorrt_llm/* ]]; then
         echo "Skipping non-product mypy input: $argument"
         continue
@@ -272,6 +298,7 @@ if python3 -c 'import tensorrt_llm.bindings'; then
     MYPY_ARGS=(--exclude "$EXCLUDE_REGEX")
 else
     if [[ "${MYPY_REQUIRE_BINDINGS:-0}" -eq 1 ]]; then
+        BINDINGS_CHECK_STATUS=1
         echo "ERROR: MYPY_REQUIRE_BINDINGS=1 but 'import tensorrt_llm.bindings'" \
              "failed (traceback above)." >&2
         # The traceback is authoritative; these are hints for the two failures
@@ -290,10 +317,6 @@ else
     echo "No compiled bindings — running configured mypy checks without stub installation"
     # Missing imports remain visible through the configured import-not-found code.
     MYPY_ARGS=(--exclude "$EXCLUDE_REGEX" --no-install-types --interactive)
-fi
-if (( ! FULL_PROJECT )); then
-    # Analyze only explicit sources; imported implementation modules become Any.
-    MYPY_ARGS+=(--follow-imports=skip)
 fi
 DIFF_ARGS=()
 if [[ -n "$DIFF_BASE" ]]; then

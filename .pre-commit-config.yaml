@@ -1620,5 +1620,6 @@ repos:
         require_serial: true  # because of install_types=true
         # Check changed paths and retain diagnostics only on added diff lines.
         # HEAD is the pre-commit base for staged changes.
+        # Configuration changes trigger a full-project scan without diff filtering.
         pass_filenames: true
         files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(mypy_exclusion\.json|mypy_baseline\.txt|run_mypy\.sh|mypy_exclusion\.py|diff_line_filter\.py)$|\.pre-commit-config\.yaml$)
