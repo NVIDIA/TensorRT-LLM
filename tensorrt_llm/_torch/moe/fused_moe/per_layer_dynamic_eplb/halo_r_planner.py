@@ -614,11 +614,13 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             helper_residency=bool(helper_residency),
         )
 
-        # Zero this layer's READY row before any peer can publish into it.
-        # The device synchronization keeps a late zero from erasing a peer's
-        # first READY; the barrier extends it to every rank.
+        # Set this layer's READY row to 1, as a launch before the first would
+        # leave it, so that every launch drains it before its count exchange,
+        # whatever its epoch. The device synchronization keeps a late write
+        # from erasing a peer's first READY; the barrier extends it to every
+        # rank.
         with torch.cuda.device(self.device):
-            arena.terminal_flags_tensor().zero_()
+            arena.terminal_flags_tensor().view(torch.int64).fill_(_READY_GENERATION)
             torch.cuda.synchronize(self.device)
         ep_comm.barrier()
 

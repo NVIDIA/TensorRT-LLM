@@ -98,6 +98,9 @@ class _Tensor:
         self.trace.append(("fill", self.name, value))
         return self
 
+    def view(self, dtype):
+        return self
+
 
 def _extract_function(path: Path, name: str, namespace: dict):
     tree = ast.parse(path.read_text())
@@ -377,11 +380,13 @@ def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(mo
         "barrier",
         "bind_gpu_direct",
         "create",
-        "zero",
+        "fill",
         "synchronize",
         "barrier",
     ]
     assert [name for name in order if name in expected] == expected
+    # The READY row starts at 1, so the first launch drains it like every other.
+    assert ("fill", "ready_row", 1) in env.trace
     # The scheduler runs on exactly the auxiliary SMs, as HALO-Q's.
     assert ("validate_config", 4) in env.trace
     # HALO-Q's methods read HALO-Q's private attributes: every one is set.
@@ -1033,13 +1038,15 @@ def test_kernel_drains_ready_before_the_exchange_within_one_bound():
         publish,
         (
             "long long const start = clock64();",
-            "epoch > 1 ? drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles) : -1;",
+            "missingReady = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);",
             "exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;",
             'return RoleResult{"READY drain timeout", missingReady};',
             "exchange_counts(",
             "epoch, exchangeCycles, p.status)",
         ),
     )
+    # Every launch drains, whatever its epoch: the row starts at 1, and the epoch wraps.
+    assert "epoch > 1" not in publish
     drain = _function_body(kernel_source, "int drainReadyRow(")
     _assert_in_order(
         drain,

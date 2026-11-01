@@ -197,11 +197,12 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
     }
 }
 
-//! CTA 0 thread 0, before the count exchange of an epoch after the first: waits until every rank's previous launch of
-//! this layer has published into this rank's READY row, then zeroes the row. Every launch publishes the constant 1, and
-//! a peer publishes this epoch's READY only after this epoch's exchange, which this rank enters only after the reset,
-//! so this epoch's gate cannot pass on the previous epoch's cells. Returns the first rank whose cell did not arrive
-//! within the bound, or -1.
+//! CTA 0 thread 0, before the count exchange of every launch: waits until every rank's previous launch of this layer
+//! has published into this rank's READY row, then zeroes the row. The row starts at 1, as if a launch had preceded
+//! the first, so no launch skips the drain, whatever its epoch. Every launch publishes the constant 1, and a peer
+//! publishes this epoch's READY only after this epoch's exchange, which this rank enters only after the reset, so this
+//! epoch's gate cannot pass on the previous epoch's cells. Returns the first rank whose cell did not arrive within the
+//! bound, or -1.
 __device__ int drainReadyRow(std::uint64_t* row, int ep, long long start, unsigned long long spinCycles)
 {
     for (int source = 0; source < ep; ++source)
@@ -249,7 +250,7 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     if (threadIdx.x == 0)
     {
         long long const start = clock64();
-        missingReady = epoch > 1 ? drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles) : -1;
+        missingReady = drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles);
         auto const elapsed = static_cast<unsigned long long>(clock64() - start);
         exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;
     }
