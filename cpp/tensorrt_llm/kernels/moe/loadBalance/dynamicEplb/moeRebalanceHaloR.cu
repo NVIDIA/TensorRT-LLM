@@ -570,7 +570,7 @@ MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int 
     std::size_t const slotBytes = MEGAMOE_TMA_COPY_SLOT_DATA_BYTES + MEGAMOE_TMA_COPY_SLOT_CONTROL_BYTES;
     std::size_t const relayBytes
         = (static_cast<std::size_t>(megamoe_tma_copy_total_slots(available)) * slotBytes + 127) & ~std::size_t{127};
-    std::size_t const minRelayBytes = kRelayWorkBytes + kRelayMinSlotsPerIssuer * kRelaySlotBytes;
+    std::size_t const minRelayBytes = kRelayWorkBytes + kRelaySlotsPerIssuer * kRelaySlotBytes;
     TLLM_CHECK_WITH_INFO(relayBytes >= minRelayBytes,
         "HALO-R relay needs at least %zu bytes of dynamic shared memory, the device provides %zu", minRelayBytes,
         relayBytes);

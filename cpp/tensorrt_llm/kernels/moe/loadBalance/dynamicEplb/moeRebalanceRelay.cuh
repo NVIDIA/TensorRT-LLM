@@ -47,10 +47,14 @@ namespace kernels
 namespace
 {
 
-//! An issuer warp needs two banks of at least two slots to overlap loads with stores.
-constexpr int kRelayMinSlotsPerIssuer = 4;
+//! Issuer warps per CTA and slots per issuer warp: two banks of one slot, so one slice loads while the other stores.
+//! Each SM's pull throughput is capped, so past about nine loads in flight per SM more loads only add latency.
+//! Measured on pull-only plans, 9 issuers with two slots each copy about 30% more per CTA than 6 issuers with four
+//! slots, and 13 issuers with two slots copy less.
+constexpr int kRelayMaxIssuers = 9;
+constexpr int kRelaySlotsPerIssuer = 2;
 //! Slices per bank batch; it sizes the per-lane batch bookkeeping.
-constexpr int kRelayMaxBatch = 16;
+constexpr int kRelayMaxBatch = kRelaySlotsPerIssuer / 2;
 constexpr std::uint64_t kRelayBulkAlignment = 16;
 constexpr std::uint64_t kRelayWordAlignment = 4;
 //! Back-off between polls of a slot's load barrier.
@@ -199,10 +203,11 @@ __device__ __forceinline__ int relayIssuers(unsigned dynamicBytes, int warps)
 {
     int const totalSlots
         = dynamicBytes > kRelayWorkBytes ? static_cast<int>((dynamicBytes - kRelayWorkBytes) / kRelaySlotBytes) : 0;
-    if (totalSlots >= kRelayMinSlotsPerIssuer)
+    if (totalSlots >= kRelaySlotsPerIssuer)
     {
-        int const issuers = totalSlots / kRelayMinSlotsPerIssuer;
-        return issuers < warps ? issuers : warps;
+        int const issuers = totalSlots / kRelaySlotsPerIssuer;
+        int const limit = warps < kRelayMaxIssuers ? warps : kRelayMaxIssuers;
+        return issuers < limit ? issuers : limit;
     }
     return totalSlots ? 1 : 0;
 }
@@ -339,7 +344,8 @@ __device__ bool relayCopy(MoeRebalanceHaloRParams const& p)
         return false;
     }
     unsigned const perWarpBytes = ((dynamicBytes - kRelayWorkBytes) / static_cast<unsigned>(issuers)) & ~127U;
-    int const slots = warp < issuers ? static_cast<int>(perWarpBytes / kRelaySlotBytes) : 0;
+    int const fitting = static_cast<int>(perWarpBytes / kRelaySlotBytes);
+    int const slots = warp < issuers ? (fitting < kRelaySlotsPerIssuer ? fitting : kRelaySlotsPerIssuer) : 0;
     unsigned char* buffer = relayShared + kRelayWorkBytes + static_cast<std::size_t>(warp) * perWarpBytes;
     auto* control
         = reinterpret_cast<RelaySlotControl*>(buffer + static_cast<std::size_t>(slots) * halo_r::kRelaySliceBytes);
