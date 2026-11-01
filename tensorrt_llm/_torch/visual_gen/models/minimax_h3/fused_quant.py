@@ -34,6 +34,7 @@ odd split happens in registers), packed codes stored 8 per 32-bit word.
 """
 
 import os
+from typing import Optional
 
 import torch
 import triton
@@ -180,6 +181,7 @@ def _minimax_h3_adaln_fp4_kernel(
     sf_ptr,
     w_ptr,
     mod_ptr,
+    gmod_ptr,
     idx_ptr,
     gs_ptr,
     rows,
@@ -189,6 +191,7 @@ def _minimax_h3_adaln_fp4_kernel(
     x1_stride,
     xq_stride,
     mod_stride,
+    gmod_stride,
     gate_off,
     scale_off,
     shift_off,
@@ -200,7 +203,9 @@ def _minimax_h3_adaln_fp4_kernel(
 ):
     """fused_adaln._minimax_h3_adaln_kernel with the modulated output quantized to NVFP4.
 
-    The grid covers the 128-padded scale rows; programs past ``rows`` only zero their scales.
+    The gate of the residual is read from ``gmod`` (the same table as ``mod``, or the previous
+    block's table when a block folds its MLP residual into the next block's norm). The grid
+    covers the 128-padded scale rows; programs past ``rows`` only zero their scales.
     """
     row = tl.program_id(0)
     r64 = row.to(tl.int64)
@@ -220,7 +225,7 @@ def _minimax_h3_adaln_fp4_kernel(
         x5 = _ld(xr, 5 * CH, D, CH)
         if HAS_RES:
             ar = a_ptr + r64 * a_stride
-            gb = mb + gate_off
+            gb = gmod_ptr + mrow * gmod_stride + gate_off
             x0 = (x0 + _ld(gb, 0 * CH, D, CH) * _ld(ar, 0 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
             x1 = (x1 + _ld(gb, 1 * CH, D, CH) * _ld(ar, 1 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
             x2 = (x2 + _ld(gb, 2 * CH, D, CH) * _ld(ar, 2 * CH, D, CH)).to(tl.bfloat16).to(tl.float32)
@@ -309,7 +314,7 @@ def _alloc(rows, k, device):
     return xq, sf
 
 
-def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, num_warps=None):
+def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, num_warps=None, gate_mod=None):
     D = x.shape[-1]
     if D > 6 * _CH or D % 16:
         raise ValueError(f"hidden size {D} is not supported by the fused NVFP4 AdaLN kernel")
@@ -329,6 +334,9 @@ def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, nu
     x1 = torch.empty((rows, D), dtype=x.dtype, device=x.device) if has_res else x2
     if mod.stride(-1) != 1:
         mod = mod.contiguous()
+    gmod = mod if gate_mod is None else gate_mod
+    if gmod.stride(-1) != 1:
+        gmod = gmod.contiguous()
     xq, sf = _alloc(rows, D, x.device)
     _minimax_h3_adaln_fp4_kernel[(swizzled_sf_rows(rows),)](
         x2,
@@ -338,6 +346,7 @@ def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, nu
         sf,
         w,
         mod,
+        gmod,
         idx,
         gs,
         rows,
@@ -347,6 +356,7 @@ def _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, nu
         x1.stride(0),
         xq.stride(0),
         mod.stride(0),
+        gmod.stride(0),
         gate_col * D,
         scale_col * D,
         shift_col * D,
@@ -437,14 +447,21 @@ def h3_gate_res_norm_mod_fp4(
     gate_col: int,
     scale_col: int,
     shift_col: int,
+    gate_mod: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """x1 = x + mod[idx, gate] * a (bf16); NVFP4 of rmsnorm(x1) * (1 + mod[idx, scale]) + mod[idx, shift]."""
-    x1, xq, sf = _launch_adaln(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col)
+    """x1 = x + gate_mod[idx, gate] * a (bf16); NVFP4 of rmsnorm(x1) * (1 + mod[idx, scale]) + mod[idx, shift].
+
+    ``gate_mod`` defaults to ``mod``; a block that folds its MLP residual into the next block's
+    norm passes its own table here while ``mod`` is the next block's.
+    """
+    x1, xq, sf = _launch_adaln(
+        x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, gate_mod=gate_mod
+    )
     return x1.view(x.shape), xq.view(*x.shape[:-1], x.shape[-1] // 2), sf
 
 
 @h3_gate_res_norm_mod_fp4.register_fake
-def _(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col):
+def _(x, a, w, mod, idx, gs, eps, gate_col, scale_col, shift_col, gate_mod=None):
     rows = x.numel() // x.shape[-1]
     return (
         torch.empty_like(x),
