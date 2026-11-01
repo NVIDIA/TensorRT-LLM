@@ -42,12 +42,66 @@ import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
 import com.nvidia.bloom.Utils
 
+// LLM repository configuration
+withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+    LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
+}
 LLM_ROOT = "llm"
 
 // Input tarball location (passed from the parent via artifactPath, same as
-// Build/L0_Test). The promoted bundle goes to a stable BRANCH-keyed path.
+// Build/L0_Test). The promoted bundle goes to a stable BRANCH-keyed path on
+// URM_ARTIFACTORY_BASE (PROFILE_PROMOTE_DIR below).
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+// credential is the identity that publishes to the location; reads from aws use it too.
+LLM_ARTIFACTS_LOCATIONS = [
+    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local",
+          credential: "aws-artifactory-credentials"],
+    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic",
+          credential: "urm-artifactory-creds"],
+]
+
+// Exit code of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the name
+// the helper gives it. tests/unittest/scripts/test_fetch_build_artifact.py checks that it
+// matches.
+FETCH_ABSENT = 2
+
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+def llmArtifactsLayoutPath(String legacyPath)
+{
+    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
+    if (!layoutPath.startsWith("llm-artifacts/")) {
+        error("Not an llm-artifacts path: ${legacyPath}")
+    }
+    return layoutPath
+}
+
+def llmArtifactsRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+def llmArtifactsUrl(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
+}
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -264,15 +318,30 @@ def b64BashRemoteCmdStdin(String script, String scriptPath)
     return "\"echo ${b64} | base64 -d > ${scriptPath}; trap 'rm -f ${scriptPath}' EXIT; bash ${scriptPath}\""
 }
 
+// For scripts too long for the two above, such as those carrying fetch_verified:
+// a csh/tcsh login shell rejects a word that long ("Word too long"). Copies the
+// script to the cluster as a file and returns the sshUserCmd remotecmd that runs it
+// under bash, with stdin left connected to whatever ssh forwards. The script must
+// hold no secret: it stays at remotePath, so a retried step can run it again.
+def bashRemoteScriptFile(pipeline, remote, String script, String localPath, String remotePath)
+{
+    pipeline.writeFile(file: localPath, text: script)
+    Utils.copyFileToRemoteHost(pipeline, remote, localPath, remotePath)
+    return "\"bash ${remotePath}\""
+}
+
 // ---------------------------------------------------------------------------
 // SLURM profile generation: fan out perf-harness runs (one per workload, BOLT
 // hook enabled) then a single cross-workload merge (slurm_merge.sh).
 // ---------------------------------------------------------------------------
-def submitProfileGen(pipeline)
+// readHelper: local copy of jenkins/scripts/fetch_build_artifact.sh from the run's
+// commit; the tarball download below runs it on the cluster frontend.
+def submitProfileGen(pipeline, String readHelper)
 {
-    // The tarball to profile:
-    def llmTarfile = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}/${BOLT_TARNAME}"
-    pipeline.echo("Input tarball: ${llmTarfile}")
+    // The tarball to profile. The primary location is resolved once here and used
+    // both to read it and to publish the BOLTed build back.
+    def primary = llmArtifactsPrimary()
+    pipeline.echo("Input tarball: ${llmArtifactsLayoutPath(ARTIFACT_PATH)}/${BOLT_TARNAME} (read from ${primary} first)")
 
     SlurmPartition partition = SlurmConfig.resolvePlatform(SLURM_PLATFORM)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -289,9 +358,14 @@ def submitProfileGen(pipeline)
     def outDir = "${fdataRoot}/_bundle"
     def bundle = "${outDir}/bolt-profile-${BOLT_REF}-${TRIPLE}.tar.gz"
 
-    // Bootstrap on the frontend entirely from that tarball (no agent->
-    // cluster file copy): extract the full source tree + wheel (the perf harness
-    // runs from the checkout, install_mode=wheel), and stage llvm-bolt once
+    // Scripts too long for the ssh command line are written here, beside the read
+    // helper, before bashRemoteScriptFile copies them to the cluster.
+    def localScriptDir = readHelper.substring(0, readHelper.lastIndexOf('/'))
+
+    // Bootstrap on the frontend from that tarball (the only agent->cluster file
+    // copies are the read helper and the bootstrap scripts): extract the full
+    // source tree + wheel (the perf harness runs from the checkout,
+    // install_mode=wheel), and stage llvm-bolt once
     // (shared, reused by the per-node instrument hook + merge). The merge job
     // mounts scripts/bolt directly from the extracted tree (no separate copy).
     // Then fan out one perf-harness run per workload, and merge once.
@@ -311,9 +385,24 @@ def submitProfileGen(pipeline)
         // xargs + coreutils): HEAD-probe for size + range support, fan out PARTS
         // ranged `curl -r` GETs via `xargs -P`, reassemble, verify. Falls back to a
         // single-stream curl when the server doesn't advertise byte ranges or on
-        // ANY failure, so nothing regresses. Defined once here, reused for BOTH
-        // downloads. NO resume on retry (append is a corruption vector); the
-        // per-file verify (gzip -t / tar -tJf) catches truncation/corruption.
+        // ANY failure, so nothing regresses. artifactory.nvidia.com and GitHub both
+        // redirect downloads to a CDN on another host. Each single-stream attempt
+        // follows the redirect; only when the CDN answers HTTP 403 does the attempt
+        // ask again, once, with X-JFrog-Download-Redirect-To: None, which makes
+        // Artifactory send the file itself (other servers ignore the header). Any
+        // other failure fails the attempt: a connection error, a stall, any other
+        // status (a 403 from the URL's own host too), or a failed request without
+        // the redirect. A failed attempt is followed by another from the URL, up to
+        // 10 more, 15 s apart. The header goes out only right after a CDN 403, at
+        // most once per attempt (11 times in all). The other Artifactory location
+        // is never tried. Logs name hosts only: a redirect target can be a signed
+        // CDN URL, whose query string is a short-lived credential. Defined once
+        // here, reused for BOTH downloads. NO resume on retry (append is a
+        // corruption vector); the per-file verify (gzip -t + SHA-1 / tar -tJf)
+        // catches truncation/corruption.
+        // Credentials come only from FETCH_NETRC, which the tarball stage sets for
+        // a URL on the aws location, so the llvm-bolt download stays anonymous. curl
+        // applies a netrc entry only to the host it names, so the CDN never gets them.
         def boltFetchLib = '''
             _verify_txz() { tar -tJf "$1" >/dev/null 2>&1; }
             # _bolt_range_download URL DEST PARTS -> 0 if the whole file was fetched
@@ -324,7 +413,8 @@ def submitProfileGen(pipeline)
                 # HEAD (not a ranged GET) so a server that ignores Range can't make
                 # us stream the whole file just to probe; -L follows the redirect to
                 # the storage/CDN backend; || true so a probe miss doesn't trip set -e.
-                hdr=$(curl -fsSL -I --retry 5 --retry-all-errors "$url" 2>/dev/null | tr -d '\\r' || true)
+                hdr=$(curl -fsSL -I --retry 5 --retry-all-errors ${FETCH_NETRC:+--netrc-file "$FETCH_NETRC"} \\
+                          "$url" 2>/dev/null | tr -d '\\r' || true)
                 total=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="content-length:"{v=$2} END{print v}')
                 accept=$(printf '%s\\n' "$hdr" | awk 'tolower($1)=="accept-ranges:"{v=tolower($2)} END{print v}')
                 case "$total" in ''|*[!0-9]*) return 1 ;; esac
@@ -341,10 +431,11 @@ def submitProfileGen(pipeline)
                     printf '%s %s %s\\n' "$i" "$start" "$end" >> "$ranges"
                 done
                 # One ranged curl per chunk, PARTS at a time. $0/$1/$2 = i/start/end
-                # (xargs -n 3); URL/DEST come from the inline-exported environment.
-                if ! BOLT_FETCH_URL="$url" BOLT_FETCH_DEST="$dest" \\
+                # (xargs -n 3); URL/DEST/NETRC come from the inline-exported environment.
+                if ! BOLT_FETCH_URL="$url" BOLT_FETCH_DEST="$dest" BOLT_FETCH_NETRC="${FETCH_NETRC:-}" \\
                      xargs -P "$parts" -n 3 bash -c '
                          curl -fsSL --retry 10 --retry-all-errors --retry-delay 5 \\
+                              ${BOLT_FETCH_NETRC:+--netrc-file "$BOLT_FETCH_NETRC"} \\
                               -r "$1-$2" -o "$BOLT_FETCH_DEST.part.$0" "$BOLT_FETCH_URL"
                      ' < "$ranges"; then
                     rm -f "$ranges" "$dest".part.*
@@ -364,8 +455,68 @@ def submitProfileGen(pipeline)
                 [ "$final" -eq "$total" ] || return 1
                 return 0
             }
-            # fetch_verified URL DEST VERIFY... : parallel fetch then `VERIFY DEST`;
-            # single-stream curl fallback on any failure. Reads PARTS (default 16).
+            # _bolt_url_host URL -> the lower-case host[:port] of URL.
+            _bolt_url_host() {
+                local rest="${1#*://}"
+                rest="${rest%%[/?#]*}"
+                rest="${rest##*@}"
+                printf '%s\\n' "${rest,,}"
+            }
+            # _bolt_get URL DEST [CURL OPTION...] -> one GET of URL into DEST that follows
+            # redirects, with FETCH_NETRC's entry for URL's host. curl does not retry it,
+            # and without -f it exits 0 whatever the HTTP status. Sets BOLT_STATUS (the
+            # last answer's status, 000 when none arrived) and BOLT_FINAL_HOST (the host
+            # of the last URL requested: that URL can be a signed CDN URL, so only its
+            # host is kept), and returns curl's exit status.
+            _bolt_get() {
+                local url="$1" dest="$2" out rc=0
+                shift 2
+                rm -f "$dest"
+                out=$(curl -sSL --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
+                           ${FETCH_NETRC:+--netrc-file "$FETCH_NETRC"} "$@" \\
+                           -w '%{http_code} %{url_effective}' -o "$dest" "$url") || rc=$?
+                BOLT_STATUS=${out%% *}
+                BOLT_FINAL_HOST=$(_bolt_url_host "${out#* }")
+                return "$rc"
+            }
+            # _bolt_single_stream URL DEST HOST -> one attempt at downloading URL, whose
+            # host is HOST, into DEST: 0 when DEST holds a 200 answer, else 1 with the
+            # reason in BOLT_FETCH_FAILURE.
+            _bolt_single_stream() {
+                local url="$1" dest="$2" host="$3" rc=0
+                _bolt_get "$url" "$dest" || rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    # The status can be an earlier hop's, so only the last host is named.
+                    BOLT_FETCH_FAILURE="download from ${BOLT_FINAL_HOST:-$host} failed (curl exit $rc)"
+                    return 1
+                fi
+                if [ "$BOLT_STATUS" = 200 ]; then
+                    return 0
+                fi
+                if [ "$BOLT_STATUS" != 403 ] || [ "$BOLT_FINAL_HOST" = "$host" ]; then
+                    # Any other status, a 403 from URL's own host among them.
+                    BOLT_FETCH_FAILURE="download answered HTTP $BOLT_STATUS from $BOLT_FINAL_HOST"
+                    return 1
+                fi
+                # The CDN that URL's host redirected to rejected the request, which says
+                # nothing about the credential. Ask URL's host for the file itself:
+                # Artifactory honors X-JFrog-Download-Redirect-To: None.
+                echo "[INFO] $BOLT_FINAL_HOST rejected the redirected download (HTTP 403); downloading from $host without the redirect."
+                _bolt_get "$url" "$dest" -H 'X-JFrog-Download-Redirect-To: None' || rc=$?
+                if [ "$rc" -ne 0 ]; then
+                    BOLT_FETCH_FAILURE="download from $host without the redirect failed (curl exit $rc)"
+                    return 1
+                fi
+                if [ "$BOLT_STATUS" = 200 ]; then
+                    return 0
+                fi
+                BOLT_FETCH_FAILURE="download from $host without the redirect answered HTTP $BOLT_STATUS from $BOLT_FINAL_HOST"
+                return 1
+            }
+            # fetch_verified URL DEST VERIFY... : parallel fetch, else a single-stream
+            # download, then `VERIFY DEST`. Reads PARTS (default 16) and FETCH_NETRC
+            # (netrc for URL's host; unset or empty sends none). On any failure it
+            # removes DEST and returns 1, also when the caller runs under set -e.
             fetch_verified() {
                 local url="$1" dest="$2"; shift 2
                 local parts="${PARTS:-16}"
@@ -374,31 +525,89 @@ def submitProfileGen(pipeline)
                     return 0
                 fi
                 echo "[INFO] parallel fetch unavailable/failed; single-stream curl: $dest"
-                rm -f "$dest"
-                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 \\
-                     --connect-timeout 60 --speed-time 120 --speed-limit 10000 \\
-                     -o "$dest" "$url" || { rm -f "$dest"; return 1; }
-                "$@" "$dest" || { echo "[ERROR] verification failed: $dest"; rm -f "$dest"; return 1; }
+                # A failed attempt, whatever the cause, is followed by another from URL,
+                # through the redirect: up to `retries` more, `retry_delay` seconds apart.
+                # A file that fails VERIFY is not downloaded again.
+                local host attempt=1 retries=10 retry_delay=15
+                local attempts=$((retries + 1))
+                host=$(_bolt_url_host "$url")
+                until _bolt_single_stream "$url" "$dest" "$host"; do
+                    if [ "$attempt" -ge "$attempts" ]; then
+                        echo "[ERROR] single-stream attempt $attempt of $attempts: $BOLT_FETCH_FAILURE: $dest" >&2
+                        rm -f "$dest"
+                        return 1
+                    fi
+                    echo "[INFO] single-stream attempt $attempt of $attempts: $BOLT_FETCH_FAILURE; retrying in ${retry_delay}s."
+                    attempt=$((attempt + 1))
+                    sleep "$retry_delay"
+                done
+                if ! "$@" "$dest"; then
+                    echo "[ERROR] verification failed: $dest" >&2
+                    rm -f "$dest"
+                    return 1
+                fi
                 return 0
             }
         '''.stripIndent()
-        // If a prior run against THIS artifactPath already published the BOLTed build
-        // as canonical, publishBoltedCanonical preserved the original as
-        // unbolted-<tarball>. Prefer it so we profile/BOLT the un-BOLTed input rather
-        // than double-BOLTing. Inert for a fresh artifactPath (no unbolted- object),
-        // where canonical IS the un-BOLTed build.
-        def unboltedTarUrl = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}/unbolted-${BOLT_TARNAME}"
+        // The read helper (copied into the workspace by the download stage) locates
+        // the tarball: `--exists` looks on the primary location first and on the
+        // other one only when the file is absent there, and prints the URL and SHA-1
+        // of the copy it found, which fetch_verified then downloads and checks.
+        // Jenkins environment variables do not reach the cluster, so the script
+        // exports what the helper reads. If a prior run against THIS artifactPath
+        // already published the BOLTed build as canonical, publishBoltedCanonical
+        // preserved the original as unbolted-<tarball>. Prefer it so we profile/BOLT
+        // the un-BOLTed input rather than double-BOLTing. Inert for a fresh
+        // artifactPath (no unbolted- object), where canonical IS the un-BOLTed build.
+        // Reads use the publishing credential, the one the pipelines publish build artifacts with.
+        def awsCredentialId = LLM_ARTIFACTS_LOCATIONS.aws.credential
+        def readNetrc = "${ws}/builds/${BOLT_TARNAME}.netrc"
         def tarStage = """
-            URL='${llmTarfile}'
-            if curl -fsI '${unboltedTarUrl}' >/dev/null 2>&1; then
-                echo '[INFO] found unbolted-${BOLT_TARNAME}; using it as the un-BOLTed input (avoids double-BOLT on reuse)'
-                URL='${unboltedTarUrl}'
-            fi
+            INPUT_DIR='${ARTIFACT_PATH}'
+            TARNAME='${BOLT_TARNAME}'
+            FETCH_HELPER='${ws}/fetch_build_artifact.sh'
+            FETCH_ABSENT=${FETCH_ABSENT}
+            AWS_ROOT='${LLM_ARTIFACTS_LOCATIONS.aws.root}/'
             DEST='${ws}/builds/${BOLT_TARNAME}'
             PARTS=16
+            export LLM_ARTIFACTS_PRIMARY='${primary}'
+            export ARTIFACTORY_NETRC='${readNetrc}'
+            export ARTIFACTORY_CREDENTIAL_ID='${awsCredentialId}'
         """.stripIndent() + boltFetchLib + '''
             set -e
-            fetch_verified "$URL" "$DEST" gzip -t
+            # The netrc arrives on stdin; the trap removes it however this exits.
+            trap 'rm -f "$ARTIFACTORY_NETRC"' EXIT
+            (umask 077 && cat > "$ARTIFACTORY_NETRC")
+            chmod 600 "$ARTIFACTORY_NETRC"
+            # FETCH_ABSENT from the helper means the file is on neither location. Other
+            # failures (a rejected credential, or a transfer that failed after its own
+            # retries) end the stage with the helper's exit code; the helper has logged why.
+            rc=0
+            RESOLVED=$(bash "$FETCH_HELPER" --exists "$INPUT_DIR/unbolted-$TARNAME") || rc=$?
+            if [ "$rc" -eq 0 ]; then
+                echo "[INFO] found unbolted-$TARNAME; using it as the un-BOLTed input (avoids double-BOLT on reuse)"
+            elif [ "$rc" -eq "$FETCH_ABSENT" ]; then
+                echo "[INFO] no unbolted-$TARNAME; using $TARNAME as the un-BOLTed input"
+                rc=0
+                RESOLVED=$(bash "$FETCH_HELPER" --exists "$INPUT_DIR/$TARNAME") || rc=$?
+                if [ "$rc" -eq "$FETCH_ABSENT" ]; then
+                    echo "[ERROR] input tarball missing: neither unbolted-$TARNAME nor $TARNAME exists on either location" >&2
+                fi
+            fi
+            [ "$rc" -eq 0 ] || exit "$rc"
+            URL=${RESOLVED%% *}
+            SHA1=${RESOLVED##* }
+            # Credentials go to the aws location only; urm is read anonymously.
+            FETCH_NETRC=
+            case "$URL" in "$AWS_ROOT"*) FETCH_NETRC=$ARTIFACTORY_NETRC ;; esac
+            # The archive check, then the SHA-1 that the serving location reported.
+            _verify_input() {
+                gzip -t "$1" || return 1
+                [ "$(sha1sum "$1" | cut -d' ' -f1)" = "$SHA1" ] && return 0
+                echo "[ERROR] $1 does not match SHA-1 $SHA1 reported for $URL" >&2
+                return 1
+            }
+            fetch_verified "$URL" "$DEST" _verify_input
         '''.stripIndent()
         // Stage llvm-bolt into the shared ${ws}/builds/llvm (the per-node instrument
         // hook via BOLT_LLVM_DIR and the merge job both reuse it). The GitHub
@@ -453,8 +662,20 @@ def submitProfileGen(pipeline)
         // is lost -- marginal, especially on a cache HIT (a quick local extract).
         // bashWrappedRemoteCmd: not all clusters default to bash, so wrap the scripts.
         stage("Bootstrap: download tarball") {
-            Utils.exec(pipeline, timeout: false, numRetries: 2,
-                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(tarStage)))
+            Utils.copyFileToRemoteHost(pipeline, remote, readHelper, "${ws}/fetch_build_artifact.sh")
+            def runDownload = bashRemoteScriptFile(pipeline, remote, tarStage,
+                "${localScriptDir}/download_tarball.sh", "${ws}/builds/${BOLT_TARNAME}.fetch.sh")
+            // The credential reaches the cluster as in promoteBundle(): a netrc
+            // rendered from shell variables on the agent and fed over ssh stdin,
+            // never part of the script text. set +x keeps the printf arguments out of
+            // the step's trace.
+            def awsHost = LLM_ARTIFACTS_LOCATIONS.aws.root.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+            pipeline.withCredentials([pipeline.usernamePassword(credentialsId: awsCredentialId,
+                    usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
+                def feed = "set +x\nprintf 'machine ${awsHost} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
+                Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
+                    script: feed + Utils.sshUserCmd(remote, runDownload))
+            }
         }
         // Extract the full source tree + wheel (packs the build commit's
         // TensorRT-LLM/src). The perf harness runs from this checkout
@@ -465,8 +686,10 @@ def submitProfileGen(pipeline)
                 script: Utils.sshUserCmd(remote, "\"tar -xf ${ws}/builds/${BOLT_TARNAME} -C ${ws} TensorRT-LLM\""))
         }
         stage("Bootstrap: stage llvm-bolt") {
+            def runLlvmStage = bashRemoteScriptFile(pipeline, remote, llvmStage,
+                "${localScriptDir}/stage_llvm_bolt.sh", "${ws}/builds/stage_llvm_bolt.sh")
             Utils.exec(pipeline, timeout: false, numRetries: 2,
-                script: Utils.sshUserCmd(remote, b64BashRemoteCmd(llvmStage)))
+                script: Utils.sshUserCmd(remote, runLlvmStage))
         }
 
         // 2) Fan-out: ONE perf-sanity run per workload (Jenkins parallel{}).
@@ -547,7 +770,7 @@ def submitProfileGen(pipeline)
                 publishBoltedCanonical(pipeline, remote,
                     "${outDir}/bolt-${BOLT_TARNAME}",       // bolted build from the merge job
                     "${ws}/builds/${BOLT_TARNAME}",         // un-BOLTed input on the cluster
-                    "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}", BOLT_TARNAME)
+                    primary, BOLT_TARNAME, localScriptDir)
             }
         } else if (!PUBLISH_BOLTED_CANONICAL) {
             pipeline.echo("PUBLISH_BOLTED_CANONICAL=false: not repushing a BOLTed canonical tarball.")
@@ -794,14 +1017,23 @@ def promoteBundle(pipeline, remote, String bundle)
 // reused artifactPath: the unbolted- snapshot is skipped if it already exists, so a
 // re-run never overwrites the real unbolted with an already-BOLTed canonical.
 //
-// Credentials use the same stdin-fed netrc pattern as promoteBundle(): the secret
-// travels over ssh stdin (read by `cat > netrc`), never embedded in the base64'd
-// script, so it can't leak via the decoded remote command or `ps`.
+// `location` is the primary location ("aws" or "urm"), which decides the target
+// URL and the publisher credential. Credentials use the same stdin-fed netrc
+// pattern as promoteBundle(): the secret travels over ssh stdin (read by
+// `cat > netrc`), never embedded in the script, so it can't leak via the script
+// file, the remote command or `ps`. The script goes to the cluster as a file
+// (bashRemoteScriptFile), written first under localScriptDir on the agent.
 // ---------------------------------------------------------------------------
-def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unboltedLocal, String artifactBase, String tarName)
+def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unboltedLocal, String location, String tarName,
+    String localScriptDir)
 {
-    def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+    def artifactBase = llmArtifactsUrl(location, ARTIFACT_PATH)
+    def host = artifactBase.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+    def credentialId = LLM_ARTIFACTS_LOCATIONS[location].credential
+    def repo = LLM_ARTIFACTS_LOCATIONS[location].repo
+    def layoutDir = llmArtifactsLayoutPath(ARTIFACT_PATH)
     def netrc = "${boltedLocal}.netrc"
+    def response = "${boltedLocal}.response"
     def canonicalUrl = "${artifactBase}/${tarName}"
     def unboltedUrl  = "${artifactBase}/unbolted-${tarName}"
     pipeline.echo("Publishing BOLTed build as canonical ${canonicalUrl} (un-BOLTed preserved at ${unboltedUrl})")
@@ -811,34 +1043,56 @@ def publishBoltedCanonical(pipeline, remote, String boltedLocal, String unbolted
     def publish = """
         set -e
         umask 077
-        trap 'rm -f "${netrc}"' EXIT
+        trap 'rm -f "${netrc}" "${response}"' EXIT
         test -f "${boltedLocal}"   || { echo "[ERROR] bolted tarball missing: ${boltedLocal} (did the merge run with BOLT_APPLY=1?)" >&2; exit 1; }
         test -f "${unboltedLocal}" || { echo "[ERROR] un-BOLTed tarball missing: ${unboltedLocal}" >&2; exit 1; }
         cat > "${netrc}"
         chmod 600 "${netrc}"
+        # http_status CURL_ARGS...: print the final HTTP status of one request (000
+        # if no response arrived). Without -f, curl retries connection errors and
+        # transient statuses (408, 429, 5xx) but returns a 401/403 at once. The
+        # body goes to a regular file: curl cannot retry a transfer whose output
+        # it cannot truncate, such as /dev/null.
+        http_status() {
+            curl -sS --netrc-file "${netrc}" --retry 5 --retry-all-errors --connect-timeout 30 \\
+                 -o "${response}" -w '%{http_code}' "\$@" || true
+        }
+        # fail_status NAME STATUS: report the failed request for NAME and exit.
+        fail_status() {
+            case "\$2" in
+                401|403) echo "[ERROR] ${host} rejected the credentials for ${layoutDir}/\$1 (HTTP \$2): the Artifactory access token in credential '${credentialId}' needs renewal or lacks deploy permission on ${repo}." >&2 ;;
+                *) echo "[ERROR] request for ${layoutDir}/\$1 on ${host} failed (HTTP \$2)" >&2 ;;
+            esac
+            exit 1
+        }
         # 1) Preserve the un-BOLTed build as unbolted-${tarName}, unless already there.
-        #    A PUT-upload, NOT /api/copy: the target repo is virtual, so a server-side
-        #    copy returns 409. Idempotent via the existence check: on a re-run the
-        #    canonical is ALREADY the BOLTed build, and re-publishing would otherwise
-        #    overwrite the real unbolted with a bolted copy.
-        if curl -fsI --netrc-file "${netrc}" "${unboltedUrl}" >/dev/null 2>&1; then
-            echo "[INFO] unbolted-${tarName} already exists; skipping upload"
-        else
-            echo "[INFO] uploading un-BOLTed tarball -> unbolted-${tarName}"
-            curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
-                 --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
-                 -T "${unboltedLocal}" "${unboltedUrl}"
-        fi
+        #    A PUT-upload, NOT /api/copy: on urm the target repo is virtual, so a
+        #    server-side copy returns 409. Idempotent via the existence check: on a
+        #    re-run the canonical is ALREADY the BOLTed build, and re-publishing would
+        #    otherwise overwrite the real unbolted with a bolted copy. Only a 404
+        #    counts as absent: a rejected credential or a failed check stops here.
+        status=\$(http_status -I "${unboltedUrl}")
+        case "\$status" in
+            2??|3??) echo "[INFO] unbolted-${tarName} already exists; skipping upload" ;;
+            404)
+                echo "[INFO] uploading un-BOLTed tarball -> unbolted-${tarName}"
+                status=\$(http_status --speed-time 300 --speed-limit 1024 -T "${unboltedLocal}" "${unboltedUrl}")
+                case "\$status" in 2??) ;; *) fail_status "unbolted-${tarName}" "\$status" ;; esac
+                ;;
+            *) fail_status "unbolted-${tarName}" "\$status" ;;
+        esac
         # 2) Overwrite canonical ${tarName} with the BOLTed build (the release name).
-        curl -fS --netrc-file "${netrc}" --retry 5 --retry-all-errors \\
-             --connect-timeout 30 --speed-time 300 --speed-limit 1024 \\
-             -T "${boltedLocal}" "${canonicalUrl}"
+        status=\$(http_status --speed-time 300 --speed-limit 1024 -T "${boltedLocal}" "${canonicalUrl}")
+        case "\$status" in 2??) ;; *) fail_status "${tarName}" "\$status" ;; esac
     """.stripIndent()
-    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
+    def runPublish = bashRemoteScriptFile(pipeline, remote, publish,
+        "${localScriptDir}/publish_bolted_canonical.sh", "${boltedLocal}.publish.sh")
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: credentialId,
             usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
-        def feed = "printf 'machine ${host} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
+        // set +x keeps the printf arguments out of the step's trace.
+        def feed = "set +x\nprintf 'machine ${host} login %s password %s\\n' \"\$ART_USER\" \"\$ART_PASS\" | "
         Utils.exec(pipeline, timeout: false, numRetries: 2, noNVDFEvent: true,
-            script: feed + Utils.sshUserCmd(remote, b64BashRemoteCmdStdin(publish, "${boltedLocal}.publish.sh")))
+            script: feed + Utils.sshUserCmd(remote, runPublish))
     }
     pipeline.echo("Published. canonical = ${canonicalUrl}")
 }
@@ -949,6 +1203,11 @@ pipeline {
             defaultValue: "",
             description: "SLURM CPU partition for the merge job. The merge is 100% CPU. An empty string maps to the value 'cpu'. Set this if a cluster names its CPU partition differently."
         )
+        string(
+            name: "globalVars",
+            defaultValue: "",
+            description: "JSON settings passed by the parent pipeline. This job reads llm_artifacts_primary from it: the location to read the input tarball from first and to publish the BOLTed build to. Empty for a standalone run, which uses this controller's LLM_ARTIFACTS_PRIMARY."
+        )
     }
     options {
         skipDefaultCheckout()
@@ -959,8 +1218,22 @@ pipeline {
         stage("BOLT Profile Generation") {
             steps {
                 script {
+                    def parentVars = trtllm_utils.updateMapWithJson(this,
+                        [(LLM_ARTIFACTS_PRIMARY_KEY): ""], env.globalVars, "globalVars")
+                    if (parentVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = parentVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
+                    // The cluster runs jenkins/scripts/fetch_build_artifact.sh from the
+                    // run's commit (the branch for a standalone run without one).
+                    // checkoutFile needs git, which the pod's default (jnlp) container
+                    // has and alpine lacks; the pod's containers share the workspace
+                    // volume, so submitProfileGen copies it to the cluster from there.
+                    def readHelperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit ?: BRANCH,
+                        "jenkins/scripts/fetch_build_artifact.sh", readHelperDir)
                     container('alpine') {
-                        def bundle = submitProfileGen(this)
+                        def bundle = submitProfileGen(this, "${readHelperDir}/fetch_build_artifact.sh")
                         echo("BOLT profile bundle: ${bundle}")
                     }
                 }
