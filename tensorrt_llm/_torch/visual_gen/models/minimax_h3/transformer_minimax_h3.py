@@ -159,6 +159,13 @@ class MiniMaxH3Attention(Attention):
             async_ulysses=use_async_ulysses,
             separate_qkv_is_self_attention=True,
         )
+        # Ulysses rank of this attention's sequence shard (0 without Ulysses), for the padded-row
+        # bound of the fused FP8 cast.
+        self._l8_rank = (
+            torch.distributed.get_rank(group=self.attn.process_group)
+            if getattr(self.attn, "world_size", 1) > 1
+            else 0
+        )
         self.use_async_ulysses = use_async_ulysses
 
     def _use_fused_qk_norm_rope(
@@ -224,6 +231,12 @@ class MiniMaxH3Attention(Attention):
                 if fusion_mode() == "static"
                 else None
             )
+            valid_len = None
+            if key_padding_mask is not None:
+                # Trailing padding; the mask spans the full sequence, this rank holds rows
+                # [rank * S_local, (rank + 1) * S_local). Padded rows must not set the scale.
+                lengths = key_padding_mask.sum(dim=1) - self._l8_rank * sequence_length
+                valid_len = lengths.clamp(0, sequence_length).to(torch.int32).contiguous()
             query, key, value, descales = torch.ops.h3_lever8.qk_norm_rope_fp8(
                 qkv,
                 self.norm_q.weight,
@@ -235,6 +248,7 @@ class MiniMaxH3Attention(Attention):
                 self.local_num_attention_heads,
                 self.head_dim,
                 int(self.layer_idx),
+                valid_len,
             )
             hidden_states = self._attn_impl(
                 query,
