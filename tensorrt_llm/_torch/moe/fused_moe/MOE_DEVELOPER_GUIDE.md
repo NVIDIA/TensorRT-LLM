@@ -948,7 +948,13 @@ set wrong has a test that catches it:
   reset by the next launch before its count exchange; the route wait waits for
   `auxiliary_sms` and resets the counter in one batched stream memory
   operation; MAIN may change between layer calls behind a MAIN-to-MAIN fence;
-  and `finish` joins COPY into MAIN.
+  and `finish` joins COPY into MAIN. The fence sees only host layer calls:
+  after a capture the host's MAIN stays the capture stream while replays run on
+  the execution stream, so an eager call on the capture stream after a replay
+  must be ordered after it by the caller, as the breakable runner's
+  `wait_stream` before each warmup does.
+  `forget_helper_residency` is an EP collective that raises when the ranks
+  differ in which layer they reset or how often.
 - HALO-Q and TMA follow the native-operator path under
   `cpp/tensorrt_llm/kernels/moe/loadBalance/dynamicEplb` and
   `cpp/tensorrt_llm/thop/moe/loadBalance`. The scheduler accepts the original

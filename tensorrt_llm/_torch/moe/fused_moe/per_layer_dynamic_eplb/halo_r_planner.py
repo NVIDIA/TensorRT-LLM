@@ -410,7 +410,9 @@ class HaloRRelayEndpoint:
 
         The counts cover every launch of the layer, eager and replayed, and
         sum each plan's receivers over its broadcasts. This diagnostic waits
-        for the copy stream, so it stays out of the serving path.
+        for the copy stream only, and replayed launches run on the graph's
+        own streams: synchronize the device first to count them. It stays out
+        of the serving path.
         """
         launches, copies, skips = torch.ops.trtllm.moe_rebalance_halo_r_relay_counts(self.ctx)
         return int(launches), int(copies), int(skips)
@@ -661,6 +663,14 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         last route-counter reset the next route wait must follow. A change
         into a stream that is capturing raises: an event recorded outside the
         capture cannot be waited on inside it.
+
+        The host sees only layer calls, not graph replays: after a capture,
+        MAIN stays the capture stream while the graph replays on the execution
+        stream. A later eager call on the capture stream is therefore no
+        change and gets no fence, so the caller must order it after the
+        replays, as the breakable runner does before every warmup on its
+        capture stream (``wait_stream``). Without that order, its route wait
+        could pass on a replayed launch's routes.
         """
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")

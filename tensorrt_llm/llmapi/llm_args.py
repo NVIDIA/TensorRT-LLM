@@ -1962,7 +1962,7 @@ _HALO_R_MIN_HOME_EXPERTS = 4
 _HALO_R_MAX_EP = 32
 # The HALO-R scheduler plans on CTA 0 and maps routes on the others.
 _HALO_R_MIN_AUXILIARY_SMS = 2
-# HALO-R's relay copy runs on the auxiliary SMs; its bandwidth grows with them up to about 16.
+# HALO-R's relay copy runs on the auxiliary SMs, one CTA each, so they bound its copy bandwidth.
 _HALO_R_MAX_AUXILIARY_SMS = 16
 # HALO-Q's in-switch TMA copy runs on at most 8 SMs.
 _HALO_Q_MAX_AUXILIARY_SMS = 8
