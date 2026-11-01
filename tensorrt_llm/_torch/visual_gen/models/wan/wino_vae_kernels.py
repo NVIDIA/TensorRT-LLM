@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Kernel wrappers for WinoVae: the CuTe DSL norm kernel (:mod:`jit_norm`, :mod:`cute_norm`),
+"""Kernel wrappers for WinoVae: the CuTe DSL norm kernel (:mod:`jit_norm`, :mod:`kernels.norm`),
 the compiled ``trtllm::vae_*`` ops and the sm100 CuTe DSL pipeline. Each wrapper states its
 layout, dtype and shape preconditions; choosing a fallback when they do not hold is the
 caller's job (``can_*`` / ``*_available`` predicates), not the wrapper's."""
@@ -209,7 +209,7 @@ def winograd_weights(
 
 # Spatial filter transforms G of F(2x2, 3x3) and F(4x4, 3x3) (:mod:`wino_tables`, shared with
 # the sm100 path), applied in fp64 and rounded once. The matching B^T and A^T live in
-# cute_spatial.py.
+# kernels/spatial_winograd.py.
 _WINO_G = {tile: torch.tensor(SPATIAL_WINO[tile]["G"], dtype=torch.float64) for tile in (2, 4)}
 
 
@@ -217,7 +217,7 @@ def winograd_spatial_weights(weight: torch.Tensor, tile: int = 2, order: int = 2
     """``[Cout, Cin, 3, 3, 3]`` -> ``U [(order+2) * (tile+2)^2, Cin, Cout]`` fp16: the temporal
     components of :func:`winograd_weights`, each transformed as ``G g G^T`` for spatial
     F(tile x tile, 3x3), ordered ``component * (tile+2)^2 + row * (tile+2) + col`` to match
-    :func:`cute_spatial.wino_spatial_in`. The transformed data is fp16 end to end (V, U, M)."""
+    :func:`kernels.spatial_winograd.wino_spatial_in`. The transformed data is fp16 end to end (V, U, M)."""
     taps = weight.detach().double()  # [Cout, Cin, 3, 3, 3]
     gt = torch.tensor(TEMPORAL_WINO[order]["G"], dtype=torch.float64, device=weight.device)
     comps = torch.einsum("kt,oitab->koiab", gt, taps)  # [comps, Cout, Cin, 3, 3]
@@ -254,7 +254,7 @@ def wino_spatial_conv_frames(
     taps, _, cin = frames.shape
     tile = spatial_tile_of(u, 1)
     tile_rows = -(-height // tile)
-    from .cute_spatial import wino_spatial_in, wino_spatial_out
+    from .kernels.spatial_winograd import wino_spatial_in, wino_spatial_out
 
     v = wino_spatial_in(frames.view(taps, height, width, cin), 1, 0, tile_rows, tile, taps > 1)
     m = torch.bmm(v, u)
@@ -278,7 +278,7 @@ def wino_spatial_conv_taps(
     tile = spatial_tile_of(u, 1)
     tile_rows = -(-height // tile)
     cout = u.shape[2]
-    from .cute_spatial import wino_spatial_in_taps, wino_spatial_out
+    from .kernels.spatial_winograd import wino_spatial_in_taps, wino_spatial_out
 
     v = wino_spatial_in_taps(
         [t.view(t.shape[0], height, width, t.shape[-1]) for t in taps],
@@ -312,13 +312,15 @@ def jit_norm_available() -> bool:
 @functools.lru_cache(maxsize=None)
 def sm100_wino_available() -> bool:
     """The Blackwell spatial-Winograd kernels: sm100 and ``nvidia-cutlass-dsl`` installed."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import sm100_wino_available
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
+        sm100_wino_available,
+    )
 
     return sm100_wino_available()
 
 
 def sm100_spatial_eligible(cin: int, cout: int, width: int) -> bool:
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import spatial_eligible
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import spatial_eligible
 
     return spatial_eligible(cin, cout) and width % 4 == 0
 
@@ -326,19 +328,19 @@ def sm100_spatial_eligible(cin: int, cout: int, width: int) -> bool:
 def sm100_spatial_filters(g: list[torch.Tensor]) -> torch.Tensor:
     """Transformed filters for :func:`wino_spatial_conv_sm100` from the component filters
     ``g[k] [Cout, Cin, 3, 3]`` (:func:`winograd_weights`)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import spatial_filters
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import spatial_filters
 
     return spatial_filters(g)
 
 
 def sm100_fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import fused_eligible
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import fused_eligible
 
     return fused_eligible(cin, cout, height, width)
 
 
 def sm100_fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import fused_filters
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import fused_filters
 
     return fused_filters(g)
 
@@ -349,7 +351,7 @@ def wino_spatial_conv_fused(
     """Same contract as :func:`wino_spatial_conv_cuda` for the 256-output-channel convs: the
     fused F(2,3)-horizontal / direct-vertical kernel (CuTe DSL, sm100), filters from
     :func:`sm100_fused_filters`."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import (
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
         wino_spatial_conv_fused as conv,
     )
 
@@ -361,7 +363,7 @@ def wino_spatial_conv_sm100(
 ) -> torch.Tensor:
     """Same contract as :func:`wino_spatial_conv_cuda` with ``u`` from
     :func:`sm100_spatial_filters`: the Blackwell F(4x4, 3x3) pipeline (CuTe DSL, sm100)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.spatial import (
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
         wino_spatial_conv as conv,
     )
 
@@ -374,13 +376,13 @@ def wino_spatial_conv_cuda(
     """3x3 conv (padding 1) of each of the ``order + 2`` Winograd inputs (4 or 6) by its filter as
     spatial Winograd: ``D [comps, pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [comps, pairs, H*W,
     Cout]`` in ``D``'s dtype (bias-free, fp32 accumulate).
-    Input and output transforms are CuTe DSL kernels (:mod:`cute_spatial`); the batched GEMMs
+    Input and output transforms are CuTe DSL kernels (:mod:`kernels.spatial_winograd`); the batched GEMMs
     are one cuBLAS call. The tile size (2 or 4) follows the filters ``u``."""
     comps, pairs, positions, cin = d.shape
     tile = spatial_tile_of(u, comps)
     frames = d.view(comps * pairs, height, width, cin)
     tile_rows = -(-height // tile)
-    from .cute_spatial import wino_spatial_in, wino_spatial_out
+    from .kernels.spatial_winograd import wino_spatial_in, wino_spatial_out
 
     v = wino_spatial_in(frames, comps, 0, tile_rows, tile)
     m = torch.bmm(v, u)
@@ -393,7 +395,7 @@ def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, p
     """Write ``clamp(unpatchify(chunk), -1, 1)`` into ``out[:, :, frame0:frame0 + t]``: ``chunk``
     ``[1, C*patch*patch, t, H, W]`` and ``out`` ``[1, C, T, H*patch, W*patch]``, both channels-last
     bf16. Same element mapping as :func:`wan_vae.unpatchify`."""
-    from .cute_frame_ops import unpatchify_clamp_into as kernel
+    from .kernels.frame_ops import unpatchify_clamp_into as kernel
 
     kernel(chunk, out, frame0, patch)
 
@@ -472,7 +474,7 @@ def avg_down_add_cuda(
 ) -> torch.Tensor:
     """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``;
     ``bias`` is the downsample conv's bias when that conv ran without it."""
-    from .cute_frame_ops import avg_down_add
+    from .kernels.frame_ops import avg_down_add
 
     return avg_down_add(
         x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t, bias
@@ -481,7 +483,7 @@ def avg_down_add_cuda(
 
 def interleave_bias_cuda(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
-    from .cute_frame_ops import interleave_bias
+    from .kernels.frame_ops import interleave_bias
 
     return interleave_bias(u, bias)
 
@@ -534,10 +536,10 @@ def wino_norm_silu_cuda(
 
 
 def can_use_cuda_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
-    """The gather kernel runs and covers these shapes (:func:`cute_upsample.can_upsample_gather`)."""
+    """The gather kernel runs and covers these shapes (:func:`kernels.upsample_gather.can_upsample_gather`)."""
     if not cuda_op_available():
         return False
-    from .cute_upsample import can_upsample_gather
+    from .kernels.upsample_gather import can_upsample_gather
 
     return can_upsample_gather(cout, factor_t, repeats)
 
@@ -579,8 +581,8 @@ def upsample_gather_cuda(
     crop: int = 0,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Phase gather (:mod:`cute_upsample`) with the conv bias and the DupUp3D shortcut add
+    """Phase gather (:mod:`kernels.upsample_gather`) with the conv bias and the DupUp3D shortcut add
     folded in."""
-    from .cute_upsample import upsample_gather
+    from .kernels.upsample_gather import upsample_gather
 
     return upsample_gather(temp, shortcut, batch, frames, factor_t, repeats, crop, bias)

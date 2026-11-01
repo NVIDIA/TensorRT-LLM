@@ -32,7 +32,8 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir_helpers.op import dsl_user_op
 
-from .cute_common import (
+from ..jit_norm import MID_NONE, MID_NORM_SILU, OUT_ROWS, OUT_WINOGRAD, Variant
+from .common import (
     VEC,
     bf16_hi,
     bf16_lo,
@@ -43,7 +44,6 @@ from .cute_common import (
     u32_view,
     vec_view,
 )
-from .jit_norm import MID_NONE, MID_NORM_SILU, OUT_ROWS, OUT_WINOGRAD, Variant
 
 THREADS = 256
 WARPS = THREADS // 32
@@ -73,7 +73,7 @@ def _opaque(x: Int32, *, loc=None, ip=None) -> Int32:
 
 @functools.lru_cache(maxsize=None)
 def _tables(order: int) -> tuple[list[list[float]], list[list[float]]]:
-    from .wino_vae_kernels import TEMPORAL_WINO
+    from ..wino_vae_kernels import TEMPORAL_WINO
 
     w = TEMPORAL_WINO[max(order, 2)]
     return w["BT"], w["AT"]
@@ -933,7 +933,7 @@ def _compile(variant: Variant, has_sum: bool, stream):
         )
         return cute.compile(kernel.wrapper, *ptrs, *scalars, stream, options="--enable-tvm-ffi")
 
-    from . import jit_norm, wino_vae_kernels
+    from .. import jit_norm, wino_vae_kernels
 
     sources = [__file__, jit_norm.__file__, wino_vae_kernels.__file__]
     fn = compile_cached("trtllm_wan_vae_norm", _kernel_name(variant, has_sum), compile_fn, sources)

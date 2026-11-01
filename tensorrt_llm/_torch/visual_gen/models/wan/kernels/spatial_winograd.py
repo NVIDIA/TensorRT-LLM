@@ -32,7 +32,7 @@ import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass._mlir_helpers.math import RoundingMode
 
-from .cute_common import VEC, compile_cached, pack2
+from .common import VEC, compile_cached, pack2
 
 THREADS = 256
 STAGED_TILES = 8

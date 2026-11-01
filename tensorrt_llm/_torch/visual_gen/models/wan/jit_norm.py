@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The Wan VAE position-walk kernel (:mod:`.cute_norm`): call-site interface.
+"""The Wan VAE position-walk kernel (:mod:`.kernels.norm`): call-site interface.
 
 One kernel covers the fused RMSNorm + SiLU, the temporal Winograd norm (Winograd input producer
 and product consumer, order 2 or 4) and the Winograd combine; its parameters (dtypes, order,
@@ -205,14 +205,14 @@ def _launch(
 ) -> None:
     from cuda.bindings import driver as cuda
 
-    from . import cute_norm
+    from .kernels import norm as norm_kernel
 
     out_positions = (height + pad_h) * (width + pad_w) if variant.padded else positions
     if out_positions <= 0:
         return
     halo = _halo_args(out_geo.push if out_geo is not None else None, channels)
     in_map, out_map = _map_args(in_geo), _map_args(out_geo)
-    cute_norm.launch(
+    norm_kernel.launch(
         variant,
         device,
         out_sum is not None,

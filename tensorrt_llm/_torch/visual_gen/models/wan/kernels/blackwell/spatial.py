@@ -24,7 +24,7 @@ def sm100_wino_available() -> bool:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         return False
     try:
-        from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import (  # noqa: F401
+        from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import (  # noqa: F401
             fused_conv,
             gemm,
             transforms,
@@ -37,7 +37,7 @@ def sm100_wino_available() -> bool:
 def spatial_filters(g: list[torch.Tensor]) -> torch.Tensor:
     """``U [36, components, Cout, Cin]`` fp16: ``G g G^T`` per component filter ``g[k]
     [Cout, Cin, 3, 3]`` (fp32 math, rounded once), batch index ``coord * components + k``."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.transforms import WINO
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.transforms import WINO
 
     comps = len(g)
     cout, cin = g[0].shape[:2]
@@ -94,7 +94,9 @@ def _gemm(a, b, c, n_tile: int):
     import cutlass.utils as utils
     from cutlass.cute.runtime import make_fake_stream
 
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100.gemm import PersistentDenseGemmKernel
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.gemm import (
+        PersistentDenseGemmKernel,
+    )
 
     key = ("gemm", n_tile)
     fn = _compiled.get(key)
@@ -110,7 +112,7 @@ def _run(x: torch.Tensor, u: torch.Tensor, y: torch.Tensor, comps: int, pairs: i
     import cuda.bindings.driver as cuda
     from cutlass.cute.runtime import from_dlpack
 
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import transforms
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms
 
     frames, height, width, cin = x.shape
     cout = u.shape[2]
@@ -139,7 +141,7 @@ def fused_eligible(cin: int, cout: int, height: int, width: int) -> bool:
 def fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
     """Transformed filters for :func:`wino_spatial_conv_fused`, one per component filter
     ``g[k] [Cout, Cin, 3, 3]``."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import fused_conv
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import fused_conv
 
     return [fused_conv.prepare(gk.contiguous().to(torch.bfloat16)) for gk in g]
 
@@ -150,7 +152,7 @@ def wino_spatial_conv_fused(
     """The fused F(2,3)-horizontal / direct-vertical 3x3 conv per component: ``D [components,
     pairs, H*W, Cin]`` (bf16 or fp16) -> ``M [components, pairs, H*W, 256]`` in ``D``'s dtype,
     one stacked buffer (the consumer norm kernel reads the components at one stride)."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import fused_conv
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import fused_conv
 
     comps, pairs, positions, cin = d.shape
     cout = filters[0].shape[0]

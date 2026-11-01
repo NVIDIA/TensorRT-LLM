@@ -727,7 +727,7 @@ def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
 
 # --- spatial Winograd F(2x2, 3x3) transforms -------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.cute_spatial import (  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.wan.kernels.spatial_winograd import (  # noqa: E402
     wino_spatial_in,
     wino_spatial_out,
 )
@@ -1078,7 +1078,7 @@ def test_spatial_winograd_sm100_fp16_six_components() -> None:
 
 def _sm100_tile_v(x: torch.Tensor, n: int, th: int, tw: int, c0: int, c1: int) -> torch.Tensor:
     """V[:, tile (n, th, tw), c0:c1] of the F(4x4, 3x3) input transform in fp32."""
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import transforms as wino
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms as wino
 
     _, h, w, _ = x.shape
     d = torch.zeros(6, 6, c1 - c0, dtype=torch.float32, device=x.device)
@@ -1103,7 +1103,7 @@ def test_spatial_winograd_sm100_in_xform_above_2_31_elements() -> None:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import transforms as wino
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms as wino
 
     n, h, w, c = 3, 1080, 1920, 512
     th, tw = -(-h // 4), w // 4
@@ -1143,7 +1143,7 @@ def test_spatial_winograd_sm100_out_xform_above_2_31_elements() -> None:
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-    from tensorrt_llm._torch.visual_gen.models.wan.wino_sm100 import transforms as wino
+    from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell import transforms as wino
 
     n, h, w, c = 3, 1080, 1920, 512
     th, tw = -(-h // 4), w // 4

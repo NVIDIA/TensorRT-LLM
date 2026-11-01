@@ -26,7 +26,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import BFloat16, Float32, Int32
 
-from .cute_common import (
+from .common import (
     VEC,
     compile_cached,
     load_words,
