@@ -43,9 +43,12 @@ OUT_QUANT_ENABLED = _ENV not in ("0", "off", "false")
 
 
 def _launch_config() -> Tuple[int, int, int]:
-    """(rows per program, columns per program, warps) from the environment; defaults from the sweep."""
-    rb = int(os.environ.get("H3_OUT_QUANT_RB", "8"))
-    ch = int(os.environ.get("H3_OUT_QUANT_CH", "1024"))
+    """(rows per program, columns per program, warps) from the environment.
+
+    Defaults are the R200 sweep best: 16 rows x 512 columns per program, 4 warps.
+    """
+    rb = int(os.environ.get("H3_OUT_QUANT_RB", "16"))
+    ch = int(os.environ.get("H3_OUT_QUANT_CH", "512"))
     warps = int(os.environ.get("H3_OUT_QUANT_WARPS", "4"))
     if rb & (rb - 1) or ch & (ch - 1) or ch % 16 or rb < 1 or ch < 16:
         raise ValueError(
