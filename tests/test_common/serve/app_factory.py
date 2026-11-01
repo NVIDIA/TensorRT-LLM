@@ -107,6 +107,9 @@ class AggConfig:
     tool_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
     num_postprocess_workers: int = 0  # > 0 takes the postprocess-worker path
+    # Attached frontend of a multi-frontend server: registers the launcher
+    # forwarding routes ahead of the local handlers, which they shadow.
+    multi_frontend_attached: bool = False
 
 
 @dataclass(frozen=True)
@@ -221,6 +224,16 @@ class ServeTestEnv:
         else:
             generator = FakeLLM(args=args, executor=executor)
 
+        multi_frontend_serving = None
+        if config.multi_frontend_attached:
+            from tensorrt_llm.serve.multi_frontend import MultiFrontendServing
+
+            ipc_dir = self.tmp_dir / "multi_frontend_ipc"
+            ipc_dir.mkdir(parents=True, exist_ok=True)
+            multi_frontend_serving = MultiFrontendServing(
+                launcher_uds=str(ipc_dir / "launcher.sock"), is_launcher=False
+            )
+
         server = OpenAIServer(
             generator=generator,
             model=config.model_name,
@@ -231,6 +244,7 @@ class ServeTestEnv:
             rl_control_api_key="test-key" if config.rl_control else None,
             enable_runtime_control_endpoints=config.runtime_control,
             runtime_control_api_key="test-key" if config.runtime_control else None,
+            multi_frontend_serving=multi_frontend_serving,
         )
         self._servers.append(server)
         return server

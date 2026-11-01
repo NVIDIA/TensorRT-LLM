@@ -187,6 +187,14 @@ CONFIGS: Tuple[SnapshotConfig, ...] = (
         "openai_server",
         AggConfig(env=(("TRTLLM_ENABLE_RENDER_ENDPOINTS", "1"),)),
     ),
+    # An attached frontend of a multi-frontend server registers the launcher
+    # forwarding routes before the local table; same method and path, so
+    # registration order decides which handler serves them.
+    SnapshotConfig(
+        "llm_multi_frontend_attached",
+        "openai_server",
+        AggConfig(multi_frontend_attached=True),
+    ),
     SnapshotConfig("mm_encoder", "openai_server", AggConfig(role=ServerRole.MM_ENCODER)),
     SnapshotConfig(
         "mm_encoder_rl_control",
@@ -336,8 +344,14 @@ def compare(expected: Sequence[str], actual: Sequence[str]) -> List[str]:
             if _methods_path(added_record) == _methods_path(removed_record):
                 old_cls = _parse_record(removed_record)[2]
                 new_cls = _parse_record(added_record)[2]
+                why = (
+                    " (a plain APIRouter breaks msgpack bodies from the disaggregated frontend)"
+                    if old_cls == "_MsgspecRoute"
+                    else ""
+                )
                 class_changes.append(
-                    f"route class changed: {_methods_path(removed_record)}: {old_cls} -> {new_cls}"
+                    f"route class changed: {_methods_path(removed_record)}: "
+                    f"{old_cls} -> {new_cls}{why}"
                 )
                 removed.remove(removed_record)
                 remaining_added.remove(added_record)

@@ -424,6 +424,50 @@ configs:
     - GET /server_info _MsgspecRoute
     - POST /v1/chat/completions/render _MsgspecRoute
     - POST /v1/completions/render _MsgspecRoute
+  llm_multi_frontend_attached:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - 'GET /metrics _MsgspecRoute #forward'
+    - 'POST /kv_cache_events _MsgspecRoute #forward'
+    - 'POST /start_profile _MsgspecRoute #forward'
+    - 'POST /stop_profile _MsgspecRoute #forward'
+    - 'POST /steady_clock_offset _MsgspecRoute #forward'
+    - 'GET /v1/messages/batches _MsgspecRoute #forward'
+    - 'POST /v1/messages/batches _MsgspecRoute #forward'
+    - GET /v1/messages/batches/{rest:path} _MsgspecRoute
+    - POST /v1/messages/batches/{rest:path} _MsgspecRoute
+    - DELETE /v1/messages/batches/{rest:path} _MsgspecRoute
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - 'GET /metrics _MsgspecRoute #get_iteration_stats'
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - 'POST /steady_clock_offset _MsgspecRoute #set_steady_clock_offset'
+    - 'POST /kv_cache_events _MsgspecRoute #get_kv_cache_events'
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - 'POST /v1/messages/batches _MsgspecRoute #anthropic_create_batch'
+    - 'GET /v1/messages/batches _MsgspecRoute #anthropic_list_batches'
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - 'POST /start_profile _MsgspecRoute #start_profile'
+    - 'POST /stop_profile _MsgspecRoute #stop_profile'
+    - GET /server_info _MsgspecRoute
   mm_encoder:
     kind: openai_server
     routes:

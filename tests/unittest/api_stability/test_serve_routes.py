@@ -151,6 +151,41 @@ def test_metrics_presence_per_role(live_snapshots):
     assert "/metrics" in mm_paths
 
 
+def test_launcher_forwarding_shadows_local_routes(live_snapshots):
+    """An attached frontend's forwarding routes precede the local handlers.
+
+    Launcher-owned routes are registered before the local table with the same
+    method and path (or a path parameter that matches the same requests), and
+    FastAPI matches in registration order: flipping the order silently serves
+    launcher-owned state from the local process instead.
+    """
+    records = _routes_of(live_snapshots, "llm_multi_frontend_attached")
+    base = _routes_of(live_snapshots, "llm")
+    assert len(records) == len(base) + 10, (
+        "the attached-frontend configuration registers the ten launcher "
+        "forwarding routes on top of the default table"
+    )
+    forward_positions = [i for i, r in enumerate(records) if r.endswith("#forward")]
+    assert len(forward_positions) == 7, records
+    for position in forward_positions:
+        methods_path = " ".join(records[position].split(" ")[:2])
+        shadowed = [
+            j
+            for j, record in enumerate(records)
+            if j != position and " ".join(record.split(" ")[:2]) == methods_path
+        ]
+        assert shadowed and all(position < j for j in shadowed), (
+            f"{records[position]} must stay registered before the local handler of {methods_path}"
+        )
+    rest_positions = [i for i, r in enumerate(records) if "{rest:path}" in _parse(r)[1]]
+    batch_id_positions = [i for i, r in enumerate(records) if "{batch_id}" in _parse(r)[1]]
+    assert rest_positions and batch_id_positions
+    assert max(rest_positions) < min(batch_id_positions), (
+        "the batches forwarding routes (a path parameter that matches every "
+        "batch id) must stay registered before the local batch-id handlers"
+    )
+
+
 def test_metrics_shadowing_order(live_snapshots):
     records = _routes_of(live_snapshots, "llm_perf_metrics_enable_metrics_env")
     metrics = [r for r in records if _parse(r)[1] == "/metrics" and _parse(r)[0] == "GET"]

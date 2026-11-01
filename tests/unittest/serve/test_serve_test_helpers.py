@@ -101,7 +101,12 @@ def test_compare_reports_each_difference_kind():
     differences = compare(expected, actual)
     assert any(d.startswith("added:") and "/new" in d for d in differences)
     assert any(d.startswith("removed:") and "GET /a" in d for d in differences)
-    assert any("route class changed" in d and "_MsgspecRoute -> APIRoute" in d for d in differences)
+    assert any(
+        "route class changed" in d
+        and "_MsgspecRoute -> APIRoute" in d
+        and "(a plain APIRouter breaks msgpack bodies from the disaggregated frontend)" in d
+        for d in differences
+    )
     assert any("order changed" in d and "#get_iteration_stats" in d for d in differences)
 
 
