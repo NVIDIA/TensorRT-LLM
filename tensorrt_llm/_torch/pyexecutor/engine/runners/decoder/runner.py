@@ -1205,8 +1205,14 @@ class DecoderRunner(ScheduledModelRunner):
                         token_ids = [prompt + history for history in histories]
                     else:
                         token_ids = [request.get_tokens(beam_idx) for beam_idx in range(beam_width)]
-                    if is_context_request and request.py_orig_prompt_len < len(token_ids[0]):
-                        # Skip as we only need to apply logit processor on the last context request
+                    if is_context_request and (
+                        not request.is_last_context_chunk
+                        or request.py_orig_prompt_len < len(token_ids[0])
+                    ):
+                        # Only the last context chunk's row is sampled from; the
+                        # sampler drops the row of an earlier chunk. get_tokens(0)
+                        # is already the whole prompt during chunked prefill, so
+                        # the length check alone does not tell the chunks apart.
                         logits_row_offset += row_stride
                         continue
 

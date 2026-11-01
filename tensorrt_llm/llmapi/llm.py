@@ -1642,12 +1642,25 @@ class BaseLLM:
                     f"max_num_tokens ({max_num_tokens})")
         self._check_one_model_speculative_sampling(sampling_params)
 
-        if (sampling_params.apply_batched_logits_processor
-                and self.args.batched_logits_processor is None):
-            raise ValueError(
-                "`sampling_params.apply_batched_logits_processor=True` requires "
-                "`LLM(batched_logits_processor=...)`: there is no batched logits "
-                "processor to apply.")
+        if sampling_params.apply_batched_logits_processor:
+            if self.args.batched_logits_processor is None:
+                raise ValueError(
+                    "`sampling_params.apply_batched_logits_processor=True` requires "
+                    "`LLM(batched_logits_processor=...)`: there is no batched logits "
+                    "processor to apply.")
+            if (self.args.backend == "pytorch"
+                    and self.args.speculative_config is not None):
+                # One-model workers (MTP, Eagle3, ...) sample inside the
+                # forward, so the processor's edits never reach the tokens;
+                # the drafter-based modes (NGram, draft-target) sample
+                # 1 + draft_len rows per request while the post-processor
+                # walk steps by beam width, so it would hand the processor
+                # another request's rows. RequestError so the OpenAI frontend
+                # answers 4xx before the stream opens.
+                raise RequestError(
+                    "`sampling_params.apply_batched_logits_processor=True` is "
+                    "not supported with speculative decoding on the PyTorch "
+                    "backend. Drop the flag or disable speculative decoding.")
 
         if sampling_params.return_routed_experts and not (
                 self.args.backend == "pytorch"

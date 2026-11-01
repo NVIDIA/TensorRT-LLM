@@ -171,6 +171,12 @@ class BatchedLogitsProcessor(ABC):
     ) -> None:
         """Batched logits processing callback. The callback is expected to inplace modify the logits.
 
+        The TensorRT backend calls it once per step, on tensor-parallel rank 0, and broadcasts the
+        sampled tokens. The PyTorch backend calls it on every tensor-parallel rank of the last
+        pipeline stage, and each rank samples from its own copy of the edits: a callback with side
+        effects runs ``tp_size`` times per step, and a nondeterministic one can make the ranks
+        sample different tokens.
+
         Args:
             req_ids (List[int]): A batch of request ids.
             logits (List[torch.Tensor]): A batch of the logits tensors.
@@ -213,7 +219,9 @@ class SamplingParams:
         apply_batched_logits_processor (bool): Whether to apply batched logits postprocessor callback. Defaults to False.
             The BatchedLogitsProcessor class is recommended for callback creation. The callback must be provided when initializing LLM.
             The callback is called once per decoding step with every scheduled request that sets this, after each
-            request's own logits_processor(s).
+            request's own logits_processor(s). On the PyTorch backend it runs on every tensor-parallel rank of the
+            last pipeline stage, each sampling from its own edits, so it must be deterministic and free of side
+            effects; it is not supported together with speculative decoding there.
 
         n (int): Number of sequences to generate. Defaults to 1.
         best_of (int, optional): Number of sequences to consider for best output. Defaults to None.

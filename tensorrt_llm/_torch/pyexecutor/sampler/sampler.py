@@ -147,6 +147,7 @@ def greedy_tokens_usable(request: LlmRequest) -> bool:
         and not request.py_return_log_probs
         and not request.py_return_generation_logits
         and not request.py_logits_post_processors
+        and not request.py_apply_batched_logits_processor
         and request.py_guided_decoding_params is None
         and not check_stop_words_length(request)
         and request_row_params(request).mode is SamplingMode.GREEDY
