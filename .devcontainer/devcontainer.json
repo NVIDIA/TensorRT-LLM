@@ -1,5 +1,5 @@
-// For format details, see https://aka.ms/devcontainer.json. For config options, see the README at:
-// https://github.com/microsoft/vscode-dev-containers/tree/v0.245.2/containers/docker-existing-dockerfile
+// For configuration options, see https://containers.dev/implementors/json_reference/
+// For Dockerfile guidance, see https://containers.dev/guide/dockerfile
 {
   "name": "TRT-LLM Devcontainer",
   "dockerComposeFile": [
