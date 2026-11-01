@@ -26,6 +26,7 @@ Every op is ``@_compiler_disable``d to keep one clean Dynamo graph break per op
 instead of a per-call break from tracing flashinfer's lazy JIT bootstrap.
 """
 
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar, Union, cast
 
 import torch
@@ -47,6 +48,7 @@ def _compiler_disable(fn: _OpT) -> _OpT:
 
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
+    import flashinfer.topk
 else:
 
     class _FlashInferUnavailable:
@@ -398,6 +400,66 @@ def warmup_sampling_module() -> None:
             "flashinfer sampling module prewarm failed; it will be built "
             f"lazily on first use. {type(e).__name__}: {e}"
         )
+
+
+_topk_module_ready: Optional[bool] = None
+
+
+def topk_module_ready() -> bool:
+    """Whether flashinfer's top-k kernels load without a JIT build.
+
+    Decided once per process: beam search keeps a single top-k kernel for its
+    lifetime because the two kernels order equal values differently.
+    """
+    global _topk_module_ready
+    if _topk_module_ready is None:
+        ready = False
+        if IS_FLASHINFER_AVAILABLE:
+            try:
+                from flashinfer.jit.topk import gen_topk_module
+
+                ready = bool(gen_topk_module().is_compiled)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"flashinfer topk module probe failed. {type(e).__name__}: {e}")
+        _topk_module_ready = ready
+    return _topk_module_ready
+
+
+def _build_topk_module() -> None:
+    try:
+        flashinfer.topk.get_topk_module()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"flashinfer topk module background build failed. {type(e).__name__}: {e}")
+
+
+@_compiler_disable
+def warmup_topk_module() -> None:
+    """Load flashinfer's top-k kernels if built, else build them off the startup path.
+
+    Since flashinfer 0.7.2 the topk module also compiles CUB's batched top-k,
+    ~10 minutes from a cold cache: too long for the hang detector when built
+    lazily on the first beam step, and too long for launcher ready timeouts
+    when built synchronously here. A cold cache therefore builds on a daemon
+    thread while this process's beam search stays on torch.topk
+    (``topk_module_ready``); the next start picks up the cached kernels.
+    Best-effort like ``warmup_sampling_module``.
+    """
+    if not IS_FLASHINFER_AVAILABLE:
+        return
+    if topk_module_ready():
+        try:
+            flashinfer.topk.get_topk_module()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "flashinfer topk module prewarm failed; it will be built "
+                f"lazily on first use. {type(e).__name__}: {e}"
+            )
+        return
+    logger.info(
+        "flashinfer topk module is not built; beam search uses torch.topk in this "
+        "process while the kernels build in the background."
+    )
+    threading.Thread(target=_build_topk_module, name="flashinfer-topk-build", daemon=True).start()
 
 
 @torch.compile(options={"max-autotune": True})

@@ -1248,8 +1248,13 @@ async def test_token_ids_are_rejected_when_the_processor_does_not_consume_them()
 
 
 @pytest.mark.asyncio
-async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image_llm, monkeypatch):
+@pytest.mark.parametrize("model_defaults", [None, {"format": "np"}])
+async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(
+    image_llm, monkeypatch, model_defaults
+):
     llm, _ = image_llm
+    if model_defaults is None:
+        monkeypatch.delattr(_ImageInputProcessor, "get_preferred_media_io_kwargs")
     created_with = []
 
     class _ImageIo:
@@ -1292,7 +1297,7 @@ async def test_image_sources_preserve_order_uuid_and_model_decode_defaults(image
 
     mapped = await request_mapping._input_from_request(request, llm)
 
-    assert created_with == [({"format": "np"}, None)]
+    assert created_with == [(model_defaults, None)]
     assert mapped["prompt"] == request.prompt
     assert mapped["multi_modal_data"] == {
         "image": [

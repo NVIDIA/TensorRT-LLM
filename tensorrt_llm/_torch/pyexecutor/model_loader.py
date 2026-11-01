@@ -56,7 +56,7 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
@@ -121,6 +121,19 @@ _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
     rope_types=frozenset({"mrope"}),
     rope_fusion=frozenset({False}),
 )
+
+# TorchLlmArgs fields that only the model classes listing them in
+# `model_specific_llm_args` implement.
+_MODEL_SPECIFIC_LLM_ARGS = ("replicate_embedding",
+                            "mnnvl_allreduce_fp8_payload")
+
+
+def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
+                                       model_cls: type) -> None:
+    supported = getattr(model_cls, "model_specific_llm_args", frozenset())
+    for name in _MODEL_SPECIFIC_LLM_ARGS:
+        if getattr(llm_args, name) and name not in supported:
+            raise ValueError(f"{name} is not supported by {model_cls.__name__}")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -947,6 +960,8 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        if model_cls is not None:
+            _reject_unsupported_model_llm_args(llm_args, model_cls)
         original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
@@ -1070,7 +1085,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1595,7 +1610,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
@@ -2118,6 +2133,12 @@ class ModelLoader:
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
+            mnnvl_allreduce_fp8_payload=self.llm_args.
+            mnnvl_allreduce_fp8_payload,
+            replicate_embedding=self.llm_args.replicate_embedding,
+            cuda_graph_batch_sizes=tuple(
+                self.llm_args.cuda_graph_config.batch_sizes or
+                ()) if self.llm_args.cuda_graph_config else (),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
