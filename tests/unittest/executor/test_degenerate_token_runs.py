@@ -25,7 +25,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import meet_stop_token_criteria
+from tensorrt_llm._torch.pyexecutor.request_utils import executor_request_to_llm_request
+from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import (
+    handle_stop_criteria,
+    meet_stop_token_criteria,
+)
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.executor.utils import (
@@ -59,6 +63,7 @@ class _Request:
         self.py_stop_words_list = params._get_stop_words()
         self.py_num_generated_only_stop_words = len(params._degenerate_token_runs)
         self.py_orig_prompt_len = len(PROMPT)
+        self.orig_prompt_len = len(PROMPT)
         self.tokens = list(PROMPT)
 
     def get_tokens(self, beam_idx: int) -> list:
@@ -253,6 +258,7 @@ def test_production_run_does_not_count_prompt_suffix(ordinary_rule: bool) -> Non
         py_stop_words_list=([[PAD] * 20] if ordinary_rule else []) + params._get_stop_words(),
         py_num_generated_only_stop_words=1,
         py_orig_prompt_len=len(tokens),
+        orig_prompt_len=len(tokens),
         get_tokens=lambda beam_idx: tokens,
     )
     for generated in range(1, 21):
@@ -281,3 +287,66 @@ def test_worker_marks_only_server_added_stop_rules(ignore_eos: bool) -> None:
     assert BaseWorker._enqueue_request(worker, request) == 42
     assert submitted[0].py_num_generated_only_stop_words == (0 if ignore_eos else 1)
     assert submitted[0].stop_words == ([] if ignore_eos else [[7], [PAD] * 20])
+
+
+def test_generated_run_survives_native_pause_and_recompute() -> None:
+    source = tllm.Request(
+        input_token_ids=[PAD] * 19, max_tokens=40, stop_words=[[PAD] * 20], end_id=END_ID
+    )
+    source.py_num_generated_only_stop_words = 1
+    request = executor_request_to_llm_request(
+        42, source, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    for _ in range(10):
+        request.add_new_token(PAD, 0)
+        assert not meet_stop_token_criteria(request, PAD)
+    request.reset_for_recompute(256)
+    assert request.orig_prompt_len == 19
+    assert request.py_orig_prompt_len == 29
+    for count in range(1, 11):
+        request.add_new_token(PAD, 0)
+        assert meet_stop_token_criteria(request, PAD) == (count == 10)
+
+
+@pytest.mark.parametrize("limit", ["max_tokens", "max_seq_len"])
+@pytest.mark.parametrize("ignored", [False, True])
+def test_generated_run_at_length_boundary_fails(limit: str, ignored: bool) -> None:
+    params = SamplingParams(
+        end_id=END_ID, max_tokens=20 if limit == "max_tokens" else 40, ignore_eos=ignored
+    )
+    params._set_degenerate_token_runs([PAD], 20)
+    source = tllm.Request(
+        input_token_ids=list(PROMPT),
+        max_tokens=params.max_tokens,
+        stop_words=[] if ignored else params._get_stop_words(),
+        end_id=END_ID,
+    )
+    source.py_num_generated_only_stop_words = 0 if ignored else 1
+    request = executor_request_to_llm_request(
+        42, source, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    max_seq_len = len(PROMPT) + 20 if limit == "max_seq_len" else 256
+    for count in range(1, 21):
+        request.add_new_token(PAD, 0)
+        assert handle_stop_criteria(request, PAD, max_seq_len=max_seq_len, beam_idx=0) == (
+            count == 20
+        )
+    result = _finished_result(params)
+    assert request.is_finished_due_to_length
+    reason = tllm.FinishReason.LENGTH
+    if ignored:
+        _finish(result, [PAD] * 20, reason)
+        assert result._outputs[0].finish_reason == "length"
+    else:
+        with pytest.raises(RequestError, match="degenerate"):
+            _finish(result, [PAD] * 20, reason)
+
+
+def test_user_stop_at_length_boundary_keeps_length_result() -> None:
+    params = SamplingParams(end_id=END_ID, max_tokens=20, stop_token_ids=[PAD])
+    params._set_degenerate_token_runs([PAD], 20)
+    result = _finished_result(params)
+    _finish(result, [PAD] * 20, tllm.FinishReason.LENGTH)
+    assert result._outputs[0].finish_reason == "length"
+    assert result._outputs[0].token_ids == [PAD] * 20
+    assert result.error is None

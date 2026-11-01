@@ -520,6 +520,17 @@ class GenerationResultBase:
                         break
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
+                # Length takes precedence in both samplers, but a completed
+                # degenerate run still invalidates the generated response.
+                if (self.sampling_params._degenerate_token_runs
+                        and not self.sampling_params.ignore_eos):
+                    for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if output.token_ids[-len(stop_ids):] == stop_ids:
+                            if isinstance(stop_reason, DegenerateTokenRun):
+                                self._fail_degenerate_generation(
+                                    stop_reason, output)
+                            break
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
             # For disaggregated serving, finish reason might be NOT_FINISHED which is ok

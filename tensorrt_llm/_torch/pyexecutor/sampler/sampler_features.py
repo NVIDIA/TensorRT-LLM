@@ -362,7 +362,7 @@ def meet_stop_token_criteria(
         for index, stop_word in enumerate(stop_words_list):
             available = len(tokens)
             if index >= generated_only_start:
-                available -= request.py_orig_prompt_len
+                available -= request.orig_prompt_len
             if len(stop_word) > available:
                 continue
             if tokens[-len(stop_word) :] == stop_word:

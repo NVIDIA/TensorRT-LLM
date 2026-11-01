@@ -250,8 +250,9 @@ class FinishReasonsHandler:
             flat_tokens.extend(word)
             offsets.append(len(flat_tokens))
         generated_only_start = len(words) - getattr(request, "py_num_generated_only_stop_words", 0)
+        # The native original boundary survives pause/recompute.
         min_lengths = [
-            request.py_orig_prompt_len + len(word) if index >= generated_only_start else 0
+            request.orig_prompt_len + len(word) if index >= generated_only_start else 0
             for index, word in enumerate(words)
         ]
         history_offset = len(offsets) + len(flat_tokens) + len(min_lengths)
