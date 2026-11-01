@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Muse Spark Open marathon in attach mode: V2 KV cache + Python transceiver, 1P1D.
+#
+# At TP4 per instance, 1P1D needs 8 GPUs. On 4-GPU nodes the two instances
+# cannot share one node (two weight-resident TP4 engines exceed device memory),
+# so the cluster is launched externally, one node per instance, and the
+# marathon attaches to it through stress_config.external_cluster instead of
+# launching workers itself. That is also why no context_servers or
+# generation_servers sizing appears here.
+#
+# The run environment provides the endpoints through ${VAR} references, which
+# the harness resolves at setup() time (see README.md in this directory):
+#   TRTLLM_TEST_EXTERNAL_CLUSTER_URL      e.g. http://nodename:8340
+#   TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR  serve directory containing
+#                                         ctx/server.log, gen1/server.log and
+#                                         orch/server.log
+#
+# model: is the name the external cluster serves (the request envelope), not a
+# checkpoint path: attach mode loads no weights.
+
+model: musespark_open
+backend: pytorch
+
+# ============================================================================
+# Stress harness configuration (consumed by harness.py::StressConfig).
+# Schema documented in ../README.md.
+# ============================================================================
+stress_config:
+  mode: log_only
+  duration_min: 10
+
+  kv_cache_manager: v2
+  transceiver: python
+
+  external_cluster:
+    server_url: ${TRTLLM_TEST_EXTERNAL_CLUSTER_URL}
+    server_log: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/orch/server.log
+    worker_logs:
+      - role: ctx
+        path: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/ctx/server.log
+      - role: gen
+        path: ${TRTLLM_TEST_EXTERNAL_CLUSTER_LOG_DIR}/gen1/server.log
+
+  log_only_probe:
+    interval_s: 30
+    prompt: "Write one sentence about reliable distributed inference."
+    max_tokens: 32
+    seed: 42
+    request_timeout_s: 300   # first probe pays one-time JIT/warmup cost
+
+  log_scan:
+    hard_zero_patterns:
+      - "Broken promise"
+      - "Segfault"
+      - "Segmentation fault"
+      - "SIGSEGV"
+      - "0xffffffffffffffff"
+      - "use-after-free"
+      - "heap-use-after-free"
+      - "AddressSanitizer:.*use-after-free"
+      - "double[- ]free"
