@@ -71,6 +71,7 @@ from .action import (
 from .config_resolver import Cosmos3ConfigResolver
 from .defaults import (
     COSMOS3_720P_PARAMS,
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
     COSMOS3_DEFAULT_SYSTEM_PROMPT,
     COSMOS3_DURATION_TEMPLATE,
@@ -82,9 +83,9 @@ from .defaults import (
     COSMOS3_V2V_FLOW_SHIFT,
     _normalize_condition_video_keep,
     _normalize_condition_video_latent_indexes,
+    find_closest_target_size,
     resolve_checkpoint_policy_defaults,
 )
-from .geometry import COSMOS3_ASPECT_RATIO_BUCKETS, find_closest_target_size
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
 from .request_resolver import RequestContext, resolve_domain_action_config, resolve_generation

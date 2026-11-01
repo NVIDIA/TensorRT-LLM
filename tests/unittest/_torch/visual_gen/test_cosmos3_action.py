@@ -13,8 +13,6 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    EMBODIMENT_TO_DOMAIN_ID,
-    EMBODIMENT_TO_RAW_ACTION_DIM,
     action_reference_frame_step,
     action_reference_size,
     crop_action_latent,
@@ -23,21 +21,21 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     resolve_action_content_size,
     resolve_action_size,
     resolve_domain_id,
-    resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_ASPECT_RATIO_BUCKETS,
     COSMOS3_DOMAIN_PRESET_ALIASES,
     COSMOS3_DOMAIN_PRESETS,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_POLICY_SAMPLING_PARAMS,
-    get_domain_preset,
-    resolve_checkpoint_policy_defaults,
-)
-from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
-    COSMOS3_ASPECT_RATIO_BUCKETS,
+    EMBODIMENT_TO_DOMAIN_ID,
+    EMBODIMENT_TO_RAW_ACTION_DIM,
     VIDEO_RES_SIZE_INFO,
     find_closest_target_size,
+    get_domain_preset,
     normalize_action_resolution,
+    resolve_checkpoint_policy_defaults,
+    resolve_raw_action_dim,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
     resolve_domain_action_config,

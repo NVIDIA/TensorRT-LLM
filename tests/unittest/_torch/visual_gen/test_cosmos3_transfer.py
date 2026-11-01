@@ -30,8 +30,6 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_GENERATION_DEFAULTS,
-)
-from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
     VIDEO_RES_SIZE_INFO,
     find_closest_target_size,
 )

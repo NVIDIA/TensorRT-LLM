@@ -27,9 +27,9 @@ import sys
 
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import EMBODIMENT_TO_DOMAIN_ID
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_DOMAIN_PRESETS,
+    EMBODIMENT_TO_DOMAIN_ID,
     resolve_checkpoint_policy_defaults,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (

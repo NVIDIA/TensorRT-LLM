@@ -20,18 +20,166 @@ request's extra parameters. The request resolver reads them in precedence order.
 from collections.abc import Mapping
 from typing import Any, Dict, Iterable, TypedDict
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import EMBODIMENT_TO_DOMAIN_ID
-from tensorrt_llm._torch.visual_gen.models.cosmos3.geometry import (
-    COSMOS3_ACTION_RESOLUTIONS,
-    VIDEO_RES_SIZE_INFO,
-    normalize_action_resolution,
-)
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 from tensorrt_llm.inputs.media_io import sniff_media_kind
 
 # ---------------------------------------------------------------------------
 # Constant tables
 # ---------------------------------------------------------------------------
+
+# The reference's ``W,H`` aspect buckets: every canvas is one of these shapes, and a
+# request's bucket string is carried into the caption verbatim, so a resolved frame
+# size maps back to the nearest bucket rather than to its exact reduced ratio
+# (832x480 reduces to "15,26", which the model never saw).
+COSMOS3_ASPECT_RATIO_BUCKETS = ("1,1", "4,3", "3,4", "16,9", "9,16")
+
+
+# Output sizes per resolution level and aspect bucket, as (width, height).
+VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "16,9": (320, 192),
+        "9,16": (192, 320),
+    },
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "704": {
+        "1,1": (960, 960),
+        "4,3": (1088, 832),
+        "3,4": (832, 1088),
+        "16,9": (1280, 704),
+        "9,16": (704, 1280),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
+
+COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INFO, key=int))
+
+
+def normalize_action_resolution(resolution: Any) -> int:
+    if resolution is None:
+        raise ValueError("Cosmos3 action_resolution is required for action generation.")
+    try:
+        bucket = int(resolution)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Cosmos3 action_resolution must be an int bucket, got {resolution!r}."
+        ) from exc
+    if bucket not in COSMOS3_ACTION_RESOLUTIONS:
+        raise ValueError(
+            f"Unknown Cosmos3 action_resolution={bucket}; "
+            f"expected one of {COSMOS3_ACTION_RESOLUTIONS}."
+        )
+    return bucket
+
+
+def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
+    """The ``resolution`` bucket whose aspect ratio is closest to ``h/w``, as
+    ``(width, height)``, so a source frame lands on a supported size undistorted."""
+    key = str(resolution)
+    if key not in VIDEO_RES_SIZE_INFO:
+        raise ValueError(
+            f"Unknown Cosmos3 resolution={resolution!r}; "
+            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
+        )
+    input_ratio = h / w
+    best_size = None
+    best_diff = float("inf")
+    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
+        diff = abs(input_ratio - cand_h / cand_w)
+        if diff < best_diff:
+            best_diff = diff
+            best_size = (cand_w, cand_h)
+    assert best_size is not None
+    return best_size
+
+
+EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
+    "no_action": 0,
+    "av": 1,
+    "camera_pose": 2,
+    "hand_pose": 3,
+    "pusht": 4,
+    "libero": 5,
+    "umi": 6,
+    "bridge_orig_lerobot": 7,
+    "droid_lerobot": 8,
+    "robomind-franka": 8,
+    "galbot": 9,
+    "robomind-franka-dual": 12,
+    "robomind-ur": 13,
+    "agibotworld": 15,
+    "agibot_gear_gripper": 15,
+    "agibot_gear_gripper_ext": 15,
+    "fractal": 20,
+}
+
+# Canonical unpadded action width per embodiment.  Widths compose the Cosmos3
+# unified action representation from shared geometric blocks: a 9-D pose (3-D
+# translation + 6-D rotation), a 1-D grasp state, and a 15-D fingertip state.
+# One arm is 9 + 1 = 10; a dual-arm setup is 20; the AgiBot humanoid is
+# 9 + 2 x (9 + 1) = 29; two-hand egocentric motion is 9 + 2 x (9 + 15) = 57.
+#
+# This is a property of the embodiment, not a tunable, so it is keyed by the
+# real domain name rather than by the sampling presets below (where several of
+# these names share one preset).  ``libero`` is absent on purpose:
+# its width depends on the dataset's rotation space (7/10/13), so callers must
+# pass ``raw_action_dim`` explicitly.
+EMBODIMENT_TO_RAW_ACTION_DIM: dict[str, int] = {
+    "av": 9,
+    "camera_pose": 9,
+    "hand_pose": 57,
+    "pusht": 2,
+    "umi": 10,
+    "bridge_orig_lerobot": 10,
+    "droid_lerobot": 10,
+    "robomind-franka": 10,
+    "robomind-franka-dual": 20,
+    "robomind-ur": 10,
+    "galbot": 30,
+    "agibotworld": 29,
+    "agibot_gear_gripper": 29,
+    "agibot_gear_gripper_ext": 29,
+    "fractal": 10,
+}
+
+
+def resolve_raw_action_dim(
+    domain_name: Any = None,
+    domain_id: Any = None,
+) -> int | None:
+    """Look up the canonical action width, or None when it cannot be determined.
+
+    Resolves by name first.  A bare ``domain_id`` is only usable when every
+    embodiment sharing that id agrees on a width (true for all current ids).
+    """
+    if domain_name is not None and str(domain_name).strip():
+        return EMBODIMENT_TO_RAW_ACTION_DIM.get(str(domain_name).strip().lower())
+
+    if domain_id is None:
+        return None
+
+    widths = {
+        EMBODIMENT_TO_RAW_ACTION_DIM[name]
+        for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items()
+        if mapped_id == int(domain_id) and name in EMBODIMENT_TO_RAW_ACTION_DIM
+    }
+    return widths.pop() if len(widths) == 1 else None
+
 
 # The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
 _DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
@@ -385,7 +533,7 @@ class Cosmos3DomainPreset(TypedDict, total=False):
     """Recommended action sampling settings for a trained embodiment.
 
     Sampling settings only — the embodiment's action width lives in
-    ``action.EMBODIMENT_TO_RAW_ACTION_DIM``, keyed by the unaliased domain name.
+    ``EMBODIMENT_TO_RAW_ACTION_DIM``, keyed by the unaliased domain name.
     """
 
     action_chunk_size: int
