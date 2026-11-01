@@ -82,10 +82,6 @@ def _register_fake():
     def _(handle: int, completion_event: int) -> None:
         return None
 
-    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_set_probe")
-    def _(handle: int, probe: Optional[torch.Tensor]) -> None:
-        return None
-
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,

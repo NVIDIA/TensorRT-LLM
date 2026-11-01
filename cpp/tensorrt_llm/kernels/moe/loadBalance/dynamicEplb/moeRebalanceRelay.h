@@ -60,8 +60,6 @@ struct MoeRebalanceRelayParams
     int planes;
     int ctas;
     bool programmaticLaunch; //!< Launch as a programmatic dependent of the scheduler, if the device supports it.
-    std::uint64_t* probe;    //!< The scheduler's timing records (MoeRebalanceHaloRProbeWord), or null.
-    int probeRecords;
 };
 
 //! Dynamic shared memory of one relay CTA on the current device.

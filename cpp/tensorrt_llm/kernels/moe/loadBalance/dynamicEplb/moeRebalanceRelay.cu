@@ -400,19 +400,6 @@ __device__ std::uint64_t relayReadyValue(MoeRebalanceRelayParams const& p, bool 
     return error ? (value | kReadyErrorBit) : value;
 }
 
-//! This launch's timing record, or null when the probe is off or full. Read before the last CTA bumps launchCount.
-__device__ __forceinline__ unsigned long long* relayProbeRecord(MoeRebalanceRelayParams const& p)
-{
-    if (p.probe == nullptr)
-    {
-        return nullptr;
-    }
-    unsigned const launch = *reinterpret_cast<unsigned const volatile*>(p.launchCount);
-    return launch < static_cast<unsigned>(p.probeRecords)
-        ? reinterpret_cast<unsigned long long*>(p.probe) + static_cast<std::size_t>(launch) * kHaloRProbeWords
-        : nullptr;
-}
-
 //! With a programmatic launch, this kernel may start while the scheduler's workers still write routes. It reads only
 //! the plan before its last CTA has waited for the scheduler grid: the plan through the acquired epoch, and the
 //! status words, whose worker writes are final only at scheduler exit, after that wait.
@@ -421,19 +408,9 @@ __global__ void haloRRelayKernel(MoeRebalanceRelayParams const p)
     // The work table and every slot live in dynamic shared memory, so the footprint is the requested size.
     extern __shared__ __align__(128) unsigned char relayShared[];
     RelayWork& work = *reinterpret_cast<RelayWork*>(relayShared);
-    unsigned long long* probe = nullptr;
     if (threadIdx.x == 0)
     {
-        probe = relayProbeRecord(p);
-        if (probe != nullptr)
-        {
-            atomicMin(probe + kHaloRProbeRelayStart, static_cast<unsigned long long>(globalTimerNs()));
-        }
-        bool const fellBack = acquirePlan(p);
-        if (probe != nullptr && fellBack)
-        {
-            atomicAdd(probe + kHaloRProbeRelayFallbacks, 1ULL);
-        }
+        acquirePlan(p);
         // Report residency before any copy work: MAIN launches MegaMoE, whose full grid blocks on READY, only once
         // every relay CTA holds its SM. The scheduler zeroed the counter before releasing the plan epoch acquired
         // above (or before completing, after a fallback), so this add follows that zero.
@@ -473,10 +450,6 @@ __global__ void haloRRelayKernel(MoeRebalanceRelayParams const p)
         // did when the relay started after it. The copy is done; by now the scheduler normally is too.
         waitForScheduler();
         multicastStoreReady(p.readyFlagMc, relayReadyValue(p, copyFailed));
-        if (probe != nullptr)
-        {
-            atomicMax(probe + kHaloRProbeRelayEnd, static_cast<unsigned long long>(globalTimerNs()));
-        }
     }
 }
 
@@ -561,7 +534,6 @@ void invokeMoeRebalanceRelay(MoeRebalanceRelayParams const& params, cudaStream_t
     TLLM_CHECK_WITH_INFO(params.ctas >= 1 && params.ctas <= smCount,
         "HALO-R relay CTAs must be between 1 and the device SM count (%d), got %d", smCount, params.ctas);
     int const sharedBytes = relayDynamicSharedMemoryBytes(device);
-    TLLM_CHECK_WITH_INFO(params.probe == nullptr || params.probeRecords > 0, "HALO-R timing probe needs a record");
 
     // A programmatic launch overlaps the scheduler's route tail. The kernel is correct either way: on a plain launch
     // the plan epoch is visible at once and the scheduler waits return immediately.

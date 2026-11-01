@@ -456,12 +456,6 @@ def test_relay_is_a_programmatic_dependent_of_the_scheduler():
     assert "relayProgrammaticLaunchEnabled()," in op
 
 
-def test_timing_probe_is_a_separate_test_op():
-    op = _HALO_R_OP_SOURCE.read_text()
-    schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op.split("m.def(")[1:]]
-    assert "moe_rebalance_halo_r_set_probe(int handle, Tensor? probe) -> ()" in schemas
-
-
 def test_context_binds_the_relay_residency_counter():
     op = _HALO_R_OP_SOURCE.read_text()
     schemas = ["".join(re.findall(r'"([^"]*)"', block)) for block in op.split("m.def(")[1:]]
