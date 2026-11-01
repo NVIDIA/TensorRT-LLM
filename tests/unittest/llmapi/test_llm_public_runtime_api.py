@@ -42,6 +42,7 @@ def _llm(executor, encode_only=False, encoder_executor=None):
 def _proxy(engine_dead=False, fatal_error=None):
     """A proxy with exactly the two fields its engine_dead property reads."""
     proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
     proxy._engine_dead = engine_dead
     proxy._fatal_error = fatal_error
     return proxy
@@ -51,7 +52,7 @@ def _proxy(engine_dead=False, fatal_error=None):
 # BaseLLM.check_health()
 # ---------------------------------------------------------------------------
 def test_check_health_encode_only_with_encoder_executor():
-    assert _llm(None, encode_only=True, encoder_executor=object()).check_health() is True
+    assert _llm(None, encode_only=True, encoder_executor=_NoOpExecutor()).check_health() is True
 
 
 def test_check_health_encode_only_without_encoder_executor():
@@ -130,7 +131,7 @@ def test_shutdown_started_true_without_executor():
 
 
 def test_shutdown_started_false_for_encode_only():
-    assert _llm(None, encode_only=True, encoder_executor=object()).shutdown_started is False
+    assert _llm(None, encode_only=True, encoder_executor=_NoOpExecutor()).shutdown_started is False
 
 
 # ---------------------------------------------------------------------------
