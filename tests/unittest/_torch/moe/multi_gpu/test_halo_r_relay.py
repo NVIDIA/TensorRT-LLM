@@ -3,31 +3,39 @@
 """HALO-R kernel tests on a real shared-slot arena, one EP rank per GPU.
 
 Every rank fills its home experts with a byte pattern unique to (expert,
-plane, weights) and runs HALO-R layer calls through the scheduler group. After
-each checked call it compares:
-- the plan words with the pure-Python reference plan of the global routes;
-- every route with its owner's home slot or a receiver's helper slot, and the
-  routes per (expert, rank) with the plan's quota;
-- every helper row this rank received with the owner's expert, bytewise;
-- the READY row with the value the call lent to MegaMoE, and every status word
-  with 0;
-- the relay counters (launches, copied and skipped receivers) and, with
-  per-layer helper slots, the residency table with a model of it, on every rank.
+plane, weights) and runs HALO-R layer calls through the scheduler group. Each
+layer call holds the copy stream back before the kernel starts and then
+queues on MAIN, as MegaMoE does:
+- a copy of the routes it lends, right after the route wait;
+- a READY gate on the SMs that the HALO-R kernel leaves free;
+- a copy of this rank's helper rows, once the gate opens.
+A route wait that passes before the kernel releases its routes, or a gate
+that opens on the previous launch's READY cells, therefore copies the
+previous launch's routes or helper rows.
 
-The test ids carry the TEST_PLAN ids: t1_2 (equivalence with commit 0: the
-dump runs on a commit-0 build, the compare on later ones, through
-HALO_R_EQUIV_DIR), t1_3 (reference and READY), t1_4 (zero-token ranks, empty
-plan), t1_5 (residency and skipped copies), t1_6 (slot stability), t1_7 (the
-READY gate under an SM hog), t1_8 (fail-closed: a status word traps the rank
-before it releases routes, and its peers trap at their next exchange) and
-t1_10 (breakable-prefill CUDA graphs).
+After the launches since the previous check, every rank compares:
+- each launch's copies with that launch's pure-Python reference plan of the
+  global routes: every route goes to its owner's home slot or to a
+  receiver's helper slot of its expert, the routes per (expert, rank) match
+  the plan's quota, and every helper row this rank received holds the
+  owner's expert, bytewise;
+- the last launch's plan words and helper experts with the reference;
+- the READY row (1 in every cell), the route counter (0) and every status
+  word (0);
+- the relay counters (launches, copied and skipped receivers) and, with
+  per-layer helper slots, the residency table with a model of it, on every
+  rank.
+
+``test_halo_r_traps`` makes one launch fail on purpose: a status word set
+before the route release, a READY cell that never arrives, or a CTA that
+cannot become resident. The failing rank must trap in that call, and its
+peers in that call or the next, at their wait for it. These cases fault
+every GPU of the node on purpose, so the CI test lists do not run them.
 
 The ranks run on one node through an MPIPoolExecutor, or on any number of
 nodes under ``trtllm-llmapi-launch`` through the MPI session it serves.
 HALO_R_TEST_EP sets the EP size (default 4) and HALO_R_TEST_SEEDS the number
-of seeds per case (default 1). The cases need only the native ops of the build
-they run on, so one file drives commit 0 (t1_2 dump only), the fused kernel
-without CUDA graphs, and the current build.
+of seeds per case (default 1).
 """
 
 import ctypes
@@ -57,7 +65,6 @@ MPI.pickle.__init__(cloudpickle.dumps, cloudpickle.loads, pickle.HIGHEST_PROTOCO
 
 _EP_SIZE = int(os.environ.get("HALO_R_TEST_EP", "4"))
 _SEEDS = int(os.environ.get("HALO_R_TEST_SEEDS", "1"))
-_EQUIV_DIR = os.environ.get("HALO_R_EQUIV_DIR")
 _HOME_EXPERTS = 8
 _HELPER_SLOTS = 2
 _TOPK = 4
@@ -68,32 +75,24 @@ _AUXILIARY_SMS = 4
 _HIDDEN = 256
 _INTERMEDIATE = 128
 _WORKER_TIMEOUT_S = 600
-# The READY-gate stand-in gives up after this long; the relay finishes in milliseconds.
+# Every launch publishes READY 1, which MegaMoE's gate waits for.
+_READY = 1
+# COPY waits this long before each kernel, so MAIN reaches its route wait and
+# READY gate long before the kernel writes routes or helper rows.
+_COPY_DELAY_NS = 2_000_000
+# The READY gate gives up after this long; the relay finishes in milliseconds.
 _GATE_TIMEOUT_NS = 5_000_000_000
 # The SM hog outlives the HALO-R kernel's scheduler role.
 _HOG_NS = 300_000_000
-# T1-2 inputs: every token count, both route kinds, three layers over the two shared banks.
-_EQUIV_MAX_TOKENS = 2048
-_EQUIV_TOKENS = (0, 1, 7, 128, 2048)
-# T1-8: the spin bound of every launch after the injection, and the pass bounds.
-_FAIL_TIMEOUT_S = 20
-_FAIL_OWN_TRAP_S = 10
-_FAIL_PEER_TRAP_S = 50
+# The trap cases: the spin bound of every launch after the warmup, the failing
+# call (forward, layer), and how long a hog keeps one HALO-R CTA from an SM.
+_TRAP_TIMEOUT_S = 5
+_TRAP_CALL = (5, 1)
+_TRAP_HOG_NS = 3 * _TRAP_TIMEOUT_S * 1_000_000_000
 
 
-def _implementation() -> str:
-    """The HALO-R native ops of this build: commit 0's, the fused kernel's, or the capturable ones."""
-    # Resolve the op namespace by name: this module is pickled by value into the
-    # workers, and a direct `torch.ops` reference would make cloudpickle try to
-    # serialize torch's op-namespace object.
-    ops = getattr(getattr(torch, "ops"), "trtllm")
-    if hasattr(ops, "moe_rebalance_halo_r_join"):
-        return "graphs"
-    if hasattr(ops, "moe_rebalance_halo_r_submit_fused"):
-        return "fused"
-    if hasattr(ops, "moe_rebalance_halo_r_submit"):
-        return "commit0"
-    return "none"
+class _Skip(Exception):
+    """Raised on every rank alike when a case does not apply to this geometry."""
 
 
 class _RawBytes:
@@ -120,7 +119,11 @@ def _pattern(expert: int, plane: int, layer: int, nbytes: int, device: int) -> t
 
 
 def _routes(step: int, rank: int, num_tokens: int, experts: int, device: int) -> torch.Tensor:
-    """Skewed routes: most tokens pick one hot expert per step, distinct experts per token."""
+    """Skewed routes: most tokens pick the step's hot expert, distinct experts per token.
+
+    The hot experts change every step, so consecutive launches differ in
+    their routes and helper experts.
+    """
     rng = random.Random(1000 * step + rank)
     hot = [(5 * step) % experts, (5 * step + 9) % experts]
     rows = []
@@ -142,7 +145,7 @@ def _uniform_routes(rank: int, num_tokens: int, experts: int, device: int) -> to
     return torch.tensor(rows, dtype=torch.int32, device=f"cuda:{device}").reshape(-1, _TOPK)
 
 
-_GATE_SOURCE = r"""
+_KERNEL_SOURCE = r"""
 __device__ unsigned long long globalTimer()
 {
     unsigned long long now;
@@ -165,8 +168,18 @@ extern "C" __global__ void smHog(unsigned long long ns)
     }
 }
 
+// Holds the stream it runs on for `ns` nanoseconds, on one thread.
+extern "C" __global__ void streamDelay(unsigned long long ns)
+{
+    unsigned long long const start = globalTimer();
+    while (globalTimer() - start < ns)
+    {
+        __nanosleep(1000);
+    }
+}
+
 // MegaMoE's helper-weight READY gate: hold the SM until every cell of this rank's READY row reaches the
-// expected generation. Gives up after `timeoutNs` and counts the CTA in `timedOut`.
+// expected value. Gives up after `timeoutNs` and counts the CTA in `timedOut`.
 extern "C" __global__ void readyGate(unsigned long long const* ready, int cells, unsigned long long expected,
     unsigned long long timeoutNs, int* timedOut)
 {
@@ -201,11 +214,12 @@ extern "C" __global__ void readyGate(unsigned long long const* ready, int cells,
 """
 
 
-class _GateKernels:
-    """A READY-gate stand-in on every SM and an SM hog, both one CTA per SM.
+class _Kernels:
+    """The READY gate, an SM hog and a stream delay.
 
-    Each CTA takes over half of an SM's shared memory, so neither shares an SM
-    with the other or with a HALO-R CTA, which takes nearly all of it.
+    Each gate or hog CTA takes over half of an SM's shared memory, so neither
+    shares an SM with the other or with a HALO-R CTA, which takes nearly all
+    of it.
     """
 
     def __init__(self, device: int) -> None:
@@ -225,7 +239,7 @@ class _GateKernels:
         self.check = check
         major, minor = torch.cuda.get_device_capability(device)
         program = check(
-            nvrtc.nvrtcCreateProgram(_GATE_SOURCE.encode(), b"ready_gate.cu", 0, [], [])
+            nvrtc.nvrtcCreateProgram(_KERNEL_SOURCE.encode(), b"halo_r_test.cu", 0, [], [])
         )
         options = [f"--gpu-architecture=sm_{major}{minor}".encode()]
         if (
@@ -240,6 +254,7 @@ class _GateKernels:
         self.module = check(driver.cuModuleLoadData(cubin))
         self.gate = check(driver.cuModuleGetFunction(self.module, b"readyGate"))
         self.hog = check(driver.cuModuleGetFunction(self.module, b"smHog"))
+        self.delay = check(driver.cuModuleGetFunction(self.module, b"streamDelay"))
         cu_device = check(driver.cuDeviceGet(device))
         per_sm = check(
             driver.cuDeviceGetAttribute(
@@ -259,38 +274,35 @@ class _GateKernels:
         self.sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.timed_out = torch.zeros(1, dtype=torch.int32, device=f"cuda:{device}")
 
-    def _launch(self, function, blocks: int, args, stream: torch.cuda.Stream) -> None:
+    def _launch(self, function, blocks: int, threads: int, shared: int, args, stream) -> None:
         self.check(
             self.driver.cuLaunchKernel(
                 function,
                 blocks,
                 1,
                 1,
-                128,
+                threads,
                 1,
                 1,
-                self.shared_bytes,
+                shared,
                 self.driver.CUstream(stream.cuda_stream),
                 args,
                 0,
             )
         )
 
-    def launch_hog(self, stream: torch.cuda.Stream, auxiliary_sms: int) -> None:
-        # Leave only the HALO-R kernel's SMs free, as the shared expert's
-        # reservation does.
-        args = ((_HOG_NS,), (ctypes.c_ulonglong,))
-        self._launch(self.hog, self.sms - auxiliary_sms, args, stream)
+    def launch_hog(self, stream: torch.cuda.Stream, blocks: int, ns: int = _HOG_NS) -> None:
+        """Hold ``blocks`` SMs for ``ns`` nanoseconds."""
+        args = ((ns,), (ctypes.c_ulonglong,))
+        self._launch(self.hog, blocks, 128, self.shared_bytes, args, stream)
 
-    def launch_gate(self, ready: torch.Tensor, generation: int, stream: torch.cuda.Stream) -> None:
+    def launch_delay(self, stream: torch.cuda.Stream, ns: int) -> None:
+        args = ((ns,), (ctypes.c_ulonglong,))
+        self._launch(self.delay, 1, 32, 0, args, stream)
+
+    def launch_gate(self, ready: torch.Tensor, stream: torch.cuda.Stream, blocks: int) -> None:
         args = (
-            (
-                ready.data_ptr(),
-                ready.numel(),
-                generation,
-                _GATE_TIMEOUT_NS,
-                self.timed_out.data_ptr(),
-            ),
+            (ready.data_ptr(), ready.numel(), _READY, _GATE_TIMEOUT_NS, self.timed_out.data_ptr()),
             (
                 ctypes.c_void_p,
                 ctypes.c_int,
@@ -299,7 +311,7 @@ class _GateKernels:
                 ctypes.c_void_p,
             ),
         )
-        self._launch(self.gate, self.sms, args, stream)
+        self._launch(self.gate, blocks, 128, self.shared_bytes, args, stream)
 
 
 def _init_process_group(rank: int, world: int) -> None:
@@ -317,34 +329,15 @@ def _init_process_group(rank: int, world: int) -> None:
 def _skip_reason() -> str | None:
     if torch.cuda.get_device_capability()[0] != 10:
         return "HALO-R requires an SM100-family GPU"
-    if _implementation() == "none":
+    # Resolve the op namespace by name: this module is pickled by value into
+    # the workers, and a direct `torch.ops` reference would make cloudpickle
+    # try to serialize torch's op-namespace object.
+    if not hasattr(getattr(getattr(torch, "ops"), "trtllm"), "moe_rebalance_halo_r_create"):
         return "HALO-R ops are not built"
     MnnvlMemory.initialize()
     if not MnnvlMemory.supports_mnnvl():
         return "HALO-R requires an NVLink fabric with multicast"
     return None
-
-
-def _buffers(group) -> SimpleNamespace:
-    """The scheduler outputs and workspace of a group: the CUDA scheduler's, or commit 0's own."""
-    scheduler = getattr(group, "scheduler", None)
-    if scheduler is not None and hasattr(scheduler, "plan_workspace"):
-        return SimpleNamespace(
-            plan=scheduler.plan_workspace,
-            prefix=scheduler.route_prefix,
-            slots=scheduler.outputs.physical_slot_ids,
-            ids=scheduler.outputs.hot_expert_ids,
-            owners=scheduler.outputs.hot_expert_source_ranks,
-            status=scheduler.status,
-        )
-    return SimpleNamespace(
-        plan=group.plan_words,
-        prefix=group.route_prefix,
-        slots=group.physical_slot_ids,
-        ids=group.hot_expert_ids,
-        owners=group.hot_expert_source_ranks,
-        status=group.status,
-    )
 
 
 # A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use.
@@ -362,7 +355,6 @@ class _Layers:
         count: int,
         auxiliary_sms: int = _AUXILIARY_SMS,
         helper_slot_mode: str = "shared_banks",
-        max_tokens: int = _MAX_TOKENS,
     ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
@@ -375,8 +367,9 @@ class _Layers:
         self.rank = rank
         self.ep = world
         self.device = device
-        self.max_tokens = max_tokens
+        self.max_tokens = _MAX_TOKENS
         self.experts = _HOME_EXPERTS * world
+        self.auxiliary_sms = auxiliary_sms
         self.resident = helper_slot_mode == "per_layer_resident"
         config = SimpleNamespace(
             num_slots=self.experts + world * _HELPER_SLOTS,
@@ -402,17 +395,33 @@ class _Layers:
                     layer_idx=layer,
                 )
             )
+        # The helper set of each layer: shared banks alternate, per-layer slots do not.
+        self.banks = [int(arena.provider.layer.helper_set) for arena in self.arenas]
+        self._helper_views = {}
+        for layer in range(count):
+            self.helper_rows(layer)
         # The weights of each layer, as loaded; a reload changes them.
         self.weights = list(range(count))
         for layer in range(count):
             self.load_weights(layer)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
+        self.kernels = _Kernels(device)
+        # MegaMoE's grid leaves the HALO-R kernel's SMs to it.
+        self.gate_blocks = self.kernels.sms - auxiliary_sms
+        self.copy_delay_ns = _COPY_DELAY_NS
         self.groups = []
         self.launches = [0] * count
         self.receiver_copies = [0] * count
         self.receiver_skips = [0] * count
         self.last_copies = 0
+        # Per layer, the MAIN-side copies of each launch since the last check; None when not checkable.
+        self.pending = [[] for _ in range(count)]
+        # Per captured layer, the copies its graph writes on every replay.
+        self.graph_copies = {}
+        # Per helper set, the layer whose launch last wrote it.
+        self.bank_user = {}
+        self.captures = 0
         # A model of each layer's residency table, [rank][helper slot], with per-layer helper slots.
         self.tables = [
             [[-1] * _HELPER_SLOTS for _ in range(world)] if self.resident else None
@@ -422,6 +431,24 @@ class _Layers:
 
     def routes(self, step: int, tokens: int) -> torch.Tensor:
         return _routes(step, self.rank, tokens, self.experts, self.device)
+
+    def ready_row(self, layer: int) -> torch.Tensor:
+        return self.arenas[layer].terminal_flags_tensor().view(torch.int64)
+
+    def helper_rows(self, layer: int) -> list:
+        """This rank's helper rows of ``layer``, one uint8 view per plane, made outside any capture."""
+        views = self._helper_views.get(layer)
+        if views is None:
+            bound = self.arenas[layer].bound.base
+            views = self._helper_views[layer] = [
+                _row(
+                    int(bound.local_plane_views[plane].data_ptr()) + _HOME_EXPERTS * int(nbytes),
+                    _HELPER_SLOTS * int(nbytes),
+                    self.device,
+                )
+                for plane, nbytes in enumerate(bound.plane_bytes)
+            ]
+        return views
 
     def load_weights(self, layer: int) -> None:
         """Write this rank's home experts of ``layer`` with the pattern of its current weights."""
@@ -439,7 +466,7 @@ class _Layers:
         self.weights[layer] += 1000
         self.load_weights(layer)
         torch.cuda.synchronize()
-        # What the layer handle's rebind calls once a loader has rewritten the weights.
+        # What the layer handle's rebind calls on every rank once a loader has rewritten the weights.
         self.groups[layer].forget_helper_residency()
         if self.tables[layer] is not None:
             self.tables[layer] = [[-1] * _HELPER_SLOTS for _ in range(self.ep)]
@@ -465,20 +492,62 @@ class _Layers:
                 )
             )
 
-    def layer_call(self, layer: int, routes: torch.Tensor) -> int:
-        """One layer call on the current stream, without a host wait; returns the READY value it lent."""
-        group = self.groups[layer]
-        _, ready = group.plan(routes, defer_wait=False)
-        group.finish()
-        self.launches[layer] += 1
-        return int(ready)
+    def layer_call(
+        self,
+        layer: int,
+        routes: torch.Tensor,
+        *,
+        gate_blocks: int | None = None,
+        delay: bool = True,
+        capturing: bool = False,
+    ) -> None:
+        """One layer call on the current stream (MAIN), without a host wait.
 
-    def call(self, layer: int, routes: torch.Tensor, stream: torch.cuda.Stream) -> int:
+        It copies the lent routes right after the route wait and this rank's
+        helper rows once the READY gate opens. Under capture, the graph
+        writes those copies on every replay; record each replay with
+        ``replayed``.
+        """
+        group = self.groups[layer]
+        main = torch.cuda.current_stream()
+        if delay and self.copy_delay_ns:
+            # The kernel follows MAIN's work on COPY; hold it back after that.
+            fork = torch.cuda.Event()
+            fork.record(main)
+            group.copy_stream.wait_event(fork)
+            self.kernels.launch_delay(group.copy_stream, self.copy_delay_ns)
+        physical, ready = group.plan(routes, defer_wait=False)
+        if int(ready) != _READY:
+            raise RuntimeError(f"layer {layer} lent READY {int(ready)}, not {_READY}")
+        slots = physical.clone()
+        blocks = self.gate_blocks if gate_blocks is None else gate_blocks
+        self.kernels.launch_gate(self.ready_row(layer), main, blocks)
+        rows = [row.clone() for row in self.helper_rows(layer)]
+        group.finish()
+        copies = (slots, rows)
+        if capturing:
+            self.graph_copies[layer] = copies
+        else:
+            self._launched(layer, copies)
+
+    def replayed(self, layers: list) -> None:
+        """Record one replay of a graph that captured ``layers``."""
+        for layer in layers:
+            self._launched(layer, self.graph_copies[layer])
+
+    def _launched(self, layer: int, copies: tuple) -> None:
+        self.launches[layer] += 1
+        # A replay rewrites the copies of the same graph's earlier replays:
+        # only the latest replay since the last check can be checked.
+        self.pending[layer] = [None if c is copies else c for c in self.pending[layer]]
+        self.pending[layer].append(copies)
+        self.bank_user[self.banks[layer]] = layer
+
+    def call(self, layer: int, routes: torch.Tensor, stream: torch.cuda.Stream) -> None:
         with torch.cuda.stream(stream):
-            ready = self.layer_call(layer, routes)
+            self.layer_call(layer, routes)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        return ready
 
     def _apply(self, layer: int, routes: torch.Tensor):
         """The reference plan of one launch, applied to the model; returns the plan."""
@@ -501,42 +570,27 @@ class _Layers:
         self.last_copies = copies
         return plan
 
-    def check(self, layer: int, routes, ready: int) -> list:
-        """Check the last of the launches since the previous check, whose routes ``routes`` lists in order.
+    def apply_unchecked(self, layer: int, routes: torch.Tensor) -> None:
+        """Apply one launch to the model without checking it, for a launch the test tampered with."""
+        if len(self.pending[layer]) != 1:
+            raise RuntimeError("apply_unchecked takes exactly one launch")
+        self.pending[layer] = []
+        self._apply(layer, routes)
 
-        A single tensor is one launch. Every launch updates the model; the last
-        one's plan, routes and helper rows are compared with the device.
-        """
-        routes_list = [routes] if isinstance(routes, torch.Tensor) else list(routes)
-        for earlier in routes_list[:-1]:
-            self._apply(layer, earlier)
-        routes = routes_list[-1]
-        plan = self._apply(layer, routes)
-        group, arena = self.groups[layer], self.arenas[layer]
-        buffers = _buffers(group)
+    def _route_failures(self, plan, routes: torch.Tensor, slots: torch.Tensor, where: str) -> list:
+        """Every route goes to its owner or to a receiver's helper slot of its expert, at the plan's quota."""
         failures = []
         rank, local_slots = self.rank, _HOME_EXPERTS + _HELPER_SLOTS
-        # Every launch of the layer is one scheduler epoch.
-        if buffers.plan.cpu().tolist() != plan.plan_words(epoch=self.launches[layer]):
-            failures.append(f"rank {rank}: layer {layer} plan words differ from the reference")
-        if buffers.ids.cpu().tolist() != plan.helper_table[rank]:
-            failures.append(f"rank {rank}: layer {layer} helper experts differ from the reference")
-        if any(buffers.status.cpu().tolist()):
-            failures.append(f"rank {rank}: status words {buffers.status.cpu().tolist()}")
-        cells = arena.terminal_flags_tensor().view(torch.int64).cpu().tolist()
-        if cells != [ready] * self.ep:
-            failures.append(f"rank {rank}: layer {layer} READY row {cells}, expected {ready}")
-
-        # Every route goes to its owner or to a receiver's helper slot of its expert.
-        slots = buffers.slots[: routes.shape[0]].cpu().flatten().tolist()
         moved = {}
-        for expert, slot in zip(routes.flatten().cpu().tolist(), slots):
+        for expert, slot in zip(routes.flatten().cpu().tolist(), slots.flatten().cpu().tolist()):
             destination, local = divmod(slot, local_slots)
-            if local < _HOME_EXPERTS:
+            if slot < 0 or destination >= self.ep:
+                failures.append(f"rank {rank}: {where}: expert {expert} routed to slot {slot}")
+            elif local < _HOME_EXPERTS:
                 if destination * _HOME_EXPERTS + local != expert:
-                    failures.append(f"rank {rank}: expert {expert} routed to home slot {slot}")
+                    failures.append(f"rank {rank}: {where}: expert {expert} in home slot {slot}")
             elif plan.helper_table[destination][local - _HOME_EXPERTS] != expert:
-                failures.append(f"rank {rank}: expert {expert} routed to helper slot {slot}")
+                failures.append(f"rank {rank}: {where}: expert {expert} in helper slot {slot}")
             else:
                 moved[(expert, destination)] = moved.get((expert, destination), 0) + 1
         totals = {}
@@ -545,32 +599,91 @@ class _Layers:
                 totals[key] = totals.get(key, 0) + value
         expected = {(b.expert, d): rows for b in plan.broadcasts for d, rows in b.rows.items()}
         if totals != expected:
-            failures.append(f"rank {rank}: moved routes {totals} != plan {expected}")
+            failures.append(f"rank {rank}: {where}: moved routes {totals} != plan {expected}")
+        return failures
 
-        # The relay delivered every received expert byte for byte.
-        bound = arena.bound.base
-        for helper, expert in enumerate(plan.helper_table[rank]):
+    def _row_failures(self, layer: int, plan, rows: list, where: str) -> list:
+        """Every helper row this rank received holds the owner's expert, byte for byte."""
+        failures = []
+        bound = self.arenas[layer].bound.base
+        for helper, expert in enumerate(plan.helper_table[self.rank]):
             if expert < 0:
                 continue
             for plane, nbytes in enumerate(bound.plane_bytes):
-                address = int(bound.local_plane_views[plane].data_ptr()) + (
-                    _HOME_EXPERTS + helper
-                ) * int(nbytes)
-                weights = _pattern(expert, plane, self.weights[layer], int(nbytes), self.device)
-                if not torch.equal(_row(address, int(nbytes), self.device), weights):
-                    failures.append(f"rank {rank}: layer {layer} helper {helper} plane {plane}")
+                nbytes = int(nbytes)
+                weights = _pattern(expert, plane, self.weights[layer], nbytes, self.device)
+                if not torch.equal(rows[plane][helper * nbytes : (helper + 1) * nbytes], weights):
+                    failures.append(
+                        f"rank {self.rank}: {where}: helper {helper} plane {plane} is not expert {expert}"
+                    )
+        return failures
+
+    def check(self, layer: int, routes) -> list:
+        """Check the launches of ``layer`` since the previous check, whose routes ``routes`` lists in order.
+
+        A single tensor is one launch. Every launch updates the model and is
+        checked against its own plan through its MAIN-side copies; the last
+        one's plan, outputs and helper rows are also compared as they are now.
+        """
+        routes_list = [routes] if isinstance(routes, torch.Tensor) else list(routes)
+        copies = self.pending[layer]
+        if len(copies) != len(routes_list):
+            raise RuntimeError(f"{len(routes_list)} routes for {len(copies)} launches")
+        self.pending[layer] = []
+        rank = self.rank
+        failures = []
+        first = self.launches[layer] - len(routes_list) + 1
+        plan = None
+        for index, (launch_routes, launch_copies) in enumerate(zip(routes_list, copies)):
+            plan = self._apply(layer, launch_routes)
+            if launch_copies is None:
+                continue
+            where = f"layer {layer} launch {first + index}"
+            slots, rows = launch_copies
+            failures += self._route_failures(
+                plan, launch_routes, slots, f"{where} routes after the route wait"
+            )
+            failures += self._row_failures(layer, plan, rows, f"{where} helper rows at the gate")
+
+        group = self.groups[layer]
+        scheduler = group.scheduler
+        routes = routes_list[-1]
+        where = f"layer {layer} now"
+        # Every launch of the layer is one scheduler epoch.
+        if scheduler.plan_workspace.cpu().tolist() != plan.plan_words(epoch=self.launches[layer]):
+            failures.append(f"rank {rank}: {where}: plan words differ from the reference")
+        if scheduler.outputs.hot_expert_ids.cpu().tolist() != plan.helper_table[rank]:
+            failures.append(f"rank {rank}: {where}: helper experts differ from the reference")
+        if any(scheduler.status.cpu().tolist()):
+            failures.append(f"rank {rank}: {where}: status words {scheduler.status.cpu().tolist()}")
+        cells = self.ready_row(layer).cpu().tolist()
+        if cells != [_READY] * self.ep:
+            failures.append(f"rank {rank}: {where}: READY row {cells}")
+        # Every route wait resets the counter that the launch's CTAs raised.
+        counter = int(group._route_epoch.item())
+        if counter != 0:
+            failures.append(f"rank {rank}: {where}: route counter {counter} after the route waits")
+        timed_out = int(self.kernels.timed_out.item())
+        if timed_out:
+            failures.append(f"rank {rank}: {where}: {timed_out} gate CTAs timed out on READY")
+            self.kernels.timed_out.zero_()
+        slots = scheduler.outputs.physical_slot_ids[: routes.shape[0]]
+        failures += self._route_failures(plan, routes, slots, f"{where} routes")
+        # A later layer on the same shared bank has refilled its helper rows since.
+        if self.bank_user.get(self.banks[layer]) == layer:
+            failures += self._row_failures(layer, plan, self.helper_rows(layer), f"{where} rows")
 
         counts = group.broadcaster.relay_counts()
         want = (self.launches[layer], self.receiver_copies[layer], self.receiver_skips[layer])
         if counts != want:
-            failures.append(f"rank {rank}: layer {layer} relay counts {counts} != {want}")
+            failures.append(f"rank {rank}: {where}: relay counts {counts} != {want}")
         table = self.tables[layer]
         if table is not None:
             native = group.broadcaster.residency.cpu().tolist()
             if native != table:
-                failures.append(f"rank {rank}: layer {layer} residency {native} != {table}")
+                failures.append(f"rank {rank}: {where}: residency {native} != {table}")
             if any(other != native for other in MPI.COMM_WORLD.allgather(native)):
-                failures.append(f"rank {rank}: layer {layer} residency differs across ranks")
+                failures.append(f"rank {rank}: {where}: residency differs across ranks")
         return failures
 
     def shutdown(self) -> None:
@@ -582,7 +695,7 @@ class _Layers:
 
 
 def _case_reference(layers: _Layers) -> list:
-    """T1-3: every launch against the reference, over ranks with different token counts."""
+    """Every launch against the reference, over ranks with different token counts."""
     rank = layers.rank
     main = torch.cuda.Stream()
     failures = []
@@ -592,21 +705,22 @@ def _case_reference(layers: _Layers) -> list:
             last = rank == layers.ep - 1
             tokens = 0 if step == 1 and last else layers.max_tokens - 17 * (rank % 8)
             routes = layers.routes(100 * seed + step, tokens)
-            failures += layers.check(0, routes, layers.call(0, routes, main))
+            layers.call(0, routes, main)
+            failures += layers.check(0, routes)
     return failures
 
 
-def _case_empty_plan(layers: _Layers) -> list:
-    """T1-4: balanced routes plan no broadcast, and ranks without tokens still publish READY."""
+def _case_balanced_and_empty(layers: _Layers) -> list:
+    """Balanced routes plan no broadcast, and ranks without tokens still publish READY."""
     rank = layers.rank
     main = torch.cuda.Stream()
     failures = []
     for tokens in (layers.max_tokens, 0):
         routes = _uniform_routes(rank, tokens, layers.experts, layers.device)
-        ready = layers.call(0, routes, main)
-        if int(_buffers(layers.groups[0]).plan[1]) != 0:
+        layers.call(0, routes, main)
+        if int(layers.groups[0].scheduler.plan_workspace[1]) != 0:
             failures.append(f"rank {rank}: a balanced load planned broadcasts")
-        failures += layers.check(0, routes, ready)
+        failures += layers.check(0, routes)
     return failures
 
 
@@ -614,20 +728,20 @@ def _case_alternating_layers(layers: _Layers) -> list:
     """Three layers: on two shared helper banks, layer 2 refills the bank of layer 0; per-layer
     helper slots give every layer its own set."""
     rank = layers.rank
-    banks = [int(arena.provider.layer.helper_set) for arena in layers.arenas]
     expected = [0, 1, 2] if layers.resident else [0, 1, 0]
-    failures = [] if banks == expected else [f"rank {rank}: helper sets {banks}"]
+    failures = [] if layers.banks == expected else [f"rank {rank}: helper sets {layers.banks}"]
     main = torch.cuda.Stream()
     for seed in range(_SEEDS):
         for step in range(2):
             for layer in range(len(layers.groups)):
                 routes = layers.routes(1000 * seed + 10 * step + layer, layers.max_tokens)
-                failures += layers.check(layer, routes, layers.call(layer, routes, main))
+                layers.call(layer, routes, main)
+                failures += layers.check(layer, routes)
     return failures
 
 
 def _case_resident_repeat(layers: _Layers) -> list:
-    """T1-5 (a, b): repeated routes copy nothing and keep the rows, even a row a test overwrote.
+    """Repeated routes copy nothing and keep the rows, even a row the test overwrote.
 
     The first rank that received an expert into helper slot 0 overwrites that
     row with a sentinel; the repeat keeps it, because the relay skips it. Once
@@ -638,35 +752,36 @@ def _case_resident_repeat(layers: _Layers) -> list:
     main = torch.cuda.Stream()
     failures = []
     routes = layers.routes(0, layers.max_tokens)
-    failures += layers.check(0, routes, layers.call(0, routes, main))
+    layers.call(0, routes, main)
+    failures += layers.check(0, routes)
     holders = [d for d in range(layers.ep) if layers.tables[0][d][0] >= 0]
     if not holders:
-        return failures + [f"rank {rank}: no rank received an expert, so the case is void"]
+        raise _Skip(f"no rank receives a helper expert in these routes at EP {layers.ep}")
     sentinel_rank = holders[0]
-    bound = layers.arenas[0].bound.base
-    nbytes = int(bound.plane_bytes[0])
-    address = int(bound.local_plane_views[0].data_ptr()) + _HOME_EXPERTS * nbytes
+    nbytes = int(layers.arenas[0].bound.base.plane_bytes[0])
+    row = layers.helper_rows(0)[0][:nbytes]
     sentinel = torch.full((nbytes,), 0x5A, dtype=torch.uint8, device=layers.device)
     if rank == sentinel_rank:
-        _row(address, nbytes, layers.device).copy_(sentinel)
+        row.copy_(sentinel)
     torch.cuda.synchronize()
     MPI.COMM_WORLD.Barrier()
     layers.call(0, routes, main)
     # The sentinel row no longer holds the expert, so only the model is updated here.
-    layers._apply(0, routes)
+    layers.apply_unchecked(0, routes)
     if layers.last_copies:
         failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
-    if rank == sentinel_rank and not torch.equal(_row(address, nbytes, layers.device), sentinel):
+    if rank == sentinel_rank and not torch.equal(row, sentinel):
         failures.append(f"rank {rank}: the repeated call rewrote a resident helper row")
     layers.groups[0].forget_helper_residency()
     layers.tables[0] = [[-1] * _HELPER_SLOTS for _ in range(layers.ep)]
     MPI.COMM_WORLD.Barrier()
-    failures += layers.check(0, routes, layers.call(0, routes, main))
+    layers.call(0, routes, main)
+    failures += layers.check(0, routes)
     return failures
 
 
 def _case_resident_sequence(layers: _Layers) -> list:
-    """T1-5 (c): random routes with evictions and returns; tables match a model and each other."""
+    """Random routes with evictions and returns; tables match a model and each other."""
     rank = layers.rank
     main = torch.cuda.Stream()
     rng = random.Random(7)
@@ -675,7 +790,8 @@ def _case_resident_sequence(layers: _Layers) -> list:
     for index, step in enumerate(steps):
         tokens = 0 if index % 17 == 5 and rank == 0 else layers.max_tokens
         routes = layers.routes(step, tokens)
-        failures += layers.check(0, routes, layers.call(0, routes, main))
+        layers.call(0, routes, main)
+        failures += layers.check(0, routes)
         if failures:
             break
     if layers.receiver_skips[0] == 0:
@@ -684,27 +800,29 @@ def _case_resident_sequence(layers: _Layers) -> list:
 
 
 def _case_resident_reload(layers: _Layers) -> list:
-    """T1-5: a weight reload makes the next call copy every receiver again, with the new weights."""
+    """A weight reload makes the next call copy every receiver again, with the new weights."""
     rank = layers.rank
     main = torch.cuda.Stream()
     failures = []
     routes = layers.routes(0, layers.max_tokens)
     for _ in range(2):
-        failures += layers.check(0, routes, layers.call(0, routes, main))
+        layers.call(0, routes, main)
+        failures += layers.check(0, routes)
     if layers.last_copies:
         failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
     layers.reload_weights(0)
     skips = layers.receiver_skips[0]
-    failures += layers.check(0, routes, layers.call(0, routes, main))
-    # check() compared the rows with the new weights and the counters and the
-    # table with a model that forgot every slot.
+    layers.call(0, routes, main)
+    # check() compares the rows with the new weights, and the counters and
+    # the table with a model that forgot every slot.
+    failures += layers.check(0, routes)
     if layers.last_copies == 0 or layers.receiver_skips[0] != skips:
         failures.append(f"rank {rank}: the call after the reload skipped receivers")
     return failures
 
 
 def _case_shared_banks(layers: _Layers) -> list:
-    """T1-5 (d): shared banks keep no table and copy every receiver every time."""
+    """Shared banks keep no table and copy every receiver every time."""
     failures = _case_alternating_layers(layers)
     if any(layers.receiver_skips):
         failures.append(f"rank {layers.rank}: shared banks skipped receivers")
@@ -712,7 +830,7 @@ def _case_shared_banks(layers: _Layers) -> list:
 
 
 def _case_stable_slot(layers: _Layers) -> list:
-    """T1-6: a resident expert keeps its slot when a lower-id expert joins its receiver.
+    """A resident expert keeps its slot when a lower-id expert joins its receiver.
 
     At EP 4, route step 2 sends expert 10 to slot 0 of rank 3, and step 13
     sends experts 1 and 10 there: in ascending order expert 10 would move to
@@ -720,15 +838,16 @@ def _case_stable_slot(layers: _Layers) -> list:
     """
     rank = layers.rank
     if layers.ep != 4:
-        return [f"rank {rank}: the stable-slot routes are built for EP 4, not {layers.ep}"]
+        raise _Skip(f"the stable-slot routes are built for EP 4, not {layers.ep}")
     main = torch.cuda.Stream()
     failures = []
     skips = 0
     for step in (2, 13):
         routes = layers.routes(step, layers.max_tokens)
         skips = layers.receiver_skips[0]
-        failures += layers.check(0, routes, layers.call(0, routes, main))
-    hot = _buffers(layers.groups[0]).ids.cpu().tolist()
+        layers.call(0, routes, main)
+        failures += layers.check(0, routes)
+    hot = layers.groups[0].scheduler.outputs.hot_expert_ids.cpu().tolist()
     if layers.tables[0][3] != [10, 1] or (rank == 3 and hot != [10, 1]):
         failures.append(f"rank {rank}: rank 3's helper slots {layers.tables[0][3]}, here {hot}")
     if layers.receiver_skips[0] == skips:
@@ -736,206 +855,68 @@ def _case_stable_slot(layers: _Layers) -> list:
     return failures
 
 
+def _starve_relay(layers: _Layers) -> None:
+    """Give COPY the lowest stream priority, below the MAIN of the hog cases.
+
+    Production gives COPY the highest priority, which only orders CTAs that
+    are still pending; inverting it makes MegaMoE win every SM that frees up
+    while the HALO-R kernel is pending. Must run before the groups are built.
+    """
+    least, _ = torch.cuda.Stream.priority_range()
+    copy_stream = torch.cuda.Stream(device=layers.device, priority=least)
+    layers.manager.get_copy_stream = lambda device: copy_stream
+
+
 def _case_gate_under_hog(layers: _Layers, use_graph: bool) -> list:
-    """T1-7: MegaMoE's full grid, queued right after the route wait, must not starve the relay.
+    """MegaMoE's full grid, queued right after the route wait, must not starve the relay.
 
     A hog holds every SM but the HALO-R kernel's, and COPY runs below MAIN, so
     a gate kernel that MAIN has already released takes every SM that frees up
     first. The route wait passes only once every HALO-R CTA has released its
     routes, after the grid rendezvous, so the relay already holds its SMs.
     """
-    rank = layers.rank
     group = layers.groups[0]
-    kernels = _GateKernels(layers.device)
-    ready_row = layers.arenas[0].terminal_flags_tensor().view(torch.int64)
+    kernels = layers.kernels
     _, greatest = torch.cuda.Stream.priority_range()
     main = torch.cuda.Stream(device=layers.device, priority=greatest)
     side = torch.cuda.Stream(device=layers.device)
     # The group accepts only a MAIN below COPY; bind this MAIN directly.
     group._execution_stream_handle = int(main.cuda_stream)
     static = layers.routes(0, layers.max_tokens)
-    expected = 1 if _implementation() == "graphs" else None
 
-    def layer_call() -> None:
-        _, ready = group.plan(static, defer_wait=False)
-        kernels.launch_gate(ready_row, int(ready) if expected is None else expected, main)
-        group.finish()
+    def layer_call(capturing: bool = False) -> None:
+        layers.layer_call(0, static, gate_blocks=kernels.sms, delay=False, capturing=capturing)
 
+    failures = []
     graph = None
     if use_graph:
         main.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(main):
             # Warm up eagerly on the capture stream, as the breakable runner does.
             layer_call()
-        layers.launches[0] += 1
         torch.cuda.synchronize()
-        failures = layers.check(0, static, 1)
+        MPI.COMM_WORLD.Barrier()
+        failures += layers.check(0, static)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=main):
-            layer_call()
-    else:
-        failures = []
+            layer_call(capturing=True)
     for step in range(1, 51):
         routes = layers.routes(step, layers.max_tokens)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        kernels.launch_hog(side, group.auxiliary_sms)
+        kernels.launch_hog(side, kernels.sms - group.auxiliary_sms)
         with torch.cuda.stream(main):
             static.copy_(routes)
             if graph is not None:
                 graph.replay()
+                layers.replayed([0])
             else:
                 layer_call()
-        layers.launches[0] += 1
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
-        timed_out = int(kernels.timed_out.item())
-        if timed_out:
-            failures.append(f"rank {rank}: step {step}: {timed_out} gate CTAs timed out on READY")
-            kernels.timed_out.zero_()
-        ready = 1 if expected is not None else layers.launches[0]
-        failures += layers.check(0, routes, ready)
+        failures += layers.check(0, routes)
     if graph is not None:
         graph.reset()
-    return failures
-
-
-def _case_fail_closed(layers: _Layers) -> dict:
-    """T1-8 (a): a status word set on rank 0 traps it before it releases routes; its peers trap next.
-
-    Rank 0 writes a nonzero epoch into the invalid-route status word of layer 1
-    on MAIN before forward 5. Its kernel traps before its route release, so its
-    call fails within seconds. Each peer completes that forward and traps at
-    its next count exchange or READY drain, which rank 0 never joins, within
-    the spin bound. Returns this rank's first error and its delay.
-    """
-    rank = layers.rank
-    main = torch.cuda.Stream()
-    for forward in range(5):
-        for layer in range(2):
-            layers.call(layer, layers.routes(10 * forward + layer, layers.max_tokens), main)
-    layers.manager.get_scheduler_spin_bound().set_timeout_seconds(_FAIL_TIMEOUT_S)
-    torch.cuda.synchronize()
-    MPI.COMM_WORLD.Barrier()
-    start = time.monotonic()
-    error = None
-    where = None
-    for forward in range(5, 9):
-        for layer in range(2):
-            try:
-                with torch.cuda.stream(main):
-                    if rank == 0 and forward == 5 and layer == 1:
-                        _buffers(layers.groups[layer]).status[3].fill_(5)
-                    layers.layer_call(layer, layers.routes(10 * forward + layer, layers.max_tokens))
-                torch.cuda.synchronize()
-            except Exception as exc:  # noqa: BLE001  the trap surfaces as a CUDA error
-                error, where = f"{type(exc).__name__}: {exc}", (forward, layer)
-                break
-        if error is not None:
-            break
-    layers.dead = error is not None
-    return {"rank": rank, "error": error, "where": where, "seconds": time.monotonic() - start}
-
-
-def _case_graphs_single(layers: _Layers) -> list:
-    """T1-10 (a): one layer captured once, then 50 replays with fresh routes in the static input."""
-    graph, static, failures = _capture(layers, [0])
-    for step in range(1, 51):
-        routes = layers.routes(step, layers.max_tokens)
-        with torch.cuda.stream(layers.eager[0]):
-            static[0].copy_(routes)
-            graph.replay()
-        layers.launches[0] += 1
-        torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
-        failures += layers.check(0, routes, 1)
-    failures += _replay_counts(layers, replays=50)
-    graph.reset()
-    return failures
-
-
-def _case_graphs_layers(layers: _Layers) -> list:
-    """T1-10 (b): three layers in one graph, replayed with fresh routes."""
-    count = len(layers.groups)
-    graph, static, failures = _capture(layers, list(range(count)))
-    for step in range(1, 11):
-        routes = [layers.routes(100 * step + layer, layers.max_tokens) for layer in range(count)]
-        with torch.cuda.stream(layers.eager[0]):
-            for layer in range(count):
-                static[layer].copy_(routes[layer])
-            graph.replay()
-        torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
-        for layer in range(count):
-            layers.launches[layer] += 1
-            failures += layers.check(layer, routes[layer], 1)
-    graph.reset()
-    return failures
-
-
-def _case_graphs_interleaved(layers: _Layers) -> list:
-    """T1-10 (c): eager calls and replays interleaved on the same layer, with MAIN changing.
-
-    Each step queues one to three launches without a host wait: eager calls on
-    one of two MAIN streams and replays on the current one, so the group's
-    MAIN-to-MAIN fence, the per-call join and the route-counter reset order
-    them. The step's last launch is checked; the model applies every launch.
-    """
-    graph, static, failures = _capture(layers, [0])
-    rng = random.Random(11)
-    streams = layers.eager
-    # Replays run on the group's current MAIN, as the runner replays on the
-    # execution stream that its eager calls use; only eager calls change MAIN.
-    main = 0
-    replays = 0
-    for step in range(200):
-        launches = []
-        for _ in range(1 + rng.randrange(3)):
-            routes = layers.routes(1000 + 7 * step + len(launches), layers.max_tokens)
-            if rng.random() < 0.5:
-                with torch.cuda.stream(streams[main]):
-                    static[0].copy_(routes)
-                    graph.replay()
-                layers.launches[0] += 1
-                replays += 1
-            else:
-                if rng.random() < 0.4:
-                    main ^= 1
-                with torch.cuda.stream(streams[main]):
-                    layers.layer_call(0, routes)
-            launches.append(routes)
-        torch.cuda.synchronize()
-        MPI.COMM_WORLD.Barrier()
-        failures += layers.check(0, launches, 1)
-        if failures:
-            break
-    failures += _replay_counts(layers, replays=replays)
-    graph.reset()
-    return failures
-
-
-def _case_graphs_capturing_switch(layers: _Layers) -> list:
-    """T1-10 (d): MAIN cannot change into a stream that is capturing."""
-    rank = layers.rank
-    group = layers.groups[0]
-    failures = []
-    main = torch.cuda.Stream(device=layers.device)
-    routes = layers.routes(0, layers.max_tokens)
-    failures += layers.check(0, routes, layers.call(0, routes, main))
-    graph = torch.cuda.CUDAGraph()
-    capture = torch.cuda.Stream(device=layers.device)
-    try:
-        with torch.cuda.graph(graph, stream=capture):
-            group.plan(routes, defer_wait=False)
-        failures.append(f"rank {rank}: a switch into a capturing stream did not raise")
-    except RuntimeError as error:
-        if "capturing" not in str(error):
-            failures.append(f"rank {rank}: unexpected error {error}")
-    torch.cuda.synchronize()
-    MPI.COMM_WORLD.Barrier()
-    # Nothing changed: the next eager call proceeds.
-    routes = layers.routes(1, layers.max_tokens)
-    failures += layers.check(0, routes, layers.call(0, routes, main))
     return failures
 
 
@@ -953,12 +934,11 @@ def _capture(layers: _Layers, layer_ids: list):
     MPI.COMM_WORLD.Barrier()
     failures = []
     for layer in layer_ids:
-        failures += layers.check(layer, static[layer], 1)
+        failures += layers.check(layer, static[layer])
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=capture):
         for layer in layer_ids:
-            layers.groups[layer].plan(static[layer], defer_wait=False)
-            layers.groups[layer].finish()
+            layers.layer_call(layer, static[layer], capturing=True)
     torch.cuda.synchronize()
     layers.captures = len(layer_ids)
     return graph, static, failures
@@ -974,153 +954,217 @@ def _replay_counts(layers: _Layers, replays: int) -> list:
     return []
 
 
-def _equivalence_records(layers: _Layers) -> dict:
-    """T1-2: run the fixed inputs and return what both builds must produce bitwise.
-
-    Plan words without the epoch, the route prefix of every broadcast, the
-    physical slot of every valid route, the helper experts and their owners, and
-    every helper row of the layer after each call.
-    """
-    records = {}
-    main = torch.cuda.Stream()
-    for seed in range(_SEEDS):
-        for tokens in _EQUIV_TOKENS:
-            for kind in ("uniform", "skewed"):
-                for layer in range(len(layers.groups)):
-                    if kind == "uniform":
-                        routes = _uniform_routes(layers.rank, tokens, layers.experts, layers.device)
-                    else:
-                        routes = layers.routes(10000 * seed + 10 * tokens + layer, tokens)
-                    layers.call(layer, routes, main)
-                    buffers = _buffers(layers.groups[layer])
-                    plan = buffers.plan.cpu()
-                    broadcasts = int(plan[1])
-                    prefix = buffers.prefix.cpu().view(-1, layers.ep + 1)[:broadcasts, : layers.ep]
-                    bound = layers.arenas[layer].bound.base
-                    rows = []
-                    for plane, nbytes in enumerate(bound.plane_bytes):
-                        base = int(bound.local_plane_views[plane].data_ptr())
-                        helpers = _row(
-                            base + _HOME_EXPERTS * int(nbytes),
-                            _HELPER_SLOTS * int(nbytes),
-                            layers.device,
-                        )
-                        rows.append(helpers.cpu().clone())
-                    records[f"seed{seed}/T{tokens}/{kind}/layer{layer}"] = {
-                        "plan": plan[1:].clone(),
-                        "prefix": prefix.clone(),
-                        "slots": buffers.slots[:tokens].cpu().clone(),
-                        "ids": buffers.ids.cpu().clone(),
-                        "owners": buffers.owners.cpu().clone(),
-                        "helper_rows": rows,
-                    }
-    return records
-
-
-def _case_equivalence(layers: _Layers, mode: str) -> list:
-    """T1-2: dump on a commit-0 build, or compare bitwise with that dump."""
-    path = os.path.join(_EQUIV_DIR, f"ep{layers.ep}_rank{layers.rank}.pt")
-    records = _equivalence_records(layers)
-    if mode == "dump":
-        os.makedirs(_EQUIV_DIR, exist_ok=True)
-        torch.save(records, path)
-        return []
-    reference = torch.load(path)
-    failures = []
-    if set(reference) != set(records):
-        return [
-            f"rank {layers.rank}: inputs differ from the dump: {sorted(set(reference) ^ set(records))[:4]}"
-        ]
-    for key, want in reference.items():
-        got = records[key]
-        for name in ("plan", "prefix", "slots", "ids", "owners"):
-            if not torch.equal(got[name], want[name]):
-                failures.append(f"rank {layers.rank}: {key} {name} differs from commit 0")
-        if any(not torch.equal(a, b) for a, b in zip(got["helper_rows"], want["helper_rows"])):
-            failures.append(f"rank {layers.rank}: {key} helper rows differ from commit 0")
-        if len(failures) > 20:
-            break
+def _case_graphs_single(layers: _Layers) -> list:
+    """One layer captured once, then 50 replays with fresh routes in the static input."""
+    graph, static, failures = _capture(layers, [0])
+    for step in range(1, 51):
+        routes = layers.routes(step, layers.max_tokens)
+        with torch.cuda.stream(layers.eager[0]):
+            static[0].copy_(routes)
+            graph.replay()
+        layers.replayed([0])
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        failures += layers.check(0, routes)
+    failures += _replay_counts(layers, replays=50)
+    graph.reset()
     return failures
 
 
-def _has_helper_residency() -> bool:
-    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import halo_r_planner
+def _case_graphs_layers(layers: _Layers) -> list:
+    """Three layers in one graph, replayed with fresh routes."""
+    count = len(layers.groups)
+    graph, static, failures = _capture(layers, list(range(count)))
+    for step in range(1, 11):
+        routes = [layers.routes(100 * step + layer, layers.max_tokens) for layer in range(count)]
+        with torch.cuda.stream(layers.eager[0]):
+            for layer in range(count):
+                static[layer].copy_(routes[layer])
+            graph.replay()
+        layers.replayed(list(range(count)))
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        for layer in range(count):
+            failures += layers.check(layer, routes[layer])
+    graph.reset()
+    return failures
 
-    group = getattr(halo_r_planner, "HaloRSlotSchedulerGroup", None)
-    return hasattr(group, "forget_helper_residency")
 
+def _case_graphs_interleaved(layers: _Layers) -> list:
+    """Eager calls and replays interleaved on the same layer, with MAIN changing.
 
-def _starve_relay(layers: _Layers) -> None:
-    """Give COPY the lowest stream priority, below the MAIN of the hog cases.
-
-    Production gives COPY the highest priority, which only orders CTAs that
-    are still pending; inverting it makes MegaMoE win every SM that frees up
-    while the HALO-R kernel is pending. Must run before the groups are built.
+    Each step queues one to three launches without a host wait: eager calls on
+    one of two MAIN streams and replays on the current one, so the group's
+    MAIN-to-MAIN fence, the per-call join and the route-counter reset order
+    them. Every eager launch and the step's last replay are checked through
+    their MAIN-side copies; the model applies every launch.
     """
-    least, _ = torch.cuda.Stream.priority_range()
-    copy_stream = torch.cuda.Stream(device=layers.device, priority=least)
-    layers.manager.get_copy_stream = lambda device: copy_stream
+    graph, static, failures = _capture(layers, [0])
+    rng = random.Random(11)
+    streams = layers.eager
+    # Replays run on the group's current MAIN, as the runner replays on the
+    # execution stream that its eager calls use; only eager calls change MAIN.
+    main = 0
+    replays = 0
+    for step in range(200):
+        launches = []
+        for _ in range(1 + rng.randrange(3)):
+            routes = layers.routes(1000 + 7 * step + len(launches), layers.max_tokens)
+            if rng.random() < 0.5:
+                with torch.cuda.stream(streams[main]):
+                    static[0].copy_(routes)
+                    graph.replay()
+                layers.replayed([0])
+                replays += 1
+            else:
+                if rng.random() < 0.4:
+                    main ^= 1
+                with torch.cuda.stream(streams[main]):
+                    layers.layer_call(0, routes)
+            launches.append(routes)
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        failures += layers.check(0, launches)
+        if failures:
+            break
+    failures += _replay_counts(layers, replays=replays)
+    graph.reset()
+    return failures
 
 
-# case: (layers, auxiliary SMs, helper-slot mode, max tokens per rank, needs CUDA graphs)
-_SETUPS = {
-    "t1_2": (3, _AUXILIARY_SMS, "shared_banks", _EQUIV_MAX_TOKENS, False),
-    "t1_3": (1, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, False),
-    "t1_3_aux16": (1, 16, "shared_banks", _MAX_TOKENS, False),
-    "t1_4": (1, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, False),
-    "t1_5_repeat": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, False),
-    "t1_5_sequence": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, False),
-    "t1_5_layers": (3, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, False),
-    "t1_5_reload": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, False),
-    "t1_5_shared_banks": (3, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, False),
-    "t1_6": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, False),
-    "t1_7": (1, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, False),
-    "t1_7_aux16": (1, 16, "shared_banks", _MAX_TOKENS, False),
-    "t1_7_graph": (1, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, True),
-    "t1_8": (2, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, False),
-    "t1_10_single": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, True),
-    "t1_10_layers_resident": (3, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, True),
-    "t1_10_layers_shared": (3, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, True),
-    "t1_10_interleaved": (1, _AUXILIARY_SMS, "per_layer_resident", _MAX_TOKENS, True),
-    "t1_10_capturing_switch": (1, _AUXILIARY_SMS, "shared_banks", _MAX_TOKENS, True),
+def _case_graphs_capturing_switch(layers: _Layers) -> list:
+    """MAIN cannot change into a stream that is capturing."""
+    rank = layers.rank
+    group = layers.groups[0]
+    failures = []
+    main = torch.cuda.Stream(device=layers.device)
+    routes = layers.routes(0, layers.max_tokens)
+    layers.call(0, routes, main)
+    failures += layers.check(0, routes)
+    graph = torch.cuda.CUDAGraph()
+    capture = torch.cuda.Stream(device=layers.device)
+    try:
+        with torch.cuda.graph(graph, stream=capture):
+            group.plan(routes, defer_wait=False)
+        failures.append(f"rank {rank}: a switch into a capturing stream did not raise")
+    except RuntimeError as error:
+        if "capturing" not in str(error):
+            failures.append(f"rank {rank}: unexpected error {error}")
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    # Nothing changed: the next eager call proceeds.
+    routes = layers.routes(1, layers.max_tokens)
+    layers.call(0, routes, main)
+    failures += layers.check(0, routes)
+    return failures
+
+
+def _break_launch(layers: _Layers, kind: str, layer: int, main: torch.cuda.Stream) -> None:
+    """Queue on MAIN what makes the next launch of ``layer`` on this rank fail, before its routes."""
+    if kind == "status_word":
+        # The invalid-route status word, set with a nonzero epoch.
+        layers.groups[layer].scheduler.status[3].fill_(5)
+    elif kind == "ready_drain_timeout":
+        # The last rank's READY of the previous launch never arrived.
+        layers.ready_row(layer)[layers.ep - 1].zero_()
+    elif kind == "grid_rendezvous_timeout":
+        # One SM fewer than the kernel's CTAs stays free for longer than the spin bound.
+        side = torch.cuda.Stream(device=layers.device)
+        kernels = layers.kernels
+        kernels.launch_hog(side, kernels.sms - layers.auxiliary_sms + 1, _TRAP_HOG_NS)
+        # Let the hog take its SMs before the HALO-R kernel launches.
+        time.sleep(0.5)
+    else:
+        raise ValueError(f"unknown trap {kind}")
+
+
+def _case_trap(layers: _Layers, kind: str) -> dict:
+    """Rank 0 breaks one launch of layer 1; it traps in that call, before it releases routes.
+
+    Its peers trap in that call or the next, at their wait for rank 0, within
+    the spin bound. Returns this rank's first error, the call that raised it
+    and its delay.
+    """
+    rank = layers.rank
+    main = torch.cuda.Stream()
+    for forward in range(_TRAP_CALL[0]):
+        for layer in range(2):
+            layers.call(layer, layers.routes(10 * forward + layer, layers.max_tokens), main)
+    layers.manager.get_scheduler_spin_bound().set_timeout_seconds(_TRAP_TIMEOUT_S)
+    layers.copy_delay_ns = 0
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    start = time.monotonic()
+    error = None
+    where = None
+    for forward in range(_TRAP_CALL[0], _TRAP_CALL[0] + 4):
+        for layer in range(2):
+            try:
+                with torch.cuda.stream(main):
+                    if rank == 0 and (forward, layer) == _TRAP_CALL:
+                        _break_launch(layers, kind, layer, main)
+                    layers.layer_call(layer, layers.routes(10 * forward + layer, layers.max_tokens))
+                torch.cuda.synchronize()
+            except Exception as exc:  # noqa: BLE001  the trap surfaces as a CUDA error
+                error, where = f"{type(exc).__name__}: {exc}", (forward, layer)
+                break
+        if error is not None:
+            break
+    layers.dead = error is not None
+    return {"rank": rank, "error": error, "where": where, "seconds": time.monotonic() - start}
+
+
+# case: (case function, layers, auxiliary SMs, helper-slot mode)
+_CASES = {
+    "reference": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
+    "reference_aux16": (_case_reference, 1, 16, "shared_banks"),
+    "balanced_and_empty": (_case_balanced_and_empty, 1, _AUXILIARY_SMS, "shared_banks"),
+    "resident_repeat": (_case_resident_repeat, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "resident_sequence": (_case_resident_sequence, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "resident_layers": (_case_alternating_layers, 3, _AUXILIARY_SMS, "per_layer_resident"),
+    "resident_reload": (_case_resident_reload, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "shared_banks": (_case_shared_banks, 3, _AUXILIARY_SMS, "shared_banks"),
+    "stable_slot": (_case_stable_slot, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "gate_under_hog": (
+        lambda layers: _case_gate_under_hog(layers, use_graph=False),
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+    ),
+    "gate_under_hog_aux16": (
+        lambda layers: _case_gate_under_hog(layers, use_graph=False),
+        1,
+        16,
+        "shared_banks",
+    ),
+    "gate_under_hog_graph": (
+        lambda layers: _case_gate_under_hog(layers, use_graph=True),
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+    ),
+    "graphs_single": (_case_graphs_single, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "graphs_layers_resident": (_case_graphs_layers, 3, _AUXILIARY_SMS, "per_layer_resident"),
+    "graphs_layers_shared": (_case_graphs_layers, 3, _AUXILIARY_SMS, "shared_banks"),
+    "graphs_interleaved": (_case_graphs_interleaved, 1, _AUXILIARY_SMS, "per_layer_resident"),
+    "graphs_capturing_switch": (
+        _case_graphs_capturing_switch,
+        1,
+        _AUXILIARY_SMS,
+        "shared_banks",
+    ),
 }
+_TRAPS = ("status_word", "ready_drain_timeout", "grid_rendezvous_timeout")
+for _kind in _TRAPS:
+    _CASES[f"trap_{_kind}"] = (
+        lambda layers, kind=_kind: _case_trap(layers, kind),
+        2,
+        _AUXILIARY_SMS,
+        "shared_banks",
+    )
 
 
-def _run_case(layers: _Layers, case: str, params: dict):
-    if case == "t1_2":
-        return _case_equivalence(layers, params["mode"])
-    if case.startswith("t1_3"):
-        return _case_reference(layers)
-    if case == "t1_4":
-        return _case_empty_plan(layers)
-    if case == "t1_5_repeat":
-        return _case_resident_repeat(layers)
-    if case == "t1_5_sequence":
-        return _case_resident_sequence(layers)
-    if case == "t1_5_layers":
-        return _case_alternating_layers(layers)
-    if case == "t1_5_reload":
-        return _case_resident_reload(layers)
-    if case == "t1_5_shared_banks":
-        return _case_shared_banks(layers)
-    if case == "t1_6":
-        return _case_stable_slot(layers)
-    if case.startswith("t1_7"):
-        return _case_gate_under_hog(layers, use_graph=case == "t1_7_graph")
-    if case == "t1_8":
-        return _case_fail_closed(layers)
-    if case == "t1_10_single":
-        return _case_graphs_single(layers)
-    if case.startswith("t1_10_layers"):
-        return _case_graphs_layers(layers)
-    if case == "t1_10_interleaved":
-        return _case_graphs_interleaved(layers)
-    if case == "t1_10_capturing_switch":
-        return _case_graphs_capturing_switch(layers)
-    raise ValueError(f"unknown case {case}")
-
-
-def _run_worker(case: str, params: dict):
+def _run_worker(case: str):
     """One EP rank of a case; returns (skip reason or None, result)."""
     from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 
@@ -1130,24 +1174,16 @@ def _run_worker(case: str, params: dict):
     layers = None
     try:
         torch.cuda.set_device(device)
-        count, auxiliary_sms, mode, max_tokens, needs_graphs = _SETUPS[case]
-        auxiliary_sms = params.get("auxiliary_sms", auxiliary_sms)
-        implementation = _implementation()
+        function, count, auxiliary_sms, mode = _CASES[case]
         reason = _skip_reason()
         if reason is None and world != _EP_SIZE:
             reason = f"the MPI world has {world} ranks, HALO_R_TEST_EP is {_EP_SIZE}"
-        if reason is None and needs_graphs and implementation != "graphs":
-            reason = f"this build ({implementation}) cannot capture HALO-R layers"
-        if reason is None and implementation == "commit0" and params.get("mode") != "dump":
-            reason = "a commit-0 build runs only the t1_2 dump"
-        if reason is None and mode == "per_layer_resident" and not _has_helper_residency():
-            reason = f"this build ({implementation}) has no per-layer HALO-R helper slots"
         reasons = MPI.COMM_WORLD.allgather(reason)
         if any(reasons):
             return "; ".join(sorted({r for r in reasons if r})), []
         _init_process_group(rank, world)
-        layers = _Layers(rank, world, device, count, auxiliary_sms, mode, max_tokens)
-        if case.startswith("t1_7"):
+        layers = _Layers(rank, world, device, count, auxiliary_sms, mode)
+        if case.startswith("gate_under_hog"):
             _starve_relay(layers)
         try:
             layers.build_groups()
@@ -1156,7 +1192,10 @@ def _run_worker(case: str, params: dict):
             if _PLACEHOLDER_MESSAGE in str(error):
                 return f"placeholder build: {error}", []
             raise
-        return None, _run_case(layers, case, params)
+        try:
+            return None, function(layers)
+        except _Skip as skip:
+            return str(skip), []
     except Exception:
         traceback.print_exc()
         MPI.COMM_WORLD.Abort(1)
@@ -1169,7 +1208,7 @@ def _run_worker(case: str, params: dict):
         faulthandler.cancel_dump_traceback_later()
 
 
-def _run_on_every_rank(monkeypatch, case: str, params: dict) -> list:
+def _run_on_every_rank(monkeypatch, case: str) -> list:
     """Run one case on every EP rank and return each rank's (skip reason, result).
 
     Under ``trtllm-llmapi-launch`` the ranks are the launcher's MPI world, on
@@ -1187,87 +1226,46 @@ def _run_on_every_rank(monkeypatch, case: str, params: dict) -> list:
             # this process's sys.path, which holds this module. The task is the
             # builtin eval instead: on every rank it unpickles this module's worker
             # by value (cloudpickle, registered above) and runs it.
-            expression = "__import__('cloudpickle').loads(worker)(case, params)"
-            names = {"worker": cloudpickle.dumps(_run_worker), "case": case, "params": params}
+            expression = "__import__('cloudpickle').loads(worker)(case)"
+            names = {"worker": cloudpickle.dumps(_run_worker), "case": case}
             return client.submit_sync(eval, expression, names)  # nosec B307
         if torch.cuda.device_count() < _EP_SIZE:
             pytest.skip(f"Requires {_EP_SIZE} GPUs, or trtllm-llmapi-launch across nodes")
         # Per-layer dynamic EPLB needs the larger launch queues from CUDA initialization on.
         monkeypatch.setenv("CUDA_SCALE_LAUNCH_QUEUES", "4x")
         with MPIPoolExecutor(_EP_SIZE) as executor:
-            return list(executor.map(_run_worker, [case] * _EP_SIZE, [params] * _EP_SIZE))
+            return list(executor.map(_run_worker, [case] * _EP_SIZE))
     finally:
         faulthandler.cancel_dump_traceback_later()
 
 
-def _assert_passed(results: list) -> None:
+def _skip_if_any(results: list) -> None:
     skips = {skip for skip, _ in results if skip}
     if skips:
         pytest.skip("; ".join(sorted(skips)))
+
+
+@pytest.mark.parametrize("case", [case for case in _CASES if not case.startswith("trap_")])
+def test_halo_r(monkeypatch, case):
+    results = _run_on_every_rank(monkeypatch, case)
+    _skip_if_any(results)
     failures = [failure for _, rank_failures in results for failure in rank_failures]
     assert not failures, "\n".join(failures[:20])
 
 
-@pytest.mark.parametrize(
-    "case, params",
-    [
-        pytest.param("t1_3", {}, id="t1_3_reference"),
-        pytest.param("t1_3_aux16", {}, id="t1_3_reference_aux16"),
-        pytest.param("t1_4", {}, id="t1_4_zero_tokens_and_empty_plan"),
-        pytest.param("t1_5_repeat", {}, id="t1_5_repeat_and_sentinel"),
-        pytest.param("t1_5_sequence", {}, id="t1_5_sequence"),
-        pytest.param("t1_5_layers", {}, id="t1_5_per_layer_sets"),
-        pytest.param("t1_5_reload", {}, id="t1_5_weight_reload"),
-        pytest.param("t1_5_shared_banks", {}, id="t1_5_shared_banks"),
-        pytest.param("t1_6", {}, id="t1_6_stable_slot"),
-        pytest.param("t1_7", {}, id="t1_7_gate_under_hog"),
-        pytest.param("t1_7_aux16", {}, id="t1_7_gate_under_hog_aux16"),
-        pytest.param("t1_7_graph", {}, id="t1_7_gate_under_hog_graph"),
-        pytest.param("t1_10_single", {}, id="t1_10_single_layer"),
-        pytest.param("t1_10_layers_resident", {}, id="t1_10_layers_resident"),
-        pytest.param("t1_10_layers_shared", {}, id="t1_10_layers_shared"),
-        pytest.param("t1_10_interleaved", {}, id="t1_10_eager_and_replay_interleaved"),
-        pytest.param("t1_10_capturing_switch", {}, id="t1_10_switch_into_capture"),
-    ],
-)
-def test_halo_r(monkeypatch, case, params):
-    _assert_passed(_run_on_every_rank(monkeypatch, case, params))
-
-
-@pytest.mark.parametrize(
-    "mode, auxiliary_sms",
-    [
-        pytest.param("dump", _AUXILIARY_SMS, id="t1_2_dump"),
-        pytest.param("compare", 2, id="t1_2_compare_aux2"),
-        pytest.param("compare", 4, id="t1_2_compare_aux4"),
-        pytest.param("compare", 8, id="t1_2_compare_aux8"),
-    ],
-)
-def test_halo_r_matches_commit_0(monkeypatch, mode, auxiliary_sms):
-    if not _EQUIV_DIR:
-        pytest.skip("HALO_R_EQUIV_DIR names the commit-0 dump of T1-2")
-    params = {"mode": mode, "auxiliary_sms": auxiliary_sms}
-    _assert_passed(_run_on_every_rank(monkeypatch, "t1_2", params))
-
-
-def test_halo_r_t1_8_status_word_fails_closed(monkeypatch):
-    """A status word on rank 0 traps it before it releases routes; every peer traps after it."""
-    results = _run_on_every_rank(monkeypatch, "t1_8", {})
-    skips = {skip for skip, _ in results if skip}
-    if skips:
-        pytest.skip("; ".join(sorted(skips)))
+@pytest.mark.parametrize("kind", _TRAPS)
+def test_halo_r_traps(monkeypatch, kind):
+    """A broken launch on rank 0 traps it in that call; every peer traps in that call or the next."""
+    results = _run_on_every_rank(monkeypatch, f"trap_{kind}")
+    _skip_if_any(results)
     outcomes = {result["rank"]: result for _, result in results}
     assert sorted(outcomes) == list(range(_EP_SIZE)), outcomes
     failures = []
     for rank, outcome in sorted(outcomes.items()):
-        bound = _FAIL_OWN_TRAP_S if rank == 0 else _FAIL_PEER_TRAP_S
         if outcome["error"] is None or "CUDA" not in outcome["error"]:
             failures.append(f"rank {rank} did not trap: {outcome}")
-        elif outcome["seconds"] > bound:
-            failures.append(
-                f"rank {rank} trapped after {outcome['seconds']:.1f} s, bound {bound} s"
-            )
-    # The injected rank traps in the call it injected; its peers complete that call.
-    if outcomes[0]["where"] != (5, 1):
-        failures.append(f"rank 0 trapped at {outcomes[0]['where']}, not at forward 5, layer 1")
+        elif rank == 0 and outcome["where"] != _TRAP_CALL:
+            failures.append(f"rank 0 trapped at {outcome['where']}, not at {_TRAP_CALL}: {outcome}")
+        elif rank != 0 and outcome["where"] not in (_TRAP_CALL, (_TRAP_CALL[0] + 1, 0)):
+            failures.append(f"rank {rank} trapped at {outcome['where']}: {outcome}")
     assert not failures, "\n".join(failures)
