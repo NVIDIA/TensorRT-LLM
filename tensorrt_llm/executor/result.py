@@ -524,10 +524,25 @@ class GenerationResultBase:
                 # degenerate run still invalidates the generated response.
                 if (self.sampling_params._degenerate_token_runs
                         and not self.sampling_params.ignore_eos):
+                    num_generated_tokens = output.length - len(
+                        decoder_output_prefix)
+                    if (not self.sampling_params.exclude_input_from_output
+                            and not getattr(self, "_streaming", False)):
+                        # Non-streamed output can contain the original prompt.
+                        # Postprocessing records carry its count, not its tokens.
+                        num_prompt_tokens = len(
+                            getattr(self, "prompt_token_ids", ()))
+                        if (self.postproc_params is not None and
+                                self.postproc_params.postproc_args is not None):
+                            num_prompt_tokens = (self.postproc_params.
+                                                 postproc_args.num_prompt_tokens
+                                                 or num_prompt_tokens)
+                        num_generated_tokens -= num_prompt_tokens
                     for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                     ):
                         if output.token_ids[-len(stop_ids):] == stop_ids:
-                            if isinstance(stop_reason, DegenerateTokenRun):
+                            if (isinstance(stop_reason, DegenerateTokenRun)
+                                    and num_generated_tokens >= len(stop_ids)):
                                 self._fail_degenerate_generation(
                                     stop_reason, output)
                             break

@@ -31,7 +31,9 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampler_features import (
     meet_stop_token_criteria,
 )
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm.executor.result import GenerationResultBase
+from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams, PostprocWorker
+from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.result import GenerationResult, GenerationResultBase
 from tensorrt_llm.executor.utils import (
     RequestError,
     degenerate_generation_message,
@@ -350,3 +352,52 @@ def test_user_stop_at_length_boundary_keeps_length_result() -> None:
     assert result._outputs[0].finish_reason == "length"
     assert result._outputs[0].token_ids == [PAD] * 20
     assert result.error is None
+
+
+@pytest.mark.parametrize("postproc_worker", [False, True])
+@pytest.mark.parametrize("output_mode", ["prompt", "generated", "streaming"])
+@pytest.mark.parametrize("generated_count", [1, 20])
+def test_length_limited_run_counts_only_generated_tokens(
+    postproc_worker: bool, output_mode: str, generated_count: int
+) -> None:
+    """Returned prompt tokens do not contribute to a server-added run."""
+    prompt = [PAD] * 19
+    streaming = output_mode == "streaming"
+    params = SamplingParams(
+        end_id=END_ID,
+        max_tokens=generated_count,
+        exclude_input_from_output=output_mode == "generated",
+    )
+    params._set_degenerate_token_runs([PAD], 20)
+    if postproc_worker:
+        result = PostprocWorker.default_record_creator(
+            PostprocWorker.Input(
+                rsp=SimpleNamespace(client_id=11),
+                sampling_params=params,
+                postproc_params=PostprocParams(
+                    postproc_args=PostprocArgs(num_prompt_tokens=len(prompt))
+                ),
+                streaming=streaming,
+            ),
+            tokenizer=None,
+        )
+    else:
+        request = GenerationRequest(
+            prompt_token_ids=prompt, sampling_params=params, streaming=streaming
+        )
+        request.set_id(11)
+        result = GenerationResult(request)
+    generated = [PAD] * generated_count
+    if streaming and generated_count > 1:
+        _finish(result, generated[:-1], tllm.FinishReason.NOT_FINISHED)
+        generated = generated[-1:]
+    returned = prompt + generated if output_mode == "prompt" else generated
+    result._done = True
+    if generated_count == 20:
+        with pytest.raises(RequestError, match="degenerate"):
+            _finish(result, returned, tllm.FinishReason.LENGTH)
+    else:
+        _finish(result, returned, tllm.FinishReason.LENGTH)
+        assert result._outputs[0].finish_reason == "length"
+        assert result._outputs[0].token_ids == returned
+        assert result.error is None
