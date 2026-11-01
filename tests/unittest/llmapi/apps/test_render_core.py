@@ -561,6 +561,47 @@ class TestExtensions:
             != render_chat(chat_request(), harmony_resources()).token_ids
         )
 
+    @pytest.mark.parametrize(
+        ("kwargs", "template", "expected"),
+        [
+            ({"reasoning_effort": "LOW"}, "{{ thinking_effort }}", "low"),
+            ({"reasoning_effort": "none"}, "{{ thinking }}", "False"),
+            (
+                {"reasoning_effort": "low", "thinking_effort": "high"},
+                "{{ thinking_effort }}",
+                "high",
+            ),
+            (
+                {"reasoning_effort": "low"},
+                "{{ reasoning_effort }}:{{ thinking_effort }}",
+                "low:low",
+            ),
+        ],
+    )
+    def test_kimi_generic_effort_is_consumed_before_jinja_validation(
+        self, tokenizer, monkeypatch, kwargs, template, expected
+    ) -> None:
+        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        request = chat_request(chat_template=template, chat_template_kwargs=kwargs)
+        res = RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+
+        assert render_chat(request, res, tokenize=False).text == expected
+
+    def test_kimi_unrecognized_generic_effort_still_requires_a_template_consumer(
+        self, tokenizer, monkeypatch
+    ) -> None:
+        from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
+
+        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        request = chat_request(
+            chat_template="{{ thinking_effort | default('max') }}",
+            chat_template_kwargs={"reasoning_effort": "medium"},
+        )
+        res = RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
+
+        with pytest.raises(UnusedChatTemplateKwargsError, match="reasoning_effort"):
+            render_chat(request, res, tokenize=False)
+
     def test_the_generic_thinking_kwargs_reach_the_kimi_k3_prompt(self) -> None:
         # K3's template reads `thinking` / `thinking_effort`; the extension derives them from the
         # `enable_thinking` / `reasoning_effort` that other templates read and the Anthropic

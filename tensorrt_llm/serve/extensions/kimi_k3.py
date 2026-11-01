@@ -264,11 +264,21 @@ class KimiK3ServingExtension(ServingExtension):
             chat_template_kwargs, chat_template_kwargs.get("reasoning_effort")
         )
         translated = unset & chat_template_kwargs.keys()
-        if translated:
-            # The server added these keys, not the client: exempt them from the
-            # unused-kwargs guard, which runs when a Jinja chat template is in use.
+        exempted = set(translated)
+        generic_effort = chat_template_kwargs.get("reasoning_effort")
+        if isinstance(generic_effort, str) and generic_effort.lower() in (
+            "none",
+            "low",
+            "high",
+            "max",
+        ):
+            # The extension consumes this control even if a higher-precedence
+            # K3 setting wins. Keep it available to custom templates as well.
+            exempted.add("reasoning_effort")
+        if exempted:
+            # Derived and consumed controls need not be read again by a Jinja template.
             request.injected_chat_template_kwargs = sorted(
-                {*(request.injected_chat_template_kwargs or ()), *translated}
+                {*(request.injected_chat_template_kwargs or ()), *exempted}
             )
         if derived or translated:
             request.chat_template_kwargs = chat_template_kwargs

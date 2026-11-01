@@ -449,7 +449,7 @@ class TestKimiGenericThinkingKwargs:
             }
         )
         assert k3_thinking_kwargs(req) == {"thinking": True, "thinking_effort": "high"}
-        assert req.injected_chat_template_kwargs is None
+        assert req.injected_chat_template_kwargs == ["reasoning_effort"]
 
     @pytest.mark.parametrize(
         "fields, expected",
@@ -478,6 +478,7 @@ class TestKimiGenericThinkingKwargs:
         )
         assert req.injected_chat_template_kwargs == [
             "enable_thinking",
+            "reasoning_effort",
             "thinking",
             "thinking_effort",
         ]
