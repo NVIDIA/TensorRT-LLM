@@ -257,7 +257,8 @@ def _qk_norm_rope_fp8_split(
     grid = (rows,)
     static = static_descale is not None
     if static:
-        descale = static_descale.to(torch.float32).contiguous()
+        # A custom op's output may not alias an input: copy the static table.
+        descale = static_descale.to(torch.float32).contiguous().clone()
         amax = descale
     else:
         amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
@@ -379,7 +380,7 @@ def qk_norm_rope_fp8(
         static = False
     else:
         amax = static_descale  # unused in the static branch; keeps the signature
-        descale = static_descale.to(torch.float32).contiguous()
+        descale = static_descale.to(torch.float32).contiguous().clone()  # no aliasing of an input
         static = True
     _qkv_cast_kernel[grid](
         qkv,
@@ -579,7 +580,7 @@ def norm_rope_fp8_tensor(
         )
         static = False
     elif out_fp8:
-        descale = static_descale.to(torch.float32).reshape(1).contiguous()
+        descale = static_descale.to(torch.float32).reshape(1).contiguous().clone()
         static = True
     else:
         descale = torch.ones(1, dtype=torch.float32, device=x.device)
