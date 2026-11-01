@@ -48,6 +48,7 @@ BASELINE = {
     "tests/unittest/disaggregated/test_openai_disagg_service.py": 2,
     "tests/unittest/disaggregated/test_openai_server_info.py": 1,
     "tests/unittest/disaggregated/test_openai_server_stream_errors.py": 1,
+    "tests/unittest/disaggregated/test_paired_request_cancellation.py": 2,
     "tests/unittest/disaggregated/test_router.py": 2,
     "tests/unittest/executor/test_spec_decode_stats_payload.py": 1,
     "tests/unittest/llmapi/apps/_test_trtllm_serve_profile.py": 1,
@@ -59,9 +60,12 @@ BASELINE = {
     "tests/unittest/llmapi/apps/test_responses_store_replay.py": 1,
     "tests/unittest/llmapi/apps/test_responses_streaming_events.py": 1,
     "tests/unittest/llmapi/apps/test_serving_extensions.py": 1,
+    "tests/unittest/llmapi/apps/test_tool_parsers.py": 1,
     "tests/unittest/llmapi/test_llm.py": 2,
     "tests/unittest/llmapi/test_rl_control_auth.py": 1,
     "tests/unittest/llmapi/test_runtime_control.py": 1,
+    "tests/unittest/llmapi/test_serve_multi_frontend_helpers.py": 4,
+    "tests/unittest/llmapi/test_serve_multi_frontend_route_gate.py": 1,
 }
 
 

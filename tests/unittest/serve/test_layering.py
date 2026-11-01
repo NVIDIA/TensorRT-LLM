@@ -54,18 +54,27 @@ CONTRACTS = (
         importers=("tensorrt_llm.grpc",),
         forbidden=("tensorrt_llm.serve",),
         allowed=frozenset(
-            (
-                "tensorrt_llm.grpc.openengine.server",
-                "tensorrt_llm.serve._frontend_processes",
-                name,
-            )
-            for name in (
-                "FrontendStartupCancelled",
-                "_init_multi_frontend_mode",
-                "_signal_frontend_ready",
-                "_spawn_attached_frontends",
-                "_terminate_attached_frontends",
-            )
+            {
+                (
+                    "tensorrt_llm.grpc.openengine.server",
+                    "tensorrt_llm.serve._frontend_processes",
+                    name,
+                )
+                for name in (
+                    "FrontendStartupCancelled",
+                    "_init_multi_frontend_mode",
+                    "_signal_frontend_ready",
+                    "_spawn_attached_frontends",
+                    "_terminate_attached_frontends",
+                )
+            }
+            | {
+                (
+                    "tensorrt_llm.grpc.openengine.server",
+                    "tensorrt_llm.serve._perf_metrics_config",
+                    "resolve_perf_metrics_config",
+                )
+            }
         ),
         fix=(
             "gRPC frontends use serving code only through public entry points; add a public "
