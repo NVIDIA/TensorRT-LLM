@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
+#include "tensorrt_llm/nanobind/common/tokenIds.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/ATen.h>
@@ -355,7 +356,7 @@ void initBindings(nb::module_& m)
         .def(
             "__init__",
             [](tb::LlmRequest* self, tb::LlmRequest::RequestIdType request_id,
-                tb::LlmRequest::SizeType32 max_new_tokens, std::vector<tb::LlmRequest::TokenIdType> input_tokens,
+                tb::LlmRequest::SizeType32 max_new_tokens, nb::handle input_tokens_handle,
                 executor::SamplingConfig sampling_config, bool is_streaming,
                 std::optional<std::vector<std::vector<tb::LlmRequest::SizeType32>>> multimodal_hashes,
                 std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_positions,
@@ -390,13 +391,14 @@ void initBindings(nb::module_& m)
                 auto lora_weights_tensor_ptr = makeOptionalTensor(lora_weights);
                 auto lora_config_tensor_ptr = makeOptionalTensor(lora_config);
 
-                new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
-                    multimodal_hashes, multimodal_positions, multimodal_lengths, multimodal_uuids, lora_task_id,
-                    lora_weights_tensor_ptr, lora_config_tensor_ptr, kv_cache_retention_config, draft_tokens,
-                    exclude_input_from_output, encoder_input_tokens, priority, encoder_input_length,
-                    encoder_output_length, llm_request_type, input_token_extra_ids, return_perf_metrics,
-                    context_phase_params, arrival_time, std::move(agent_hierarchy), multimodal_item_run_cu_offsets,
-                    multimodal_run_positions, multimodal_run_lengths, std::move(cache_salt)};
+                new (self) tb::LlmRequest{request_id, max_new_tokens, NanobindUtils::toVecTokens(input_tokens_handle),
+                    sampling_config, is_streaming, multimodal_hashes, multimodal_positions, multimodal_lengths,
+                    multimodal_uuids, lora_task_id, lora_weights_tensor_ptr, lora_config_tensor_ptr,
+                    kv_cache_retention_config, draft_tokens, exclude_input_from_output, encoder_input_tokens, priority,
+                    encoder_input_length, encoder_output_length, llm_request_type, input_token_extra_ids,
+                    return_perf_metrics, context_phase_params, arrival_time, std::move(agent_hierarchy),
+                    multimodal_item_run_cu_offsets, multimodal_run_positions, multimodal_run_lengths,
+                    std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("multimodal_hashes") = std::nullopt,

@@ -695,6 +695,21 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class PreroutedRouting:
+    """Routing a caller computed for one ``run_moe`` of an impl that declares
+    ``supports_prerouted_routing``: the routing tables of the kernels' tile
+    (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
+    the [tile, config] tactic they are built for, and the [num_tokens, top_k]
+    expert ids (int32) and BF16 weights. The impl runs that tactic and skips
+    its routing kernel."""
+
+    tables: torch.Tensor
+    tactic: List[int]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
 class MoEReplicaPlan:
     """Per-forward physical replica layout produced by the EPLB layer.
 
@@ -766,6 +781,9 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by a decode front end that routed the tokens itself; single
+    # chunk, no communication (see PreroutedRouting)
+    prerouted: Optional[PreroutedRouting] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
 

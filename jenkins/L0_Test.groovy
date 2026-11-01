@@ -50,6 +50,32 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+// "Setup Environment" stashes jenkins/scripts/fetch_build_artifact.sh from the run's commit under
+// this name, because test stages read build artifacts before they have a source tree.
+FETCH_BUILD_ARTIFACT_STASH = "fetch-build-artifact"
+
+// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
+// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
+// that they match.
+FETCH_ABSENT = 2
+FETCH_TRANSFER_FAILED = 4
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -70,6 +96,9 @@ ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 // Read-only artifactory pull credentials
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
+// Credential with which the read helper reads build artifacts on artifactory.nvidia.com: the
+// publishing credential, the one the pipelines publish build artifacts with.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
 
 // DLFW torch image
 DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
@@ -906,15 +935,17 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // login node. If that pod dies mid-run (eviction, container error, agent
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
 // job and any Jenkins agent node leak. State + reconciliation live in the shared
-// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers two
+// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers
 // sibling entries -- "<stage>/dispatcher-pod" (the pod spec, from the pod
-// wrapper) and "<stage>/slurm" (the per-attempt SLURM job / Jenkins node, from
-// the stage body) -- so freeing the job/node after a successful in-pod cleanup
-// (markReclaimed) never disturbs the pod spec a *later* attempt's off-pod
-// reconciliation needs. The ledger stores only serializable primitives (it
-// rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
-// is rebuilt from clusterName at reconcile time. The functions below are thin
-// SLURM-specific adapters over that generic ledger.
+// wrapper) and one "<stage>/slurm/<job UID or node name>" per attempt (that
+// attempt's SLURM job / Jenkins node, from the stage body) -- so freeing the
+// job/node after a successful in-pod cleanup (markReclaimed) never disturbs the
+// pod spec a *later* attempt's off-pod reconciliation needs, and an attempt
+// whose cleanup failed stays registered beside the next one. The ledger stores
+// only serializable primitives (it rejects anything else) so pipeline
+// persistence is unaffected; the SlurmCluster is rebuilt from clusterName at
+// reconcile time. The functions below are thin SLURM-specific adapters over
+// that generic ledger.
 //
 // Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
 // for equivalence with the pre-shared inlined finalizer this replaced:
@@ -936,8 +967,9 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 
 // Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
 // under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
-// node identity (recorded under "<stage>/slurm"). Keyed separately so they are
-// reclaimed independently. Absent fields are skipped by the ledger.
+// node identity (recorded under "<stage>/slurm/<jobUID or nodeName>", one entry
+// per attempt). Keyed separately so they are reclaimed independently. Absent
+// fields are skipped by the ledger.
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
         return
@@ -947,7 +979,7 @@ void registerSlurmResource(String stageName, Map fields) {
             fields: [podSpec: fields.podSpec, containerName: fields.containerName],
             ownerBuildTag: env.BUILD_TAG)
     } else {
-        resourceLedger.register(id: "${stageName}/slurm",
+        resourceLedger.register(id: "${stageName}/slurm/${fields.jobUID ?: fields.nodeName}",
             type: fields.usedSbatch ? 'slurmJob' : 'slurmNode',
             fields: [clusterName: fields.clusterName, nodeName: fields.nodeName,
                      jobUID: fields.jobUID, slurmJobId: fields.slurmJobId, usedSbatch: fields.usedSbatch],
@@ -955,14 +987,15 @@ void registerSlurmResource(String stageName, Map fields) {
     }
 }
 
-// Called once an attempt's resources are actually torn down: drop the per-attempt
-// SLURM job/node entry. The stage's dispatcher-pod entry is a separate id and is
-// left intact (a later attempt's off-pod reconciliation still needs its pod spec).
-void deregisterSlurmResource(String stageName) {
+// Called once an attempt's resources are actually torn down: drop that attempt's
+// SLURM job/node entry (`attempt` is its jobUID or nodeName). The stage's
+// dispatcher-pod entry is a separate id and is left intact (a later attempt's
+// off-pod reconciliation still needs its pod spec).
+void deregisterSlurmResource(String stageName, String attempt) {
     if (!stageName) {
         return
     }
-    resourceLedger.markReclaimed("${stageName}/slurm")
+    resourceLedger.markReclaimed("${stageName}/slurm/${attempt}")
 }
 
 // Reclaim one orphaned SLURM entry off the (dead) dispatcher pod: launch a fresh
@@ -986,7 +1019,7 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     if (!entry.jobUID && !entry.nodeName) {
         return true
     }
-    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm$/, "/dispatcher-pod"))
+    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm\/[^\/]+$/, "/dispatcher-pod"))
     def podSpec = podSpecOverride ?: podEntry?.podSpec
     def containerName = podEntry?.containerName ?: "trt-llm"
     def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
@@ -1014,15 +1047,15 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     }
 }
 
-// Reconcile this stage's orphaned SLURM job/node off-pod (in-catch, on a detected
-// dispatcher-pod death). podSpecOverride is the failing attempt's pod spec so
-// reconciliation never depends on the sibling entry surviving.
+// Reconcile this stage's orphaned SLURM jobs/nodes off-pod, every attempt's (in-catch,
+// on a detected dispatcher-pod death). podSpecOverride is the failing attempt's pod
+// spec so reconciliation never depends on the sibling entry surviving.
 def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
     if (!stageName) {
         return
     }
     resourceLedger.reconcile(pipeline,
-        { it.id == "${stageName}/slurm" },
+        { (it.id as String).startsWith("${stageName}/slurm/") },
         { p, entry -> reconcileSlurmResource(p, entry, podSpecOverride) })
 }
 
@@ -1539,7 +1572,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             }
             // Reaching here means cleanup succeeded within its retry budget. If all
             // attempts fail, the throw skips deregistration and leaves the entry for sweep.
-            deregisterSlurmResource(stageName)
+            deregisterSlurmResource(stageName, nodeName)
         }
         }
     }
@@ -1760,7 +1793,100 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-// Which build of <tarName> this stage tests.
+// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
+// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
+// never appears on a command line or in the trace. Callers remove the file in a finally block.
+def writeArtifactoryNetrc(pipeline, String netrcPath)
+{
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        pipeline.withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            pipeline.sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
+    }
+}
+
+// Returns the path of the read helper, jenkins/scripts/fetch_build_artifact.sh from the run's
+// commit, in the node's temporary directory, which workspace resets and package extraction leave
+// alone. Unstashes it there the first time.
+def readHelperPath(pipeline)
+{
+    def helperDir = "${pipeline.pwd(tmp: true)}/fetch-build-artifact"
+    def helper = "${helperDir}/fetch_build_artifact.sh"
+    if (!pipeline.fileExists(helper)) {
+        pipeline.dir(helperDir) {
+            pipeline.unstash(FETCH_BUILD_ARTIFACT_STASH)
+        }
+    }
+    return helper
+}
+
+// Reads one in-scope build artifact with the read helper, which tries the primary location first
+// and the other one only when the file is absent there, and checks each download against the
+// SHA-1 that the serving location reports. The helper's netrc lives in the node's temporary
+// directory beside the helper, and is removed before this returns.
+//
+// "download" writes dest and returns null. "exists" writes nothing and returns "<url> <sha1>" of
+// the location that holds the file. Both fail the step at once on a final failure of the helper,
+// such as FETCH_ABSENT or a rejected credential, and on FETCH_TRANSFER_FAILED once the helper's
+// and llmExecStepWithRetry's retries are spent. "properties" writes the properties JSON to dest and
+// returns the helper's exit status instead of failing: 0 when found, otherwise one of the exit
+// codes the helper names, such as FETCH_ABSENT when neither location has properties for it.
+def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode = "download")
+{
+    if (!(mode in ["download", "exists", "properties"])) {
+        pipeline.error("fetchBuildArtifact: unknown mode '${mode}'")
+    }
+    def primary = llmArtifactsPrimary()
+    def helper = readHelperPath(pipeline)
+    def command = "bash '${helper}'" + (mode == "download" ? "" : " --${mode}") + " '${artifactPath}'" +
+        (mode == "exists" ? "" : " '${dest}'")
+    def netrcPath = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    def statusPath = "${pipeline.pwd(tmp: true)}/fetch-status-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(pipeline, netrcPath)
+        return pipeline.withEnv([
+            "LLM_ARTIFACTS_PRIMARY=${primary}",
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            if (mode == "properties") {
+                // The helper retries transient errors itself.
+                return pipeline.sh(label: "Fetch properties of ${artifactPath}", script: command, returnStatus: true)
+            }
+            // The helper retries transient errors itself, so only FETCH_TRANSFER_FAILED fails the
+            // script and lets llmExecStepWithRetry repeat it. Any other status is final: the script
+            // records it and succeeds, and the step fails on it below without a retry.
+            def script = "status=0; ${command} || status=\$?; " +
+                "if [ \"\$status\" -eq ${FETCH_TRANSFER_FAILED} ]; then exit \"\$status\"; fi; " +
+                "echo \"\$status\" > '${statusPath}'"
+            def stdout = trtllm_utils.llmExecStepWithRetry(pipeline, label: "Fetch ${artifactPath}", script: script,
+                returnStdout: mode == "exists")
+            def status = pipeline.readFile(statusPath).trim()
+            if (status != "0") {
+                pipeline.error("fetch_build_artifact.sh could not read ${artifactPath} (exit status ${status}); " +
+                    "its message above says why.")
+            }
+            if (mode == "download") {
+                return null
+            }
+            def location = stdout.trim()
+            if (!(location ==~ /\S+ [0-9a-f]{40}/)) {
+                pipeline.error("fetchBuildArtifact: unexpected location '${location}' for ${artifactPath}")
+            }
+            return location
+        }
+    } finally {
+        pipeline.sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${statusPath}'")
+    }
+}
+
+// Which build of <tarName> this stage tests, as the artifact path to read it
+// from with fetchBuildArtifact.
 //
 // Deterministic, not discovered. The pipeline already decided whether the build
 // published a BOLTed variant, so there is nothing to probe for: fetch
@@ -1773,35 +1899,45 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 // by name proves only that something is there; the property proves it is the
 // right something, which is what keeps the tested build and the released wheel
 // on one profile set. Absent property means an artifact predating the label:
-// reported and allowed rather than failed.
-def boltedTarUrl(String config, String tarName)
+// reported and allowed rather than failed, as is a property lookup that keeps
+// failing. A rejected credential fails the stage.
+def boltedTarArtifactPath(pipeline, String config, String tarName)
 {
-    def base = "${URM_ARTIFACTORY_BASE}/${ARTIFACT_PATH}"
     // Only the SBSA build is BOLTed, so only its tarball has a bolted- variant.
     // Asking for one on any other config would 404 the stage rather than fail
     // honestly, so the arch gate has to match the build's exactly.
     if (!BOLT_TEST_BOLTED_TARBALL || config != LINUX_AARCH64_CONFIG) {
-        return "${base}/${tarName}"
+        return "${ARTIFACT_PATH}/${tarName}"
     }
     if (BOLT_PINNED_REF) {
-        def propsUrl = "${URM_ARTIFACTORY_BASE}/api/storage/${ARTIFACT_PATH}/bolted-${tarName}?properties"
-        // -L: Artifactory redirects metadata reads, and without it curl returns
-        // the redirect rather than the document.
-        def got = sh(returnStdout: true, script: """
-            curl -fsSL --retry 3 --retry-all-errors --connect-timeout 30 '${propsUrl}' 2>/dev/null \\
-              | tr -d ' \\n' \\
-              | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p' || true
-        """).trim()
+        def propsFile = "${pipeline.pwd(tmp: true)}/bolted-${tarName}.properties.json"
+        def propsStatus = fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/bolted-${tarName}", propsFile, "properties")
+        // FETCH_ABSENT: no properties on either location. FETCH_TRANSFER_FAILED: the lookup kept
+        // failing.
+        if (!(propsStatus in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
+            error("[BOLT] Could not read the properties of bolted-${tarName}: " +
+                  "fetch_build_artifact.sh exited ${propsStatus} (see its message above).")
+        }
+        def got = ""
+        if (propsStatus == 0) {
+            got = sh(returnStdout: true, script: """
+                tr -d ' \\n' < '${propsFile}' \\
+                  | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p'
+                rm -f '${propsFile}'
+            """).trim()
+        }
         if (got && got != BOLT_PINNED_REF) {
             error("[BOLT] bolted-${tarName} carries bolt.ref=${got}, but this pipeline pinned ${BOLT_PINNED_REF}. " +
                   "Refusing to test a build optimized with a different profile bundle than the release artifacts use.")
         }
-        if (!got) {
+        if (propsStatus == FETCH_TRANSFER_FAILED) {
+            echo "[BOLT] the bolt.ref lookup for bolted-${tarName} failed (fetch_build_artifact.sh exited ${propsStatus}, see its message above); proceeding on pin ${BOLT_PINNED_REF}"
+        } else if (!got) {
             echo "[BOLT] bolted-${tarName} carries no bolt.ref (artifact predates the label); proceeding on pin ${BOLT_PINNED_REF}"
         }
     }
     echo "[BOLT] testing the BOLTed build: bolted-${tarName}"
-    return "${base}/bolted-${tarName}"
+    return "${ARTIFACT_PATH}/bolted-${tarName}"
 }
 
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
@@ -1847,7 +1983,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = boltedTarUrl(config, tarName)
+            def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -1858,6 +1994,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
+            def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -1875,6 +2012,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
             // Per-job enroot config (never shared ~/.config/enroot — that races across jobs).
             def enrootConfigDirNode = "${jobWorkspace}/enroot-config"
+            // Per-job netrc for the read helper that slurm_install.sh runs. It is not kept in
+            // enrootConfigDirNode, which the ENROOT srun prologue deletes before slurm_install.sh runs.
+            // The package's slurm_install.sh deletes it once every node of its step has finished
+            // downloading the package, before the tests start; a package whose slurm_install.sh has
+            // no remove_artifactory_netrc leaves it to cleanUpSlurmResources.
+            def artifactoryNetrcPathNode = "${jobWorkspace}/artifactory-netrc"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1882,11 +2025,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
-                // Download and Unzip Tar File
+                // Download and Unzip Tar File. The node downloads it again itself, with the read
+                // helper. The URL that --exists resolves is for the older slurm_install.sh inside a
+                // package built before the helper existed, which downloads that URL instead.
+                def llmTarfileLocation = ""
                 timeout(time: 30, unit: 'MINUTES') {
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${BUILD_CONFIGS[config][TARNAME]}' '${llmTarfile}'")
+                    llmTarfileLocation = fetchBuildArtifact(pipeline, llmTarArtifactPath, null, "exists")
+                    fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+                def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1911,6 +2059,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     remote,
                     scriptBashUtilsLocalPath,
                     scriptBashUtilsPathNode,
+                    true
+                )
+                // The read helper from the run's commit, which slurm_install.sh runs to download
+                // the packaged build.
+                def scriptFetchHelperLocalPath = readHelperPath(pipeline)
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptFetchHelperLocalPath,
+                    scriptFetchHelperPathNode,
                     true
                 )
 
@@ -1998,6 +2156,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "${enrootConfigDirNode}/.credentials"
                         )
                     }
+                }
+
+                // Record this attempt's job before the token reaches its workspace, so that
+                // the off-pod cleanup removes the workspace even if this pod dies before the
+                // job is submitted. The registration after submission adds the job ID to the
+                // same entry; an earlier attempt's entry stays for its own cleanup.
+                registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID, usedSbatch: true])
+                // Every job gets the helper's netrc: the read helper on the node contacts
+                // artifactory.nvidia.com whenever aws is the primary, wherever the package is.
+                // A frontend failover reruns this closure, which copies it again; when the submit
+                // script then reuses a job that has already downloaded, that copy stays until
+                // cleanUpSlurmResources. A job that the submit script resubmits, or that Slurm
+                // requeues, after the first run deleted it has no netrc, and its download fails.
+                def artifactoryNetrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                try {
+                    writeArtifactoryNetrc(pipeline, artifactoryNetrcPathLocal)
+                    // scp -p keeps the netrc's 600 mode on the node.
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        artifactoryNetrcPathLocal,
+                        artifactoryNetrcPathNode
+                    )
+                } finally {
+                    sh(label: "Remove Artifactory netrc", script: "rm -f '${artifactoryNetrcPathLocal}'")
                 }
 
                 // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
@@ -2234,6 +2417,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
+                    export llmTarArtifactPath=$llmTarArtifactPath
+                    export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
+                    export ARTIFACTORY_NETRC=$artifactoryNetrcPathNode
+                    export ARTIFACTORY_CREDENTIAL_ID=$LLM_ARTIFACTS_CREDENTIALS_ID
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
@@ -2317,6 +2504,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptRunPathNode,
                     scriptInstallPathNode,
                     scriptBashUtilsPathNode,
+                    scriptFetchHelperPathNode,
+                    artifactoryNetrcPathNode,
                     scriptLaunchPathNode,
                     scriptSubmitPathNode,
                     scriptTrackPathNode,
@@ -2817,7 +3006,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             // Reaching here means cleanup succeeded within its retry budget. If all
             // attempts fail, the throw skips deregistration and leaves the entry for sweep.
-            deregisterSlurmResource(stageName)
+            deregisterSlurmResource(stageName, jobUID)
         }
         }
     }
@@ -3246,6 +3435,8 @@ def BOLT_PROFILE_REF = "bolt_profile_ref"
 def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
 @Field
 def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 // Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
 // is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
 // so reading it inside them throws MissingPropertyException; Build.groovy handles
@@ -3269,6 +3460,9 @@ def globalVars = [
     (BOLT_PUBLISH_VARIANT): false,
     (BOLT_PROFILE_BRANCH): "",
     (JOB_TYPE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
 ]
 
 class GlobalState {
@@ -4155,9 +4349,9 @@ def runLLMDocBuild(pipeline, config)
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
 
     // Step 2: download TRT-LLM tarfile
-    def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${BUILD_CONFIGS[config][TARNAME]}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${BUILD_CONFIGS[config][TARNAME]}' '${llmTarfile}'")
-    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+    def tarName = BUILD_CONFIGS[config][TARNAME]
+    fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/${tarName}", "${llmPath}/${tarName}")
+    sh "cd ${llmPath} && tar -zxf ${tarName}"
     // install python package
     if (env.alternativeTRT) {
         sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
@@ -4883,9 +5077,8 @@ def generateRerunReport(stageName, llmSrc) {
 }
 
 def mergeWaivesTxt(pipeline, llmSrc, stageName) {
-    def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
     try {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+        fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/waive_list/waives.txt", "waives.txt")
         if (!fileExists("waives.txt")) {
             error "There is no merged waives.txt file, use the default waives.txt."
         }
@@ -5203,9 +5396,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = boltedTarUrl(config, tarName)
+        def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
         timeout(time: 30, unit: 'MINUTES') {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv -O '${tarName}' '${llmTarfile}'")
+            fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
         }
         sh "cd ${llmPath} && tar -zxf ${tarName}"
 
@@ -7514,6 +7707,16 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
+                    // The read helper that fetchBuildArtifact unstashes on every node.
+                    def fetchHelperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/fetch_build_artifact.sh", fetchHelperDir)
+                    dir(fetchHelperDir) {
+                        stash(name: FETCH_BUILD_ARTIFACT_STASH, includes: "fetch_build_artifact.sh")
+                    }
                 }
             }
         }
