@@ -6,7 +6,7 @@
 # that sets the following required environment variables:
 #
 #   FAT_CONTAINER_DIR       - scratch path for enroot base .sqsh files
-#   FAT_CONTAINER           - docker URI (urm.nvidia.com#...) for the base image
+#   FAT_CONTAINER           - docker URI of the base image, in enroot's host#path form
 #   FAT_SQSH_DIR            - scratch path where fat .sqsh files are stored
 #   FAT_LLM_TAR_ARTIFACT_PATH - artifact path of the TRT-LLM tarball, read with FAT_FETCH_HELPER_PATH
 #   FAT_LLM_DOCKER_IMAGE    - full docker image tag (used for cache-key hashing)
@@ -74,7 +74,7 @@ importContainerWithRetries "${FAT_CONTAINER}" "$baseSqshPath"
 # Build fat sqsh from cached base sqsh.
 mkdir -p "${FAT_SQSH_DIR}"
 # Include hash of the build script itself so changing fat_build_inline.sh
-# (e.g. adding --no-user) invalidates the cached sqsh automatically.
+# invalidates the cached sqsh automatically.
 # Only writer of the cache; the formula is mirrored in prepare_container.sh and
 # computeFatSqshPath() in L0_Test.groovy. Change all three together.
 fatBuildScriptHash=$(sha256sum "${FAT_BUILD_SCRIPT_PATH}" | cut -d' ' -f1 | head -c 8)

@@ -836,8 +836,7 @@ def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatB
     return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
 }
 
-// Shared by the SLURM agent and sbatch flows. The fat sqsh cache key hashes the
-// builder script, so both flows must generate byte-identical content.
+// Shared by the SLURM agent and sbatch flows.
 def generateFatBuildSbatchScript(Map args) {
     return """\
 #!/bin/bash
@@ -927,8 +926,8 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             // instead of deleting per job; reused images keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            // Fat sqsh files are shared across jobs (keyed by commit/tarfile), so age-prune
-            // rather than delete per-job; recent fat sqsh files survive via mtime refresh.
+            // Fat sqsh files are shared across jobs (keyed by package, image and builder script),
+            // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
             "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
@@ -978,8 +977,8 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName} || true",
-            // The fat sqsh builder's netrc, should neither the builder nor Prepare Container have
-            // deleted it.
+            // The fat sqsh builder's netrc, in case neither the builder nor Prepare Container
+            // removed it.
             "rm -f /home/svc_tensorrt/bloom/scripts/${nodeName}/fat-artifactory-netrc || true",
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
@@ -1189,11 +1188,6 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     if (placementContext != null) {
         placementContext.lastSlurmClusterName = partition.clusterName
     }
-
-    // Fat sqsh is detected at runtime inside runLLMTestlistOnPlatformImpl via
-    // /tmp/TensorRT-LLM existence (isFatSqsh). No need to set skipInstallWheel
-    // here: isFatSqsh handles both the fat sqsh case and the fallback (base image)
-    // case correctly without relying on cluster config.
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
@@ -2275,8 +2269,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptInstallPathNode,
                     true
                 )
-                // Defined here, ahead of the fat sqsh block that passes it to the
-                // builder, rather than at the Job Launch Script below.
+                // Image for both the fat sqsh builder and the job launch script below.
                 def container = LLM_DOCKER_IMAGE
                 if (cluster.containerRuntime.toString() == "ENROOT") {
                     container = LLM_DOCKER_IMAGE
@@ -2517,7 +2510,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
 
-                // Generate Job Launch Script (container defined above, before the fat sqsh block)
+                // Generate Job Launch Script
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 // Multi-node perf-sanity and SingleNvlinkDomain stages must land in one NVLink
                 // domain: across racks the wide-EP MoE all-to-all cannot use MNNVL.
@@ -2553,6 +2546,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         export enrootImagePath="${fatSqshPath}"
                         export SKIP_INSTALL=1
                         touch "${fatSqshPath}" || true
+                        # The fat sqsh is a local file, so enroot needs no registry credentials.
+                        rm -rf "${enrootConfigDirNode}"
                     else
                         # Fat sqsh not ready; use digest-cached base sqsh + full install.
                         # Job-private enroot config (under jobWorkspace). Avoids racing on
@@ -2565,7 +2560,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         # If the image URI already contains a manifest digest (@sha256:...) use
                         # it directly for content-addressed caching; otherwise hash the tag
                         # string, which is stable for per-build images but will not detect a
-                        # re-pushed mutable tag within the 3-day TTL window.
+                        # re-pushed mutable tag while the cached .sqsh is kept.
                         if printf '%s' "$container" | grep -q '@sha256:'
                         then
                             imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
@@ -4787,8 +4782,12 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
         returnStdout: true
     ).trim()
     if (!scriptPath) {
-        echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation."
-        return false
+        // Without the script no results-timeout.xml is written, but the tests that did not
+        // finish must still fail the stage.
+        def hasUnfinished = sh(script: "grep -q '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true) == 0
+        echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation" +
+            (hasUnfinished ? ", but ${stageName}/unfinished_test.txt lists unfinished tests." : ".")
+        return hasUnfinished
     }
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"

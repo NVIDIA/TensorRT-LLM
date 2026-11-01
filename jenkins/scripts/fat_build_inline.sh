@@ -16,8 +16,8 @@
 
 # Build a "fat" enroot sqsh (base image + trtllm pre-installed).
 # Called by the CPU fat-builder sbatch job after the base sqsh has already been
-# imported/cached. The GPU test job depends on this builder job completing
-# (--dependency=afterok) and then uses the fat sqsh directly (SKIP_INSTALL=1).
+# imported/cached. Prepare Container waits for that job, and the GPU test job then
+# uses the fat sqsh directly (SKIP_INSTALL=1).
 #
 # Usage:
 #   fat_build_inline.sh <fat_sqsh_path> <base_sqsh_path> <llm_tar_artifact_path> <tar_name>

@@ -61,7 +61,19 @@ runningFatBuilder() {
     squeue -h -n "$FAT_BUILD_JOB_NAME" -t RUNNING -o "%i" 2>/dev/null | head -1 || true
 }
 
-# Log file of a builder submitted by another Jenkins run (different jobUID).
+# A queued or running builder that this stage submitted, on an earlier run of this script.
+# Its sbatch wrapper is this stage's own, so it reads this stage's FAT_ARTIFACTORY_NETRC.
+ownFatBuilder() {
+    local id
+    for id in $(squeue -h -n "$FAT_BUILD_JOB_NAME" -o "%i" 2>/dev/null || true); do
+        if [ "$(scontrol show job "$id" 2>/dev/null | grep -oP '(?<=Command=)\S+' || true)" = "${FAT_BUILD_SBATCH_PATH}" ]; then
+            echo "$id"
+            return 0
+        fi
+    done
+}
+
+# Log file of a builder, whichever stage submitted it.
 fatBuilderLogPath() {
     scontrol show job "$1" 2>/dev/null | grep -oP '(?<=StdOut=)\S+' || true
 }
@@ -73,9 +85,15 @@ EXISTING=$(runningFatBuilder)
 if [ -z "$EXISTING" ]; then
     EXISTING=$(squeue -h -n "$FAT_BUILD_JOB_NAME" -o "%i" 2>/dev/null | head -1 || true)
 fi
+OWN_BUILDER_ID=""
 if [ -n "$EXISTING" ]; then
     echo "Fat sqsh builder already running as job $EXISTING, will wait for it"
-    removeUnusedNetrc
+    OWN_BUILDER_ID=$(ownFatBuilder)
+    if [ -z "$OWN_BUILDER_ID" ]; then
+        removeUnusedNetrc
+    else
+        trap - EXIT
+    fi
     BUILDER_ID="$EXISTING"
     actualFatBuildLogPath=$(fatBuilderLogPath "$BUILDER_ID")
 else
@@ -90,6 +108,7 @@ else
     BUILDER_ID=$(printf '%s\n' "$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
     if [ "$BUILDER_RC" -eq 0 ] && [ -n "$BUILDER_ID" ]; then
         echo "Submitted fat sqsh builder as cpu_builder_job_id=$BUILDER_ID at $(date '+%Y-%m-%d %H:%M:%S')"
+        OWN_BUILDER_ID="$BUILDER_ID"
         trap - EXIT
         _fatLogTemplate="${FAT_BUILD_LOG_TEMPLATE}"
         actualFatBuildLogPath="${_fatLogTemplate//%j/$BUILDER_ID}"
@@ -119,8 +138,7 @@ tailFatBuildLog
 trap '[ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true' EXIT
 MAX_WAIT_ITERS="${FAT_BUILD_MAX_WAIT_ITERS:-30}"   # 30 * 60s = 30min
 # A builder stuck in the CPU queue falls back sooner than one that is building, so
-# the GPU job does not idle on queue time it could spend on a full install. The
-# builder is left queued: once it finishes, retries and later stages hit the cache.
+# the GPU job does not idle on queue time it could spend on a full install.
 MAX_PENDING_ITERS="${FAT_BUILD_MAX_PENDING_ITERS:-10}"
 iters=0
 pendingIters=0
@@ -167,7 +185,7 @@ while true; do
             iters=$((iters + 1))
             pendingIters=$((pendingIters + 1))
             if [ "$pendingIters" -ge "$MAX_PENDING_ITERS" ] || [ "$iters" -ge "$MAX_WAIT_ITERS" ]; then
-                echo "Giving up on fat sqsh builder $BUILDER_ID (still PENDING after ${pendingIters} polls); it stays queued for later stages. GPU job will fall back to base sqsh + full install"
+                echo "Giving up on fat sqsh builder $BUILDER_ID (still PENDING after ${pendingIters} polls); GPU job will fall back to base sqsh + full install"
                 gaveUp=true
                 break
             fi
@@ -187,6 +205,18 @@ while true; do
 done
 [ -n "$FAT_TAIL_PID" ] && kill "$FAT_TAIL_PID" 2>/dev/null || true
 trap - EXIT
+
+# This stage's builder must not outlive the wait while still queued: the stage's cleanup
+# deletes the workspace that holds its scripts and netrc, and the GPU job, which mounts that
+# workspace, would otherwise run beside the netrc. A running builder is left to finish.
+if [ -n "$OWN_BUILDER_ID" ]; then
+    ownState=$(squeue -h -j "$OWN_BUILDER_ID" -o "%T" 2>/dev/null | head -1 || true)
+    if [ "$ownState" = "PENDING" ]; then
+        echo "Cancelling fat sqsh builder $OWN_BUILDER_ID, still PENDING"
+        scancel "$OWN_BUILDER_ID" 2>/dev/null || true
+        removeUnusedNetrc
+    fi
+fi
 
 if [ -f "$fatSqshPath" ]; then
     echo "Fat sqsh ready: $fatSqshPath"
