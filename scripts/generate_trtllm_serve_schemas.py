@@ -153,17 +153,11 @@ def generate_serve_schema() -> dict:
         {**per_layer_dynamic, "required": ["mode"]},
         {"type": ["string", "null"]},
     ]
-    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_helper_slot_mode().
+    # Mirror MoePerLayerDynamicLoadBalancerConfig.validate_planner_auxiliary_sms().
     schema["$defs"][MoePerLayerDynamicLoadBalancerConfig.__name__].update(
         {
             "if": {"properties": {"planner": {"const": "halo_r"}}, "required": ["planner"]},
-            "then": {
-                "properties": {
-                    "helper_slot_mode": {"const": "shared_banks"},
-                    "auxiliary_sms": {"minimum": 2},
-                },
-                "required": ["helper_slot_mode"],
-            },
+            "then": {"properties": {"auxiliary_sms": {"minimum": 2}}},
             "else": {"properties": {"auxiliary_sms": {"maximum": 8}}},
         }
     )

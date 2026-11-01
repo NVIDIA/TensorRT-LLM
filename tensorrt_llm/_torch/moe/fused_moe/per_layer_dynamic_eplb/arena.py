@@ -607,7 +607,7 @@ class _SharedSlotPool:
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
         self.per_layer_sets = per_layer_sets
-        self._peer_helper_bases: Optional[Dict[Tuple[int, int, str], int]] = None
+        self._peer_helper_bases: Dict[int, Dict[Tuple[int, str], int]] = {}
         self._construction_complete = False
         self._owner_registry = owner_registry
         self._owner_registry.append(self)
@@ -716,7 +716,7 @@ class _SharedSlotPool:
                 lambda: self._on_device(self.vmm.release_created_handles),
             )
             self._closed = True
-            self._peer_helper_bases = None
+            self._peer_helper_bases = {}
             if self in self._owner_registry:
                 self._owner_registry.remove(self)
             self.sets = ()
@@ -791,39 +791,45 @@ class _SharedSlotPool:
         _create_multicast(self.vmm, comm, self.rank, specs)
         return _RecordPage(tuple(uc_ptrs), tuple(mc_ptrs), tuple(specs))
 
-    def peer_helper_bases(self) -> Dict[Tuple[int, int, str], int]:
-        """Map every peer's helper chunks for unicast access, collectively and once.
+    def peer_helper_bases(self, helper_set: int) -> Dict[Tuple[int, str], int]:
+        """Map every peer's chunks of one helper set for unicast access, collectively once per set.
 
         Layer views expose only a peer's home rows; a unicast copy into a
         peer's helper slots needs the chunks themselves. Returns
-        ``{(peer, bank, plane name): address of the peer's helper row 0}`` for
-        every large plane. The mappings are released with the pool. It needs
-        the two shared helper banks, which exist before the first layer is
-        built; per-layer helper sets are rejected.
+        ``{(peer, plane name): address of the peer's helper row 0}`` for every
+        large plane of ``helper_set``. The first call for a set is collective;
+        later calls return the cached mappings, which are released with the
+        pool. Layers map their sets in construction order, so every rank makes
+        the same collective calls.
         """
         if self._closed:
             raise RuntimeError("cannot map helper chunks of a closed shared-slot pool")
-        if self.per_layer_sets:
-            raise RuntimeError("peer helper mapping requires the shared helper banks")
-        if self._peer_helper_bases is None:
-            local = tuple(dict(helper_set.shareables) for helper_set in self.sets)
+        if not 0 <= helper_set < len(self.sets):
+            raise ValueError(
+                f"helper set {helper_set} is not one of the pool's {len(self.sets)} sets"
+            )
+        bases = self._peer_helper_bases.get(helper_set)
+        if bases is None:
+            local = dict(self.sets[helper_set].shareables)
             gathered = self.comm.allgather(local)
             if len(gathered) != self.world:
                 raise RuntimeError("shared-slot helper exchange returned an incomplete EP")
-            bases: Dict[Tuple[int, int, str], int] = {}
-            for peer, banks in enumerate(gathered):
+            names = {plane.name for plane in self.large}
+            bases = {}
+            for peer, shareables in enumerate(gathered):
                 if peer == self.rank:
                     continue
-                if len(banks) != len(self.sets):
-                    raise RuntimeError("shared-slot helper banks differ across the EP communicator")
-                for bank, shareables in enumerate(banks):
-                    for plane in self.large:
-                        nbytes = self.helper_bytes[plane.name]
-                        address = self.vmm.reserve(nbytes)
-                        self.vmm.map(address, nbytes, self.vmm.import_(shareables[plane.name]))
-                        bases[(peer, bank, plane.name)] = address
-            self._peer_helper_bases = bases
-        return self._peer_helper_bases
+                if set(shareables) != names:
+                    raise RuntimeError(
+                        "shared-slot helper chunks differ across the EP communicator"
+                    )
+                for plane in self.large:
+                    nbytes = self.helper_bytes[plane.name]
+                    address = self.vmm.reserve(nbytes)
+                    self.vmm.map(address, nbytes, self.vmm.import_(shareables[plane.name]))
+                    bases[(peer, plane.name)] = address
+            self._peer_helper_bases[helper_set] = bases
+        return bases
 
     def _flat(self, owner: _SharedLayer, pointer: int, nbytes: int) -> torch.Tensor:
         holder = _RawPointer(pointer, nbytes)

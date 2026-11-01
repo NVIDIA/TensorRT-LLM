@@ -56,12 +56,13 @@ constexpr std::uint64_t kRelayWordAlignment = 4;
 //! Back-off between polls of a slot's load barrier.
 constexpr unsigned kRelayAwaitBackoffNs = 32;
 
-//! This rank's received broadcasts in plan order with item prefix sums. Built by thread 0 of every CTA at the start
-//! of the dynamic shared memory.
+//! The broadcasts this rank copies, in plan order, with item prefix sums: those whose need set it belongs to. Built
+//! by thread 0 of every CTA at the start of the dynamic shared memory.
 struct RelayWork
 {
     int entries;
     int broadcast[halo_r::kMaxBroadcasts];
+    unsigned need[halo_r::kMaxBroadcasts]; //!< The broadcast's need set N_b, the receivers it stores into.
     int prefix[halo_r::kMaxBroadcasts + 1];
     int destinations[halo_r::kMaxBroadcasts];
     int index[halo_r::kMaxBroadcasts];
@@ -156,7 +157,8 @@ __device__ __forceinline__ std::uint64_t relayDestination(
         + static_cast<std::uint64_t>(row) * work.planeBytes[plane] + offset;
 }
 
-//! Thread 0: this rank's received broadcasts of the plan, which every CTA holds once its scheduler role is done.
+//! Thread 0: the broadcasts this rank pulls a share of, from the plan, which every CTA holds once its scheduler role is
+//! done, and the residency table, which no CTA of this launch writes before every CTA has read it.
 __device__ void prepareRelayWork(MoeRebalanceHaloRParams const& p, RelayWork* work)
 {
     for (int plane = 0; plane < p.planes; ++plane)
@@ -166,17 +168,23 @@ __device__ void prepareRelayWork(MoeRebalanceHaloRParams const& p, RelayWork* wo
     work->slices = halo_r::relayBundleSlices(work->planeBytes, p.planes);
     work->prefix[0] = 0;
     int const broadcasts = p.plan[1];
+    int const* experts = halo_r::planField(p.plan, halo_r::PlanField::kExpert);
     int const* masks = halo_r::planField(p.plan, halo_r::PlanField::kDestinationMask);
+    int const* lowMasks = halo_r::planField(p.plan, halo_r::PlanField::kHelperLowMask);
+    int const* highMasks = halo_r::planField(p.plan, halo_r::PlanField::kHelperHighMask);
     int entries = 0;
     for (int b = 0; b < broadcasts && b < halo_r::kMaxBroadcasts; ++b)
     {
+        unsigned const need = halo_r::relayNeedMask(static_cast<unsigned>(masks[b]), static_cast<unsigned>(lowMasks[b]),
+            static_cast<unsigned>(highMasks[b]), experts[b], p.residency, p.helpers);
         int destinations = 0;
-        int const index = halo_r::relayDestinationIndex(static_cast<unsigned>(masks[b]), p.localRank, &destinations);
+        int const index = halo_r::relayDestinationIndex(need, p.localRank, &destinations);
         if (index < 0)
         {
             continue;
         }
         work->broadcast[entries] = b;
+        work->need[entries] = need;
         work->destinations[entries] = destinations;
         work->index[entries] = index;
         work->prefix[entries + 1]
@@ -212,7 +220,6 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 
     int const* experts = halo_r::planField(p.plan, halo_r::PlanField::kExpert);
-    int const* masks = halo_r::planField(p.plan, halo_r::PlanField::kDestinationMask);
     int const banks = slots >= 2 ? 2 : 1;
     int const bankSlots = slots / banks;
     int const batchLimit = bankSlots < kRelayMaxBatch ? bankSlots : kRelayMaxBatch;
@@ -250,7 +257,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
             unsigned long long bytes = 0;
             halo_r::relayLocateSlice(work.planeBytes, p.planes, slice, &plane, &offset, &bytes);
             int const b = work.broadcast[entry];
-            unsigned const mask = static_cast<unsigned>(masks[b]);
+            unsigned const mask = work.need[entry];
             std::uint64_t const source
                 = p.sourceTable[static_cast<std::size_t>(experts[b]) * p.planes + plane] + offset;
             bool aligned = ((source | bytes) % kRelayBulkAlignment) == 0;
@@ -286,7 +293,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
             int const s = bank * bankSlots + c;
             relayAwait(&control[s]);
             int const b = work.broadcast[entryOf[c]];
-            unsigned const mask = static_cast<unsigned>(masks[b]);
+            unsigned const mask = work.need[entryOf[c]];
             for (int d = 0; d < p.ep; ++d)
             {
                 if ((mask >> d) & 1U)

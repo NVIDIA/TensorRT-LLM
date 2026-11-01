@@ -18,10 +18,12 @@
 // Work assignment of the HALO-R relay copy.
 //
 // A broadcast b sends one expert bundle (every weight plane of one expert) from its owner to the destination set D_b,
-// with m = |D_b| and the owner not in D_b. The bundle is cut into slices: each plane, in plane order, into
-// ceil(bytes / kRelaySliceBytes) slices, the last one short. The destination with index i = |{d in D_b : d < rank}|
-// pulls every slice j with j mod m == i from the owner and stores it into the helper slot of every member of D_b, its
-// own included. Every slice is therefore read once from the owner and written once into every destination.
+// the owner not in D_b. With helper residency, only the need set N_b = {d in D_b : d's helper slot for b does not hold
+// b's expert} is copied to; without it, N_b = D_b. Every rank keeps the same residency table, so every rank derives the
+// same N_b. The bundle is cut into slices: each plane, in plane order, into ceil(bytes / kRelaySliceBytes) slices, the
+// last one short. With m = |N_b|, the member of N_b with index i = |{d in N_b : d < rank}| pulls every slice j with
+// j mod m == i from the owner and stores it into the helper slot of every member of N_b, its own included. Every slice
+// is therefore read once from the owner and written once into every member of N_b; an empty N_b copies nothing.
 //
 // The work items of one rank are (b, k) for every broadcast it receives, in plan order, and k in [0, count(N, m, i)),
 // slice j = i + k * m. Items are flattened broadcast-major with prefix sums and dealt round-robin to the grid's issuer
@@ -43,6 +45,26 @@ namespace halo_r
 constexpr unsigned long long kRelaySliceBytes = 8192ULL;
 //! Weight planes per expert bundle the relay accepts.
 constexpr int kRelayMaxPlanes = 8;
+
+//! The receivers of a broadcast of `expert` whose helper slot does not hold it yet, from the residency table
+//! [rank][helper slot] (`residency`, -1 for unknown); every receiver when there is no table.
+TLLM_HALO_R_HOST_DEVICE inline unsigned relayNeedMask(
+    unsigned destinationMask, unsigned lowMask, unsigned highMask, int expert, int const* residency, int helpers)
+{
+    if (residency == nullptr)
+    {
+        return destinationMask;
+    }
+    unsigned need = 0;
+    for (int d = 0; d < kMaxRanks; ++d)
+    {
+        if (((destinationMask >> d) & 1U) && residency[d * helpers + helperIndex(lowMask, highMask, d)] != expert)
+        {
+            need |= 1U << d;
+        }
+    }
+    return need;
+}
 
 //! Index of `rank` in a destination mask, or -1 when the rank is not a destination; *count receives |mask|.
 TLLM_HALO_R_HOST_DEVICE inline int relayDestinationIndex(unsigned destinationMask, int rank, int* count)

@@ -222,11 +222,11 @@ def test_manager_rejects_unknown_planner():
         PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_m"))
 
 
-def test_manager_rejects_halo_r_with_resident_helper_slots():
+def test_manager_keeps_halo_r_helper_slots_resident_per_layer():
     config = _Config("halo_r")
     config.helper_slot_mode = "per_layer_resident"
-    with pytest.raises(ValueError, match="requires helper_slot_mode 'shared_banks'"):
-        PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
+    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
+    assert manager.helper_residency
 
 
 def test_reference_plan_words_have_the_kernel_layout():

@@ -60,9 +60,11 @@ enum MoeRebalanceHaloRCounter : int
 //!      and write the physical slot of every route.
 //!   2. Route release. Each CTA checks every status word and then adds 1 to `routeCounter` with a system-scope
 //!      release. A route consumer on another stream waits until the counter has grown by `ctas`.
-//!   3. Relay. Each CTA copies its share of the expert bundles this rank receives: the receivers of a bundle split it
-//!      into slices, and each pulls its slices from the owner and stores them into the helper slot of every receiver.
-//!   4. Completion. The last CTA to finish its copies publishes `readyValue` into this rank's READY cell on every rank.
+//!   3. Relay. Each CTA copies its share of the expert bundles this rank receives: the receivers of a bundle that do
+//!      not hold it yet (all of them without a residency table) split it into slices, and each pulls its slices from
+//!      the owner and stores them into the helper slot of every such receiver.
+//!   4. Completion. The last CTA to finish its copies records the plan's helper experts in the residency table and
+//!      publishes `readyValue` into this rank's READY cell on every rank.
 //!
 //! Any failure traps before the failing CTA releases its routes, so a consumer never reads routes of a failed launch
 //! and no READY is published for it.
@@ -85,6 +87,8 @@ struct MoeRebalanceHaloRParams
     std::uint64_t const* destinationTable; //!< [ep * planes] address A such that A + row * planeBytes[p] is row `row`
                                            //!< of rank d's plane p.
     std::uint64_t const* planeBytes;       //!< [planes] bytes of one expert in each plane.
+    int* residency;                        //!< [ep * helpers] expert each rank's helper slot holds, -1 unknown;
+                                           //!< null when the helper slots are shared by several layers.
     unsigned* completedCtas;               //!< [1] zero before the first launch; every launch leaves it zero.
     long long* counters;                   //!< [kHaloRCounters] diagnostic counters.
     std::uint64_t* readyFlagMc;            //!< This rank's READY cell through the multicast view of the READY rows.

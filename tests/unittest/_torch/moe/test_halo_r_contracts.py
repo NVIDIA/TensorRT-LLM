@@ -119,7 +119,9 @@ class _Env(SimpleNamespace):
     """A built HALO-R group with the fakes it runs on."""
 
 
-def _build(monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None) -> _Env:
+def _build(
+    monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None, helper_residency=False
+) -> _Env:
     trace = []
     state = SimpleNamespace(stream=_MAIN, device=0, fail_submit=False, counters=[0, 0, 0])
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
@@ -226,6 +228,7 @@ def _build(monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None) -> _Env:
 
     def create(*args):
         trace.append(("create", len(args)))
+        state.create_args = args
         return SimpleNamespace(name="ctx")
 
     ops = SimpleNamespace(
@@ -240,6 +243,7 @@ def _build(monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None) -> _Env:
         int32="int32",
         int64="int64",
         zeros=lambda *shape, dtype, device: _Tensor(f"zeros{shape}", trace),
+        full=lambda shape, value, dtype, device: _Tensor(f"full{shape}={value}", trace),
         tensor=lambda values, dtype: _Tensor("table", trace),
         ops=SimpleNamespace(trtllm=ops),
         _C=SimpleNamespace(
@@ -291,7 +295,7 @@ def _build(monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None) -> _Env:
         max_tokens_per_rank=_MAX_TOKENS,
         copy_stream=copy,
         auxiliary_sms=auxiliary_sms,
-        helper_residency=False,
+        helper_residency=helper_residency,
         spin_bound=spin_bound,
         layer_idx=5,
     )
@@ -650,9 +654,9 @@ def test_kernel_traps_before_it_releases_routes_and_before_ready():
         (
             '"atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"',
             "firstFailedStatus(p.status)",
-            'trapLaunch(p, "status word set before READY", word);',
+            'trapLaunch(p, "status word set before READY", failedWord);',
             "publishReady(p.readyFlagMc, p.readyValue);",
-            "countLaunch(p);",
+            "p.counters[kHaloRCounterLaunches] += 1;",
         ),
     )
     # Every scheduler wait that times out fails the launch instead of routing home.
@@ -711,3 +715,154 @@ def test_kernel_runs_in_the_remote_memory_sync_domain():
     _assert_in_order(
         publish, ('"fence.release.sys;"', '"multimem.st.release.sys.global.u64 [%0], %1;"')
     )
+
+
+def _create_argument(env, name):
+    """The value a fake native create received for the schema parameter ``name``."""
+    names = _op_parameters("moe_rebalance_halo_r_create")
+    assert len(names) == len(env.state.create_args)
+    return env.state.create_args[names.index(name)]
+
+
+@pytest.mark.parametrize("helper_residency", [False, True])
+def test_residency_table_exists_only_for_per_layer_helper_slots(monkeypatch, helper_residency):
+    env = _build(monkeypatch, helper_residency=helper_residency)
+    table = _create_argument(env, "residency")
+    if not helper_residency:
+        assert table is None and env.endpoint.residency is None
+        return
+    # One int32 [ep][helpers] table per layer, unknown (-1) everywhere, before any launch.
+    assert table is env.endpoint.residency
+    assert table.name == "full(8, 3)=-1"
+    assert env.trace.index(("synchronize", 0)) < env.trace.index(
+        ("create", len(env.state.create_args))
+    )
+
+
+def test_kernel_skips_resident_receivers_and_records_residency_before_ready():
+    kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
+    relay_source = (_KERNELS / "moeRebalanceRelay.cuh").read_text()
+    prepare = _function_body(relay_source, "void prepareRelayWork(")
+    _assert_in_order(
+        prepare,
+        (
+            "halo_r::relayNeedMask(",
+            "p.residency, p.helpers);",
+            "halo_r::relayDestinationIndex(need, p.localRank, &destinations);",
+            "work->need[entries] = need;",
+        ),
+    )
+    issue = _function_body(relay_source, "void relayIssue(")
+    # Loads and stores go to the need set, never to the plan's whole receiver mask.
+    assert issue.count("work.need[") == 2 and "kDestinationMask" not in issue
+    account = _function_body(kernel_source, "void accountBroadcasts(")
+    _assert_in_order(
+        account,
+        (
+            "halo_r::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);",
+            "atomicAdd(receiverCopies",
+            "atomicAdd(receiverSkips",
+            "p.residency[d * p.helpers + halo_r::helperIndex(low, high, d)] = experts[b];",
+        ),
+    )
+    complete = _function_body(kernel_source, "void completeLaunch(")
+    _assert_in_order(
+        complete,
+        (
+            '"atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;"',
+            "firstFailedStatus(p.status)",
+            "accountBroadcasts(p, &receiverCopies, &receiverSkips);",
+            "publishReady(p.readyFlagMc, p.readyValue);",
+            "p.counters[kHaloRCounterReceiverSkips] += ",
+        ),
+    )
+    # Every thread's table change precedes thread 0's READY release.
+    barrier = complete.index("__syncthreads();", complete.index("accountBroadcasts("))
+    assert barrier < complete.index("publishReady(")
+
+
+class _FakeVmm:
+    def __init__(self, trace):
+        self.trace = trace
+        self.next_address = 0x100000
+
+    def reserve(self, nbytes):
+        self.next_address += 0x10000
+        self.trace.append(("reserve", nbytes))
+        return self.next_address
+
+    def import_(self, shareable):
+        self.trace.append(("import", shareable))
+        return f"handle:{shareable}"
+
+    def map(self, address, nbytes, handle):
+        self.trace.append(("map", address, nbytes, handle))
+
+
+def _pool(trace, *, rank, sets, gathered):
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import (
+        _HelperSet,
+        _SharedSlotPool,
+    )
+
+    pool = _SharedSlotPool.__new__(_SharedSlotPool)
+    pool.world = len(gathered[0]) if gathered else 4
+    pool.rank = rank
+    pool._closed = False
+    pool._peer_helper_bases = {}
+    pool.large = (SimpleNamespace(name="w13"), SimpleNamespace(name="w2"))
+    pool.helper_bytes = {"w13": 4096, "w2": 2048}
+    pool.sets = tuple(
+        _HelperSet({}, (), (), shareables={"w13": f"s{index}-w13", "w2": f"s{index}-w2"})
+        for index in range(sets)
+    )
+    pool.vmm = _FakeVmm(trace)
+
+    def allgather(local):
+        trace.append(("allgather", dict(local)))
+        return gathered.pop(0)
+
+    pool.comm = SimpleNamespace(allgather=allgather)
+    return pool
+
+
+@pytest.mark.parametrize("sets", [2, 5], ids=["shared-banks", "per-layer"])
+def test_peer_helper_chunks_are_mapped_once_per_set(sets):
+    trace = []
+    world = 4
+
+    def peers(index):
+        return [{"w13": f"r{r}-s{index}-w13", "w2": f"r{r}-s{index}-w2"} for r in range(world)]
+
+    pool = _pool(trace, rank=1, sets=sets, gathered=[peers(index) for index in range(sets)])
+    for helper_set in range(sets):
+        bases = pool.peer_helper_bases(helper_set)
+        # Every peer but this rank, every large plane, the peer's own chunk of this set.
+        assert set(bases) == {(peer, name) for peer in (0, 2, 3) for name in ("w13", "w2")}
+        assert trace[-1][0] == "map" and ("allgather", pool.sets[helper_set].shareables) in trace
+        imported = [entry[1] for entry in trace if entry[0] == "import"]
+        assert f"r3-s{helper_set}-w2" in imported and f"r1-s{helper_set}-w2" not in imported
+    # A repeat is served from the cache, with no collective.
+    count = len(trace)
+    assert pool.peer_helper_bases(0) is pool.peer_helper_bases(0)
+    assert len(trace) == count
+    assert sum(1 for entry in trace if entry[0] == "allgather") == sets
+    with pytest.raises(ValueError, match="not one of the pool"):
+        pool.peer_helper_bases(sets)
+    pool._closed = True
+    with pytest.raises(RuntimeError, match="closed shared-slot pool"):
+        pool.peer_helper_bases(0)
+
+
+def test_peer_helper_mapping_refuses_mismatched_chunks():
+    trace = []
+    gathered = [
+        [{"w13": "a", "w2": "b"}, {"w13": "c"}, {"w13": "e", "w2": "f"}, {"w13": "g", "w2": "h"}]
+    ]
+    pool = _pool(trace, rank=0, sets=1, gathered=gathered)
+    with pytest.raises(RuntimeError, match="chunks differ"):
+        pool.peer_helper_bases(0)
+    pool = _pool(trace, rank=0, sets=1, gathered=[[{"w13": "a", "w2": "b"}] * 3])
+    pool.world = 4
+    with pytest.raises(RuntimeError, match="incomplete EP"):
+        pool.peer_helper_bases(0)

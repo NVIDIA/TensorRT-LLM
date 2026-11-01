@@ -377,19 +377,19 @@ class TestMoeConfigPerLayerDynamicEplb:
         assert config.load_balancer.planner == "halo_r"
         assert config.backend == "MEGAMOE_CUTEDSL"
 
-    # The planner rejection tests build the config directly: MoeConfig
-    # re-raises a load-balancer error with only the input dictionary in its
-    # message, which would hide the reason these tests check.
-    @pytest.mark.parametrize("mode", [None, "per_layer_resident"])
-    def test_halo_r_requires_shared_banks(self, mode: str | None) -> None:
+    @pytest.mark.parametrize("mode", [None, "per_layer_resident", "shared_banks"])
+    def test_halo_r_accepts_both_helper_slot_modes(self,
+                                                   mode: str | None) -> None:
         values = self._per_layer_dynamic()
         values["planner"] = "halo_r"
         if mode is not None:
             values["helper_slot_mode"] = mode
-        with pytest.raises(ValidationError,
-                           match="requires `helper_slot_mode: shared_banks`"):
-            MoePerLayerDynamicLoadBalancerConfig(**values)
+        config = MoePerLayerDynamicLoadBalancerConfig(**values)
+        assert config.helper_slot_mode == (mode or "per_layer_resident")
 
+    # The planner rejection tests build the config directly: MoeConfig
+    # re-raises a load-balancer error with only the input dictionary in its
+    # message, which would hide the reason these tests check.
     @pytest.mark.parametrize("planner, auxiliary_sms, valid", [
         pytest.param("halo_q", 8, True, id="halo-q-8"),
         pytest.param("halo_q", 9, False, id="halo-q-9"),

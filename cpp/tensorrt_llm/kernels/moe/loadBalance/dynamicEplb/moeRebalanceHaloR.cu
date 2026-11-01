@@ -19,7 +19,8 @@
 // CTA per SM, on the copy stream (moeRebalanceHaloR.h). It follows the fused HALO-Q + TMA kernel
 // (moeRebalanceTma.cu) and reuses its scheduler passes (moeRebalanceHaloQKernel.cuh), with three differences:
 //   - The plan is HALO-R's own (moeRebalanceHaloRPlanner.h): arbitrary receiver masks, each receiver with its own
-//     helper slot, copied with the unicast relay (moeRebalanceRelay.cuh) instead of multicast.
+//     helper slot, copied with the unicast relay (moeRebalanceRelay.cuh) instead of multicast. With per-layer helper
+//     slots, the relay skips each receiver whose slot already holds the expert, not a whole team.
 //   - A CTA starts its relay share right after releasing its routes, without waiting for the other CTAs: CTA 0
 //     publishes the plan only once it is complete, and the grid rendezvous already proved every CTA resident.
 //   - A failing CTA traps before it releases its routes: every timeout, a planner status other than OK and any
@@ -312,46 +313,81 @@ __device__ __forceinline__ void publishReady(std::uint64_t* flag, std::uint64_t 
     asm volatile("fence.proxy.alias;" ::: "memory");
 }
 
-//! Thread 0 of the last CTA, after READY: one launch, and every receiver of every broadcast of its plan copied.
-__device__ void countLaunch(MoeRebalanceHaloRParams const& p)
+//! The last CTA, every thread: the copied and skipped receivers of each broadcast, from the residency table as the
+//! relay read it, and then the broadcast's expert recorded in every receiver's helper slot. A plan assigns each
+//! (receiver, helper slot) to one broadcast, so a thread reads and writes only its own broadcasts' table entries.
+__device__ void accountBroadcasts(
+    MoeRebalanceHaloRParams const& p, unsigned long long* receiverCopies, unsigned long long* receiverSkips)
 {
     int const broadcasts = p.plan[1];
+    int const* experts = halo_r::planField(p.plan, halo_r::PlanField::kExpert);
     int const* masks = halo_r::planField(p.plan, halo_r::PlanField::kDestinationMask);
-    long long copies = 0;
-    for (int b = 0; b < broadcasts; ++b)
+    int const* lowMasks = halo_r::planField(p.plan, halo_r::PlanField::kHelperLowMask);
+    int const* highMasks = halo_r::planField(p.plan, halo_r::PlanField::kHelperHighMask);
+    for (int b = threadIdx.x; b < broadcasts; b += blockDim.x)
     {
-        copies += __popc(static_cast<unsigned>(masks[b]));
+        unsigned const mask = static_cast<unsigned>(masks[b]);
+        unsigned const low = static_cast<unsigned>(lowMasks[b]);
+        unsigned const high = static_cast<unsigned>(highMasks[b]);
+        unsigned const need = halo_r::relayNeedMask(mask, low, high, experts[b], p.residency, p.helpers);
+        atomicAdd(receiverCopies, static_cast<unsigned long long>(__popc(need)));
+        atomicAdd(receiverSkips, static_cast<unsigned long long>(__popc(mask & ~need)));
+        if (p.residency == nullptr)
+        {
+            continue;
+        }
+        for (int d = 0; d < p.ep; ++d)
+        {
+            if ((mask >> d) & 1U)
+            {
+                p.residency[d * p.helpers + halo_r::helperIndex(low, high, d)] = experts[b];
+            }
+        }
     }
-    p.counters[kHaloRCounterLaunches] += 1;
-    p.counters[kHaloRCounterReceiverCopies] += copies;
 }
 
 //! Phase 4: a release/acquire chain over the CTAs elects the last one, which publishes READY. No CTA waits for
 //! another, and a rank with nothing to copy joins the chain all the same.
+//!
+//! The residency table changes before READY: every read of it in this launch precedes the chain, and READY orders the
+//! change before any later launch of the layer that acquires it. Every rank applies the same change, so the tables
+//! stay identical.
 __device__ void completeLaunch(MoeRebalanceHaloRParams const& p)
 {
     __shared__ int last;
+    __shared__ int failedWord;
+    __shared__ unsigned long long receiverCopies;
+    __shared__ unsigned long long receiverSkips;
     if (threadIdx.x == 0)
     {
         unsigned previous;
         asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(p.completedCtas) : "memory");
         last = previous == gridDim.x - 1;
+        failedWord = last ? firstFailedStatus(p.status) : -1;
+        receiverCopies = 0;
+        receiverSkips = 0;
     }
     __syncthreads();
-    if (!last || threadIdx.x != 0)
+    if (!last)
     {
         return;
     }
-    int const word = firstFailedStatus(p.status);
-    if (word >= 0)
+    if (failedWord >= 0)
     {
-        trapLaunch(p, "status word set before READY", word);
+        trapLaunch(p, "status word set before READY", failedWord);
         return;
     }
-    // Every CTA has arrived; the next launch is stream-ordered after this one, so the counter can be rearmed.
-    asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(p.completedCtas) : "memory");
-    publishReady(p.readyFlagMc, p.readyValue);
-    countLaunch(p);
+    accountBroadcasts(p, &receiverCopies, &receiverSkips);
+    __syncthreads();
+    if (threadIdx.x == 0)
+    {
+        // Every CTA has arrived; the next launch is stream-ordered after this one, so the counter can be rearmed.
+        asm volatile("st.relaxed.gpu.global.u32 [%0], 0;" ::"l"(p.completedCtas) : "memory");
+        publishReady(p.readyFlagMc, p.readyValue);
+        p.counters[kHaloRCounterLaunches] += 1;
+        p.counters[kHaloRCounterReceiverCopies] += static_cast<long long>(receiverCopies);
+        p.counters[kHaloRCounterReceiverSkips] += static_cast<long long>(receiverSkips);
+    }
 }
 
 __global__ __launch_bounds__(kFusedThreads, 1) void haloRFusedKernel(MoeRebalanceHaloRParams const p)

@@ -3,18 +3,21 @@
 """Four-rank HALO-R kernel on a real shared-slot arena.
 
 Every rank fills its home experts with a byte pattern unique to (expert,
-plane, layer) and runs HALO-R layer calls through the scheduler group:
-eagerly, over three layers that alternate the two shared helper banks, with
-ranks that have no tokens and with a plan that moves nothing. After each call
-it checks:
+plane, layer) and runs HALO-R layer calls through the scheduler group: over
+three layers that alternate the two shared helper banks or keep their own
+helper slots, with ranks that have no tokens, with a plan that moves nothing,
+and with repeated routes whose experts are still resident. After each call it
+checks:
 - the plan words equal the pure-Python reference plan of the global routes;
 - every route lands on its owner's home slot or a receiver's helper slot, and
   the routes per (expert, rank) add up to the plan's quota;
 - every helper row this rank received equals the owner's expert bytewise;
 - the READY row holds the call's generation on every cell, and every status
   word is clear;
-- the relay counters count every launch and every receiver of every broadcast.
-The residency case puts a full-device kernel that spins on the READY row, like
+- the relay counters count every launch and the copied and skipped receivers
+  of every broadcast, and with per-layer helper slots the residency table is
+  the same on every rank and equals a model of it.
+The hog cases put a full-device kernel that spins on the READY row, like
 MegaMoE's gate, on MAIN right after the route wait, while a hog holds every
 SM but the HALO-R kernel's, and expects it to pass its gate every time.
 """
@@ -370,7 +373,7 @@ def _check_call(
                 failures.append(
                     f"rank {rank}: layer {layer} helper {helper} plane {plane} != expert {expert}"
                 )
-    return failures, sum(len(b.rows) for b in plan.broadcasts)
+    return failures, plan
 
 
 # A build without the SM100 + CUDA 13.1 kernels registers the ops but throws on use.
@@ -380,7 +383,9 @@ _PLACEHOLDER_MESSAGE = "HALO-R requires CUDA 13.1+"
 class _Layers:
     """HALO-R groups of consecutive MoE layers on one model-level manager."""
 
-    def __init__(self, rank: int, count: int, auxiliary_sms: int) -> None:
+    def __init__(
+        self, rank: int, count: int, auxiliary_sms: int, helper_slot_mode: str = "shared_banks"
+    ) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
             PerLayerDynamicMoeLoadBalancer,
         )
@@ -394,7 +399,7 @@ class _Layers:
         config = SimpleNamespace(
             num_slots=self.experts + _EP_SIZE * _HELPER_SLOTS,
             auxiliary_sms=auxiliary_sms,
-            helper_slot_mode="shared_banks",
+            helper_slot_mode=helper_slot_mode,
             planner="halo_r",
         )
         self.manager = PerLayerDynamicMoeLoadBalancer(ep_rank=rank, ep_size=_EP_SIZE, config=config)
@@ -425,6 +430,10 @@ class _Layers:
         MPI.COMM_WORLD.Barrier()
         self.groups = []
         self.receiver_copies = []
+        self.receiver_skips = []
+        # A model of each layer's residency table, [rank][helper slot], with per-layer helper slots.
+        self.tables = []
+        self.resident = helper_slot_mode == "per_layer_resident"
 
     def build_groups(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
@@ -446,6 +455,10 @@ class _Layers:
                 )
             )
             self.receiver_copies.append(0)
+            self.receiver_skips.append(0)
+            self.tables.append(
+                [[-1] * _HELPER_SLOTS for _ in range(_EP_SIZE)] if self.resident else None
+            )
 
     def call(self, layer: int, routes: torch.Tensor, stream: torch.cuda.Stream) -> int:
         group = self.groups[layer]
@@ -457,13 +470,31 @@ class _Layers:
         return generation
 
     def check(self, layer: int, routes: torch.Tensor, generation: int) -> list:
+        """Check one finished call; return the failures and the receivers it copied to."""
         group, arena = self.groups[layer], self.arenas[layer]
-        failures, copies = _check_call(group, arena, routes, generation, self.rank, layer=layer)
+        failures, plan = _check_call(group, arena, routes, generation, self.rank, layer=layer)
+        table = self.tables[layer]
+        copies = 0
+        for b in plan.broadcasts:
+            for destination, slot in b.helper.items():
+                if table is not None and table[destination][slot] == b.expert:
+                    self.receiver_skips[layer] += 1
+                else:
+                    copies += 1
+                if table is not None:
+                    table[destination][slot] = b.expert
         self.receiver_copies[layer] += copies
         counts = group.broadcaster.relay_counts()
-        expected = (generation, self.receiver_copies[layer], 0)
+        expected = (generation, self.receiver_copies[layer], self.receiver_skips[layer])
         if counts != expected:
             failures.append(f"rank {self.rank}: layer {layer} relay counts {counts} != {expected}")
+        if table is not None:
+            native = group.broadcaster.residency.cpu().tolist()
+            if native != table:
+                failures.append(f"rank {self.rank}: layer {layer} residency {native} != {table}")
+            if any(other != native for other in MPI.COMM_WORLD.allgather(native)):
+                failures.append(f"rank {self.rank}: layer {layer} residency differs across ranks")
+        self.last_copies = copies
         return failures
 
     def shutdown(self) -> None:
@@ -498,10 +529,14 @@ def _case_empty_plan(layers: _Layers) -> list:
 
 
 def _case_alternating_banks(layers: _Layers) -> list:
-    """Three layers on two shared helper banks: layer 2 refills the bank of layer 0."""
+    """Three layers on two shared helper banks: layer 2 refills the bank of layer 0.
+
+    With per-layer helper slots, every layer has its own set instead.
+    """
     rank, experts = layers.rank, layers.experts
     banks = [int(arena.provider.layer.helper_set) for arena in layers.arenas]
-    failures = [] if banks == [0, 1, 0] else [f"rank {rank}: helper banks {banks}"]
+    expected = [0, 1, 2] if layers.resident else [0, 1, 0]
+    failures = [] if banks == expected else [f"rank {rank}: helper sets {banks}"]
     main = torch.cuda.Stream()
     for step in range(2):
         for layer in range(len(layers.groups)):
@@ -510,7 +545,28 @@ def _case_alternating_banks(layers: _Layers) -> list:
     return failures
 
 
-def _case_relay_residency(layers: _Layers, auxiliary_sms: int) -> list:
+def _case_resident_repeat(layers: _Layers) -> list:
+    """Per-layer helper slots skip every receiver that still holds its expert.
+
+    The same routes twice copy nothing the second time and keep the rows; other
+    routes in between evict and return experts, once with a rank without
+    tokens. The checks compare the native tables with a model on every call.
+    """
+    rank, experts = layers.rank, layers.experts
+    main = torch.cuda.Stream()
+    failures = []
+    # (route step, tokens of rank 0); the other ranks always submit _MAX_TOKENS.
+    calls = ((0, _MAX_TOKENS), (0, _MAX_TOKENS), (1, _MAX_TOKENS), (1, 0), (0, _MAX_TOKENS))
+    for index, (step, rank0_tokens) in enumerate(calls):
+        tokens = rank0_tokens if rank == 0 else _MAX_TOKENS
+        routes = _routes(step, rank, tokens, experts, rank)
+        failures += layers.check(0, routes, layers.call(0, routes, main))
+        if index == 1 and layers.last_copies:
+            failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
+    return failures
+
+
+def _case_gate_under_hog(layers: _Layers, auxiliary_sms: int) -> list:
     """MegaMoE's full grid, queued right after the route wait, must not starve the relay.
 
     A hog holds every SM but the HALO-R kernel's, and COPY runs below MAIN, so
@@ -559,8 +615,10 @@ def _run_worker(case: str):
             return "; ".join(sorted({r for r in reasons if r})), []
         _init_process_group(rank)
         auxiliary_sms = 16 if case.endswith("_16") else _AUXILIARY_SMS
-        layers = _Layers(rank, 3 if case == "banks" else 1, auxiliary_sms)
-        if case.startswith("residency"):
+        helper_slot_mode = "per_layer_resident" if case.startswith("resident") else "shared_banks"
+        count = 3 if case in ("banks", "resident_layers") else 1
+        layers = _Layers(rank, count, auxiliary_sms, helper_slot_mode)
+        if case.startswith("hog"):
             _starve_relay(layers)
         try:
             layers.build_groups()
@@ -569,12 +627,14 @@ def _run_worker(case: str):
             if _PLACEHOLDER_MESSAGE in str(error):
                 return f"placeholder build: {error}", []
             raise
-        if case == "banks":
+        if case in ("banks", "resident_layers"):
             return None, _case_alternating_banks(layers)
         if case == "empty_plan":
             return None, _case_empty_plan(layers)
-        if case.startswith("residency"):
-            return None, _case_relay_residency(layers, auxiliary_sms)
+        if case == "resident":
+            return None, _case_resident_repeat(layers)
+        if case.startswith("hog"):
+            return None, _case_gate_under_hog(layers, auxiliary_sms)
         return None, _case_single_layer(layers)
     except Exception:
         traceback.print_exc()
@@ -589,7 +649,7 @@ def _run_worker(case: str):
 
 
 def _starve_relay(layers: _Layers) -> None:
-    """Give COPY the lowest stream priority, below the MAIN of the residency cases.
+    """Give COPY the lowest stream priority, below the MAIN of the hog cases.
 
     Production gives COPY the highest priority, which only orders CTAs that
     are still pending; inverting it makes MegaMoE win every SM that frees up
@@ -602,7 +662,17 @@ def _starve_relay(layers: _Layers) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < _EP_SIZE, reason="Requires 4 GPUs")
 @pytest.mark.parametrize(
-    "case", ["eager", "eager_16", "empty_plan", "banks", "residency", "residency_16"]
+    "case",
+    [
+        "eager",
+        "eager_16",
+        "empty_plan",
+        "banks",
+        "hog",
+        "hog_16",
+        "resident",
+        "resident_layers",
+    ],
 )
 def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):
     results = list(halo_r_mpi_pool.map(_run_worker, [case] * _EP_SIZE))

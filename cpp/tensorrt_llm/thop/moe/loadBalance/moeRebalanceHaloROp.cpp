@@ -26,6 +26,7 @@
 #include <climits>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -91,9 +92,9 @@ public:
         torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
         torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
         torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-        torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::int64_t readyFlagMcPtr,
-        std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue, std::int64_t sendCountValue,
-        std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
+        torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
+        std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue,
+        std::int64_t sendCountValue, std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
         std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t copyStream)
     {
         int const ep = checkedInt(epValue, "ep");
@@ -133,6 +134,10 @@ public:
         checkCudaTensor(relayPlaneBytes, device, torch::kInt64, planes, "relay_plane_bytes");
         checkCudaTensor(relayCompletedCtas, device, torch::kInt32, 1, "relay_completed_ctas");
         checkCudaTensor(relayCounters, device, torch::kInt64, kernels::kHaloRCounters, "relay_counters");
+        if (residency.has_value())
+        {
+            checkCudaTensor(*residency, device, torch::kInt32, static_cast<std::int64_t>(ep) * helpers, "residency");
+        }
 
         mParams = kernels::MoeRebalanceHaloRParams{
             nullptr,
@@ -150,6 +155,7 @@ public:
             reinterpret_cast<std::uint64_t const*>(relaySources.data_ptr<std::int64_t>()),
             reinterpret_cast<std::uint64_t const*>(relayDestinations.data_ptr<std::int64_t>()),
             reinterpret_cast<std::uint64_t const*>(relayPlaneBytes.data_ptr<std::int64_t>()),
+            residency.has_value() ? residency->data_ptr<int>() : nullptr,
             reinterpret_cast<unsigned*>(relayCompletedCtas.data_ptr<int>()),
             reinterpret_cast<long long*>(relayCounters.data_ptr<std::int64_t>()),
             checkedPointer<std::uint64_t>(readyFlagMcPtr, "ready_flag_mc_ptr"),
@@ -179,6 +185,10 @@ public:
             std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync), std::move(plan),
             std::move(routePrefix), std::move(routeCounter), std::move(relaySources), std::move(relayDestinations),
             std::move(relayPlaneBytes), std::move(relayCompletedCtas), std::move(relayCounters)};
+        if (residency.has_value())
+        {
+            mTensors.push_back(std::move(*residency));
+        }
         mBound = true;
     }
 
@@ -302,16 +312,17 @@ MoeRebalanceHaloRStatePtr moeRebalanceHaloRCreate(torch::Tensor outSlots, torch:
     torch::Tensor peerBases, torch::Tensor status, torch::Tensor partial, torch::Tensor routeAux,
     torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
     torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
-    torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::int64_t readyFlagMcPtr, std::int64_t ep,
-    std::int64_t experts, std::int64_t helpers, std::int64_t sendCount, std::int64_t sendWeight, std::int64_t localRank,
-    std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas, std::int64_t copyStream)
+    torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
+    std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts, std::int64_t helpers, std::int64_t sendCount,
+    std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas,
+    std::int64_t copyStream)
 {
     return c10::make_intrusive<MoeRebalanceHaloRState>(std::move(outSlots), std::move(outIds), std::move(outOwners),
         std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync),
         std::move(plan), std::move(routePrefix), std::move(routeCounter), std::move(relaySources),
         std::move(relayDestinations), std::move(relayPlaneBytes), std::move(relayCompletedCtas),
-        std::move(relayCounters), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight, localRank, topk,
-        routeCapacity, ctas, copyStream);
+        std::move(relayCounters), std::move(residency), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight,
+        localRank, topk, routeCapacity, ctas, copyStream);
 }
 
 // The per-layer op takes this handle instead of the custom class, whose conversion costs several microseconds of
@@ -361,8 +372,9 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_rebalance_halo_r_create(Tensor out_slots, Tensor out_ids, Tensor out_owners, Tensor peer_bases, "
         "Tensor status, Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan, Tensor route_prefix, "
         "Tensor route_counter, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
-        "Tensor relay_completed_ctas, Tensor relay_counters, int ready_flag_mc_ptr, int ep, int experts, int helpers, "
-        "int send_count, int send_weight, int local_rank, int topk, int route_capacity, int ctas, int copy_stream) -> "
+        "Tensor relay_completed_ctas, Tensor relay_counters, Tensor? residency, int ready_flag_mc_ptr, int ep, "
+        "int experts, int helpers, int send_count, int send_weight, int local_rank, int topk, int route_capacity, "
+        "int ctas, int copy_stream) -> "
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState");
     m.def(
         "moe_rebalance_halo_r_handle("

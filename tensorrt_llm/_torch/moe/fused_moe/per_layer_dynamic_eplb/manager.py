@@ -51,8 +51,6 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         self.planner = str(getattr(config, "planner", "halo_q"))
         if self.planner not in ("halo_q", "halo_r"):
             raise ValueError(f"unknown per-layer dynamic EPLB planner {self.planner!r}")
-        if self.planner == "halo_r" and self.helper_residency:
-            raise ValueError("planner 'halo_r' requires helper_slot_mode 'shared_banks'")
 
         # State read by the shared lifecycle and by the engine.
         self._previous_balancer = None

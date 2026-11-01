@@ -26,6 +26,7 @@
 
 #include <barrier>
 #include <cstring>
+#include <random>
 #include <thread>
 #include <vector>
 
@@ -414,4 +415,83 @@ TEST(MoeRebalanceRelayWorkTest, ItemsMapBackToTheirBroadcast)
     EXPECT_EQ(k, 0);
     EXPECT_EQ(halo_r::relayLocateItem(prefix, 3, 11, &k), 2);
     EXPECT_EQ(k, 6);
+}
+
+TEST(MoeRebalanceRelayWorkTest, NeedSetsSplitEverySliceOverTheReceiversThatNeedIt)
+{
+    std::mt19937 rng(20887);
+    int emptyNeedSets = 0;
+    for (int trial = 0; trial < 10000; ++trial)
+    {
+        int const ep = 2 * (1 + static_cast<int>(rng() % 16));
+        int const helpers = 1 + static_cast<int>(rng() % halo_r::kMaxHelperSlots);
+        int const owner = static_cast<int>(rng() % ep);
+        int const expert = static_cast<int>(rng() % 64);
+        unsigned mask = 0;
+        unsigned low = 0;
+        unsigned high = 0;
+        for (int d = 0; d < ep; ++d)
+        {
+            if (d != owner && rng() % 2)
+            {
+                unsigned const slot = rng() % helpers;
+                mask |= 1U << d;
+                low |= (slot & 1U) << d;
+                high |= ((slot >> 1) & 1U) << d;
+            }
+        }
+        std::vector<int> table(static_cast<std::size_t>(ep) * helpers);
+        for (int& entry : table)
+        {
+            entry = rng() % 3 == 0 ? expert : (rng() % 2 ? -1 : static_cast<int>(rng() % 64));
+        }
+        long long const slices = 1 + static_cast<long long>(rng() % 40);
+
+        unsigned const need = halo_r::relayNeedMask(mask, low, high, expert, table.data(), helpers);
+        for (int d = 0; d < 32; ++d)
+        {
+            bool const holds
+                = d < ep && ((mask >> d) & 1U) && table[d * helpers + halo_r::helperIndex(low, high, d)] == expert;
+            ASSERT_EQ((need >> d) & 1U, ((mask >> d) & 1U) && !holds ? 1U : 0U) << "trial " << trial;
+        }
+        emptyNeedSets += need == 0 ? 1 : 0;
+
+        // Every simulated rank derives the need set from its own identical copy of the table.
+        std::vector<int> pulls(slices, 0);
+        std::vector<int> stores(slices * ep, 0);
+        for (int rank = 0; rank < ep; ++rank)
+        {
+            std::vector<int> const rankTable = table;
+            unsigned const rankNeed = halo_r::relayNeedMask(mask, low, high, expert, rankTable.data(), helpers);
+            ASSERT_EQ(rankNeed, need);
+            int destinations = 0;
+            int const index = halo_r::relayDestinationIndex(rankNeed, rank, &destinations);
+            long long const count = halo_r::relaySliceCount(slices, destinations, index);
+            if (index < 0)
+            {
+                ASSERT_EQ(count, 0) << "a rank outside the need set pulls nothing";
+            }
+            for (long long k = 0; k < count; ++k)
+            {
+                long long const slice = halo_r::relaySliceOf(k, destinations, index);
+                ++pulls[slice];
+                for (int d = 0; d < ep; ++d)
+                {
+                    stores[slice * ep + d] += static_cast<int>((rankNeed >> d) & 1U);
+                }
+            }
+        }
+        for (long long slice = 0; slice < slices; ++slice)
+        {
+            ASSERT_EQ(pulls[slice], need ? 1 : 0) << "trial " << trial << " slice " << slice;
+            for (int d = 0; d < ep; ++d)
+            {
+                ASSERT_EQ(stores[slice * ep + d], static_cast<int>((need >> d) & 1U))
+                    << "trial " << trial << " slice " << slice << " receiver " << d;
+            }
+        }
+    }
+    EXPECT_GT(emptyNeedSets, 0) << "the trials must cover broadcasts that copy nothing";
+    // Without a residency table every receiver needs the copy.
+    EXPECT_EQ(halo_r::relayNeedMask(0b1010U, 0U, 0U, 5, nullptr, 2), 0b1010U);
 }

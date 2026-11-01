@@ -117,8 +117,9 @@ def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> 
     experts = len(sources) // planes
     if len(sources) != experts * planes or experts % home_experts:
         raise RuntimeError("HALO-R relay source table does not cover every expert plane")
-    bank = int(arena.provider.layer.helper_set)
-    peer_helpers = pool.peer_helper_bases()
+    # The layer's own helper set with per-layer helper slots, else one of the
+    # two shared banks; mapping it is collective on first use.
+    peer_helpers = pool.peer_helper_bases(int(arena.provider.layer.helper_set))
     destinations = []
     for rank in range(experts // home_experts):
         for index, (view, nbytes) in enumerate(zip(live.planes, plane_bytes)):
@@ -126,7 +127,7 @@ def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> 
             if rank != ep_rank and name in pool.helper_bytes:
                 # Peers' unicast views map only home rows; use the mapped
                 # helper chunk, whose row 0 is the peer's slot `home`.
-                base = peer_helpers[(rank, bank, name)] - home_experts * nbytes
+                base = peer_helpers[(rank, name)] - home_experts * nbytes
             else:
                 base = int(view.uc_views[rank].data_ptr())
             destinations.append(base)
@@ -156,6 +157,7 @@ class HaloRRelayEndpoint:
         pool: Any,
         home_experts: int,
         copy_stream: torch.cuda.Stream,
+        helper_residency: bool,
     ) -> None:
         from cuda.bindings import driver
 
@@ -199,6 +201,13 @@ class HaloRRelayEndpoint:
         self.relay_plane_bytes = int64(plane_bytes)
         self.completed_ctas = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.counters = torch.zeros(HALO_R_COUNTERS, dtype=torch.int64, device=self.device)
+        # The expert each rank's helper slot holds, identical on every rank:
+        # every rank starts at -1 (unknown) and applies the same plans. Only a
+        # layer's own helper slots can hold it, so shared banks keep no table.
+        self.residency: Optional[torch.Tensor] = None
+        if helper_residency:
+            self.residency = torch.full((ep, helpers), -1, dtype=torch.int32, device=self.device)
+            torch.cuda.synchronize(self.device)
         # Binds every argument the per-layer launches share and prepares the
         # launch, so a layer call is one native call on the context's handle.
         ctx = torch.ops.trtllm.moe_rebalance_halo_r_create(
@@ -218,6 +227,7 @@ class HaloRRelayEndpoint:
             self.relay_plane_bytes,
             self.completed_ctas,
             self.counters,
+            self.residency,
             flag_mc,
             ep,
             experts,
@@ -430,8 +440,6 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             helper_slots=int(helper_slots),
             auxiliary_sms=int(auxiliary_sms),
         )
-        if helper_residency:
-            raise ValueError("planner 'halo_r' requires helper_slot_mode 'shared_banks'")
         self.layer_idx = layer_idx
         self.device = int(device)
         self.ep_size = ep_size
@@ -532,6 +540,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             pool=pool,
             home_experts=self.home_experts,
             copy_stream=self.copy_stream,
+            helper_residency=bool(helper_residency),
         )
 
         # Zero this layer's READY row before any peer can publish into it.
