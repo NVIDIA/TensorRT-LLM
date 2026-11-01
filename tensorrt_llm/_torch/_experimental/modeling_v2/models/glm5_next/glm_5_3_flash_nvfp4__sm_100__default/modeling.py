@@ -559,6 +559,18 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
         # Avoid AUTO autotuning on TP decode; honor explicit user overrides.
         return {"allreduce_strategy": "ONESHOT"}
 
+    def _quantization_named_modules(self):
+        """The modules the checkpoint's quantization exclusions apply to: all but those that chose their own
+        quantization (and their children)."""
+        own = [
+            name
+            for name, module in self.named_modules()
+            if getattr(module, "_glm5_next_own_quant", False)
+        ]
+        for name, module in self.named_modules():
+            if not any(name == p or name.startswith(f"{p}.") for p in own):
+                yield name, module
+
     @property
     def mamba_metadata_cls(self) -> type[Mamba2Metadata]:
         """Metadata with paged tables refreshed before CUDA graph replay."""
@@ -1060,6 +1072,16 @@ class Glm5NextForCausalLM(DecoderModelForCausalLM):
                         [g["weight_scale_inv"] for g in groups], dim=0
                     )
                 load_linear(fused_path, [merged])
+
+        if experts is not None and quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            # BF16 checkpoint experts built as FP8 block-scale ones (the MTP layer): quantize on the device.
+            device = torch.device("cuda", torch.cuda.current_device())
+            for key in [k for k in moe_weights if k.endswith(".weight")]:
+                if moe_weights[key].dtype == torch.float8_e4m3fn:
+                    continue
+                fp8, scale = _fp8_block_cast(moe_weights[key].to(device))
+                moe_weights[key] = fp8
+                moe_weights[f"{key}_scale_inv"] = scale
 
         if experts is not None:
             tensors_per_expert = {
@@ -1859,6 +1881,18 @@ class Glm5NextGate(DeepseekV3Gate):
         )
 
 
+def _fp8_block_cast(weight: torch.Tensor, block: int = 128) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(fp8 weight, fp32 dequant scales [rows / block, cols / block])``: per ``block x block`` tile, the scale
+    is the tile's amax / 448 (the FP8_BLOCK_SCALES checkpoint layout)."""
+    rows, cols = weight.shape
+    if rows % block or cols % block:
+        raise ValueError(f"FP8 block cast: {tuple(weight.shape)} is not a multiple of {block}")
+    tiles = weight.view(rows // block, block, cols // block, block)
+    scale = tiles.abs().float().amax(dim=(1, 3), keepdim=True).clamp(min=1e-4) / 448.0
+    fp8 = (tiles.float() / scale).to(torch.float8_e4m3fn)
+    return fp8.view(rows, cols), scale.view(rows // block, cols // block)
+
+
 class Glm5NextMoE(nn.Module):
     """Fused routed experts with a shared GatedMLP expert.
 
@@ -1898,18 +1932,24 @@ class Glm5NextMoE(nn.Module):
         # fetched per call so it follows the parameter through
         # materialization onto its final device).
         routing = self.gate.routing_method
-        # Routed experts use the checkpoint's quantization; excluded layers
-        # (including the NVFP4 checkpoint's BF16 MTP layer) stay unquantized.
+        # Routed experts use the checkpoint's quantization. The MTP layer's
+        # experts, BF16 in the checkpoint, run as FP8 block-scale experts
+        # (quantized when the weights load): the draft step's MoE is
+        # weight-bandwidth bound, and this is the low-M kernel with the
+        # clamped SwiGLU. Other excluded layers stay unquantized.
         quant = model_config.get_quant_config()
-        experts_quant = (
-            QuantConfig(quant_algo=quant.quant_algo, group_size=quant.group_size)
-            if quant is not None
-            and quant.quant_algo is not None
-            and not quant.is_module_excluded_from_quantization(
-                f"model.layers.{layer_idx}.mlp.experts"
-            )
-            else QuantConfig()
+        excluded = (
+            quant is None
+            or quant.quant_algo is None
+            or quant.is_module_excluded_from_quantization(f"model.layers.{layer_idx}.mlp.experts")
         )
+        is_mtp = layer_idx >= int(config.num_hidden_layers)
+        if not excluded:
+            experts_quant = QuantConfig(quant_algo=quant.quant_algo, group_size=quant.group_size)
+        elif is_mtp:
+            experts_quant = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES, group_size=128)
+        else:
+            experts_quant = QuantConfig()
         self.experts = create_moe(
             routing_method=routing,
             num_experts=self.num_experts,
@@ -1922,6 +1962,8 @@ class Glm5NextMoE(nn.Module):
             layer_idx=layer_idx,
             activation=SwigluActivation(clamp=self.swiglu_limit),
         )
+        # The exclusion pass after construction must not reset the quantization chosen here.
+        self.experts._glm5_next_own_quant = excluded and is_mtp
         backend = getattr(self.experts, "backend", self.experts)
         self.moe_backend_name = type(backend).__name__
         # Four-rank composition: the fused layer runs

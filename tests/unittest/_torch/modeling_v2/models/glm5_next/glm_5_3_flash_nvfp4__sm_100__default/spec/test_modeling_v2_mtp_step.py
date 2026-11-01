@@ -18,6 +18,7 @@ from torch import nn
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default.modeling import (  # noqa: E501
     Glm5NextMtpStep,
     _check_speculation,
+    _fp8_block_cast,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.speculative.utils import get_spec_worker
@@ -333,3 +334,22 @@ def test_vocab_head_step_matches_stock_worker(greedy):
         assert torch.equal(stock[key], fused[key]), key
     assert fused.get("logits_vocab_shard", False) is greedy
     assert torch.equal(stock["logits"], fused["logits"])
+
+
+def test_fp8_block_cast_matches_the_checkpoint_layout():
+    """The MTP experts' load-time FP8 block cast: one fp32 dequant scale per 128x128 tile (amax / 448), and the
+    dequantized weight within FP8 E4M3's rounding of the original."""
+    weight = (
+        torch.randn(256, 384, device="cuda") * torch.linspace(0.01, 3.0, 384, device="cuda")
+    ).to(torch.bfloat16)
+    fp8, scale = _fp8_block_cast(weight)
+    assert fp8.dtype == torch.float8_e4m3fn and fp8.shape == weight.shape
+    assert scale.dtype == torch.float32 and scale.shape == (2, 3)
+    tiles = weight.float().view(2, 128, 3, 128)
+    torch.testing.assert_close(scale, tiles.abs().amax(dim=(1, 3)) / 448.0)
+    dequant = (fp8.float().view(2, 128, 3, 128) * scale.view(2, 1, 3, 1)).view_as(weight)
+    # E4M3 keeps 3 mantissa bits: relative error at most 2^-4 above the tile's subnormal range.
+    tol = scale.repeat_interleave(128, 0).repeat_interleave(128, 1) * 2.0**-6
+    assert ((dequant - weight.float()).abs() <= weight.float().abs() * 2.0**-4 + tol).all()
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _fp8_block_cast(weight[:, :200])
