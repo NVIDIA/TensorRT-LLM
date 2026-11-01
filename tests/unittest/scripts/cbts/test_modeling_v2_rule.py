@@ -35,11 +35,11 @@ _COMM = "unittest/_torch/modeling_v2/comm"
 _NATIVE_UNIT = "unittest/_torch/modeling_v2/models/glm_moe_dsa/test_modeling_v2_glm_native.py"
 _DEEPSEEK_ACCURACY = "accuracy/modeling_v2/test_deepseek_v3.py::TestDeepseek::test_gsm8k[tp4]"
 _GPT_OSS_ACCURACY = "accuracy/modeling_v2/test_gpt_oss.py::TestGptOss::test_gsm8k[tp1]"
-_CLAIMS = "unittest/_torch/modeling_v2/test_modeling_v2_claims.py"
+_TREE = "unittest/_torch/modeling_v2/test_modeling_v2_routing.py"
 
 
 @pytest.fixture
-def rule(tmp_path) -> ModelingV2Rule:
+def rule() -> ModelingV2Rule:
     yaml_index = YAMLIndex()
     yaml_index.blocks = [
         Block(
@@ -59,7 +59,7 @@ def rule(tmp_path) -> ModelingV2Rule:
             tests=[_COMM, _DEEPSEEK_ACCURACY],
         ),
         Block(yaml_stem="l0_b200", block_index=0, condition={}, tests=[_NATIVE_UNIT]),
-        Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _CLAIMS]),
+        Block(yaml_stem="l0_cpu", block_index=0, condition={}, tests=["unittest/tools", _TREE]),
     ]
     stages = {
         "B300-PyTorch-1": Stage("B300-PyTorch-1", "l0_b300", "aarch64", 1, 2),
@@ -69,16 +69,7 @@ def rule(tmp_path) -> ModelingV2Rule:
         "B200-PyTorch-1": Stage("B200-PyTorch-1", "l0_b200", "x86_64", 1, 1),
         "CPU-Generic-x86-1": Stage("CPU-Generic-x86-1", "l0_cpu", "x86_64", 1, 1),
     }
-    for family, target, cls in (
-        ("gpt_oss", "gpt_oss_120b__sm_10x__default", "GptOss"),
-        ("deepseek_v3", "target", "Deepseek"),
-        ("glm_moe_dsa", "target", "Glm"),
-    ):
-        root = tmp_path / _PY / "models" / family
-        (root / target).mkdir(parents=True)
-        (root / target / "modeling.py").touch()
-        (root / "routing.py").write_text(f"from .{target}.modeling import {cls}\n")
-    return ModelingV2Rule(yaml_index, stages, repo_root=tmp_path)
+    return ModelingV2Rule(yaml_index, stages)
 
 
 def _apply(rule: ModelingV2Rule, *files: str):
@@ -134,16 +125,16 @@ def test_entry_runs_family():
 def test_scope(rule):
     """A family change selects what runs that family's tests, plus the CPU checks.
 
-    Families union; shared code selects every modeling_v2 entry; an unreadable family
-    selects all modeling_v2 entries.
+    Families union; shared code selects every modeling_v2 entry; a family that no
+    entry runs keeps only the CPU checks.
     """
     result = _apply(rule, f"{_PY}/models/gpt_oss/gpt_oss_120b__sm_10x__default/csrc/k.cu")
     assert result.scope == "modelingv2only" and result.sanity_relevant is False
-    assert _selected(result) == {_UNIT, _GPT_OSS_ACCURACY, _CLAIMS}
+    assert _selected(result) == {_UNIT, _GPT_OSS_ACCURACY, _TREE}
     result = _apply(
         rule, f"{_PY}/models/deepseek_v3/routing.py", f"{_PY}/models/glm_moe_dsa/csrc/k.cu"
     )
-    assert _selected(result) == {_UNIT, _DEEPSEEK_ACCURACY, _NATIVE_UNIT, _CLAIMS}
+    assert _selected(result) == {_UNIT, _DEEPSEEK_ACCURACY, _NATIVE_UNIT, _TREE}
     result = _apply(rule, f"{_CPP}/common/torchLibrary.h")
     assert _selected(result) == {
         _UNIT,
@@ -151,13 +142,13 @@ def test_scope(rule):
         _NATIVE_UNIT,
         _DEEPSEEK_ACCURACY,
         _GPT_OSS_ACCURACY,
-        _CLAIMS,
+        _TREE,
     }
     assert _apply(rule, "tensorrt_llm/_torch/pyexecutor/model_loader.py") is None
     rule.yaml_index.blocks[0].tests.remove(_UNIT)
     result = _apply(rule, f"{_PY}/models/minimax_m3/csrc/attnMega.cu")
     assert result.scope == "modelingv2only"
-    assert _COMM in _selected(result)  # unreadable family falls back to all modeling_v2
+    assert _selected(result) == {_TREE}
 
 
 @pytest.mark.parametrize("relative", ["csrc/kernel.cu", "fake_ops.py", "routing.py"])
@@ -169,10 +160,6 @@ def test_k3_uses_modeling_v2_selection(rule, relative):
 
 @pytest.mark.parametrize("relative", ["csrc/k3MnnvlAllreduce.cu", "target/modeling.py"])
 def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative):
-    family = rule._src_root / "models/kimi_k3_vl"
-    (family / "target").mkdir(parents=True)
-    (family / "target/modeling.py").touch()
-    (family / "routing.py").write_text("from .target.modeling import KimiK3\n")
     prefix = "unittest/_torch/modeling_v2/models/kimi_k3_vl"
     kernel_tests = {
         f"{prefix}/test_k3_mnnvl_comm.py",
@@ -191,7 +178,7 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
     rule.yaml_index.blocks[2].tests.append(norm)
     rule.yaml_index.blocks[3].tests.append(host)
     result = _apply(rule, f"{_PY}/models/kimi_k3_vl/{relative}")
-    selected = kernel_tests | {matrix, norm, native, host, accuracy, _CLAIMS}
+    selected = kernel_tests | {matrix, norm, native, host, accuracy, _TREE}
     assert _selected(result) == selected
     assert result.affected_stages == {
         "B300-PyTorch-1",
@@ -201,7 +188,7 @@ def test_k3_family_paths_select_kernel_collective_and_host_tests(rule, relative)
     }
     assert result.scope == "modelingv2only"
     other = _selected(_apply(rule, f"{_PY}/models/gpt_oss/csrc/kernel.cu"))
-    assert not (selected - {_CLAIMS}) & other
+    assert not (selected - {_TREE}) & other
 
 
 def test_k3_ci_runs_once_on_b300_or_gb300_by_topology():

@@ -26,7 +26,7 @@ load, or lacks an op a ``fake_ops.py`` declares, is a :class:`NativeLoadError`,
 never a fallback. The family's ``fake_ops.py`` registers when the library opens, a
 target's when the target is found in it.
 
-The "Native code" section of the modeling_v2 README is the guide for authors.
+``cpp/tensorrt_llm/modeling_v2/README.md`` is the guide for authors.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ import importlib
 import importlib.util
 import re
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional
 
 from ._router_index import NoTarget
 
@@ -59,13 +59,21 @@ class NativeLoadError(RuntimeError):
 
 
 def namespace_of(module: str) -> str:
-    """The torch namespace of the ops a module's ``fake_ops.py`` fakes.
+    """The torch namespace of the ops a ``fake_ops.py`` fakes.
 
-    ``mv2_<family>_<target>`` for a module of a target package, ``mv2_<family>`` for
-    a module of the family itself (its shared ops). Target directories are named
-    ``<checkpoint>__<sm>__<parallel>``, so the module path tells the two apart.
+    Takes a family or target package, or the ``fake_ops`` module in one:
+    ``mv2_<family>`` for the family's shared ops, ``mv2_<family>_<target>`` for a
+    target's.
     """
-    return _namespace(*_split(module))
+    parts = _parts(module)
+    if len(parts) > 1 and parts[-1] == "fake_ops":
+        parts = parts[:-1]
+    if len(parts) > 2:
+        raise ValueError(
+            f"{module!r} is not a models.<family> or models.<family>.<target> package, "
+            "or the fake_ops module in one"
+        )
+    return _namespace(*parts)
 
 
 # --- Naming (mirrors cpp/cmake/modules/modeling_v2.cmake) --------------------
@@ -84,15 +92,13 @@ def _library_name(family: str) -> str:
     return f"libth_modeling_v2_{family}.so"
 
 
-def _split(module: str) -> Tuple[str, Optional[str]]:
-    """``(family, target)`` of a module under ``models.<family>``; ``target`` is None
-    for a module of the family itself."""
+def _parts(module: str) -> List[str]:
+    """The path of ``module`` below ``models``, family first."""
     prefix = f"{_MODELS_PACKAGE}."
     parts = module[len(prefix) :].split(".") if module.startswith(prefix) else []
     if not parts or not parts[0]:
         raise ValueError(f"{module!r} is not a module of a modeling_v2 family")
-    target = parts[1] if len(parts) > 1 and "__" in parts[1] else None
-    return parts[0], target
+    return parts
 
 
 # --- Loading ------------------------------------------------------------------
@@ -143,13 +149,14 @@ def load_target_ops(package: str) -> Any:
     """Load the native code of the target package ``package`` and return its ops
     namespace, ``torch.ops.mv2_<family>_<target>``.
 
-    Call it from the target's ``__init__.py`` with ``__name__``. Raises
-    :class:`NoTarget` when this installation does not carry the target
+    Call it with the target package's name, ``__name__`` in its ``__init__.py``.
+    Raises :class:`NoTarget` when this installation does not carry the target
     and :class:`NativeLoadError` when its library is broken.
     """
-    family, target = _split(package)
-    if target is None or package != f"{_MODELS_PACKAGE}.{family}.{target}":
+    parts = _parts(package)
+    if len(parts) != 2:
         raise ValueError(f"{package!r} is not a models.<family>.<target> package")
+    family, target = parts
     built = _load_family_library(family)
     if target not in built:
         carried = ", ".join(sorted(built)) or "none"
@@ -175,7 +182,7 @@ def load_family_ops(module: str) -> Any:
     """
     ops = _family_ops.get(module)
     if ops is None:
-        family = _split(module)[0]
+        family = _parts(module)[0]
         _load_family_library(family)
         import torch
 

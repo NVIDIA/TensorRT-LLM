@@ -16,7 +16,7 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per family for changes under `models/<family>/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
@@ -309,14 +309,17 @@ per model family, loaded only when routing picks one of the family's targets),
 plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
 native build module `cpp/cmake/modules/modeling_v2.cmake`.
 
-Scope — per model node, else all of modeling_v2: source changes under
-`models/` (native `csrc/` included) select the nearest model node's unit tests
-and the accuracy gates of its targets. Family-shared code selects the whole
-family. A covering directory entry is retained when no more specific entry
-exists, unless it ignores that node. Whole-tree unit checks are always retained.
-Shared Python or native infrastructure selects every modeling_v2 entry, as does
-an unreadable routing tree. If no modeling_v2 entry matches, the rule falls back
-to baseline.
+Scope — per family, else all of modeling_v2: a source change under
+`models/<family>/` (native `csrc/` included) selects that family's unit tests
+(`unittest/_torch/modeling_v2/models/<family>`) and accuracy tests
+(`accuracy/modeling_v2/test_<family>.py`), from the path alone. A covering
+directory entry is retained when no more specific entry exists, unless it
+ignores that family. Whole-tree unit checks directly under
+`unittest/_torch/modeling_v2/` are always retained; among them,
+`test_modeling_v2_ci_selection.py` checks that families do not reach each
+other's code, which per-family selection relies on. Shared Python or native
+infrastructure selects every modeling_v2 entry. If no modeling_v2 entry
+matches, the rule falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -337,9 +340,9 @@ modeling_v2 iff one of its `tests:` entries matches
   `l0_gb300_multi_gpus` for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
-Both markers are exact by construction rather than by luck: every test
-file in the subtree is named `test_modeling_v2_*` precisely so it cannot
-collide with the upstream test of the same op. So unlike `SpecDecRule`'s
+Both markers are exact by construction rather than by luck: the unit
+tests and the accuracy tests each live in their own `modeling_v2/`
+directory. So unlike `SpecDecRule`'s
 `mtp_nextn`, no substring here can claim an unrelated entry and no
 carve-out is needed.
 

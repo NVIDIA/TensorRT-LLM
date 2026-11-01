@@ -1310,8 +1310,6 @@
    "test_unittests.py::test_unittests_v2[unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py]": 30.08225925925926,
    "unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py": 25.9784,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py]": 25.9784,
-   "unittest/_torch/modeling_v2/test_modeling_v2_claims.py": 24.492159420289855,
-   "test_unittests.py::test_unittests_v2[unittest/_torch/modeling_v2/test_modeling_v2_claims.py]": 24.492159420289855,
    "unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py": 1068.7946414904332,
    "test_unittests.py::test_unittests_v2[unittest/_torch/modeling_v2/test_modeling_v2_deepseek_default_shards.py]": 1068.7946414904332,
    "unittest/_torch/modeling_v2/test_modeling_v2_gpt_oss_default_shards.py": 159.5571090909091,
