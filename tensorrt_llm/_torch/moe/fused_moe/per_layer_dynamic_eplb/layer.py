@@ -234,6 +234,14 @@ class PerLayerDynamicMoeLayerLoadBalancer:
                     f"per-layer dynamic EPLB layer {self.layer_idx} is already "
                     "bound to a different backend"
                 )
+            # Loaders bind again after they rewrite the weights. Helper slots
+            # may still hold copies of the old ones, so a producer that tracks
+            # what they hold must forget it.
+            forget_helper_residency = getattr(
+                self._scheduler_group, "forget_helper_residency", None
+            )
+            if forget_helper_residency is not None:
+                forget_helper_residency()
             return
 
         backend_ref = weakref.ref(backend)

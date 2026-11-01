@@ -418,14 +418,11 @@ class _Layers:
                 device=rank,
                 layer_idx=layer,
             )
-            bound = arena.bound.base
-            for plane, nbytes in enumerate(bound.plane_bytes):
-                base = int(bound.local_plane_views[plane].data_ptr())
-                for local in range(_HOME_EXPERTS):
-                    _row(base + local * int(nbytes), int(nbytes), rank).copy_(
-                        _pattern(rank * _HOME_EXPERTS + local, plane, layer, int(nbytes), rank)
-                    )
             self.arenas.append(arena)
+        # The weights of each layer, as loaded; a reload changes them.
+        self.weights = list(range(count))
+        for layer in range(count):
+            self.load_weights(layer)
         torch.cuda.synchronize()
         MPI.COMM_WORLD.Barrier()
         self.groups = []
@@ -434,6 +431,28 @@ class _Layers:
         # A model of each layer's residency table, [rank][helper slot], with per-layer helper slots.
         self.tables = []
         self.resident = helper_slot_mode == "per_layer_resident"
+
+    def load_weights(self, layer: int) -> None:
+        """Write this rank's home experts of ``layer`` with the pattern of its current weights."""
+        bound = self.arenas[layer].bound.base
+        for plane, nbytes in enumerate(bound.plane_bytes):
+            base = int(bound.local_plane_views[plane].data_ptr())
+            for local in range(_HOME_EXPERTS):
+                expert = self.rank * _HOME_EXPERTS + local
+                _row(base + local * int(nbytes), int(nbytes), self.rank).copy_(
+                    _pattern(expert, plane, self.weights[layer], int(nbytes), self.rank)
+                )
+
+    def reload_weights(self, layer: int) -> None:
+        """Load new weights into ``layer`` between layer calls, as a weight update does."""
+        self.weights[layer] += 1000
+        self.load_weights(layer)
+        torch.cuda.synchronize()
+        # What the layer handle's rebind calls once a loader has rewritten the weights.
+        self.groups[layer].forget_helper_residency()
+        if self.tables[layer] is not None:
+            self.tables[layer] = [[-1] * _HELPER_SLOTS for _ in range(_EP_SIZE)]
+        MPI.COMM_WORLD.Barrier()
 
     def build_groups(self) -> None:
         from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.halo_r_planner import (
@@ -472,7 +491,9 @@ class _Layers:
     def check(self, layer: int, routes: torch.Tensor, generation: int) -> list:
         """Check one finished call; return the failures and the receivers it copied to."""
         group, arena = self.groups[layer], self.arenas[layer]
-        failures, plan = _check_call(group, arena, routes, generation, self.rank, layer=layer)
+        failures, plan = _check_call(
+            group, arena, routes, generation, self.rank, layer=self.weights[layer]
+        )
         table = self.tables[layer]
         copies = 0
         for b in plan.broadcasts:
@@ -566,6 +587,27 @@ def _case_resident_repeat(layers: _Layers) -> list:
     return failures
 
 
+def _case_resident_reload(layers: _Layers) -> list:
+    """A weight reload makes the next call copy every receiver again, with the new weights."""
+    rank, experts = layers.rank, layers.experts
+    main = torch.cuda.Stream()
+    failures = []
+    routes = _routes(0, rank, _MAX_TOKENS, experts, rank)
+    for _ in range(2):
+        failures += layers.check(0, routes, layers.call(0, routes, main))
+    if layers.last_copies:
+        failures.append(f"rank {rank}: the repeated call copied {layers.last_copies} receivers")
+    layers.reload_weights(0)
+    skips = layers.receiver_skips[0]
+    failures += layers.check(0, routes, layers.call(0, routes, main))
+    # Every receiver of the plan is copied again, and check() compared their
+    # rows with the new weights and the native counters and table with a model
+    # that forgot every slot.
+    if layers.last_copies == 0 or layers.receiver_skips[0] != skips:
+        failures.append(f"rank {rank}: the call after the reload skipped receivers")
+    return failures
+
+
 def _case_gate_under_hog(layers: _Layers, auxiliary_sms: int) -> list:
     """MegaMoE's full grid, queued right after the route wait, must not starve the relay.
 
@@ -633,6 +675,8 @@ def _run_worker(case: str):
             return None, _case_empty_plan(layers)
         if case == "resident":
             return None, _case_resident_repeat(layers)
+        if case == "resident_reload":
+            return None, _case_resident_reload(layers)
         if case.startswith("hog"):
             return None, _case_gate_under_hog(layers, auxiliary_sms)
         return None, _case_single_layer(layers)
@@ -672,6 +716,7 @@ def _starve_relay(layers: _Layers) -> None:
         "hog_16",
         "resident",
         "resident_layers",
+        "resident_reload",
     ],
 )
 def test_halo_r_relay_matches_reference(halo_r_mpi_pool, case):

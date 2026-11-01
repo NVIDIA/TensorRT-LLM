@@ -94,6 +94,10 @@ class _Tensor:
         self.trace.append(("zero", self.name))
         return self
 
+    def fill_(self, value):
+        self.trace.append(("fill", self.name, value))
+        return self
+
 
 def _extract_function(path: Path, name: str, namespace: dict):
     tree = ast.parse(path.read_text())
@@ -540,10 +544,13 @@ def test_relay_counts_come_from_the_native_context(monkeypatch):
 
 
 def test_group_overrides_only_construction():
-    overridden = {
+    methods = {
         name for name, value in vars(HaloRSlotSchedulerGroup).items() if inspect.isfunction(value)
     }
+    overridden = {name for name in methods if hasattr(RebalanceSlotSchedulerGroup, name)}
     assert overridden == {"__init__"}
+    # The one addition is the weight-reload hook that the layer handle looks up.
+    assert methods - overridden == {"forget_helper_residency"}
     assert inspect.signature(HaloRSlotSchedulerGroup.__init__) == inspect.signature(
         RebalanceSlotSchedulerGroup.__init__
     )
@@ -866,3 +873,38 @@ def test_peer_helper_mapping_refuses_mismatched_chunks():
     pool.world = 4
     with pytest.raises(RuntimeError, match="incomplete EP"):
         pool.peer_helper_bases(0)
+
+
+def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
+    env = _build(monkeypatch, helper_residency=True)
+    table = env.endpoint.residency
+    group = env.group
+    _layer_call(group, 8)
+    part = group.plan_schedule(_Routes(8))
+    with pytest.raises(RuntimeError, match="only between layer calls"):
+        group.forget_helper_residency()
+    group.plan_finish(part)
+    with pytest.raises(RuntimeError, match="only between layer calls"):
+        group.forget_helper_residency()
+    group.finish()
+    env.trace.clear()
+    group.forget_helper_residency()
+    # No launch before the reset can still update the table, and every later one reads the reset.
+    assert env.trace == [("synchronize", 0), ("fill", table.name, -1), ("synchronize", 0)]
+    # The reset does not disturb the generations: the next call proceeds as usual.
+    _, generation = _layer_call(group, 8)
+    assert generation == 3
+
+
+def test_weight_reload_without_residency_is_free(monkeypatch):
+    env = _build(monkeypatch)
+    _layer_call(env.group, 8)
+    env.trace.clear()
+    env.group.forget_helper_residency()
+    assert env.trace == []
+    env.state.fail_submit = True
+    with pytest.raises(RuntimeError, match="launch failed"):
+        env.group.plan_schedule(_Routes(8))
+    # An aborted group is rebuilt, not reset.
+    with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+        env.group.forget_helper_residency()

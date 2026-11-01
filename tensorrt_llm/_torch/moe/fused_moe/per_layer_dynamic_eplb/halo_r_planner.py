@@ -382,6 +382,25 @@ class HaloRRelayEndpoint:
         launches, copies, skips = torch.ops.trtllm.moe_rebalance_halo_r_relay_counts(self.ctx)
         return int(launches), int(copies), int(skips)
 
+    def forget_residency(self) -> None:
+        """Mark every helper slot's expert unknown, so the next launch copies every receiver.
+
+        For a weight reload or rebind, between layer calls. It waits for the
+        device before and after the reset, so that no earlier launch, eager
+        or replayed, can still update the table and every later one reads the
+        reset table. Every rank resets at the same point of its layer calls
+        because every rank loads the weights between the same forward passes,
+        which keeps the tables identical.
+        """
+        with self._lock:
+            self._require_operational()
+            if self.residency is None:
+                return
+            with torch.cuda.device(self.device):
+                torch.cuda.synchronize(self.device)
+                self.residency.fill_(-1)
+                torch.cuda.synchronize(self.device)
+
     def close(self) -> None:
         """Release the native context after all device work is drained."""
         with self._lock, torch.cuda.device(self.device):
@@ -399,8 +418,21 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     It overrides only construction. HALO-Q's ``__init__`` builds the TMA
     copy endpoint, so this one sets the same attributes in the same collective
     order and builds a ``HaloRRelayEndpoint`` instead; every other method is
-    HALO-Q's.
+    HALO-Q's. It adds ``forget_helper_residency`` for weight reloads.
     """
+
+    def forget_helper_residency(self) -> None:
+        """Forget which expert each helper slot holds after the expert weights were rewritten.
+
+        The helper slots may still hold copies of the old weights, which the
+        next launch would otherwise skip. Collective in effect: every rank
+        must call it between the same two layer calls, as weight loading does.
+        """
+        if self._closed:
+            raise RuntimeError("Rebalance scheduler group is closed")
+        if self._plan_part is not None or self._generation != self._finished_generation:
+            raise RuntimeError("helper residency can be reset only between layer calls")
+        self.broadcaster.forget_residency()
 
     def __init__(
         self,

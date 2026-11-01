@@ -217,6 +217,28 @@ def test_default_planner_builds_the_halo_q_group(monkeypatch):
     assert manager.planner == "halo_q"
 
 
+def test_rebinding_the_backend_forgets_helper_residency(monkeypatch):
+    """Loaders bind the layer again after they rewrite its weights."""
+    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_r"))
+    layer = manager.add_layer(expert_count=16, top_k=2, slot_count_per_rank=6)
+    group = SimpleNamespace(home_experts=4, helper_slots=2, forget_helper_residency=MagicMock())
+    monkeypatch.setattr(
+        halo_r_planner, "build_halo_r_slot_scheduler_group", MagicMock(return_value=group)
+    )
+    _allocate_arena(layer, monkeypatch, _Arena())
+    backend = _Backend()
+
+    layer.bind_backend(backend)
+    group.forget_helper_residency.assert_not_called()
+    layer.bind_backend(backend)
+    layer.bind_backend(backend)
+    assert group.forget_helper_residency.call_count == 2
+
+    # A producer without the hook, such as HALO-Q's, rebinds as before.
+    del group.forget_helper_residency
+    layer.bind_backend(backend)
+
+
 def test_manager_rejects_unknown_planner():
     with pytest.raises(ValueError, match="unknown per-layer dynamic EPLB planner"):
         PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=_Config("halo_m"))
