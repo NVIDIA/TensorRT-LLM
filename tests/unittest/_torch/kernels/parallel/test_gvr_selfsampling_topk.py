@@ -2486,16 +2486,19 @@ def test_selfsampling_topk_varlen_16bit_edge_patterns(
         pytest.param(512, 8192, 512, 4, "main", id="main_v16"),
         pytest.param(512, 32768, 2048, 1, "main", id="main_v16_dense"),
         pytest.param(256, 32768, 1024, 4, "main", id="main_blk512"),
-        pytest.param(1, 262144, 1024, 4, "main", id="main_split_bs1"),
+        pytest.param(8, 262144, 1024, 4, "main", id="main_split_bs8"),
         pytest.param(64, 65536, 1024, 4, "clus", id="clus"),
     ],
 )
 def test_selfsampling_topk_varlen_fp16_main_clus_smoke(
-    rows: int, ncols: int, top_k: int, compress_ratio: int, family: str
+    rows: int, ncols: int, top_k: int, compress_ratio: int, family: str, monkeypatch
 ) -> None:
     """Native FP16 on the streaming families: tie-aware exact
     top-K values, valid unique indices, -1 tails and the FP32 values output on random fp16
-    rows whose windows cover the full row, a shortened row, the short path and an empty row."""
+    rows whose windows cover the full row, a shortened row, the short path and an empty row. The FP16
+    code-radix routes are switched off so each shape keeps the streaming family under test."""
+    monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_16BIT", False)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     logits = torch.randn((rows, ncols), generator=generator, device=_DEV).to(torch.float16)
     kv_pattern = [ncols * compress_ratio, (ncols - 7) * compress_ratio, top_k - 3, 0]
@@ -2693,9 +2696,10 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
     window on the 1024-thread builds: 8x the bins (2,048, an 8 KB histogram), an 11-bit bin
     field in the staged word, a 1,023-code re-anchor below the sampled K-th, and the
     histogram's extra words taken from the staging capacity so the smem total (the
-    shared-memory carveout) equals the bf16 build's. The 512/256-thread fp16 builds, bf16
-    and fp32 builds, and fp16 linear-bin builds keep the 256-bin geometry and the
-    module-level index width."""
+    shared-memory carveout) equals the bf16 build's. The non-split 512/256-thread fp16 builds
+    take 2x the bins (512, a 511-code window); bf16 and fp32 builds and fp16 linear-bin builds
+    keep the 256-bin geometry. All but the 1024-thread fp16 builds keep the module-level
+    index width."""
     import cutlass
 
     from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as dev
@@ -2711,10 +2715,11 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
 
     base = (256, 256, dev.IDXB__main, dev.IDXM__main, 127)
     wide = (2048, 2048, 21, (1 << 21) - 1, 1023)
+    mid = (512, 512, dev.IDXB__main, dev.IDXM__main, 255)
     assert geometry(cutlass.Float16, True) == wide
     assert geometry(cutlass.Float16, True, (1024, 1, 1, 256, 2, True, False)) == wide
-    assert geometry(cutlass.Float16, True, (512, 4, 2, 256, 4, False, False)) == base
-    assert geometry(cutlass.Float16, True, (256, 4, 4, 256, 8, False, False)) == base
+    assert geometry(cutlass.Float16, True, (512, 4, 2, 256, 4, False, False)) == mid
+    assert geometry(cutlass.Float16, True, (256, 4, 4, 256, 8, False, False)) == mid
     assert geometry(cutlass.Float16, False) == base
     assert geometry(cutlass.BFloat16, True) == base
     assert geometry(cutlass.BFloat16, False) == base
@@ -2730,8 +2735,9 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
     for tpl in ((512, 4, 2, 256, 4, False, False), (256, 4, 4, 256, 8, False, False)):
         f16 = kernel(cutlass.Float16, True, tpl)
         bf16 = kernel(cutlass.BFloat16, True, tpl)
-        assert (f16.hb, f16.scpb, f16.sample_scpb, f16.dyn_bytes) == (
-            bf16.hb,
+        # 2x histogram words in static smem; the staging and the dynamic smem are unchanged
+        assert f16.hb == 2 * bf16.hb
+        assert (f16.scpb, f16.sample_scpb, f16.dyn_bytes) == (
             bf16.scpb,
             bf16.sample_scpb,
             bf16.dyn_bytes,
@@ -2857,12 +2863,16 @@ def test_selfsampling_topk_varlen_fp16_regclus_exactness(
     next_n: int,
     compress_ratio: int,
     pattern: str,
+    monkeypatch,
 ) -> None:
     """Native FP16 on the clustered register family: the four bf16 reg_clus routes
     (hybrid128 = dense-key hybrid walk, cr4, cs16 = bits-domain window, mtp4) stay on reg_clus and are
     tie-aware exact on the bf16 patterns and the fp16-specific ones, with the FP32 values output.  The
     K=2048 shapes run the fp16 fkey16 window (stage B5: sampled-anchor single-code bins, 1024 bins);
-    fp16 takes no hybrid plan, so hybrid128 is a window build too."""
+    fp16 takes no hybrid plan, so hybrid128 is a window build too. The FP16 code-radix routes (which take
+    some of these shapes in production) are switched off so the reg_clus kernel stays under test."""
+    monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_16BIT", False)
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
     logits, kv_lens, lengths = _make_fp16_varlen_case(
         rows, ncols, top_k, next_n, compress_ratio, pattern
     )
@@ -2975,6 +2985,10 @@ def _launcher_entry(
     return ss_host._varlen_cache_for(dtype)[key]
 
 
+# position of `bool(code_radix)` in get_compiled__reg's cache key (tagged FP16 fields follow the fixed ones)
+_REG_KEY_CODE_RADIX = 21
+
+
 @_LOW_DTYPE_PARAMS
 @pytest.mark.parametrize("code_radix", (True, False), ids=("radix", "bracket"))
 @pytest.mark.parametrize("pattern", _B6_RADIX_PATTERNS)
@@ -2994,8 +3008,7 @@ def test_selfsampling_topk_varlen_16bit_reg_code_radix(
     (switch off) give the exact top-K value multiset, valid unique indices, the (-1) tail of short
     rows and the FP32 values output on every register plan geometry, for bf16 and fp16."""
     monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_16BIT", code_radix)
-    if code_radix:
-        monkeypatch.setattr(ss_host, "_reg_code_radix", lambda k, n, rows, plan: True)
+    monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_FORCE", code_radix)
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
     logits, kv_lens, lengths = _make_low_varlen_case(
@@ -3015,9 +3028,32 @@ def test_selfsampling_topk_varlen_16bit_reg_code_radix(
     torch.cuda.synchronize()
     family, compiled = _launcher_entry(dtype, logits, top_k, ncols, next_n, compress_ratio)[:2]
     assert family in ("reg", "regimg"), family
-    # the launcher's compiled register kernel carries the requested mode (last field of its cache key)
-    modes = {key[-1] for key, fn in ss_host._device()._COMPILE_CACHE__reg.items() if fn is compiled}
+    # the launcher's compiled register kernel carries the requested mode (code_radix field of its cache key)
+    modes = {
+        key[_REG_KEY_CODE_RADIX]
+        for key, fn in ss_host._device()._COMPILE_CACHE__reg.items()
+        if fn is compiled
+    }
     assert modes == {code_radix}, modes
+    _check_low_varlen_exact(logits, indices, lengths, values)
+
+
+@pytest.mark.parametrize("pattern", ["ties", "infinities"])
+def test_selfsampling_topk_varlen_bf16_unpadded_single_row(pattern: str, monkeypatch) -> None:
+    """A single BF16 row whose width is not a multiple of 64 (the packed clamp window kernel needs a
+    64-element row stride) takes another register plan and is exact."""
+    monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
+    rows, ncols, top_k = 1, 8195, 1024
+    logits, kv_lens, lengths = _make_low_varlen_case(
+        rows, ncols, top_k, 1, 4, pattern, torch.bfloat16
+    )
+    assert logits.shape[1] % 64 != 0
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    values = torch.full((rows, top_k + 13), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run_varlen(
+        logits, kv_lens, indices, compress_ratio=4, values=values, max_seq_len=ncols * 4
+    )
+    torch.cuda.synchronize()
     _check_low_varlen_exact(logits, indices, lengths, values)
 
 
