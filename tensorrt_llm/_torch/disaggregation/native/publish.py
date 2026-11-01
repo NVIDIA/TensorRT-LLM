@@ -16,9 +16,9 @@
 
 from __future__ import annotations
 
-from tensorrt_llm._torch.disaggregation.base import Attempt, CacheExtent
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
+from .extent import Attempt, CacheExtent
 from .fetch import refuse_extent_for_another_request
 from .handle import TaskHandle
 from .transfer import TxSession

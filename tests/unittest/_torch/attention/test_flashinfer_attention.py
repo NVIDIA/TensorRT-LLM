@@ -673,281 +673,292 @@ class TestFlashInferAttention(unittest.TestCase):
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        try:
+            kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-        for i in kv_cache_manager.layer_offsets:
-            buf = kv_cache_manager.get_buffers(i)
-            if buf is not None:
-                torch.nn.init.normal_(buf)
-                del buf
+            for i in kv_cache_manager.layer_offsets:
+                buf = kv_cache_manager.get_buffers(i)
+                if buf is not None:
+                    torch.nn.init.normal_(buf)
+                    del buf
 
-        if isinstance(num_kv_heads, int):
-            num_kv_heads = [num_kv_heads] * num_layers
+            if isinstance(num_kv_heads, int):
+                num_kv_heads = [num_kv_heads] * num_layers
 
-        contexts_per_layer = []
-        gens_per_layer = []
+            contexts_per_layer = []
+            gens_per_layer = []
 
-        for layer_idx in range(num_layers):
-            kv_heads = num_kv_heads[layer_idx]
-            if kv_heads is None:
-                continue
+            for layer_idx in range(num_layers):
+                kv_heads = num_kv_heads[layer_idx]
+                if kv_heads is None:
+                    continue
 
-            context_qs = [
-                torch.randn(sequence_length,
-                            num_heads * head_dim,
-                            dtype=dtype,
-                            device=device)
-                for sequence_length in context_sequence_lengths
+                context_qs = [
+                    torch.randn(sequence_length,
+                                num_heads * head_dim,
+                                dtype=dtype,
+                                device=device)
+                    for sequence_length in context_sequence_lengths
+                ]
+
+                context_ks = [
+                    torch.randn(sequence_length,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device)
+                    for sequence_length in context_sequence_lengths
+                ]
+                context_vs = [
+                    torch.randn(sequence_length,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device)
+                    for sequence_length in context_sequence_lengths
+                ]
+
+                contexts_per_layer.append((context_qs, context_ks, context_vs))
+
+                gen_qs = [
+                    torch.randn(1,
+                                num_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
+                ]
+
+                gen_ks = [
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
+                ]
+
+                gen_vs = [
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(num_gens)
+                ]
+
+                gens_per_layer.append((gen_qs, gen_ks, gen_vs))
+
+            layers = [
+                FlashInferAttention(
+                    layer_idx=layer_idx,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    num_kv_heads=kv_heads,
+                ) for layer_idx, kv_heads in enumerate(num_kv_heads)
+                if kv_heads is not None
             ]
 
-            context_ks = [
-                torch.randn(sequence_length,
-                            kv_heads * head_dim,
-                            dtype=dtype,
-                            device=device)
-                for sequence_length in context_sequence_lengths
+            # [context_1, context_2, gen_1, gen_2]
+            results_1 = []
+
+            seq_lens = torch.tensor(sequence_lengths).int()
+            attn_metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=len(context_sequence_lengths),
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
+                max_num_requests=4,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
+
+            attn_metadata.prepare()
+            for attn_layer_idx, flashinfer_attn in enumerate(layers):
+                context_qs, context_ks, context_vs = contexts_per_layer[
+                    attn_layer_idx]
+                gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
+
+                q = torch.cat((*context_qs, *gen_qs))
+                k = torch.cat((*context_ks, *gen_ks))
+                v = torch.cat((*context_vs, *gen_vs))
+
+                result_1 = flashinfer_attn.forward(q, k, v, attn_metadata)
+                self.assertEqual(result_1.size()[0],
+                                 sum(context_sequence_lengths) + num_gens)
+
+                # validate kv cache was updated expectedly
+                cache_buf = kv_cache_manager.get_buffers(
+                    flashinfer_attn.layer_idx,
+                    kv_layout=attn_metadata.kv_layout)
+                if attn_metadata.kv_layout == "HND":
+                    cache_buf = cache_buf.transpose(2, 3).contiguous()
+                assert cache_buf is not None
+                num_kv_heads = cache_buf.size(-2)
+
+                # validate contexts
+                block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(
+                    request_ids)
+                for seq_id in range(len(context_sequence_lengths)):
+                    # get a contiguous copy of the cache for the sequence
+                    block_ids = block_ids_per_seq[seq_id]
+                    last_block_len = attn_metadata.paged_kv_last_page_len[
+                        seq_id]
+                    cached_kvs = torch.concat(
+                        cache_buf[block_ids, :].unbind(dim=0), dim=1)
+                    # only look at new tokens added
+                    cached_kvs = cached_kvs[:, past_seen_tokens[seq_id]:
+                                            last_block_len]
+
+                    # compare to input kvs
+                    torch.testing.assert_close(
+                        cached_kvs[0].to(context_ks[seq_id].dtype),
+                        context_ks[seq_id].view(-1, num_kv_heads, head_dim))
+                    torch.testing.assert_close(
+                        cached_kvs[1].to(context_vs[seq_id].dtype),
+                        context_vs[seq_id].view(-1, num_kv_heads, head_dim))
+
+                # validate generations (same way)
+                for gen_seq_id in range(num_gens):
+                    seq_id = len(context_sequence_lengths) + gen_seq_id
+                    block_ids = block_ids_per_seq[seq_id]
+                    last_block_len = attn_metadata.paged_kv_last_page_len[
+                        seq_id]
+                    cached_kvs = torch.concat(
+                        cache_buf[block_ids, :].unbind(dim=0),
+                        dim=1)[:, past_seen_tokens[seq_id]:last_block_len]
+
+                    torch.testing.assert_close(
+                        cached_kvs[0],
+                        gen_ks[gen_seq_id].view(-1, num_kv_heads, head_dim))
+                    torch.testing.assert_close(
+                        cached_kvs[1],
+                        gen_vs[gen_seq_id].view(-1, num_kv_heads, head_dim))
+
+                results_1.append(result_1)
+                del cache_buf
+
+            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+                self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
+
+            # prepare() defers re-planning to forward_impl only when multiple
+            # wrappers share one workspace_buffer (hybrid attention); for the
+            # single-wrapper case it re-plans eagerly so cuda-graph capture works.
+            attn_metadata.prepare()
+            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+                self.assertEqual(wrappers.is_planned, not defer_plan)
+
+            # [context_1, gen_1]
+            results_2 = []
+            num_cached_tokens_per_seq = [
+                j for j in [
+                    past_seen_tokens[0], past_seen_tokens[len(
+                        context_sequence_lengths)]
+                ]
             ]
-            context_vs = [
-                torch.randn(sequence_length,
-                            kv_heads * head_dim,
-                            dtype=dtype,
-                            device=device)
-                for sequence_length in context_sequence_lengths
+
+            seq_lens = torch.tensor([context_sequence_lengths[0], 1],
+                                    dtype=torch.int)
+            attn_metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq),
+                max_num_requests=2,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=[0, 2],
+            )
+
+            attn_metadata.prepare()
+
+            for attn_layer_idx, flashinfer_attn in enumerate(layers):
+                context_qs, context_ks, context_vs = contexts_per_layer[
+                    attn_layer_idx]
+                gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
+
+                result_2 = flashinfer_attn.forward(
+                    torch.cat((context_qs[0], gen_qs[0])),
+                    torch.cat((context_ks[0], gen_ks[0])),
+                    torch.cat((context_vs[0], gen_vs[0])), attn_metadata)
+                self.assertEqual(result_2.size()[0],
+                                 context_sequence_lengths[0] + 1)
+                results_2.append(result_2)
+
+            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+                self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
+
+            # prepare() defers re-planning to forward_impl only when multiple
+            # wrappers share one workspace_buffer (hybrid attention); for the
+            # single-wrapper case it re-plans eagerly so cuda-graph capture works.
+            attn_metadata.prepare()
+            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+                self.assertEqual(wrappers.is_planned, not defer_plan)
+
+            # [context_2, gen_2]
+            results_3 = []
+            num_cached_tokens_per_seq = [
+                j for j in [
+                    past_seen_tokens[1], past_seen_tokens[
+                        len(context_sequence_lengths) + 1]
+                ]
             ]
 
-            contexts_per_layer.append((context_qs, context_ks, context_vs))
+            seq_lens = torch.tensor([context_sequence_lengths[1], 1],
+                                    dtype=torch.int)
+            attn_metadata = TestingFlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=1,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True,
+                    num_cached_tokens_per_seq=num_cached_tokens_per_seq),
+                max_num_requests=2,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=[1, 3],
+            )
 
-            gen_qs = [
-                torch.randn(1, num_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(num_gens)
-            ]
+            attn_metadata.prepare()
+            for attn_layer_idx, flashinfer_attn in enumerate(layers):
+                context_qs, context_ks, context_vs = contexts_per_layer[
+                    attn_layer_idx]
+                gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
 
-            gen_ks = [
-                torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(num_gens)
-            ]
+                result_3 = flashinfer_attn.forward(
+                    torch.cat((context_qs[1], gen_qs[1])),
+                    torch.cat((context_ks[1], gen_ks[1])),
+                    torch.cat((context_vs[1], gen_vs[1])), attn_metadata)
+                self.assertEqual(result_3.size()[0],
+                                 context_sequence_lengths[1] + 1)
+                results_3.append(result_3)
 
-            gen_vs = [
-                torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(num_gens)
-            ]
+            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+                self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-            gens_per_layer.append((gen_qs, gen_ks, gen_vs))
+            # prepare() defers re-planning to forward_impl only when multiple
+            # wrappers share one workspace_buffer (hybrid attention); for the
+            # single-wrapper case it re-plans eagerly so cuda-graph capture works.
+            attn_metadata.prepare()
+            defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+            for wrappers in attn_metadata._plan_params_to_wrappers.values():
+                self.assertEqual(wrappers.is_planned, not defer_plan)
 
-        layers = [
-            FlashInferAttention(
-                layer_idx=layer_idx,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                num_kv_heads=kv_heads,
-            ) for layer_idx, kv_heads in enumerate(num_kv_heads)
-            if kv_heads is not None
-        ]
+            # assert value
 
-        # [context_1, context_2, gen_1, gen_2]
-        results_1 = []
-
-        seq_lens = torch.tensor(sequence_lengths).int()
-        attn_metadata = TestingFlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=len(context_sequence_lengths),
-            kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
-            max_num_requests=4,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-        )
-
-        attn_metadata.prepare()
-        for attn_layer_idx, flashinfer_attn in enumerate(layers):
-            context_qs, context_ks, context_vs = contexts_per_layer[
-                attn_layer_idx]
-            gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
-
-            q = torch.cat((*context_qs, *gen_qs))
-            k = torch.cat((*context_ks, *gen_ks))
-            v = torch.cat((*context_vs, *gen_vs))
-
-            result_1 = flashinfer_attn.forward(q, k, v, attn_metadata)
-            self.assertEqual(result_1.size()[0],
-                             sum(context_sequence_lengths) + num_gens)
-
-            # validate kv cache was updated expectedly
-            cache_buf = kv_cache_manager.get_buffers(
-                flashinfer_attn.layer_idx, kv_layout=attn_metadata.kv_layout)
-            if attn_metadata.kv_layout == "HND":
-                cache_buf = cache_buf.transpose(2, 3).contiguous()
-            assert cache_buf is not None
-            num_kv_heads = cache_buf.size(-2)
-
-            # validate contexts
-            block_ids_per_seq = kv_cache_manager.get_batch_cache_indices(
-                request_ids)
-            for seq_id in range(len(context_sequence_lengths)):
-                # get a contiguous copy of the cache for the sequence
-                block_ids = block_ids_per_seq[seq_id]
-                last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
-                cached_kvs = torch.concat(cache_buf[block_ids, :].unbind(dim=0),
-                                          dim=1)
-                # only look at new tokens added
-                cached_kvs = cached_kvs[:,
-                                        past_seen_tokens[seq_id]:last_block_len]
-
-                # compare to input kvs
+            for result_1, result_2, result_3 in zip(results_1, results_2,
+                                                    results_3):
                 torch.testing.assert_close(
-                    cached_kvs[0].to(context_ks[seq_id].dtype),
-                    context_ks[seq_id].view(-1, num_kv_heads, head_dim))
-                torch.testing.assert_close(
-                    cached_kvs[1].to(context_vs[seq_id].dtype),
-                    context_vs[seq_id].view(-1, num_kv_heads, head_dim))
+                    torch.cat((
+                        result_1[:context_sequence_lengths[0] +
+                                 context_sequence_lengths[1], :],
+                        result_1[sum(context_sequence_lengths
+                                     ):sum(context_sequence_lengths) + 2],
+                    )),
+                    torch.cat((
+                        result_2[:context_sequence_lengths[0], :],
+                        result_3[:context_sequence_lengths[1], :],
+                        result_2[context_sequence_lengths[0]:, :],
+                        result_3[context_sequence_lengths[1]:, :],
+                    )))
 
-            # validate generations (same way)
-            for gen_seq_id in range(num_gens):
-                seq_id = len(context_sequence_lengths) + gen_seq_id
-                block_ids = block_ids_per_seq[seq_id]
-                last_block_len = attn_metadata.paged_kv_last_page_len[seq_id]
-                cached_kvs = torch.concat(
-                    cache_buf[block_ids, :].unbind(dim=0),
-                    dim=1)[:, past_seen_tokens[seq_id]:last_block_len]
-
-                torch.testing.assert_close(
-                    cached_kvs[0],
-                    gen_ks[gen_seq_id].view(-1, num_kv_heads, head_dim))
-                torch.testing.assert_close(
-                    cached_kvs[1],
-                    gen_vs[gen_seq_id].view(-1, num_kv_heads, head_dim))
-
-            results_1.append(result_1)
-            del cache_buf
-
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
-
-        # prepare() defers re-planning to forward_impl only when multiple
-        # wrappers share one workspace_buffer (hybrid attention); for the
-        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
-        attn_metadata.prepare()
-        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-        for wrappers in attn_metadata._plan_params_to_wrappers.values():
-            self.assertEqual(wrappers.is_planned, not defer_plan)
-
-        # [context_1, gen_1]
-        results_2 = []
-        num_cached_tokens_per_seq = [
-            j for j in [
-                past_seen_tokens[0], past_seen_tokens[len(
-                    context_sequence_lengths)]
-            ]
-        ]
-
-        seq_lens = torch.tensor([context_sequence_lengths[0], 1],
-                                dtype=torch.int)
-        attn_metadata = TestingFlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq),
-            max_num_requests=2,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=[0, 2],
-        )
-
-        attn_metadata.prepare()
-
-        for attn_layer_idx, flashinfer_attn in enumerate(layers):
-            context_qs, context_ks, context_vs = contexts_per_layer[
-                attn_layer_idx]
-            gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
-
-            result_2 = flashinfer_attn.forward(
-                torch.cat((context_qs[0], gen_qs[0])),
-                torch.cat((context_ks[0], gen_ks[0])),
-                torch.cat((context_vs[0], gen_vs[0])), attn_metadata)
-            self.assertEqual(result_2.size()[0],
-                             context_sequence_lengths[0] + 1)
-            results_2.append(result_2)
-
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
-
-        # prepare() defers re-planning to forward_impl only when multiple
-        # wrappers share one workspace_buffer (hybrid attention); for the
-        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
-        attn_metadata.prepare()
-        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-        for wrappers in attn_metadata._plan_params_to_wrappers.values():
-            self.assertEqual(wrappers.is_planned, not defer_plan)
-
-        # [context_2, gen_2]
-        results_3 = []
-        num_cached_tokens_per_seq = [
-            j for j in [
-                past_seen_tokens[1], past_seen_tokens[
-                    len(context_sequence_lengths) + 1]
-            ]
-        ]
-
-        seq_lens = torch.tensor([context_sequence_lengths[1], 1],
-                                dtype=torch.int)
-        attn_metadata = TestingFlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=num_cached_tokens_per_seq),
-            max_num_requests=2,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=[1, 3],
-        )
-
-        attn_metadata.prepare()
-        for attn_layer_idx, flashinfer_attn in enumerate(layers):
-            context_qs, context_ks, context_vs = contexts_per_layer[
-                attn_layer_idx]
-            gen_qs, gen_ks, gen_vs = gens_per_layer[attn_layer_idx]
-
-            result_3 = flashinfer_attn.forward(
-                torch.cat((context_qs[1], gen_qs[1])),
-                torch.cat((context_ks[1], gen_ks[1])),
-                torch.cat((context_vs[1], gen_vs[1])), attn_metadata)
-            self.assertEqual(result_3.size()[0],
-                             context_sequence_lengths[1] + 1)
-            results_3.append(result_3)
-
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
-
-        # prepare() defers re-planning to forward_impl only when multiple
-        # wrappers share one workspace_buffer (hybrid attention); for the
-        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
-        attn_metadata.prepare()
-        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
-        for wrappers in attn_metadata._plan_params_to_wrappers.values():
-            self.assertEqual(wrappers.is_planned, not defer_plan)
-
-        # assert value
-
-        for result_1, result_2, result_3 in zip(results_1, results_2,
-                                                results_3):
-            torch.testing.assert_close(
-                torch.cat((
-                    result_1[:context_sequence_lengths[0] +
-                             context_sequence_lengths[1], :],
-                    result_1[sum(context_sequence_lengths
-                                 ):sum(context_sequence_lengths) + 2],
-                )),
-                torch.cat((
-                    result_2[:context_sequence_lengths[0], :],
-                    result_3[:context_sequence_lengths[1], :],
-                    result_2[context_sequence_lengths[0]:, :],
-                    result_3[context_sequence_lengths[1]:, :],
-                )))
-
-        kv_cache_manager.shutdown()
+        finally:
+            kv_cache_manager.shutdown()
 
     @parameterized.expand([
         CUDAGraphTestScenario(
@@ -1019,113 +1030,121 @@ class TestFlashInferAttention(unittest.TestCase):
             mapping=mapping,
             dtype=kv_cache_dtype,
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
+        try:
+            kv_cache_manager.add_dummy_requests(request_ids, token_nums)
 
-        gen_qs = []
-        gen_ks = []
-        gen_vs = []
+            gen_qs = []
+            gen_ks = []
+            gen_vs = []
 
-        for i in range(num_layers):
-            gen_qs.append([
-                torch.randn(1, num_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(batch_size)
-            ])
+            for i in range(num_layers):
+                gen_qs.append([
+                    torch.randn(1,
+                                num_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
+                ])
 
-            kv_heads = num_kv_heads if isinstance(num_kv_heads,
-                                                  int) else num_kv_heads[i]
-            gen_ks.append([
-                torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(batch_size)
-            ])
+                kv_heads = num_kv_heads if isinstance(num_kv_heads,
+                                                      int) else num_kv_heads[i]
+                gen_ks.append([
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
+                ])
 
-            gen_vs.append([
-                torch.randn(1, kv_heads * head_dim, dtype=dtype, device=device)
-                for _ in range(batch_size)
-            ])
+                gen_vs.append([
+                    torch.randn(1,
+                                kv_heads * head_dim,
+                                dtype=dtype,
+                                device=device) for _ in range(batch_size)
+                ])
 
-        layers = []
-        for i in range(num_layers):
-            kv_heads = num_kv_heads if isinstance(num_kv_heads,
-                                                  int) else num_kv_heads[i]
-            layers.append(
-                FlashInferAttention(
-                    layer_idx=i,
-                    head_dim=head_dim,
-                    num_heads=num_heads,
-                    num_kv_heads=kv_heads,
-                ))
+            layers = []
+            for i in range(num_layers):
+                kv_heads = num_kv_heads if isinstance(num_kv_heads,
+                                                      int) else num_kv_heads[i]
+                layers.append(
+                    FlashInferAttention(
+                        layer_idx=i,
+                        head_dim=head_dim,
+                        num_heads=num_heads,
+                        num_kv_heads=kv_heads,
+                    ))
 
-        seq_lens = torch.ones((batch_size, ), dtype=torch.int)
-        attn_metadata_ref = TestingFlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=0,
-            kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
-            max_num_requests=batch_size,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-        )
+            seq_lens = torch.ones((batch_size, ), dtype=torch.int)
+            attn_metadata_ref = TestingFlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
 
-        attn_metadata_ref.kv_cache_manager = kv_cache_manager
+            attn_metadata_ref.kv_cache_manager = kv_cache_manager
 
-        workspace = torch.empty(1024 * 1024 * 128,
-                                dtype=torch.int,
-                                device='cuda')
-        attn_metadata_cuda_graph = TestingFlashInferAttentionMetadata(
-            seq_lens=seq_lens,
-            num_contexts=0,
-            is_cuda_graph=True,
-            kv_cache_params=KVCacheParams(
-                use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
-            workspace_buffer=workspace,
-            max_num_requests=batch_size,
-            max_num_tokens=8192,
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-        )
+            workspace = torch.empty(1024 * 1024 * 128,
+                                    dtype=torch.int,
+                                    device='cuda')
+            attn_metadata_cuda_graph = TestingFlashInferAttentionMetadata(
+                seq_lens=seq_lens,
+                num_contexts=0,
+                is_cuda_graph=True,
+                kv_cache_params=KVCacheParams(
+                    use_cache=True, num_cached_tokens_per_seq=past_seen_tokens),
+                workspace_buffer=workspace,
+                max_num_requests=batch_size,
+                max_num_tokens=8192,
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+            )
 
-        attn_metadata_ref.prepare()
-        attn_metadata_cuda_graph.prepare()
+            attn_metadata_ref.prepare()
+            attn_metadata_cuda_graph.prepare()
 
-        results_ref = []
+            results_ref = []
 
-        for i in range(num_layers):
-            q = torch.cat(gen_qs[i])
-            k = torch.cat(gen_ks[i])
-            v = torch.cat(gen_vs[i])
-            layer = layers[i]
-            results_ref.append(layer.forward(q, k, v, attn_metadata_ref))
+            for i in range(num_layers):
+                q = torch.cat(gen_qs[i])
+                k = torch.cat(gen_ks[i])
+                v = torch.cat(gen_vs[i])
+                layer = layers[i]
+                results_ref.append(layer.forward(q, k, v, attn_metadata_ref))
 
-        graph = torch.cuda.CUDAGraph()
-        for i in range(num_layers):
-            layer = layers[i]
-            q = torch.cat(gen_qs[i])
-            k = torch.cat(gen_ks[i])
-            v = torch.cat(gen_vs[i])
-            # Warmup run, required by PT
-            for _ in range(2):
-                layer.forward(q, k, v, attn_metadata_cuda_graph)
-
-        results_actual = []
-        with torch.cuda.graph(graph):
+            graph = torch.cuda.CUDAGraph()
             for i in range(num_layers):
                 layer = layers[i]
                 q = torch.cat(gen_qs[i])
                 k = torch.cat(gen_ks[i])
                 v = torch.cat(gen_vs[i])
-                results_actual.append(
-                    layer.forward(q, k, v, attn_metadata_cuda_graph))
+                # Warmup run, required by PT
+                for _ in range(2):
+                    layer.forward(q, k, v, attn_metadata_cuda_graph)
 
-        graph.replay()
+            results_actual = []
+            with torch.cuda.graph(graph):
+                for i in range(num_layers):
+                    layer = layers[i]
+                    q = torch.cat(gen_qs[i])
+                    k = torch.cat(gen_ks[i])
+                    v = torch.cat(gen_vs[i])
+                    results_actual.append(
+                        layer.forward(q, k, v, attn_metadata_cuda_graph))
 
-        for result_actual, result_ref in zip(results_actual, results_ref):
-            torch.testing.assert_close(result_actual,
-                                       result_ref,
-                                       atol=1e-2,
-                                       rtol=0)
+            graph.replay()
 
-        kv_cache_manager.shutdown()
+            for result_actual, result_ref in zip(results_actual, results_ref):
+                torch.testing.assert_close(result_actual,
+                                           result_ref,
+                                           atol=1e-2,
+                                           rtol=0)
+
+        finally:
+            kv_cache_manager.shutdown()
 
     def test_ragged_prefill_no_kv_cache_uses_cudnn_plan(self) -> None:
         """Ragged QKV with ``kv_cache_manager=None`` plans via cuDNN (``_plan_ragged_cudnn_no_kv``)."""

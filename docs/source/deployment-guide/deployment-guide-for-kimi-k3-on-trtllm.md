@@ -39,6 +39,7 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 * **CUDA graphs and the overlap scheduler are enabled.** The performance-sweep recipes set `disable_overlap_scheduler: false` and enable CUDA graphs. DEP16 additionally sets `cuda_graph_config.enable_padding: true`.
 * **Chunked prefill is supported and enabled** (`enable_chunked_prefill: true`), so prompts longer than `max_num_tokens` are scheduled across multiple steps.
 * **`kv_cache_config.tokens_per_block` is `64`** — retained as the validated configuration. Earlier releases needed this page size to avoid a legacy MLA fallback that did not support Kimi K3's 96 query heads.
+* **NVFP4 KV cache is supported** (`kv_cache_config.dtype: nvfp4`). The last two MLA layers stay in an FP8 KV cache by default (see `TLLM_KIMI_K3_FP8_KV_LAYERS` below), and KV cache block reuse with an NVFP4 KV cache requires `enable_chunked_prefill: true`.
 * **Disaggregated serving and suffix-automaton speculative decoding are available.** Disaggregated serving is validated end-to-end on GB300 with matched DEP16 context/generation servers; see `examples/kimi_k3/disagg/README.md`. Suffix-automaton speculation works for both aggregated and disaggregated serving. See the "Current limitations" section of `examples/kimi_k3/README.md` for constraints (e.g. only matched DEP16=DEP16 disagg geometry is validated at scale).
 
 ## Deployment Steps
@@ -48,11 +49,11 @@ The checkpoint and the configuration file must live on a shared filesystem visib
 Kimi K3 support currently requires TensorRT LLM built from source and installed in place. Inside the TensorRT LLM container, from the repository root:
 
 ```bash
-python3 scripts/build_wheel.py --cuda_architectures 103-real --skip_building_wheel --yes
+python3 scripts/build_wheel.py --cuda_architectures 103 --skip_building_wheel --yes
 .venv-3.12/bin/python -m pip install -e .
 ```
 
-`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103-real` for GB300, `100-real` for B200). A `103-real` build also runs on B200 (the Kimi K3 kernels compile for the `100f` family) but omits the `sm100a`-specific batched-GEMM kernels, so build with `100-real` when targeting B200. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
+`build_wheel.py` creates the virtual environment at the repository root, named after the container's Python version: `.venv-3.12` for the current containers (Python 3.12). If your container ships a different Python, substitute the matching `.venv-<major>.<minor>` path in the commands on this page. Adjust `--cuda_architectures` to the target GPUs (`103` for GB300, `100` for B200). You should always specify all exact GPU architectures you want to run on, and never rely on compatibility across architectures. Internally, TensorRT LLM will decide for each kernel whether compatibility can be utilized to reduce binary size. The multi-node jobs below run TensorRT LLM from this in-place environment, so build and install with the repository at the same path the jobs use.
 
 Kimi K3 additionally depends on `fla` and `einops`, installed into the same in-place environment (these dependencies might be removed in future releases, replaced by other kernels):
 
@@ -216,6 +217,7 @@ When the served model is Kimi K3, `trtllm-serve` applies Kimi/Moonshot API seman
 * **Streaming usage:** `usage` is reported in the final streaming chunk even when the client does not send `stream_options` (Kimi API parity).
 * **Prompt-token accounting:** reported `usage.prompt_tokens` excludes the trailing 3-token generation channel opener, matching Kimi's reference accounting; the model still consumes the full rendered prompt.
 * **`TRTLLM_KIMI_PARAM_POLICY`** (default `0`, off): when set to `1`, enforces Kimi's immutable sampling parameters — `top_p` pinned to 0.95 (unset or the OpenAI default `1.0` are coerced to 0.95; other values are rejected with HTTP 400), `presence_penalty`/`frequency_penalty` 0, `n` 1, and `temperature` bounded to [0, 1]. Off by default so existing deployments keep accepting the requests they accept today; a Kimi-Vendor-Verifier certification run must set it to `1` (the KVV params suite requires the rejections).
+* **`TLLM_KIMI_K3_FP8_KV_LAYERS`** (NVFP4 KV cache only): comma-separated zero-based global MLA layer IDs to keep in an FP8 KV cache instead of the default last two MLA layers; an empty value keeps every MLA layer in NVFP4. The previous `TLLM_KIMI_K3_BF16_KV_LAYERS` is deprecated: it is still honored as this list, with a warning, when `TLLM_KIMI_K3_FP8_KV_LAYERS` is unset.
 * **`TRTLLM_KIMI_K3_STRICT_TOOL_GRAMMAR`** (default `0`): opt-in constrained decoding for tools with `strict: true` (requires `guided_decoding_backend: xgrammar`). Disabled by default pending the investigation of a device-side assert observed under sustained concurrent guided load; strict tools otherwise fall back to warn-and-continue.
 
 ## Testing API Endpoint
@@ -283,7 +285,7 @@ sbatch --account <account> --partition batch --qos <qos> --time 04:00:00 \
 
 The batch script declares `--nodes=4 --ntasks-per-node=4 --gpus-per-node=4`, and takes `--account`, `--partition` and `--qos` from the submitting command line. Export `KIMI_K3_ROUTER_BF16=0` before submitting: with attention-DP off the MoE router gate defaults to its BF16 fast path, which can flip borderline expert picks, so the reference scores above are only comparable with that path disabled. The reference scores used BF16 shared/latent MLP projections, which remain the default (`KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=0`). Set `KIMI_K3_FP8_WEIGHT_READ_MOE_MLP=1` to opt into lossy FP8 conversion of those projections. Attention projection datatypes follow the checkpoint quantization configuration.
 
-Measured on 16 GB200 GPUs (4 nodes, `100-real` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
+Measured on 16 GB200 GPUs (4 nodes, `100` build, 184.31 GiB per GPU), with the checkpoint's native MXFP4 routed experts:
 
 | Filter | Exact match |
 | :-- | --: |

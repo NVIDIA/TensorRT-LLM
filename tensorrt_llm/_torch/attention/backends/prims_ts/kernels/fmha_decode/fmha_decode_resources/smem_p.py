@@ -43,7 +43,6 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from ..fmha_decode_config import FmhaDecodeConfig
 from ..fmha_decode_constants import (
-    FP8_P_QUANT_LOG2_SCALE,
     INT32_SCORE_BIAS,
 )
 from ...placeholder_helpers import _placeholder_smem_array
@@ -83,20 +82,14 @@ from .helpers_softmax import (
     _pack_float4_to_fp8_e4m3,
     _pack_float4_to_fp8_e4m3_inline,
 )
-from .sage_scales import SageKScalesResource
+from .sage_scales import load_sage_k_fragment, sage_k_view
 from .tmem_s import TmemSResource
 
-# Tunable: number of score pairs per streamed fragment whose exponentials run
-# as FMA polynomials instead of MUFU. The MUFU issue rate bounds the fragment
-# otherwise, while the FMA pipe is nearly idle in the softmax warps. Larger
-# shares grow the fragment body and the softmax warps become instruction-fetch
-# bound again, so one quarter of the 16 pairs is the measured optimum.
-KV_TILE_256_EX2_EMULATED_PAIRS = 4
 
-
-def _pair_uses_ex2_emulation(pair_idx: int, pairs_per_fragment: int) -> bool:
-    """Spread the emulated pairs evenly across a fragment's score pairs."""
-    count = KV_TILE_256_EX2_EMULATED_PAIRS
+def _pair_uses_ex2_emulation(
+    pair_idx: int, pairs_per_fragment: int, count: int
+) -> bool:
+    """Spread ``count`` emulated pairs evenly across a fragment's score pairs."""
     pairs = pairs_per_fragment
     return ((pair_idx + 1) * count) // pairs != (pair_idx * count) // pairs
 
@@ -144,10 +137,7 @@ class SmemPResource(DecodeGenResourceBase):
     use_variable_seqlens_kv: Constexpr[bool] = False
     tmem_s_ref: Constexpr[TmemSResource] = None
     tmem_o_ref: Constexpr[object] = None
-    # The instance's ``sfK`` resources, shared with the S resource; proxy
-    # routes read ``sage_summary_k_scales``, everything else ``sage_k_scales``.
-    sage_k_scales: SageKScalesResource | None = None
-    sage_summary_k_scales: SageKScalesResource | None = None
+    # The instance's ``sfK`` words, shared with the S resource.
     _alloc: Constexpr[SmemAllocation | None] = None
     _fragment_ready_alloc: Constexpr[SmemAllocation | None] = None
     _tmem_alloc: Constexpr[TmemAllocation | None] = None
@@ -336,7 +326,8 @@ class SmemPResource(DecodeGenResourceBase):
           maximum) anchors on zero so its scores exponentiate to zero, not NaN.
           Callers whose masked rows are skipped or discarded downstream pass
           ``guards_masked_rows=False``.
-        - Byte-wide P adds ``log2(448)``, its static FP8 quantization scale.
+        - Byte-wide P adds the log2 of its quantization scale
+          (``fp8_p_quant_scale``).
         - A proxy route adds ``log2`` of its block mass, as the max pass does,
           so each summary probability carries the tokens it stands for.
         """
@@ -348,7 +339,7 @@ class SmemPResource(DecodeGenResourceBase):
         # Not ``cute.math.fma``: the fused form makes ptxas spill in the callers.
         addend = Float32(-self.scale_softmax_log2 * safe_new_max)
         if cutlass.const_expr(self.cfg.use_fp8_pv):
-            addend += Float32(FP8_P_QUANT_LOG2_SCALE)
+            addend += Float32(cfg.fp8_p_quant_log2_scale)
         if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
             if route_is_proxy:
                 addend += Float32(cfg.proxy_log2_block_mass)
@@ -377,18 +368,20 @@ class SmemPResource(DecodeGenResourceBase):
         *,
         new_max_arr: cutlass.Array,
         sage_q_scale: Float32,
-        sage_scale_arr: cutlass.Array,
-        sage_summary_scale_arr: cutlass.Array,
+        sage_k_stage_bytes: Int32,
     ) -> None:
-        """Stream every K32 fragment with per-group Sage dequantization scales."""
+        """Stream every K32 fragment with per-group Sage dequantization scales.
+
+        ``sage_k_stage_bytes`` is the waited ``sfK`` ring stage, routed from
+        ``SageKScalesResource.open_stage``.
+        """
         assert self.cfg.use_sage_attention
         self._compute_p_fragments_impl(
             stage_info,
             new_max_arr=new_max_arr,
             route_is_proxy=cutlass.Boolean(False),
             sage_q_scale=sage_q_scale,
-            sage_scale_arr=sage_scale_arr,
-            sage_summary_scale_arr=sage_summary_scale_arr,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @producer_work
@@ -417,8 +410,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_flags: Int32,
         sage_q_scale: Float32,
-        sage_scale_arr: cutlass.Array,
-        sage_summary_scale_arr: cutlass.Array,
+        sage_k_stage_bytes: Int32,
     ) -> None:
         """Stream exact or proxy K32 fragments with per-group Sage scales."""
         assert self.cfg.use_block_sparse_proxy_routes and self.cfg.use_sage_attention
@@ -427,8 +419,7 @@ class SmemPResource(DecodeGenResourceBase):
             new_max_arr=new_max_arr,
             route_is_proxy=_route_is_proxy(route_flags),
             sage_q_scale=sage_q_scale,
-            sage_scale_arr=sage_scale_arr,
-            sage_summary_scale_arr=sage_summary_scale_arr,
+            sage_k_stage_bytes=sage_k_stage_bytes,
         )
 
     @cute.jit
@@ -439,8 +430,7 @@ class SmemPResource(DecodeGenResourceBase):
         new_max_arr: cutlass.Array,
         route_is_proxy: cutlass.Boolean,
         sage_q_scale: Float32 | None = None,
-        sage_scale_arr: cutlass.Array | None = None,
-        sage_summary_scale_arr: cutlass.Array | None = None,
+        sage_k_stage_bytes: Int32 | None = None,
     ) -> None:
         """Reload, exponentiate, and publish all K32 fragments in a rolled loop.
 
@@ -467,52 +457,45 @@ class SmemPResource(DecodeGenResourceBase):
         tidx, _, _ = cute.arch.thread_idx()
         publishes_fragment = (tidx & Int32(31)) == Int32(0)
 
-        # ``c * sfQ`` is one factor per lane and tile: the only multiplier of a
-        # route kind whose max pass returns dequantized scores (no bias),
-        # otherwise folded into the kind's raw ``sfK`` words.
-        exact_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
-            proxy=False
-        )
-        summary_dequantized: Constexpr[bool] = cfg.sage_scores_dequantized_for(
-            proxy=True
-        )
-        exact_scales_in_smem: Constexpr[bool] = cfg.sage_k_scales_in_smem_for(
-            cfg.sage_k_groups_per_fragment
-        )
-        # A mixed geometry selects the resource per fragment on the CTA-uniform
-        # route kind, unless proxy scores are dequantized and the exact words
-        # sit in registers: the exact resource then serves both kinds, routing
-        # ones on a proxy tile.
-        unified_scales: Constexpr[bool] = (
-            cfg.sage_mixed_k_geometry
-            and summary_dequantized
-            and not exact_scales_in_smem
-        )
-        mixed_scales: Constexpr[bool] = cfg.sage_mixed_k_geometry and not unified_scales
-        exp_scale = None
-        scales_view = None
-        summary_view = None
+        # Every score scales by ``c * sfQ * sfK_g``. A geometry whose max pass
+        # returns dequantized scores (one scale per score) scales by
+        # ``c * sfQ`` alone and carries no bias; any other loads the tile's
+        # words in place, a fragment ahead like the scores.
+        dequantized: Constexpr[bool] = cfg.sage_scores_dequantized()
+        uses_words: Constexpr[bool] = cfg.use_sage_attention and not dequantized
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
+        # A mixed plan's proxy tile comes back from the max pass dequantized
+        # (``FmhaDecodeConfig.sage_scores_dequantized``), so its multipliers
+        # are ``c * sfQ`` alone, with no INT32 bias, in place of the exact
+        # words.
+        replaces_proxy_words: Constexpr[bool] = uses_words and cfg.sage_mixed_k_geometry
         score_bias = None
+        exp_scale = None
+        words_view = None
         row_multipliers = None
         row_addends = None
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
-            if cutlass.const_expr(exact_dequantized or summary_dequantized):
+            if cutlass.const_expr(uses_words):
+                words_view = sage_k_view(
+                    cfg,
+                    stage_info.context,
+                    sage_k_stage_bytes,
+                    Int32(
+                        _decode_gen_task_cache(stage_info)[
+                            _TASK_CACHE_WARP_GRP_THREAD_IDX
+                        ]
+                    ),
+                    exp_scale,
+                )
+            else:
                 row_multipliers = cutlass.Array(
                     Float32, 1, space=cutlass.AddressSpace.rmem
                 )
                 row_addends = cutlass.Array(Float32, 1, space=cutlass.AddressSpace.rmem)
                 row_multipliers[0] = exp_scale
                 row_addends[0] = exponent_addend
-            if cutlass.const_expr(not exact_dequantized):
-                scales_view = self.sage_k_scales.open(
-                    stage_info, sage_scale_arr, exp_scale
-                )
-            if cutlass.const_expr(mixed_scales and not summary_dequantized):
-                summary_view = self.sage_summary_k_scales.open(
-                    stage_info, sage_summary_scale_arr, exp_scale
-                )
-            if cutlass.const_expr(unified_scales and cfg.uses_int32_scores):
+            if cutlass.const_expr(replaces_proxy_words and cfg.uses_int32_scores):
                 score_bias = Float32(INT32_SCORE_BIAS)
                 if route_is_proxy:
                     score_bias = Float32(0.0)
@@ -520,7 +503,9 @@ class SmemPResource(DecodeGenResourceBase):
         # A fragment is scaled before its first exponential, and the next
         # fragment's TMEM load issues once the scale FFMAs have consumed the
         # scores, so it reuses their registers and hides behind the
-        # exponentials. The running sum stays a packed pair until the loop ends.
+        # exponentials. The next fragment's ``sfK`` words load at the same
+        # point, so an SMEM read never waits in front of the scale FFMAs. The
+        # running sum stays a packed pair until the loop ends.
         num_fragments = cfg.num_softmax_score_fragments
         last_fragment = Int32(num_fragments - 1)
         total_sum_pair = (Float32(0.0), Float32(0.0))
@@ -528,64 +513,44 @@ class SmemPResource(DecodeGenResourceBase):
         pending_scores = cutlass.Array(
             Float32, fragment_regs, space=cutlass.AddressSpace.rmem
         )
+        pending_words = None
+        if cutlass.const_expr(uses_words):
+            pending_words = cutlass.Array(
+                Float32, groups, space=cutlass.AddressSpace.rmem
+            )
+            self._take_fragment_words(words_view, Int32(0), pending_words)
         self._load_score_fragment(tmem_base, Int32(0), pending_scores)
         for fragment_idx in cutlass.range(cfg.num_softmax_score_fragments, unroll=1):
             fragment = Int32(fragment_idx)
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             for score_idx in cutlass.range_constexpr(fragment_regs):
                 s_arr[score_idx] = pending_scores[score_idx]
-
-            if cutlass.const_expr(mixed_scales):
-                # Each route kind scales the fragment in place with its own
-                # resource, so only the scores cross the branch.
-                if route_is_proxy:
-                    if cutlass.const_expr(summary_dequantized):
-                        self._scale_fragment_pairs(
-                            s_arr, row_addends, row_multipliers, groups=1
-                        )
-                    else:
-                        self._scale_fragment_with(
-                            self.sage_summary_k_scales,
-                            summary_view,
-                            fragment,
-                            s_arr,
-                            exponent_addend,
-                        )
-                else:
-                    if cutlass.const_expr(exact_dequantized):
-                        self._scale_fragment_pairs(
-                            s_arr, row_addends, row_multipliers, groups=1
-                        )
-                    else:
-                        self._scale_fragment_with(
-                            self.sage_k_scales,
-                            scales_view,
-                            fragment,
-                            s_arr,
-                            exponent_addend,
-                        )
-            elif cutlass.const_expr(exact_dequantized):
+            if cutlass.const_expr(dequantized):
                 self._scale_fragment_pairs(
                     s_arr, row_addends, row_multipliers, groups=1
                 )
             else:
-                fragment_multipliers = None
-                if cutlass.const_expr(cfg.use_sage_attention):
-                    fragment_multipliers = self.sage_k_scales.fragment(
-                        scales_view, fragment
+                if cutlass.const_expr(replaces_proxy_words):
+                    # The per-group select on the warp-uniform route kind
+                    # works on a copy: one loop body serves both kinds
+                    # because a loop per kind spills the softmax warps'
+                    # registers, and ``pending_words`` stays read-only as
+                    # the loop-carried prefetch array.
+                    words = cutlass.Array(
+                        Float32, groups, space=cutlass.AddressSpace.rmem
                     )
-                    self.sage_k_scales.advance(scales_view)
+                    for group_idx in cutlass.range_constexpr(groups):
+                        words[group_idx] = pending_words[group_idx]
+                    if route_is_proxy:
+                        for group_idx in cutlass.range_constexpr(groups):
+                            words[group_idx] = exp_scale
+                else:
+                    words = pending_words
                 group_multipliers, group_addends = self._fragment_exponent_terms(
-                    fragment_multipliers,
-                    exponent_addend,
-                    groups=cfg.sage_k_groups_per_fragment,
-                    score_bias=score_bias,
+                    words, exponent_addend, groups=groups, score_bias=score_bias
                 )
                 self._scale_fragment_pairs(
-                    s_arr,
-                    group_addends,
-                    group_multipliers,
-                    groups=cfg.sage_k_groups_per_fragment,
+                    s_arr, group_addends, group_multipliers, groups=groups
                 )
             # The last iteration reloads its own fragment so the loop body
             # stays branch-free; the wait after the loop retires it.
@@ -593,6 +558,8 @@ class SmemPResource(DecodeGenResourceBase):
             if next_fragment > last_fragment:
                 next_fragment = last_fragment
             self._load_score_fragment(tmem_base, next_fragment, pending_scores)
+            if cutlass.const_expr(uses_words):
+                self._take_fragment_words(words_view, next_fragment, pending_words)
             local_sum_pair = self._exponentiate_fragment_pairs(s_arr)
             total_sum_pair = cute.arch.add_packed_f32x2(total_sum_pair, local_sum_pair)
 
@@ -635,24 +602,21 @@ class SmemPResource(DecodeGenResourceBase):
         self.tmem_s_ref.store_p_local_sum(0, total_sum)
 
     @cute.jit
-    def _scale_fragment_with(
+    def _take_fragment_words(
         self,
-        scales: Constexpr[SageKScalesResource],
-        view,
+        words_view,
         fragment: Int32,
-        s_arr: cutlass.Array,
-        exponent_addend: Float32,
+        words: cutlass.Array,
     ) -> None:
-        """Turn one fragment's scores into log2 exponents with one route kind's resource."""
-        groups = scales.groups
-        fragment_multipliers = scales.fragment(view, fragment)
-        scales.advance(view)
-        group_multipliers, group_addends = self._fragment_exponent_terms(
-            fragment_multipliers, exponent_addend, groups=groups
-        )
-        self._scale_fragment_pairs(
-            s_arr, group_addends, group_multipliers, groups=groups
-        )
+        """Copy one fragment's ``c * sfQ * sfK_g`` words into ``words``.
+
+        A constant-indexed register copy, so the in-place loads can issue a
+        fragment ahead of the FFMAs that read them.
+        """
+        fragment_words = load_sage_k_fragment(self.cfg, words_view, fragment)
+        groups: Constexpr[int] = self.cfg.sage_k_groups_per_fragment()
+        for group_idx in cutlass.range_constexpr(groups):
+            words[group_idx] = fragment_words[group_idx]
 
     @cute.jit
     def _load_score_fragment(
@@ -716,7 +680,7 @@ class SmemPResource(DecodeGenResourceBase):
         The multipliers are the resource's ``c * sfQ * sfK_g`` under Sage, else
         the softmax scale. Biased INT32 scores subtract ``bias * multiplier``
         from the row's addend; ``score_bias`` replaces the constant bias when
-        given (zero on a tile whose scores come back dequantized).
+        given (zero on a tile whose scores came back dequantized).
         """
         cfg = self.cfg
         neg_bias = Float32(-INT32_SCORE_BIAS)
@@ -779,7 +743,9 @@ class SmemPResource(DecodeGenResourceBase):
             p0 = Float32(s_arr[value_idx])
             p1 = Float32(s_arr[value_idx + 1])
             if cutlass.const_expr(
-                _pair_uses_ex2_emulation(pair_idx, pairs_per_fragment)
+                _pair_uses_ex2_emulation(
+                    pair_idx, pairs_per_fragment, self.cfg.ex2_emulated_pairs
+                )
             ):
                 p0, p1 = _ex2_emulation_packed_f32x2(p0, p1)
             else:

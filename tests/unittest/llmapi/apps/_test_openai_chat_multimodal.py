@@ -138,6 +138,41 @@ def test_single_chat_session_image(client: openai.OpenAI, model_name: str):
         == chat_completion.choices[0].message.content
 
 
+@pytest.mark.parametrize("typed", [True, False], ids=["message", "untyped"])
+def test_responses_image_input(client: openai.OpenAI, model_name: str,
+                               typed: bool):
+    """An input_image sent to /v1/responses has to reach the model.
+
+    The text is the same with and without the image, so an image that never
+    reaches the model leaves the input token count of a text-only request.
+    """
+    image_url = str(llm_models_root() / "multimodals" / "test_data" /
+                    "seashore.png")
+    question = {
+        "type": "input_text",
+        "text": "Describe the natural environment in the image."
+    }
+    image = {"type": "input_image", "image_url": image_url, "detail": "auto"}
+
+    def user_item(*parts):
+        item = {"role": "user", "content": list(parts)}
+        if typed:
+            item["type"] = "message"
+        return item
+
+    with_image = client.responses.create(model=model_name,
+                                         input=[user_item(question, image)],
+                                         max_output_tokens=16,
+                                         temperature=0.0)
+    text_only = client.responses.create(model=model_name,
+                                        input=[user_item(question)],
+                                        max_output_tokens=16,
+                                        temperature=0.0)
+
+    assert with_image.output_text
+    assert with_image.usage.input_tokens > text_only.usage.input_tokens
+
+
 # used by mm_encoder_server
 @pytest.fixture(scope="module")
 def extra_encoder_options() -> bool:

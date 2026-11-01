@@ -10,10 +10,11 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
 from tensorrt_llm._torch.disaggregation.native.bounce import NoBounceTransport
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.retirement import RetirementWatchdog
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 
@@ -21,23 +22,25 @@ pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize("reason", ["cancelled", "failed", "shutdown", "peer lost"])
-def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_first_drain_trigger_cannot_be_extended(reason: str, grace_s: float | None) -> None:
     """Repeated notifications do not reset the physical grace period."""
     clock, notify = Mock(return_value=10.0), Mock()
     watchdog = RetirementWatchdog(notify, clock=clock)
-    owner = watchdog.create_owner(4, "receive", 5.0)
+    owner = watchdog.create_owner(4, "receive", 5.0, grace_s=grace_s)
+    deadline = 10.0 + (5.0 if grace_s is None else grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain(reason)
-    clock.return_value = 14.0
+    clock.return_value = deadline - 1.0
     owner.request_drain("another failure")
     watchdog.progress()
     assert watchdog.fatal is None
-    clock.return_value = 15.0
+    clock.return_value = deadline
     watchdog.progress()
     event = watchdog.fatal
     assert event is not None
-    assert (event.started_at, event.deadline, event.reason) == (10.0, 15.0, reason)
+    assert (event.started_at, event.deadline, event.reason) == (10.0, deadline, reason)
     assert not owner.settle(claim)
     assert not owner.can_retire()
     assert not owner.close()
@@ -45,16 +48,19 @@ def test_first_drain_trigger_cannot_be_extended(reason: str) -> None:
     notify.assert_called_once_with(event)
 
 
-@pytest.mark.parametrize("settle_at,retirable", [(14.999, True), (15.0, False), (15.001, False)])
-def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable: bool) -> None:
+@pytest.mark.parametrize("offset,retirable", [(-0.001, True), (0.0, False), (0.001, False)])
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+def test_settlement_and_deadline_share_one_boundary(
+    offset: float, retirable: bool, grace_s: float | None
+) -> None:
     """Evidence arriving exactly at expiry cannot authorize memory reuse."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
     owner.request_drain("failed")
-    clock.return_value = settle_at
+    clock.return_value = 10.0 + (5.0 if grace_s is None else grace_s) + offset
     assert owner.settle(claim) is retirable
     assert owner.close() is retirable
     clock.return_value = 100.0
@@ -62,21 +68,29 @@ def test_settlement_and_deadline_share_one_boundary(settle_at: float, retirable:
     assert (watchdog.fatal is None) is retirable
 
 
-def test_request_timeout_starts_grace_without_executor_polling() -> None:
+@pytest.mark.parametrize("grace_s", [None, 2.0, 8.0])
+@pytest.mark.parametrize("pieces_complete", [False, True])
+def test_request_timeout_starts_grace_without_executor_polling(
+    grace_s: float | None, pieces_complete: bool
+) -> None:
     """A stalled backend gets a request timeout followed by exactly one grace window."""
     clock = Mock(return_value=10.0)
     watchdog = RetirementWatchdog(Mock(), clock=clock)
-    owner = watchdog.create_owner(4, "send", 5.0)
+    owner = watchdog.create_owner(4, "send", 5.0, grace_s=grace_s)
     claim = object()
     assert owner.expose(claim)
-    clock.return_value = 19.0
+    if pieces_complete:
+        owner.complete_pieces()
+    deadline = 15.0 + (5.0 if grace_s is None else grace_s)
+    clock.return_value = deadline - 1.0
     watchdog.progress()
     assert watchdog.fatal is None
     assert not owner.expose(object())
-    clock.return_value = 20.0
+    clock.return_value = deadline
     watchdog.progress()
     assert watchdog.fatal is not None
     assert watchdog.fatal.started_at == 15.0
+    assert watchdog.fatal.deadline == deadline
     assert watchdog.fatal.reason == "transfer timeout"
 
 
@@ -116,10 +130,63 @@ def test_unpublished_cancellation_is_retirable_without_fatal() -> None:
     watchdog.stop()
 
 
+def test_unclosed_owner_query_observes_owner_lifecycle_without_progress() -> None:
+    """Observation neither retires an owner nor changes clocks or admission."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+
+    def assert_unclosed(expected: bool) -> None:
+        """Check the snapshot without progressing or stopping the watchdog."""
+        clock.reset_mock()
+        assert watchdog.has_unclosed_owners is expected
+        clock.assert_not_called()
+        notify.assert_not_called()
+        assert not watchdog._stopped.is_set()
+        assert not watchdog.shutdown_requested
+
+    assert_unclosed(False)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    assert_unclosed(True)
+    claim = object()
+    assert owner.expose(claim)
+    assert_unclosed(True)
+    assert owner._claims == {id(claim): claim}
+    assert owner.settle(claim)
+    assert_unclosed(True)
+    assert watchdog.fatal is None
+    assert owner.can_retire()
+    with pytest.raises(RuntimeError, match="retained owners"):
+        watchdog.stop()
+    with pytest.raises(RuntimeError, match="teardown refused"):
+        watchdog.require_retired()
+    assert_unclosed(True)
+    assert watchdog._owners == {owner}
+    assert owner.close()
+    assert_unclosed(False)
+    watchdog.require_retired()
+    watchdog.stop()
+
+
+def test_shutdown_request_closes_admission_without_fatal() -> None:
+    """Requested shutdown blocks new work independently of fatal expiry."""
+    watchdog = RetirementWatchdog(Mock(), clock=Mock(return_value=10.0))
+    owner = watchdog.create_owner(4, "receive", 5.0)
+    assert not watchdog.shutdown_requested
+    watchdog.request_shutdown()
+    assert watchdog.shutdown_requested
+    assert watchdog.fatal is None
+    assert not owner.expose(object())
+    with pytest.raises(RuntimeError, match="admission is closed"):
+        watchdog.create_owner(5, "send", 5.0)
+    assert owner.close()
+    watchdog.stop()
+    assert watchdog.shutdown_requested
+
+
 def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     """One fatal owner closes the worker, not merely its own next operation."""
-    clock = Mock(return_value=10.0)
-    watchdog = RetirementWatchdog(Mock(), clock=clock)
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
     sender = watchdog.create_owner(4, "send", 5.0)
     receiver = watchdog.create_owner(5, "receive", 5.0)
     source, destination = object(), object()
@@ -128,6 +195,15 @@ def test_fatal_closes_all_admission_and_keeps_sibling_roots() -> None:
     sender.request_drain("failed")
     clock.return_value = 15.0
     watchdog.progress()
+    clock.reset_mock()
+    assert watchdog.has_unclosed_owners
+    assert watchdog.fatal is not None
+    assert not watchdog.shutdown_requested
+    clock.assert_not_called()
+    notify.assert_called_once_with(watchdog.fatal)
+    assert not watchdog._stopped.is_set()
+    assert sender._claims == {id(source): source}
+    assert receiver._claims == {id(destination): destination}
     assert not receiver.settle(destination)
     assert not receiver.expose(object())
     with pytest.raises(RuntimeError, match="admission is closed"):
@@ -151,6 +227,165 @@ def test_callback_failure_is_once_only_and_cannot_erase_fatal() -> None:
     notify.assert_called_once()
     assert watchdog.fatal is not None
     assert not owner.settle(claim)
+
+
+@pytest.mark.parametrize("first_poll", [15.0, 20.0, 21.0])
+def test_timeout_callback_failure_preserves_physical_deadline(first_poll: float) -> None:
+    """Logical notification failure cannot postpone or suppress physical expiry."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    timeout = Mock(side_effect=RuntimeError("logical notification failed"))
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = first_poll
+    watchdog.progress()
+    if first_poll < 20.0:
+        assert watchdog.fatal is None
+        assert not owner.expose(object())
+        clock.return_value = 20.0
+        watchdog.progress()
+    event = watchdog.fatal
+    assert event is not None
+    assert (event.started_at, event.deadline, event.expired_at) == (
+        15.0,
+        20.0,
+        max(first_poll, 20.0),
+    )
+    watchdog.progress()
+    timeout.assert_called_once_with()
+    notify.assert_called_once_with(event)
+    assert not owner.settle(claim)
+    assert owner._claims == {id(claim): claim}
+
+
+def test_timeout_callback_failure_keeps_watchdog_running() -> None:
+    """Containment still runs without caller-side checks after a callback raises."""
+    clock = Mock(return_value=10.0)
+    timed_out, notified = threading.Event(), threading.Event()
+    notify = Mock(side_effect=lambda _event: notified.set())
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+
+    def fail_timeout() -> None:
+        """Signal callback entry before exercising the failure boundary."""
+        timed_out.set()
+        raise RuntimeError("logical notification failed")
+
+    timeout = Mock(side_effect=fail_timeout)
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = 15.0
+    watchdog.start()
+    try:
+        assert timed_out.wait(1)
+        with watchdog.lock:
+            assert watchdog.fatal is None
+            clock.return_value = 20.0
+        watchdog.wake.set()
+        assert notified.wait(1)
+        event = watchdog.fatal
+        assert event is not None
+        assert (event.started_at, event.deadline) == (15.0, 20.0)
+        timeout.assert_called_once_with()
+        notify.assert_called_once_with(event)
+        assert owner._claims == {id(claim): claim}
+    finally:
+        # Test-only thread cleanup; no physical claim is released by containment.
+        watchdog._stopped.set()
+        watchdog.wake.set()
+        watchdog._thread.join(timeout=1)
+    assert not watchdog._thread.is_alive()
+
+
+@pytest.mark.parametrize("scan", ["progress", "request_shutdown"])
+def test_timeout_callback_can_close_owner_during_scan(scan: str) -> None:
+    """Removing a settled owner cannot interrupt checks of other tracked owners."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    sibling = watchdog.create_owner(5, "receive", 5.0)
+    claim, sibling_claim = object(), object()
+    assert owner.expose(claim)
+    assert owner.settle(claim)
+    assert sibling.expose(sibling_claim)
+    timeout = Mock(side_effect=owner.close)
+    owner.bind_timeout_outcome(timeout)
+    clock.return_value = 15.0
+    getattr(watchdog, scan)()
+    timeout.assert_called_once_with()
+    assert owner._closed
+    assert watchdog._owners == {sibling}
+    assert watchdog.fatal is None
+    clock.return_value = 20.0
+    watchdog.progress()
+    assert watchdog.fatal is not None
+    assert watchdog.fatal.request_id == 5
+    assert sibling._claims == {id(sibling_claim): sibling_claim}
+    notify.assert_called_once_with(watchdog.fatal)
+
+
+@pytest.mark.parametrize("scan", ["progress", "request_shutdown"])
+def test_timeout_callback_owner_registration_obeys_shutdown(scan: str) -> None:
+    """Reentrant registration is tracked normally but rejected during shutdown."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    claim = object()
+    assert owner.expose(claim)
+    assert owner.settle(claim)
+    register = Mock(side_effect=lambda: watchdog.create_owner(5, "receive", 5.0))
+    owner.bind_timeout_outcome(register)
+    clock.return_value = 15.0
+    getattr(watchdog, scan)()
+    register.assert_called_once_with()
+    assert owner.close()
+    if scan == "request_shutdown":
+        assert not watchdog._owners
+        assert watchdog.shutdown_requested
+        watchdog.stop()
+        notify.assert_not_called()
+    else:
+        (created,) = watchdog._owners
+        assert created.request_id == 5
+        assert created.expose(claim)
+        clock.return_value = 25.0
+        watchdog.progress()
+        assert watchdog.fatal is not None
+        assert watchdog.fatal.request_id == 5
+        assert created._claims == {id(claim): claim}
+        notify.assert_called_once_with(watchdog.fatal)
+
+
+def test_timeout_callback_reentry_preserves_first_fatal_event() -> None:
+    """The outer expiry check cannot overwrite a fatal decision from reentry."""
+    clock, notify = Mock(return_value=10.0), Mock()
+    watchdog = RetirementWatchdog(notify, clock=clock)
+    owner = watchdog.create_owner(4, "send", 5.0)
+    sibling = watchdog.create_owner(5, "receive", 5.0)
+    claim, sibling_claim = object(), object()
+    assert owner.expose(claim)
+    assert sibling.expose(sibling_claim)
+    first_events = []
+
+    def check_sibling() -> None:
+        """Commit the sibling's fatal event before the outer check resumes."""
+        sibling.check()
+        first_events.append(watchdog.fatal)
+
+    owner.bind_timeout_outcome(check_sibling)
+    clock.return_value = 20.0
+    owner.check()
+    assert len(first_events) == 1
+    assert watchdog.fatal is first_events[0]
+    assert watchdog.fatal.request_id == 5
+    watchdog.progress()
+    watchdog.progress()
+    notify.assert_called_once_with(first_events[0])
+    assert owner._claims == {id(claim): claim}
+    assert sibling._claims == {id(sibling_claim): sibling_claim}
 
 
 def test_watchdog_notifies_outside_arbiter_lock() -> None:
@@ -302,12 +537,18 @@ def test_repeated_done_is_idempotent_after_another_owner_becomes_fatal() -> None
     assert not task.resources_drained
 
 
-@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), float("nan")])
-def test_invalid_deadline_is_rejected_before_admission(timeout: float) -> None:
+@pytest.mark.parametrize("timeout", [0.0, -1.0, float("inf"), -float("inf"), float("nan")])
+@pytest.mark.parametrize("invalid_grace", [False, True])
+def test_invalid_deadline_is_rejected_before_admission(timeout: float, invalid_grace: bool) -> None:
     """Unbounded and non-positive settings cannot activate deadline enforcement."""
     watchdog = RetirementWatchdog(Mock())
     with pytest.raises(ValueError, match="finite positive"):
-        watchdog.create_owner(4, "send", timeout)
+        watchdog.create_owner(
+            4,
+            "send",
+            5.0 if invalid_grace else timeout,
+            grace_s=timeout if invalid_grace else 5.0,
+        )
     assert not watchdog._owners
 
 

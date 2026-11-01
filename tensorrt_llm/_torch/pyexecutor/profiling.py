@@ -63,6 +63,10 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+# The iteration log refreshes kv_cache_util (a full KV cache stats build) once
+# per this many iterations and reuses the last value in between.
+ITER_LOG_KV_UTIL_REFRESH_ITERS = 16
+
 
 @functools.cache
 def load_iteration_indexes(env_var: str):
@@ -611,6 +615,9 @@ class PyExecutorProfileManager:
         # Cumulative fetch counter as of the previous iter log line; the
         # per-iteration ``num_fetched`` on the log line is the delta.
         prev_fetch_requests_cur_rank = 0
+        # Last kv_cache_util printed and the iteration it was computed at.
+        kv_util_str = "N/A"
+        kv_util_iter = None
 
         env_torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         if env_torch_trace_path is not None:
@@ -663,6 +670,7 @@ class PyExecutorProfileManager:
             nonlocal it, enabled, start_time
             nonlocal start_event_1, end_event_1, start_event_2, end_event_2
             nonlocal prev_device_step_time, prev_fetch_requests_cur_rank
+            nonlocal kv_util_str, kv_util_iter
             nonlocal torch_profiler, active_torch_trace_path
             nonlocal active_enable_torch_trace
             calibrator.post_step(it)
@@ -740,8 +748,11 @@ class PyExecutorProfileManager:
                         prev_device_step_time_str = "N/A"  # first iteration
                     else:
                         prev_device_step_time_str = f"{prev_device_step_time}ms"
-                    kv_util_str = "N/A"
-                    if executor.kv_cache_manager is not None:
+                    if executor.kv_cache_manager is not None and (
+                        kv_util_iter is None or it - kv_util_iter >= ITER_LOG_KV_UTIL_REFRESH_ITERS
+                    ):
+                        kv_util_iter = it
+                        kv_util_str = "N/A"
                         kv_stats = executor.kv_cache_manager.get_kv_cache_stats()
                         if kv_stats.max_num_blocks > 0:
                             kv_util_str = (

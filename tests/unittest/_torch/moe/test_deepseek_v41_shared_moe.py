@@ -34,6 +34,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import DeepseekV4MoE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import AuxStreamType
 from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 from tensorrt_llm.mapping import Mapping
@@ -243,41 +244,43 @@ def _run_shared_moe(ep_size: int, attention_dp: bool) -> None:
                 (expected_gate[:, shard_start:shard_end], expected_up[:, shard_start:shard_end]),
                 dim=-1,
             )
-            # Saturation hides wrong positive FC1 shards from the final output.
-            torch.testing.assert_close(
-                moe.shared_experts.gate_up_proj(x),
-                expected_local_gate_up,
-                rtol=1e-2,
-                atol=0.1,
-            )
-            actual_shared = moe.shared_experts(x)
-            if moe.shared_output_scale is not None:
-                actual_shared *= moe.shared_output_scale
-            if moe.allreduce is not None:
-                actual_shared = moe.allreduce(actual_shared)
-            torch.testing.assert_close(actual_shared, expected_shared, rtol=1e-2, atol=0.1)
-
-            actual_routed = moe.compute_routed_output(
-                x, None, None, all_rank_num_tokens, do_finalize=True
-            )
-            if moe.allreduce is not None:
-                actual_routed = moe.allreduce(actual_routed)
-            reference_routed.check_accuracy(actual_routed, expected_routed)
-
-            actual = moe(x, all_rank_num_tokens=all_rank_num_tokens)
-            torch.cuda.synchronize()
-            assert actual.shape == x.shape
-            assert torch.isfinite(actual).all()
-            expected = expected_routed + expected_shared
-            reference_routed.check_accuracy(actual, expected)
-            if attention_dp:
-                # Send rank 0's prefix to the last rank to check row-order sensitivity.
-                misordered = torch.cat(mpi_comm().allgather(actual.cpu())).roll(
-                    sum(counts[:-1]), dims=0
+            # Standalone outputs remain live through reference and accuracy checks.
+            with nccl_window_tensor_scope(x):
+                # Saturation hides wrong positive FC1 shards from the final output.
+                torch.testing.assert_close(
+                    moe.shared_experts.gate_up_proj(x),
+                    expected_local_gate_up,
+                    rtol=1e-2,
+                    atol=0.1,
                 )
-                misordered = misordered[start : start + counts[rank]].to(actual.device)
-                with pytest.raises(Exception, match="Mismatch percentage"):
-                    reference_routed.check_accuracy(misordered, expected)
+                actual_shared = moe.shared_experts(x)
+                if moe.shared_output_scale is not None:
+                    actual_shared *= moe.shared_output_scale
+                if moe.allreduce is not None:
+                    actual_shared = moe.allreduce(actual_shared)
+                torch.testing.assert_close(actual_shared, expected_shared, rtol=1e-2, atol=0.1)
+
+                actual_routed = moe.compute_routed_output(
+                    x, None, None, all_rank_num_tokens, do_finalize=True
+                )
+                if moe.allreduce is not None:
+                    actual_routed = moe.allreduce(actual_routed)
+                reference_routed.check_accuracy(actual_routed, expected_routed)
+
+                actual = moe(x, all_rank_num_tokens=all_rank_num_tokens)
+                torch.cuda.synchronize()
+                assert actual.shape == x.shape
+                assert torch.isfinite(actual).all()
+                expected = expected_routed + expected_shared
+                reference_routed.check_accuracy(actual, expected)
+                if attention_dp:
+                    # Send rank 0's prefix to the last rank to check row-order sensitivity.
+                    misordered = torch.cat(mpi_comm().allgather(actual.cpu())).roll(
+                        sum(counts[:-1]), dims=0
+                    )
+                    misordered = misordered[start : start + counts[rank]].to(actual.device)
+                    with pytest.raises(Exception, match="Mismatch percentage"):
+                        reference_routed.check_accuracy(misordered, expected)
 
 
 @skip_pre_blackwell

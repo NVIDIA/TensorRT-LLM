@@ -53,6 +53,7 @@ as the reference script, so a lane is configured purely through the YAML's
 """
 
 import argparse
+import http.client
 import json
 import os
 import subprocess
@@ -68,6 +69,11 @@ DEFAULT_AIPERF_REF = (
     "git+https://github.com/SemiAnalysisAI/agentx-harness.git"
     "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 )
+
+# aiperf's idle-connection keep-alive, in seconds. Must stay below the server's
+# own keep-alive timeout: trtllm-serve's is 5 s (TIMEOUT_KEEP_ALIVE in
+# tensorrt_llm/serve/openai_server.py).
+AIPERF_HTTP_KEEPALIVE_TIMEOUT_S = 4
 
 # aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
 # carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
@@ -218,8 +224,29 @@ def aiperf_is_usable() -> bool:
     return result.returncode == 0
 
 
-def post_one_token(url: str, model: str, timeout: float) -> "str | None":
-    """POST a 1-token non-streaming completion. Returns the body, or None on failure."""
+def _http_error_text(error: urllib.error.HTTPError) -> str:
+    """Describe an HTTP error as ``HTTP <code>: <first 2 KB of its body>`` and close it.
+
+    A body that cannot be read still yields a description, so the best-effort
+    callers never see an exception from here.
+    """
+    with error:
+        try:
+            body = error.read(2048).decode(errors="replace")
+        except (OSError, ValueError, http.client.HTTPException) as read_error:
+            body = f"<unreadable body: {read_error!r}>"
+    return f"HTTP {error.code}: {body}"
+
+
+def post_one_token(
+    url: str, model: str, timeout: float, *, fail_on_client_error: bool = False
+) -> "str | None":
+    """POST one token and return the response body.
+
+    An HTTP error comes back as ``HTTP <code>: <body>`` so callers can report the
+    server's reason. With ``fail_on_client_error``, a permanent 4xx (anything but
+    408/429) raises instead. Transport failures return None.
+    """
     payload = json.dumps(
         {
             "model": model,
@@ -237,6 +264,13 @@ def post_one_token(url: str, model: str, timeout: float) -> "str | None":
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as error:
+        reason = _http_error_text(error)
+        if fail_on_client_error and 400 <= error.code < 500 and error.code not in (408, 429):
+            raise RuntimeError(
+                f"{req.full_url} rejected the 1-token readiness request: {reason}"
+            ) from error
+        return reason
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
@@ -297,30 +331,37 @@ def ensure_aiperf(url: str, model: str) -> None:
         )
 
 
+def _is_completion(response: "str | None") -> bool:
+    """Whether a post_one_token result is a chat completion, not an error description."""
+    try:
+        payload = json.loads(response or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and "choices" in payload
+
+
 def verify_endpoint(url: str, model: str) -> None:
     """Prove the endpoint serves one real token before spending GPU-hours.
 
-    The harness has already waited for the disagg server, so this is a short
-    confirmation rather than the reference script's 5400 s poll. It exists
-    because a broken ctx->gen KV path answers /health perfectly well and only
-    fails once real traffic arrives -- an hour later, as a client-side error.
+    A healthy process may still reject inference requests or fail to generate.
+    This check applies to both aggregated and disaggregated servers. Permanent
+    request errors fail immediately with the response body; transient failures
+    retain the readiness retry budget.
     """
     timeout = _env_int("AGENTX_READY_TIMEOUT", 900)
     interval = _env_int("AGENTX_READY_INTERVAL", 15)
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        last = post_one_token(url, model, timeout=300)
-        if last and '"choices"' in last:
-            _log("1-token completion OK -- the disagg path is live")
+        last = post_one_token(url, model, timeout=300, fail_on_client_error=True)
+        if _is_completion(last):
+            _log("1-token completion OK -- the inference endpoint is ready")
             return
         _log(f"not serving yet (response head: {str(last)[:200]})")
         time.sleep(interval)
     raise RuntimeError(
-        f"{url} could not complete ONE token within {timeout}s. This is a "
-        f"SERVER-side failure: inspect the ctx/gen worker logs and the disagg "
-        f"server log, not the client. Suspect the ctx->gen KV transfer "
-        f"(on GB300/NVL72 check UCX_TLS contains no 'rc'). "
+        f"{url} could not complete ONE token within {timeout}s. "
+        f"Inspect the inference server logs and readiness request failures. "
         f"Last response: {str(last)[:500]}"
     )
 
@@ -601,6 +642,12 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     # Custom tokenizers (e.g. deepseek_v4) are loaded in aiperf's worker
     # processes, which do not inherit a CLI trust flag.
     os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+    # trtllm-serve closes a connection that has been idle for its keep-alive
+    # timeout (5 s). aiperf keeps idle pooled connections for 300 s, so it can
+    # write a request into a connection the server is closing at that moment,
+    # which fails as ClientOSError "Connection reset by peer". Dropping idle
+    # connections on the client side first avoids that.
+    os.environ.setdefault("AIPERF_HTTP_KEEPALIVE_TIMEOUT", str(AIPERF_HTTP_KEEPALIVE_TIMEOUT_S))
 
     ensure_aiperf(url, args.model)
     verify_endpoint(url, args.model)

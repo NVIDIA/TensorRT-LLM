@@ -19,19 +19,22 @@ and indexer state, pool-key updates, and sparse attention kernels. Selection arr
 as global latent-cache row IDs in GlmKpoolBackendForwardArgs.topk_rows.
 
 Queries have no rotary component and are absorbed into the 512-wide latent
-space. Small TP generation batches use native TRTLLM-GEN query heads; other
-shapes use FlashMLA. FP8 cache rows are gathered and dequantized
-in bounded query chunks. Prepared GLM page tables and live TRTLLM lengths
-provide the same cache contract for prefill, decode and verification.
+space. TRTLLM-GEN serves supported FP8 cache shapes and small BF16 TP generation
+batches. Other shapes use FlashMLA, gathering and dequantizing FP8 cache rows
+in bounded query chunks when needed. Prepared GLM page tables and live TRTLLM
+lengths provide the same cache contract for prefill, decode and verification.
 """
 
 from __future__ import annotations
 
+import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
 
 from ...interface import (
     AttentionForwardArgs,
@@ -41,7 +44,14 @@ from ...interface import (
     merge_attention_forward_args,
 )
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
-from .kernels import gather_fp8_kv_rows, kpool_expand, kpool_score, kpool_update
+from .kernels import (
+    append_paged_state_rows,
+    gather_fp8_kv_rows,
+    kpool_expand,
+    kpool_score,
+    kpool_score_fp8,
+    kpool_update,
+)
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
 from .params import INDEX_SENTINEL, GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
@@ -130,6 +140,64 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     # At the published 2112-entry selection this uses 132 MiB of BF16 rows.
     _FP8_QUERY_CHUNK_SIZE = 64
 
+    # FP32 elements one packed-context scoring call may hold: logits, their row
+    # copy and gathered pool keys grow with the visible pools, which a fresh-prompt
+    # profiling forward does not reach. plan_context_scores tiles calls to this
+    # bound and runtime_workspace_fixed_bytes reserves it in KV-cache sizing.
+    _CONTEXT_SCORE_ELEMENTS = 1 << 26
+
+    @staticmethod
+    def _context_score_cost(
+        rows: int, tables: int, pools: int, *, fp8: bool, head_dim: int, capacity_pools: int
+    ) -> int:
+        """FP32 elements a scoring call of ``rows`` rows over ``tables`` tables holds at once.
+
+        Counts the buffers that grow with the visible ``pools``: the BF16 scorer's
+        capacity-wide output, or every buffer :func:`kpool_score_fp8` keeps alive
+        together -- the padded logits, a multi-table call's gather temporary and
+        aligned row copy, and per gathered key its BF16 row, FP8 row, scale and
+        int64 slot index.
+        """
+        if not fp8 or pools == 0:
+            return rows * capacity_pools
+        # fp8_mqa_logits pads each row to a multiple of 256 columns, plus 256.
+        logits = -(-tables * pools // 256) * 256 + 256
+        copy = max(1024, -(-pools // 64) * 64) + pools if tables > 1 else 0
+        keys = tables * pools * (head_dim // 2 + head_dim // 4 + 3)
+        # int64 pool positions, pages and offsets.
+        return rows * (logits + copy) + keys + 6 * pools
+
+    @classmethod
+    def runtime_workspace_fixed_bytes(
+        cls,
+        model_config,
+        mapping,
+        *,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        enable_cuda_graph: bool,
+    ) -> int:
+        """Bytes of the largest scoring call plan_context_scores can emit for these capacities."""
+        if max_num_tokens <= 0 or max_seq_len <= 0:
+            return 0
+        config = unwrap_glm5_next_text_config(model_config.pretrained_config)
+        defaults = GlmKpoolSparseParams()
+        kpool = getattr(config, "index_kpool", defaults.index_kpool)
+        head_dim = getattr(config, "index_head_dim", defaults.index_head_dim)
+        pools = -(-max_seq_len // kpool)
+        tables = max(1, min(max_batch_size, max_num_tokens))
+
+        def cost(rows: int, tables: int, fp8: bool) -> int:
+            return cls._context_score_cost(
+                rows, tables, pools, fp8=fp8, head_dim=head_dim, capacity_pools=pools
+            )
+
+        largest = max(cost(max_num_tokens, tables, True), cost(max_num_tokens, 1, False))
+        # Calls fit the budget, except that a single row is never split.
+        bound = max(cls._CONTEXT_SCORE_ELEMENTS, cost(1, 1, True), cost(1, 1, False))
+        return min(largest, bound) * 4
+
     def __init__(
         self,
         layer_idx: int,
@@ -199,6 +267,14 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         #: score scale is unchanged.
         self.softmax_scale = float(self.qk_nope_head_dim) ** -0.5
         self._native_decode = GlmKpoolNativeDecode()
+        #: ``softmax_scale * kv_scale_quant_orig`` for the native FP8 kernel, read to
+        #: the host once outside CUDA graph capture (the KV scale is fixed after
+        #: construction). A float lets the kernel take it as an argument, without a
+        #: per-call device multiply.
+        self._native_bmm1_scale: float | None = None
+        #: Packed context rows score pools in FP8 with DeepGEMM MQA logits on SM100-family
+        #: GPUs; TRTLLM_GLM_INDEXER_BF16=1 keeps the BF16 Triton scorer for them.
+        self._indexer_fp8 = is_sm_100f() and os.environ.get("TRTLLM_GLM_INDEXER_BF16", "0") != "1"
 
     @classmethod
     def support_fused_rope(cls) -> bool:
@@ -283,15 +359,24 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         and uses the generation slice of the prepared block tables.
         """
         state = self._cache_state(metadata)
-        if request_ids is not None:
-            # Packed context rows of several requests: row i's page comes from
-            # block table request_ids[i] (no [tokens, max_pages] gather).
-            page_idx = torch.div(positions, state.tokens_per_block, rounding_mode="floor")
-            offset = positions - page_idx * state.tokens_per_block
-            page = state.block_tables[request_ids.long(), page_idx]
-        else:
-            table = state.block_tables[state.num_contexts :]
-            page, offset = paged_slot_indices(table, positions, state.tokens_per_block)
+        if request_ids is None:
+            # Generation rows: one launch computes the slots and writes both pools.
+            append_paged_state_rows(
+                latent,
+                packed,
+                positions,
+                state.block_tables[state.num_contexts :],
+                state.latent_pool,
+                state.index_pool,
+                state.tokens_per_block,
+                self.kv_scale_orig_quant,
+            )
+            return
+        # Packed context rows of several requests: row i's page comes from
+        # block table request_ids[i] (no [tokens, max_pages] gather).
+        page_idx = torch.div(positions, state.tokens_per_block, rounding_mode="floor")
+        offset = positions - page_idx * state.tokens_per_block
+        page = state.block_tables[request_ids.long(), page_idx]
         if state.latent_pool.dtype == torch.float8_e4m3fn:
             quantized = (latent.float() * self.kv_scale_orig_quant).clamp(-448, 448)
             # PyTorch advanced indexing does not implement FP8 payloads. Index
@@ -309,19 +394,17 @@ class GlmKpoolSparseAttention(TrtllmAttention):
     def _rows(
         self,
         state: _GlmKpoolCacheState,
-        rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Select generation tables, or all tables for packed context request IDs.
+        """Select generation tables, or all tables for per-row request IDs.
 
-        Verification repeats generation tables per token; callers supply each
-        query's visible length for verification and packed context rows.
+        Rows with request_ids (packed context, or verification rows given their
+        tables' batch rows) index all tables and supply each query's visible
+        length; single-token decode rows use the generation tables and live lengths.
         """
         if request_ids is not None:
             return state.block_tables, None
         gen = slice(state.num_contexts, None)
-        if rows_per_request > 1:
-            return state.block_tables[gen].repeat_interleave(rows_per_request, dim=0), None
         return state.block_tables[gen], state.kv_lens[gen]
 
     def update_pool_keys(
@@ -335,7 +418,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         """Refresh the pool containing each position using compression APE.
 
         positions is [rows]; ape is [kpool, head_dim]. Generation has one position per
-        request. For packed context, request_ids maps each row to a request and only
+        request, or [requests, T] consecutive draft positions (applied as T ordered
+        updates). For packed context, request_ids maps each row to a request and only
         pool-final positions are supplied, avoiding concurrent writes to one pool.
         """
         state = self._cache_state(metadata)
@@ -351,6 +435,63 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             request_ids=request_ids,
         )
 
+    def plan_context_scores(
+        self, metadata, spans: Sequence[tuple[int, int]]
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Split packed context scoring into calls within ``_CONTEXT_SCORE_ELEMENTS``.
+
+        spans lists ``(rows, visible bound)`` of each context request in packed
+        order. Each returned ``(row_start, row_end, table_start, table_end,
+        max_kv_len)`` scores rows ``row_start:row_end`` against context tables
+        ``table_start:table_end``. Consecutive requests share a call while it
+        fits; a request that does not fit alone is split by rows. Costs count
+        only the transients that grow with the visible pools.
+        """
+        state = self._cache_state(metadata)
+        kpool = self.sparse_params.index_kpool
+        budget = self._CONTEXT_SCORE_ELEMENTS
+        # The BF16 scorer writes every pool column of the configured capacity.
+        capacity_pools = -(-state.block_tables.shape[1] * state.tokens_per_block // kpool)
+
+        def cost(rows: int, tables: int, pools: int) -> int:
+            return self._context_score_cost(
+                rows,
+                tables,
+                pools,
+                fp8=self._indexer_fp8,
+                head_dim=self.sparse_params.index_head_dim,
+                capacity_pools=capacity_pools,
+            )
+
+        calls: list[tuple[int, int, int, int, int]] = []
+        group: list[int] | None = None  # [row_start, rows, table_start, tables, max visible]
+        row_start = 0
+        for table, (rows, visible) in enumerate(spans):
+            if group is not None:
+                merged = max(group[4], visible)
+                if cost(group[1] + rows, group[3] + 1, merged // kpool) <= budget:
+                    group[1] += rows
+                    group[3] += 1
+                    group[4] = merged
+                    row_start += rows
+                    continue
+                calls.append(
+                    (group[0], group[0] + group[1], group[2], group[2] + group[3], group[4])
+                )
+                group = None
+            if cost(rows, 1, visible // kpool) <= budget:
+                group = [row_start, rows, table, 1, visible]
+            else:
+                fixed = cost(0, 1, visible // kpool)
+                tile = max(1, (budget - fixed) // max(1, cost(1, 1, visible // kpool) - fixed))
+                for start in range(row_start, row_start + rows, tile):
+                    end = min(start + tile, row_start + rows)
+                    calls.append((start, end, table, table + 1, visible))
+            row_start += rows
+        if group is not None:
+            calls.append((group[0], group[0] + group[1], group[2], group[2] + group[3], group[4]))
+        return calls
+
     def score_pools(
         self,
         q: torch.Tensor,
@@ -363,21 +504,47 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
         max_kv_len: int | None = None,
+        table_range: tuple[int, int] | None = None,
     ) -> torch.Tensor:
         """Score complete pools into FP32 [rows, pool_capacity].
 
-        q is [rows, heads, head_dim], weights is [rows, heads]. Packed context uses
-        request_ids; verification repeats generation tables rows_per_request times.
-        Both supply per-query kv_lens. Single-token decode uses live metadata lengths.
+        q is [rows, heads, head_dim], weights is [rows, heads]. Packed context and
+        verification (rows_per_request rows per request) use request_ids and
+        per-query kv_lens. Single-token decode uses live metadata lengths.
         Incomplete/invisible pools receive the FP32 minimum before top-k. Eager
         callers that know a host bound on the visible lengths pass max_kv_len so
         only reachable pools are scored; columns past it are left unwritten and
-        the top-k must scan only each row's complete pools.
+        the top-k must scan only each row's complete pools. Packed context rows
+        with such a bound use the FP8 scorer on SM100-family GPUs, whose result
+        may be a strided view. table_range, from :meth:`plan_context_scores`,
+        names the context tables those rows' request_ids fall in.
         """
+        if rows_per_request > 1 and request_ids is None:
+            raise ValueError("glm_kpool verification rows need request_ids")
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
+        tables, gen_lens = self._rows(state, request_ids)
         capacity = state.block_tables.shape[1] * state.tokens_per_block
         kpool = self.sparse_params.index_kpool
+        packed_context = request_ids is not None and rows_per_request == 1
+        if self._indexer_fp8 and packed_context and max_kv_len is not None:
+            # Packed context rows only reference the context requests' tables.
+            first, last = (0, state.num_contexts) if table_range is None else table_range
+            scores = kpool_score_fp8(
+                q,
+                weights,
+                state.index_pool,
+                tables[first:last],
+                kv_lens,
+                state.tokens_per_block,
+                head_dim=self.sparse_params.index_head_dim,
+                kpool=kpool,
+                q_scale=q_scale,
+                w_scale=w_scale,
+                request_ids=request_ids - first if first else request_ids,
+                max_kv_len=max_kv_len,
+            )
+            if scores is not None:
+                return scores
         return kpool_score(
             q,
             weights,
@@ -394,9 +561,10 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             # dot is an fp32 accumulation of exact products, like tf32 on the
             # widened operands (measured: identical selections).
             precision="bf16",
-            # Context rows: the query tokens of a request share its block
-            # table, so a program gathers each pool-key block once for 16 rows.
-            rows_per_program=1 if request_ids is None else 16,
+            # Packed context rows share their request's block table, so a program
+            # gathers each pool-key block once for 16 rows. Verification batches
+            # are small; one row per program keeps more programs in flight.
+            rows_per_program=16 if request_ids is not None and rows_per_request == 1 else 1,
             request_ids=request_ids,
             max_kv_len=max_kv_len,
         )
@@ -407,7 +575,6 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         metadata,
         *,
         kv_lens: torch.Tensor | None = None,
-        rows_per_request: int = 1,
         request_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Selected pools ``[N, select_k]`` -> latent row ids for the kernel.
@@ -418,7 +585,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         row addressing as :meth:`score_pools`.
         """
         state = self._cache_state(metadata)
-        tables, gen_lens = self._rows(state, rows_per_request, request_ids=request_ids)
+        tables, gen_lens = self._rows(state, request_ids)
         _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
         return kpool_expand(
             selected,
@@ -612,24 +779,47 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         kv_rows, _, _ = latent_pool_rows(state.latent_pool)
         num_query_tokens, num_query_heads, head_dim = q.shape
         num_cache_rows = kv_rows.shape[0]
+        native_fp8 = kv_rows.dtype == torch.float8_e4m3fn and num_query_heads in (16, 32, 64)
         native_supported = (
             q.is_cuda
-            and q.dtype == kv_rows.dtype == torch.bfloat16
-            and (num_query_heads, head_dim) == (16, 512)
+            and q.dtype == torch.bfloat16
+            and (native_fp8 or (kv_rows.dtype == torch.bfloat16 and num_query_heads == 16))
+            and head_dim == 512
             and num_cache_rows % 32 == 0
             and get_sm_version() in (100, 103)
         )
         if native_supported:
-            # Reserve shared scratch and per-layer counters during prefill/profiling,
-            # even though only small generation batches use the native kernel.
+            # Reserve shared scratch and per-layer counters during prefill/profiling.
             # Deferring this allocation to decode would miss it in KV-cache sizing.
-            self._native_decode.prepare_workspace(q, metadata)
+            self._native_decode.prepare_workspace(
+                q,
+                metadata,
+                max_query_rows=max(metadata.max_num_tokens, num_query_tokens) if native_fp8 else 8,
+                query_dtype=kv_rows.dtype,
+            )
         if (
             native_supported
-            and input_type == AttentionInputType.generation_only
-            and 1 <= num_query_tokens <= 8
+            and num_query_tokens > 0
+            and (
+                native_fp8
+                or (input_type == AttentionInputType.generation_only and num_query_tokens <= 8)
+            )
         ):
-            out = self._native_decode(q, kv_rows, topk_rows, self.softmax_scale, metadata)
+            if (
+                native_fp8
+                and self._native_bmm1_scale is None
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                self._native_bmm1_scale = float(self.kv_scale_quant_orig) * self.softmax_scale
+            out = self._native_decode(
+                q,
+                kv_rows,
+                topk_rows,
+                self.softmax_scale,
+                metadata,
+                kv_scale=self.kv_scale_quant_orig if native_fp8 else 1.0,
+                bmm1_scale=self._native_bmm1_scale if native_fp8 else None,
+            )
         else:
             out = self._dispatch_sparse_core(q, kv_rows, topk_rows)
         return self._finalize_output(out, output)

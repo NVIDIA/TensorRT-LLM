@@ -16,11 +16,13 @@
 
 The package root resolves the module-layer classes on attribute access
 (PEP 562). These checks pin the contract: every exported name is the
-defining submodule's own object, plain submodule access still works, a
-missing dependency inside a submodule surfaces as ``ModuleNotFoundError``,
+defining submodule's own object, submodules resolve only through the import
+system (unknown names, dotted ones included, raise ``AttributeError`` without
+importing anything), a missing dependency inside a submodule surfaces as ``ModuleNotFoundError``, an
+``AttributeError`` inside one surfaces as ``ImportError`` with its cause,
 importing the package root or its ``backends`` sub-package loads no
 module-layer module, and ``rotary_embedding`` (which the backends import
-back) works as the first import of a process. The import-order checks run in
+back) works as the first import of a process and loads none of the backends. The import-order checks run in
 a fresh interpreter, because the pytest process has long since imported most
 of the package.
 """
@@ -54,6 +56,8 @@ MODULE_LAYER = [
     f"{PKG}.qk_norm_attention",
     f"{PKG}.rotary_embedding",
 ]
+
+BACKENDS = f"{PKG}.backends"
 
 _SENTINEL = "CLOSURE-OK"
 
@@ -90,10 +94,10 @@ def test_all_and_dir_list_exports(pkg):
 
 
 @pytest.mark.parametrize("submodule", ["backends", "kernels", "rotary_embedding", "attention"])
-def test_submodule_attribute_access(pkg, submodule):
-    module = getattr(pkg, submodule)
+def test_imported_submodule_is_attribute(pkg, submodule):
+    module = importlib.import_module(f"{PKG}.{submodule}")
     assert isinstance(module, types.ModuleType)
-    assert module.__name__ == f"{PKG}.{submodule}"
+    assert getattr(pkg, submodule) is module
 
 
 def test_from_import_submodule():
@@ -103,6 +107,35 @@ def test_from_import_submodule():
     assert mla.__name__ == f"{PKG}.mla"
 
 
+def test_unexported_name_raises_attribute_error_without_import():
+    """Names outside the export table, unimported submodules included, never reach the import system."""
+    names = ["mla", "backends", ".models", ".", "..", "", "backends.trtllm"]
+    _run_fresh(f"""
+        import sys
+        import tensorrt_llm._torch
+        preloaded = sorted(m for m in ("{PKG}.mla", "{BACKENDS}") if m in sys.modules)
+        assert not preloaded, f"already imported by tensorrt_llm._torch: {{preloaded}}"
+        import {PKG} as pkg
+        failures = {{}}
+        for name in {names!r}:
+            before = set(sys.modules)
+            try:
+                getattr(pkg, name)
+            except AttributeError:
+                pass
+            else:
+                failures[name] = "getattr returned a value"
+                continue
+            if hasattr(pkg, name):
+                failures[name] = "hasattr is True"
+                continue
+            added = sorted(set(sys.modules) - before)
+            if added:
+                failures[name] = f"imported {{added}}"
+        assert not failures, failures
+    """)
+
+
 def test_unknown_name_raises_attribute_error(pkg):
     with pytest.raises(AttributeError) as excinfo:
         pkg.NoSuchAttentionName  # noqa: B018
@@ -110,8 +143,7 @@ def test_unknown_name_raises_attribute_error(pkg):
     assert not hasattr(pkg, "NoSuchAttentionName")
 
 
-@pytest.mark.parametrize("name", ["MLA", "mla"])
-def test_missing_dependency_inside_submodule_propagates(pkg, monkeypatch, name):
+def test_missing_dependency_inside_submodule_propagates(pkg, monkeypatch):
     """A dependency missing inside an existing submodule must not turn into AttributeError."""
     real_import_module = importlib.import_module
 
@@ -120,23 +152,65 @@ def test_missing_dependency_inside_submodule_propagates(pkg, monkeypatch, name):
             raise ModuleNotFoundError("No module named 'some_missing_dep'", name="some_missing_dep")
         return real_import_module(target, package)
 
-    monkeypatch.delitem(pkg.__dict__, name, raising=False)
+    monkeypatch.delitem(pkg.__dict__, "MLA", raising=False)
     monkeypatch.setattr(pkg.importlib, "import_module", fake_import_module)
     with pytest.raises(ModuleNotFoundError) as excinfo:
-        getattr(pkg, name)
+        getattr(pkg, "MLA")
     assert excinfo.value.name == "some_missing_dep"
 
 
+@pytest.mark.parametrize(
+    "access",
+    [
+        lambda pkg: getattr(pkg, "MLA"),
+        lambda pkg: hasattr(pkg, "MLA"),
+        lambda pkg: getattr(pkg, "MLA", None),
+        lambda pkg: exec(f"from {PKG} import MLA", {}),
+    ],
+    ids=["getattr", "hasattr", "getattr_default", "from_import"],
+)
+def test_attribute_error_inside_submodule_surfaces_as_import_error(pkg, monkeypatch, access):
+    """An AttributeError raised while importing a submodule must not be swallowed or retried."""
+    real_import_module = importlib.import_module
+    calls = []
+
+    def fake_import_module(target, package=None):
+        if package == PKG and target == ".mla":
+            calls.append(target)
+            raise AttributeError("module 'torch' has no attribute 'some_missing_op'")
+        return real_import_module(target, package)
+
+    monkeypatch.delitem(pkg.__dict__, "MLA", raising=False)
+    monkeypatch.setattr(pkg.importlib, "import_module", fake_import_module)
+    with pytest.raises(ImportError) as excinfo:
+        access(pkg)
+    assert isinstance(excinfo.value.__cause__, AttributeError)
+    assert "some_missing_op" in str(excinfo.value.__cause__)
+    assert calls == [".mla"]
+
+
 def test_package_root_import_is_lazy():
-    """Importing the package root adds nothing beyond the package module itself."""
+    """Importing the package root adds nothing beyond the package module itself.
+
+    ``tensorrt_llm._torch`` may load the package root already, because the custom
+    ops import their kernels from ``kernels/`` beneath it. Nothing else under the
+    package may be loaded at that point.
+    """
+    kernels = f"{PKG}.kernels"
     _run_fresh(f"""
         import sys
         import tensorrt_llm._torch
         before = set(sys.modules)
-        assert {PKG!r} not in before, "tensorrt_llm._torch already imports the package root"
         import {PKG}
         added = set(sys.modules) - before
         assert added <= {{{PKG!r}}}, sorted(added)
+        loaded = sorted(
+            m for m in sys.modules
+            if m.startswith({PKG + "."!r})
+            and m != {kernels!r}
+            and not m.startswith({kernels + "."!r})
+        )
+        assert not loaded, loaded
     """)
 
 
@@ -160,5 +234,19 @@ def test_backends_import_loads_no_module_layer():
     ],
 )
 def test_rotary_embedding_first_import(statement):
-    """rotary_embedding imports the backends, which import it back; neither order may cycle."""
+    """Backends import rotary_embedding back; importing it first must not cycle."""
     _run_fresh(statement)
+
+
+def test_rotary_embedding_import_loads_no_backends():
+    """rotary_embedding uses the backends only in annotations, so importing it must not load them."""
+    _run_fresh(f"""
+        import sys
+        import tensorrt_llm._torch
+        before = set(sys.modules)
+        backends = {BACKENDS!r}
+        assert backends not in before, "tensorrt_llm._torch already imports the backends"
+        import {PKG}.rotary_embedding
+        loaded = sorted(m for m in set(sys.modules) - before if m == backends or m.startswith(backends + "."))
+        assert not loaded, loaded
+    """)

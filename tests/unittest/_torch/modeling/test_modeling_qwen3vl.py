@@ -6,17 +6,19 @@ import os
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
+from unittest.mock import patch
 
 import pytest
 import torch
 from _torch.helpers import create_mock_cuda_graph_runner
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal
+from test_modeling_qwen2vl import _make_vision_attention
 from transformers import Qwen3VLConfig
 from transformers import Qwen3VLForConditionalGeneration as HFQwen3VLForConditionalLM
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models import modeling_qwen3vl
+from tensorrt_llm._torch.models import modeling_qwen2vl, modeling_qwen3vl
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -24,7 +26,9 @@ from tensorrt_llm._torch.models.modeling_qwen3vl import (
     Qwen3VLModel,
     _triton_pos_embed_interpolate,
 )
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
@@ -167,7 +171,7 @@ class TestQwen3VL(TestModelingMultimodal):
             )
         else:
             # Mrope position ids. For chunked prefill / KV cache reuse we must
-            # mirror production `PyTorchModelEngine` behavior and slice the
+            # mirror production `ModelEngine` behavior and slice the
             # request's full `mrope_position_ids` to the current chunk's
             # range -- the model now indexes mrope cos/sin by batch-flat
             # per-token index, so the position_ids tensor must contain only
@@ -233,7 +237,7 @@ class TestQwen3VL(TestModelingMultimodal):
             # Prepare metadata before capture (like in working Qwen2.5-VL test)
             trtllm_inputs["attn_metadata"].prepare()
 
-            key = (1, 0)
+            key = KeyType(batch_size=1, draft_len=0)
             graph_runner.capture(
                 key=key,
                 forward_fn=lambda inputs: self.trtllm_model.forward(**inputs),
@@ -494,7 +498,7 @@ def test_qwen3_vision_prepare_metadata_passes_fixed_max_seq_len(
 
     monkeypatch.setattr(
         modeling_qwen3vl,
-        "_prepare_qwen_vl_vision_attn_metadata",
+        "prepare_encoder_attn_metadata",
         capture_prepare_attn_metadata,
     )
     model = Qwen3VisionModel.__new__(Qwen3VisionModel)
@@ -529,6 +533,7 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
     torch.nn.Module.__init__(vision)
     vision.patch_embed = patch_embed
     vision.attn_metadata = object()
+    vision._blocks_graph_runner = None
     vision._rope_position_ids_buffer = None
     vision.rot_pos_emb = lambda grid: (
         torch.empty(6, 0),
@@ -544,6 +549,366 @@ def test_qwen3_vision_patch_projection_matches_conv3d() -> None:
 
     torch.testing.assert_close(actual, expected)
     assert deepstack == []
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("deepstack_visual_indexes", "expected_features"), [([0], [3.0]), ([1, 0], [6.0, 4.0])]
+)
+def test_qwen3_vision_run_blocks_uses_encoder_graph(
+    deepstack_visual_indexes: list[int], expected_features: list[float]
+) -> None:
+    class FakeGraphRunner:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def maybe_run(self, **kwargs: object) -> dict[str, torch.Tensor]:
+            self.calls.append(kwargs)
+            return {
+                "hidden_states": torch.full((4, 8), 2.0),
+                "deepstack_0": torch.full((4, 8), 3.0),
+                "deepstack_1": torch.full((4, 8), 4.0),
+            }
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision._blocks_graph_runner = FakeGraphRunner()
+    vision.deepstack_visual_indexes = deepstack_visual_indexes
+    vision._deepstack_layer_to_merger_idx = {
+        layer_idx: idx for idx, layer_idx in enumerate(deepstack_visual_indexes)
+    }
+    vision.deepstack_merger_list = torch.nn.ModuleList(
+        [torch.nn.Linear(8, 8, bias=False) for _ in deepstack_visual_indexes]
+    )
+    with torch.no_grad():
+        for idx, merger in enumerate(vision.deepstack_merger_list):
+            merger.weight.copy_(torch.eye(8) * (idx + 1))
+    vision.merger = torch.nn.Identity()
+    metadata = SimpleNamespace(seq_lens=torch.tensor([4]))
+    hidden_states = torch.ones(4, 8)
+    cos = torch.ones(4, 2)
+    sin = torch.zeros(4, 2)
+    position_ids = torch.arange(4, dtype=torch.int32)
+
+    output, deepstack = vision._run_blocks(hidden_states, cos, sin, position_ids, metadata)
+
+    assert torch.equal(output, torch.full((4, 8), 2.0))
+    assert len(deepstack) == len(expected_features)
+    for features, expected in zip(deepstack, expected_features):
+        assert torch.equal(features, torch.full((4, 8), expected))
+    assert vision._blocks_graph_runner.calls == [
+        {
+            "seq_lengths": [4],
+            "inputs": {
+                "hidden_states": hidden_states,
+                "cos": cos,
+                "sin": sin,
+                "rope_position_ids": position_ids,
+            },
+        }
+    ]
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vision_run_blocks_preserves_eager_merger_order() -> None:
+    events = []
+
+    class RecordingBlock(torch.nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, hidden_states: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            events.append(self.name)
+            return hidden_states
+
+    class RecordingMerger(torch.nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+            events.append(self.name)
+            return hidden_states
+
+    vision = Qwen3VisionModel.__new__(Qwen3VisionModel)
+    torch.nn.Module.__init__(vision)
+    vision._blocks_graph_runner = None
+    vision.blocks = torch.nn.ModuleList([RecordingBlock("block_0"), RecordingBlock("block_1")])
+    vision._deepstack_layer_to_merger_idx = {0: 0}
+    vision.deepstack_merger_list = torch.nn.ModuleList([RecordingMerger("deepstack_merger")])
+    vision.merger = RecordingMerger("final_merger")
+    hidden_states = torch.ones(4, 8)
+
+    vision._run_blocks(
+        hidden_states,
+        torch.ones(4, 2),
+        torch.zeros(4, 2),
+        torch.arange(4, dtype=torch.int32),
+        SimpleNamespace(seq_lens=torch.tensor([4])),
+    )
+
+    assert events == ["block_0", "deepstack_merger", "block_1", "final_merger"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("attn_backend", ["TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("deepstack_visual_indexes", [[0], [1, 0]])
+@pytest.mark.parametrize("automatic", [False, True], ids=["explicit", "automatic"])
+@pytest.mark.parametrize("num_tokens", [192, 256])
+def test_qwen3_vision_cuda_graph_replay_matches_eager(
+    monkeypatch: pytest.MonkeyPatch,
+    attn_backend: str,
+    deepstack_visual_indexes: list[int],
+    automatic: bool,
+    num_tokens: int,
+) -> None:
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import (
+        setup_mm_encoder_attn_metadata,
+        setup_mm_encoder_cuda_graphs,
+    )
+
+    config_dict = copy.deepcopy(QWEN3_VL_8B_CONFIG)
+    config_dict["vision_config"].update(depth=2, deepstack_visual_indexes=deepstack_visual_indexes)
+    model_config = ModelConfig(
+        pretrained_config=Qwen3VLConfig.from_dict(config_dict),
+        attn_backend=attn_backend,
+        multimodal_config=MultimodalConfig(
+            encoder_cuda_graph={
+                "vision": (
+                    MultimodalEncoderCudaGraphConfig(max_batch_size=2)
+                    if automatic
+                    else MultimodalEncoderCudaGraphConfig(buckets=[(256, 1)])
+                )
+            }
+        ),
+    )
+    torch.manual_seed(0)
+    encoder = modeling_qwen3vl.Qwen3VisionModelBase(model_config, Qwen3VisionModel).cuda().eval()
+    with torch.no_grad():
+        for name, param in encoder.named_parameters():
+            if "norm" in name and name.endswith("weight"):
+                param.fill_(1.0)
+            else:
+                param.normal_(std=0.02)
+    vision = encoder.visual
+    setup_mm_encoder_attn_metadata(encoder, object(), 256, {"attention": 1})
+    grid_thw = torch.tensor([[1, num_tokens // 16, 16]])
+    pixel_values = torch.randn(num_tokens, 3 * 2 * 16 * 16, device="cuda")
+    eager = encoder.encode_batched(pixel_values, grid_thw)
+
+    if automatic:
+        setup_mm_encoder_cuda_graphs(encoder, max_num_tokens=256)
+    else:
+        vision.enable_blocks_cuda_graph()
+
+    def fail_eager_fallback(*args: object, **kwargs: object) -> None:
+        raise AssertionError("Qwen3-VL vision CUDA graph replay fell back to eager.")
+
+    monkeypatch.setattr(vision, "_run_encoder_blocks", fail_eager_fallback)
+    graph = encoder.encode_batched(pixel_values, grid_thw)
+
+    torch.testing.assert_close(graph, eager, rtol=5e-2, atol=5e-2)
+    captured = vision._blocks_graph_runner._captured[(257, 2)]
+    # Replay must refresh the device lengths read by attention, not only the host copy.
+    assert captured.metadata.seq_lens_cuda.tolist() == [num_tokens, 257 - num_tokens]
+    assert vision.attn_metadata.max_num_tokens == 256
+    assert vision.attn_metadata.max_num_requests == 1
+    assert captured.metadata.max_num_tokens == 257
+    assert captured.metadata.max_num_requests == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("support_fused_qkv", [True, False])
+@pytest.mark.parametrize("rope_impl", ["torch", "flash_attn", "flashinfer"])
+def test_qwen2_5_vision_attention_reuses_fused_qkv(
+    monkeypatch: pytest.MonkeyPatch, support_fused_qkv: bool, rope_impl: str
+) -> None:
+    # CPU stubs exercise kernel routing and mutation contracts, not CUDA kernels.
+    monkeypatch.setattr(modeling_qwen2vl, "_flash_attn_apply_rotary", None)
+    monkeypatch.setattr(modeling_qwen2vl, "IS_FLASHINFER_AVAILABLE", rope_impl == "flashinfer")
+    head_dim = 64 if rope_impl == "flashinfer" else 4
+    q_size = 2 * head_dim
+    fused_qkv = torch.randn(3, 3 * q_size)
+    attention, forwarded = _make_vision_attention(
+        fused_qkv, head_dim=head_dim, support_fused_qkv=support_fused_qkv
+    )
+    q, k, original_v = attention.split_qkv(fused_qkv)
+    original_q = q.reshape(3, 2, head_dim).clone()
+    original_k = k.reshape(3, 2, head_dim).clone()
+    original_v = original_v.clone()
+    cos = torch.randn(3, head_dim // 2)
+    sin = torch.randn(3, head_dim // 2)
+    position_ids = torch.arange(3, dtype=torch.int32)
+    kernel_calls = []
+
+    def flash_attn_rope(
+        tensor: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        *,
+        interleaved: bool,
+        inplace: bool,
+    ) -> torch.Tensor:
+        assert not interleaved
+        assert inplace
+        kernel_calls.append(tensor)
+        tensor.copy_(
+            modeling_qwen2vl.RotaryEmbedding.apply_rotary_pos_emb(tensor, cos, sin, unsqueeze_dim=1)
+        )
+        return tensor
+
+    def flashinfer_rope(
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_size: int,
+        cos_sin_cache: torch.Tensor,
+        *,
+        is_neox: bool,
+    ) -> None:
+        assert positions is position_ids
+        assert head_size == 64
+        assert is_neox
+        assert cos_sin_cache.dtype == torch.float32
+        assert cos_sin_cache.is_contiguous()
+        torch.testing.assert_close(cos_sin_cache, torch.cat((cos, sin), dim=-1))
+        kernel_calls.append(query)
+        for tensor in (query, key):
+            tensor.copy_(
+                modeling_qwen2vl.RotaryEmbedding.apply_rotary_pos_emb(
+                    tensor.view(1, 3, 2, head_dim), cos, sin, unsqueeze_dim=1
+                ).reshape_as(tensor)
+            )
+
+    if rope_impl == "flash_attn":
+        monkeypatch.setattr(modeling_qwen2vl, "_flash_attn_apply_rotary", flash_attn_rope)
+    elif rope_impl == "flashinfer":
+        monkeypatch.setattr(
+            modeling_qwen2vl,
+            "flashinfer_apply_rope_with_cos_sin_cache_inplace",
+            flashinfer_rope,
+            raising=False,
+        )
+
+    expected_q = modeling_qwen2vl.RotaryEmbedding.apply_rotary_pos_emb(
+        original_q.unsqueeze(0), cos, sin, unsqueeze_dim=1
+    ).squeeze(0)
+    expected_k = modeling_qwen2vl.RotaryEmbedding.apply_rotary_pos_emb(
+        original_k.unsqueeze(0), cos, sin, unsqueeze_dim=1
+    ).squeeze(0)
+    output = attention.forward(
+        torch.empty(3, q_size),
+        attn_metadata=object(),
+        position_ids=position_ids,
+        position_embeddings=(cos, sin),
+    )
+
+    actual_q, actual_k, actual_v = attention.split_qkv(fused_qkv)
+    torch.testing.assert_close(actual_q.reshape_as(expected_q), expected_q)
+    torch.testing.assert_close(actual_k.reshape_as(expected_k), expected_k)
+    torch.testing.assert_close(actual_v, original_v)
+    assert len(kernel_calls) == {"torch": 0, "flash_attn": 1, "flashinfer": 1}[rope_impl]
+    if support_fused_qkv:
+        assert forwarded["q"] is fused_qkv
+        assert forwarded["k"] is None
+        assert forwarded["v"] is None
+        assert output is fused_qkv
+    else:
+        assert forwarded["q"].is_set_to(actual_q)
+        assert forwarded["k"].is_set_to(actual_k)
+        assert forwarded["v"].is_set_to(actual_v)
+        assert output.is_set_to(actual_q)
+
+
+@pytest.fixture(
+    params=[modeling_qwen3vl.Qwen3VLVisionAttention, modeling_qwen2vl.Qwen2_5_VLVisionAttention]
+)
+def vision_attention(request: pytest.FixtureRequest) -> modeling_qwen2vl.Qwen2_5_VLVisionAttention:
+    attention = request.param.__new__(request.param)
+    torch.nn.Module.__init__(attention)
+    return attention
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(modeling_qwen2vl._flash_attn_apply_rotary is None, reason="flash_attn required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("shape", [(1, 1, 72), (7, 4, 80), (128, 16, 72), (513, 16, 80)])
+@pytest.mark.parametrize("row_step", [1, 2])
+def test_qwen_vl_vision_packed_rope_cuda(
+    vision_attention: modeling_qwen2vl.Qwen2_5_VLVisionAttention,
+    dtype: torch.dtype,
+    shape: tuple[int, int, int],
+    row_step: int,
+) -> None:
+    seq_len, num_heads, head_dim = shape
+    # Include a nonzero storage offset and padding between projection rows.
+    storage = torch.randn(
+        seq_len * row_step + 1, 3 * num_heads * head_dim, device="cuda", dtype=dtype
+    )
+    original = storage.clone()
+    fused_qkv = storage[1::row_step]
+    expected_qkv = original[1::row_step]
+    vision_attention.head_dim = head_dim
+    cos = torch.randn(seq_len, head_dim // 2, device="cuda", dtype=dtype)
+    sin = torch.randn_like(cos)
+    rotary = modeling_qwen2vl._flash_attn_apply_rotary
+    for tensor in expected_qkv.split(num_heads * head_dim, dim=-1)[:2]:
+        rotary(
+            tensor.view(1, seq_len, num_heads, head_dim), cos, sin, interleaved=False, inplace=True
+        )
+
+    with patch.object(modeling_qwen2vl, "_flash_attn_apply_rotary", wraps=rotary) as calls:
+        vision_attention.apply_rope(
+            *fused_qkv.split(num_heads * head_dim, dim=-1),
+            position_embeddings=(cos, sin),
+            packed_qk=fused_qkv[:, : 2 * num_heads * head_dim],
+        )
+    assert torch.equal(storage, original)
+    assert calls.call_count == 1
+    assert calls.call_args.args[0].shape == (1, seq_len, 2 * num_heads, head_dim)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(modeling_qwen2vl._flash_attn_apply_rotary is None, reason="flash_attn required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["separate", "gap", "dim_stride", "different_stride"])
+def test_qwen_vl_vision_rope_layout_fallback_cuda(
+    vision_attention: modeling_qwen2vl.Qwen2_5_VLVisionAttention,
+    dtype: torch.dtype,
+    layout: str,
+) -> None:
+    seq_len, num_heads, head_dim = 7, 4, 80
+    fused_qkv = torch.randn(seq_len, 3, num_heads, head_dim, device="cuda", dtype=dtype)
+    if layout == "dim_stride":
+        fused_qkv = fused_qkv[..., ::2]
+    q, k, v = fused_qkv.unbind(dim=1)
+    if layout == "separate":
+        q, k = (
+            torch.empty_strided(t.shape, t.stride(), device=t.device, dtype=t.dtype).copy_(t)
+            for t in (q, k)
+        )
+    elif layout == "gap":
+        k, v = v, k
+    elif layout == "different_stride":
+        k = k.clone()
+    original_v = v.clone()
+    expected_q, expected_k = q.clone(), k.clone()
+    cos = torch.randn(seq_len, q.shape[-1] // 2, device="cuda", dtype=dtype)
+    sin = torch.randn_like(cos)
+    rotary = modeling_qwen2vl._flash_attn_apply_rotary
+    for tensor in (expected_q, expected_k):
+        rotary(tensor.unsqueeze(0), cos, sin, interleaved=False, inplace=True)
+    vision_attention.head_dim = q.shape[-1]
+
+    with patch.object(modeling_qwen2vl, "_flash_attn_apply_rotary", wraps=rotary) as calls:
+        actual = vision_attention.apply_rope(
+            q.flatten(1), k.flatten(1), v.flatten(1), position_embeddings=(cos, sin)
+        )
+    assert calls.call_count == 2
+    for tensor, expected in zip(actual, (expected_q, expected_k, original_v)):
+        assert torch.equal(tensor, expected.flatten(1))
+    assert torch.equal(v, original_v)
 
 
 def test_qwen3_processor_max_pixels_maps_to_fixed_attention_capacity() -> None:

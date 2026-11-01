@@ -13,11 +13,13 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm as op,
 )
 
 __extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "flashinfer_rmsnorm requires a CUDA device"
@@ -31,7 +33,35 @@ def _build(spec, seed):
     return x, weight, spec["eps"]
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="decode-shaped, deepseek-r1 hidden 7168",
+            spec=dict(shape=(1, 7168), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="deepseek q_lora rank 1536, the q_norm this op is called on",
+            spec=dict(shape=(16, 1536), dtype=torch.bfloat16, eps=1e-6),
+        ),
+        Cell(
+            why="deepseek kv_lora rank 512, the narrowest row any target asks for",
+            spec=dict(shape=(16, 512), dtype=torch.bfloat16, eps=1e-6),
+        ),
+    ),
+    "gpt_oss/gpt_oss_120b__sm_10x__default": (
+        Cell(
+            why="decode-shaped, gpt-oss-120b hidden 2880",
+            spec=dict(shape=(1, 2880), dtype=torch.bfloat16, eps=1e-5),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     certifying(op)
     x, weight, eps = _build(cell.spec, seed=zlib.crc32(cell.why.encode()) % 2**31)

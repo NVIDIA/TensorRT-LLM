@@ -1,4 +1,5 @@
 metadata:
+  architecture: DeepseekV4ForCausalLM
   model_name: deepseek_v4_pro_fp4
   precision: fp4
   model_dir_name: DeepSeek-V4-Pro
@@ -69,7 +70,6 @@ worker_config:
       use_low_precision_moe_combine: true
       load_balancer: tests/scripts/perf-sanity/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_gen_ep32_slots384.yaml
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 60000
       backend: NIXL
       transceiver_runtime: PYTHON
@@ -100,7 +100,6 @@ worker_config:
       backend: TRTLLM
       load_balancer: tests/scripts/perf-sanity/disaggregated/deepseek-v4-pro-eplb/moe_load_balancer_ctx_ep4_384.yaml
     cache_transceiver_config:
-      max_tokens_in_buffer: 8192
       kv_transfer_timeout_ms: 60000
       backend: NIXL
       transceiver_runtime: PYTHON

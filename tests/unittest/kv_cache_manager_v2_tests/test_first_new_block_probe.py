@@ -229,9 +229,9 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         scopes = [
             ReuseScope(),
             ReuseScope(lora_id=0),
-            ReuseScope(salt=0),
-            ReuseScope(lora_id=0, salt=0),
-            ReuseScope(lora_id=7, salt=(1 << 64) - 1),
+            ReuseScope(salt=""),
+            ReuseScope(lora_id=0, salt=""),
+            ReuseScope(lora_id=7, salt="tenant-中文"),
         ]
         keys = [self.probe_key(tokens, scope) for scope in scopes]
         self.assertEqual(len(set(keys)), len(scopes))
@@ -253,7 +253,7 @@ class TestFirstNewBlockProbe(unittest.TestCase):
 
     def test_backoff_uses_the_last_complete_matched_block(self) -> None:
         tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
-        scope = ReuseScope(lora_id=7, salt=1234)
+        scope = ReuseScope(lora_id=7, salt="1234")
         for backoff in (1, TOKENS_PER_BLOCK, TOKENS_PER_BLOCK + 1, len(tokens)):
             with self.subTest(backoff=backoff):
                 config = replace(self.manager.init_config, reuse_match_backoff=backoff)
@@ -278,7 +278,7 @@ class TestFirstNewBlockProbe(unittest.TestCase):
         tokens = self.tokens(0, 4 * TOKENS_PER_BLOCK)
         tokens[3] = bytes([17]) * 32
         tokens[9] = bytes([23]) * 32
-        scope = ReuseScope(lora_id=9, salt=4567)
+        scope = ReuseScope(lora_id=9, salt="4567")
         self.commit(tokens[: 2 * TOKENS_PER_BLOCK], scope)
         self.assertIsNotNone(self.probe_key(tokens, scope))
         self.assertNotEqual(self.probe_key(tokens, scope), self.probe_key(tokens, ReuseScope()))

@@ -27,7 +27,13 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (
+    get_sm_version,
+    is_sm_100f,
+    is_sm_120f,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -89,6 +95,17 @@ except ImportError:
 _DG_SCHEDULE_BLOCK_KV = 64
 
 
+def use_cute_dsl_paged_mqa_logits(requested: bool) -> bool:
+    """Whether the CuTe DSL paged MQA logits kernel runs instead of DeepGEMM.
+
+    The indexer and the metadata must both use this: the metadata builds
+    DSL-only buffers (atom-split expansion, padded logits row stride) and
+    skips the sm90 MTP expansion off the same decision. is_sm_100f() is the
+    custom op's own precondition.
+    """
+    return requested and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
+
+
 def _pick_dsl_expand(
     next_n: int,
     num_sms: int,
@@ -142,6 +159,46 @@ def _pick_dsl_expand(
     cands.sort(key=lambda x: (x[0], -x[1]))  # min waves, max factor
     _, factor, eff = cands[0]
     return factor, eff
+
+
+def _atom_ctx_offsets(next_n: int, num_atoms: int) -> List[int]:
+    """Per-atom causal stagger of an in-kernel next_n split: atom i (0 = oldest)
+    sees the context shortened by the tokens of the atoms after it. Same split
+    as the kernel (first ``next_n % num_atoms`` atoms get one extra token)."""
+    base, rem = divmod(next_n, num_atoms)
+    return [
+        next_n - (i * base + min(i, rem) + base + (1 if i < rem else 0)) for i in range(num_atoms)
+    ]
+
+
+def _pick_dsl_split(
+    next_n: int,
+    num_sms: int,
+    batch_size: int = 0,
+    max_ctx: int = 0,
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3),
+) -> Tuple[int, int, int]:
+    """``_pick_dsl_expand`` plus the kernel's in-kernel uneven split.
+
+    Returns ``(expand_factor, atom, num_kernel_atoms)``. When no atom > 1 in
+    ``kernel_atoms`` divides ``next_n`` (e.g. 5 or 7), the caller-side split can
+    only run atom 1 and reads the KV ``next_n`` times; the in-kernel split runs
+    ``ceil(next_n / max(kernel_atoms))`` atoms instead. It is taken when atom 1
+    would need many waves and the split needs fewer, or when the workload is unknown.
+    """
+    factor, atom = _pick_dsl_expand(next_n, num_sms, batch_size, max_ctx, kernel_atoms)
+    if atom != 1 or next_n <= 1 or any(next_n % a == 0 for a in kernel_atoms if a > 1):
+        return factor, atom, 1
+    num_atoms = -(-next_n // max(kernel_atoms))
+    if batch_size > 0 and max_ctx > 0:
+        tiles = -(-max_ctx // 256)
+        waves_split = -(-batch_size * num_atoms * tiles // num_sms)
+        waves_atom1 = -(-batch_size * next_n * tiles // num_sms)
+        # Below ~16 atom-1 waves the split's wider tiles cost more than the KV
+        # re-reads they save (GB300, next_n=7: B=1 0.87-1.00x; >= 24 waves 1.04-2.6x).
+        if waves_split >= waves_atom1 or waves_atom1 < 16:
+            return factor, atom, 1
+    return 1, -(-next_n // num_atoms), num_atoms
 
 
 def _compute_slot_mappings(
@@ -857,8 +914,8 @@ class Indexer(nn.Module):
         )
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
-        self.use_cute_dsl_paged_mqa_logits = (
-            sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
+        self.use_cute_dsl_paged_mqa_logits = use_cute_dsl_paged_mqa_logits(
+            sparse_params.use_cute_dsl_paged_mqa_logits
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
@@ -1671,7 +1728,7 @@ class Indexer(nn.Module):
             if not 1 <= heads <= 64:
                 raise ValueError("FP4 MQA requires between 1 and 64 index heads")
             # Consumer Blackwell lacks the 8-head FP4 MQA specialization.
-            supported_heads = (16, 32, 64) if get_sm_version() in (120, 121) else (8, 16, 32, 64)
+            supported_heads = (16, 32, 64) if is_sm_120f() else (8, 16, 32, 64)
             padded_heads = next(size for size in supported_heads if size >= heads)
             if padded_heads != heads:
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
@@ -1936,9 +1993,24 @@ class Indexer(nn.Module):
         )
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
-            topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
-                metadata.shared_topk_indices[:num_generations, :]
+            self._copy_reused_topk(
+                metadata,
+                topk_indices_buffer,
+                token_offset,
+                num_gen_tokens,
+                num_generations,
+                has_prefill,
+                gvr_prior_indices,
             )
+        elif (
+            has_decode
+            and not metadata.skip_indexer_for_gen_reqs
+            and self._fill_decode_topk(
+                metadata, q_fp8, weights, topk_indices_buffer, token_offset, num_gen_tokens
+            )
+        ):
+            # A subclass filled the generation rows.
+            pass
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
@@ -2030,6 +2102,17 @@ class Indexer(nn.Module):
                     metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
+                # In-kernel uneven split (next_n with no exact atom divisor):
+                # native Q / context_lens / block_table, schedule over the
+                # staggered per-atom rows. Same full-window gate as above.
+                dsl_kernel_split = (
+                    metadata.dsl_kernel_atoms > 1 and next_n == metadata.dsl_kernel_next_n
+                )
+                dsl_split_kwargs: dict = {}
+                if dsl_kernel_split:
+                    dsl_split_kwargs = dict(
+                        num_next_n_atoms=metadata.dsl_kernel_atoms, atom=metadata.dsl_atom
+                    )
                 gvr_emit_kwargs: dict = {}
                 # emitting for a step the Top-K cannot consume only churns
                 # the closed-loop state, so gate on the consumable shape
@@ -2038,6 +2121,7 @@ class Indexer(nn.Module):
                     and gvr_prior_indices is not None
                     and next_n == 1
                     and not dsl_atom_split
+                    and not dsl_kernel_split
                     and num_gen_tokens <= 256
                     # ext tiers are single-CTA/sort-path only; row reordering
                     # routes the Top-K through order_row, which excludes them
@@ -2071,6 +2155,8 @@ class Indexer(nn.Module):
                         dsl_context_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
@@ -2082,6 +2168,7 @@ class Indexer(nn.Module):
                         dsl_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -2101,6 +2188,8 @@ class Indexer(nn.Module):
                         fp8_ctx_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         fp8_block_table = metadata.block_table_expanded[:exp_B]
                         fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q,
                         k_cache,
@@ -2110,6 +2199,7 @@ class Indexer(nn.Module):
                         fp8_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
             else:
                 decode_q_scale = (
@@ -2199,29 +2289,82 @@ class Indexer(nn.Module):
                 prev_topk_dst.copy_(last_mtp_topk)
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
-            rows = None
-            if has_decode:
-                next_n = num_gen_tokens // num_generations
-                gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-                rows = self._mtp_last_accepted_rows(
-                    gen_topk, metadata, num_contexts, num_generations, next_n
-                )
-            if has_prefill:
-                ctx_last = (
-                    torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
-                )
-                ctx_rows = topk_indices_buffer[ctx_last]
-                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
-            if rows is not None:
-                shared_topk_indices = metadata.shared_topk_indices
-                if shared_topk_indices is None:
-                    metadata.shared_topk_indices = rows.contiguous()
-                else:
-                    row_start = num_contexts if is_generation else 0
-                    shared_topk_indices[
-                        row_start : row_start + rows.shape[0], : rows.shape[1]
-                    ].copy_(rows)
+            self._store_mtp_shared_rows(
+                topk_indices_buffer,
+                metadata,
+                num_contexts,
+                num_generations,
+                num_gen_tokens,
+                token_offset,
+                has_prefill,
+                has_decode,
+                is_generation,
+            )
         return topk_indices_buffer
+
+    def _copy_reused_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+        num_generations: int,
+        has_prefill: bool,
+        gvr_prior_indices: Optional[torch.Tensor],
+    ) -> None:
+        """Copy the shared TopK rows an MTP draft step reuses into its generation rows."""
+        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
+            metadata.shared_topk_indices[:num_generations, :]
+        )
+
+    def _fill_decode_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+    ) -> bool:
+        """Fill the generation TopK rows ahead of the decode branch; True if it filled them.
+
+        This class leaves them to the decode branch of ``sparse_attn_indexer``.
+        """
+        return False
+
+    def _store_mtp_shared_rows(
+        self,
+        topk_indices_buffer: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        num_contexts: int,
+        num_generations: int,
+        num_gen_tokens: int,
+        token_offset: int,
+        has_prefill: bool,
+        has_decode: bool,
+        is_generation: Optional[bool],
+    ) -> None:
+        """Store each request's last accepted TopK row for the next MTP draft step to reuse."""
+        rows = None
+        if has_decode:
+            next_n = num_gen_tokens // num_generations
+            gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+            rows = self._mtp_last_accepted_rows(
+                gen_topk, metadata, num_contexts, num_generations, next_n
+            )
+        if has_prefill:
+            ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+            ctx_rows = topk_indices_buffer[ctx_last]
+            rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+        if rows is not None:
+            shared_topk_indices = metadata.shared_topk_indices
+            if shared_topk_indices is None:
+                metadata.shared_topk_indices = rows.contiguous()
+            else:
+                row_start = num_contexts if is_generation else 0
+                shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(
+                    rows
+                )
 
     def _mtp_last_accepted_rows(
         self,
