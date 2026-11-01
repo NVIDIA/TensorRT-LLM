@@ -243,6 +243,69 @@ def _launch_config() -> Tuple[int, int]:
     )
 
 
+def _split_launch() -> bool:
+    """``H3_FP8_FUSION_SPLIT=1``: one launch per tensor (three amax, three cast) through the
+    per-tensor kernels with the packed row stride, instead of one launch over the packed row:
+    the same arithmetic, three times the programs with a third of the work each."""
+    return os.environ.get("H3_FP8_FUSION_SPLIT", "0") == "1"
+
+
+def _qk_norm_rope_fp8_split(
+    qkv, weight_q, weight_k, cos, sin, static_descale, eps, h, d, s, rows, outs, block_h, num_warps
+):
+    width = h * d
+    grid = (rows,)
+    static = static_descale is not None
+    if static:
+        descale = static_descale.to(torch.float32).contiguous()
+        amax = descale
+    else:
+        amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
+        descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
+    weights = (weight_q, weight_k, weight_q)
+    rot = cos.shape[-1]
+    if not static:
+        for i in range(3):
+            _tensor_amax_kernel[grid](
+                qkv[..., i * width : (i + 1) * width],
+                weights[i],
+                cos,
+                sin,
+                amax[i : i + 1],
+                s,
+                eps,
+                NORM_ROPE=i < 2,
+                H=h,
+                D=d,
+                ROT=rot,
+                BLOCK_H=block_h,
+                ROW_STRIDE=3 * width,
+                num_warps=num_warps,
+            )
+    for i in range(3):
+        _tensor_cast_kernel[grid](
+            qkv[..., i * width : (i + 1) * width],
+            weights[i],
+            cos,
+            sin,
+            amax[i : i + 1],
+            descale[i : i + 1],
+            outs[i],
+            s,
+            eps,
+            NORM_ROPE=i < 2,
+            OUT_FP8=True,
+            STATIC=static,
+            H=h,
+            D=d,
+            ROT=rot,
+            BLOCK_H=block_h,
+            ROW_STRIDE=3 * width,
+            num_warps=num_warps,
+        )
+    return descale, static
+
+
 @torch.library.custom_op("h3_lever8::qk_norm_rope_fp8", mutates_args=())
 def qk_norm_rope_fp8(
     qkv: torch.Tensor,
@@ -275,6 +338,26 @@ def qk_norm_rope_fp8(
     v8 = torch.empty_like(q8)
     block_h, num_warps = _launch_config()
     grid = (rows,)
+    if _split_launch():
+        descale, static = _qk_norm_rope_fp8_split(
+            qkv,
+            weight_q,
+            weight_k,
+            cos,
+            sin,
+            static_descale,
+            eps,
+            h,
+            d,
+            s,
+            rows,
+            (q8, k8, v8),
+            block_h,
+            num_warps,
+        )
+        if _AMAX_LOG is not None and not static:
+            _record_descale(layer_idx, descale)
+        return q8, k8, v8, descale
     if static_descale is None:
         amax = torch.zeros(3, dtype=torch.float32, device=qkv.device)
         descale = torch.empty(3, dtype=torch.float32, device=qkv.device)
@@ -356,12 +439,13 @@ def _tensor_amax_kernel(
     D: tl.constexpr,
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r % S
     d = tl.arange(0, D)
     hh = tl.arange(0, BLOCK_H)
-    row = x_ptr + r.to(tl.int64) * (H * D)
+    row = x_ptr + r.to(tl.int64) * ROW_STRIDE
     m = tl.zeros((BLOCK_H, D), dtype=tl.float32)
     if NORM_ROPE:
         partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
@@ -401,12 +485,13 @@ def _tensor_cast_kernel(
     D: tl.constexpr,
     ROT: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    ROW_STRIDE: tl.constexpr,
 ):
     r = tl.program_id(0)
     t = r % S
     d = tl.arange(0, D)
     hh = tl.arange(0, BLOCK_H)
-    row = x_ptr + r.to(tl.int64) * (H * D)
+    row = x_ptr + r.to(tl.int64) * ROW_STRIDE
     out_row = out_ptr + r.to(tl.int64) * (H * D)
     if NORM_ROPE:
         partner, sign, cos_v, sin_v = _rope_vectors(cos_ptr, sin_ptr, t, d, ROT)
@@ -489,6 +574,7 @@ def norm_rope_fp8_tensor(
             D=d,
             ROT=rot,
             BLOCK_H=block_h,
+            ROW_STRIDE=h * d,
             num_warps=num_warps,
         )
         static = False
@@ -515,6 +601,7 @@ def norm_rope_fp8_tensor(
         D=d,
         ROT=rot,
         BLOCK_H=block_h,
+        ROW_STRIDE=h * d,
         num_warps=num_warps,
     )
     return out, descale
@@ -598,7 +685,9 @@ def static_descale(layer_idx: int, device: torch.device) -> torch.Tensor:
         if not path:
             raise RuntimeError("H3_FP8_SCALE_FUSION=static needs H3_FP8_STATIC_SCALES=<json>")
         with open(path) as f:
-            _STATIC_TABLE = json.load(f)
+            table = json.load(f)
+        # Either a bare {layer: [dq, dk, dv]} map or the calibration log's {"descale_max": {...}}.
+        _STATIC_TABLE = table.get("descale_max", table)
     margin = float(os.environ.get("H3_FP8_STATIC_MARGIN", "1.0"))
     values = _STATIC_TABLE[str(layer_idx)]
     t = torch.tensor([float(v) * margin for v in values], dtype=torch.float32)
