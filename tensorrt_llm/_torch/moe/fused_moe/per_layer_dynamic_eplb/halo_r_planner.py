@@ -421,9 +421,8 @@ class HaloRRelayEndpoint:
         For a weight reload or rebind, between layer calls. It waits for the
         device before and after the reset, so that no earlier launch, eager
         or replayed, can still update the table and every later one reads the
-        reset table. Every rank resets at the same point of its layer calls
-        because every rank loads the weights between the same forward passes,
-        which keeps the tables identical.
+        reset table. The group checks that every rank resets at the same
+        point of its layer calls, which keeps the tables identical.
         """
         with self._lock:
             self._require_operational()
@@ -462,13 +461,28 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         """Forget which expert each helper slot holds after the expert weights were rewritten.
 
         The helper slots may still hold copies of the old weights, which the
-        next launch would otherwise skip. Collective in effect: every rank
-        must call it between the same two layer calls, as weight loading does.
+        next launch would otherwise skip. Every rank's launches derive the
+        same need sets from their own tables, so a reset on some ranks only
+        would leave helper slices that no rank copies. This is therefore an
+        EP collective: every rank must call it for the same layer between the
+        same two layer calls, as weight loading does. The ranks compare the
+        layer and the count of its resets and raise if any differs. A rank
+        that skips the call leaves its peers waiting here, so its own next
+        launch traps at the count exchange.
         """
         if self._closed:
             raise RuntimeError("Rebalance scheduler group is closed")
         if self._plan_part is not None or self._generation != self._finished_generation:
             raise RuntimeError("helper residency can be reset only between layer calls")
+        if self.broadcaster.residency is not None:
+            self._residency_resets += 1
+            local = (self.layer_idx, self._residency_resets)
+            resets = list(self._ep_comm.allgather(local))
+            if any(tuple(entry) != local for entry in resets):
+                raise RuntimeError(
+                    "HALO-R helper residency resets differ across EP ranks: "
+                    f"(layer, resets) per rank {resets}"
+                )
         self.broadcaster.forget_residency()
 
     def __init__(
@@ -535,6 +549,7 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         self._execution_stream_handle: Optional[int] = None
         # Every stream validated as MAIN, kept alive with its handle.
         self._main_streams: Dict[int, torch.cuda.Stream] = {}
+        self._residency_resets = 0
         self._closed = False
         self.scheduler = None
         self.symmetric = None

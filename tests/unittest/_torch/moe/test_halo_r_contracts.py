@@ -149,7 +149,12 @@ def _build(
 ) -> _Env:
     trace = []
     state = SimpleNamespace(
-        stream=_MAIN, device=0, fail_submit=False, counters=[0, 0, 0], capturing=False
+        stream=_MAIN,
+        device=0,
+        fail_submit=False,
+        counters=[0, 0, 0],
+        capturing=False,
+        peer_reset=None,
     )
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
 
@@ -304,10 +309,16 @@ def _build(
         ),
     )
 
+    def allgather(value):
+        trace.append(("allgather",))
+        if isinstance(value, tuple):
+            # A residency reset: every peer reports the same, unless a test makes rank 0 differ.
+            return [state.peer_reset or value] + [value] * (ep_size - 1)
+        return [bytes([r]) for r in range(ep_size)]
+
     ep_comm = SimpleNamespace(
         validate_geometry=lambda **kwargs: trace.append(("validate_geometry",)),
-        allgather=lambda value: trace.append(("allgather",))
-        or [bytes([r]) for r in range(ep_size)],
+        allgather=allgather,
         barrier=lambda: trace.append(("barrier",)),
     )
     pool = SimpleNamespace(comm=ep_comm)
@@ -959,11 +970,30 @@ def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
     group.finish()
     env.trace.clear()
     group.forget_helper_residency()
-    # No launch before the reset can still update the table, and every later one reads the reset.
-    assert env.trace == [("synchronize", 0), ("fill", table.name, -1), ("synchronize", 0)]
+    # Every rank resets the same layer for the same time; no launch before the
+    # reset can still update the table, and every later one reads the reset.
+    assert env.trace == [
+        ("allgather",),
+        ("synchronize", 0),
+        ("fill", table.name, -1),
+        ("synchronize", 0),
+    ]
     # The reset does not disturb the generations: the next call proceeds as usual.
     _layer_call(group, 8)
     assert group._generation == 3
+
+
+@pytest.mark.parametrize("peer_reset", [(5, 2), (6, 1), (None, 1)])
+def test_weight_reload_raises_when_ranks_reset_differently(monkeypatch, peer_reset):
+    """A rank that reset another layer, or this one another number of times, fails every rank."""
+    env = _build(monkeypatch, helper_residency=True)
+    _layer_call(env.group, 8)
+    env.state.peer_reset = peer_reset
+    env.trace.clear()
+    with pytest.raises(RuntimeError, match="resets differ across EP ranks"):
+        env.group.forget_helper_residency()
+    # The table is left as it was, for no rank may reset alone.
+    assert env.trace == [("allgather",)]
 
 
 def test_weight_reload_without_residency_is_free(monkeypatch):
