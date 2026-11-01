@@ -194,6 +194,15 @@ class WriteMeta:
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
     bounce_dst_base: Optional[int] = None
+    # The receiver's session key for this piece. ``unique_rid`` is the sender's own
+    # TxSession key; the two differ when a generation retry carries a fresh
+    # disagg_request_id for the same context request.
+    peer_rid: Optional[int] = None
+
+    @property
+    def result_rid(self) -> int:
+        """The id every result message to the peer must carry: the peer's own key."""
+        return self.unique_rid if self.peer_rid is None else self.peer_rid
 
 
 class MessageType:
@@ -540,6 +549,12 @@ class _SessionQuiescence:
     unique_rid: int
     peer_rank: int
     endpoint: Optional[str]
+    # The receiver's session key; the acknowledgment is matched by it on the peer.
+    peer_rid: Optional[int] = None
+
+    @property
+    def result_rid(self) -> int:
+        return self.unique_rid if self.peer_rid is None else self.peer_rid
 
 
 class Sender(SenderBase):
@@ -564,7 +579,8 @@ class Sender(SenderBase):
         self._enforce_physical_ownership = enforce_physical_ownership
         self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
-        self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
+        # Both keyed by our TxSession key (RecvReqInfo.sender_req_id), then by peer rank.
+        self._peer_requests_timestamps: dict[int, float] = {}  # TxSession key -> insert time
         self._peer_requests_lock = threading.Lock()
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._dealers = {}  # used by listener thread only (single-threaded path)
@@ -729,7 +745,7 @@ class Sender(SenderBase):
                     self._sessions[unique_rid] = tx_session
                 for info in req_infos:
                     self._queue_session_quiescence(
-                        unique_rid, info.instance_name, info.instance_rank
+                        unique_rid, info.instance_name, info.instance_rank, peer_rid=info.unique_rid
                     )
             else:
                 tx_session.cancel(by_peer=cancelled_by_peer)
@@ -966,12 +982,12 @@ class Sender(SenderBase):
                     pending.send_slot_id = None
                 if meta.meta_type == WriteMetaType.AUX:
                     message = _make_aux_result_msg(
-                        self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
+                        self._instance_rank, meta.result_rid, AgentResult.FAILED_QUIESCED
                     )
                 else:
                     message = _make_kv_result_msg(
                         self._instance_rank,
-                        meta.unique_rid,
+                        meta.result_rid,
                         meta.receiver_slice_id,
                         True,
                         AgentResult.FAILED_QUIESCED,
@@ -1080,7 +1096,7 @@ class Sender(SenderBase):
             self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                 _make_kv_result_msg(
                     self._instance_rank,
-                    write_meta.unique_rid,
+                    write_meta.result_rid,
                     write_meta.receiver_slice_id,
                     True,  # is_last_slice — ensures receiver resolves its task future
                     AgentResult.FAILED,
@@ -1113,7 +1129,7 @@ class Sender(SenderBase):
                 self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
                     _make_kv_result_msg(
                         self._instance_rank,
-                        write_meta.unique_rid,
+                        write_meta.result_rid,
                         write_meta.receiver_slice_id,
                         True,  # is_last_slice — ensures receiver resolves its task future
                         AgentResult.FAILED,
@@ -1182,7 +1198,7 @@ class Sender(SenderBase):
             transfer_size = int(write_meta.sizes.sum())
         result_msg = _make_kv_result_msg(
             self._instance_rank,
-            write_meta.unique_rid,
+            write_meta.result_rid,
             write_meta.receiver_slice_id,
             write_meta.is_last_slice,
             agent_result,
@@ -1265,7 +1281,7 @@ class Sender(SenderBase):
                     self._get_result_dealer(write_meta.peer_endpoint).send(
                         _make_aux_result_msg(
                             self._instance_rank,
-                            write_meta.unique_rid,
+                            write_meta.result_rid,
                             AgentResult.FAILED,
                         )
                     )
@@ -1296,13 +1312,13 @@ class Sender(SenderBase):
             if agent_result == AgentResult.IN_DOUBT:
                 self._retain_in_doubt_transfer(
                     write_meta,
-                    _make_aux_result_msg(self._instance_rank, write_meta.unique_rid, agent_result),
+                    _make_aux_result_msg(self._instance_rank, write_meta.result_rid, agent_result),
                 )
                 return
             self._get_result_dealer(write_meta.peer_endpoint).send(
                 _make_aux_result_msg(
                     self._instance_rank,
-                    write_meta.unique_rid,
+                    write_meta.result_rid,
                     agent_result,
                 )
             )
@@ -1536,6 +1552,7 @@ class Sender(SenderBase):
             peer_rank=peer_ri.instance_rank,
             peer_endpoint=peer_ri.self_endpoint,
             unique_rid=task._unique_rid,
+            peer_rid=req_info.unique_rid,
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
@@ -1588,6 +1605,7 @@ class Sender(SenderBase):
             peer_rank=req_info.instance_rank,
             peer_endpoint=peer_ri.self_endpoint,
             unique_rid=task._unique_rid,
+            peer_rid=req_info.unique_rid,
             meta_type=WriteMetaType.AUX,
         )
 
@@ -1709,12 +1727,20 @@ class Sender(SenderBase):
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
-        if self._enforce_physical_ownership and len(message) == 4:
-            # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
-            self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
+        if self._enforce_physical_ownership and len(message) >= 4:
+            # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA. The
+            # receiver's own key rides in the fifth frame when it differs from ours.
+            peer_rid = int(message[4]) if len(message) > 4 else unique_rid
+            self._queue_session_quiescence(
+                unique_rid, message[2].decode(), int(message[3]), peer_rid=peer_rid
+            )
 
     def _queue_session_quiescence(
-        self, unique_rid: int, instance_name: str, instance_rank: int
+        self,
+        unique_rid: int,
+        instance_name: str,
+        instance_rank: int,
+        peer_rid: Optional[int] = None,
     ) -> None:
         """Queue proof on the same worker/socket as this peer's piece results."""
         endpoint = self._registrar.get_peer_rank_info(instance_name, instance_rank).self_endpoint
@@ -1722,7 +1748,7 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown_requested or key in self._pending_session_quiescence:
                 return
-            marker = _SessionQuiescence(unique_rid, instance_rank, endpoint)
+            marker = _SessionQuiescence(unique_rid, instance_rank, endpoint, peer_rid=peer_rid)
             self._pending_session_quiescence[key] = marker
             self._send_task_queues[hash(key) % self._num_threads].put(marker)
 
@@ -1754,7 +1780,7 @@ class Sender(SenderBase):
                 [
                     MessageType.SESSION_QUIESCED,
                     str(self._instance_rank).encode("ascii"),
-                    str(marker.unique_rid).encode("ascii"),
+                    str(marker.result_rid).encode("ascii"),
                 ]
             )
         except Exception as error:
@@ -1768,25 +1794,38 @@ class Sender(SenderBase):
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
+        # The receiver names our TxSession by sender_req_id (the context request's id)
+        # and itself by unique_rid (its own session key); every reply carries the latter.
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
         with self._sessions_lock:
-            session = self._get_session(info.unique_rid)
+            session = self._get_session(info.sender_req_id)
             fenced = (
-                self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
+                self._enforce_physical_ownership and info.sender_req_id in self._pre_cancelled_rids
             )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
                 return
         if fenced:
-            self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
+            self._queue_session_quiescence(
+                info.sender_req_id, info.instance_name, info.instance_rank, peer_rid=info.unique_rid
+            )
             return
         assert session is not None
         with session.lock:
             with self._sessions_lock:
-                if self._get_session(info.unique_rid) is not session or session._closed:
+                if self._get_session(info.sender_req_id) is not session or session._closed:
                     tasks = None
                     terminal = True
                     include_aux = bool(session._claim_unsubmitted_aux_failures_locked((info,)))
+                elif self._is_repeat_request(info):
+                    # The pieces were, or are being, served to this rank's first
+                    # attempt; serving them again would write twice and overrun
+                    # the per-piece transfer count. Refuse the whole request so
+                    # the receiver never sees FAILED for some pieces and writes
+                    # for others. No aux claim: that slot is the first attempt's.
+                    tasks = None
+                    terminal = True
+                    include_aux = bool(getattr(session, "_need_aux", False))
                 else:
                     self._save_peer_req_info(info)
                     tasks = list(session.kv_tasks)
@@ -1882,7 +1921,7 @@ class Sender(SenderBase):
                 )
             else:
                 with self._sessions_lock:
-                    session = self._get_session(info.unique_rid)
+                    session = self._get_session(info.sender_req_id)
                 if session is not None and not session._claim_aux_terminal_result(
                     info.instance_rank
                 ):
@@ -1932,13 +1971,23 @@ class Sender(SenderBase):
             self._dealers[endpoint] = ZMQMessenger(mode="DEALER", endpoint=endpoint)
         return self._dealers[endpoint]
 
+    def _is_repeat_request(self, info: RecvReqInfo) -> bool:
+        """A second REQUEST_DATA for the same piece from the same receiver rank.
+
+        Each piece is asked for once per rank. A repeat means a later generation
+        attempt for the same context request asked again after the first one
+        retired on its side while this session was still live.
+        """
+        prior = (self._get_req_info(info.sender_req_id) or {}).get(info.instance_rank)
+        return prior is not None and prior.slice_id == info.slice_id
+
     def _save_peer_req_info(self, peer_transfer_req_info: RecvReqInfo):
         req_info = peer_transfer_req_info
-        self._add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
+        self._add_req_info(req_info.sender_req_id, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-        if self._is_req_ready(req_info.unique_rid, expected_transfers):
-            session = self._get_session(req_info.unique_rid)
+        if self._is_req_ready(req_info.sender_req_id, expected_transfers):
+            session = self._get_session(req_info.sender_req_id)
             if session is not None and not session.receiver_ready:
                 session.receiver_ready = True
 
@@ -1951,7 +2000,7 @@ class Sender(SenderBase):
     def _has_all_peer_req_infos(self, req_info: RecvReqInfo) -> bool:
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
         expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
-        return self._is_req_ready(req_info.unique_rid, expected_transfers)
+        return self._is_req_ready(req_info.sender_req_id, expected_transfers)
 
     def clear_session(self, unique_rid: int):
         with self._sessions_lock:
@@ -1971,8 +2020,9 @@ class Sender(SenderBase):
                 peer_ri = self._registrar.get_peer_rank_info(
                     req_info.instance_name, req_info.instance_rank
                 )
+                # The receiver matches the cancel by its own key, not ours.
                 self._get_or_connect_dealer(peer_ri.self_endpoint).send(
-                    [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+                    [MessageType.CANCEL_SESSION, str(req_info.unique_rid).encode("ascii")]
                 )
             except Exception as e:
                 logger.warning(f"send_cancel_to_receivers: failed for rid={unique_rid}: {e}")
@@ -2814,9 +2864,11 @@ class Receiver(ReceiverBase):
     def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
         self_ri = self._registrar.self_rank_info
         assert task._unique_rid is not None, "KVRecvTask unique_rid is None"
-        # Some requests arrive with ctx_request_id None while disagg_request_id
-        # is set; disagg_request_id is the receive-session key, so fall back to
-        # it instead of failing here (nvbugs/6482576).
+        # sender_req_id names the ctx TxSession (the context request's id) and
+        # unique_rid names this session; the sender resolves by the former and
+        # answers by the latter. Some requests arrive with ctx_request_id None
+        # while disagg_request_id is set, so fall back to it instead of failing
+        # here (nvbugs/6482576).
         sender_req_id = task._params.ctx_request_id
         if sender_req_id is None:
             sender_req_id = task._params.disagg_request_id
@@ -3131,12 +3183,23 @@ class Receiver(ReceiverBase):
             return self._sender_ep_instance_map[info_endpoint]
 
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
-        """Notify senders and return the endpoints whose cancel message was sent."""
-        message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
+        """Notify senders and return the endpoints whose cancel message was sent.
+
+        ``unique_rid`` is our session key. The sender matches the cancel by its own
+        TxSession key (the context request's id), so that is what the first frame
+        carries; under ownership our key follows so the acknowledgment can find us.
+        """
+        session = self._get_session(unique_rid)
+        sender_rid = unique_rid if session is None else session.sender_request_id
+        message = [MessageType.CANCEL_SESSION, str(sender_rid).encode("ascii")]
         if self._enforce_physical_ownership:
             rank_info = self._registrar.self_rank_info
             message.extend(
-                [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
+                [
+                    rank_info.instance_name.encode(),
+                    str(rank_info.instance_rank).encode("ascii"),
+                    str(unique_rid).encode("ascii"),
+                ]
             )
         sent = set()
         for endpoint in sender_endpoints:
@@ -3351,14 +3414,34 @@ class RxSession(RxSessionBase):
 
     @property
     def disagg_request_id(self) -> int:
+        """This session's own key: the Receiver table, every REQUEST_DATA's ``unique_rid``
+        and every result and cancel the sender returns are matched by it.
+
+        It is this generation request's id, not the context request's. The
+        orchestrator issues a fresh ``disagg_request_id`` for each retry, so two
+        attempts for one context request never share a key and a result still in
+        flight for a retired attempt cannot land on its successor. The sender's
+        session is named separately by ``sender_request_id``.
+        """
         params = self._base_args.params
         if params.disagg_request_id is not None:
             return params.disagg_request_id
-        # ctx_request_id is set on gen-side requests to the ctx server's request ID,
-        # which matches the key the ctx TxSession registered under.  Fall back to
-        # the local request_id only when neither field is available.
         if params.ctx_request_id is not None:
             return params.ctx_request_id
+        return self.request_id
+
+    @property
+    def sender_request_id(self) -> int:
+        """The key the ctx TxSession registered under: the context request's id.
+
+        Goes on the wire as ``RecvReqInfo.sender_req_id`` and in cancels, so the
+        sender can resolve its session whatever id this attempt carries.
+        """
+        params = self._base_args.params
+        if params.ctx_request_id is not None:
+            return params.ctx_request_id
+        if params.disagg_request_id is not None:
+            return params.disagg_request_id
         return self.request_id
 
     @contextmanager
