@@ -352,7 +352,8 @@ def test_create_router_does_not_mutate_router_config_args(monkeypatch):
 
 
 def test_openengine_launch_server_does_not_mutate_llm_args(monkeypatch):
-    oe_server = pytest.importorskip("tensorrt_llm.grpc.openengine.server")
+    from tensorrt_llm.grpc.openengine import server as oe_server
+
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     recorder = _Recorder()
     monkeypatch.setattr(oe_server, "PyTorchLLM", recorder)
@@ -376,7 +377,8 @@ def test_openengine_launch_server_does_not_mutate_llm_args(monkeypatch):
 
 
 def test_openengine_cli_passes_provisioned_connector_config(monkeypatch):
-    oe_server = pytest.importorskip("tensorrt_llm.grpc.openengine.server")
+    from tensorrt_llm.grpc.openengine import server as oe_server
+
     monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
     llm_args = {
         "model": "m",
@@ -409,7 +411,8 @@ def test_openengine_cli_passes_provisioned_connector_config(monkeypatch):
 
 def test_smg_launch_server_does_not_mutate_llm_args(monkeypatch):
     pytest.importorskip("smg_grpc_proto")
-    smg_server = pytest.importorskip("tensorrt_llm.grpc.smg.server")
+    from tensorrt_llm.grpc.smg import server as smg_server
+
     recorder = _Recorder()
     monkeypatch.setattr(smg_server, "PyTorchLLM", recorder)
     llm_args = {
