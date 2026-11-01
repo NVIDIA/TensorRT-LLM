@@ -505,15 +505,18 @@ class TestMoeConfigPerLayerDynamicEplb:
                 prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
                 moe_config={"load_balancer": self._per_layer_dynamic()})
 
-    def test_halo_r_rejects_breakable_prefill_graph(self) -> None:
+    @pytest.mark.parametrize("mode", ["per_layer_resident", "shared_banks"])
+    def test_halo_r_accepts_breakable_prefill_graph(self, mode: str) -> None:
         values = self._per_layer_dynamic()
         values["planner"] = "halo_r"
-        values["helper_slot_mode"] = "shared_banks"
-        with pytest.raises(ValidationError, match="prefill CUDA graphs"):
-            TorchLlmArgs(
-                model=llama_model_path,
-                prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
-                moe_config={"load_balancer": values})
+        values["helper_slot_mode"] = mode
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            prefill_cuda_graph_backend=PrefillCudaGraphBackend.BREAKABLE,
+            moe_config={"load_balancer": values})
+        assert args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE
+        # Decode CUDA graphs stay off for every planner.
+        assert args.cuda_graph_config is None
 
     def test_halo_r_rejects_piecewise_prefill_graph(self) -> None:
         values = self._per_layer_dynamic()

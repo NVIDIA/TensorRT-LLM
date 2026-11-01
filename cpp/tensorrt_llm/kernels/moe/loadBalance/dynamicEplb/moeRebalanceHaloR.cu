@@ -27,6 +27,7 @@
 //     nonzero status word, which also catches the invalid routes and unmappable slots that the route passes record
 //     and continue past. The route consumer therefore never passes its wait for a failed launch, and the last CTA,
 //     which re-checks the status words before it publishes READY, publishes nothing.
+//   - READY and the route counter take constant values (moeRebalanceHaloR.h), so a captured launch replays exactly.
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -196,7 +197,44 @@ __device__ void materializeSelectedRoutes(int const* routes, int* output, int co
     }
 }
 
-//! CTA 0: count exchange, plan, plan publication and route prefix.
+//! CTA 0 thread 0, before the count exchange of an epoch after the first: waits until every rank's previous launch of
+//! this layer has published into this rank's READY row, then zeroes the row. Every launch publishes the constant 1, and
+//! a peer publishes this epoch's READY only after this epoch's exchange, which this rank enters only after the reset,
+//! so this epoch's gate cannot pass on the previous epoch's cells. Returns the first rank whose cell did not arrive
+//! within the bound, or -1.
+__device__ int drainReadyRow(std::uint64_t* row, int ep, long long start, unsigned long long spinCycles)
+{
+    for (int source = 0; source < ep; ++source)
+    {
+        std::uint64_t value;
+        for (;;)
+        {
+            asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(row + source) : "memory");
+            if (value != 0)
+            {
+                break;
+            }
+            if (static_cast<unsigned long long>(clock64() - start) > spinCycles)
+            {
+                return source;
+            }
+        }
+    }
+    // Acquire the values published through the multicast alias before resetting through the unicast alias.
+    asm volatile("fence.proxy.alias;" ::: "memory");
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    for (int source = 0; source < ep; ++source)
+    {
+        asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(row + source), "l"(0ULL) : "memory");
+    }
+    // Order the reset before this rank's exchange arrival; a peer's next READY follows its acquire of that arrival.
+    asm volatile("fence.proxy.alias;" ::: "memory");
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    return -1;
+}
+
+//! CTA 0: READY drain, count exchange, plan, plan publication and route prefix. The drain and the exchange share one
+//! spin bound.
 __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epoch)
 {
     extern __shared__ int shared[];
@@ -205,9 +243,23 @@ __device__ RoleResult planAndPublish(MoeRebalanceHaloRParams const& p, Epoch epo
     int* quota = histogram + p.experts;
     auto* scratch = reinterpret_cast<halo_r::PlannerScratch*>(quota + halo_r::kMaxBroadcasts * p.ep);
     __shared__ int planStatus;
+    __shared__ int missingReady;
+    __shared__ unsigned long long exchangeCycles;
 
+    if (threadIdx.x == 0)
+    {
+        long long const start = clock64();
+        missingReady = epoch > 1 ? drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles) : -1;
+        auto const elapsed = static_cast<unsigned long long>(clock64() - start);
+        exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;
+    }
+    __syncthreads();
+    if (missingReady >= 0)
+    {
+        return RoleResult{"READY drain timeout", missingReady};
+    }
     if (!exchange_counts(reinterpret_cast<unsigned long long const*>(p.peerBases), p.partial, shared, p.ep, p.experts,
-            p.localRank, static_cast<int>(gridDim.x), epoch, p.spinCycles, p.status))
+            p.localRank, static_cast<int>(gridDim.x), epoch, exchangeCycles, p.status))
     {
         return RoleResult{"count exchange timeout", static_cast<int>(epoch)};
     }
@@ -464,7 +516,7 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
             && params.routeAux != nullptr && params.gridSync != nullptr && params.plan != nullptr
             && params.routePrefix != nullptr && params.routeCounter != nullptr && params.sourceTable != nullptr
             && params.destinationTable != nullptr && params.planeBytes != nullptr && params.completedCtas != nullptr
-            && params.counters != nullptr && params.readyFlagMc != nullptr,
+            && params.counters != nullptr && params.readyFlags != nullptr && params.readyFlagMc != nullptr,
         "HALO-R kernel buffers must not be null");
     halo_r::PlannerConfig const cfg{
         params.ep, params.experts, params.helpers, params.sendCount, params.sendWeight, params.localRank};
@@ -481,9 +533,10 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
         params.routeCapacity, params.ep, params.sendWeight);
     TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= halo_r::kRelayMaxPlanes,
         "HALO-R relay supports 1 to %d weight planes, got %d", halo_r::kRelayMaxPlanes, params.planes);
-    TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlagMc) % sizeof(std::uint64_t) == 0
+    TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlags) % sizeof(std::uint64_t) == 0
+            && reinterpret_cast<std::uintptr_t>(params.readyFlagMc) % sizeof(std::uint64_t) == 0
             && reinterpret_cast<std::uintptr_t>(params.routeCounter) % sizeof(std::uint64_t) == 0,
-        "HALO-R READY cell and route counter must be 8-byte aligned");
+        "HALO-R READY row, READY cell and route counter must be 8-byte aligned");
     TLLM_CHECK_WITH_INFO(ctas >= kMinCtas && ctas <= kMaxCtas, "HALO-R kernel needs between %d and %d CTAs, got %d",
         kMinCtas, kMaxCtas, ctas);
 }

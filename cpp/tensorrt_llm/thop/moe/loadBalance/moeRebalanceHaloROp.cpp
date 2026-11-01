@@ -20,6 +20,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda.h>
 #include <torch/custom_class.h>
 #include <torch/extension.h>
 
@@ -38,6 +39,8 @@ namespace torch_ext
 namespace
 {
 
+//! Every launch publishes this READY generation; the kernel drains the READY row before each exchange instead.
+constexpr std::uint64_t kReadyGeneration = 1;
 //! Plan words of the shared per-layer dynamic EPLB layout and its per-field entry count.
 constexpr std::int64_t kPlanWords = 2 + 6 * 384;
 constexpr std::int64_t kPlanFieldStride = 384;
@@ -75,16 +78,18 @@ T* checkedPointer(std::int64_t value, char const* name)
 } // namespace
 
 //! One layer's fused HALO-R kernel on one EP rank (moeRebalanceHaloR.h). It binds every argument the per-layer
-//! launches share, the copy stream (COPY) and the event that forks COPY from the calling stream (MAIN), and prepares
-//! the launch, so that a layer call makes one native call:
+//! launches share, the copy stream (COPY) and the events that fork COPY from the calling stream (MAIN) and join it
+//! back, and prepares the launch, so that each step of a layer call is one native call:
 //!
 //!     submit_fused: MAIN record input_ready; COPY wait input_ready -> fused kernel
+//!     wait_routes:  MAIN wait route counter >= ctas, then write 0 (one batched stream memory operation)
+//!     join:         COPY record copy_idle; MAIN wait copy_idle
 //!
-//! The caller then waits on MAIN for the route counter, which the kernel raises once per CTA, before it reads the
-//! routes. Every launch follows the MAIN work queued before it, which includes the previous consumer of the helper
-//! slots this launch overwrites.
+//! Every launch follows the MAIN work queued before it, which includes the previous consumer of the helper slots this
+//! launch overwrites. The values are constant (READY 1, route target `ctas`), so every step can be captured into a
+//! CUDA graph and replayed, in any interleaving with eager calls.
 //!
-//! A CUDA error in any call poisons the context: every later submit fails with it, and the owner rebuilds the group.
+//! A CUDA error in any call poisons the context: every later call fails with it, and the owner rebuilds the group.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
 {
 public:
@@ -93,9 +98,10 @@ public:
         torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
         torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
         torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
-        std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue, std::int64_t helpersValue,
-        std::int64_t sendCountValue, std::int64_t sendWeightValue, std::int64_t localRankValue, std::int64_t topkValue,
-        std::int64_t routeCapacityValue, std::int64_t ctasValue, std::int64_t copyStream)
+        std::int64_t readyFlagsPtr, std::int64_t readyFlagMcPtr, std::int64_t epValue, std::int64_t expertsValue,
+        std::int64_t helpersValue, std::int64_t sendCountValue, std::int64_t sendWeightValue,
+        std::int64_t localRankValue, std::int64_t topkValue, std::int64_t routeCapacityValue, std::int64_t ctasValue,
+        std::int64_t copyStream)
     {
         int const ep = checkedInt(epValue, "ep");
         int const experts = checkedInt(expertsValue, "experts");
@@ -158,8 +164,9 @@ public:
             residency.has_value() ? residency->data_ptr<int>() : nullptr,
             reinterpret_cast<unsigned*>(relayCompletedCtas.data_ptr<int>()),
             reinterpret_cast<long long*>(relayCounters.data_ptr<std::int64_t>()),
+            checkedPointer<std::uint64_t>(readyFlagsPtr, "ready_flags_ptr"),
             checkedPointer<std::uint64_t>(readyFlagMcPtr, "ready_flag_mc_ptr"),
-            0,
+            kReadyGeneration,
             0,
             ep,
             experts,
@@ -180,6 +187,13 @@ public:
         mLaunch = kernels::prepareMoeRebalanceHaloRLaunch(ep, experts, ctas);
         checkCudaResult(
             cudaEventCreateWithFlags(&mInputReady, cudaEventDisableTiming), "cudaEventCreate(HALO-R input ready)");
+        cudaError_t const error = cudaEventCreateWithFlags(&mCopyIdle, cudaEventDisableTiming);
+        if (error != cudaSuccess)
+        {
+            mCopyIdle = nullptr;
+            releaseEvents();
+            checkCudaResult(error, "cudaEventCreate(HALO-R copy idle)");
+        }
         // The launches read and write these by address; retaining them prevents allocator reuse.
         mTensors = {std::move(outSlots), std::move(outIds), std::move(outOwners), std::move(peerBases),
             std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync), std::move(plan),
@@ -200,14 +214,12 @@ public:
         releaseEvents();
     }
 
-    //! Forks COPY from the current stream and enqueues the fused kernel of generation `generation()`, whose READY
-    //! value it is. The routes must stay unmodified until the caller's route wait.
+    //! Forks COPY from the current stream and enqueues the fused kernel. The routes must stay unmodified until the
+    //! caller's route wait. Capturable.
     void submitFused(torch::Tensor const& routes, std::int64_t spinCycles)
     {
         std::lock_guard<std::mutex> lock(mMutex);
-        requireBound();
-        TORCH_CHECK(mPoison == cudaSuccess, "HALO-R context is poisoned by an earlier CUDA error (",
-            cudaGetErrorString(mPoison), "); a quiesced group rebuild is required");
+        requireOperational();
         TORCH_CHECK_VALUE(routes.is_cuda() && routes.get_device() == mDevice
                 && routes.scalar_type() == at::ScalarType::Int && routes.is_contiguous() && routes.dim() == 2
                 && routes.size(1) == mTopk && routes.numel() <= mParams.routeCapacity,
@@ -218,19 +230,52 @@ public:
         params.validRouteCount = static_cast<int>(routes.numel());
         params.routes = params.validRouteCount > 0 ? routes.data_ptr<int>() : nullptr;
         params.spinCycles = static_cast<unsigned long long>(spinCycles);
-        params.readyValue = mGeneration;
 
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
         cudaStream_t const execution = currentExecutionStream();
-        cudaStreamCaptureStatus capture{cudaStreamCaptureStatusNone};
-        poisonOnError(cudaStreamIsCapturing(execution, &capture), "cudaStreamIsCapturing(HALO-R)");
-        // A captured READY generation would replay a stale value, so capture is refused before COPY joins it.
-        TORCH_CHECK(capture == cudaStreamCaptureStatusNone,
-            "HALO-R submit: ", cudaGetErrorString(cudaErrorStreamCaptureUnsupported));
         poisonOnError(cudaEventRecord(mInputReady, execution), "cudaEventRecord(HALO-R input ready)");
         poisonOnError(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(HALO-R input ready)");
         poisonOnError(kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream), "HALO-R kernel launch");
-        ++mGeneration;
+    }
+
+    //! Orders `stream` (MAIN) after the route release of the last launch: it waits until every CTA has added 1 to the
+    //! route counter and then resets it, in one batched memory operation that holds no SM. The next launch's adds
+    //! follow input_ready, which MAIN records after the reset. Capturable.
+    void waitRoutes(std::int64_t streamHandle)
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireOperational();
+        TORCH_CHECK(streamHandle != 0, "the route wait needs MAIN's stream handle");
+        auto const stream = reinterpret_cast<cudaStream_t>(streamHandle);
+        TORCH_CHECK(stream != mCopyStream, "the route wait must not run on the copy stream");
+        c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
+        CUstreamBatchMemOpParams operations[2]{};
+        operations[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
+        operations[0].waitValue.address = reinterpret_cast<CUdeviceptr>(mParams.routeCounter);
+        operations[0].waitValue.value64 = static_cast<cuuint64_t>(mLaunch.ctas);
+        operations[0].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
+        operations[1].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;
+        operations[1].writeValue.address = reinterpret_cast<CUdeviceptr>(mParams.routeCounter);
+        operations[1].writeValue.value64 = 0;
+        operations[1].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
+        CUresult const result = cuStreamBatchMemOp(reinterpret_cast<CUstream>(stream), 2, operations, 0);
+        if (result != CUDA_SUCCESS)
+        {
+            mPoison = cudaErrorUnknown;
+            TORCH_CHECK(false, "cuStreamBatchMemOp(HALO-R route wait) failed with CUresult ", static_cast<int>(result));
+        }
+    }
+
+    //! Joins COPY back into the current stream (MAIN): MAIN waits for everything queued on COPY so far, the last
+    //! launch's tail included. Capturable; a capture needs it because COPY was forked natively.
+    void join()
+    {
+        std::lock_guard<std::mutex> lock(mMutex);
+        requireOperational();
+        c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
+        cudaStream_t const execution = currentExecutionStream();
+        poisonOnError(cudaEventRecord(mCopyIdle, mCopyStream), "cudaEventRecord(HALO-R copy idle)");
+        poisonOnError(cudaStreamWaitEvent(execution, mCopyIdle, 0), "cudaStreamWaitEvent(HALO-R copy idle)");
     }
 
     //! Waits for COPY and returns the diagnostic counters (launches, receiver copies, receiver skips). For tests and
@@ -265,6 +310,13 @@ private:
         TORCH_CHECK(mBound, "HALO-R state is destroyed");
     }
 
+    void requireOperational() const
+    {
+        requireBound();
+        TORCH_CHECK(mPoison == cudaSuccess, "HALO-R context is poisoned by an earlier CUDA error (",
+            cudaGetErrorString(mPoison), "); a quiesced group rebuild is required");
+    }
+
     void poisonOnError(cudaError_t error, char const* operation)
     {
         if (error != cudaSuccess)
@@ -285,10 +337,13 @@ private:
     void releaseEvents() noexcept
     {
         // A pending record completes normally after its event is destroyed.
-        if (mInputReady != nullptr)
+        for (cudaEvent_t* event : {&mInputReady, &mCopyIdle})
         {
-            static_cast<void>(cudaEventDestroy(mInputReady));
-            mInputReady = nullptr;
+            if (*event != nullptr)
+            {
+                static_cast<void>(cudaEventDestroy(*event));
+                *event = nullptr;
+            }
         }
     }
 
@@ -298,10 +353,9 @@ private:
     std::vector<torch::Tensor> mTensors;
     int mDevice{-1};
     int mTopk{0};
-    //! READY value of the next launch; the caller's generation count starts at 1 too.
-    std::uint64_t mGeneration{1};
     cudaStream_t mCopyStream{nullptr};
     cudaEvent_t mInputReady{nullptr};
+    cudaEvent_t mCopyIdle{nullptr};
     cudaError_t mPoison{cudaSuccess};
     bool mBound{false};
 };
@@ -313,16 +367,16 @@ MoeRebalanceHaloRStatePtr moeRebalanceHaloRCreate(torch::Tensor outSlots, torch:
     torch::Tensor gridSync, torch::Tensor plan, torch::Tensor routePrefix, torch::Tensor routeCounter,
     torch::Tensor relaySources, torch::Tensor relayDestinations, torch::Tensor relayPlaneBytes,
     torch::Tensor relayCompletedCtas, torch::Tensor relayCounters, std::optional<torch::Tensor> residency,
-    std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts, std::int64_t helpers, std::int64_t sendCount,
-    std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk, std::int64_t routeCapacity, std::int64_t ctas,
-    std::int64_t copyStream)
+    std::int64_t readyFlagsPtr, std::int64_t readyFlagMcPtr, std::int64_t ep, std::int64_t experts,
+    std::int64_t helpers, std::int64_t sendCount, std::int64_t sendWeight, std::int64_t localRank, std::int64_t topk,
+    std::int64_t routeCapacity, std::int64_t ctas, std::int64_t copyStream)
 {
     return c10::make_intrusive<MoeRebalanceHaloRState>(std::move(outSlots), std::move(outIds), std::move(outOwners),
         std::move(peerBases), std::move(status), std::move(partial), std::move(routeAux), std::move(gridSync),
         std::move(plan), std::move(routePrefix), std::move(routeCounter), std::move(relaySources),
         std::move(relayDestinations), std::move(relayPlaneBytes), std::move(relayCompletedCtas),
-        std::move(relayCounters), std::move(residency), readyFlagMcPtr, ep, experts, helpers, sendCount, sendWeight,
-        localRank, topk, routeCapacity, ctas, copyStream);
+        std::move(relayCounters), std::move(residency), readyFlagsPtr, readyFlagMcPtr, ep, experts, helpers, sendCount,
+        sendWeight, localRank, topk, routeCapacity, ctas, copyStream);
 }
 
 // The per-layer op takes this handle instead of the custom class, whose conversion costs several microseconds of
@@ -349,6 +403,16 @@ void moeRebalanceHaloRSubmitFused(std::int64_t handle, torch::Tensor const& rout
     stateFromHandle(handle).submitFused(routes, spinCycles);
 }
 
+void moeRebalanceHaloRWaitRoutes(std::int64_t handle, std::int64_t stream)
+{
+    stateFromHandle(handle).waitRoutes(stream);
+}
+
+void moeRebalanceHaloRJoin(std::int64_t handle)
+{
+    stateFromHandle(handle).join();
+}
+
 std::vector<std::int64_t> moeRebalanceHaloRRelayCounts(MoeRebalanceHaloRStatePtr const& state)
 {
     TORCH_CHECK(state, "HALO-R state is null");
@@ -372,14 +436,17 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_rebalance_halo_r_create(Tensor out_slots, Tensor out_ids, Tensor out_owners, Tensor peer_bases, "
         "Tensor status, Tensor partial, Tensor route_aux, Tensor grid_sync, Tensor plan, Tensor route_prefix, "
         "Tensor route_counter, Tensor relay_sources, Tensor relay_destinations, Tensor relay_plane_bytes, "
-        "Tensor relay_completed_ctas, Tensor relay_counters, Tensor? residency, int ready_flag_mc_ptr, int ep, "
-        "int experts, int helpers, int send_count, int send_weight, int local_rank, int topk, int route_capacity, "
+        "Tensor relay_completed_ctas, Tensor relay_counters, Tensor? residency, int ready_flags_ptr, "
+        "int ready_flag_mc_ptr, int ep, int experts, int helpers, int send_count, int send_weight, int local_rank, int "
+        "topk, int route_capacity, "
         "int ctas, int copy_stream) -> "
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState");
     m.def(
         "moe_rebalance_halo_r_handle("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> int");
     m.def("moe_rebalance_halo_r_submit_fused(int handle, Tensor routes, int spin_cycles) -> ()");
+    m.def("moe_rebalance_halo_r_wait_routes(int handle, int stream) -> ()");
+    m.def("moe_rebalance_halo_r_join(int handle) -> ()");
     m.def(
         "moe_rebalance_halo_r_relay_counts("
         "__torch__.torch.classes.trtllm.MoeRebalanceHaloRState state) -> int[]");
@@ -393,6 +460,8 @@ TORCH_LIBRARY_IMPL(trtllm, CompositeExplicitAutograd, m)
     m.impl("moe_rebalance_halo_r_create", &tensorrt_llm::torch_ext::moeRebalanceHaloRCreate);
     m.impl("moe_rebalance_halo_r_handle", &tensorrt_llm::torch_ext::moeRebalanceHaloRHandle);
     m.impl("moe_rebalance_halo_r_submit_fused", &tensorrt_llm::torch_ext::moeRebalanceHaloRSubmitFused);
+    m.impl("moe_rebalance_halo_r_wait_routes", &tensorrt_llm::torch_ext::moeRebalanceHaloRWaitRoutes);
+    m.impl("moe_rebalance_halo_r_join", &tensorrt_llm::torch_ext::moeRebalanceHaloRJoin);
     m.impl("moe_rebalance_halo_r_relay_counts", &tensorrt_llm::torch_ext::moeRebalanceHaloRRelayCounts);
     m.impl("moe_rebalance_halo_r_destroy", &tensorrt_llm::torch_ext::moeRebalanceHaloRDestroy);
 }

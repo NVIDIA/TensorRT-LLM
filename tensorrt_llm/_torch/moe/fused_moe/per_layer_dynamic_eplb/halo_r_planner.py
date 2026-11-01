@@ -4,21 +4,31 @@
 
 HALO-R is a second producer behind HALO-Q's scheduler-group contract
 (``planner.RebalanceSlotSchedulerGroup``): the same generations, route hold,
-route wait, lent routes, lease and spin bound, over the same CUDA scheduler
-buffers. Only the copy endpoint differs. Its one kernel runs on the
+deferred route wait, lent routes, lease and spin bound, over the same CUDA
+scheduler buffers. Only the copy endpoint differs. Its one kernel runs on the
 ``auxiliary_sms`` CTAs on the shared copy stream (COPY):
 
-    MAIN: ... routes(g) -> record input_ready
-    COPY: wait input_ready -> HALO-R(g): scheduler -> route release -> relay -> READY(g)
-    MAIN: wait route counter >= auxiliary_sms * g (first route consumer) -> MegaMoE(g)
+    MAIN: ... routes -> record input_ready
+    COPY: wait input_ready -> HALO-R: READY drain -> scheduler -> route release -> relay -> READY 1
+    MAIN: wait route counter >= auxiliary_sms, write 0 (first route consumer) -> MegaMoE
+    MAIN: (finish) wait copy_idle, recorded on COPY
 
 The scheduler role plans the layer's replicas and writes every route's
 physical slot. Each CTA then adds one to the group's route counter and copies
 its share of the relay: every receiver of an expert pulls its share of the
 expert from the owner and writes it into the helper slot of every receiver.
-The last CTA publishes READY(g) into this rank's cell on every rank, which
+The last CTA publishes READY into this rank's cell on every rank, which
 MegaMoE's gate waits for. A failing CTA traps before it adds to the route
 counter, so MegaMoE never reads routes of a failed launch.
+
+Every value a layer call hands the device is constant: READY is always 1,
+because the next launch of the layer waits for every rank's READY and zeroes
+its row before its count exchange; the route wait targets ``auxiliary_sms``
+and MAIN resets the counter once it passes. A breakable prefill CUDA graph can
+therefore capture whole layer calls and replay them in any interleaving with
+eager calls: MAIN may change between layer calls (the eager warmup and the
+capture of the breakable runner run on its capture stream), and a change
+orders the new MAIN after the old one; COPY joins MAIN in every ``finish``.
 
 Helper bank reuse needs no host barrier: every launch follows the MAIN work
 queued before it, which includes this rank's consumer of the previous
@@ -29,7 +39,7 @@ count exchange, which every rank enters after its own consumers.
 from __future__ import annotations
 
 import threading
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -67,6 +77,8 @@ HALO_R_RELAY_SLICE_BYTES = 8192
 HALO_R_COUNTERS = 3
 #: READY cells are uint64.
 _READY_CELL_BYTES = 8
+#: Every launch publishes this READY generation; see the module docstring.
+_READY_GENERATION = 1
 
 
 def validate_halo_r_geometry(
@@ -132,7 +144,7 @@ def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> 
                 base = int(view.uc_views[rank].data_ptr())
             destinations.append(base)
     flag_mc = int(bound.terminal_mc_ptr) + _READY_CELL_BYTES * ep_rank
-    return sources, destinations, plane_bytes, flag_mc
+    return sources, destinations, plane_bytes, int(bound.terminal_local_ptr), flag_mc
 
 
 class HaloRRelayEndpoint:
@@ -187,7 +199,7 @@ class HaloRRelayEndpoint:
             ctas,
             _threads,
         ) = scheduler.fused_launch_args()
-        sources, destinations, plane_bytes, flag_mc = _relay_tables(
+        sources, destinations, plane_bytes, ready_row, flag_mc = _relay_tables(
             arena, pool, ep_rank=local_rank, home_experts=int(home_experts)
         )
         if len(destinations) != ep * len(plane_bytes):
@@ -228,6 +240,7 @@ class HaloRRelayEndpoint:
             self.completed_ctas,
             self.counters,
             self.residency,
+            ready_row,
             flag_mc,
             ep,
             experts,
@@ -372,6 +385,26 @@ class HaloRRelayEndpoint:
             self._generation = generation + 1
             return generation
 
+    def wait_routes(self, stream_handle: int) -> None:
+        """Queue MAIN's route wait on ``stream_handle``: counter >= CTAs, then reset it to 0."""
+        with self._lock:
+            self._require_operational()
+            try:
+                torch.ops.trtllm.moe_rebalance_halo_r_wait_routes(self._handle, stream_handle)
+            except BaseException:
+                self._handoff_aborted = True
+                raise
+
+    def join(self) -> None:
+        """Order the current stream (MAIN) after everything queued on COPY so far."""
+        with self._lock:
+            self._require_operational()
+            try:
+                torch.ops.trtllm.moe_rebalance_halo_r_join(self._handle)
+            except BaseException:
+                self._handoff_aborted = True
+                raise
+
     def relay_counts(self) -> Tuple[int, int, int]:
         """Return ``(launches, receiver_copies, receiver_skips)`` once COPY is idle.
 
@@ -415,10 +448,14 @@ class HaloRRelayEndpoint:
 class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     """One layer's HALO-R producer behind HALO-Q's scheduler-group contract.
 
-    It overrides only construction. HALO-Q's ``__init__`` builds the TMA
-    copy endpoint, so this one sets the same attributes in the same collective
-    order and builds a ``HaloRRelayEndpoint`` instead; every other method is
-    HALO-Q's. It adds ``forget_helper_residency`` for weight reloads.
+    HALO-Q's ``__init__`` builds the TMA copy endpoint, so this one sets the
+    same attributes in the same collective order and builds a
+    ``HaloRRelayEndpoint`` instead. For CUDA graphs it overrides four more:
+    ``plan_finish`` lends the constant READY generation, ``_wait_route_epoch``
+    waits for the constant route target and resets the counter,
+    ``_check_owner`` lets MAIN change between layer calls behind a MAIN-to-MAIN
+    fence, and ``finish`` joins COPY into MAIN. Every other method is HALO-Q's.
+    It adds ``forget_helper_residency`` for weight reloads.
     """
 
     def forget_helper_residency(self) -> None:
@@ -496,6 +533,8 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         self._lent_rows = -1
         self._lent_routes: Optional[torch.Tensor] = None
         self._execution_stream_handle: Optional[int] = None
+        # Every stream validated as MAIN, kept alive with its handle.
+        self._main_streams: Dict[int, torch.cuda.Stream] = {}
         self._closed = False
         self.scheduler = None
         self.symmetric = None
@@ -594,6 +633,65 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
             self.helper_slots,
             self.auxiliary_sms,
         )
+
+    def _check_owner(self) -> None:
+        """Bind the current stream as MAIN for this layer call.
+
+        HALO-Q binds MAIN once for life. The breakable graph runner warms up
+        and captures on its own capture stream and replays on the execution
+        stream, so MAIN may change between layer calls, never within one. A
+        change orders the new MAIN after the work queued on the old one, whose
+        last route-counter reset the next route wait must follow. A change
+        into a stream that is capturing raises: an event recorded outside the
+        capture cannot be waited on inside it.
+        """
+        if self._closed:
+            raise RuntimeError("Rebalance scheduler group is closed")
+        if torch._C._cuda_getDevice() != self.device:
+            raise RuntimeError("Rebalance submission requires its bound CUDA device")
+        handle = torch._C._cuda_getCurrentRawStream(self.device)
+        if handle == self._execution_stream_handle:
+            return
+        if self._plan_part is not None or self._generation != self._finished_generation:
+            raise RuntimeError("one HALO-R layer call must stay on one MAIN stream")
+        streams = self._main_streams
+        stream = streams.get(handle)
+        if stream is None:
+            stream = torch.cuda.current_stream(self.device)
+            if handle == self._stream_handle or stream.priority <= self.copy_stream.priority:
+                raise RuntimeError("MAIN must be distinct from the higher-priority COPY stream")
+            streams[handle] = stream
+        previous = streams.get(self._execution_stream_handle)
+        if previous is not None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("HALO-R cannot switch MAIN into a stream that is capturing")
+            fence = torch.cuda.Event()
+            fence.record(previous)
+            stream.wait_event(fence)
+        self._execution_stream_handle = handle
+
+    def _wait_route_epoch(self, stream_handle: int) -> None:
+        # A constant target and a reset after it, in one batched memory
+        # operation, so a captured route wait replays exactly.
+        self.broadcaster.wait_routes(stream_handle)
+
+    def plan_finish(
+        self, part: Tuple[Any, int], *, defer_wait: bool = False
+    ) -> Tuple[torch.Tensor, int]:
+        """Lend routes until finish() with the constant READY generation."""
+        physical, _ = super().plan_finish(part, defer_wait=defer_wait)
+        return physical, _READY_GENERATION
+
+    def finish(self, completion_event: torch.cuda.Event | None = None) -> None:
+        """Release this generation as HALO-Q does, then join COPY into MAIN.
+
+        A capture must join COPY, which the launch forked natively, and an
+        eager call's kernel tail must precede a replay of the same layer.
+        MAIN waits only for the tail after READY: MegaMoE, queued before,
+        already waited for READY.
+        """
+        super().finish(completion_event)
+        self.broadcaster.join()
 
 
 def build_halo_r_slot_scheduler_group(

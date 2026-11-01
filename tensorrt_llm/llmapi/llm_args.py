@@ -8322,13 +8322,24 @@ class TorchLlmArgs(BaseLlmArgs):
 
     @model_validator(mode="after")
     def validate_per_layer_dynamic_eplb_cuda_graph(self) -> 'TorchLlmArgs':
-        """Per-layer dynamic EPLB plans cannot be captured in CUDA graphs."""
-        if getattr(self.moe_config.load_balancer, "mode",
-                   None) != "per_layer_dynamic":
+        """Restrict CUDA graphs with per-layer dynamic EPLB.
+
+        Only the HALO-R planner hands the device constant values in every
+        layer call, so only it can be captured, and only in breakable prefill
+        graphs, whose eager breaks leave the MoE layers in captured segments.
+        """
+        load_balancer = self.moe_config.load_balancer
+        if getattr(load_balancer, "mode", None) != "per_layer_dynamic":
             return self
         if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
-            raise ValueError(
-                "per-layer dynamic EPLB does not support prefill CUDA graphs")
+            capturable = (getattr(load_balancer, "planner", "halo_q")
+                          == "halo_r" and self.prefill_cuda_graph_backend
+                          == PrefillCudaGraphBackend.BREAKABLE)
+            if not capturable:
+                raise ValueError(
+                    "per-layer dynamic EPLB does not support prefill CUDA "
+                    "graphs except with planner='halo_r' and "
+                    "prefill_cuda_graph_backend='breakable'")
         if self.cuda_graph_config is not None:
             logger.warning("per-layer dynamic EPLB does not support CUDA "
                            "graphs; setting cuda_graph_config to None.")

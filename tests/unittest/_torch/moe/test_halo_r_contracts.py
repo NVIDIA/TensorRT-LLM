@@ -119,6 +119,24 @@ def _spin_cycles_for_timeout():
     return _extract_function(_SCHEDULER_RUNTIME, "spin_cycles_for_timeout", namespace)
 
 
+class _Stream(SimpleNamespace):
+    def __init__(self, handle, priority, trace):
+        super().__init__(cuda_stream=handle, priority=priority, trace=trace)
+
+    def wait_event(self, event):
+        self.trace.append(("main_wait", self.cuda_stream, event.recorded_on))
+
+
+class _Event:
+    def __init__(self, trace):
+        self.trace = trace
+        self.recorded_on = None
+
+    def record(self, stream):
+        self.recorded_on = stream.cuda_stream
+        self.trace.append(("main_record", stream.cuda_stream))
+
+
 class _Env(SimpleNamespace):
     """A built HALO-R group with the fakes it runs on."""
 
@@ -127,7 +145,9 @@ def _build(
     monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None, helper_residency=False
 ) -> _Env:
     trace = []
-    state = SimpleNamespace(stream=_MAIN, device=0, fail_submit=False, counters=[0, 0, 0])
+    state = SimpleNamespace(
+        stream=_MAIN, device=0, fail_submit=False, counters=[0, 0, 0], capturing=False
+    )
     priorities = {_MAIN: 0, _OTHER_MAIN: 0, _COPY: -1}
 
     def call(name):
@@ -239,6 +259,10 @@ def _build(
         moe_rebalance_halo_r_create=create,
         moe_rebalance_halo_r_handle=lambda ctx: _HANDLE,
         moe_rebalance_halo_r_submit_fused=submit_fused,
+        moe_rebalance_halo_r_wait_routes=lambda handle, stream: trace.append(
+            ("route_wait", handle, stream)
+        ),
+        moe_rebalance_halo_r_join=lambda handle: trace.append(("join", handle, state.stream)),
         moe_rebalance_halo_r_relay_counts=lambda ctx: list(state.counters),
         moe_rebalance_halo_r_destroy=lambda ctx: trace.append(("destroy",)),
     )
@@ -256,9 +280,9 @@ def _build(
         ),
         cuda=SimpleNamespace(
             Stream=object,
-            current_stream=lambda device: SimpleNamespace(
-                cuda_stream=state.stream, priority=priorities[state.stream]
-            ),
+            Event=lambda: _Event(trace),
+            current_stream=lambda device: _Stream(state.stream, priorities[state.stream], trace),
+            is_current_stream_capturing=lambda: state.capturing,
             device=lambda device: nullcontext(),
             synchronize=lambda device: trace.append(("synchronize", device)),
         ),
@@ -268,7 +292,13 @@ def _build(
     monkeypatch.setattr(
         halo_r_planner,
         "_relay_tables",
-        lambda arena, pool, *, ep_rank, home_experts: ([1] * 8, [2] * ep_size, [512], 0x9000),
+        lambda arena, pool, *, ep_rank, home_experts: (
+            [1] * 8,
+            [2] * ep_size,
+            [512],
+            0x8000,
+            0x9000,
+        ),
     )
 
     ep_comm = SimpleNamespace(
@@ -364,25 +394,20 @@ def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(mo
 
 
 @pytest.mark.parametrize("auxiliary_sms", [2, 4, 8, 16])
-def test_generations_accumulate_the_route_target_and_defer_the_route_wait(
-    monkeypatch, auxiliary_sms
-):
+def test_constant_ready_and_route_target_with_the_route_wait_deferred(monkeypatch, auxiliary_sms):
     env = _build(monkeypatch, auxiliary_sms=auxiliary_sms)
     group, trace = env.group, env.trace
     lent = {}
     for generation, rows in enumerate((16, 16, 0), 1):
         trace.clear()
         routes = _Routes(rows)
-        route_wait = (
-            "wait_value",
-            _MAIN,
-            group._route_epoch_ptr,
-            generation * auxiliary_sms,
-            "geq",
-        )
+        # The native route wait waits for the CTA count and resets the counter;
+        # it takes no target from the host, so a replay reproduces it.
+        route_wait = ("route_wait", _HANDLE, _MAIN)
         part = group.plan_schedule(routes)
-        physical, actual = group.plan_finish(part, defer_wait=True)
-        assert actual == generation
+        physical, ready = group.plan_finish(part, defer_wait=True)
+        assert ready == 1
+        assert group._generation == generation
         assert physical.shape == (rows, _TOPK)
         assert lent.setdefault(rows, physical) is physical
         assert route_wait not in trace
@@ -394,28 +419,56 @@ def test_generations_accumulate_the_route_target_and_defer_the_route_wait(
         assert group._routes_in_flight is None
         group.finish()
         assert trace.count(route_wait) == 1
-        assert trace.index(("submit", _HANDLE, rows, _SERVING_SPIN_CYCLES)) < trace.index(
-            route_wait
-        )
-        # Without an event, finish queues no device work.
-        assert not any(entry[0] == "wait_event" for entry in trace)
+        submit = trace.index(("submit", _HANDLE, rows, _SERVING_SPIN_CYCLES))
+        assert submit < trace.index(route_wait) < trace.index(("join", _HANDLE, _MAIN))
         # The previous consumer is proven reusable before the next launch.
         assert env.endpoint._collective_safe_generation == generation - 1
 
 
-def test_main_stream_is_bound_once_and_copy_cannot_be_main(monkeypatch):
+def test_main_may_change_between_layer_calls_behind_a_fence(monkeypatch):
     env = _build(monkeypatch)
-    env.state.stream = _COPY
+    group, trace, state = env.group, env.trace, env.state
+    state.stream = _COPY
     with pytest.raises(RuntimeError, match="distinct from the higher-priority COPY"):
-        env.group.plan_schedule(_Routes(4))
-    env.state.stream = _MAIN
-    _layer_call(env.group, 4)
-    env.state.stream = _OTHER_MAIN
-    with pytest.raises(RuntimeError, match="MAIN stream cannot change"):
-        env.group.plan_schedule(_Routes(4))
-    env.state.device = 1
+        group.plan_schedule(_Routes(4))
+    state.stream = _MAIN
+    _layer_call(group, 4)
+    # A change between layer calls: one record on the old MAIN and one wait on
+    # the new MAIN, both before the launch.
+    trace.clear()
+    state.stream = _OTHER_MAIN
+    _layer_call(group, 4)
+    fence = [entry for entry in trace if entry[0] in ("main_record", "main_wait")]
+    assert fence == [("main_record", _MAIN), ("main_wait", _OTHER_MAIN, _MAIN)]
+    submit = next(i for i, entry in enumerate(trace) if entry[0] == "submit")
+    assert trace.index(("main_wait", _OTHER_MAIN, _MAIN)) < submit
+    assert ("route_wait", _HANDLE, _OTHER_MAIN) in trace and ("join", _HANDLE, _OTHER_MAIN) in trace
+    # Staying on a MAIN needs no fence; going back fences again.
+    trace.clear()
+    _layer_call(group, 4)
+    assert not any(entry[0] in ("main_record", "main_wait") for entry in trace)
+    state.stream = _MAIN
+    _layer_call(group, 4)
+    assert [entry for entry in trace if entry[0] == "main_wait"] == [
+        ("main_wait", _MAIN, _OTHER_MAIN)
+    ]
+    # A change inside a layer call raises.
+    part = group.plan_schedule(_Routes(4))
+    state.stream = _OTHER_MAIN
+    with pytest.raises(RuntimeError, match="must stay on one MAIN stream"):
+        group.plan_finish(part)
+    state.stream = _MAIN
+    group.plan_finish(part)
+    group.finish()
+    # A change into a capturing stream raises; capturing on the bound MAIN does not.
+    state.stream, state.capturing = _OTHER_MAIN, True
+    with pytest.raises(RuntimeError, match="into a stream that is capturing"):
+        group.plan_schedule(_Routes(4))
+    state.stream = _MAIN
+    _layer_call(group, 4)
+    state.device = 1
     with pytest.raises(RuntimeError, match="bound CUDA device"):
-        env.group.plan_schedule(_Routes(4))
+        group.plan_schedule(_Routes(4))
 
 
 @pytest.mark.parametrize(
@@ -457,14 +510,25 @@ def test_each_launch_takes_the_spin_bound_of_its_moment(
     assert launched_cycles() == warmup_cycles
 
 
-def test_finish_waits_on_copy_only_for_a_caller_event(monkeypatch):
+def test_finish_joins_copy_every_call_and_waits_for_a_caller_event(monkeypatch):
     env = _build(monkeypatch)
     _layer_call(env.group, 8)
     assert not any(entry[0] == "wait_event" for entry in env.trace)
+    assert [entry for entry in env.trace if entry[0] == "join"] == [("join", _HANDLE, _MAIN)]
     env.trace.clear()
     _layer_call(env.group, 8, event=SimpleNamespace(cuda_event=0x99))
     assert [entry for entry in env.trace if entry[0] == "wait_event"] == [
         ("wait_event", _COPY, 0x99, 0)
+    ]
+    assert env.trace.index(("wait_event", _COPY, 0x99, 0)) < env.trace.index(
+        ("join", _HANDLE, _MAIN)
+    )
+    # A discarded plan still waits for its routes and joins.
+    env.trace.clear()
+    env.group.discard_plan(env.group.plan_schedule(_Routes(8)))
+    assert [entry[0] for entry in env.trace if entry[0] in ("route_wait", "join")] == [
+        "route_wait",
+        "join",
     ]
     with pytest.raises(ValueError, match="CUDA event"):
         _layer_call(env.group, 8, event=SimpleNamespace(cuda_event=0))
@@ -485,6 +549,8 @@ def test_failed_submit_holds_its_routes_and_aborts_the_endpoint(monkeypatch):
     endpoint = env.endpoint
     for call in (
         lambda: endpoint.submit_fused(endpoint._outputs, _Routes(8), 0, spin_cycles=1),
+        lambda: endpoint.wait_routes(_MAIN),
+        endpoint.join,
         lambda: endpoint.release_generation_after(1),
         lambda: endpoint.mark_collective_reuse_safe(env.group.lease, 1),
         lambda: endpoint.bind_generation_reuse_authority(env.group.lease),
@@ -543,19 +609,19 @@ def test_relay_counts_come_from_the_native_context(monkeypatch):
     assert env.endpoint.relay_counts() == (3, 12, 0)
 
 
-def test_group_overrides_only_construction():
+def test_group_overrides_construction_and_the_four_graph_hooks():
     methods = {
         name for name, value in vars(HaloRSlotSchedulerGroup).items() if inspect.isfunction(value)
     }
     overridden = {name for name in methods if hasattr(RebalanceSlotSchedulerGroup, name)}
-    assert overridden == {"__init__"}
+    assert overridden == {"__init__", "_check_owner", "_wait_route_epoch", "plan_finish", "finish"}
     # The one addition is the weight-reload hook that the layer handle looks up.
     assert methods - overridden == {"forget_helper_residency"}
     assert inspect.signature(HaloRSlotSchedulerGroup.__init__) == inspect.signature(
         RebalanceSlotSchedulerGroup.__init__
     )
     for name, value in vars(RebalanceSlotSchedulerGroup).items():
-        if inspect.isfunction(value) and not name.startswith("_"):
+        if inspect.isfunction(value) and (not name.startswith("_") or name in overridden):
             assert inspect.signature(getattr(HaloRSlotSchedulerGroup, name)) == inspect.signature(
                 value
             )
@@ -611,17 +677,16 @@ def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error():
     _assert_in_order(
         submit,
         (
-            "TORCH_CHECK(mPoison == cudaSuccess",
+            "requireOperational();",
             "TORCH_CHECK_VALUE(routes.is_cuda()",
             "cudaStream_t const execution = currentExecutionStream();",
-            "poisonOnError(cudaStreamIsCapturing(execution, &capture)",
-            "TORCH_CHECK(capture == cudaStreamCaptureStatusNone",
             "poisonOnError(cudaEventRecord(mInputReady, execution)",
             "poisonOnError(cudaStreamWaitEvent(mCopyStream, mInputReady, 0)",
             "poisonOnError(kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream)",
-            "++mGeneration;",
         ),
     )
+    # Capture is allowed: every value the launch hands the device is constant.
+    assert "cudaStreamIsCapturing" not in submit and "kReadyGeneration," in source
     # Every CUDA call of a launch goes through the sticky poison.
     calls = re.findall(r"(\w*)\((cuda\w+|kernels::launch\w+)\(", submit)
     assert calls and all(wrapper == "poisonOnError" for wrapper, _ in calls)
@@ -892,8 +957,8 @@ def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
     # No launch before the reset can still update the table, and every later one reads the reset.
     assert env.trace == [("synchronize", 0), ("fill", table.name, -1), ("synchronize", 0)]
     # The reset does not disturb the generations: the next call proceeds as usual.
-    _, generation = _layer_call(group, 8)
-    assert generation == 3
+    _layer_call(group, 8)
+    assert group._generation == 3
 
 
 def test_weight_reload_without_residency_is_free(monkeypatch):
@@ -927,3 +992,68 @@ def test_planner_reads_the_residency_table_from_shared_memory():
     build = _function_body(planner, "inline PlanStatus buildHelperTable(")
     # Resident experts are placed before the others fill the free slots.
     _assert_in_order(build, ("row[q] == received[r]", "placed[r] = true;", "while (hot[q] >= 0)"))
+
+
+def test_native_route_wait_and_join_are_constant_and_poisoned_together():
+    assert _op_parameters("moe_rebalance_halo_r_wait_routes") == ["handle", "stream"]
+    assert _op_parameters("moe_rebalance_halo_r_join") == ["handle"]
+    source = _HALO_R_OP.read_text()
+    wait = _function_body(source, "void waitRoutes(std::int64_t streamHandle)")
+    _assert_in_order(
+        wait,
+        (
+            "requireOperational();",
+            "operations[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;",
+            "operations[0].waitValue.value64 = static_cast<cuuint64_t>(mLaunch.ctas);",
+            "operations[0].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;",
+            "operations[1].writeValue.operation = CU_STREAM_MEM_OP_WRITE_VALUE_64;",
+            "operations[1].writeValue.value64 = 0;",
+            "cuStreamBatchMemOp(reinterpret_cast<CUstream>(stream), 2, operations, 0)",
+            "mPoison = ",
+        ),
+    )
+    join = _function_body(source, "void join()")
+    _assert_in_order(
+        join,
+        (
+            "requireOperational();",
+            "cudaStream_t const execution = currentExecutionStream();",
+            "poisonOnError(cudaEventRecord(mCopyIdle, mCopyStream)",
+            "poisonOnError(cudaStreamWaitEvent(execution, mCopyIdle, 0)",
+        ),
+    )
+    operational = _function_body(source, "void requireOperational() const")
+    assert "mPoison == cudaSuccess" in operational
+
+
+def test_kernel_drains_ready_before_the_exchange_within_one_bound():
+    kernel_source = (_KERNELS / "moeRebalanceHaloR.cu").read_text()
+    publish = _function_body(kernel_source, "RoleResult planAndPublish(")
+    _assert_in_order(
+        publish,
+        (
+            "long long const start = clock64();",
+            "epoch > 1 ? drainReadyRow(p.readyFlags, p.ep, start, p.spinCycles) : -1;",
+            "exchangeCycles = elapsed < p.spinCycles ? p.spinCycles - elapsed : 1;",
+            'return RoleResult{"READY drain timeout", missingReady};',
+            "exchange_counts(",
+            "epoch, exchangeCycles, p.status)",
+        ),
+    )
+    drain = _function_body(kernel_source, "int drainReadyRow(")
+    _assert_in_order(
+        drain,
+        (
+            '"ld.relaxed.sys.global.u64 %0, [%1];"',
+            "return source;",
+            '"fence.acq_rel.sys;"',
+            '"st.relaxed.sys.global.u64 [%0], %1;"',
+            "return -1;",
+        ),
+    )
+    # The reset is fenced on both sides.
+    reset = drain.index('"st.relaxed.sys.global.u64 [%0], %1;"')
+    assert (
+        drain.count('"fence.acq_rel.sys;"') == 2
+        and drain.index('"fence.acq_rel.sys;"', reset) > reset
+    )

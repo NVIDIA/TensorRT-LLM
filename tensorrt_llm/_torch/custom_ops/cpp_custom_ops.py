@@ -74,6 +74,14 @@ def _register_fake():
     def _(handle: int, routes: torch.Tensor, spin_cycles: int) -> None:
         return None
 
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_wait_routes")
+    def _(handle: int, stream: int) -> None:
+        return None
+
+    @torch.library.register_fake("trtllm::moe_rebalance_halo_r_join")
+    def _(handle: int) -> None:
+        return None
+
     @torch.library.register_fake("trtllm::allreduce")
     def allreduce(
         input: torch.Tensor,

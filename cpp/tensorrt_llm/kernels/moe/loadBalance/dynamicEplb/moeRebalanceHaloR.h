@@ -55,9 +55,9 @@ enum MoeRebalanceHaloRCounter : int
 //! One launch of the fused HALO-R kernel for one MoE layer on one EP rank. The kernel runs on `ctas` CTAs, one per
 //! SM, on the copy stream; every rank launches it once per layer forward, ranks without tokens included.
 //!
-//!   1. Scheduler role. CTA 0 exchanges the routed-token counts with every EP rank, plans the layer's replicas with one
-//!      warp and builds the route prefix of every selected expert; the other CTAs compute stable per-expert ordinals
-//!      and write the physical slot of every route.
+//!   1. Scheduler role. CTA 0 drains this layer's READY row, exchanges the routed-token counts with every EP rank,
+//!      plans the layer's replicas with one warp and builds the route prefix of every selected expert; the other CTAs
+//!      compute stable per-expert ordinals and write the physical slot of every route.
 //!   2. Route release. Each CTA checks every status word and then adds 1 to `routeCounter` with a system-scope
 //!      release. A route consumer on another stream waits until the counter has grown by `ctas`.
 //!   3. Relay. Each CTA copies its share of the expert bundles this rank receives: the receivers of a bundle that do
@@ -68,6 +68,10 @@ enum MoeRebalanceHaloRCounter : int
 //!
 //! Any failure traps before the failing CTA releases its routes, so a consumer never reads routes of a failed launch
 //! and no READY is published for it.
+//!
+//! READY and the route counter take constant values, so that a captured launch replays without host bookkeeping:
+//! every launch publishes READY 1 and, from its second epoch on, first waits for every rank's previous READY in this
+//! rank's row and zeroes it; the route consumer waits for the counter to reach `ctas` and then resets it to 0.
 struct MoeRebalanceHaloRParams
 {
     int const* routes;                //!< [validRouteCount] global logical expert ids, -1 for padding.
@@ -81,7 +85,7 @@ struct MoeRebalanceHaloRParams
     int* gridSync;                    //!< [4] grid rendezvous words and the route-prefix publication epoch.
     int* plan;                        //!< [halo_r::kPlanWords] the layer's plan; word 0 is its publication epoch.
     int* routePrefix;                 //!< [384 * (ep + 1)] per-broadcast destination prefix of this rank's routes.
-    unsigned long long* routeCounter; //!< Route release counter; only grows, by `ctas` per launch.
+    unsigned long long* routeCounter; //!< Each CTA adds 1; the consumer waits for `ctas`, then resets it.
     std::uint64_t const* sourceTable; //!< [experts * planes] address of each expert's plane in its owner's home
                                       //!< rows.
     std::uint64_t const* destinationTable; //!< [ep * planes] address A such that A + row * planeBytes[p] is row `row`
@@ -91,8 +95,9 @@ struct MoeRebalanceHaloRParams
                                            //!< null when the helper slots are shared by several layers.
     unsigned* completedCtas;               //!< [1] zero before the first launch; every launch leaves it zero.
     long long* counters;                   //!< [kHaloRCounters] diagnostic counters.
+    std::uint64_t* readyFlags;             //!< [ep] this layer's READY row on this rank, drained before each exchange.
     std::uint64_t* readyFlagMc;            //!< This rank's READY cell through the multicast view of the READY rows.
-    std::uint64_t readyValue;              //!< READY generation this launch publishes.
+    std::uint64_t readyValue;              //!< READY generation this launch publishes: always 1.
     unsigned long long spinCycles;         //!< Bound of every cross-rank and cross-CTA wait, in SM clock cycles.
     int ep;
     int experts;
