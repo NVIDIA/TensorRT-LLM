@@ -4085,7 +4085,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..c6771a1 100644
+index fa63a02..1a181a3 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4289,20 +4289,44 @@ index fa63a02..c6771a1 100644
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -257,9 +374,10 @@ class FMHAVariantManager:
+@@ -244,6 +361,7 @@ class FMHAVariantManager:
+         self._lock = threading.Lock()
+         self._all_module = None
+         self._all_module_checked = False
++        self._all_module_packaged = False
+         self._inst_template = None
+         self._run_template = None
+ 
+@@ -256,10 +374,13 @@ class FMHAVariantManager:
+ 
      def _ensure_all_module(self):
          if not self._all_module_checked:
-             self._all_module_checked = True
+-            self._all_module_checked = True
 -            if _ALL_VARIANTS_SO.exists():
-+            path = _aot_module_path("variants") or _ALL_VARIANTS_SO
++            packaged = _aot_module_path("variants")
++            path = packaged or _ALL_VARIANTS_SO
 +            if path.exists():
                  import tvm_ffi
 -                self._all_module = tvm_ffi.load_module(str(_ALL_VARIANTS_SO))
 +                self._all_module = tvm_ffi.load_module(str(path))
++                self._all_module_packaged = packaged is not None
++            self._all_module_checked = True
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -455,6 +573,10 @@ def _compile_plan_only():
+@@ -285,8 +406,9 @@ class FMHAVariantManager:
+                     fn = getattr(self._all_module, fn_name)
+                     self._loaded[variant_name] = _VariantWrapper(fn)
+                     return self._loaded[variant_name]
+-                except AttributeError:
+-                    pass
++                except AttributeError as exc:
++                    if self._all_module_packaged:
++                        raise RuntimeError(f"Packaged FMHA library is missing {fn_name}") from exc
+ 
+             # Try per-variant .so
+             cache_dir = CACHE_BASE / variant_name
+@@ -455,6 +577,10 @@ def _compile_plan_only():
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -4313,7 +4337,7 @@ index fa63a02..c6771a1 100644
      lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
      try:
          _do_compile_plan()
-@@ -553,6 +675,11 @@ def get_sparse_topk_module():
+@@ -553,6 +679,11 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
@@ -4325,7 +4349,7 @@ index fa63a02..c6771a1 100644
          lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
          try:
              _do_compile_sparse_topk()
-@@ -638,6 +765,11 @@ def get_reduction_module():
+@@ -638,6 +769,11 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module

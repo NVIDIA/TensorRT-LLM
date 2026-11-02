@@ -111,6 +111,7 @@ def test_packaged_variant_avoids_compiler_and_user_cache(jit_package, monkeypatc
     artifact_dir = _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
     monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+    monkeypatch.setattr(jit.subprocess, "run", lambda *_a, **_k: pytest.fail("unexpected subprocess"))
 
     variant = manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
 
@@ -134,6 +135,33 @@ def test_packaged_helpers_avoid_compiler_and_user_cache(jit_package, monkeypatch
         artifact_dir / "sparse_topk.so",
         artifact_dir / "reduction.so",
     ]
+    assert not cache.exists()
+
+
+def test_broken_packaged_library_never_silently_falls_back(jit_package, monkeypatch):
+    jit, package, cache, _ = jit_package
+    _stage_artifacts(jit, package)
+    manager = jit.FMHAVariantManager()
+    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+
+    def load_broken_library(_path):
+        raise OSError("bad library")
+
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_broken_library)
+    for _ in range(2):
+        with pytest.raises(OSError, match="bad library"):
+            manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert not cache.exists()
+
+
+def test_packaged_library_missing_export_never_silently_falls_back(jit_package, monkeypatch):
+    jit, package, cache, _ = jit_package
+    _stage_artifacts(jit, package)
+    manager = jit.FMHAVariantManager()
+    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", lambda _path: types.SimpleNamespace())
+    with pytest.raises(RuntimeError, match="1_0_1_3_1_0_0"):
+        manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert not cache.exists()
 
 
@@ -189,6 +217,28 @@ def test_source_install_without_artifacts_retains_jit_fallback(jit_package, monk
 
     assert variant.run("input") == ("compiled", "input")
     assert loaded == [cache / jit.CACHE_BASE.name / "1_0_1_3_1_0_0/1_0_1_3_1_0_0.so"]
+
+
+def test_incomplete_legacy_aggregate_still_uses_per_variant_jit(jit_package, monkeypatch):
+    jit, _, cache, _ = jit_package
+    manager = jit.FMHAVariantManager()
+    jit._ALL_VARIANTS_SO.parent.mkdir(parents=True)
+    jit._ALL_VARIANTS_SO.write_bytes(b"old partial aggregate")
+
+    def load_module(path):
+        if Path(path) == jit._ALL_VARIANTS_SO:
+            return types.SimpleNamespace()
+        return types.SimpleNamespace(**{"run_1_0_1_3_1_0_0": lambda value: ("compiled", value)})
+
+    def compile_fixture(name, _params):
+        path = cache / jit.CACHE_BASE.name / name / f"{name}.so"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"JIT fixture")
+
+    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
+    monkeypatch.setattr(manager, "_compile_only", compile_fixture)
+    variant = manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
+    assert variant.run("input") == ("compiled", "input")
 
 
 def test_packaged_gpu_compatibility_is_checked_for_each_device(jit_package, monkeypatch):
