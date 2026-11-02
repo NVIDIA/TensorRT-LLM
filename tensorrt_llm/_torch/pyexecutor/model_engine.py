@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
-import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Hashable, Iterator
@@ -53,6 +52,7 @@ from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import plan_cuda_graphs
 from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
+from .engine.model_setup import resolve_max_num_tokens, resolve_max_seq_len
 from .engine.multimodal import (
     MultimodalItemScheduler,
     is_multimodal,
@@ -1218,91 +1218,11 @@ class ModelEngine:
         except (RuntimeError, AttributeError) as e:
             logger.warning("ModelEngine cleanup failed during destruction: %s", e)
 
-    def _init_max_seq_len(self):
-        # Allow user to override the inferred max_seq_len with a warning.
-        allow_long_max_model_len = os.getenv("TLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").lower() in [
-            "1",
-            "true",
-            "yes",
-            "y",
-        ]
-
-        # Vision encoders may expose their own sequence-length inference.
-        if hasattr(self.model, "infer_max_seq_len"):
-            inferred_max_seq_len = self.model.infer_max_seq_len()
-        else:
-            inferred_max_seq_len = self._infer_max_seq_len_from_config()
-
-        if self.max_seq_len is None:
-            logger.info(
-                f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
-            )
-            self.max_seq_len = inferred_max_seq_len
-        elif inferred_max_seq_len < self.max_seq_len:
-            if allow_long_max_model_len:
-                logger.warning(
-                    f"User specified max_seq_len is larger than the config in the model config file "
-                    f"({inferred_max_seq_len}). Setting max_seq_len to user's specified value {self.max_seq_len}. "
-                )
-            else:
-                # NOTE: py_executor_creator makes sure that the executor uses this
-                # smaller value as its max_seq_len too.
-                logger.warning(
-                    f"Specified {self.max_seq_len=} is larger than what the model can support "
-                    f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
-                )
-                self.max_seq_len = inferred_max_seq_len
-
-    def _infer_max_seq_len_from_config(self) -> int:
-        if hasattr(self.model, "model_config") and self.model.model_config:
-            model_config = self.model.model_config.pretrained_config
-            rope_scaling = getattr(model_config, "rope_scaling", None)
-            rope_factor = 1
-            if rope_scaling is not None:
-                rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
-                if rope_type not in ("su", "longrope", "llama3", "yarn"):
-                    rope_factor = rope_scaling.get("factor", 1.0)
-
-            # Step 1: Find the upper bound of max_seq_len
-            inferred_max_seq_len = 2048
-            max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
-            if max_position_embeddings is None and hasattr(model_config, "text_config"):
-                max_position_embeddings = getattr(
-                    model_config.text_config, "max_position_embeddings", None
-                )
-            if max_position_embeddings is not None:
-                inferred_max_seq_len = max_position_embeddings
-
-            # Step 2: Scale max_seq_len with rotary scaling
-            if rope_factor != 1:
-                inferred_max_seq_len = int(math.ceil(inferred_max_seq_len * rope_factor))
-                logger.warning(
-                    f"max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}"
-                )
-
-            return inferred_max_seq_len
-
-        default_max_seq_len = 8192
-        logger.warning(
-            f"Could not infer max_seq_len from model config, using default value: {default_max_seq_len}"
-        )
-        return default_max_seq_len
-
-    def _init_max_num_tokens(self):
-        # Modified from tensorrt_llm/_bootstrap.py check_max_num_tokens
-        if self.max_num_tokens is None:
-            self.max_num_tokens = self.max_seq_len * self.batch_size
-        if self.max_num_tokens > self.max_seq_len * self.batch_size:
-            logger.warning(
-                f"max_num_tokens ({self.max_num_tokens}) shouldn't be greater than "
-                f"max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size}), "
-                f"specifying to max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size})."
-            )
-            self.max_num_tokens = self.max_seq_len * self.batch_size
-
     def _init_model_capacity(self):
-        self._init_max_seq_len()
-        self._init_max_num_tokens()
+        self.max_seq_len = resolve_max_seq_len(self.model, self.max_seq_len)
+        self.max_num_tokens = resolve_max_num_tokens(
+            self.max_num_tokens, max_seq_len=self.max_seq_len, max_batch_size=self.batch_size
+        )
 
     def _release_model_owned_cuda_graphs(
         self,

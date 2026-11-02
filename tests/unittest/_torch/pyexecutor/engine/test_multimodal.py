@@ -312,7 +312,6 @@ def test_engine_captures_encoder_graphs_with_original_token_budget(
     )
     engine_cls = model_engine.ModelEngine
     monkeypatch.setattr(engine_cls, "_validate_breakable_cuda_graph_compatibility", Mock())
-    monkeypatch.setattr(engine_cls, "_init_model_capacity", engine_cls._init_max_num_tokens)
     monkeypatch.setattr(engine_cls, "__del__", lambda self: None)
     monkeypatch.setattr(
         model_engine,
