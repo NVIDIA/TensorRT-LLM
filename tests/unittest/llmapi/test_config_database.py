@@ -65,7 +65,11 @@ async def _header_middleware(request, call_next):
 
 
 def _load_config_path_to_lookup_entry() -> dict[str, dict]:
-    """Build config_path -> {model, arch?} from database and curated lookup.yaml files."""
+    """Build config_path -> {model, arch?} from database and curated lookup.yaml files.
+
+    A curated recipe-page record (``config_paths``, no model) maps each of its configs to an
+    entry without model or architecture.
+    """
     result = {}
     for lookup_path in ALL_LOOKUP_PATHS:
         if not lookup_path.exists():
@@ -75,7 +79,11 @@ def _load_config_path_to_lookup_entry() -> dict[str, dict]:
         if not entries:
             continue
         for entry in entries:
-            if not isinstance(entry, dict) or "config_path" not in entry:
+            if not isinstance(entry, dict):
+                continue
+            for key in entry.get("config_paths", []):
+                result[key] = {"model": None, "arch": None}
+            if "config_path" not in entry:
                 continue
             key = entry["config_path"]
             result[key] = {"model": entry.get("model"), "arch": entry.get("arch")}
@@ -83,6 +91,22 @@ def _load_config_path_to_lookup_entry() -> dict[str, dict]:
 
 
 _CONFIG_PATH_TO_ENTRY = _load_config_path_to_lookup_entry()
+
+# A recipe qualified as one exact deployment pins settings that equal today's defaults, so that
+# a changed default cannot silently change the configuration that was qualified.
+_BEAM_PINNED_DEFAULTS = (
+    "pipeline_parallel_size",
+    "enable_attention_dp",
+    "attn_backend",
+    "enable_chunked_prefill",
+    "max_num_tokens",
+    "kv_cache_config.enable_block_reuse",
+    "kv_cache_config.use_kv_cache_manager_v2",
+)
+_PINNED_DEFAULT_LEAVES = {
+    f"examples/configs/curated/beam-nvfp4-dflash2-fp8kv-{mode}.yaml": _BEAM_PINNED_DEFAULTS
+    for mode in ("aggregated", "disagg-ctx", "disagg-gen")
+}
 
 
 def _get_default_values_for_config(config_path: Path) -> dict:
@@ -153,7 +177,8 @@ def test_database_yaml_config_does_not_disable_kv_cache_block_reuse(config_path:
 def test_database_yaml_config_does_not_set_default_leaves(config_path: Path):
     config_dict = load_yaml_dict(config_path)
     default_cfg = _get_default_values_for_config(config_path)
-    assert_no_default_valued_leaves(config_dict, default_cfg)
+    pinned = _PINNED_DEFAULT_LEAVES.get(config_path.relative_to(REPO_ROOT).as_posix(), ())
+    assert_no_default_valued_leaves(config_dict, default_cfg, allowlist=pinned)
 
 
 @pytest.mark.part0
@@ -218,6 +243,7 @@ class _MockOpenAIServer:
     def __init__(self, generator, model, **kwargs):
         self.generator = generator
         self.model = model
+        self.app = FastAPI()
 
     def __call__(self, host, port, sockets=None):
         return _noop_serve(host, port, sockets)
@@ -239,7 +265,13 @@ def test_database_yaml_config_serve_cli(config_path: Path):
         serve_main(args=_serve_cli_args(config_path), standalone_mode=False)
     mock_pytorch_llm.assert_called_once()
     call_kwargs = mock_pytorch_llm.call_args[1]
-    llm_args_module.TorchLlmArgs(**call_kwargs)
+    # A recipe's custom tokenizer reads the checkpoint, which dummy/model does not have.
+    custom = load_yaml_dict(config_path).get("custom_tokenizer")
+    with mock.patch.object(llm_args_module, "load_custom_tokenizer", return_value=None) as load:
+        llm_args_module.TorchLlmArgs(**call_kwargs)
+    expected = mock.call(custom, "dummy/model", trust_remote_code=False, use_fast=True)
+    assert all(call == expected for call in load.call_args_list)
+    assert load.called == (custom is not None)
 
 
 def test_apply_fastapi_middlewares_supports_class_and_function():

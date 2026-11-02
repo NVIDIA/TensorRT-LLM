@@ -557,6 +557,12 @@ class KVCacheManager(BaseResourceManager):
             draft_loop_tokens = spec_config.dynamic_tree_max_topK * spec_config.max_draft_len
             self._kv_reserve_draft_tokens = max(self.max_total_draft_tokens,
                                                 draft_loop_tokens)
+        if self.is_draft:
+            from ..speculative.dflash import dflash_block_kv_lookahead
+
+            # A DFlash-family drafter stores its noise block past its draft tokens.
+            self._kv_reserve_draft_tokens += dflash_block_kv_lookahead(
+                spec_config)
 
         # Resolve the per-layer window vector and clamp the pool windows to
         # the same max_seq_len bound, so their window keys agree.

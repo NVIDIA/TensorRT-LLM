@@ -610,6 +610,21 @@
     return curatedEntries.filter((entry) => entry.model === model);
   }
 
+  // Recipe-page records name no model, so a selector limited to some models (data-models)
+  // shows none of them; they carry links only, never a command.
+  function curatedPagesForSelector(payload, allowedModels) {
+    if (allowedModels) return [];
+    return Array.isArray(payload && payload.curated_pages) ? payload.curated_pages : [];
+  }
+
+  // The rendered page lives next to the config DB's _static directory in the docs build.
+  function recipePageHref(page, dbUrl) {
+    if (page.recipe_page_html && dbUrl) {
+      return new URL(`../${page.recipe_page_html}`, dbUrl).toString();
+    }
+    return page.recipe_page_github_url || "";
+  }
+
   function parseCsvModels(s) {
     if (!s) return null;
     const parts = String(s)
@@ -619,7 +634,57 @@
     return parts.length ? parts : null;
   }
 
-  function initOne(container, payload) {
+  function renderCuratedPages(pages, dbUrl) {
+    const panel = el("div", {
+      class: "trtllm-config-selector__curated trtllm-config-selector__pages",
+    });
+    panel.appendChild(
+      el("div", { class: "trtllm-config-selector__curatedHeading" }, [
+        el("span", { text: "Documented deployments" }),
+        el("span", { class: "trtllm-config-selector__curatedBadge", text: "Recipe page" }),
+      ])
+    );
+    const list = el("ul", { class: "trtllm-config-selector__pageList" });
+    for (const page of pages) {
+      const item = el("li", { class: "trtllm-config-selector__page" });
+      item.appendChild(
+        el("a", {
+          class: "trtllm-config-selector__configLink trtllm-config-selector__pageTitle",
+          href: recipePageHref(page, dbUrl),
+          text: page.title,
+        })
+      );
+      if (page.gpu_compatibility) {
+        item.appendChild(
+          el("span", { class: "trtllm-config-selector__curatedGpu", text: page.gpu_compatibility })
+        );
+      }
+      const configs = el("span", { class: "trtllm-config-selector__pageConfigs" });
+      for (const config of page.configs || []) {
+        configs.appendChild(
+          el("a", {
+            class: "trtllm-config-selector__configLink",
+            href: config.config_github_url || config.config_raw_url || "",
+            target: "_blank",
+            rel: "noopener",
+            text: config.config_filename || config.config_path,
+          })
+        );
+      }
+      item.appendChild(configs);
+      list.appendChild(item);
+    }
+    panel.appendChild(list);
+    panel.appendChild(
+      el("div", {
+        class: "trtllm-config-selector__curatedHint",
+        text: "The page lists the required inputs and launch steps; there is no one-line command.",
+      })
+    );
+    return panel;
+  }
+
+  function initOne(container, payload, dbUrl) {
     const allowedModels = parseCsvModels(container.getAttribute("data-models"));
 
     const allEntries = Array.isArray(payload.entries) ? payload.entries : [];
@@ -795,6 +860,8 @@
     container.appendChild(form);
     container.appendChild(output);
     container.appendChild(errorBox);
+    const pages = curatedPagesForSelector(payload, allowedModels);
+    if (pages.length) container.appendChild(renderCuratedPages(pages, dbUrl));
 
     const yamlCache = new Map();
     let currentEntry = null;
@@ -1267,7 +1334,7 @@
 
     try {
       const payload = await loadDb(dbUrl);
-      for (const c of containers) initOne(c, payload);
+      for (const c of containers) initOne(c, payload, dbUrl);
     } catch (err) {
       const hint = isFileProtocol()
         ? "\n\nThis page requires an HTTP server. " +
@@ -1287,11 +1354,13 @@
       buildDomains,
       createSelectorViewModel,
       curatedEntriesForModel,
+      curatedPagesForSelector,
       filterEntriesByState,
       formatCommand,
       formatCuratedCommand: formatCommand,
       nextStateAfterSelection,
       normalizeState,
+      recipePageHref,
       validatedCommitUrl,
     };
   }

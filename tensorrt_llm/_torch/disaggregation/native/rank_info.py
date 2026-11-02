@@ -49,6 +49,13 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    # Semantic identity of the cached state (model, layout, cache format, scales and the
+    # transferred managers), compared by the peer registrar before any transfer; None for
+    # peers that declare none. Carries digests only, never scale values or weights.
+    cache_identity: Optional[dict] = None
+    # Layers a unified KV cache manager owns for the drafter (layer specs with
+    # a DRAFT owner). They ride the target's pages, so both peers must agree.
+    num_draft_layers: int = 0
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -70,6 +77,7 @@ class RankInfo:
         kv_cache_manager: KVCacheManager,
         device_id: int,
         aux_buffer_meta: Optional[AuxBufferMeta] = None,
+        cache_identity: Optional[dict] = None,
     ) -> "RankInfo":
         m = kv_cache_manager.mapping
         kvm = kv_cache_manager
@@ -114,6 +122,10 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
+            cache_identity=cache_identity,
+            num_draft_layers=(
+                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
+            ),
         )
 
     @classmethod

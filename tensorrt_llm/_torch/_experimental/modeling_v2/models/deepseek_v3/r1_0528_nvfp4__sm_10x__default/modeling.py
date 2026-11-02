@@ -106,9 +106,9 @@ _CACHED_CTX_FIELDS = (
 )
 
 
-def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
+def _build_step_args(md: TrtllmAttentionMetadata, num_contexts: int, num_ctx_tokens: int) -> dict:
     """Project the prepared metadata onto the batch state both MLA attention calls of one
-    forward share."""
+    forward share; the caller states the step's context counts."""
     return dict(
         sequence_length=md.kv_lens_cuda_runtime,
         host_past_key_value_lengths=md.kv_lens_runtime,
@@ -127,8 +127,8 @@ def _build_step_args(md: TrtllmAttentionMetadata) -> dict:
         attention_window_size=md.max_seq_len,
         rope_max_positions=md.max_seq_len,
         rope_original_max_positions=md.max_seq_len,
-        num_contexts=md.num_contexts,
-        num_ctx_tokens=md.num_ctx_tokens,
+        num_contexts=num_contexts,
+        num_ctx_tokens=num_ctx_tokens,
         trtllm_gen_jit_warmup=md.trtllm_gen_jit_warmup,
         max_num_sequences=md.max_num_sequences,
         force_prepare_spec_dec_tree_mask=md.force_prepare_spec_dec_tree_mask,
@@ -895,7 +895,7 @@ class PrefillTarget:
 
     def step_args(self, md: TrtllmAttentionMetadata) -> dict:
         """The batch state both MLA calls of one step share."""
-        return _build_step_args(md)
+        return _build_step_args(md, md.num_contexts, md.num_ctx_tokens)
 
     def forward(
         self,
@@ -1470,10 +1470,7 @@ class DecodeTarget:
         only when `num_contexts` is zero, so reading them would ask the metadata to
         confirm what the routing already decided.
         """
-        step = _build_step_args(md)
-        step["num_contexts"] = 0
-        step["num_ctx_tokens"] = 0
-        return step
+        return _build_step_args(md, num_contexts=0, num_ctx_tokens=0)
 
     def forward(
         self,

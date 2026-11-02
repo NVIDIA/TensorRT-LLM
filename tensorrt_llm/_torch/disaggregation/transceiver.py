@@ -239,7 +239,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
+        cache_identity: Optional[dict] = None,
+        context_state_exporter: Optional[Callable[[LlmRequest], Optional[bytes]]] = None,
+        context_state_validator: Optional[Callable[[LlmRequest], Optional[str]]] = None,
     ):
+        """``cache_identity`` is the semantic identity peers must match before any transfer;
+        draft layers the KV cache manager owns travel with the target's pages.
+        ``context_state_exporter`` returns the model's handoff record for a finished context
+        request (a dict, see ``native.auxiliary.encode_handoff_record``); it travels in the
+        request's auxiliary slot, inside the same transfer session as the KV pages.
+        ``context_state_validator`` checks the received record on the generation side once
+        the session completes, before the request becomes transmission-complete, and
+        returns an error message to fail the request, else None.
+        """
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise ValueError(
                 "KvCacheTransceiverV2 does not support KV cache manager V1. "
@@ -277,6 +289,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             _retirement_executor_comm(mapping) if enforce_physical_ownership else None
         )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
+        self._context_state_exporter = context_state_exporter
+        self._context_state_validator = context_state_validator
+        # Every session then moves the auxiliary slot, which carries the handoff record.
+        self._transfer_handoff_aux = (
+            context_state_exporter is not None or context_state_validator is not None
+        )
 
         self._device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self._device_id} in KvCacheTransceiverV2")
@@ -325,6 +343,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     else 0
                 ),
                 agent_bounce_params=cache_transceiver_config.agent_bounce_params,
+                cache_identity=cache_identity,
+                transfer_handoff_aux=self._transfer_handoff_aux,
             )
         )
         if enforce_physical_ownership:
@@ -658,6 +678,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             return False
         return True
 
+    def _accept_context_state(self, session, req: LlmRequest) -> bool:
+        """Read a completed session's handoff record into ``req`` and validate it.
+
+        Runs once the session (KV pages and auxiliary slot) has completed and before the
+        request becomes transmission-complete, so a record that does not fit fails the
+        request before any received state is used. Every rank receives the same record from
+        its peer rank and checks it against the same local state.
+        """
+        if not getattr(self, "_transfer_handoff_aux", False):
+            return True
+        session.unpack_handoff(req)
+        validator = getattr(self, "_context_state_validator", None)
+        error = validator(req) if validator is not None else None
+        if error is None:
+            return True
+        logger.error(
+            f"Disagg generation request {req.py_request_id}: rejecting the received context "
+            f"handoff before decoding: {error}"
+        )
+        return False
+
     def _ctx_consensus(self, local_ids: list) -> list:
         # TP consensus: ensure all TP ranks have peer info
         sync_size = self._dist.tp_size if self._ctx_need_tp_sync else 1
@@ -976,7 +1017,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         """Pack aux and set context phase params. Call after the last slice."""
         rid = get_unique_rid(req)
         assert rid is not None
-        if self._need_aux_transfer(req):
+        handoff_aux = getattr(self, "_transfer_handoff_aux", False)
+        if handoff_aux:
+            # Frozen now, after the context forward and before the request's model-side
+            # state can be recycled; the generation worker validates it on arrival.
+            exporter = self._context_state_exporter
+            req.py_disagg_handoff = exporter(req) if exporter is not None else None
+        if self._need_aux_transfer(req) or handoff_aux:
             session.pack_aux(req)
             session.send_aux()
         req.context_phase_params = ContextPhaseParams(
@@ -1133,7 +1180,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._recv_reqs[rid] = req
             result = session.wait_complete(blocking=True)
 
-            if result == WaitResult.COMPLETED:
+            if result == WaitResult.COMPLETED and not self._accept_context_state(session, req):
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            elif result == WaitResult.COMPLETED:
                 # Verified-range reuse admission (local verdict; this
                 # blocking path has no cross-rank outcome consensus).
                 req.py_kv_transfer_verified = session.kv_write_verified()
@@ -1349,6 +1398,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 req = self._recv_reqs[rid]
+                if not self._accept_context_state(session, req):
+                    # Received, but the handoff record does not fit: fail the request
+                    # through the consensus below rather than decode from it.
+                    failed.append(rid)
+                    continue
                 if session.transfer_end_time is not None:
                     req.set_kv_cache_transfer_end(session.transfer_end_time)
                 if session.kv_cache_size_bytes > 0:

@@ -265,6 +265,35 @@
       "scenario": "Max Throughput"
     }
   ],
+  "curated_pages": [
+    {
+      "configs": [
+        {
+          "config_filename": "beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+          "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+          "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml",
+          "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-aggregated.yaml"
+        },
+        {
+          "config_filename": "beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+          "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+          "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml",
+          "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-ctx.yaml"
+        },
+        {
+          "config_filename": "beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+          "config_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+          "config_path": "examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml",
+          "config_raw_url": "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/examples/configs/curated/beam-nvfp4-dflash2-fp8kv-disagg-gen.yaml"
+        }
+      ],
+      "gpu_compatibility": "GB300: one 4-GPU node (aggregated) or two 4-GPU nodes (disaggregated)",
+      "recipe_page": "docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md",
+      "recipe_page_github_url": "https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/deployment-guide/deployment-guide-for-beam-on-trtllm.md",
+      "recipe_page_html": "deployment-guide/deployment-guide-for-beam-on-trtllm.html",
+      "title": "Beam NVFP4 with DFlash2 and FP8 KV cache (aggregated and disaggregated)"
+    }
+  ],
   "entries": [
     {
       "command": "trtllm-serve deepseek-ai/DeepSeek-R1-0528 --config ${TRTLLM_DIR}/examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp4_conc8.yaml",

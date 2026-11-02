@@ -57,6 +57,7 @@ from .layout_bf16 import (
     HEAD,
     WORLD_SIZE,
     TensorSpec,
+    _get,
     check_config,
     check_rank,
 )
@@ -374,3 +375,45 @@ def check_checkpoint(checkpoint_dir: Any) -> dict:
     check_config(config)
     check_recipe(read_config(checkpoint_dir, QUANT_CONFIG_FILE), tensor_specs(config))
     return config
+
+
+def check_drafter_config(drafter: Any, target_config: Mapping, target_layer_ids) -> None:
+    """Raise ValueError unless ``drafter`` is a DFlash 2 drafter this target can serve.
+
+    ``drafter`` is the drafter checkpoint's config.json (a mapping, or an object with those
+    fields). The drafter reads the target's completed block outputs at ``target_layer_ids``
+    (zero-based logical layers, ascending), shares the target's vocabulary, embedding and
+    head (no draft to target id map), runs the DFlash 2 recipe (block convolutions and the
+    candidate selector) at the target's hidden size, and declares its own unary logit softcap.
+    """
+    dflash = _get(drafter, "dflash_config") or {}
+    problems = []
+    hidden = _get(drafter, "hidden_size")
+    if hidden != target_config["hidden_size"]:
+        problems.append(f"hidden_size {hidden} != {target_config['hidden_size']}")
+    vocab = target_config["vocab_size"]
+    for key in ("vocab_size", "draft_vocab_size"):
+        value = _get(drafter, key)
+        if value is not None and value != vocab:
+            problems.append(f"{key} {value} != the target's {vocab}")
+    num_layers = bf16_layout.SUPPORTED_CONFIG["num_hidden_layers"]
+    layers = list(target_layer_ids or [])
+    if (
+        not layers
+        or layers != sorted(set(layers))
+        or not all(type(i) is int and 0 <= i < num_layers for i in layers)
+        or layers != list(dflash.get("target_layer_ids") or [])
+    ):
+        problems.append(
+            f"target_layer_ids {layers} must be the drafter's own ascending, distinct layers in "
+            f"0..{num_layers - 1} (dflash_config: {dflash.get('target_layer_ids')})"
+        )
+    for key in ("conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"):
+        if not int(dflash.get(key, 0) or 0) > 0:
+            problems.append(f"dflash_config.{key} is missing")
+    if dflash.get("final_logit_softcapping") is None:
+        problems.append("dflash_config.final_logit_softcapping is missing")
+    if problems:
+        raise ValueError(
+            "the drafter is not a DFlash 2 drafter of this target: " + "; ".join(problems)
+        )

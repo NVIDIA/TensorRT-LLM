@@ -123,26 +123,204 @@ def test_every_target_ships_both_products():
                 assert (target_dir / product).is_file(), f"{name}: missing {product}"
 
 
+_PACKAGE = _modeling_v2.__name__
+
+
+def _dotted(root: Path, package: str, path: Path) -> str:
+    """The dotted module name of ``path``, a file of the tree rooted at ``root``."""
+    parts = list(path.relative_to(root).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join([package, *parts])
+
+
+def _module_file(root: Path, package: str, dotted: str):
+    """The file defining module ``dotted`` inside the tree, or None (outside it, or a name)."""
+    if dotted != package and not dotted.startswith(package + "."):
+        return None
+    rel = dotted[len(package) :].lstrip(".").replace(".", "/")
+    for candidate in (root / (rel + ".py"), root / rel / "__init__.py"):
+        if rel and candidate.is_file():
+            return candidate
+    return None
+
+
+def _imported_modules(root: Path, package: str, path: Path) -> list[tuple[str, int]]:
+    """Every module an import in ``path`` names, as absolute dotted names, with its line.
+
+    Absolute and relative ``import`` / ``from ... import`` statements at any depth (a
+    function-local import executes all the same); an alias changes nothing about what is
+    imported. ``from P import n`` names the module ``P.n`` when that is a module of the tree
+    (a submodule imported through its package) and ``P`` otherwise (a name re-exported by P).
+    """
+    module = _dotted(root, package, path)
+    here = module if path.name == "__init__.py" else module.rsplit(".", 1)[0]
+    found = []
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.Import):
+            found.extend((alias.name, node.lineno) for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = here.split(".")[: len(here.split(".")) - (node.level - 1)]
+                source = ".".join(base + ([node.module] if node.module else []))
+            else:
+                source = node.module or ""
+            for alias in node.names:
+                submodule = f"{source}.{alias.name}"
+                named = submodule if _module_file(root, package, submodule) else source
+                found.append((named, node.lineno))
+    return found
+
+
+def _isolation_violations(root: Path, package: str, target_dir: Path) -> list[str]:
+    """Imports in a target's production closure that leave what it may use.
+
+    A target may import its own package, the catalog, the router index, its family's
+    routing module and the packages on its own path (their ``__init__``). The closure
+    follows every module of the target and of the catalog it reaches, so a forbidden
+    module cannot hide behind an alias, a relative form, a function-local import or a
+    re-export through the catalog.
+    """
+    target = _dotted(root, package, target_dir / "__init__.py")
+    family = target.rsplit(".", 1)[0]
+    catalog = f"{package}.catalog"
+    allowed_exact = {
+        package,
+        f"{package}.models",
+        family,
+        f"{package}._router_index",
+        f"{family}.routing",
+    }
+
+    def allowed(dotted: str) -> bool:
+        return (
+            dotted in allowed_exact
+            or dotted == target
+            or dotted.startswith(target + ".")
+            or dotted == catalog
+            or dotted.startswith(catalog + ".")
+        )
+
+    pending = sorted(target_dir.rglob("*.py"))
+    seen = set(pending)
+    violations = []
+    while pending:
+        path = pending.pop()
+        for dotted, line in _imported_modules(root, package, path):
+            file = _module_file(root, package, dotted)
+            if file is None:
+                if dotted == package or dotted.startswith(package + "."):
+                    violations.append(
+                        f"{path.relative_to(root)}:{line} imports {dotted}, no module"
+                    )
+                continue  # outside this tree: torch, the runtime, the native extension
+            if not allowed(dotted):
+                violations.append(f"{path.relative_to(root)}:{line} imports {dotted}")
+                continue
+            if file not in seen and (dotted.startswith(target) or dotted.startswith(catalog)):
+                seen.add(file)
+                pending.append(file)
+    return sorted(violations)
+
+
 def test_targets_do_not_share_files():
     """Isolation is the property being demonstrated; measure it.
 
-    Targets are allowed to import the catalog and nothing else of each
-    other's. A shared helper between two targets is the first step back to
-    the abstraction this package exists to avoid.
+    Targets are allowed to import the catalog and nothing else of each other's -- nor of
+    the earlier single-purpose components of their family, whose code a target owns
+    itself when it needs it. A shared helper between two targets is the first step back
+    to the abstraction this package exists to avoid. Checked over every routed target's
+    whole import closure, with no exemption for any target.
     """
+    violations = []
     for arch in _ARCHS:
-        for target_dir, name in _routed_targets(arch):
-            for source_file in target_dir.glob("*.py"):
-                text = source_file.read_text()
-                for match in re.finditer(r"^from (\.+)([\w.]*) import", text, re.MULTILINE):
-                    dots, tail = match.group(1), match.group(2)
-                    if len(dots) == 1:
-                        continue  # sibling within the target
-                    assert tail.startswith("catalog"), (
-                        f"{name}: {source_file.name} reaches outside its own "
-                        f"directory for {tail!r}; targets may import the "
-                        f"catalog and nothing else"
-                    )
+        for target_dir, _ in _routed_targets(arch):
+            violations += _isolation_violations(_ROOT, _PACKAGE, target_dir)
+    assert not violations, "targets reach outside their directory and the catalog: " + (
+        "; ".join(violations)
+    )
+
+
+def _write_tree(root: Path, files: dict) -> None:
+    for rel, source in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+
+
+_FIXTURE_TREE = {
+    "__init__.py": "",
+    "_router_index.py": "",
+    "catalog/__init__.py": "",
+    "catalog/norm/__init__.py": "",
+    "catalog/norm/rmsnorm.py": "",
+    "models/__init__.py": "",
+    "models/fam/__init__.py": "",
+    "models/fam/routing.py": "",
+    "models/fam/old_component/__init__.py": "",
+    "models/fam/old_component/model.py": "",
+    "models/fam/target__sm_100__tp1/__init__.py": "",
+    "models/fam/target__sm_100__tp1/helper.py": "",
+    "models/fam/target__sm_100__tp1/modeling.py": "",
+}
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "from pkg.models.fam.old_component.model import Block\n",
+        "from ..old_component.model import Block\n",
+        "import pkg.models.fam.old_component.model as m\n",
+        "from ..old_component import model\n",
+        "from pkg.models.fam import old_component\n",
+        "def build():\n    from ..old_component.model import Block\n    return Block\n",
+    ],
+    ids=["absolute", "relative", "aliased", "package-submodule", "package", "function-local"],
+)
+def test_isolation_gate_rejects_every_import_form(tmp_path, source):
+    _write_tree(tmp_path, {**_FIXTURE_TREE, "models/fam/target__sm_100__tp1/modeling.py": source})
+    target = tmp_path / "models/fam/target__sm_100__tp1"
+    assert _isolation_violations(tmp_path, "pkg", target), source
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        # Through the target's own helper module.
+        {"models/fam/target__sm_100__tp1/helper.py": "from ..old_component.model import Block\n"},
+        # Through the catalog: an entry re-exporting a component.
+        {
+            "catalog/norm/rmsnorm.py": "from pkg.models.fam.old_component.model import Block\n",
+            "models/fam/target__sm_100__tp1/helper.py": "from ....catalog.norm.rmsnorm import Block\n",
+        },
+    ],
+    ids=["own-helper", "catalog-re-export"],
+)
+def test_isolation_gate_follows_the_closure(tmp_path, files):
+    _write_tree(
+        tmp_path,
+        {
+            **_FIXTURE_TREE,
+            **files,
+            "models/fam/target__sm_100__tp1/modeling.py": "from . import helper\n",
+        },
+    )
+    assert _isolation_violations(tmp_path, "pkg", tmp_path / "models/fam/target__sm_100__tp1")
+
+
+def test_isolation_gate_accepts_the_allowed_imports(tmp_path):
+    source = (
+        "from . import helper\n"
+        "from .helper import name\n"
+        "from pkg.models.fam.target__sm_100__tp1 import helper as h\n"
+        "from pkg.catalog.norm.rmsnorm import rmsnorm\n"
+        "from ....catalog.norm import rmsnorm as r\n"
+        "from pkg._router_index import NoTarget\n"
+        "from ..routing import LIMIT\n"
+        "import torch\n"
+    )
+    _write_tree(tmp_path, {**_FIXTURE_TREE, "models/fam/target__sm_100__tp1/modeling.py": source})
+    assert _isolation_violations(tmp_path, "pkg", tmp_path / "models/fam/target__sm_100__tp1") == []
 
 
 def test_every_entry_with_cells_has_a_test_that_drives_them():
@@ -188,6 +366,63 @@ def _core_modules() -> list[Path]:
     ]
 
 
+def _decode_phase_reads(source: str) -> list[str]:
+    """Phase reads in what a module's ``DecodeTarget`` executes: ``Class.method:line .field``.
+
+    Starts at ``DecodeTarget.forward`` and follows, with a visited set, every ``self.m(...)``
+    and ``super().m(...)`` call through the class's bases defined in the module (so an
+    inherited or delegated body such as ``_Target._run`` is read where it is written) and
+    every call of a module-level function of the module. Calls into other modules (the
+    component the target drives) are not followed.
+    """
+    tree = ast.parse(source)
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+    functions = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    if "DecodeTarget" not in classes:
+        return []
+
+    def mro(name: str) -> list:
+        order, todo = [], [name]
+        while todo:
+            current = todo.pop(0)
+            if current in classes and current not in order:
+                order.append(current)
+                todo += [b.id for b in classes[current].bases if isinstance(b, ast.Name)]
+        return order
+
+    def method(cls_name: str, name: str, start: int = 0):
+        for owner in mro(cls_name)[start:]:
+            for node in classes[owner].body:
+                if isinstance(node, ast.FunctionDef) and node.name == name:
+                    return owner, node
+        return None
+
+    reads, visited = [], set()
+    pending = [method("DecodeTarget", "forward")]
+    while pending:
+        item = pending.pop()
+        if item is None or (item[0], item[1].name) in visited:
+            continue
+        visited.add((item[0], item[1].name))
+        owner, fn = item
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Attribute) and node.attr in _PHASE_FIELDS:
+                reads.append(f"{owner}.{fn.name}:{node.lineno} .{node.attr}")
+            if not isinstance(node, ast.Call):
+                continue
+            callee = node.func
+            if isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Name):
+                if callee.value.id == "self":
+                    pending.append(method("DecodeTarget", callee.attr))
+            elif isinstance(callee, ast.Attribute) and isinstance(callee.value, ast.Call):
+                inner = callee.value.func
+                if isinstance(inner, ast.Name) and inner.id == "super":
+                    pending.append(method(owner, callee.attr, start=1))
+            elif isinstance(callee, ast.Name) and callee.id in functions:
+                pending.append(("<module>", functions[callee.id]))
+    return sorted(set(reads))
+
+
 def test_a_decode_target_never_reads_the_phase_back():
     """Decode is routed to only when there are no context rows. Reading the
     count back inside it is not a redundancy, it is the design being violated:
@@ -198,33 +433,92 @@ def test_a_decode_target_never_reads_the_phase_back():
     needs `num_ctx_tokens` to split it. The asymmetry is the design, not an
     oversight.
 
-    Scoped to the `DecodeTarget` class node rather than inverted over the
-    whole module: that inversion existed only while a decode body could be
-    inherited from a shared base, where `DecodeTarget`'s own node held just
-    the literal-args `step_args` call and a gate keyed on the class name saw
-    nothing of the forward that actually ran. Every target in this tree is
-    now a complete, independent class -- `DecodeTarget.forward` is not
-    inherited from anywhere -- so the class node is once again the target's
-    whole body, and the direct form catches a violation planted anywhere in
-    it.
+    Read over what a `DecodeTarget` executes, not only its class node: its own
+    methods, the bodies it inherits from or delegates to in its module (a shared
+    `_Target._run`) and the module's helper functions it calls.
 
     Read by parsing rather than by importing, like everything else in this
     file: no GPU, no built extensions.
     """
     offenders = []
     for path in _core_modules():
-        if not path.is_file():
-            continue
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ClassDef) or node.name != "DecodeTarget":
-                continue
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Attribute) and inner.attr in _PHASE_FIELDS:
-                    offenders.append(f"{path.relative_to(_ROOT)}:{inner.lineno} .{inner.attr}")
+        if path.is_file():
+            offenders += [
+                f"{path.relative_to(_ROOT)} {r}" for r in _decode_phase_reads(path.read_text())
+            ]
     assert not offenders, "a decode target reads the phase it was routed on: " + ", ".join(
         offenders
     )
+
+
+_PHASE_FIXTURE_BASE = """
+class _Target:
+    def _run(self, md, rows):
+        return self.model(md, rows)
+
+    def _rows(self, md):
+        return None
+
+
+class PrefillTarget(_Target):
+    def forward(self, md):
+        return self._run(md, md.num_ctx_tokens)
+"""
+
+
+@pytest.mark.parametrize(
+    "decode",
+    [
+        # Direct: the decode body branches on the phase.
+        "class DecodeTarget(_Target):\n"
+        "    def forward(self, md):\n"
+        "        return self._run(md, md.num_contexts)\n",
+        # Inherited: the decode target runs a base forward that reads it.
+        "class _Base(_Target):\n"
+        "    def forward(self, md):\n"
+        "        return self._run(md, md.num_ctx_tokens)\n"
+        "class DecodeTarget(_Base):\n"
+        "    pass\n",
+        # Delegated: the decode forward hands off to a shared body that reads it.
+        "class DecodeTarget(_Target):\n"
+        "    def forward(self, md):\n"
+        "        return self._delegate(md)\n"
+        "    def _delegate(self, md):\n"
+        "        return super()._shared(md)\n",
+        # Same-module helper.
+        "def _split(md):\n"
+        "    return md.num_contexts\n"
+        "class DecodeTarget(_Target):\n"
+        "    def forward(self, md):\n"
+        "        return self._run(md, _split(md))\n",
+    ],
+    ids=["direct", "inherited", "delegated", "helper"],
+)
+def test_decode_phase_gate_catches_executed_bodies(decode):
+    shared = "\n\nclass _Shared:\n    def _shared(self, md):\n        return md.num_contexts\n"
+    source = _PHASE_FIXTURE_BASE + shared + "\n\n" + decode
+    if "super()._shared" in decode:
+        source = source.replace("class _Target:", "class _Target(_Shared):")
+    assert _decode_phase_reads(source), decode
+
+
+def test_decode_phase_gate_follows_the_shared_run_body():
+    source = (
+        _PHASE_FIXTURE_BASE.replace(
+            "return self.model(md, rows)", "return self.model(md, rows or md.num_contexts)"
+        )
+        + "\n\nclass DecodeTarget(_Target):\n    def forward(self, md):\n        return self._run(md, None)\n"
+    )
+    assert _decode_phase_reads(source) == ["_Target._run:4 .num_contexts"]
+
+
+def test_decode_phase_gate_accepts_the_prefill_split():
+    source = _PHASE_FIXTURE_BASE + (
+        "\n\nclass DecodeTarget(_Target):\n"
+        "    def forward(self, md):\n"
+        "        return self._run(md, None)\n"
+    )
+    assert _decode_phase_reads(source) == []
 
 
 def test_decode_step_args_state_the_zero_rather_than_reading_it():

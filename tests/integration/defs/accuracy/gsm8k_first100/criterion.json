@@ -1,0 +1,6 @@
+{
+  "schema": 1,
+  "protocol_id": "gsm8k-first100-public-v1",
+  "manifest_sha256": "d36d25d42c8c9d02f9e927e82efa705523f30106fb90523067c2cc22c9b946ad",
+  "min_correct": 95
+}
