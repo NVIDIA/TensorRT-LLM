@@ -152,9 +152,7 @@ def write_kv_paged(
     if tokens == 0:
         return
     if k.stride(2) != 1 or k.stride(1) != head_dim or v.stride() != k.stride():
-        raise ValueError(
-            f"k and v must share contiguous-head strides, got {k.stride()} / {v.stride()}."
-        )
+        raise ValueError(f"k and v must share contiguous-head strides, got {k.stride()} / {v.stride()}.")
     if pool.stride(4) != 1:
         raise ValueError(f"pool must be contiguous in head_dim, got strides {pool.stride()}.")
     _write_kv_paged_kernel[(tokens,)](
@@ -237,14 +235,9 @@ class FlashAttn4GenerationFmha(PhasedFmha):
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         if get_sm_version() != 90 or _fa4_forward() is None:
             return False
-        if (
-            getattr(attn, "is_mla_enable", False)
-            or getattr(attn, "sparse_params", None) is not None
-        ):
+        if getattr(attn, "is_mla_enable", False) or getattr(attn, "sparse_params", None) is not None:
             return False
-        if getattr(attn, "predicted_tokens_per_seq", 1) != 1 or getattr(
-            attn, "attention_chunk_size", None
-        ):
+        if getattr(attn, "predicted_tokens_per_seq", 1) != 1 or getattr(attn, "attention_chunk_size", None):
             return False
         head_dim = getattr(attn, "head_dim", 0)
         num_heads = getattr(attn, "num_heads", 0)
@@ -294,9 +287,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             or metadata.is_spec_dec_dynamic_tree
         ):
             return False
-        if not (
-            forward_args.is_fused_qkv and k is None and v is None and forward_args.update_kv_cache
-        ):
+        if not (forward_args.is_fused_qkv and k is None and v is None and forward_args.update_kv_cache):
             return False
         if forward_args.attention_mask != PredefinedAttentionMask.CAUSAL:
             return False
@@ -311,11 +302,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         if q.dtype not in (torch.bfloat16, torch.float16):
             return False
         window = forward_args.attention_window_size
-        if (
-            window is not None
-            and metadata.max_seq_len is not None
-            and window < metadata.max_seq_len
-        ):
+        if window is not None and metadata.max_seq_len is not None and window < metadata.max_seq_len:
             return False
         if PositionEmbeddingType(getattr(self.attn, "position_embedding_type", 0)).is_rope():
             max_seq_len = metadata.max_seq_len
@@ -348,9 +335,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         """
         metadata = params.meta
         manager = metadata.kv_cache_manager
-        pool_index = int(
-            manager.layer_to_pool_mapping_dict[manager.layer_offsets[self.attn.layer_idx]]
-        )
+        pool_index = int(manager.layer_to_pool_mapping_dict[manager.layer_offsets[self.attn.layer_idx]])
         rows = slice(params.seq_offset, params.seq_offset + params.batch_size)
         offsets = metadata.kv_cache_block_offsets[pool_index, rows, 0, :]
         table = torch.div(offsets, int(manager.kv_factor), rounding_mode="floor")
@@ -390,9 +375,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         rows = params.batch_size
         tokens = params.num_tokens
         if rows <= 0 or tokens % rows:
-            raise RuntimeError(
-                f"{LIB_NAME}: {tokens} generation tokens are not uniform over {rows} rows."
-            )
+            raise RuntimeError(f"{LIB_NAME}: {tokens} generation tokens are not uniform over {rows} rows.")
         q_len = tokens // rows
         if not self._logged:
             self._logged = True

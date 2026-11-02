@@ -133,9 +133,11 @@ if IS_FLASHINFER_AVAILABLE:
     from .sampling_shared_prefix_fused import (
         MAX_QUERIES_PER_TILE,
         CtxPrefix,
+        Fa4Prefix,
         FusedWorkspace,
         ctx_prefix_supported,
         default_prefix_splits,
+        fa4_prefix_supported,
         fused_sampling_attention,
     )
     from .sampling_shared_prefix_kernels import (
@@ -254,8 +256,13 @@ FUSED_ENV = "TLLM_SAMPLING_SHARED_PREFIX_FUSED"
 of the fused Triton kernel (``sampling_shared_prefix_fused``)."""
 PREFIX_KERNEL_ENV = "TLLM_SAMPLING_SHARED_PREFIX_PREFIX_KERNEL"
 """``auto`` (default) serves the shared pages of captured n-sample batches through the TRTLLM-Gen
-context kernel where it exists (SM100/SM103, bf16, head_dim 64/128) and through the Triton prefix
-kernel elsewhere; ``triton`` forces the Triton kernel (see ``CtxPrefix``)."""
+context kernel where it exists (SM100/SM103, bf16, head_dim 64/128), through FlashAttention-4 on SM90
+(``Fa4Prefix``) and through the Triton prefix kernel elsewhere; ``triton`` forces the Triton kernel
+(see ``CtxPrefix``)."""
+FA4_PREFIX_MAX_GROUPS = 8
+"""Default sharing-group capacity of a captured batch on the FlashAttention-4 prefix path: FA4 launches
+blocks for every padded request, so the padded group count stays small. Further groups are attended
+through the tail call alone."""
 CHECK_ENV = "TLLM_SAMPLING_SHARED_PREFIX_CHECK"
 """Set to 1 to synchronize after every stage of the step and validate the
 sampling attention output against a dense reference. Debugging aid:
@@ -1277,7 +1284,16 @@ def _ctx_prefix_enabled(head_dim: int, q_len: int) -> bool:
         return False
     if not IS_FLASHINFER_AVAILABLE or not torch.cuda.is_available():
         return False
-    return ctx_prefix_supported(head_dim, torch.bfloat16)
+    return ctx_prefix_supported(head_dim, torch.bfloat16) or fa4_prefix_supported(
+        head_dim, torch.bfloat16
+    )
+
+
+def _fa4_prefix_active(head_dim: int, q_len: int) -> bool:
+    """Whether the context-kernel slot is served by FlashAttention-4 (SM90)."""
+    return _ctx_prefix_enabled(head_dim, q_len) and not ctx_prefix_supported(
+        head_dim, torch.bfloat16
+    )
 
 
 def break_even_tokens(q_len: int, num_heads: int, num_kv_heads: int, head_dim: int) -> float:
@@ -1581,13 +1597,14 @@ def _maybe_enable_ctx_prefix(
     max_pages = int(metadata.host_kv_cache_block_offsets.size(-1))
     tokens_per_block = int(metadata.tokens_per_block)
     max_kv_len = int(metadata.max_seq_len or max_pages * tokens_per_block)
+    prefix_cls = Fa4Prefix if _fa4_prefix_active(head_dim, q_len) else CtxPrefix
     graph.enable_ctx(
-        CtxPrefix(
+        prefix_cls(
             tokens,
             num_heads,
             head_dim,
             q_len,
-            CtxPrefix.num_requests_for(graph.num_groups, tokens, q_len),
+            prefix_cls.num_requests_for(graph.num_groups, tokens, q_len),
             max_pages,
             max_kv_len,
             torch.bfloat16,
@@ -1636,7 +1653,14 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
         # Captured batches and, when the fused kernel can serve the shape, eager ones too: the
         # fused kernel reads its tables from fixed device buffers and never calls FlashInfer (whose
         # FA2 kernels return zeros for heads with extremely negative logits, e.g. Qwen2.5-7B).
-        num_groups = min(_max_groups_from_env(), rows // 2) + 1
+        max_groups = _max_groups_from_env()
+        if (
+            os.environ.get(MAX_GROUPS_ENV) is None
+            and _model_shape is not None
+            and _fa4_prefix_active(_model_shape[2], q_len)
+        ):
+            max_groups = FA4_PREFIX_MAX_GROUPS
+        num_groups = min(max_groups, rows // 2) + 1
         state.graph = _GraphBuffers.create(
             rows, num_groups, int(host_offsets.size(-1)), metadata.kv_cache_block_offsets.device
         )
