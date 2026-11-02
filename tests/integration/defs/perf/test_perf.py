@@ -1589,7 +1589,9 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             elif self._config.model_name == "glm_5.3_fp8":
                 # Allow time for checkpoint loading and cold executor warmup.
                 server_timeout = 1800
-            elif self._config.model_name == "glm_5.3_flash_fp8":
+            elif self._config.model_name in {
+                    "glm_5.3_flash_fp8", "glm_5.3_flash_fp8_mtp"
+            }:
                 # Weight loading and executor warmup can exceed 10 minutes.
                 server_timeout = 3600
             else:
