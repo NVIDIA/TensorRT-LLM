@@ -87,14 +87,16 @@ def test_dflash_ctx_store_start_follows_the_pool_numbering(
 
 
 @pytest.mark.parametrize(
-    ("cur", "first_pos", "raises"), [(0, 8192, True), (0, 0, False), (4096, 4096, False)]
+    ("cur", "first_pos", "raises"),
+    [(0, 8192, True), (0, 65, True), (0, 64, False), (0, 0, False), (4096, 4096, False)],
 )
 def test_slot_from_zero_refuses_a_chunk_past_zero_on_a_windowed_pool(
     cur: int, first_pos: int, raises: bool
 ) -> None:
     """A worker that numbers slots from 0 (the Kimi K3 workers) on an unpaired
-    sliding-window pool cannot store a chunk whose slot starts past 0: the
-    manager has released the pages that slot would write."""
+    sliding-window pool with a 64-token trail cannot store a chunk whose slot
+    starts more than the trail past 0: the manager releases the pages that slot
+    would address. Within the trail every entry stays on a page it holds."""
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     worker = object.__new__(DFlashWorker)
@@ -102,6 +104,7 @@ def test_slot_from_zero_refuses_a_chunk_past_zero_on_a_windowed_pool(
     worker._ctx_reuse_addressable = False
     worker._ctx_reads_rebased_view = False
     worker._ctx_pool_windowed = True
+    worker._ctx_pool_trail = 64
     if raises:
         with pytest.raises(RuntimeError, match="numbers drafter slots from 0"):
             worker._ctx_store_start(cur, first_pos)

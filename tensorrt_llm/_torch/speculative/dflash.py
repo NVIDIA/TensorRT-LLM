@@ -809,9 +809,11 @@ class DFlashWorker(SpecWorkerBase):
     # preparation that reads _ctx_block_tables directly sets it False and
     # numbers every slot from 0.
     _ctx_reads_rebased_view = True
-    # Whether the bound draft pool releases pages behind a sliding window.
-    # Set in _lazy_init_ctx_buffers.
+    # Whether the bound draft pool releases pages behind a sliding window, and
+    # how many tokens it keeps below each window (kv_cache_manager_v2's
+    # draft_slot_trail_tokens). Set in _lazy_init_ctx_buffers.
     _ctx_pool_windowed = False
+    _ctx_pool_trail = 0
 
     def __init__(
         self,
@@ -1512,6 +1514,7 @@ class DFlashWorker(SpecWorkerBase):
                     window is not None and (max_seq_len is None or window < max_seq_len)
                     for window in windows or ()
                 )
+                self._ctx_pool_trail = getattr(draft_kv_cache_manager, "draft_slot_trail_tokens", 0)
                 if (
                     not self._ctx_reads_rebased_view
                     and self._ctx_pool_windowed
@@ -1604,12 +1607,14 @@ class DFlashWorker(SpecWorkerBase):
             return first_pos
         if (
             cur == 0
-            and first_pos > 0
+            and first_pos > self._ctx_pool_trail
             and self._ctx_block_tables is not None
             and self._ctx_pool_windowed
         ):
-            # The manager has released this request's pages below its window,
-            # so a slot numbered from 0 would write entries without a page.
+            # A slot numbered from 0 lags the request's absolute positions by
+            # first_pos, and the manager keeps pages only from the absolute
+            # position less the window and trail: past the trail, the slot's
+            # window reaches entries without a page once the request outgrows it.
             raise RuntimeError(
                 f"{type(self).__name__} numbers drafter slots from 0 and cannot store a context "
                 f"chunk at position {first_pos} on a sliding-window draft KV pool."
