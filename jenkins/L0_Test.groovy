@@ -7010,7 +7010,7 @@ def runLLMBuild(
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
-        // Reserve CUDA 13.0 torch and torchvision packages
+        // Preserve CUDA 13 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
@@ -7050,7 +7050,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
-        // Reserve CUDA 13.0 torch and torchvision packages
+        // Preserve CUDA 13 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
@@ -7927,7 +7927,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             true,
             false,
             UBUNTU_22_04_IMAGE,
-            true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            true, // Install the public PyTorch CUDA 13 build used by TensorRT LLM wheels.
             'manylinux_2_28_x86_64',
         ],
         "PY312-UB2404": [
@@ -7937,7 +7937,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             true,
             false,
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            true, // Extra PyTorch CUDA 13 install
             'manylinux_2_28_x86_64',
         ],
     ]
@@ -7950,7 +7950,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             false,
             false,
             UBUNTU_24_04_IMAGE,
-            true, // Extra PyTorch CUDA 13.0 install
+            true, // Extra PyTorch CUDA 13 install
             'manylinux_2_39_aarch64',
         ],
         "PY312-DLFW": [
@@ -8068,14 +8068,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             // Match the CUDA the DLFW base image builds the wheel with.
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Install the public CUDA 13 PyTorch build in bare-metal environments
                         if (values[6]) {
                             echo "###### Extra CUDA 13 PyTorch install Start ######"
                             // Must match what requirements.txt resolves to from the public index: the
                             // wheel under test is linked against that libtorch, and a mismatch fails
                             // the import with an undefined c10 symbol instead of a version error.
                             // The internal mirror proxies https://download.pytorch.org/whl/cu132.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.1+cu132 torchvision==0.29.2+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
 
                         // A stock image, so nothing here went through Dockerfile.multi or
