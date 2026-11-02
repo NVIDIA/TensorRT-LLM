@@ -19848,7 +19848,8 @@ class GvrRegClusKernel:
                         x1 = x1 + (
                             popc(
                                 ballot(
-                                    ((c1 >> cutlass.Int32(0)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c1 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19857,7 +19858,8 @@ class GvrRegClusKernel:
                         x1 = x1 + (
                             popc(
                                 ballot(
-                                    ((c1 >> cutlass.Int32(1)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c1 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19866,7 +19868,8 @@ class GvrRegClusKernel:
                         x1 = x1 + (
                             popc(
                                 ballot(
-                                    ((c1 >> cutlass.Int32(2)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c1 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19875,7 +19878,8 @@ class GvrRegClusKernel:
                         x1 = x1 + (
                             popc(
                                 ballot(
-                                    ((c1 >> cutlass.Int32(3)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c1 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19884,7 +19888,8 @@ class GvrRegClusKernel:
                         x1 = x1 + (
                             popc(
                                 ballot(
-                                    ((c1 >> cutlass.Int32(4)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c1 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19905,7 +19910,8 @@ class GvrRegClusKernel:
                         x2 = x2 + (
                             popc(
                                 ballot(
-                                    ((c2 >> cutlass.Int32(0)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c2 >> cutlass.Int32(0)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19914,7 +19920,8 @@ class GvrRegClusKernel:
                         x2 = x2 + (
                             popc(
                                 ballot(
-                                    ((c2 >> cutlass.Int32(1)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c2 >> cutlass.Int32(1)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19923,7 +19930,8 @@ class GvrRegClusKernel:
                         x2 = x2 + (
                             popc(
                                 ballot(
-                                    ((c2 >> cutlass.Int32(2)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c2 >> cutlass.Int32(2)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19932,7 +19940,8 @@ class GvrRegClusKernel:
                         x2 = x2 + (
                             popc(
                                 ballot(
-                                    ((c2 >> cutlass.Int32(3)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c2 >> cutlass.Int32(3)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19941,7 +19950,8 @@ class GvrRegClusKernel:
                         x2 = x2 + (
                             popc(
                                 ballot(
-                                    ((c2 >> cutlass.Int32(4)) & cutlass.Int32(1)) == cutlass.Int32(1)
+                                    ((c2 >> cutlass.Int32(4)) & cutlass.Int32(1))
+                                    == cutlass.Int32(1)
                                 )
                                 & lml
                             )
@@ -19983,7 +19993,10 @@ class GvrRegClusKernel:
                         while ewm != cutlass.Int32(0):
                             esd = ffs_m1(ewm)
                             idx = (
-                                ((base4 + tid) + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk))
+                                (
+                                    (base4 + tid)
+                                    + (esd >> cutlass.Int32(2)) * cutlass.Int32(self.blk)
+                                )
                                 << cutlass.Int32(2)
                             ) + (esd & cutlass.Int32(3))
                             if p1 < lim1:
@@ -20029,7 +20042,9 @@ class GvrRegClusKernel:
                             qv = _fmaf__regclus(_val__regclus(frags, s), SC, CQ)  # bit-identical
                             if qv >= LOQ:
                                 bn = _umin_u32__regclus(f2u_rz(qv), cutlass.Uint32(NB__regclus - 1))
-                                p = atomic_add_cta(s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1))
+                                p = atomic_add_cta(
+                                    s_mrg.iterator + cutlass.Int32(bn), cutlass.Int32(1)
+                                )
                                 idx = (
                                     (base4 + tid + cutlass.Int32((s // 4) * self.blk))
                                     << cutlass.Int32(2)
@@ -20121,7 +20136,10 @@ class GvrRegClusKernel:
                                         _ld_shared_cluster_i32(
                                             _mapa_shared_cluster_addr(
                                                 ck_addr
-                                                + ((i & cutlass.Int32(CMPC - 1)) << cutlass.Int32(2)),
+                                                + (
+                                                    (i & cutlass.Int32(CMPC - 1))
+                                                    << cutlass.Int32(2)
+                                                ),
                                                 i >> cutlass.Int32(LCMPC),
                                             )
                                         )
@@ -20160,7 +20178,9 @@ class GvrRegClusKernel:
                                         if b2w > cutlass.Int32(LNB):
                                             sh2 = b2w - cutlass.Int32(LNB)
                                         for z in cutlass.range_constexpr(NB__regclus // self.blk):
-                                            s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
+                                            s_hist[tid + cutlass.Int32(z * self.blk)] = (
+                                                cutlass.Int32(0)
+                                            )
                                         cute.arch.barrier()  # level clear
                                         i = tid
                                         while i < mc:
@@ -20234,7 +20254,9 @@ class GvrRegClusKernel:
                                             if det_s < cutlass.Int32(0):
                                                 det_s = cutlass.Int32(0)
                                             det_sh = cutlass.Uint32(det_s)
-                                            for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                            for z in cutlass.range_constexpr(
+                                                NB__regclus // self.blk
+                                            ):
                                                 s_hist[tid + cutlass.Int32(z * self.blk)] = (
                                                     cutlass.Int32(0)
                                                 )
@@ -20273,16 +20295,16 @@ class GvrRegClusKernel:
                                                 if cutlass.Int64(cutlass.Uint32(uke)) > ethr:
                                                     q1f = cutlass.Int32(1)
                                                 if cutlass.Int64(cutlass.Uint32(uke)) == ethr:
-                                                    det_u = cutlass.Uint32(0xFFFFFFFF) - cutlass.Uint32(
-                                                        idv
-                                                    )
+                                                    det_u = cutlass.Uint32(
+                                                        0xFFFFFFFF
+                                                    ) - cutlass.Uint32(idv)
                                                     if det_ph == cutlass.Int32(0):
                                                         if cutlass.Uint32(det_u) >= cutlass.Uint32(
                                                             det_lo
                                                         ):
-                                                            if cutlass.Uint32(det_u) <= cutlass.Uint32(
-                                                                det_hi
-                                                            ):
+                                                            if cutlass.Uint32(
+                                                                det_u
+                                                            ) <= cutlass.Uint32(det_hi):
                                                                 det_b = (
                                                                     cutlass.Uint32(det_u)
                                                                     - cutlass.Uint32(det_lo)
@@ -20517,7 +20539,9 @@ class GvrRegClusKernel:
                                     0
                                 )  # DET SLOTS: all positions tie -> emit [0, L) directly
                                 if det_ph == cutlass.Int32(0):
-                                    if mm == n:  # every valid position ties: take the first L positions
+                                    if (
+                                        mm == n
+                                    ):  # every valid position ties: take the first L positions
                                         if nA == cutlass.Int32(0):
                                             det_direct = cutlass.Int32(1)
                                         det_thr = cutlass.Int64(
@@ -20538,7 +20562,9 @@ class GvrRegClusKernel:
                                             if det_s < cutlass.Int32(0):
                                                 det_s = cutlass.Int32(0)
                                             det_sh = cutlass.Uint32(det_s)
-                                            for z in cutlass.range_constexpr(NB__regclus // self.blk):
+                                            for z in cutlass.range_constexpr(
+                                                NB__regclus // self.blk
+                                            ):
                                                 s_hist[tid + cutlass.Int32(z * self.blk)] = (
                                                     cutlass.Int32(0)
                                                 )
@@ -20560,9 +20586,9 @@ class GvrRegClusKernel:
                                                             0xFFFFFFFF
                                                         ) - cutlass.Uint32(i)
                                                         if det_ph == cutlass.Int32(0):
-                                                            if cutlass.Uint32(det_u) >= cutlass.Uint32(
-                                                                det_lo
-                                                            ):
+                                                            if cutlass.Uint32(
+                                                                det_u
+                                                            ) >= cutlass.Uint32(det_lo):
                                                                 if cutlass.Uint32(
                                                                     det_u
                                                                 ) <= cutlass.Uint32(det_hi):
