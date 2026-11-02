@@ -24,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.modules.fla.op import gdc_wait_with_memory_clobber
 from tensorrt_llm._torch.modules.mamba import PAD_SLOT_ID
 from tensorrt_llm._utils import get_sm_version
 
@@ -623,10 +624,11 @@ def _causal_conv1d_update_kernel(
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     LAUNCH_DEPENDENT_KERNELS: tl.constexpr,
+    WAIT_PRODUCER: tl.constexpr = False,
+    HOIST_X: tl.constexpr = False,
 ):
     if LAUNCH_DEPENDENT_KERNELS:
         tl.extra.cuda.gdc_launch_dependents()
-
     # ruff: noqa: E501
     idx_seq = tl.program_id(0)
     if idx_seq >= batch:
@@ -710,6 +712,10 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )
     conv_state = tl.load(conv_state_ptrs_source, mask, other=0.0)
+    if WAIT_PRODUCER:
+        # PDL dependent of the producer of x: the slot, accepted-count and conv-state reads above (data of
+        # earlier steps, which the producer does not write) overlap it; x is read after the dependency wait.
+        gdc_wait_with_memory_clobber()
 
     VAL = state_len - seqlen
     x_base = x_ptr + (idx_seq * stride_x_seq) + (idx_feats * stride_x_dim)  # [BLOCK_N]
@@ -722,6 +728,15 @@ def _causal_conv1d_update_kernel(
         & (idx_feats < dim)[None, :]
     )  # token-index  # token-index  # feature-index
     loaded_x = tl.load(x_ptrs, mask_x, 0.0)
+    if HOIST_X:
+        # All token rows in flight at once (a tuple of [BLOCK_N] vectors), before the conv-state / output stores:
+        # otherwise every token's load sits behind the previous token's stores (ptxas cannot prove they do not
+        # alias), so a T-token verify step pays T dependent L2 round trips.
+        xs_hoisted = ()
+        for idx_token_h in tl.static_range(seqlen):
+            xs_hoisted = xs_hoisted + (
+                tl.load(x_base + idx_token_h * stride_x_token, mask=idx_feats < dim),
+            )
     tl.debug_barrier()
 
     new_conv_state = tl.where(mask, conv_state, loaded_x)
@@ -909,8 +924,11 @@ def _causal_conv1d_update_kernel(
                         matrix_x = col2
                     elif j == 3:
                         matrix_w = w_col3
-                        x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                        matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                        if HOIST_X:
+                            matrix_x = xs_hoisted[idx_token]
+                        else:
+                            x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
+                            matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
 
                 acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -984,6 +1002,8 @@ def causal_conv1d_update(
     _block_n: int | None = None,
     _num_warps: int | None = None,
     _num_stages: int | None = None,
+    launch_with_pdl_wait: bool = False,
+    hoist_x: bool = False,
 ):
     """x: (batch, dim) or (batch, dim, seqlen)
         [shape=2: single token prediction]
@@ -1012,10 +1032,16 @@ def causal_conv1d_update(
         which can profitably start fetching already available inputs
         like the state before needing the output of this kernel.
         Ignored on hardware that doesn't support PDL (sm < 90).
+    launch_with_pdl_wait: If true, launch as a PDL dependent of the producer of x; x is read after
+        griddepcontrol.wait, the slots, accepted counts and conv state (data of earlier steps) before it.
+        Ignored on hardware that doesn't support PDL (sm < 90).
+    hoist_x: If true (width 4, no tree / num_accepted_tokens), load the x rows of all tokens before the first
+        store. Same values and arithmetic.
     """
     # PDL needs sm >= 90.
     if get_sm_version() < 90:
         launch_dependent_kernels = False
+        launch_with_pdl_wait = False
 
     if validate_data:
         assert cache_seqlens is None  # not implemented yet - ok for vLLM
@@ -1179,6 +1205,15 @@ def causal_conv1d_update(
         LAUNCH_DEPENDENT_KERNELS=launch_dependent_kernels,
         num_warps=_num_warps if _num_warps is not None else 4,
         **({"num_stages": _num_stages} if _num_stages else {}),
+        **({"WAIT_PRODUCER": True, "launch_pdl": True} if launch_with_pdl_wait else {}),
+        **(
+            {"HOIST_X": True}
+            if hoist_x
+            and width == 4
+            and retrieve_next_token is None
+            and num_accepted_tokens is None
+            else {}
+        ),
     )
     if unsqueeze:
         out = out.squeeze(-1)

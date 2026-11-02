@@ -191,7 +191,8 @@ def _register_fake():
           buffer_flags,
           rmsnorm_fusion,
           scale=None,
-          fusion_op: int = 0):
+          fusion_op: int = 0,
+          fp8_payload: bool = False):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -1189,6 +1190,29 @@ def _register_fake():
         out: Optional[torch.Tensor] = None,
     ) -> None:
         pass
+
+    @torch.library.register_fake("trtllm::gdn_verify")
+    def _(
+        qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        fp8_scale: Optional[torch.Tensor],
+        norm_eps: float,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        old_u: torch.Tensor,
+        old_k: torch.Tensor,
+        old_g: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
+        return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
+                             dtype=dtype)
 
     @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(

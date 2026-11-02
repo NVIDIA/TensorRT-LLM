@@ -144,6 +144,10 @@ class KeyType(NamedTuple):
     num_encoder_tokens: int = 0
     peft_cache_data_type: Optional[torch.dtype] = None
     use_lora_graph: bool = False
+    # The one-engine temperature-only sampling variant (vocabulary-sharded
+    # Gumbel-max target sampling); False unless that variant was captured, so
+    # the stock keys are unchanged otherwise.
+    temperature_only: bool = False
     # Total submitted verifier tokens for a ragged generation graph. ``None``
     # retains the existing uniform graph family.
     ragged_verify_bucket: Optional[int] = None
@@ -507,6 +511,9 @@ class CUDAGraphRunner:
         # this field (non-one-engine paths or non-spec batches).
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
+        # The temperature-only variant of the advanced-sampling graphs.
+        temperature_only = (not is_all_greedy_sample and bool(
+            getattr(spec_metadata, "temperature_only", False)))
 
         # Sampling tier this graph must contain. Only meaningful when the fast
         # sampler is enabled; otherwise it stays FULL so every batch shares one
@@ -546,6 +553,7 @@ class CUDAGraphRunner:
                        num_encoder_tokens=num_encoder_tokens,
                        peft_cache_data_type=peft_cache_data_type,
                        use_lora_graph=use_lora_graph,
+                       temperature_only=temperature_only,
                        ragged_verify_bucket=self._ragged_verify_bucket(batch))
 
     def set_capture_sample_type(self,
@@ -921,11 +929,15 @@ class CUDAGraphRunner:
         current_inputs: Dict[str, Any],
         *,
         position_id_offsets: Optional[torch.Tensor] = None,
+        static_inputs_staged: int = 0,
     ) -> Optional[torch.Tensor]:
         """Replay a graph, applying optional per-generation-token offsets to hooks.
 
         ``position_id_offsets`` is a one-dimensional device tensor containing the
         position corrections applied inside the captured speculative preprocessing.
+        ``static_inputs_staged``: the number of tokens whose static input ids and
+        positions the input preparation already wrote (see PreparedInputs); the
+        replay copies them only when it runs another token count.
         """
         stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
@@ -945,9 +957,11 @@ class CUDAGraphRunner:
                 f"was captured for {expected_num_tokens} tokens. A shorter "
                 "input_ids leaves the tail of the static input buffer stale.")
         # With the decoder runner's buffers as the static inputs (static_input_ids)
-        # the source is the static view itself, and there is nothing to copy.
+        # the source is the static view itself, and there is nothing to copy; a
+        # staged step has already written them.
+        staged = static_inputs_staged == seqlen
         static_input_ids = static_tensors["input_ids"][:seqlen]
-        if input_ids.data_ptr() != static_input_ids.data_ptr():
+        if not staged and input_ids.data_ptr() != static_input_ids.data_ptr():
             step_inputs.copy_(static_input_ids, input_ids)
 
         position_ids = current_inputs["position_ids"]
@@ -959,7 +973,9 @@ class CUDAGraphRunner:
                     f"for key {key}, but expected {expected_position_ids_shape}. "
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
-            static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
+            if not staged:
+                static_tensors["position_ids"][:, :, :seqlen].copy_(
+                    position_ids)
             mrope_delta_read_seq_slots = current_inputs.get(
                 'mrope_delta_read_seq_slots')
             num_slots = key.batch_size * self.max_beam_width
@@ -996,7 +1012,8 @@ class CUDAGraphRunner:
                     "torch.Tensor.copy_() silently broadcasts mismatched shapes, "
                     "which would corrupt the static input buffer.")
             static_position_ids = static_tensors["position_ids"][:, :seqlen]
-            if position_ids.data_ptr() != static_position_ids.data_ptr():
+            if not staged and position_ids.data_ptr(
+            ) != static_position_ids.data_ptr():
                 step_inputs.copy_(static_position_ids, position_ids)
 
         num_encoder_tokens = key.num_encoder_tokens
