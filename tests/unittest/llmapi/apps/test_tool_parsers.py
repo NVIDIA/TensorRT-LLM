@@ -1767,6 +1767,84 @@ class TestQwen3CoderParameterRecovery:
                 for item in calls.values()] == expected
 
 
+class TestQwen3CoderStreamEnd:
+    """Streams that end inside a call still yield JSON-object arguments."""
+
+    @pytest.fixture
+    def tools(self):
+        return [
+            ChatCompletionToolsParam(
+                type="function",
+                function=FunctionDefinition(
+                    name="f",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "x": {
+                                "type": "string"
+                            },
+                            "a": {
+                                "type": "string"
+                            },
+                            "b": {
+                                "type": "string"
+                            },
+                            "c": {
+                                "type": "string"
+                            },
+                            "scale": {
+                                "type": "number"
+                            },
+                            "opts": {
+                                "type": "object"
+                            },
+                        },
+                    },
+                ),
+            )
+        ]
+
+    @staticmethod
+    def _stream(parser, tools, text, chunk_size):
+        results = [
+            parser.parse_streaming_increment(text[i:i + chunk_size], tools)
+            for i in range(0, len(text), chunk_size)
+        ] + [parser.finish(tools)]
+        calls = {}
+        for result in results:
+            for call in result.calls:
+                item = calls.setdefault(call.tool_index, {
+                    "name": "",
+                    "arguments": ""
+                })
+                item["name"] += call.name or ""
+                item["arguments"] += call.parameters
+        return list(calls.values())
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            # EOS right after </function>, before </tool_call>.
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n"
+             "</function>", {
+                 "x": "abc"
+             }),
+            ("<tool_call>\n<function=f>\n</function>", {}),
+            # max_tokens reached inside the call.
+            ("<tool_call>\n<function=f>\n", {}),
+            ("<tool_call>\n<function=f>\n<parameter=x>\nabc\n</parameter>\n",
+             {
+                 "x": "abc"
+             }),
+        ])
+    def test_stream_ending_inside_call_closes_arguments(
+            self, tools, chunk_size, text, expected):
+        calls = self._stream(Qwen3CoderToolParser(), tools, text, chunk_size)
+        assert [(item["name"], json.loads(item["arguments"]))
+                for item in calls] == [("f", expected)]
+
+
 class TestQwen3CoderToolParser(BaseToolParserTestClass):
     """Test suite for Qwen3CoderToolParser class."""
 

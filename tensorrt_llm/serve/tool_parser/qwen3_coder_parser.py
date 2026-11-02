@@ -484,6 +484,12 @@ class Qwen3CoderToolParser(BaseToolParser):
         result = self._parse_streaming("", tools, complete=True)
         if not self._in_tool_call:
             result.normal_text += self._buf
+        elif self._function_name_sent:
+            # The stream ended inside a call: EOS after </function> but before
+            # </tool_call>, or max_tokens mid-call. Flush its parameters and
+            # close the arguments so clients never receive "" or an unterminated
+            # object.
+            result.calls.extend(self._close_unterminated_call(tools))
         self._buf = ""
         self._reset_streaming_state()
         return result
@@ -558,6 +564,20 @@ class Qwen3CoderToolParser(BaseToolParser):
             self._current_parameters = new_params
             self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
 
+        return calls
+
+    def _close_unterminated_call(self, tools: list[Tool]) -> list[ToolCallItem]:
+        body = self._buf
+        function_end = self._find_closing_tag(body, "</function>", complete=True)
+        if function_end != -1:
+            body = body[:function_end]
+        param_config = self._get_arguments_config(self._current_function_name, tools)
+        calls = self._parse_and_stream_parameters(body, param_config, complete=True)
+        current_streamed = self.streamed_args_for_tool[self.current_tool_id]
+        closing = "}" if current_streamed else "{}"
+        calls.append(ToolCallItem(tool_index=self.current_tool_id, name=None, parameters=closing))
+        self.streamed_args_for_tool[self.current_tool_id] = current_streamed + closing
+        self.current_tool_id += 1
         return calls
 
     def _reset_streaming_state(self):
