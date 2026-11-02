@@ -1438,7 +1438,7 @@ class DFlashWorker(SpecWorkerBase):
             f"reuse_addressable={self._ctx_reuse_addressable}"
         )
 
-    def _report_prefix_reuse(self, target_cache_manager) -> None:
+    def _report_prefix_reuse(self, target_cache_manager: Optional[BaseResourceManager]) -> None:
         """Report how this drafter's context is served on KV-cache prefix hits.
 
         A prefix hit skips the target forward for the reused prompt, and the

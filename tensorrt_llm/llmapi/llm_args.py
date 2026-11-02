@@ -3635,24 +3635,20 @@ def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
     return max(windows) if windows else None
 
 
-def dspark_context_attention_window(config_dict: dict) -> Optional[int]:
+def dspark_context_attention_window(model_dir: str) -> Optional[int]:
     """Widest context-attention window of a standalone DSpark drafter.
 
-    ``dflash_context_attention_window`` of the drafter's ``config.json``, read
-    the way the drafter is built from it: a speculators-format checkpoint goes
-    through ``translate_speculators_dspark_config`` (which drops its window),
-    and a MiniMax-M3 drafter's VL-shaped config through
-    ``build_minimax_dspark_draft_config``, the only place its window is
-    flattened to the fields the drafter reads.
+    ``dflash_context_attention_window`` of the config the drafter is built
+    from: ``load_pretrained_config`` with the drafter's arguments
+    (``external_drafter_config_kwargs``), so a speculators-format checkpoint is
+    translated (which drops its window), a MiniMax-M3 drafter's VL-shaped
+    config is flattened, and HF config classes normalize their window fields
+    exactly as at runtime.
     """
-    from tensorrt_llm._torch.pyexecutor.config_utils import (
-        MINIMAX_DSPARK_DRAFT_ARCH, build_minimax_dspark_draft_config)
-    config = translate_speculators_dspark_config(config_dict)
-    architectures = config.get("architectures") or []
-    if architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
-        return dflash_context_attention_window(
-            build_minimax_dspark_draft_config(config))
-    return dflash_context_attention_window(types.SimpleNamespace(**config))
+    from tensorrt_llm._torch.pyexecutor.config_utils import \
+        load_pretrained_config
+    return dflash_context_attention_window(
+        load_pretrained_config(model_dir, trust_remote_code=True))
 
 
 def is_lilicorr_checkpoint(architectures: Optional[List[str]],
@@ -3906,8 +3902,9 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         "no-reuse drafter inputs exactly; 4096 for MiniMax-M3.1), else -1. -1 "
         "forces a full re-prefill on a hit. A smaller tail trades acceptance "
         "length for TTFT. The embedded (DeepSeek-V4) drafter resolves to 0. "
-        "Requires chunked prefill and the all_reusable block-reuse policy; the "
-        "KV cache managers disable it with a warning otherwise.")
+        "The V2 KV cache manager requires the all_reusable block-reuse policy; "
+        "the V1 manager requires chunked prefill and no sliding-window target "
+        "layers. The managers disable it with a warning otherwise.")
 
     decoding_type: Literal["DSpark"] = Field(default="DSpark")
 
@@ -3931,7 +3928,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
         return self
 
     @model_validator(mode="after")
-    def default_embedded_recompute_tail(self):
+    def default_embedded_recompute_tail(self) -> "DSparkDecodingConfig":
         """Resolve ``context_recompute_tail: None`` to 0 without a drafter
         checkpoint.
 
@@ -3982,8 +3979,7 @@ class DSparkDecodingConfig(DecodingBaseConfig):
                                          "config.json")
         if not os.path.exists(draft_config_path):
             return
-        with open(draft_config_path) as f:
-            window = dspark_context_attention_window(json.load(f))
+        window = dspark_context_attention_window(str(self.speculative_model))
         self.context_recompute_tail = int(window) if window else -1
         if window:
             reason = f"the drafter's {window}-token attention window"

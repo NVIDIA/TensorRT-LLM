@@ -119,43 +119,84 @@ def _runtime_windows(config_dict: dict) -> list:
     return windows
 
 
+def _window(tmp_path: Path, config: dict) -> Optional[int]:
+    """``dspark_context_attention_window`` of a drafter checkpoint holding ``config``."""
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return dspark_context_attention_window(str(tmp_path))
+
+
 class TestWindowResolution:
-    def test_the_m31_drafter_window_is_read_from_its_nested_config(self) -> None:
-        assert dspark_context_attention_window(_copy(_M31)) == 4096
+    def test_the_m31_drafter_window_is_read_from_its_nested_config(self, tmp_path: Path) -> None:
+        assert _window(tmp_path, _copy(_M31)) == 4096
         # The top level alone declares no window: a reader that skips the
         # flattening would mistake the drafter for an unwindowed one.
         assert dflash_context_attention_window(SimpleNamespace(**_copy(_M31))) is None
 
-    def test_the_resolved_window_is_the_one_the_runtime_applies(self) -> None:
+    def test_the_resolved_window_is_the_one_the_runtime_applies(self, tmp_path: Path) -> None:
         assert _runtime_windows(_copy(_M31)) == [4096] * 5
-        assert dspark_context_attention_window(_copy(_M31)) == max(_runtime_windows(_copy(_M31)))
+        assert _window(tmp_path, _copy(_M31)) == max(_runtime_windows(_copy(_M31)))
 
-    def test_a_window_declared_only_in_text_config_is_read(self) -> None:
+    def test_a_window_declared_only_in_text_config_is_read(self, tmp_path: Path) -> None:
         config = _copy(_M31)
         for scope in (config, config["dflash_config"]):
             scope.pop("sliding_window", None)
         config["text_config"]["sliding_window"] = 2048
         config["text_config"]["dflash_config"]["sliding_window"] = 2048
-        assert dspark_context_attention_window(config) == 2048
+        assert _window(tmp_path, config) == 2048
         assert _runtime_windows(config) == [2048] * 5
 
-    def test_a_full_attention_layer_needs_the_whole_prompt(self) -> None:
+    def test_a_full_attention_layer_needs_the_whole_prompt(self, tmp_path: Path) -> None:
         config = _copy(_M31)
         types = [SLIDING] * 4 + [FULL]
         config["dflash_config"]["layer_types"] = types
         config["text_config"]["layer_types"] = types
         config["text_config"]["dflash_config"]["layer_types"] = types
-        assert dspark_context_attention_window(config) is None
+        assert _window(tmp_path, config) is None
         assert _runtime_windows(config)[-1] is None
 
-    def test_a_disabled_window_needs_the_whole_prompt(self) -> None:
+    def test_a_disabled_window_needs_the_whole_prompt(self, tmp_path: Path) -> None:
         config = _copy(_M31)
         config["text_config"]["use_sliding_window"] = False
-        assert dspark_context_attention_window(config) is None
+        assert _window(tmp_path, config) is None
         assert _runtime_windows(config) == [None] * 5
 
-    def test_a_speculators_drafter_has_no_window(self) -> None:
-        assert dspark_context_attention_window(_copy(_SPECULATORS)) is None
+    def test_a_speculators_drafter_has_no_window(self, tmp_path: Path) -> None:
+        assert _window(tmp_path, _copy(_SPECULATORS)) is None
+
+    @pytest.mark.parametrize(
+        "fields, expected",
+        [
+            # Qwen3Config clears sliding_window unless use_sliding_window is set,
+            # so the raw JSON window is not the one the drafter applies.
+            ({"sliding_window": 256}, None),
+            ({"sliding_window": 256, "use_sliding_window": True}, None),
+            (
+                {
+                    "sliding_window": 256,
+                    "use_sliding_window": True,
+                    "layer_types": [SLIDING] * 2,
+                },
+                256,
+            ),
+        ],
+        ids=["window-switched-off", "full-attention-layer-types", "windowed"],
+    )
+    def test_hf_config_normalization_decides_the_window(
+        self, tmp_path: Path, fields: dict, expected: Optional[int]
+    ) -> None:
+        config = {
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 128,
+            **fields,
+        }
+        assert _window(tmp_path, config) == expected
 
     @pytest.mark.parametrize(
         "config, expected",
