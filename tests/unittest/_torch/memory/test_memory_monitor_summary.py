@@ -232,3 +232,79 @@ class TestBaselineDelta:
             [_entry(Category.KV_CACHE_POOL, 16 * GIB), _entry(Category.COMM_MNNVL, 1024)]
         )
         assert Group.COMMUNICATION.value not in render(frame, _capability()).partition("---")[0]
+
+
+@pytest.mark.cpu_only
+class TestGrowthSuggestion:
+    """Growth after warmup, which already ran the largest batch, is specific
+    evidence; the suggestion should use it rather than generic row advice."""
+
+    def _grown(self, unattributed):
+        # The typical frame with ``unattributed`` more PyTorch memory in use.
+        return _frame(
+            [
+                _entry(Category.KV_CACHE_POOL, 16 * GIB),
+                _entry(
+                    Category.WEIGHTS,
+                    GIB // 2,
+                    Placement.TORCH_DEFAULT,
+                    source=Source.TAG,
+                    basis=Basis.LOGICAL,
+                ),
+                _entry(Category.COMM_MNNVL, GIB),
+            ],
+            process=20 * GIB + unattributed,
+            reserved=2 * GIB + unattributed,
+            live=GIB + unattributed,
+        )
+
+    def _summary(self, frame, **kw):
+        from tensorrt_llm._torch.memory.monitor.summary import render_summary
+
+        baseline = dict(group_totals(_typical()).sizes)
+        advice = {Group.TORCH_UNATTRIBUTED: "reduce max_num_tokens"}
+        return "\n".join(
+            render_summary(frame, group_totals(frame), baseline=baseline, advice=advice, **kw)
+        )
+
+    def test_oom_after_growth_points_at_held_memory(self):
+        text = self._summary(self._grown(8 * GIB), headline="OUT OF MEMORY")
+        assert "grew 8.00 GiB after warmup" in text
+        assert "TLLM_MEM_MONITOR_STACKS=1" in text
+        # The executor's own advice stays, as the fallback.
+        assert "if it is activation memory, reduce max_num_tokens" in text
+
+    def test_recorded_stacks_name_the_code(self):
+        sites = {"my_app/processors.py:__call__": 6 * GIB, "modules/linear.py:forward": GIB}
+        text = self._summary(
+            self._grown(8 * GIB), headline="OUT OF MEMORY", unattributed_sites=sites
+        )
+        assert "allocated by my_app/processors.py:__call__ (6.00 GiB)" in text
+        assert "TLLM_MEM_MONITOR_STACKS" not in text
+
+    def test_large_growth_is_named_before_anything_fails(self):
+        # A periodic report: no headline, but 2 GiB held since warmup.
+        text = self._summary(self._grown(2 * GIB))
+        assert "Suggestion: PyTorch memory with no known owner grew 2.00 GiB" in text
+
+    def test_small_growth_without_a_failure_is_left_alone(self):
+        text = self._summary(self._grown(GIB // 2))
+        assert "Suggestion" not in text
+
+    def test_growth_outside_pytorch(self):
+        frame = _frame(
+            [
+                _entry(Category.KV_CACHE_POOL, 16 * GIB),
+                _entry(
+                    Category.WEIGHTS,
+                    GIB // 2,
+                    Placement.TORCH_DEFAULT,
+                    source=Source.TAG,
+                    basis=Basis.LOGICAL,
+                ),
+                _entry(Category.COMM_MNNVL, GIB),
+            ],
+            process=23 * GIB,
+        )
+        text = self._summary(frame, headline="OUT OF MEMORY")
+        assert "memory outside PyTorch grew 3.00 GiB after warmup" in text
