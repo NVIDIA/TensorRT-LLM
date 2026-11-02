@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -154,6 +156,165 @@ def test_explicit_inductor_compile_pool_quiesce_setting_takes_precedence(
     _bootstrap._keep_inductor_compile_pool_alive()
 
     assert os.environ[_bootstrap._INDUCTOR_QUIESCE_POOL_ENV] == "1"
+
+
+@pytest.fixture
+def _mimalloc_default_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, raising=False)
+    monkeypatch.setattr(_bootstrap.sys, "platform", "linux")
+    monkeypatch.setattr(_bootstrap, "_mimalloc_thp_default_applied", False)
+    monkeypatch.setattr(_bootstrap, "_thp_disabled_before_torch", None)
+
+
+@pytest.mark.usefixtures("_mimalloc_default_state")
+def test_prepare_environment_keeps_mimalloc_arenas_off_thp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: False)
+    for name in (
+        "_setup_unified_cache",
+        "_add_trt_llm_dll_directory",
+        "_preload_python_lib",
+        "_setup_vendored_triton_kernels",
+    ):
+        monkeypatch.setattr(_bootstrap, name, lambda: None)
+
+    _bootstrap._prepare_environment()
+
+    assert os.environ[_bootstrap._MIMALLOC_ALLOW_THP_ENV] == "0"
+    assert _bootstrap._mimalloc_thp_default_applied
+    assert _bootstrap._thp_disabled_before_torch is False
+
+
+@pytest.mark.usefixtures("_mimalloc_default_state")
+def test_explicit_mimalloc_thp_setting_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_bootstrap._MIMALLOC_ALLOW_THP_ENV, "1")
+    calls = []
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: True)
+    monkeypatch.setattr(_bootstrap, "_clear_thp_disable_flag", lambda: calls.append("clear"))
+
+    _bootstrap._keep_mimalloc_arenas_off_thp()
+    _bootstrap._restore_process_thp()
+
+    assert os.environ[_bootstrap._MIMALLOC_ALLOW_THP_ENV] == "1"
+    assert calls == []
+
+
+@pytest.mark.usefixtures("_mimalloc_default_state")
+def test_mimalloc_thp_default_is_linux_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_bootstrap.sys, "platform", "win32")
+
+    _bootstrap._keep_mimalloc_arenas_off_thp()
+
+    assert _bootstrap._MIMALLOC_ALLOW_THP_ENV not in os.environ
+    assert not _bootstrap._mimalloc_thp_default_applied
+
+
+def test_mimalloc_thp_default_is_set_before_torch_can_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The option only takes effect if it is in the environment when torch loads
+    # mimalloc, and the vendored triton_kernels import is the first step that can
+    # import torch.
+    calls = []
+    for name in (
+        "_set_numexpr_thread_default",
+        "_keep_inductor_compile_pool_alive",
+        "_setup_unified_cache",
+        "_add_trt_llm_dll_directory",
+        "_preload_python_lib",
+    ):
+        monkeypatch.setattr(_bootstrap, name, lambda: None)
+    monkeypatch.setattr(
+        _bootstrap, "_keep_mimalloc_arenas_off_thp", lambda: calls.append("mimalloc")
+    )
+    monkeypatch.setattr(
+        _bootstrap, "_setup_vendored_triton_kernels", lambda: calls.append("triton")
+    )
+
+    _bootstrap._prepare_environment()
+
+    assert calls == ["mimalloc", "triton"]
+
+
+@pytest.mark.usefixtures("_mimalloc_default_state")
+@pytest.mark.parametrize(
+    ("before", "after", "cleared"),
+    [
+        (False, True, True),  # the torch import disabled THP: undo it
+        (False, False, False),  # nothing changed
+        (True, True, False),  # disabled before TensorRT LLM was imported: keep it
+        (None, True, False),  # flag not readable before the import: keep it
+    ],
+)
+def test_restore_process_thp_withdraws_the_default(
+    monkeypatch: pytest.MonkeyPatch, before, after, cleared
+) -> None:
+    calls = []
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: before)
+    _bootstrap._keep_mimalloc_arenas_off_thp()
+    assert os.environ[_bootstrap._MIMALLOC_ALLOW_THP_ENV] == "0"
+    monkeypatch.setattr(_bootstrap, "_thp_disable_flag", lambda: after)
+    monkeypatch.setattr(_bootstrap, "_clear_thp_disable_flag", lambda: calls.append("clear"))
+
+    _bootstrap._restore_process_thp()
+    _bootstrap._restore_process_thp()
+
+    assert _bootstrap._MIMALLOC_ALLOW_THP_ENV not in os.environ
+    assert calls == (["clear"] if cleared else [])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_THP_DISABLE is Linux-only")
+def test_thp_disable_flag_round_trip() -> None:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    original = libc.prctl(_bootstrap._PR_GET_THP_DISABLE, 0, 0, 0, 0)
+    assert original in (0, 1)
+    try:
+        assert libc.prctl(_bootstrap._PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0
+        assert _bootstrap._thp_disable_flag() is True
+        _bootstrap._clear_thp_disable_flag()
+        assert _bootstrap._thp_disable_flag() is False
+    finally:
+        libc.prctl(_bootstrap._PR_SET_THP_DISABLE, original, 0, 0, 0)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="PR_SET_THP_DISABLE is Linux-only")
+def test_importing_tensorrt_llm_keeps_process_thp_enabled() -> None:
+    # A fresh interpreter, as a worker process starts: importing the package loads
+    # torch, whose mimalloc sees the default, so its arenas are not advised
+    # MADV_HUGEPAGE; neither the process's THP setting nor a later library with
+    # its own mimalloc is affected by it.
+    code = (
+        "import ctypes, os\n"
+        "libc = ctypes.CDLL(None)\n"
+        "if libc.prctl(42, 0, 0, 0, 0) != 0:\n"
+        "    raise SystemExit(77)\n"
+        "import tensorrt_llm\n"
+        "assert 'MIMALLOC_ALLOW_THP' not in os.environ\n"
+        "assert libc.prctl(42, 0, 0, 0, 0) == 0\n"
+        "try:\n"
+        "    import pyarrow\n"
+        "except ImportError:\n"
+        "    pass\n"
+        "assert libc.prctl(42, 0, 0, 0, 0) == 0\n"
+        "import torch\n"
+        "keep = torch.empty(64 << 20, dtype=torch.uint8)\n"
+        "advised = []\n"
+        "name = None\n"
+        "for line in open('/proc/self/smaps'):\n"
+        "    if line[:1] in '0123456789abcdef' and '-' in line.split()[0]:\n"
+        "        name = line.split()[5] if len(line.split()) > 5 else ''\n"
+        "    elif line.startswith('VmFlags:') and name == '[anon:mimalloc]' and ' hg' in line:\n"
+        "        advised.append(line)\n"
+        "assert not advised, advised\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "MIMALLOC_ALLOW_THP"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, timeout=600)
+    if result.returncode == 77:
+        pytest.skip("THP is already disabled for processes started here")
+    assert result.returncode == 0
 
 
 def test_mpi_pool_environment_forwards_unified_cache_variables(

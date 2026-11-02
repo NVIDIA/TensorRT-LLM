@@ -21,7 +21,7 @@
 # torch ahead of the environment preparation it performs.
 import sys
 
-from ._bootstrap import _init, _prepare_environment
+from ._bootstrap import _init, _prepare_environment, _restore_process_thp
 
 # Phase 1: cache environment, DLL search path, Python-library preload and
 # vendored triton_kernels precedence. Must run before torch and before any
@@ -41,6 +41,9 @@ from typing import TYPE_CHECKING
 # cannot be found for the public PyTorch, raising errors like:
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
+
+# Undo the process-wide part of the mimalloc option phase 1 set (see _bootstrap).
+_restore_process_thp()
 
 from .logger import logger
 from .version import __version__

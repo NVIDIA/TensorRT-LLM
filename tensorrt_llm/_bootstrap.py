@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 # Disable UCC to WAR allgather issue before NGC PyTorch 25.12 upgrade.
 os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
@@ -46,6 +47,13 @@ os.environ["OMPI_MCA_coll_ucc_enable"] = "0"
 _inited = False
 
 _INDUCTOR_QUIESCE_POOL_ENV = "TORCHINDUCTOR_QUIESCE_ASYNC_COMPILE_POOL"
+_MIMALLOC_ALLOW_THP_ENV = "MIMALLOC_ALLOW_THP"
+_PR_SET_THP_DISABLE = 41
+_PR_GET_THP_DISABLE = 42
+# Whether this process set the mimalloc default, and its THP-disable flag right
+# before that (None if it could not be read).
+_mimalloc_thp_default_applied = False
+_thp_disabled_before_torch: Optional[bool] = None
 _UNIFIED_CACHE_ROOT_ENV = "TRTLLM_CACHE_DIR"
 _TRTLLM_DG_CACHE_ENV = "TRTLLM_DG_CACHE_DIR"
 _TRTLLM_DG_DUMP_CUBIN_ENV = "TRTLLM_DG_JIT_DUMP_CUBIN"
@@ -93,6 +101,61 @@ def _set_numexpr_thread_default() -> None:
     # TRT-LLM uses NumExpr only for scalar checkpoint formulas. Avoid creating
     # its helper pool unless the embedding application explicitly opts in.
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
+
+def _thp_disable_flag() -> Optional[bool]:
+    """Return this process's PR_GET_THP_DISABLE flag, or None where it cannot be read."""
+    if sys.platform != "linux":
+        return None
+    import ctypes
+
+    try:
+        value = ctypes.CDLL(None, use_errno=True).prctl(_PR_GET_THP_DISABLE, 0, 0, 0, 0)
+    except (AttributeError, OSError):
+        return None
+    return None if value < 0 else bool(value)
+
+
+def _clear_thp_disable_flag() -> None:
+    import ctypes
+
+    ctypes.CDLL(None, use_errno=True).prctl(_PR_SET_THP_DISABLE, 0, 0, 0, 0)
+
+
+def _keep_mimalloc_arenas_off_thp() -> None:
+    # PyTorch's CPU allocator on aarch64 is mimalloc, which by default advises
+    # its 1 GiB arenas MADV_HUGEPAGE. With 64 KiB base pages a transparent huge
+    # page is 512 MiB. Once a free inside the arena splits one, khugepaged later
+    # collapses the range again, copying 512 MiB while it holds the process's
+    # mmap lock, so a page fault in any thread of the process (the executor
+    # touching a fresh heap page) waits tens of milliseconds, and its
+    # tensor-parallel peers wait with it. mimalloc reads the option when torch
+    # loads it, so it is set before that import; a value the caller sets wins.
+    global _mimalloc_thp_default_applied, _thp_disabled_before_torch
+    if sys.platform != "linux" or _MIMALLOC_ALLOW_THP_ENV in os.environ:
+        return
+    _thp_disabled_before_torch = _thp_disable_flag()
+    os.environ[_MIMALLOC_ALLOW_THP_ENV] = "0"
+    _mimalloc_thp_default_applied = True
+
+
+def _restore_process_thp() -> None:
+    # With the option off, mimalloc also disables transparent huge pages for the
+    # whole process (PR_SET_THP_DISABLE) when it initializes. Only torch's arenas
+    # need to stay off huge pages: memory that asks for them with MADV_HUGEPAGE
+    # (the MoE load balancer's NUMA pool, the KVCacheManagerV2 host tier under
+    # TLLM_KV_CACHE_MANAGER_V2_THP=1) must keep getting them. So once torch has
+    # loaded, the default is withdrawn, which keeps it from later libraries that
+    # bundle their own mimalloc (pyarrow does) and from child processes that do
+    # not import TensorRT LLM, and a flag the torch import set is cleared again.
+    # A flag that was already set before is left alone.
+    global _mimalloc_thp_default_applied
+    if not _mimalloc_thp_default_applied:
+        return
+    _mimalloc_thp_default_applied = False
+    os.environ.pop(_MIMALLOC_ALLOW_THP_ENV, None)
+    if _thp_disabled_before_torch is False and _thp_disable_flag():
+        _clear_thp_disable_flag()
 
 
 def _keep_inductor_compile_pool_alive() -> None:
@@ -170,6 +233,7 @@ def _setup_vendored_triton_kernels():
 
 def _prepare_environment() -> None:
     """Phase 1: environment and library preparation, before the Torch import."""
+    _keep_mimalloc_arenas_off_thp()
     _set_numexpr_thread_default()
     _keep_inductor_compile_pool_alive()
     _setup_unified_cache()
