@@ -155,7 +155,10 @@ def load_target_ops(package: str) -> Any:
     """
     parts = _parts(package)
     if len(parts) != 2:
-        raise ValueError(f"{package!r} is not a models.<family>.<target> package")
+        raise ValueError(
+            f"{package!r} is not a models.<family>.<target> package; "
+            "pass __name__ from the target's __init__.py"
+        )
     family, target = parts
     built = _load_family_library(family)
     if target not in built:

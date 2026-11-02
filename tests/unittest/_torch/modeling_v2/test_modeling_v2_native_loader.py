@@ -64,7 +64,7 @@ def test_names():
         namespace_of("tensorrt_llm._torch.models")
     with pytest.raises(ValueError, match="fake_ops module"):
         namespace_of(f"{_TARGET}.ops.moe.entry")
-    with pytest.raises(ValueError, match="models.<family>.<target>"):
+    with pytest.raises(ValueError, match="pass __name__ from the target's __init__"):
         load_target_ops(f"{_TARGET}.weights")
 
 
