@@ -12,7 +12,7 @@ import socket
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import Executor
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -22,7 +22,6 @@ from stat import S_ISREG
 from types import MappingProxyType
 from typing import (
     Any,
-    Callable,
     ClassVar,
     Dict,
     Generic,
@@ -1153,6 +1152,9 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
     _request_executor: ClassVar[ContextVar[Optional[Executor]]] = ContextVar(
         "media_io_executor", default=None
     )
+    _work_tracker: ClassVar[ContextVar[Optional[Callable[[asyncio.Future], None]]]] = ContextVar(
+        "media_io_work_tracker", default=None
+    )
 
     # Required MIME type prefix for `data:` URIs handled by this modality
     # (e.g. `"image/"`). A data URI whose declared media type falls outside
@@ -1171,12 +1173,19 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
 
     @classmethod
     @contextmanager
-    def use_executor(cls, executor: Optional[Executor]) -> Iterator[None]:
+    def use_executor(
+        cls,
+        executor: Optional[Executor],
+        *,
+        on_submit: Optional[Callable[[asyncio.Future], None]] = None,
+    ) -> Iterator[None]:
         """Scope decode work to a server-owned executor without replacing other servers' pools."""
         token = BaseMediaIO._request_executor.set(executor)
+        tracker_token = BaseMediaIO._work_tracker.set(on_submit)
         try:
             yield
         finally:
+            BaseMediaIO._work_tracker.reset(tracker_token)
             BaseMediaIO._request_executor.reset(token)
 
     @classmethod
@@ -1265,7 +1274,13 @@ class BaseMediaIO(ABC, Generic[_MediaT]):
             fn = functools.partial(fn, **kwargs)
         loop = asyncio.get_event_loop()
         executor = BaseMediaIO._request_executor.get() or BaseMediaIO._executor
-        return await loop.run_in_executor(executor, fn, *args)
+        future = loop.run_in_executor(executor, fn, *args)
+        tracker = BaseMediaIO._work_tracker.get()
+        if tracker is not None:
+            tracker(future)
+            # Cancelling the waiter must not report completion before the thread exits.
+            return await asyncio.shield(future)
+        return await future
 
 
 class ImageMediaIO(BaseMediaIO[Union[Image.Image, torch.Tensor, np.ndarray]]):
