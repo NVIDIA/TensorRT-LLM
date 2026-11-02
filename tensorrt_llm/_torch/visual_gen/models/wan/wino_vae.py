@@ -60,29 +60,29 @@ from .wan_vae import (
     unpatchify,
 )
 from .wino_vae_kernels import (
-    add_rms_norm_silu_cuda,
+    add_rms_norm_silu,
     apply_in_bias,
-    avg_down_add_cuda,
-    can_use_cuda_rms_norm_silu,
-    can_use_cuda_upsample_gather,
-    cuda_op_available,
+    avg_down_add,
     frames_to_video,
     frames_view,
     images_to_pairs,
-    interleave_bias_cuda,
+    interleave_bias,
+    kernels_available,
     pack_upsample_weights,
     pairs_to_images,
-    rms_norm_silu_cuda,
+    rms_norm_silu,
+    rms_norm_silu_supported,
     sm100_fused_eligible,
     sm100_fused_filters,
     sm100_spatial_eligible,
     sm100_spatial_filters,
     sm100_wino_available,
     unpatchify_clamp_into,
-    upsample_gather_cuda,
-    wino_combine_cuda,
-    wino_norm_silu_cuda,
-    wino_spatial_conv_cuda,
+    upsample_gather,
+    upsample_gather_supported,
+    wino_combine,
+    wino_norm_silu,
+    wino_spatial_conv_cublas,
     wino_spatial_conv_fused,
     wino_spatial_conv_sm100,
     wino_spatial_conv_taps,
@@ -245,7 +245,7 @@ class PendingAdd:
         x_f = frames_view(_channels_last_3d_if_needed(self.a)) if self.a is not None else None
         m_f = [images_to_pairs(mk) for mk in self.wino] if self.wino is not None else None
         r_f = frames_view(_channels_last_3d_if_needed(self.b)) if self.b is not None else None
-        return wino_combine_cuda(
+        return wino_combine(
             x_f,
             m_f,
             self.bias,
@@ -263,7 +263,7 @@ class PendingAdd:
         kernels available): the consumer norm adds it while reading and
         ``materialize`` uses the combine kernel."""
         return (
-            cuda_op_available() and self.shape[0] == 1 and (self.b is None or self.b.shape[0] == 1)
+            kernels_available() and self.shape[0] == 1 and (self.b is None or self.b.shape[0] == 1)
         )
 
     def materialize_padded_2d(self) -> torch.Tensor:
@@ -329,7 +329,7 @@ def _as_tensor(x: "torch.Tensor | PendingAdd") -> torch.Tensor:
 
 
 class WinoVaeRMSNorm(WanRMSNorm):
-    """``WanRMSNorm`` with the fused CUDA entry points: ``norm_silu`` (rows) and
+    """``WanRMSNorm`` with the fused norm kernels as entry points: ``norm_silu`` (rows) and
     ``norm_silu_winograd`` (the temporal Winograd inputs of the conv that follows)."""
 
     def __init__(
@@ -357,10 +357,10 @@ class WinoVaeRMSNorm(WanRMSNorm):
                 x.a is not None
                 and x.b is not None
                 and self.channel_first
-                and can_use_cuda_rms_norm_silu(x.a)
-                and can_use_cuda_rms_norm_silu(x.b)
+                and rms_norm_silu_supported(x.a)
+                and rms_norm_silu_supported(x.b)
             ):
-                s, y = add_rms_norm_silu_cuda(
+                s, y = add_rms_norm_silu(
                     x.a,
                     x.b,
                     self.gamma,
@@ -375,8 +375,8 @@ class WinoVaeRMSNorm(WanRMSNorm):
                 x, in_bias = x.a, x.bias  # the kernel adds the deferred bias while reading
             else:
                 x = x.materialize()
-        if self.channel_first and can_use_cuda_rms_norm_silu(x):
-            y = rms_norm_silu_cuda(
+        if self.channel_first and rms_norm_silu_supported(x):
+            y = rms_norm_silu(
                 x,
                 self.gamma,
                 bias,
@@ -406,7 +406,7 @@ class WinoVaeRMSNorm(WanRMSNorm):
         pending = x if isinstance(x, PendingAdd) else PendingAdd(x)
         h, w = pending.spatial
         bias = self.bias if isinstance(self.bias, torch.Tensor) else None
-        s, y_tail, d = wino_norm_silu_cuda(
+        s, y_tail, d = wino_norm_silu(
             frames_view(pending.a) if pending.a is not None else None,
             [images_to_pairs(mk) for mk in pending.wino] if pending.wino is not None else None,
             frames_view(pending.b) if pending.b is not None else None,
@@ -447,10 +447,10 @@ _SPATIAL_KERNELS = {
         lambda conv, order: sm100_spatial_filters(conv._winograd_weights(order)),
         wino_spatial_conv_sm100,
     ),
-    # Any GPU: CUDA transform kernels and cuBLAS batched GEMMs.
+    # Any GPU: CuTe DSL transform kernels and cuBLAS batched GEMMs.
     "cublas": (
         lambda conv, order: winograd_spatial_weights(conv.weight, _SPATIAL_TILE, order),
-        wino_spatial_conv_cuda,
+        wino_spatial_conv_cublas,
     ),
 }
 
@@ -1065,7 +1065,7 @@ class WinoVaeResample(WanResample):
         factor_t, repeats = (
             (1, 1) if shortcut is None else (shortcut[1].factor_t, shortcut[1].repeats)
         )
-        if not can_use_cuda_upsample_gather(cout, factor_t, repeats):
+        if not upsample_gather_supported(cout, factor_t, repeats):
             raise ValueError(
                 f"the upsample gather kernel does not take {cout} output channels with a "
                 f"temporal factor {factor_t} and {repeats} shortcut repeats"
@@ -1085,11 +1085,11 @@ class WinoVaeResample(WanResample):
         temp = _channels_last_2d_if_needed(temp)
         gather_bias = self.resample[1].bias if defer_bias else None
         if shortcut is None:
-            return upsample_gather_cuda(temp, None, batch_size, frames, bias=gather_bias)
+            return upsample_gather(temp, None, batch_size, frames, bias=gather_bias)
         residual, dup, first_chunk = shortcut
         residual = _channels_last_3d_if_needed(residual)
         crop = dup.factor_t - 1 if first_chunk else 0
-        return upsample_gather_cuda(
+        return upsample_gather(
             temp, residual, batch_size, frames, dup.factor_t, dup.repeats, crop, bias=gather_bias
         )
 
@@ -1128,7 +1128,7 @@ class WinoVaeResample(WanResample):
             )
         if cache_x.shape[2] < 2 and feat_cache[idx] == "Rep":
             cache_x = torch.cat([torch.zeros_like(cache_x), cache_x], dim=2)
-        fuse_interleave = cuda_op_available() and batch_size == 1
+        fuse_interleave = kernels_available() and batch_size == 1
         self.time_conv.defer_bias = fuse_interleave
         if feat_cache[idx] == "Rep":
             x = self.time_conv(x)
@@ -1140,7 +1140,7 @@ class WinoVaeResample(WanResample):
         if fuse_interleave:
             # Interleave the two channel halves along time and add the time conv's bias.
             u = frames_view(_channels_last_3d_if_needed(x))
-            return frames_to_video(interleave_bias_cuda(u, self.time_conv.bias), height, width)
+            return frames_to_video(interleave_bias(u, self.time_conv.bias), height, width)
         x = x.reshape(batch_size, 2, channels, frames, height, width)
         x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]), 3)
         return x.reshape(batch_size, channels, frames * 2, height, width)
@@ -1164,7 +1164,7 @@ class WinoVaeResample(WanResample):
         defer = (
             self.defer_bias_to_consumer
             and conv.bias is not None
-            and cuda_op_available()
+            and kernels_available()
             and batch_size == 1
         )
         self.pending_bias = conv.bias if defer else None
@@ -1262,7 +1262,7 @@ class WinoVaeResidualBlock(WanResidualBlock):
         self._merged_bias: tuple[int, int, torch.Tensor] | None = None
         # Spatial Winograd applies to both convs on every path (frame pairs, cached single
         # frames), so it is fixed here, not when a path first runs.
-        spatial = cuda_op_available()
+        spatial = kernels_available()
         for conv in (self.conv1, self.conv2):
             conv.spatial_winograd = spatial
             conv.cudnn_frontend = True
@@ -1295,7 +1295,7 @@ class WinoVaeResidualBlock(WanResidualBlock):
         if feat_cache is not None and feat_idx is None:
             raise ValueError("feat_idx is required when feat_cache is provided")
         batch, _, frames = x.shape[:3]
-        cached = feat_cache is not None and cuda_op_available()
+        cached = feat_cache is not None and kernels_available()
         if (
             cached
             and self.conv1.winograd_eligible(frames, batch)
@@ -1459,13 +1459,13 @@ class WinoVaeAttentionBlock(WanAttentionBlock):
 
     def forward(self, x: "torch.Tensor | PendingAdd") -> "torch.Tensor | PendingAdd":  # type: ignore[override]
         x = _as_tensor(x)
-        if not (cuda_op_available() and x.shape[0] == 1 and can_use_cuda_rms_norm_silu(x)):
+        if not (kernels_available() and x.shape[0] == 1 and rms_norm_silu_supported(x)):
             return super().forward(x) if self.shard is None else self._forward_gathered(x)
         residual = _channels_last_3d_if_needed(x)
         _, channels, frames, height, width = residual.shape
         positions = height * width
         # The GEMMs run on the channels-last row view [T*H*W, C], which is also SDPA's layout.
-        normed = rms_norm_silu_cuda(
+        normed = rms_norm_silu(
             residual,
             self.norm.gamma,
             None,
@@ -1591,12 +1591,12 @@ class WinoVaeResidualDownBlock(WanResidualDownBlock):
         # absorbs it in downsample3d).
         bias = self.downsampler.take_pending_bias() if self.downsampler is not None else None
         dup = self.avg_shortcut
-        if cuda_op_available() and x.shape[0] == 1:
+        if kernels_available() and x.shape[0] == 1:
             residual = _channels_last_3d_if_needed(residual)
             t_in = residual.shape[2]
             pad_t = (dup.factor_t - t_in % dup.factor_t) % dup.factor_t
             h_out, w_out = x.shape[-2:]
-            y = avg_down_add_cuda(
+            y = avg_down_add(
                 frames_view(x),
                 frames_view(residual),
                 h_out,
@@ -1640,7 +1640,7 @@ def _norm_silu_conv(
     conv's frame buffer where it can, else the eager norm and conv."""
     frames = x.shape[2]
     if (
-        cuda_op_available()
+        kernels_available()
         and feat_cache is not None
         and conv.buffer_eligible(x)
         and not (frames == 1 and feat_cache[feat_idx[0]] is None)
@@ -2063,7 +2063,7 @@ class WinoVae(WanVAE):
         return _channels_last_3d_if_needed(F.conv3d(z, w, b))
 
     def _use_fused_output(self, x: torch.Tensor) -> bool:
-        return self.config.patch_size is not None and x.shape[0] == 1 and cuda_op_available()
+        return self.config.patch_size is not None and x.shape[0] == 1 and kernels_available()
 
     def _decode_impl(
         self, z: torch.Tensor, return_dict: bool, temporal_chunk_size: int

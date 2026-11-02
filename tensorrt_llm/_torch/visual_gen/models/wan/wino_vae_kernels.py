@@ -11,24 +11,24 @@ import functools
 
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.wan import jit_norm
 from tensorrt_llm._torch.visual_gen.models.wan.jit_norm import (
     FrameGeometry,
     combine,
     rms_norm_silu_rows,
-    wino_norm_silu,
 )
 
 from .wino_tables import SPATIAL_WINO
 
 
-def cuda_op_available() -> bool:
+def kernels_available() -> bool:
     """The norm / Winograd norm / combine kernel (:mod:`jit_norm`) can run."""
     return jit_norm_available()
 
 
-def can_use_cuda_rms_norm_silu(x: torch.Tensor) -> bool:
+def rms_norm_silu_supported(x: torch.Tensor) -> bool:
     return (
-        cuda_op_available()
+        kernels_available()
         and x.is_cuda
         and x.dtype is torch.bfloat16
         and x.shape[1] % 8 == 0
@@ -49,7 +49,7 @@ def _channel_rows(x: torch.Tensor) -> torch.Tensor | None:
     return None
 
 
-def rms_norm_silu_cuda(
+def rms_norm_silu(
     x: torch.Tensor,
     gamma: torch.Tensor,
     bias: torch.Tensor | None,
@@ -63,7 +63,7 @@ def rms_norm_silu_cuda(
 ) -> torch.Tensor:
     """The norm kernel (:mod:`jit_norm` in row mode): RMSNorm over channels (+ SiLU) of a
     channels-last bf16 CUDA tensor whose channel count is a multiple of 8
-    (``can_use_cuda_rms_norm_silu``); fp32 arithmetic, bf16 result of ``x``'s shape.
+    (``rms_norm_silu_supported``); fp32 arithmetic, bf16 result of ``x``'s shape.
     ``silu=False`` returns the RMSNorm alone (plain form only: no bias, in_bias or out).
 
     ``in_bias`` is a deferred convolution bias, applied to ``x`` first as a bf16 add.
@@ -73,7 +73,7 @@ def rms_norm_silu_cuda(
     """
     rows = _channel_rows(x)
     if rows is None:
-        raise ValueError("rms_norm_silu_cuda needs a channels-last CUDA tensor")
+        raise ValueError("rms_norm_silu needs a channels-last CUDA tensor")
     dst = None
     if out is not None:
         dst = _channel_rows(out)
@@ -108,7 +108,7 @@ def _rows_to_like(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
     return rows.view(n, h, w, c).permute(0, 3, 1, 2)
 
 
-def add_rms_norm_silu_cuda(
+def add_rms_norm_silu(
     x: torch.Tensor,
     residual: torch.Tensor,
     gamma: torch.Tensor,
@@ -126,7 +126,7 @@ def add_rms_norm_silu_cuda(
     rows = _channel_rows(x)
     rrows = _channel_rows(residual)
     if rows is None or rrows is None:
-        raise ValueError("add_rms_norm_silu_cuda needs channels-last CUDA tensors")
+        raise ValueError("add_rms_norm_silu needs channels-last CUDA tensors")
     dst = _channel_rows(out) if out is not None else None
     if out is not None and dst is None:
         raise ValueError("out must be a channels-last CUDA tensor")
@@ -348,7 +348,7 @@ def sm100_fused_filters(g: list[torch.Tensor]) -> list[torch.Tensor]:
 def wino_spatial_conv_fused(
     d: torch.Tensor, filters: list[torch.Tensor], height: int, width: int
 ) -> torch.Tensor:
-    """Same contract as :func:`wino_spatial_conv_cuda` for the 256-output-channel convs: the
+    """Same contract as :func:`wino_spatial_conv_cublas` for the 256-output-channel convs: the
     fused F(2,3)-horizontal / direct-vertical kernel (CuTe DSL, sm100), filters from
     :func:`sm100_fused_filters`."""
     from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
@@ -361,7 +361,7 @@ def wino_spatial_conv_fused(
 def wino_spatial_conv_sm100(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
-    """Same contract as :func:`wino_spatial_conv_cuda` with ``u`` from
+    """Same contract as :func:`wino_spatial_conv_cublas` with ``u`` from
     :func:`sm100_spatial_filters`: the Blackwell F(4x4, 3x3) pipeline (CuTe DSL, sm100)."""
     from tensorrt_llm._torch.visual_gen.models.wan.kernels.blackwell.spatial import (
         wino_spatial_conv as conv,
@@ -370,7 +370,7 @@ def wino_spatial_conv_sm100(
     return conv(d, u, height, width)
 
 
-def wino_spatial_conv_cuda(
+def wino_spatial_conv_cublas(
     d: torch.Tensor, u: torch.Tensor, height: int, width: int
 ) -> torch.Tensor:
     """3x3 conv (padding 1) of each of the ``order + 2`` Winograd inputs (4 or 6) by its filter as
@@ -429,7 +429,7 @@ def images_to_pairs(m: torch.Tensor) -> torch.Tensor:
     return rows.view(m.shape[0], m.shape[2] * m.shape[3], m.shape[1])
 
 
-def wino_combine_cuda(
+def wino_combine(
     x: torch.Tensor | None,
     m: list[torch.Tensor] | None,
     bias: torch.Tensor | None,
@@ -460,7 +460,7 @@ def wino_combine_cuda(
     )
 
 
-def avg_down_add_cuda(
+def avg_down_add(
     x: torch.Tensor,
     r: torch.Tensor,
     out_height: int,
@@ -474,21 +474,21 @@ def avg_down_add_cuda(
 ) -> torch.Tensor:
     """``x (+ bias) + AvgDown3D(r)`` in frame layout: ``x [T', P', Cout]``, ``r [T, P, Cin]``;
     ``bias`` is the downsample conv's bias when that conv ran without it."""
-    from .kernels.frame_ops import avg_down_add
+    from .kernels.frame_ops import avg_down_add as kernel
 
-    return avg_down_add(
+    return kernel(
         x, r, out_height, out_width, in_width, factor_t, factor_s, group_size, pad_t, bias
     )
 
 
-def interleave_bias_cuda(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
+def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     """``u [T, P, 2C]`` -> ``[2T, P, C]``: even frames from channels ``0:C``, odd from ``C:2C``, plus the bias."""
-    from .kernels.frame_ops import interleave_bias
+    from .kernels.frame_ops import interleave_bias as kernel
 
-    return interleave_bias(u, bias)
+    return kernel(u, bias)
 
 
-def wino_norm_silu_cuda(
+def wino_norm_silu(
     x: torch.Tensor | None,
     m: list[torch.Tensor] | None,
     residual: torch.Tensor | None,
@@ -511,7 +511,7 @@ def wino_norm_silu_cuda(
     ``D[k]`` is input k, fp16 when ``fp16_inputs`` (required for order 4) else bf16. The
     geometries describe products / Winograd inputs that carry halo rows or columns (sharded decode);
     ``inputs`` is an optional preallocated ``D``."""
-    return wino_norm_silu(
+    return jit_norm.wino_norm_silu(
         x,
         m,
         residual,
@@ -535,9 +535,9 @@ def wino_norm_silu_cuda(
 # ---------------------------------------------------------------------------
 
 
-def can_use_cuda_upsample_gather(cout: int, factor_t: int, repeats: int) -> bool:
+def upsample_gather_supported(cout: int, factor_t: int, repeats: int) -> bool:
     """The gather kernel runs and covers these shapes (:func:`kernels.upsample_gather.can_upsample_gather`)."""
-    if not cuda_op_available():
+    if not kernels_available():
         return False
     from .kernels.upsample_gather import can_upsample_gather
 
@@ -571,7 +571,7 @@ def pack_upsample_weights(
     return packed, packed_bias
 
 
-def upsample_gather_cuda(
+def upsample_gather(
     temp: torch.Tensor,
     shortcut: torch.Tensor | None,
     batch: int,
@@ -583,6 +583,6 @@ def upsample_gather_cuda(
 ) -> torch.Tensor:
     """Phase gather (:mod:`kernels.upsample_gather`) with the conv bias and the DupUp3D shortcut add
     folded in."""
-    from .kernels.upsample_gather import upsample_gather
+    from .kernels.upsample_gather import upsample_gather as kernel
 
-    return upsample_gather(temp, shortcut, batch, frames, factor_t, repeats, crop, bias)
+    return kernel(temp, shortcut, batch, frames, factor_t, repeats, crop, bias)

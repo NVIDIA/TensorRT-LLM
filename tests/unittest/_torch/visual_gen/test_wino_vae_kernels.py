@@ -9,11 +9,11 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
     TEMPORAL_WINO,
-    add_rms_norm_silu_cuda,
+    add_rms_norm_silu,
     apply_in_bias,
-    can_use_cuda_rms_norm_silu,
-    cuda_op_available,
-    rms_norm_silu_cuda,
+    kernels_available,
+    rms_norm_silu,
+    rms_norm_silu_supported,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernel")
@@ -173,7 +173,7 @@ def _require_sm100() -> None:
     assert sm100_wino_available(), "nvidia-cutlass-dsl (a declared requirement) does not import"
 
 
-cuda_op = _built(cuda_op_available(), "the CuTe DSL kernels (nvidia-cutlass-dsl, cuda-python)")
+cuda_op = _built(kernels_available(), "the CuTe DSL kernels (nvidia-cutlass-dsl, cuda-python)")
 
 
 @cuda_op
@@ -183,7 +183,7 @@ def test_cuda_fp32_mode_is_closer_to_fp32_than_eager(C: int) -> None:
     scale = C**0.5
     truth = rms_norm_silu_reference(x.float(), gamma.float(), b.float(), scale)
     eager = rms_norm_silu_reference(x, gamma, b, scale).float()
-    fused = rms_norm_silu_cuda(x, gamma, b, scale).float()
+    fused = rms_norm_silu(x, gamma, b, scale).float()
     err_eager = (eager - truth).norm() / truth.norm()
     err_fused = (fused - truth).norm() / truth.norm()
     assert torch.isfinite(fused).all()
@@ -193,12 +193,12 @@ def test_cuda_fp32_mode_is_closer_to_fp32_than_eager(C: int) -> None:
 
 def test_cuda_norm_eligibility() -> None:
     x = torch.randn(1, 32, 2, 4, 4, device="cuda", dtype=torch.bfloat16)  # NCTHW, not channels-last
-    assert not can_use_cuda_rms_norm_silu(x)
-    assert can_use_cuda_rms_norm_silu(x.to(memory_format=torch.channels_last_3d))
-    assert not can_use_cuda_rms_norm_silu(x.float().to(memory_format=torch.channels_last_3d))
-    assert not can_use_cuda_rms_norm_silu(x.cpu())
+    assert not rms_norm_silu_supported(x)
+    assert rms_norm_silu_supported(x.to(memory_format=torch.channels_last_3d))
+    assert not rms_norm_silu_supported(x.float().to(memory_format=torch.channels_last_3d))
+    assert not rms_norm_silu_supported(x.cpu())
     odd = torch.randn(1, 12, 2, 4, 4, device="cuda", dtype=torch.bfloat16)
-    assert not can_use_cuda_rms_norm_silu(odd.to(memory_format=torch.channels_last_3d))
+    assert not rms_norm_silu_supported(odd.to(memory_format=torch.channels_last_3d))
 
 
 @cuda_op
@@ -212,7 +212,7 @@ def test_cuda_4d_images_layout() -> None:
     )
     gamma = torch.ones(C, 1, 1, device="cuda", dtype=torch.bfloat16)
     expected = rms_norm_silu_reference(x, gamma, 0.0, C**0.5)
-    actual = rms_norm_silu_cuda(x, gamma, None, C**0.5, reference_rounding=True)
+    actual = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=True)
     assert (actual.float() - expected.float()).abs().max().item() < 2e-2
 
 
@@ -221,10 +221,10 @@ def test_cuda_4d_images_layout() -> None:
 @pytest.mark.parametrize("bias", [False, True])
 def test_cuda_reference_mode_matches_eager(C: int, bias: bool) -> None:
     x, gamma, b = _inputs(C, frames=5, hw=(9, 13), bias=bias)
-    assert can_use_cuda_rms_norm_silu(x)
+    assert rms_norm_silu_supported(x)
     scale = C**0.5
     expected = rms_norm_silu_reference(x, gamma, b if b is not None else 0.0, scale)
-    actual = rms_norm_silu_cuda(x, gamma, b, scale, reference_rounding=True)
+    actual = rms_norm_silu(x, gamma, b, scale, reference_rounding=True)
     assert actual.is_contiguous(memory_format=torch.channels_last_3d)
     diff = (actual.float() - expected.float()).abs()
     ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
@@ -245,7 +245,7 @@ def test_cuda_tail_rows_and_zero_rows() -> None:
     x[0, :, 0, 0, 0] = 0
     gamma = torch.ones(C, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     for reference in (False, True):
-        out = rms_norm_silu_cuda(x, gamma, None, C**0.5, reference_rounding=reference)
+        out = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=reference)
         assert torch.isfinite(out.float()).all()
         assert out[0, :, 0, 0, 0].abs().max().item() == 0.0
         expected = rms_norm_silu_reference(x, gamma, 0.0, C**0.5)
@@ -264,7 +264,7 @@ def test_cuda_large_tensor_matches_eager(C: int) -> None:
     )
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
-    ref = rms_norm_silu_cuda(x, gamma, None, scale, reference_rounding=True)
+    ref = rms_norm_silu(x, gamma, None, scale, reference_rounding=True)
     expected = rms_norm_silu_reference(x, gamma, 0.0, scale)
     ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
     assert ((ref.float() - expected.float()).abs() > ulp).float().mean().item() < 1e-3
@@ -288,7 +288,7 @@ def test_cuda_residual_variant(C: int, reference: bool) -> None:
     gamma = (1 + 0.1 * torch.randn(C, 1, 1, 1, generator=gen, device="cuda")).to(torch.bfloat16)
     scale = C**0.5
     s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale)
-    s, a = add_rms_norm_silu_cuda(x, r, gamma, None, scale, reference_rounding=reference)
+    s, a = add_rms_norm_silu(x, r, gamma, None, scale, reference_rounding=reference)
     assert torch.equal(s, s_ref), "the returned sum must be bit-identical to the eager bf16 add"
     assert a.is_contiguous(memory_format=torch.channels_last_3d)
     ulp = a_ref.float().abs().clamp_min(1e-3) * 2**-7
@@ -296,7 +296,7 @@ def test_cuda_residual_variant(C: int, reference: bool) -> None:
     assert mismatched < (1e-3 if reference else 5e-2)
     # fp32 mode must also agree with the standalone norm applied to the sum
     if not reference:
-        a2 = rms_norm_silu_cuda(s, gamma, None, scale)
+        a2 = rms_norm_silu(s, gamma, None, scale)
         assert torch.equal(a, a2)
 
 
@@ -323,22 +323,22 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
     scale = C**0.5
     if with_residual:
         s_ref, a_ref = add_rms_norm_silu_reference(x, r, gamma, 0.0, scale, in_bias=in_bias)
-        s, a = add_rms_norm_silu_cuda(
+        s, a = add_rms_norm_silu(
             x, r, gamma, None, scale, reference_rounding=reference, in_bias=in_bias
         )
         assert torch.equal(s, s_ref)
     else:
         a_ref = rms_norm_silu_reference(x, gamma, 0.0, scale, in_bias=in_bias)
-        a = rms_norm_silu_cuda(x, gamma, None, scale, reference_rounding=reference, in_bias=in_bias)
+        a = rms_norm_silu(x, gamma, None, scale, reference_rounding=reference, in_bias=in_bias)
     ulp = a_ref.float().abs().clamp_min(1e-3) * 2**-7
     mismatched = ((a.float() - a_ref.float()).abs() > ulp).float().mean().item()
     assert mismatched < (1e-3 if reference else 5e-2)
     # The in-bias path must equal the standalone kernel applied to the eagerly biased input.
     xb = (x + in_bias.view(1, -1, 1, 1, 1)).contiguous(memory_format=torch.channels_last_3d)
     if with_residual:
-        _, a2 = add_rms_norm_silu_cuda(xb, r, gamma, None, scale, reference_rounding=reference)
+        _, a2 = add_rms_norm_silu(xb, r, gamma, None, scale, reference_rounding=reference)
     else:
-        a2 = rms_norm_silu_cuda(xb, gamma, None, scale, reference_rounding=reference)
+        a2 = rms_norm_silu(xb, gamma, None, scale, reference_rounding=reference)
     assert torch.equal(a, a2)
 
 
@@ -350,7 +350,7 @@ def test_cuda_in_bias(C: int, reference: bool, with_residual: bool) -> None:
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import DupUp3D  # noqa: E402
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
     pack_upsample_weights,
-    upsample_gather_cuda,
+    upsample_gather,
 )
 
 upsample_op = cuda_op
@@ -420,7 +420,7 @@ def test_cuda_upsample_gather_with_shortcut(
         memory_format=torch.channels_last
     )
     crop = factor_t - 1 if first_chunk else 0
-    got = upsample_gather_cuda(temp, residual, b, frames, factor_t, dup.repeats, crop)
+    got = upsample_gather(temp, residual, b, frames, factor_t, dup.repeats, crop)
     assert got.shape == eager.shape and got.is_contiguous(memory_format=torch.channels_last_3d)
 
     # The kernel's gather + shortcut add must be bit-identical to the reference gather
@@ -429,21 +429,19 @@ def test_cuda_upsample_gather_with_shortcut(
         temp, b, frames, dup(residual, first_chunk=first_chunk)
     )
     assert torch.equal(got, via_reference)
-    plain = upsample_gather_cuda(temp, None, b, frames)
+    plain = upsample_gather(temp, None, b, frames)
     assert torch.equal(plain, upsample_gather_reference(temp, b, frames))
 
     # Deferred conv bias: the gather adds it before the shortcut, bit-identical to the
     # reference gather of the unbiased conv output followed by the eager bias add.
     temp_nb = F.conv2d(x4, packed, None, padding=1).contiguous(memory_format=torch.channels_last)
-    got_nb = upsample_gather_cuda(
-        temp_nb, residual, b, frames, factor_t, dup.repeats, crop, bias=bias
-    )
+    got_nb = upsample_gather(temp_nb, residual, b, frames, factor_t, dup.repeats, crop, bias=bias)
     ref_nb = upsample_gather_reference(
         temp_nb, b, frames, dup(residual, first_chunk=first_chunk), bias=bias
     )
     assert torch.equal(got_nb, ref_nb)
     assert torch.equal(
-        upsample_gather_cuda(temp_nb, None, b, frames, bias=bias),
+        upsample_gather(temp_nb, None, b, frames, bias=bias),
         upsample_gather_reference(temp_nb, b, frames, bias=bias),
     )
 
@@ -460,9 +458,7 @@ def test_cuda_upsample_gather_with_shortcut(
 # Temporal Winograd norm kernel vs its eager reference
 # ---------------------------------------------------------------------------
 
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    wino_norm_silu_cuda,
-)
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import wino_norm_silu  # noqa: E402
 
 wino_op = cuda_op
 
@@ -500,7 +496,7 @@ def test_wino_norm_silu_reference_mode_is_bitwise(
     s_ref, tail_ref, d_ref = wino_norm_silu_reference(
         x, m, residual, in_bias, cache, gamma, 0.0, scale, order, winograd_dtype
     )
-    s, tail, d = wino_norm_silu_cuda(
+    s, tail, d = wino_norm_silu(
         x,
         m,
         residual,
@@ -542,7 +538,7 @@ def test_wino_norm_silu_fp32_mode_close(C: int, order: int) -> None:
     _, tail_ref, d_ref = wino_norm_silu_reference(
         x, None, None, None, cache, gamma, 0.0, C**0.5, order, winograd_dtype
     )
-    _, tail, d = wino_norm_silu_cuda(
+    _, tail, d = wino_norm_silu(
         x,
         None,
         None,
@@ -577,7 +573,7 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
     cache = torch.randn(2, H * W, C, generator=gen, device="cuda").to(torch.bfloat16)
     gamma = (1 + 0.1 * torch.randn(C, generator=gen, device="cuda")).to(torch.bfloat16)
     weight = (0.1 * torch.randn(Co, C, 3, 3, 3, generator=gen, device="cuda")).to(torch.bfloat16)
-    _, _, d = wino_norm_silu_cuda(
+    _, _, d = wino_norm_silu(
         x, None, None, None, cache, gamma, None, C**0.5, T, order=order, fp16_inputs=order == 4
     )
     g = winograd_weights(weight, order, torch.float32)
@@ -609,8 +605,8 @@ def test_wino_norm_inputs_reproduce_conv3d(order: int) -> None:
 # ---------------------------------------------------------------------------
 
 from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    interleave_bias_cuda,
-    wino_combine_cuda,
+    interleave_bias,
+    wino_combine,
 )
 
 frame_ops = cuda_op
@@ -640,10 +636,10 @@ def test_wino_combine_is_bitwise(C: int, source: str, extras: str) -> None:
         ref = ref + bias.reshape(1, 1, -1)
     if residual is not None:
         ref = ref + residual
-    got = wino_combine_cuda(x, m, bias, residual, T, 7, 11)
+    got = wino_combine(x, m, bias, residual, T, 7, 11)
     assert torch.equal(got, ref)
     # zero-padded output (the downsampler's ZeroPad2d((0, 1, 0, 1))) in the same pass
-    padded = wino_combine_cuda(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
+    padded = wino_combine(x, m, bias, residual, T, 7, 11, 1, 1).view(T, 8, 12, C)
     ref_img = F.pad(ref.view(T, 7, 11, C).permute(0, 3, 1, 2), (0, 1, 0, 1)).permute(0, 2, 3, 1)
     assert torch.equal(padded, ref_img)
 
@@ -660,13 +656,11 @@ def test_interleave_bias_is_bitwise(C: int, with_bias: bool) -> None:
         if with_bias
         else None
     )
-    assert torch.equal(interleave_bias_cuda(u, bias), interleave_bias_reference(u, bias))
+    assert torch.equal(interleave_bias(u, bias), interleave_bias_reference(u, bias))
 
 
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import AvgDown3D  # noqa: E402
-from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (  # noqa: E402
-    avg_down_add_cuda,
-)
+from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import avg_down_add  # noqa: E402
 
 
 @frame_ops
@@ -697,7 +691,7 @@ def test_avg_down_add_matches_eager(
         x.float() + (bias.float().view(1, -1, 1, 1, 1) if with_bias else 0.0) + ref_avg.float()
     ).to(bf)
     pad_t = (ft - frames % ft) % ft
-    got = avg_down_add_cuda(
+    got = avg_down_add(
         x.permute(0, 2, 3, 4, 1).reshape(x.shape[2], h // 2 * (w // 2), cout),
         r.permute(0, 2, 3, 4, 1).reshape(frames, h * w, cin),
         h // 2,
@@ -719,7 +713,7 @@ def test_avg_down_add_matches_eager(
 def test_cuda_norm_without_activation(C: int, reference: bool) -> None:
     x, gamma, _ = _inputs(C, frames=2, hw=(9, 13))
     expected = rms_norm_reference(x, gamma, C**0.5)
-    actual = rms_norm_silu_cuda(x, gamma, None, C**0.5, reference_rounding=reference, silu=False)
+    actual = rms_norm_silu(x, gamma, None, C**0.5, reference_rounding=reference, silu=False)
     ulp = expected.float().abs().clamp_min(1e-3) * 2**-7
     mismatched = ((actual.float() - expected.float()).abs() > ulp).float().mean().item()
     assert mismatched < (1e-3 if reference else 5e-2)
@@ -890,7 +884,7 @@ def test_spatial_winograd_conv_matches_conv2d(
     cin_cout: tuple[int, int], hw: tuple[int, int], tile: int
 ) -> None:
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        wino_spatial_conv_cuda,
+        wino_spatial_conv_cublas,
         winograd_spatial_weights,
         winograd_weights,
     )
@@ -901,7 +895,7 @@ def test_spatial_winograd_conv_matches_conv2d(
     pairs = 3
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
     d = torch.randn(4, pairs, h * w, cin, device="cuda").to(torch.bfloat16)
-    got = wino_spatial_conv_cuda(d, winograd_spatial_weights(weight, tile), h, w)
+    got = wino_spatial_conv_cublas(d, winograd_spatial_weights(weight, tile), h, w)
     g = winograd_weights(weight)
     for k in range(4):
         ref = F.conv2d(
@@ -986,7 +980,7 @@ def test_spatial_winograd_conv_frame_dtypes(
 ) -> None:
     """The portable path on bf16 and fp16 frames with four or six temporal components."""
     from tensorrt_llm._torch.visual_gen.models.wan.wino_vae_kernels import (
-        wino_spatial_conv_cuda,
+        wino_spatial_conv_cublas,
         winograd_spatial_weights,
         winograd_weights,
     )
@@ -997,7 +991,7 @@ def test_spatial_winograd_conv_frame_dtypes(
     weight = (0.1 * torch.randn(cout, cin, 3, 3, 3, device="cuda")).to(torch.bfloat16)
     d = torch.randn(comps, pairs, h * w, cin, device="cuda").to(frame_dtype)
     u = winograd_spatial_weights(weight, 4, order)
-    got = wino_spatial_conv_cuda(d, u, h, w)
+    got = wino_spatial_conv_cublas(d, u, h, w)
     assert got.dtype == frame_dtype
     g = winograd_weights(weight, order, torch.float32)
     ref = torch.stack(
