@@ -2453,6 +2453,7 @@ class TestDeepSeekV4ProDSpark(LlmapiAccuracyTestHarness):
                 f"TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp{tp_size}]",
                 acceptance_length)
 
+    @pytest.mark.skip_less_device_memory(DEEPSEEKV4_PRO_4GPU_MIN_MEMORY_MB)
     @pytest.mark.skip_less_mpi_world_size(4)
     def test_gsm8k_dep4_megamoe_cutedsl(self):
         # MegaMoE CuTe DSL is the backend that serves the NVFP4 export. DEP4
