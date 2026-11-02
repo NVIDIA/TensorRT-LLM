@@ -1141,11 +1141,13 @@ def test_beam_search_sampler_cuda_graph_matches_eager(
             with llm:
                 outputs = None
                 for _ in range(3 if graph_enabled else 1):
-                    outputs = llm.generate(deepcopy(input_prompts),
-                                           sampling_params=deepcopy(
-                                               sampling_params))
-        return [[tuple(beam.token_ids) for beam in out.outputs]
-                for out in outputs]
+                    outputs = llm.generate(
+                        deepcopy(input_prompts),
+                        sampling_params=deepcopy(sampling_params))
+        return [
+            [tuple(beam.token_ids) for beam in out.outputs]  # type: ignore
+            for out in outputs  # type: ignore
+        ]
 
     eager = run(False)
     graphed = run(True)
@@ -1208,8 +1210,7 @@ def test_beam_search_warmup_captures_new_shape_on_first_use(
         log_probs_store = LogProbsStore(
             sampled_log_prob_indices=torch.zeros(log_probs_shape,
                                                  dtype=torch.int32),
-            sampled_log_probs=torch.zeros(log_probs_shape,
-                                          dtype=torch.float32),
+            sampled_log_probs=torch.zeros(log_probs_shape, dtype=torch.float32),
             sampled_log_prob_ranks=torch.zeros(log_probs_shape,
                                                dtype=torch.int32),
             topk_indices=torch.zeros((0, ), dtype=torch.int32),
@@ -1222,7 +1223,7 @@ def test_beam_search_warmup_captures_new_shape_on_first_use(
             use_speculative_d2h=False,
             has_multi_token_stop_words=lambda _: False,
             copy_to_host=lambda t: t,
-            make_side_stream_copier=nullcontext,
+            make_side_stream_copier=nullcontext,  # type: ignore
         )
         end_ids = torch.full((max_num_sequences, ), end_id, dtype=torch.int32)
         new_log_probs = log_probs_store.sampled_log_probs[..., 0]
