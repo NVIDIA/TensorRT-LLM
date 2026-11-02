@@ -10,9 +10,9 @@ C]`` (frame ``n`` is pair ``n % pairs`` of component ``n // pairs``) or, with st
 may come from up to three buffers (segments: zero frames, the causal history, the new frame).
 Output transform: ``y = A^T M A (+ bias)`` per tile, written into frames ``[N, H, W, C]``.
 
-F(2x2, 3x3) runs on the points (0, +-1, inf), F(4x4, 3x3) on (0, +-P, +-Q, inf); see the
-comment above ``P`` and ``Q`` for the matrices. Both transforms are separable: rows of B^T (or
-A^T) along one axis of the window, then along the other.
+The rows of B^T and A^T are :func:`wino_tables.bt_row` / :func:`wino_tables.at_row` (F(2x2, 3x3)
+on the points (0, +-1, inf), F(4x4, 3x3) on (0, +-3/2, +-5/8, inf)). Both transforms are
+separable: rows of B^T (or A^T) along one axis of the window, then along the other.
 
 The input transform with ``C % 64 == 0`` (every production layer) stages a block's window rows
 in shared memory: one tile row x 8 tiles x 64 channels per block, 16-byte loads, then one
@@ -32,9 +32,12 @@ import torch
 from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass.base_dsl.typing import Vector
 
+from ..wino_tables import at_row, bt_row
 from .common import (
     CHANNELS_PER_VECTOR,
     THREADS,
+    check_aligned,
+    check_bias,
     compile_cached,
     current_stream,
     flat_view,
@@ -45,39 +48,12 @@ from .common import (
 STAGED_TILES = 8
 STAGED_CHANNELS = 64
 
-# F(4x4, 3x3) interpolation points, besides 0 and infinity: +-P and +-Q. Chosen for low fp16
-# rounding error; both are dyadic (3/2, 5/8), so every product of them used below is exact in
-# fp32 and folds into a single constant at trace time.
-#
-# Where the coefficients come from (Toom-Cook on the points 0, -P, +P, -Q, +Q, inf):
-#
-#   Each row of B^T holds the coefficients (of x^0 .. x^5, applied to d0 .. d5) of the
-#   polynomial that vanishes on all finite points but one:
-#     row 0 drops 0:   (x^2 - P^2)(x^2 - Q^2) = P^2 Q^2 - (P^2 + Q^2) x^2 + x^4
-#                      -> [P^2 Q^2, 0, -(P^2 + Q^2), 0, 1, 0]
-#     rows 1, 2 drop one of +-P:  x (x^2 - Q^2)(x +- P) -> [0, -+P Q^2, -Q^2, +-P, 1, 0]
-#     rows 3, 4 drop one of +-Q:  the same with P and Q swapped
-#     row 5 (infinity): row 0 times x, i.e. shifted by one.
-#   Rows 1 and 2 share an even part (d4 - Q^2 d2) and an odd part (P d3 - P Q^2 d1) and take
-#   their sum and difference; rows 3 and 4 likewise.
-#
-#   A^T row r evaluates the m outputs at the points: [0^r, P^r, (-P)^r, Q^r, (-Q)^r, inf],
-#   where 0^0 = 1 and the infinity column is 1 only in the last row r = 3:
-#     row 0: t0 + t1 + t2 + t3 + t4
-#     row r: P^r (t1 +- t2) + Q^r (t3 +- t4)  (+ for even r, - for odd r), plus t5 for r = 3.
-#
-# The filter transform G (scaled so that A^T [(G g) * (B^T d)] is the convolution) and these
-# same B^T / A^T are tabulated in ``wino_tables.SPATIAL_WINO``; the kernel tests check the two
-# agree.
-P = 3 / 2
-Q = 5 / 8
-
 
 class _Pair:
     """The fp32 values of two channels in one 64-bit register pair. ``+`` and ``-`` are single
     packed instructions (FADD2) for both channels; ``k * pair`` with a Python constant ``k``
     stays pending (:class:`_Scaled`) until it meets a ``+`` or ``-``, which then emits one
-    packed fma (FFMA2). :func:`_bt` and :func:`_at` are written with plain operators and run
+    packed fma (FFMA2). :func:`bt_row` and :func:`at_row` are written with plain operators and run
     on pairs unchanged."""
 
     def __init__(self, v: Vector) -> None:
@@ -135,33 +111,6 @@ class _Scaled:
         raise NotImplementedError("k * x - pair is not used by the transforms")
 
 
-def _bt(m: int, x: int, d: list):
-    """Row ``x`` of B^T applied to the ``m + 2`` values ``d``."""
-    if m == 2:
-        return (d[0] - d[2], d[1] + d[2], d[2] - d[1], d[1] - d[3])[x]
-    if x == 0:
-        return (P * Q) ** 2 * d[0] - (P * P + Q * Q) * d[2] + d[4]
-    if x == 5:
-        return (P * Q) ** 2 * d[1] - (P * P + Q * Q) * d[3] + d[5]
-    a, b = (P, Q) if x in (1, 2) else (Q, P)
-    even = d[4] - b * b * d[2]
-    odd = a * d[3] - a * b * b * d[1]
-    return even + odd if x in (1, 3) else even - odd
-
-
-def _at(m: int, r: int, t: list):
-    """Row ``r`` of A^T applied to the ``m + 2`` values ``t``."""
-    if m == 2:
-        return t[0] + t[1] + t[2] if r == 0 else t[1] - t[2] - t[3]
-    if r == 0:
-        return t[0] + t[1] + t[2] + t[3] + t[4]
-    if r % 2 == 0:
-        y = P**r * (t[1] + t[2]) + Q**r * (t[3] + t[4])
-    else:
-        y = P**r * (t[1] - t[2]) + Q**r * (t[3] - t[4])
-    return y + t[5] if r == 3 else y
-
-
 def _udiv(a, b):
     """``a // b`` for non-negative 32-bit values: an unsigned division (the signed ``//`` adds
     the floor-division sign fix-ups)."""
@@ -170,7 +119,7 @@ def _udiv(a, b):
 
 def _separable_transform(fn, m: int, rows: int, window: list) -> list:
     """The separable transform of a square window of values (``window[a][b]``) by the first
-    ``rows`` rows of ``fn`` (``_bt`` with ``rows = m + 2``, ``_at`` with ``rows = m``): first
+    ``rows`` rows of ``fn`` (``bt_row`` with ``rows = m + 2``, ``at_row`` with ``rows = m``): first
     along a (``T[x][b]``), then along b."""
     a_len = len(window)
     t = [
@@ -427,7 +376,7 @@ class InputTransformKernel(_SpatialTransformKernel):
             if m == 4:
                 # The 6x6 transform on packed pairs: half the fp32 instructions (FFMA2, FADD2).
                 out = _separable_transform(
-                    _bt,
+                    bt_row,
                     m,
                     size,
                     [
@@ -440,10 +389,10 @@ class InputTransformKernel(_SpatialTransformKernel):
                 # F(2x2) is a few adds per value; scalar code keeps fewer registers live and
                 # measures faster.
                 out_lo = _separable_transform(
-                    _bt, m, size, [[vals[a][b][lo] for b in range(size)] for a in range(size)]
+                    bt_row, m, size, [[vals[a][b][lo] for b in range(size)] for a in range(size)]
                 )
                 out_hi = _separable_transform(
-                    _bt, m, size, [[vals[a][b][hi] for b in range(size)] for a in range(size)]
+                    bt_row, m, size, [[vals[a][b][hi] for b in range(size)] for a in range(size)]
                 )
                 halves = [[(out_lo[x][y], out_hi[x][y]) for y in range(size)] for x in range(size)]
             for x in range(size):
@@ -559,7 +508,7 @@ class OutputTransformKernel(_SpatialTransformKernel):
         outs = []
         for ch in range(self.lanes):
             y = _separable_transform(
-                _at, m, m, [[coords[x * size + b][ch] for b in range(size)] for x in range(size)]
+                at_row, m, m, [[coords[x * size + b][ch] for b in range(size)] for x in range(size)]
             )
             if self.has_bias:
                 y = [[y[r][s] + bias[ch] for s in range(m)] for r in range(m)]
@@ -655,8 +604,7 @@ def _check_frames(frames: torch.Tensor, tile: int, row0: int, row1: int) -> None
         raise ValueError("frames must be [N, H, W, C] bf16 or fp16")
     if not frames.is_contiguous():
         raise ValueError("frames must be contiguous")
-    if frames.data_ptr() % 16:
-        raise ValueError("frames must be 16-byte aligned")
+    check_aligned(16, frames=frames)
     if tile not in (2, 4) or frames.shape[3] % CHANNELS_PER_VECTOR:
         raise ValueError("tile must be 2 or 4 and the channel count a multiple of 8")
     if not 0 <= row0 < row1 <= _ceil_div(frames.shape[1], tile):
@@ -794,15 +742,10 @@ def wino_spatial_out(
         raise ValueError(
             "m must be contiguous fp16 [components*(tile+2)^2, (N/components)*tiles, C]"
         )
-    if bias is not None and (
-        bias.dtype != frames.dtype or tuple(bias.shape) != (c,) or not bias.is_contiguous()
-    ):
-        raise ValueError("bias must be a contiguous [C] tensor of the frames' dtype")
+    check_bias(bias, c, frames.dtype, "C")
     _check_grid(n, row0, row1)
-    if m.data_ptr() % 16:
-        raise ValueError("m must be 16-byte aligned")
-    if bias is not None and bias.data_ptr() % (2 * _lanes(tile)):
-        raise ValueError(f"bias must be {2 * _lanes(tile)}-byte aligned")
+    check_aligned(16, m=m)
+    check_aligned(2 * _lanes(tile), bias=bias)
     device = frames.device.index
     _output_kernel(device, tile, frames.dtype == torch.float16, bias is not None)(
         m.data_ptr(),

@@ -794,18 +794,21 @@ class VaeNormKernel:
         words = []
         for i in range(WORDS_PER_VECTOR):
             pair = [self._combine_input(j, ins, in_bias_v, e) for e in (2 * i, 2 * i + 1)]
+            # The packed word of the last rounding is the stored value; pack only if none.
+            word = None
             if p.round_each_add:
-                _, lo, hi = round_pair_bf16(pair[0], pair[1])
+                word, lo, hi = round_pair_bf16(pair[0], pair[1])
                 pair = [lo, hi]
             if v.has_residual:
                 pair = [pair[0] + res[2 * i], pair[1] + res[2 * i + 1]]
+                word = None
                 if p.round_each_add:
-                    _, lo, hi = round_pair_bf16(pair[0], pair[1])
+                    word, lo, hi = round_pair_bf16(pair[0], pair[1])
                     pair = [lo, hi]
             if v.mid != MID_NONE:
                 sum_sq = cute.math.fma(pair[0], pair[0], sum_sq)
                 sum_sq = cute.math.fma(pair[1], pair[1], sum_sq)
-            words.append(pack2(pair[0], pair[1]))
+            words.append(word if word is not None else pack2(pair[0], pair[1]))
         if v.mid == MID_NONE:
             store_words(c.uy, self._vrow(c, orow, kk), words)
         elif p.has_sum:

@@ -130,6 +130,23 @@ def current_stream(device: int) -> cuda.CUstream:
     return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
 
+def check_aligned(align: int, **tensors: torch.Tensor | None) -> None:
+    """Reject tensors whose data does not start on an ``align``-byte boundary (the kernels
+    load and store whole vectors)."""
+    for name, t in tensors.items():
+        if t is not None and t.data_ptr() % align:
+            raise ValueError(f"{name} must be {align}-byte aligned")
+
+
+def check_bias(bias: torch.Tensor | None, values: int, dtype: torch.dtype, what: str) -> None:
+    """A bias is a contiguous 1-D tensor of ``values`` elements of ``dtype`` (``what`` names
+    its extent in the error)."""
+    if bias is not None and (
+        bias.dtype != dtype or tuple(bias.shape) != (values,) or not bias.is_contiguous()
+    ):
+        raise ValueError(f"bias must be a contiguous {dtype} [{what}] tensor")
+
+
 def compile_cached(
     family: str, name: str, compile_fn: Callable[[], Any], sources: Sequence[str]
 ) -> Any:

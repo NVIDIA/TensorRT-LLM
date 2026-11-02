@@ -18,6 +18,8 @@ from cutlass import BFloat16, Float32, Int32
 from .common import (
     CHANNELS_PER_VECTOR,
     THREADS,
+    check_aligned,
+    check_bias,
     compile_cached,
     current_stream,
     flat_1d,
@@ -33,21 +35,6 @@ from .common import (
     unpack_bf16,
     vec_view,
 )
-
-
-def _check_aligned(align: int, **tensors: torch.Tensor | None) -> None:
-    """Reject tensors whose data does not start on an ``align``-byte boundary."""
-    for name, t in tensors.items():
-        if t is not None and t.data_ptr() % align:
-            raise ValueError(f"{name} must be {align}-byte aligned")
-
-
-def _check_bias(bias: torch.Tensor | None, values: int, what: str) -> None:
-    """A bias is a contiguous 1-D bf16 tensor of ``values`` elements."""
-    if bias is not None and (
-        bias.dtype != torch.bfloat16 or tuple(bias.shape) != (values,) or not bias.is_contiguous()
-    ):
-        raise ValueError(f"bias must be a contiguous bf16 [{what}] tensor")
 
 
 class AvgDownAddKernel:
@@ -258,8 +245,8 @@ def avg_down_add(
             "avg_down_add needs cin * factor == cout * group_size, group_size dividing factor "
             "and channel counts that are multiples of 8"
         )
-    _check_bias(bias, cout, "Cout")
-    _check_aligned(16, x=x, r=r, bias=bias)
+    check_bias(bias, cout, torch.bfloat16, "Cout")
+    check_aligned(16, x=x, r=r, bias=bias)
     y = torch.empty_like(x)
     items = out_frames * out_positions * (cin // CHANNELS_PER_VECTOR)
     if items == 0:
@@ -368,8 +355,8 @@ def interleave_bias(u: torch.Tensor, bias: torch.Tensor | None) -> torch.Tensor:
     if u.dim() != 3 or u.dtype != torch.bfloat16 or not u.is_contiguous() or u.shape[2] % 16:
         raise ValueError("u must be contiguous bf16 [T, P, 2C] with C a multiple of 8")
     frames, positions, c2 = u.shape
-    _check_bias(bias, c2, "2C")
-    _check_aligned(16, u=u, bias=bias)
+    check_bias(bias, c2, torch.bfloat16, "2C")
+    check_aligned(16, u=u, bias=bias)
     y = torch.empty((2 * frames, positions, c2 // 2), dtype=u.dtype, device=u.device)
     items = 2 * frames * positions * (c2 // 2 // CHANNELS_PER_VECTOR)
     if items == 0:
@@ -530,7 +517,7 @@ def unpatchify_clamp_into(chunk: torch.Tensor, out: torch.Tensor, frame0: int, p
         raise ValueError(
             f"frames [{frame0}, {frame0 + frames}) of chunk do not fit in out's {out.shape[2]}"
         )
-    _check_aligned(8 if _unpatchify_packed(channels, patch) else 2, chunk=chunk, out=out)
+    check_aligned(8 if _unpatchify_packed(channels, patch) else 2, chunk=chunk, out=out)
     items = frames * height * width
     if items == 0:
         return

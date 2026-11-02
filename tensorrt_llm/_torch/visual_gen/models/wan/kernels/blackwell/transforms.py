@@ -19,6 +19,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float16, Float32, Int32, Int64
 
+from ...wino_tables import at_row, bt_row
+
 # Output tile edge and input window edge.
 TILE = 4
 WINDOW = TILE + 2
@@ -29,34 +31,14 @@ IN_VECTOR = 2
 OUT_VECTOR = 4
 
 
-def _bt4(d):
-    # factorized F(4,3) B^T for points (0, +-3/2, +-5/8, inf): the +-p rows share an even and an
-    # odd part, 22 ops instead of 30
-    d0, d1, d2, d3, d4, d5 = d
-    e1 = d4 + d2 * -0.390625  # d4 - b^2 d2,        b = 5/8
-    o1 = d3 * 1.5 + d1 * -0.5859375  # a d3 - a b^2 d1,    a = 3/2
-    e2 = d4 + d2 * -2.25  # d4 - a^2 d2
-    o2 = d3 * 0.625 + d1 * -1.40625  # b d3 - a^2 b d1
-    return [
-        d0 * 0.87890625 + d2 * -2.640625 + d4,
-        e1 + o1,
-        e1 - o1,
-        e2 + o2,
-        e2 - o2,
-        d1 * 0.87890625 + d3 * -2.640625 + d5,
-    ]
+def _bt4(d: list) -> list:
+    """All six rows of the F(4, 3) B^T applied to ``d``."""
+    return [bt_row(TILE, x, d) for x in range(WINDOW)]
 
 
-def _at4(m):
-    # factorized F(4,3) A^T: 14 ops instead of 20
-    m0, m1, m2, m3, m4, m5 = m
-    p, q, r, s = m1 + m2, m1 - m2, m3 + m4, m3 - m4
-    return [
-        m0 + p + r,
-        q * 1.5 + s * 0.625,
-        p * 2.25 + r * 0.390625,
-        q * 3.375 + s * 0.244140625 + m5,
-    ]
+def _at4(m: list) -> list:
+    """All four rows of the F(4, 3) A^T applied to ``m``."""
+    return [at_row(TILE, r, m) for r in range(TILE)]
 
 
 def _vector_view(tensor: cute.Tensor, tile: tuple, coord: tuple) -> cute.Tensor:

@@ -36,9 +36,10 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass._mlir.dialects import llvm
+from cutlass.base_dsl.typing import Vector
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
-from cutlass.cutlass_dsl import Int32, T, dsl_user_op
+from cutlass.cutlass_dsl import Int32, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from ..common import CHANNELS_PER_VECTOR
@@ -140,29 +141,14 @@ def _wino_item(src: Int32, dst: Int32, in_half: bool, pass_idx: int, *, loc=None
     )
 
 
-@dsl_user_op
-def _bfly2(a0, a1, b0, b1, *, loc=None, ip=None):
-    # (a, b) <- (a + b, a - b) on two fp32 lanes with packed f32x2 add/sub (sm_100)
-    out = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
-        [
-            cutlass.Float32(a0).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(a1).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b0).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(b1).ir_value(loc=loc, ip=ip),
-        ],
-        "{\n\t.reg .b64 ra, rb, rs, rd;\n\t"
-        "mov.b64 ra, {$4, $5};\n\tmov.b64 rb, {$6, $7};\n\t"
-        "add.rn.f32x2 rs, ra, rb;\n\tsub.rn.f32x2 rd, ra, rb;\n\t"
-        "mov.b64 {$0, $1}, rs;\n\tmov.b64 {$2, $3}, rd;\n\t}",
-        "=f,=f,=f,=f,f,f,f,f",
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
+def _bfly2(a0, a1, b0, b1):
+    """``(a + b, a - b)`` on two fp32 lanes: one packed f32x2 add and one packed sub."""
+    s = cute.arch.add_packed_f32x2((a0, a1), (b0, b1))
+    d = cute.arch.sub_packed_f32x2(
+        Vector.from_elements((a0, a1), cutlass.Float32),
+        Vector.from_elements((b0, b1), cutlass.Float32),
     )
-    return [cutlass.Float32(llvm.extractvalue(T.f32(), out, [i], loc=loc, ip=ip)) for i in range(4)]
+    return [s[0], s[1], cutlass.Float32(d[0]), cutlass.Float32(d[1])]
 
 
 @dsl_user_op

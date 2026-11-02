@@ -27,6 +27,8 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from .common import (
     CHANNELS_PER_VECTOR,
     THREADS,
+    check_aligned,
+    check_bias,
     compile_cached,
     current_stream,
     flat_view,
@@ -299,13 +301,8 @@ def upsample_gather(
         if s.shape[2] * factor_t != frames + crop or s.shape[1] * repeats != cout * factor_t * 4:
             raise ValueError("shortcut frames or channels do not match")
         cin = s.shape[1]
-    if bias is not None and (
-        bias.dtype != temp.dtype or tuple(bias.shape) != (cout,) or not bias.is_contiguous()
-    ):
-        raise ValueError("bias must be a contiguous [Cout] tensor of temp's dtype")
-    for name, t in (("temp", temp), ("shortcut", shortcut), ("bias", bias)):
-        if t is not None and t.data_ptr() % 16:
-            raise ValueError(f"{name} must be 16-byte aligned")
+    check_bias(bias, cout, temp.dtype, "Cout")
+    check_aligned(16, temp=temp, shortcut=shortcut, bias=bias)
     out = torch.empty(
         (batch, cout, frames, 2 * height, 2 * width),
         dtype=temp.dtype,
