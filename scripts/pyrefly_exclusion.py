@@ -9,32 +9,43 @@ import re
 from pathlib import Path
 from typing import Any
 
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
 NAME_PATTERN = re.compile(r"`([^`]+)`|\"([^\"]+)\"")
 SYMBOL_PATTERN = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\.\*)?")
 
 
-def load_exclusions(config_path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Load and validate path and symbol exclusion entries."""
-    try:
-        config = json.loads(config_path.read_text())
-    except json.JSONDecodeError as error:
-        raise ValueError(f"{config_path}: invalid JSON: {error}") from error
-    if not isinstance(config, dict) or set(config) != {"paths", "symbols"}:
-        raise ValueError(f"{config_path}: expected paths and symbols sections")
-    sections: list[tuple[str, ...]] = []
-    for section in ("paths", "symbols"):
-        entries = config[section]
-        if not isinstance(entries, list) or any(
-            not isinstance(entry, str) or not entry or entry != entry.strip() for entry in entries
-        ):
-            raise ValueError(f"{config_path}: {section} must contain nonempty strings")
-        if len(entries) != len(set(entries)):
-            raise ValueError(f"{config_path}: duplicate entry in {section}")
-        sections.append(tuple(entries))
-    for pattern in sections[1]:
+def load_exclusions(config_path: Path) -> tuple[str, ...]:
+    """Load and validate custom symbol exclusions from pyproject.toml."""
+    config = tomllib.loads(config_path.read_text())
+    exclusions = config.get("tool", {}).get("pyrefly-exclusions")
+    if not isinstance(exclusions, dict) or set(exclusions) != {"symbols"}:
+        raise ValueError(f"{config_path}: expected [tool.pyrefly-exclusions] with a symbols array")
+    entries = exclusions["symbols"]
+    if not isinstance(entries, list) or any(
+        not isinstance(entry, str) or not entry or entry != entry.strip() for entry in entries
+    ):
+        raise ValueError(f"{config_path}: symbols must contain nonempty strings")
+    if len(entries) != len(set(entries)):
+        raise ValueError(f"{config_path}: duplicate entry in symbols")
+    for pattern in entries:
         if SYMBOL_PATTERN.fullmatch(pattern) is None:
             raise ValueError(f"{config_path}: invalid symbol pattern: {pattern}")
-    return sections[0], sections[1]
+    return tuple(entries)
+
+
+def load_excluded_paths(config_path: Path) -> set[Path]:
+    """Expand project-excludes globs relative to the Pyrefly configuration."""
+    config = tomllib.loads(config_path.read_text())
+    patterns = config.get("tool", {}).get("pyrefly", {}).get("project-excludes", [])
+    if not isinstance(patterns, list) or any(
+        not isinstance(pattern, str) or not pattern for pattern in patterns
+    ):
+        raise ValueError(f"{config_path}: project-excludes must contain nonempty strings")
+    return {path.resolve() for pattern in patterns for path in config_path.parent.glob(pattern)}
 
 
 def relative_source_path(source_path: str, project_root: Path) -> Path | None:
@@ -47,13 +58,12 @@ def relative_source_path(source_path: str, project_root: Path) -> Path | None:
         return None
 
 
-def is_excluded_path(config_path: Path, source_path: str, project_root: Path) -> bool:
-    paths, _ = load_exclusions(config_path)
+def is_excluded_path(source_path: str, project_root: Path, excluded_paths: set[Path]) -> bool:
     relative_path = relative_source_path(source_path, project_root)
     if relative_path is None:
         return False
-    value = relative_path.as_posix()
-    return any(value == entry.rstrip("/") or value.startswith(entry) for entry in paths)
+    path = (project_root / relative_path).resolve()
+    return path in excluded_paths or any(parent in excluded_paths for parent in path.parents)
 
 
 class ImportScope:
@@ -209,17 +219,16 @@ def filter_report(
         result = json.loads(output)
         if not isinstance(result, dict) or not isinstance(result.get("errors"), list):
             raise ValueError("Pyrefly JSON output must contain an errors array")
-        paths, symbols = load_exclusions(config_path)
+        symbols = load_exclusions(config_path)
+        excluded_paths = load_excluded_paths(config_path)
         scopes_by_path: dict[str, ImportScope | None] = {}
         filtered_errors = []
         excluded_count = 0
         for error in result["errors"]:
             if not isinstance(error, dict):
                 raise ValueError("Pyrefly errors must be JSON objects")
-            path = relative_source_path(str(error.get("path", "")), project_root)
-            excluded_path = path is not None and any(
-                path.as_posix() == entry.rstrip("/") or path.as_posix().startswith(entry)
-                for entry in paths
+            excluded_path = is_excluded_path(
+                str(error.get("path", "")), project_root, excluded_paths
             )
             if excluded_path or is_excluded_symbol(error, symbols, project_root, scopes_by_path):
                 excluded_count += 1
@@ -264,7 +273,8 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.command == "matches":
-            return 0 if is_excluded_path(args.config, args.source, args.project_root) else 1
+            excluded_paths = load_excluded_paths(args.config)
+            return 0 if is_excluded_path(args.source, args.project_root, excluded_paths) else 1
         return filter_report(
             args.input,
             args.output,

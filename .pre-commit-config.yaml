@@ -1614,4 +1614,4 @@ repos:
         require_serial: true
         # Pass changed paths; the wrapper skips non-product Python inputs.
         pass_filenames: true
-        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(pyrefly_exclusion\.json|run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)
+        files: ^(tensorrt_llm/.*\.pyi?$|pyproject\.toml$|scripts/(run_pyrefly\.sh|pyrefly_exclusion\.py)$|\.pre-commit-config\.yaml$)

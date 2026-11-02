@@ -73,21 +73,26 @@ def print_summary(report_path: Path) -> None:
 def clear_path_module_exclusions(source_path: Path, destination_path: Path) -> None:
     """Write a Pyrefly config with configured path and import exclusions disabled."""
     config = source_path.read_text()
-    section_start = config.find("[tool.pyrefly]")
-    if section_start < 0:
+    headers = list(re.finditer(r"(?m)^\[([^\]\n]+)\][ \t]*$", config))
+    if not any(header[1] == "tool.pyrefly" for header in headers):
         raise ValueError(f"{source_path} has no [tool.pyrefly] section")
-    next_section = re.search(r"(?m)^\[", config[section_start + 1 :])
-    section_end = (
-        section_start + 1 + next_section.start() if next_section is not None else len(config)
-    )
-    section = config[section_start:section_end]
+    # Explicit config files use Pyrefly's standalone TOML format.
+    sections = []
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(config)
+        body = config[header.end() : end]
+        if header[1] == "tool.pyrefly":
+            sections.append(body)
+        elif header[1].startswith("tool.pyrefly."):
+            sections.append(f"[{header[1].removeprefix('tool.pyrefly.')}]" + body)
+    section = "".join(sections)
     for key in ("project-excludes", "ignore-missing-imports", "replace-imports-with-any"):
         section, count = re.subn(
             rf"(?ms)^{re.escape(key)}\s*=\s*\[.*?^\]", f"{key} = []", section, count=1
         )
         if count != 1:
             raise ValueError(f"{source_path} is missing [tool.pyrefly].{key}")
-    destination_path.write_text(config[:section_start] + section + config[section_end:])
+    destination_path.write_text(section)
 
 
 def wrap_unfiltered_report(
