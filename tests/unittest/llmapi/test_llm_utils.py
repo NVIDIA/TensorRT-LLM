@@ -25,7 +25,7 @@ import torch
 from tensorrt_llm.llmapi import llm as llm_module
 from tensorrt_llm.llmapi import mm_encoder as mm_encoder_module
 from tensorrt_llm.llmapi.llm import _TorchLLM
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, _ModelWrapper
 from tensorrt_llm.llmapi.llm_utils import CachedModelLoader, ModelLoader
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import AsyncQueue, _SyncQueue
@@ -94,6 +94,95 @@ def test_attached_model_loader_resolves_hub_on_nonzero_device(
         model, revision="pinned-revision") == tmp_path
     assert model.model_dir == tmp_path
     download.assert_called_once_with("example/model", "pinned-revision")
+
+
+def _object_storage_loader(monkeypatch, tmp_path, *, attached=False):
+    """Return a loader whose metadata pull is a mock that returns ``tmp_path``."""
+    monkeypatch.delenv("TRTLLM_OBJECT_STORAGE_FORCE_PULL", raising=False)
+    monkeypatch.delenv("TLLM_EXECUTOR_ATTACH_INFO", raising=False)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 0)
+    pull = MagicMock(return_value=tmp_path)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.pull_metadata", pull)
+    llm_args = SimpleNamespace(
+        parallel_config=SimpleNamespace(is_multi_gpu=False))
+    return CachedModelLoader(llm_args, is_attached_frontend=attached), pull
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_pulls_object_storage_metadata(
+        monkeypatch, tmp_path):
+    loader, pull = _object_storage_loader(monkeypatch, tmp_path)
+    model = _ModelWrapper("s3://bucket/model")
+
+    model_dir = loader._download_hf_model_if_needed(model)
+
+    # Config and tokenizer loading see the local copy, not the URI.
+    assert model_dir == tmp_path
+    assert model.model_dir == tmp_path
+    pull.assert_called_once_with("s3://bucket/model", None)
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_passes_the_force_pull_token(
+        monkeypatch, tmp_path):
+    loader, pull = _object_storage_loader(monkeypatch, tmp_path)
+    monkeypatch.setenv("TRTLLM_OBJECT_STORAGE_FORCE_PULL", "1")
+    monkeypatch.setenv("TRTLLM_OBJECT_STORAGE_PULL_TOKEN", "launch-token")
+
+    loader._download_hf_model_if_needed(_ModelWrapper("s3://bucket/model"))
+
+    pull.assert_called_once_with("s3://bucket/model", "launch-token")
+
+
+@pytest.mark.cpu_only
+def test_attached_model_loader_pulls_object_storage_metadata_in_process(
+        monkeypatch, tmp_path):
+    loader, pull = _object_storage_loader(monkeypatch, tmp_path, attached=True)
+    # An attached frontend has no MPI session to submit work to.
+    monkeypatch.setattr(
+        loader, "_submit_to_all_workers", lambda *args, **kwargs:
+        pytest.fail("An attached frontend has no MPI session"))
+    model = _ModelWrapper("s3://bucket/model")
+
+    assert loader._download_hf_model_if_needed(model) == tmp_path
+    pull.assert_called_once_with("s3://bucket/model", None)
+
+
+@pytest.mark.cpu_only
+def test_cached_model_loader_rejects_draft_model_on_object_storage(
+        monkeypatch, tmp_path):
+    loader, pull = _object_storage_loader(monkeypatch, tmp_path)
+    loader.llm_args.speculative_config = SimpleNamespace(
+        speculative_model="s3://bucket/draft")
+
+    with pytest.raises(ValueError, match="speculative_model"):
+        loader()
+
+    pull.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("model", "expected"), [
+    ("s3://bucket/model", "local-copy"),
+    ("org/model", "org/model"),
+])
+def test_torch_llm_reads_config_from_the_local_copy_of_object_storage_models(
+        monkeypatch, model, expected):
+    llm = object.__new__(_TorchLLM)
+    llm.args = SimpleNamespace(model=model, trust_remote_code=False)
+    llm._hf_model_dir = "local-copy"
+    load_generation_config = MagicMock()
+    load_model_config = MagicMock()
+    monkeypatch.setattr(ModelLoader, "load_hf_generation_config",
+                        load_generation_config)
+    monkeypatch.setattr(ModelLoader, "load_hf_model_config", load_model_config)
+
+    llm._try_load_generation_config()
+    llm._try_load_hf_model_config()
+
+    load_generation_config.assert_called_once_with(expected)
+    load_model_config.assert_called_once_with(expected, trust_remote_code=False)
 
 
 @pytest.mark.cpu_only

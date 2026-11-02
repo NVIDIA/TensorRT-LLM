@@ -75,6 +75,8 @@ from ..tokenizer import TOKENIZER_ALIASES  # noqa: F401
 from ..tokenizer import load_custom_tokenizer
 from ..usage.config import UsageContext  # noqa: F401
 from ..usage.config import TelemetryConfig, TelemetryField
+from .object_storage import (get_force_pull_token, is_object_storage_uri,
+                             pull_metadata)
 from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
@@ -5792,6 +5794,18 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             kv_transfer_poll_interval_ms=self.kv_transfer_poll_interval_ms)
 
 
+def _local_metadata_path(path):
+    """Return the local metadata copy of an object-storage ``path``.
+
+    Hugging Face loaders read config and tokenizer files from a local directory,
+    so an object-storage path is replaced by the cached copy of its non-weight
+    files. Any other value is returned unchanged.
+    """
+    if is_object_storage_uri(path):
+        return str(pull_metadata(path, get_force_pull_token()))
+    return path
+
+
 @dataclass
 class _ModelWrapper:
     model: Union[str, Path]
@@ -5809,11 +5823,16 @@ class _ModelWrapper:
 
     @property
     def is_hub_model(self) -> bool:
-        return not self.is_local_model
+        return not self.is_local_model and not self.is_object_storage_model
 
     @property
     def is_local_model(self) -> bool:
         return isinstance(self.model, Path)
+
+    @property
+    def is_object_storage_model(self) -> bool:
+        """Whether the model is an ``s3://``, ``gs://`` or ``az://`` URI."""
+        return is_object_storage_uri(self.model)
 
     @property
     def model_dir(self) -> Path:
@@ -6326,6 +6345,23 @@ class BaseLlmArgs(StrictBaseModel):
         return self
 
     @model_validator(mode="after")
+    def validate_object_storage_model(self):
+        """Load a checkpoint from object storage only with Model Streamer.
+
+        This runs before `validate_and_init_tokenizer`, which downloads the
+        tokenizer files from object storage, so a wrong policy fails before any
+        download.
+        """
+        if is_object_storage_uri(self.model):
+            policy = getattr(self, "checkpoint_io_policy", None)
+            if policy != CheckpointIOPolicy.MODEL_STREAMER:
+                raise ValueError(
+                    f"model={self.model!r} is an object storage URI, which needs "
+                    "checkpoint_io_policy='model_streamer' (got "
+                    f"{getattr(policy, 'value', policy)!r}).")
+        return self
+
+    @model_validator(mode="after")
     def validate_and_init_tokenizer(self):
         """Initialize tokenizer based on configuration."""
         if self.skip_tokenizer_init:
@@ -6359,12 +6395,12 @@ class BaseLlmArgs(StrictBaseModel):
             # ValueError("Failed to load custom tokenizer ...") on failure.
             self.tokenizer = load_custom_tokenizer(
                 self.custom_tokenizer,
-                load_path,
+                _local_metadata_path(load_path),
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
         else:
             self.tokenizer = tokenizer_factory(
-                self.tokenizer,
+                _local_metadata_path(self.tokenizer),
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
         return self
@@ -8000,6 +8036,21 @@ class TorchLlmArgs(BaseLlmArgs):
     # The order is enforced when Pydantic runs after-validators.
     @model_validator(mode="after")
     def validate_model_streamer_config(self) -> 'TorchLlmArgs':
+        # Only the target model can be on object storage, with any checkpoint I/O
+        # policy. A draft model and LoRA adapters are read from local paths.
+        speculative_model = getattr(self.speculative_config,
+                                    "speculative_model", None)
+        if is_object_storage_uri(speculative_model):
+            raise ValueError(
+                f"speculative_model={speculative_model!r} is on object storage, "
+                "which is not supported. Use a local directory for the draft model."
+            )
+        if self.lora_config is not None:
+            for lora_dir in self.lora_config.lora_dir:
+                if is_object_storage_uri(lora_dir):
+                    raise ValueError(
+                        f"lora_dir {lora_dir!r} is on object storage, which is not "
+                        "supported. Use a local directory for LoRA adapters.")
         if self.checkpoint_io_policy != CheckpointIOPolicy.MODEL_STREAMER:
             return self
         if self.load_format != LoadFormat.AUTO:

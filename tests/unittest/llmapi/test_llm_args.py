@@ -178,6 +178,152 @@ def test_model_streamer_policy_rejects_incompatible_config(
 
 
 @pytest.mark.cpu_only
+def test_model_wrapper_classifies_object_storage_models() -> None:
+    bucket = llm_args_mod._ModelWrapper("s3://bucket/model")
+    assert bucket.is_object_storage_model
+    # An object-storage URI is not a Hugging Face repo id, so no hub download.
+    assert not bucket.is_hub_model
+    assert not bucket.is_local_model
+
+    hub = llm_args_mod._ModelWrapper("org/model")
+    assert hub.is_hub_model
+    assert not hub.is_object_storage_model
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("policy", [None, "native", "auto"])
+def test_object_storage_model_requires_model_streamer_policy(
+        monkeypatch: pytest.MonkeyPatch, policy: str | None) -> None:
+    pull_metadata = create_autospec(llm_args_mod.pull_metadata)
+    monkeypatch.setattr(llm_args_mod, "pull_metadata", pull_metadata)
+    kwargs = {} if policy is None else {"checkpoint_io_policy": policy}
+
+    with pytest.raises(ValidationError,
+                       match="needs checkpoint_io_policy='model_streamer'"):
+        TorchLlmArgs(model="s3://bucket/model", **kwargs)
+
+    # The wrong policy fails before any download.
+    pull_metadata.assert_not_called()
+
+
+@pytest.mark.cpu_only
+def test_object_storage_tokenizer_loads_from_the_metadata_copy(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    pulled = []
+    loaded = []
+    tokenizer = object()
+
+    def pull_metadata(uri: str, force_token: str | None = None) -> Path:
+        pulled.append(uri)
+        return Path("/metadata")
+
+    def tokenizer_factory(path: str, **kwargs) -> Any:
+        loaded.append(path)
+        return tokenizer
+
+    monkeypatch.setattr(llm_args_mod, "pull_metadata", pull_metadata)
+    monkeypatch.setattr(llm_args_mod, "tokenizer_factory", tokenizer_factory)
+
+    args = TorchLlmArgs(model="s3://bucket/model",
+                        tokenizer="s3://bucket/tokenizer",
+                        checkpoint_io_policy="model_streamer")
+
+    # The tokenizer comes from the local copy; the model keeps its URI so that
+    # its weights stream from the bucket.
+    assert pulled == ["s3://bucket/tokenizer"]
+    assert loaded == ["/metadata"]
+    assert args.tokenizer is tokenizer
+    assert args.model == "s3://bucket/model"
+
+
+@pytest.mark.cpu_only
+def test_object_storage_model_pulls_metadata_for_a_custom_tokenizer(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    pulled = []
+    loaded = []
+
+    def pull_metadata(uri: str, force_token: str | None = None) -> Path:
+        pulled.append(uri)
+        return Path("/metadata")
+
+    def load_custom_tokenizer(alias: str, path: str, **kwargs) -> Any:
+        loaded.append((alias, path))
+        return None
+
+    monkeypatch.setattr(llm_args_mod, "pull_metadata", pull_metadata)
+    monkeypatch.setattr(llm_args_mod, "load_custom_tokenizer",
+                        load_custom_tokenizer)
+
+    # With no tokenizer path, a custom tokenizer loads from the model path.
+    TorchLlmArgs(model="s3://bucket/model",
+                 custom_tokenizer="some_alias",
+                 checkpoint_io_policy="model_streamer")
+
+    assert pulled == ["s3://bucket/model"]
+    assert loaded == [("some_alias", "/metadata")]
+
+
+@pytest.mark.cpu_only
+def test_model_streamer_rejects_draft_model_on_object_storage() -> None:
+    with pytest.raises(ValidationError, match="speculative_model"):
+        TorchLlmArgs(model=llama_model_path,
+                     checkpoint_io_policy="model_streamer",
+                     speculative_config=MTPDecodingConfig(
+                         num_nextn_predict_layers=1,
+                         speculative_model="s3://bucket/draft"))
+
+
+@pytest.mark.cpu_only
+def test_model_streamer_rejects_lora_on_object_storage() -> None:
+    with pytest.raises(ValidationError, match="lora_dir"):
+        TorchLlmArgs(model=llama_model_path,
+                     checkpoint_io_policy="model_streamer",
+                     lora_config=LoraConfig(lora_dir=["s3://bucket/lora"]))
+
+
+@pytest.mark.cpu_only
+def test_draft_model_on_object_storage_is_rejected_with_any_policy() -> None:
+    with pytest.raises(ValidationError, match="speculative_model"):
+        TorchLlmArgs(model=llama_model_path,
+                     skip_tokenizer_init=True,
+                     speculative_config=MTPDecodingConfig(
+                         num_nextn_predict_layers=1,
+                         speculative_model="s3://bucket/draft"))
+
+
+@pytest.mark.cpu_only
+def test_lora_on_object_storage_is_rejected_with_any_policy() -> None:
+    with pytest.raises(ValidationError, match="lora_dir"):
+        TorchLlmArgs(model=llama_model_path,
+                     skip_tokenizer_init=True,
+                     lora_config=LoraConfig(lora_dir=["s3://bucket/lora"]))
+
+
+@pytest.mark.cpu_only
+def test_object_storage_model_allows_a_local_draft_model(tmp_path) -> None:
+    args = TorchLlmArgs(model="s3://bucket/model",
+                        skip_tokenizer_init=True,
+                        checkpoint_io_policy="model_streamer",
+                        speculative_config=MTPDecodingConfig(
+                            num_nextn_predict_layers=1,
+                            speculative_model=str(tmp_path)))
+
+    assert args.model == "s3://bucket/model"
+    assert str(args.speculative_config.speculative_model) == str(tmp_path)
+
+
+@pytest.mark.cpu_only
+def test_object_storage_model_allows_a_local_lora(tmp_path) -> None:
+    args = TorchLlmArgs(model="s3://bucket/model",
+                        skip_tokenizer_init=True,
+                        checkpoint_io_policy="model_streamer",
+                        lora_config=LoraConfig(lora_dir=[str(tmp_path)]))
+
+    assert args.model == "s3://bucket/model"
+    assert args.lora_config.lora_dir == [str(tmp_path)]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("model_kwargs", "expected"),
     [

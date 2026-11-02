@@ -32,6 +32,7 @@ from .llm_args import (CalibConfig, CudaGraphConfig, DecodeCudaGraphConfig,
                        update_llm_args_with_extra_options)
 # yapf: enable
 from .mpi_session import MpiSession
+from .object_storage import get_force_pull_token, pull_metadata
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import download_hf_model, print_traceback_on_error
@@ -396,7 +397,32 @@ class CachedModelLoader:
                 model_dir = next((d for d in model_dirs if d is not None), None)
             model_obj.model_dir = model_dir
             return model_dir
+        if model_obj.is_object_storage_model:
+            return self._pull_object_storage_metadata(model_obj)
         return model_obj.model_dir
+
+    def _pull_object_storage_metadata(self, model_obj: _ModelWrapper) -> Path:
+        """Copy the config and tokenizer files of an object-storage model to local disk.
+
+        Only the files that Hugging Face loaders read from a local directory
+        are copied; Model Streamer streams the weights from the original URI.
+        Each node gets its own copy, as for a hub download. Also updates the
+        model_obj.model_dir with the local metadata dir.
+        """
+        uri = model_obj.model
+        force_token = get_force_pull_token()
+        if self._is_attached_frontend:
+            # Attached frontends have no MPI session. The launcher has already
+            # filled the cache, so this finds it complete.
+            model_dir = pull_metadata(uri, force_token)
+        else:
+            model_dirs = self._submit_to_all_workers(
+                CachedModelLoader._node_pull_object_storage_metadata,
+                uri=uri,
+                force_token=force_token)
+            model_dir = next((d for d in model_dirs if d is not None), None)
+        model_obj.model_dir = model_dir
+        return model_dir
 
     def __call__(self) -> Optional[Path]:
 
@@ -405,6 +431,11 @@ class CachedModelLoader:
                 self.llm_args.speculative_config.speculative_model is not None):
             spec_model_obj = _ModelWrapper(
                 self.llm_args.speculative_config.speculative_model)
+            if spec_model_obj.is_object_storage_model:
+                raise ValueError(
+                    f"speculative_model={spec_model_obj.model!r} is on object "
+                    "storage, which is not supported. Use a local directory for "
+                    "the draft model.")
             was_hub_model = spec_model_obj.is_hub_model
             spec_model_dir = self._download_hf_model_if_needed(spec_model_obj)
             self.llm_args.speculative_config.speculative_model = spec_model_dir
@@ -456,6 +487,17 @@ class CachedModelLoader:
     ) -> Optional[Path]:
         if local_mpi_rank() == 0:
             return download_hf_model(model, revision)
+        else:
+            return None
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_pull_object_storage_metadata(
+        uri: str,
+        force_token: Optional[str] = None,
+    ) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return pull_metadata(uri, force_token)
         else:
             return None
 

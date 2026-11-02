@@ -65,6 +65,7 @@ from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
                        validate_token_encoder_bucket_config)
 from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
+from .object_storage import is_object_storage_uri
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -1670,15 +1671,15 @@ class BaseLLM:
                         trust_remote_code=self.args.trust_remote_code,
                         use_fast=self.args.tokenizer_mode != 'slow')
                     if tokenizer is None:
-                        tokenizer_path = self.args.model
+                        tokenizer_path = self._config_model_path()
                     else:
                         return tokenizer
                 except Exception:
-                    tokenizer_path = self.args.model
+                    tokenizer_path = self._config_model_path()
             else:
-                tokenizer_path = self.args.model
+                tokenizer_path = self._config_model_path()
         else:
-            tokenizer_path = self.args.model
+            tokenizer_path = self._config_model_path()
         return ModelLoader.load_hf_tokenizer(
             tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
@@ -1695,9 +1696,20 @@ class BaseLLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
+    def _config_model_path(self) -> Union[str, Path]:
+        """Where the config files of the model are read.
+
+        A model on object storage has its config files in a local copy; the
+        weights stay on object storage.
+        """
+        if is_object_storage_uri(self.args.model):
+            return self._hf_model_dir
+        return self.args.model
+
     def _try_load_generation_config(
             self) -> Optional[transformers.GenerationConfig]:
-        return ModelLoader.load_hf_generation_config(self.args.model)
+        return ModelLoader.load_hf_generation_config(
+            self._config_model_path())
 
     def _try_load_generation_config_explicit_values(self) -> dict[str, Any]:
         if self.args.backend != "pytorch" or self.args.generation_config != "auto":
@@ -1708,7 +1720,8 @@ class BaseLLM:
     def _try_load_hf_model_config(
             self) -> Optional[transformers.PretrainedConfig]:
         return ModelLoader.load_hf_model_config(
-            self.args.model, trust_remote_code=self.args.trust_remote_code)
+            self._config_model_path(),
+            trust_remote_code=self.args.trust_remote_code)
 
     @set_api_status("prototype")
     def start_profile(self,
