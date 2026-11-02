@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import requests
 import yaml
-from test_common.efa_validation import validate_efa_worker_log
+from test_common.efa_validation import validate_efa_worker_logs
 
 from .test_perf_sanity import AccuracyConfig, PerfSanityTestConfig
 
@@ -134,6 +134,7 @@ def test_kv_cache_v2_efa(output_dir: str, perf_sanity_test_case: str) -> None:
     if role == "BENCHMARK":
         assert parity.requests_checked == REQUEST_COUNT, "The functional client did not run"
         commands.wait_for_gen_log_sentinels()
+        logs = {}
         for worker in ("CTX_0", "GEN_0"):
             # MPI executor output is inherited by the srun log; the serving
             # frontend writes its own log. Inspect both files for this role.
@@ -141,7 +142,7 @@ def test_kv_cache_v2_efa(output_dir: str, perf_sanity_test_case: str) -> None:
                 Path(commands.test_output_dir) / f"trtllm-serve.{worker}.0.log",
                 Path(commands.test_output_dir) / f"{worker.lower().split('_')[0]}_server_0.log",
             ]
-            log = "\n".join(path.read_text(errors="replace") for path in paths if path.is_file())
-            validate_efa_worker_log(
-                log, received_requests=REQUEST_COUNT if worker == "GEN_0" else 0
+            logs[worker] = "\n".join(
+                path.read_text(errors="replace") for path in paths if path.is_file()
             )
+        validate_efa_worker_logs(logs["CTX_0"], logs["GEN_0"], received_requests=REQUEST_COUNT)
