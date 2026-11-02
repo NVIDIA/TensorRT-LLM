@@ -266,6 +266,44 @@ class TestKimiK3(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    # TP4 leaves about 203 GiB of weights per GPU; only GB300-class memory
+    # leaves room for the KV cache.
+    @pytest.mark.skip_less_device_memory(250000)
+    @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"])
+    def test_gsm8k_nvfp4_tp4_helix2(self, kv_cache_dtype: str) -> None:
+        """Full GSM8K on the NVFP4 checkpoint with aggregated Helix (TP4 x CP2).
+
+        Helix splits each sequence's KV cache across the two CP ranks while
+        both ranks run the full prefill, so this covers the Helix KV capacity
+        profiling, the cross-rank KV layout and the Helix decode path in
+        aggregated serving.
+        """
+        with LLM(
+            self.NVFP4_MODEL_PATH,
+            tensor_parallel_size=4,
+            context_parallel_size=2,
+            moe_expert_parallel_size=8,
+            cp_config={"cp_type": "HELIX", "tokens_per_block": 64},
+            max_batch_size=8,
+            max_num_tokens=8192,
+            max_seq_len=8192,
+            trust_remote_code=True,
+            enable_chunked_prefill=True,
+            cuda_graph_config=CudaGraphConfig(enable_padding=True, max_batch_size=8),
+            moe_config=MoeConfig(backend="CUTLASS"),
+            kv_cache_config=KvCacheConfig(
+                dtype=kv_cache_dtype,
+                enable_block_reuse=False,
+                tokens_per_block=64,
+                use_kv_cache_manager_v2=True,
+            ),
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MIXED_PRECISION
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     def _assert_checkpoint_routing(self) -> None:
         config = load_pretrained_config(self.MODEL_PATH, trust_remote_code=True)
         assert isinstance(config, KimiK3Config)

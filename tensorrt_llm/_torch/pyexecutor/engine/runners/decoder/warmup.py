@@ -425,8 +425,11 @@ class DecoderWarmup:
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # Helix CP is decode-only, so it tunes on generation requests.
-        if self._context_warmups_supported and self.mapping.has_cp_helix():
+        # Disaggregated helix generation servers never prefill, so they tune on
+        # generation requests only. V1 managers have no is_disagg and serve
+        # helix only on disaggregated generation servers.
+        disagg_helix = self.mapping.has_cp_helix() and getattr(kv_cache_manager, "is_disagg", True)
+        if self._context_warmups_supported and disagg_helix:
             with (
                 self._warmup_timer.phase(
                     "autotuner", metrics=self._metrics, metric_name="autotuner_warmup_seconds"
@@ -444,7 +447,10 @@ class DecoderWarmup:
                 ),
                 self._torch_compile_bypass(),
             ):
-                self._run_autotuner_warmup(resource_manager)
+                # Aggregated helix also decodes full batches on these ranks.
+                self._run_autotuner_warmup(
+                    resource_manager, max_generation_batch=self.mapping.has_cp_helix()
+                )
             log_mem_snapshot("warmup/after_autotuner")
             # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
             # for Mamba hybrid models. Runs regardless of enable_autotuner,
@@ -950,12 +956,18 @@ class DecoderWarmup:
             release_megamoe_scratch()
 
     def _run_autotuner_warmup(
-        self, resource_manager: ResourceManager, generation_only: bool = False
+        self,
+        resource_manager: ResourceManager,
+        generation_only: bool = False,
+        max_generation_batch: bool = False,
     ) -> None:
         """Runs forward passes to populate the autotuner cache.
 
         ``generation_only`` tunes on one batch of ``max_batch_size`` generation
-        requests instead of a context batch, for Helix CP generation workers.
+        requests instead of a context batch, for disaggregated Helix CP
+        generation workers. ``max_generation_batch`` keeps the context batch and
+        tunes that ``max_batch_size`` generation batch in place of a single
+        generation request, for aggregated Helix CP.
         """
         from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
             IS_FLASHINFER_MXFP8_CUTE_DSL_AVAILABLE,
@@ -1052,13 +1064,14 @@ class DecoderWarmup:
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
+        tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
+        num_gen_requests = min(
+            self._config.max_batch_size,
+            self._config.max_num_tokens // tokens_per_gen_request,
+        )
+        max_gen_batch_tokens = num_gen_requests * tokens_per_gen_request
         if generation_only:
-            tokens_per_gen_request = 1 + self._config.max_total_draft_tokens
-            num_gen_requests = min(
-                self._config.max_batch_size,
-                self._config.max_num_tokens // tokens_per_gen_request,
-            )
-            curr_max_num_tokens = num_gen_requests * tokens_per_gen_request
+            curr_max_num_tokens = max_gen_batch_tokens
         else:
             token_num_upper_bound = min(
                 self._config.max_num_tokens,
@@ -1102,8 +1115,11 @@ class DecoderWarmup:
         else:
             warmup_configs = [(curr_max_num_tokens, 0)]
             if self.guided_decoder is None and not self.mapping.has_pp():
-                # Add generation request to warmup the autotuner cache.
-                warmup_configs.append((1 + self._config.max_total_draft_tokens, 1))
+                # Add generation requests to warmup the autotuner cache.
+                if max_generation_batch:
+                    warmup_configs.append((max_gen_batch_tokens, num_gen_requests))
+                else:
+                    warmup_configs.append((tokens_per_gen_request, 1))
 
         def run_autotuner_pass(autotune_context: Any, synchronize_trtllm_cache: bool) -> bool:
             """Run one isolated tuning pass with fresh synthetic batches."""

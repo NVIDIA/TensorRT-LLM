@@ -2007,6 +2007,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # mNumAttnHeads).
         attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
         num_attn_heads = config.num_attention_heads // attn_tp
+        # Helix context attention splits the heads further across CP, except
+        # for sparse MLA (mirrors MLA.num_context_heads); this workspace is
+        # staged only by context.
+        if mapping.has_cp_helix() and sparse_algorithm not in ("dsa",
+                                                               "deepseek_v4"):
+            num_attn_heads //= mapping.cp_size
         # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
         #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
         #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,

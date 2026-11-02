@@ -2018,8 +2018,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                 "or max_tokens (GLOBAL tokens across CP ranks), or lower "
                 "max_batch_size."
             )
-            # A host tier helps only where requests can be suspended and
-            # resumed: aggregated helix, which does not have one yet.
+            # Suggest a host tier only where requests can be suspended and
+            # resumed (aggregated helix) and none is configured yet.
             if self.enable_recompute_pause and not self.kv_cache_manager.has_cache_tier_below_gpu:
                 remedy = f"Configure kv_cache_config.host_cache_size. {remedy}"
         elif getattr(self.kv_cache_manager, "kv_connector_manager", None) is not None:

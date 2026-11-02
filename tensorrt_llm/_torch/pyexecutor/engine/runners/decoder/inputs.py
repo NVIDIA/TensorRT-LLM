@@ -1292,11 +1292,12 @@ class DecoderInputPreparer:
                 return helix_local_len(global_len, _helix_phys, _helix_cp_size, _helix_cp_rank)
 
             def _helix_pack_extend(request, group: int) -> int:
-                # A helix gen worker's token list is the rank-LOCAL
-                # round-robin subset, so max_beam_num_tokens is not a global
-                # base; rebuild it from the global prompt length plus the
-                # rank-invariant generated count. Also repacks position_ids,
-                # which the caller filled from the local base.
+                # On a disaggregated helix gen worker the token list is the
+                # rank-LOCAL round-robin subset, so max_beam_num_tokens is not
+                # a global base. Rebuilding it from the global prompt length
+                # plus the rank-invariant generated count is exact in both
+                # helix modes. Also repacks position_ids, which the caller
+                # filled from the token-list base.
                 generated_len = request.max_beam_num_tokens - request.py_prompt_len
                 base = request.total_input_len_cp + generated_len - 1
                 helix_position_offsets.extend(range(base, base + group))
@@ -1457,13 +1458,13 @@ class DecoderInputPreparer:
                 )
                 if _has_cp_helix:
                     # Verify group [base, base+group) in GLOBAL positions.
-                    # On a helix gen worker the request's token list is the
-                    # rank-LOCAL round-robin subset, so max_beam_num_tokens
-                    # (= local_prompt + generated) must NOT be used as a
-                    # global base; reconstruct it from the global prompt
-                    # length plus the (rank-invariant) generated count. This
-                    # branch has no in-flight predecessor, so every value is
-                    # exact (no device correction needed).
+                    # On a disaggregated helix gen worker the request's token
+                    # list is the rank-LOCAL round-robin subset, so
+                    # max_beam_num_tokens (= local_prompt + generated) must NOT
+                    # be used as a global base; reconstruct it from the global
+                    # prompt length plus the (rank-invariant) generated count.
+                    # This branch has no in-flight predecessor, so every value
+                    # is exact (no device correction needed).
                     group = 1 + num_draft_tokens
                     base = _helix_pack_extend(request, group)
                     local_cached = _helix_local_len_host(base)

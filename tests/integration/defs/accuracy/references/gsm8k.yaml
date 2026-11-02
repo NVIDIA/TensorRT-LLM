@@ -362,6 +362,12 @@ moonshotai/Kimi-K3:
   # 1,319 samples on SM107; 96.0 keeps margin for run-to-run variation.
   - quant_algo: MIXED_PRECISION
     accuracy: 96.0
+  # Same requant with FP8 KV cache on aggregated Helix TP4 x CP2
+  # (TestKimiK3::test_gsm8k_nvfp4_tp4_helix2[fp8]). Measured 95.565 on all
+  # 1,319 samples on GB300; 95.2 keeps margin for run-to-run variation.
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 95.2
 nvidia/Nemotron-MOE:
   - accuracy: 88.249
   - quant_algo: FP8

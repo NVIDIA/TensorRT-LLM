@@ -1318,11 +1318,12 @@ class TestWarmupCleanup(unittest.TestCase):
             f"Expected exactly 2 empty_cache calls; got order={calls}",
         )
 
-    def test_helix_cp_runs_only_the_generation_autotuner_warmup(self):
-        """With Helix CP, can_run_general_warmup is False and the context
-        warmups (general, Mamba hybrid) are skipped; the autotuner warmup still
-        runs, on generation requests, followed by one empty_cache."""
+    def test_disagg_helix_runs_only_the_generation_autotuner_warmup(self):
+        """With disaggregated Helix CP, can_run_general_warmup is False and the
+        context warmups (general, Mamba hybrid) are skipped; the autotuner
+        warmup still runs, on generation requests, followed by one empty_cache."""
         model_engine, resource_manager = _build_engine_and_resource_manager()
+        resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER).is_disagg = True
         tracker = _Tracker()
         calls, _ = _run_warmup_tracked(
             model_engine, resource_manager, force_helix_cp=True, tracker=tracker
@@ -1341,10 +1342,36 @@ class TestWarmupCleanup(unittest.TestCase):
         )
         self.assertEqual(calls[calls.index("autotuner") + 1], "empty_cache")
 
-    @pytest.mark.cpu_only
-    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self):
-        """Helix CP tunes on max_batch_size generation requests (bounded by
-        max_num_tokens), without the context batch."""
+    def test_agg_helix_runs_context_autotuner_and_hybrid_warmup(self):
+        """With aggregated Helix CP the same ranks also prefill, so the
+        autotuner tunes the context batch plus a max generation batch and the
+        Mamba hybrid warmup runs; general warmup stays off."""
+        model_engine, resource_manager = _build_engine_and_resource_manager()
+        resource_manager.get_resource_manager(
+            ResourceManagerType.KV_CACHE_MANAGER
+        ).is_disagg = False
+        tracker = _Tracker()
+        with patch.object(
+            model_engine._runner._warmup,
+            "_run_mamba_hybrid_warmup",
+            side_effect=tracker("mamba_hybrid"),
+        ):
+            calls, _ = _run_warmup_tracked(
+                model_engine, resource_manager, force_helix_cp=True, tracker=tracker
+            )
+        self.assertEqual(
+            tracker.call_args["autotuner"],
+            [((resource_manager,), {"max_generation_batch": True})],
+        )
+        self.assertIn("mamba_hybrid", calls)
+        self.assertNotIn("general_warmup", calls)
+
+    def _run_stubbed_autotuner_warmup(self, **kwargs):
+        """Run _run_autotuner_warmup on a stub engine (max_num_tokens=100,
+        max_batch_size=32, 3 draft tokens, 64 free KV tokens).
+
+        Returns (engine, resource_manager, get_num_available_tokens).
+        """
         tuner = SimpleNamespace(
             setup_distributed_state=Mock(),
             cache_pp_recv=Mock(),
@@ -1353,7 +1380,7 @@ class TestWarmupCleanup(unittest.TestCase):
             profiling_cache={},
             print_profiling_cache=Mock(),
         )
-        get_num_available_tokens = Mock(return_value=4096)
+        get_num_available_tokens = Mock(return_value=64)
         engine = SimpleNamespace(
             _warmup_timer=_WarmupTimer(rank=0),
             _config=SimpleNamespace(
@@ -1399,7 +1426,16 @@ class TestWarmupCleanup(unittest.TestCase):
             patch("torch.cuda.empty_cache"),
             patch.object(decoder_warmup_module, "clear_memory_buffers"),
         ):
-            DecoderWarmup._run_autotuner_warmup(engine, resource_manager, generation_only=True)
+            DecoderWarmup._run_autotuner_warmup(engine, resource_manager, **kwargs)
+        return engine, resource_manager, get_num_available_tokens
+
+    @pytest.mark.cpu_only
+    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self):
+        """Disaggregated Helix CP tunes on max_batch_size generation requests
+        (bounded by max_num_tokens), without the context batch."""
+        engine, resource_manager, get_num_available_tokens = self._run_stubbed_autotuner_warmup(
+            generation_only=True
+        )
 
         # 100 tokens fit 25 requests of 1 + 3 tokens, below max_batch_size.
         engine._dummy_requests.create_warmup_request.assert_called_once_with(
@@ -1408,6 +1444,23 @@ class TestWarmupCleanup(unittest.TestCase):
         engine._forward_warmup.assert_called_once()
         get_num_available_tokens.assert_not_called()
         self.assertEqual(engine._completed_autotuner_warmup_num_tokens, 100)
+
+    @pytest.mark.cpu_only
+    def test_max_generation_batch_autotuner_warmup_tunes_context_and_max_generation_batch(self):
+        """Aggregated Helix CP tunes the KV-sized context batch, then the same
+        max_batch_size generation batch as disaggregated Helix CP."""
+        engine, resource_manager, get_num_available_tokens = self._run_stubbed_autotuner_warmup(
+            max_generation_batch=True
+        )
+
+        self.assertEqual(
+            [c.args for c in engine._dummy_requests.create_warmup_request.call_args_list],
+            [(resource_manager, 64, 0), (resource_manager, 100, 25)],
+        )
+        self.assertEqual(engine._forward_warmup.call_count, 2)
+        get_num_available_tokens.assert_called_once()
+        # The duplicate-warmup skip stays keyed on the context batch.
+        self.assertEqual(engine._completed_autotuner_warmup_num_tokens, 64)
 
     @pytest.mark.cpu_only
     def test_flashinfer_mxfp8_respects_disabled_global_autotuner(self):
