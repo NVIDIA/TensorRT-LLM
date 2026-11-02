@@ -330,10 +330,7 @@ public:
     //! The backing memory is committed on a worker thread, so a slot may exist
     //! before it is backed. Closing that gap is the owning pool group's job: it
     //! calls waitSlotUsable() before returning a slot from allocate().
-    //!
-    //! `numaNode`, when set, binds the pool's memory to that node (see HostMem).
-    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options,
-        std::optional<int> numaNode = std::nullopt);
+    HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, HostMemBackingOptions const& options);
 
     SlotCount numSlots() const noexcept override;
     void destroy() override;
@@ -595,7 +592,7 @@ public:
     //! can reserve more than groupVmSize in total. Host groups hold exactly one
     //! pool today, which makes the two equal.
     HostPoolGroup(SlotCount numSlots, TypedVec<PoolIndex, size_t> const& slotSizeList, size_t groupVmSize,
-        HostMemBackingOptions const& options = {}, std::optional<int> numaNode = std::nullopt);
+        HostMemBackingOptions const& options = {});
 
     [[nodiscard]] CacheTier cacheTier() const noexcept override
     {
@@ -929,7 +926,7 @@ class HostCacheLevelStorage : public CacheLevelStorage
 public:
     HostCacheLevelStorage(TypedVec<PoolGroupIndex, SlotDesc> const& slotDescList,
         TypedVec<PoolGroupIndex, SlotCount> const& slotCountList, std::optional<size_t> maxQuota = std::nullopt,
-        HostMemBackingOptions const& options = {}, std::optional<int> numaNode = std::nullopt);
+        HostMemBackingOptions const& options = {});
 
     CacheTier cacheTier() const noexcept override
     {

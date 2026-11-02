@@ -102,8 +102,8 @@ std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
     return {begin, end > begin ? static_cast<size_t>(end - begin) : 0};
 }
 
-//! Places the pages of [addr, addr + size) on the NUMA node the current GPU
-//! attaches to.
+//! Places the pages of [addr, addr + size) on `numaNode`, or on the NUMA node
+//! the current GPU attaches to when it is unset.
 //!
 //! The policy is attached to the address range, not to a thread, so it holds
 //! whichever thread happens to fault a page in. Setting it on the whole range
@@ -133,13 +133,13 @@ std::pair<MemAddress, size_t> pagesWithin(MemAddress addr, size_t size)
 //! Note for containers: mbind, set_mempolicy and get_mempolicy sit behind
 //! CAP_SYS_NICE in Docker's default seccomp profile, so an unprivileged
 //! container falls back to first touch.
-void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallback)
+void bindRangeToNumaNode(MemAddress addr, size_t size, std::optional<int> numaNode, bool allowRemoteFallback)
 {
     if (numa_available() < 0 || numa_max_node() < 1)
     {
         return;
     }
-    int const node = runtime::TopologyDetector::getInstance().getCurrentGpuNumaId();
+    int const node = numaNode.value_or(runtime::TopologyDetector::getInstance().getCurrentGpuNumaId());
     if (node < 0)
     {
         TLLM_LOG_WARNING("KVCM2 host tier: GPU reports no NUMA node; leaving page placement to first touch");
@@ -164,11 +164,11 @@ void bindRangeToGpuNumaNode(MemAddress addr, size_t size, bool allowRemoteFallba
             // First touch prefers the local node but takes a remote page rather
             // than failing, so it cannot stand in for a strict binding. Refusing
             // here is better than running as though the request was honoured.
-            throw LogicError(
-                "KVCM2 host tier: allow_remote_numa_fallback=false requires mbind, which failed with errno "
-                + std::to_string(errno) + " for NUMA node " + std::to_string(node)
-                + ". In a container this usually means CAP_SYS_NICE is absent; grant it, or set "
-                  "allow_remote_numa_fallback=true to accept first-touch placement.");
+            throw LogicError("KVCM2 host tier: a strict binding to NUMA node " + std::to_string(node)
+                + " requires mbind, which failed with errno " + std::to_string(errno)
+                + ". In a container this usually means CAP_SYS_NICE is absent; grant it, or allow a remote "
+                  "fallback (allow_remote_numa_fallback=true, kv_cache_config.host_cache_bind_to_gpu_numa_node="
+                  "false) to accept first-touch placement.");
         }
         TLLM_LOG_WARNING(
             "KVCM2 host tier: mbind to NUMA node %d failed with errno %d; falling back to first-touch placement by "
@@ -212,7 +212,7 @@ HostMemBacking::HostMemBacking(size_t vmSize, HostMemBackingOptions const& optio
     //! Applied once over the whole mapping. Per-chunk page-mode advice would
     //! change VMA flags and split the mapping into one VMA per chunk.
     hostMadvisePageMode(mAddr, mSize, hostUseThp());
-    bindRangeToGpuNumaNode(mAddr, mSize, mAllowRemoteNumaFallback);
+    bindRangeToNumaNode(mAddr, mSize, options.numaNode, mAllowRemoteNumaFallback);
 
     // Nothing is reachable until a step opens it, so a read that runs ahead of
     // the fill faults rather than returning zeros from an untouched page. Costs
