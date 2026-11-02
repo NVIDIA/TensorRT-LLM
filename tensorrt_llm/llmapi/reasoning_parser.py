@@ -1332,3 +1332,142 @@ class KimiK3ReasoningParser(BaseReasoningParser):
                 return ReasoningParserResult(content=remaining)
         # Header fragments and structural-gap text are dropped.
         return ReasoningParserResult()
+
+
+_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL = ("<|start|>", "<|end|>",
+                                                        "<|message|>",
+                                                        "<|channel|>")
+_BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL = ("<|constrain|>", "<|return|>",
+                                             "<|call|>")
+_BEAM_TAGS = (_BEAM_START, _BEAM_END, _BEAM_MESSAGE, _BEAM_CHANNEL,
+              _BEAM_CONSTRAIN, _BEAM_RETURN, _BEAM_CALL)
+_BEAM_ANALYSIS, _BEAM_FINAL = "analysis", "final"
+
+
+def _beam_held_tail(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of a
+    Beam channel delimiter."""
+    for n in range(min(len(text), max(len(t) for t in _BEAM_TAGS) - 1), 0, -1):
+        tail = text[-n:]
+        if any(t.startswith(tail) and t != tail for t in _BEAM_TAGS):
+            return n
+    return 0
+
+
+@register_reasoning_parser("beam_harmony_text")
+class BeamHarmonyTextParser(BaseReasoningParser):
+    """Split a Beam channel reply into ``reasoning_content`` and ``content``.
+
+    The Beam checkpoints write their reply as channel messages after the chat
+    template's bare ``<|start|>assistant`` generation prefix::
+
+        <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>...<|return|>
+
+    The delimiters are ordinary (non-special) vocabulary tokens, so they reach
+    the detokenized text whatever ``skip_special_tokens`` says. Analysis
+    bodies go to ``reasoning_content`` and final bodies to ``content``; every
+    header and terminator is dropped. A reply without channel headers is final
+    text. Parsing is incremental: a possible delimiter split across stream
+    chunks is held back until it is resolved, and ``finish`` releases a held
+    tail that is ordinary text. ``parse`` runs the same machine over a whole
+    reply, so streamed and non-streamed fields agree. Tool calls are not
+    supported; a message on any other channel is ignored.
+    """
+
+    needs_raw_special_tokens = True
+    reasoning_start = _BEAM_CHANNEL + _BEAM_ANALYSIS + _BEAM_MESSAGE
+    reasoning_end = _BEAM_END
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        self._reset()
+
+    def _reset(self) -> None:
+        # "header": before a channel's <|message|>; "body": inside a message;
+        # "between": after <|end|> until the next header; "done": after
+        # <|return|> or <|call|>.
+        self._state = "header"
+        self._channel: Optional[str] = None
+        self._header = ""
+        self._buffer = ""
+        self._saw_header = False
+
+    def _emit(self, text: str, out: tuple) -> None:
+        if not text:
+            return
+        if self._channel == _BEAM_ANALYSIS:
+            out[1].append(text)
+        elif self._channel == _BEAM_FINAL or (self._channel is None
+                                              and not self._saw_header):
+            out[0].append(text)
+
+    def _feed(self, text: str) -> ReasoningParserResult:
+        out = ([], [])
+        data = self._buffer + text
+        self._buffer = ""
+        while data:
+            if self._state == "done":
+                data = ""
+                break
+            hits = [(data.find(t), t) for t in _BEAM_TAGS if t in data]
+            pos, tag = min(hits) if hits else (-1, None)
+            if tag is None:
+                hold = _beam_held_tail(data)
+                chunk = data[:len(data) - hold]
+                self._buffer = data[len(data) - hold:]
+                data = ""
+            else:
+                chunk, data = data[:pos], data[pos + len(tag):]
+            if self._state == "body":
+                self._emit(chunk, out)
+            elif self._state == "header":
+                if (self._header or self._saw_header or tag
+                        in (_BEAM_CHANNEL, _BEAM_MESSAGE, _BEAM_CONSTRAIN)):
+                    self._header += chunk
+                else:
+                    # Text before any header: a reply without channels is
+                    # final text.
+                    self._emit(chunk, out)
+            if tag is None:
+                break
+            if tag == _BEAM_CHANNEL:
+                self._state, self._header, self._saw_header = "header", "", True
+            elif tag == _BEAM_MESSAGE:
+                if self._state == "header":
+                    self._channel = self._header.split(
+                        _BEAM_CONSTRAIN)[0].strip().split(" ")[0] or None
+                    self._header = ""
+                self._state = "body"
+            elif tag == _BEAM_CONSTRAIN:
+                self._header += _BEAM_CONSTRAIN
+            elif tag in (_BEAM_END, _BEAM_START):
+                self._state, self._channel, self._header = "between", None, ""
+            elif tag in (_BEAM_RETURN, _BEAM_CALL):
+                self._state, self._channel = "done", None
+        return ReasoningParserResult(content="".join(out[0]),
+                                     reasoning_content="".join(out[1]))
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        self._reset()
+        result = self._feed(text)
+        tail = self.finish()
+        return ReasoningParserResult(
+            content=result.content + tail.content,
+            reasoning_content=result.reasoning_content + tail.reasoning_content,
+        )
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._feed(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        held, self._buffer = self._buffer, ""
+        out = ([], [])
+        if self._state == "body" and held and held not in _BEAM_TAGS:
+            self._emit(held, out)
+        elif (self._state == "header" and not self._saw_header
+              and not self._header and held):
+            self._emit(held, out)
+        return ReasoningParserResult(content="".join(out[0]),
+                                     reasoning_content="".join(out[1]))

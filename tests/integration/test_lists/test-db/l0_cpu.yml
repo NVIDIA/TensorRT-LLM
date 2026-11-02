@@ -267,3 +267,5 @@ l0_cpu:
 
   # Beam baseline diagnostic checks (no checkpoints or GPU).
   - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py

@@ -23,8 +23,8 @@ from tensorrt_llm.mapping import Mapping
 class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
     """Preload the Beam NVFP4 full-model target from its checkpoint directory."""
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **loaders):
+        super().__init__(**loaders)
         self._preloaded = False
 
     def __reduce__(self):
