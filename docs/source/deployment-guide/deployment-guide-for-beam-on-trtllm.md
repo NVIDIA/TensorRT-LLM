@@ -562,8 +562,8 @@ directory resumes) and `summary.json` (score, failures, timing and GPU memory).
 The QA/LR functional list selects the first 100 GSM8K questions on one four-GB300 node,
 with a 45-minute timeout and a minimum score of 95/100. Execution errors, timeouts,
 truncations and parsing failures also fail the test. Two independent runs of the
-aggregated recipe on separate nodes scored 99/100 and 98/100 in 28 and 29 minutes,
-including about 6.5 minutes of model startup. This is a separate public
+aggregated recipe on separate nodes scored 97/100 and 98/100 in approximately 25 and
+30 minutes, including model startup. This is a separate public
 evaluation protocol; its score is not interchangeable with the full evaluation baseline.
 Neither this job nor full GSM8K runs in L0. Full GSM8K is excluded from all CI lists.
 
