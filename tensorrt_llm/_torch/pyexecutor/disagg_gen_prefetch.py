@@ -44,7 +44,7 @@ from tensorrt_llm.logger import logger
 
 DISAGG_GEN_PREFETCH_REQUESTS_ENV = "TRTLLM_DISAGG_GEN_PREFETCH_REQUESTS"
 # Read with the same rule as ``scheduler_v2`` so both agree on whether it is on.
-PRIORITIZE_FIRST_TOKEN_ENV = "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN"
+PRIORITIZE_FIRST_TOKEN_ENV = "TLLM_DISAGG_GEN_PRIORITIZE_FIRST_TOKEN"  # nosec B105 - env var name, not a password
 
 
 def _prioritize_first_token_enabled() -> bool:
