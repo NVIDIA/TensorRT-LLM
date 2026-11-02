@@ -110,8 +110,12 @@ def test_packaged_variant_avoids_compiler_and_user_cache(jit_package, monkeypatc
     jit, package, cache, loaded = jit_package
     artifact_dir = _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
-    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
-    monkeypatch.setattr(jit.subprocess, "run", lambda *_a, **_k: pytest.fail("unexpected subprocess"))
+    monkeypatch.setattr(
+        manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation")
+    )
+    monkeypatch.setattr(
+        jit.subprocess, "run", lambda *_a, **_k: pytest.fail("unexpected subprocess")
+    )
 
     variant = manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
 
@@ -142,7 +146,9 @@ def test_broken_packaged_library_never_silently_falls_back(jit_package, monkeypa
     jit, package, cache, _ = jit_package
     _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
-    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+    monkeypatch.setattr(
+        manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation")
+    )
 
     def load_broken_library(_path):
         raise OSError("bad library")
@@ -158,8 +164,12 @@ def test_packaged_library_missing_export_never_silently_falls_back(jit_package, 
     jit, package, cache, _ = jit_package
     _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
-    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
-    monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", lambda _path: types.SimpleNamespace())
+    monkeypatch.setattr(
+        manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation")
+    )
+    monkeypatch.setattr(
+        sys.modules["tvm_ffi"], "load_module", lambda _path: types.SimpleNamespace()
+    )
     with pytest.raises(RuntimeError, match="1_0_1_3_1_0_0"):
         manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert not cache.exists()
@@ -171,7 +181,9 @@ def test_removed_packaged_library_never_silently_falls_back(jit_package, monkeyp
     assert jit._aot_module_path("variants") == artifact_dir / "all_variants.so"
     (artifact_dir / "all_variants.so").unlink()
     manager = jit.FMHAVariantManager()
-    monkeypatch.setattr(manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation"))
+    monkeypatch.setattr(
+        manager, "_compile_only", lambda *_: pytest.fail("unexpected JIT compilation")
+    )
     with pytest.raises(FileNotFoundError):
         manager.get_variant(jit._FLOAT8_E4M3FN_CODE, 128, False, -1, 128, False, 1)
     assert not cache.exists()
@@ -261,7 +273,9 @@ def test_packaged_gpu_compatibility_is_checked_for_each_device(jit_package, monk
     assert jit._aot_module_path("variants") is None
 
 
-def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(jit_package, monkeypatch):
+def test_variant_manager_does_not_reuse_packaged_kernel_on_incompatible_device(
+    jit_package, monkeypatch
+):
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
     manifest_path = artifact_dir / "manifest.json"
@@ -308,8 +322,12 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
 
     monkeypatch.setattr(sys.modules["tvm_ffi"], "load_module", load_module)
     monkeypatch.setattr(jit, "_do_compile_plan", lambda: compile_fixture("plan/fmha_sm100_plan.so"))
-    monkeypatch.setattr(jit, "_do_compile_sparse_topk", lambda: compile_fixture("sparse_topk/sparse_topk_select.so"))
-    monkeypatch.setattr(jit, "_do_compile_reduction", lambda: compile_fixture("reduction/fmha_sm100_reduction.so"))
+    monkeypatch.setattr(
+        jit, "_do_compile_sparse_topk", lambda: compile_fixture("sparse_topk/sparse_topk_select.so")
+    )
+    monkeypatch.setattr(
+        jit, "_do_compile_reduction", lambda: compile_fixture("reduction/fmha_sm100_reduction.so")
+    )
     helpers = (jit.get_plan_fn, jit.get_sparse_topk_module, jit.get_reduction_module)
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
     monkeypatch.setattr(jit, "_aot_gpu_arch", lambda: "sm_100a")
@@ -318,7 +336,9 @@ def test_helpers_do_not_reuse_packaged_modules_on_incompatible_device(jit_packag
     assert [fn().kind for fn in helpers] == ["packaged"] * 3
 
 
-def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(jit_package, monkeypatch):
+def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(
+    jit_package, monkeypatch
+):
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)
     manager = jit.FMHAVariantManager()
@@ -349,7 +369,9 @@ def test_transient_device_query_failure_cannot_cache_a_packaged_kernel_as_jit(ji
     assert manager.get_variant(*args).run() == "jit"
 
 
-@pytest.mark.parametrize("corruption", ["missing_manifest", "invalid_json", "unsafe_path", "duplicate_variant"])
+@pytest.mark.parametrize(
+    "corruption", ["missing_manifest", "invalid_json", "unsafe_path", "duplicate_variant"]
+)
 def test_corrupt_packaged_manifest_is_rejected(jit_package, corruption):
     jit, package, _, _ = jit_package
     artifact_dir = _stage_artifacts(jit, package)

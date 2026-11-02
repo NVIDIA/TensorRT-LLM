@@ -36,9 +36,13 @@ class MsaBuildPy(build_py):
         target = package_dir / "_aot"
         for directory in (package_dir, *package_dir.parents):
             if directory.is_symlink():
-                raise RuntimeError(f"Refusing to stage FMHA artifacts through symlink: {directory}")
-        if package_dir.resolve() == Path(self.get_package_dir("fmha_sm100")).resolve():
-            raise RuntimeError(f"Refusing to stage over FMHA source directory: {package_dir}")
+                raise RuntimeError(
+                    f"Refusing to stage FMHA artifacts through symlink: {directory}"
+                )
+        if package_dir.resolve() == Path(
+                self.get_package_dir("fmha_sm100")).resolve():
+            raise RuntimeError(
+                f"Refusing to stage over FMHA source directory: {package_dir}")
         if target.is_symlink() or target.is_file():
             target.unlink()
         elif target.is_dir():

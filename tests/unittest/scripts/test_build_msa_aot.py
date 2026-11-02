@@ -42,9 +42,13 @@ def test_requested_unsupported_sm_fails_instead_of_silent_fallback():
 
 @pytest.mark.parametrize(
     ("system", "requested", "skip_wheel", "expected"),
-    [("Linux", "all", False, True), ("Linux", "90;100", False, True),
-     ("Linux", "90", False, False), ("Windows", "100", False, False),
-     ("Linux", "100", True, False)],
+    [
+        ("Linux", "all", False, True),
+        ("Linux", "90;100", False, True),
+        ("Linux", "90", False, False),
+        ("Windows", "100", False, False),
+        ("Linux", "100", True, False),
+    ],
 )
 def test_wheel_build_is_gated_by_platform_and_architecture(system, requested, skip_wheel, expected):
     assert builder.should_build(system, requested, skip_wheel) is expected
@@ -58,9 +62,7 @@ def test_native_requires_architectures_recorded_by_cmake(tmp_path):
 
 @pytest.mark.parametrize(("requested", "configured"), [("90", "103"), ("103", "90")])
 def test_final_cmake_architecture_overrides_cli(tmp_path, requested, configured):
-    (tmp_path / "CMakeCache.txt").write_text(
-        f"CMAKE_CUDA_ARCHITECTURES:STRING={configured}\n"
-    )
+    (tmp_path / "CMakeCache.txt").write_text(f"CMAKE_CUDA_ARCHITECTURES:STRING={configured}\n")
     assert builder.resolve_requested_architectures(requested, tmp_path) == configured
 
 
@@ -84,16 +86,29 @@ def test_cmake_records_resolved_architectures(tmp_path):
         "setup_cuda_architectures()\n"
     )
     build = tmp_path / "build"
-    subprocess.run(["cmake", "-S", str(tmp_path), "-B", str(build)], check=True,
-                   capture_output=True, text=True)
+    subprocess.run(
+        ["cmake", "-S", str(tmp_path), "-B", str(build)], check=True, capture_output=True, text=True
+    )
     assert (build / "trtllm_cuda_architectures.txt").read_text() == "103"
     assert builder.resolve_requested_architectures("90", build) == "103"
 
 
 def test_cli_skips_non_blackwell_without_nvcc(tmp_path):
     env = {"PATH": ""}
-    subprocess.run([sys.executable, str(_SCRIPT), str(tmp_path), str(tmp_path / "unused.py"),
-                    "90", "1", "--build-dir", str(tmp_path)], env=env, check=True)
+    subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT),
+            str(tmp_path),
+            str(tmp_path / "unused.py"),
+            "90",
+            "1",
+            "--build-dir",
+            str(tmp_path),
+        ],
+        env=env,
+        check=True,
+    )
     assert list(tmp_path.iterdir()) == []
 
 
@@ -104,7 +119,9 @@ def _shared_library(path, symbols):
 
 
 def test_artifact_validation_checks_each_export_and_helper(tmp_path):
-    files = {name: tmp_path / f"{name}.so" for name in ("variants", "plan", "sparse_topk", "reduction")}
+    files = {
+        name: tmp_path / f"{name}.so" for name in ("variants", "plan", "sparse_topk", "reduction")
+    }
     _shared_library(files["variants"], ["__tvm_ffi_run_0_0", "__tvm_ffi_run_0_1"])
     _shared_library(files["plan"], ["__tvm_ffi_plan"])
     _shared_library(files["sparse_topk"], ["__tvm_ffi_sparse_topk_select"])
@@ -121,7 +138,7 @@ def test_artifact_validation_checks_each_export_and_helper(tmp_path):
 def test_build_stages_complete_private_artifacts(tmp_path, monkeypatch):
     package = tmp_path / "fmha_sm100"
     package.mkdir()
-    (package / "jit.py").write_text('''
+    (package / "jit.py").write_text("""
 import os
 from pathlib import Path
 CACHE_BASE = Path(os.environ["MINFER_FMHA_CACHE_DIR"]) / "fingerprint"
@@ -129,9 +146,9 @@ def _aot_variant_names(): return ["0_0", "0_1"]
 def _aot_source_digest(): return "sourcehash"
 def _aot_ffi_version(): return "ffi-version"
 def _get_nvcc_flags(*args): return "-gencode=arch=compute_100a,code=sm_100a -gencode=arch=compute_103a,code=sm_103a"
-''')
+""")
     warmup = tmp_path / "warmup.py"
-    warmup.write_text('''
+    warmup.write_text("""
 import os
 import subprocess
 import fmha_sm100.jit as jit
@@ -155,10 +172,12 @@ def main():
         source = target.with_suffix(".c")
         source.write_text("\\n".join("void __tvm_ffi_" + s + "(void) {}" for s in symbols))
         subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(target)], check=True)
-''')
+""")
     nvcc = tmp_path / "nvcc"
-    nvcc.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'CUDA release 12.9\\n'; "
-                    "else printf 'sm_100a\\nsm_103a\\n'; fi\n")
+    nvcc.write_text(
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'CUDA release 12.9\\n'; "
+        "else printf 'sm_100a\\nsm_103a\\n'; fi\n"
+    )
     nvcc.chmod(0o755)
     user_cache = tmp_path / "user-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(user_cache))
@@ -187,13 +206,19 @@ def test_real_warmup_handles_spaces_in_all_build_paths(tmp_path, monkeypatch):
     cutlass_util.mkdir(parents=True)
     ffi_include = root / "ffi include"
     ffi_include.mkdir()
-    for name in ("fmha_sm100_params.h", "tvm_ffi_utils.h", "gmem_bounds_check.h",
-                 "fmha_sm100_plan.cu", "sparse_topk_select.cu", "fmha_sm100_reduction.cu"):
+    for name in (
+        "fmha_sm100_params.h",
+        "tvm_ffi_utils.h",
+        "gmem_bounds_check.h",
+        "fmha_sm100_plan.cu",
+        "sparse_topk_select.cu",
+        "fmha_sm100_reduction.cu",
+    ):
         (csrc / name).write_text("fixture\n")
     (csrc / "include/sparse_topk_select.cuh").write_text("fixture\n")
     for name in ("fmha_sm100_inst.jinja", "fmha_sm100_variant_run.cu.jinja"):
         (csrc / name).write_text("// {{ variant_name }}\n")
-    (package / "jit.py").write_text(f'''
+    (package / "jit.py").write_text(f"""
 import os
 from pathlib import Path
 CACHE_BASE = Path(os.environ["MINFER_FMHA_CACHE_DIR"]) / "fingerprint"
@@ -212,10 +237,10 @@ def _get_nvcc_flags(cache, fmha=True):
     return "-gencode=arch=compute_103a,code=sm_103a " + " ".join(
         "-I" + str(p) for p in (_FMHA_VARLEN_DIR / "include", _CUTLASS_INCLUDE,
                                 _CUTLASS_UTIL_INCLUDE, _get_tvm_ffi_include(), cache))
-''')
+""")
     nvcc = root / "cuda toolkit/bin/nvcc"
     nvcc.parent.mkdir(parents=True)
-    nvcc.write_text(f'''#!/usr/bin/env python3
+    nvcc.write_text(f"""#!/usr/bin/env python3
 import os,subprocess,sys
 args = sys.argv[1:]
 if "--list-gpu-code" in args:
@@ -228,7 +253,7 @@ out = args[args.index("-o") + 1]
 if "-c" in args:
     # Relative object paths keep the 700-input aggregate link below ARG_MAX.
     assert not os.path.isabs(out), out
-    assert {('-I' + str(csrc / 'include'))!r} in args, args
+    assert {("-I" + str(csrc / "include"))!r} in args, args
     subprocess.run(["cc", "-x", "c", "-c", "-o", out, "-"], input="", text=True, check=True)
 else:
     symbols = {{"all_variants.so": "run_0", "fmha_sm100_plan.so": "plan",
@@ -236,7 +261,7 @@ else:
     name = out.rsplit("/", 1)[-1]
     source = "void __tvm_ffi_" + symbols[name] + "(void) {{}}"
     subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-o", out, "-"], input=source, text=True, check=True)
-''')
+""")
     nvcc.chmod(0o755)
     temp = root / "private temp"
     temp.mkdir()
@@ -252,12 +277,19 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
     """Exercise the real setup.py package-data patterns with setuptools."""
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_tree = ast.parse(setup_path.read_text())
-    setup_call = next(node for node in ast.walk(setup_tree)
-                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                      and node.func.id == "setup")
+    setup_call = next(
+        node
+        for node in ast.walk(setup_tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "setup"
+    )
     package_data = next(kw.value for kw in setup_call.keywords if kw.arg == "package_data")
-    patterns = next(ast.literal_eval(value) for key, value in zip(package_data.keys, package_data.values)
-                    if isinstance(key, ast.Constant) and key.value == "fmha_sm100")
+    patterns = next(
+        ast.literal_eval(value)
+        for key, value in zip(package_data.keys, package_data.values)
+        if isinstance(key, ast.Constant) and key.value == "fmha_sm100"
+    )
     package = tmp_path / "fmha_sm100"
     artifacts = package / "_aot/sourcehash"
     artifacts.mkdir(parents=True)
@@ -274,8 +306,13 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
         f"setup(name='msa-package-check', version='0.0.1', packages=['fmha_sm100'], "
         f"package_data={{'fmha_sm100': {patterns!r}}})\n"
     )
-    subprocess.run([sys.executable, "setup.py", "bdist_wheel"], cwd=tmp_path, check=True,
-                   capture_output=True, text=True)
+    subprocess.run(
+        [sys.executable, "setup.py", "bdist_wheel"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     with zipfile.ZipFile(next((tmp_path / "dist").glob("*.whl"))) as archive:
         entries = set(archive.namelist())
     assert "fmha_sm100/csrc/kernel.cu" in entries
@@ -289,8 +326,11 @@ def test_incremental_wheel_drops_previous_fmha_artifacts(tmp_path):
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_source = setup_path.read_text()
     setup_tree = ast.parse(setup_source)
-    command = next(node for node in setup_tree.body
-                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    command = next(
+        node
+        for node in setup_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
+    )
     command_source = ast.get_source_segment(setup_source, command)
     package = tmp_path / "fmha_sm100"
     old = package / "_aot/oldhash"
@@ -315,8 +355,13 @@ def test_incremental_wheel_drops_previous_fmha_artifacts(tmp_path):
         entries = set(archive.namelist())
     assert "fmha_sm100/_aot/newhash/new.so" in entries
     assert "fmha_sm100/_aot/oldhash/old.so" not in entries
-    subprocess.run([sys.executable, "setup.py", "editable_wheel"], cwd=tmp_path,
-                   check=True, capture_output=True, text=True)
+    subprocess.run(
+        [sys.executable, "setup.py", "editable_wheel"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     assert (new / "new.so").read_bytes() == b"new"
 
 
@@ -327,8 +372,11 @@ def test_incremental_cleanup_refuses_a_symlinked_package(tmp_path, link_kind):
 
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_tree = ast.parse(setup_path.read_text())
-    command = next(node for node in setup_tree.body
-                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    command = next(
+        node
+        for node in setup_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
+    )
     namespace = {"Path": Path, "build_py": build_py}
     exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
     source = tmp_path / "source/fmha_sm100"
@@ -371,8 +419,11 @@ def test_wheel_staging_refuses_symlink_even_without_previous_artifacts(tmp_path)
 
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_tree = ast.parse(setup_path.read_text())
-    command = next(node for node in setup_tree.body
-                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    command = next(
+        node
+        for node in setup_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
+    )
     namespace = {"Path": Path, "build_py": build_py}
     exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
     shared = tmp_path / "shared"
@@ -396,8 +447,11 @@ def test_editable_build_does_not_clean_symlinked_source(tmp_path):
 
     setup_path = _SCRIPT.parents[1] / "setup.py"
     setup_tree = ast.parse(setup_path.read_text())
-    command = next(node for node in setup_tree.body
-                   if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy")
+    command = next(
+        node
+        for node in setup_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MsaBuildPy"
+    )
     namespace = {"Path": Path, "build_py": build_py}
     exec(compile(ast.Module(body=[command], type_ignores=[]), str(setup_path), "exec"), namespace)
     source = tmp_path / "source"

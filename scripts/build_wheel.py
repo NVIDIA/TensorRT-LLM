@@ -1646,11 +1646,16 @@ def main(*,
             if compiler:
                 env["CMAKE_CUDA_COMPILER"] = compiler.group(1).strip()
         run([
-            str(venv_python), str(project_dir / "scripts/build_msa_aot.py"),
+            str(venv_python),
+            str(project_dir / "scripts/build_msa_aot.py"),
             str(msa_dst),
             str(build_dir / "_deps/msa-src/scripts/warmup_fmha_sm100.py"),
-            cuda_architectures, str(max(1, min(job_count, 8))), "--build-dir", str(build_dir)
-        ], env=env, check=True)
+            cuda_architectures,
+            str(max(1, min(job_count, 8))), "--build-dir",
+            str(build_dir)
+        ],
+            env=env,
+            check=True)
 
     if not skip_stubs:
         with working_directory(pkg_dir):
@@ -1801,6 +1806,7 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument(
         "--job_count",
         "-j",
+        type=int,
         const=get_available_cpu_count(),
         nargs="?",
         help=

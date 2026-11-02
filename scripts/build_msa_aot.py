@@ -24,7 +24,9 @@ def resolve_requested_architectures(requested, build_dir):
     if recorded.is_file():
         architectures = recorded.read_text().strip()
         if not architectures:
-            raise ValueError("CMake recorded an empty CUDA architecture list; reconfigure the build")
+            raise ValueError(
+                "CMake recorded an empty CUDA architecture list; reconfigure the build"
+            )
         return architectures
     cache = Path(build_dir) / "CMakeCache.txt"
     if cache.is_file():
@@ -39,8 +41,7 @@ def resolve_requested_architectures(requested, build_dir):
 def should_build(system, requested, skip_wheel):
     if system != "Linux" or skip_wheel:
         return False
-    return requested == "all" or bool(select_cuda_architectures(
-        requested, {"sm_100a", "sm_103a"}))
+    return requested == "all" or bool(select_cuda_architectures(requested, {"sm_100a", "sm_103a"}))
 
 
 def select_cuda_architectures(requested, supported):
@@ -73,8 +74,9 @@ def validate_artifacts(files, variant_names):
         path = Path(files[kind])
         if not path.is_file():
             raise FileNotFoundError(path)
-        output = subprocess.run(["nm", "-D", "--defined-only", str(path)],
-                                check=True, capture_output=True, text=True).stdout
+        output = subprocess.run(
+            ["nm", "-D", "--defined-only", str(path)], check=True, capture_output=True, text=True
+        ).stdout
         exported = {line.split()[-1] for line in output.splitlines() if line.split()}
         missing = expected - exported
         if missing:
@@ -103,8 +105,13 @@ def _worker(package, warmup, architectures, jobs):
         original = flags(*args, **kwargs)
         original = re.sub(r"-gencode=arch=compute_\w+,code=sm_\w+", "", original)
         if "-I" in original:
-            include_dirs = (jit._FMHA_VARLEN_DIR / "include", jit._CUTLASS_INCLUDE,
-                            jit._CUTLASS_UTIL_INCLUDE, jit._get_tvm_ffi_include(), args[0])
+            include_dirs = (
+                jit._FMHA_VARLEN_DIR / "include",
+                jit._CUTLASS_INCLUDE,
+                jit._CUTLASS_UTIL_INCLUDE,
+                jit._get_tvm_ffi_include(),
+                args[0],
+            )
             directories = sorted(map(str, include_dirs), key=len, reverse=True)
             pattern = "-I(?:" + "|".join(map(re.escape, directories)) + ")"
             original = re.sub(pattern, lambda match: shlex.quote(match.group()), original)
@@ -148,13 +155,15 @@ def _worker(package, warmup, architectures, jobs):
 
 def build(package, warmup, requested, nvcc, jobs):
     package, warmup, nvcc = Path(package).resolve(), Path(warmup).resolve(), Path(nvcc).resolve()
-    output = subprocess.run([str(nvcc), "--list-gpu-code"], check=True,
-                            capture_output=True, text=True).stdout
+    output = subprocess.run(
+        [str(nvcc), "--list-gpu-code"], check=True, capture_output=True, text=True
+    ).stdout
     architectures = select_cuda_architectures(requested, output.split())
     if not architectures:
         return
-    version = subprocess.run([str(nvcc), "--version"], check=True,
-                             capture_output=True, text=True).stdout.strip()
+    version = subprocess.run(
+        [str(nvcc), "--version"], check=True, capture_output=True, text=True
+    ).stdout.strip()
     if not version:
         raise ValueError("nvcc did not report a CUDA toolkit version")
     with tempfile.TemporaryDirectory(prefix="trtllm-msa-aot-") as directory:
@@ -164,14 +173,28 @@ def build(package, warmup, requested, nvcc, jobs):
         env = os.environ.copy()
         for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
             env.pop(name, None)
-        env.update(MINFER_FMHA_CACHE_DIR=str(cache), TMPDIR=str(temporary),
-                   CUDA_HOME=str(nvcc.parent.parent), TRTLLM_MSA_BUILD_CUDA_VERSION=version)
+        env.update(
+            MINFER_FMHA_CACHE_DIR=str(cache),
+            TMPDIR=str(temporary),
+            CUDA_HOME=str(nvcc.parent.parent),
+            TRTLLM_MSA_BUILD_CUDA_VERSION=version,
+        )
         stub_dir = nvcc.parent.parent / "lib64/stubs"
         if stub_dir.is_dir():
             env["LIBRARY_PATH"] = str(stub_dir) + os.pathsep + env.get("LIBRARY_PATH", "")
-        subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker",
-                        str(package), str(warmup), ";".join(architectures), str(jobs)],
-                       env=env, check=True)
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker",
+                str(package),
+                str(warmup),
+                ";".join(architectures),
+                str(jobs),
+            ],
+            env=env,
+            check=True,
+        )
 
 
 if __name__ == "__main__":
@@ -190,9 +213,11 @@ if __name__ == "__main__":
         if not should_build(platform.system(), architectures, False):
             sys.exit(0)
         cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
-        nvcc = (os.environ.get("CMAKE_CUDA_COMPILER") or
-                (str(Path(cuda_home) / "bin/nvcc") if cuda_home else None) or
-                shutil.which("nvcc"))
+        nvcc = (
+            os.environ.get("CMAKE_CUDA_COMPILER")
+            or (str(Path(cuda_home) / "bin/nvcc") if cuda_home else None)
+            or shutil.which("nvcc")
+        )
         if not nvcc:
             parser.error("nvcc is required to build MSA artifacts")
         build(args.package, args.warmup, architectures, nvcc, args.jobs)
