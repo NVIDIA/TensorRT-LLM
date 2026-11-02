@@ -110,6 +110,7 @@ methods:
           NoneType]
         default: null
       prompt_adapter_request:
+        status: deprecated
         annotation: Union[tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest],
           NoneType]
         default: null
@@ -130,6 +131,7 @@ methods:
         annotation: Optional[tensorrt_llm.executor.request.LoRARequest]
         default: null
       prompt_adapter_request:
+        status: deprecated
         annotation: Optional[tensorrt_llm.executor.request.PromptAdapterRequest]
         default: null
       streaming:

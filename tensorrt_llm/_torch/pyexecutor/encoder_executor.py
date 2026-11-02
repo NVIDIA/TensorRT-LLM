@@ -12,13 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import torch
 
 from tensorrt_llm.logger import logger
 
 from .engine.runners.interface import PackedInputs
+
+if TYPE_CHECKING:
+    from ..distributed import Distributed
+    from .model_engine import ModelEngine
 
 
 class EncoderExecutor:
@@ -31,7 +35,7 @@ class EncoderExecutor:
     and no request queue. It runs entirely on the calling thread.
     """
 
-    def __init__(self, model_engine, dist):
+    def __init__(self, model_engine: "ModelEngine", dist: "Distributed") -> None:
         self.model_engine = model_engine
         self.dist = dist
 

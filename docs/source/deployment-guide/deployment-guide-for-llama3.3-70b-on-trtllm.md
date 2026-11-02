@@ -122,7 +122,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 #### `trust_remote_code`
 
-&emsp;**Description:** Allows TensorRT LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+&emsp;**Description:** Allows loading and executing custom Python code provided by the model repository, such as custom configuration or tokenizer implementations. This option is passed to the Hugging Face loading APIs.
 
 #### `kv_cache_config`
 
@@ -164,7 +164,7 @@ These options provide control over TensorRT LLM's behavior and are set within th
 
 &emsp;&emsp;**Default**: CUTLASS
 
-#### `attention_backend`
+#### `attn_backend`
 
 &emsp;**Description**: The backend to use for attention calculations.
 

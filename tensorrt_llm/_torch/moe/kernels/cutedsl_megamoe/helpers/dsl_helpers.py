@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
 """General-purpose CuTe DSL helpers."""
 
 from typing import Callable, Literal, Optional
@@ -28,12 +25,8 @@ def smem_exclusive_prefix(
     num_elements = cute.size(input_tensor)
     scan_rows = num_elements // 4
     num_warps = block_thread_count // 32
-    input_vectors = cute.make_tensor(
-        input_tensor.iterator, cute.make_layout((scan_rows, 4), stride=(4, 1))
-    )
-    load_atom = cute.make_copy_atom(
-        cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
-    )
+    input_vectors = cute.make_tensor(input_tensor.iterator, cute.make_layout((scan_rows, 4), stride=(4, 1)))
+    load_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128)
 
     values = cute.make_rmem_tensor((4,), cutlass.Int32)
     carry = Int32(0)
@@ -51,12 +44,7 @@ def smem_exclusive_prefix(
             for element in cutlass.range_constexpr(4):
                 values[element] = Int32(0)
 
-        local_prefix = (
-            Int32(0),
-            values[0],
-            values[0] + values[1],
-            values[0] + values[1] + values[2],
-        )
+        local_prefix = (Int32(0), values[0], values[0] + values[1], values[0] + values[1] + values[2])
         lane_total = local_prefix[3] + values[3]
         inclusive = lane_total
         for step_log in cutlass.range_constexpr(5):
@@ -95,17 +83,12 @@ def smem_exclusive_prefix(
 def mark_alignment(tensor: cute.Tensor, byte_alignment: int) -> cute.Tensor:
     pointer = tensor.iterator
     return cute.make_tensor(
-        cute.make_ptr(
-            pointer.dtype, pointer.toint(), pointer.memspace, assumed_align=byte_alignment
-        ),
-        tensor.layout,
+        cute.make_ptr(pointer.dtype, pointer.toint(), pointer.memspace, assumed_align=byte_alignment), tensor.layout
     )
 
 
 @cute.jit
-def spin_peek(
-    pointer: Pointer, condition: Callable[[Int32], Boolean], scope: str = "gpu"
-) -> Boolean:
+def spin_peek(pointer: Pointer, condition: Callable[[Int32], Boolean], scope: str = "gpu") -> Boolean:
     """Perform one acquire load and test its value."""
     value = cute.arch.load(pointer, pointer.dtype, sem="acquire", scope=scope)
     return Boolean(condition(value))
@@ -138,10 +121,7 @@ def _tma_multicast_pattern(
     if tensor_role in ("a", "sfa"):
         return sum(1 << (cluster_n_index * cluster_m) for cluster_n_index in range(cluster_n))
     if tensor_role == "b":
-        return sum(
-            1 << (cluster_m_index * mma_cta_count)
-            for cluster_m_index in range(cluster_m // mma_cta_count)
-        )
+        return sum(1 << (cluster_m_index * mma_cta_count) for cluster_m_index in range(cluster_m // mma_cta_count))
     if tensor_role == "sfb":
         return (1 << cluster_m) - 1
     raise ValueError(f"Unsupported TMA tensor role {tensor_role!r}.")
@@ -176,11 +156,7 @@ def tma_multicast_mask(
             )
         else:
             cta_n = Int32(cta_coord_in_cluster[1])
-            mma_cta_index = (
-                Int32(0)
-                if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1)
-                else cta_m % 2
-            )
+            mma_cta_index = Int32(0) if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1) else cta_m % 2
             result = cute.arch.inline_ptx(
                 "{\n\t"
                 ".reg .u32 offset;\n\t"
@@ -210,11 +186,7 @@ def tma_multicast_mask(
             )
         else:
             cta_n = Int32(cta_coord_in_cluster[1])
-            mma_cta_index = (
-                Int32(0)
-                if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1)
-                else cta_m % 2
-            )
+            mma_cta_index = Int32(0) if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1) else cta_m % 2
             result = cute.arch.inline_ptx(
                 "{\n\t"
                 ".reg .u32 offset;\n\t"
@@ -227,9 +199,7 @@ def tma_multicast_mask(
         return Int16(result)
 
     if cutlass.const_expr(is_preferred is None):
-        raise ValueError(
-            "is_preferred is required when the preferred and fallback multicast patterns differ."
-        )
+        raise ValueError("is_preferred is required when the preferred and fallback multicast patterns differ.")
 
     if cutlass.const_expr(tensor_role in ("a", "sfa")):
         result = cute.arch.inline_ptx(
@@ -243,15 +213,9 @@ def tma_multicast_mask(
         )
     else:
         if cutlass.const_expr(fallback_pattern & preferred_pattern != fallback_pattern):
-            raise ValueError(
-                "Fallback B/SFB multicast pattern must be a subset of the preferred pattern."
-            )
+            raise ValueError("Fallback B/SFB multicast pattern must be a subset of the preferred pattern.")
         cta_n = Int32(cta_coord_in_cluster[1])
-        mma_cta_index = (
-            Int32(0)
-            if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1)
-            else cta_m % 2
-        )
+        mma_cta_index = Int32(0) if cutlass.const_expr(tensor_role == "sfb" or mma_cta_count == 1) else cta_m % 2
         result = cute.arch.inline_ptx(
             "{\n\t"
             ".reg .u32 cluster_m, offset;\n\t"
@@ -268,10 +232,4 @@ def tma_multicast_mask(
     return Int16(result)
 
 
-__all__ = [
-    "mark_alignment",
-    "smem_exclusive_prefix",
-    "spin_peek",
-    "spin_wait",
-    "tma_multicast_mask",
-]
+__all__ = ["mark_alignment", "smem_exclusive_prefix", "spin_peek", "spin_wait", "tma_multicast_mask"]

@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -63,16 +62,6 @@ class RenderResources:
     tool_parser: Optional[str] = None
     reasoning_parser: Optional[str] = None
     custom_tokenizer: Optional[str] = None
-
-    def legacy_view(self) -> "RenderResources":
-        """Resources approximating the pre-merge inputs (``TRTLLM_RENDER_LEGACY=1``).
-
-        The governor, Responses and multimodal-encoder routes rendered without
-        the server-side chat template and without the model extension's rules.
-        This restores those inputs only; the render and tokenize steps are still the
-        shared ones (see :func:`~tensorrt_llm.serve.render.chat.legacy_render_enabled`).
-        """
-        return dataclasses.replace(self, default_chat_template=None, extension=ServingExtension())
 
     def fingerprint(self) -> dict:
         """Rendering-configuration fingerprint (see :mod:`.fingerprint`)."""

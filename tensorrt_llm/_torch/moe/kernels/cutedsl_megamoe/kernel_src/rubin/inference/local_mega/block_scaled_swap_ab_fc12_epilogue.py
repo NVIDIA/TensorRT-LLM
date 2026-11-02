@@ -19,20 +19,17 @@ from .....helpers.flag_batch import make_flag_batch_tracker
 from .....helpers.smem_workspace import SmemRegion, SmemWorkspace
 from .....quant_def import QuantKind
 from ....function_mapping import FunctionMapping
-from ....schedulers.base import SchedulerConsumer
-from ....schedulers.fc12_mapping import BlockPhase, SwapAbFc12WorkTileInfo
+from ....schedulers import BlockPhase, SchedulerConsumer, SwapAbFc12WorkTileInfo
 from ..mega.block_scaled_swap_ab_fc12_epilogue import (
     GatedActEpilogueArgs,
     SwapABFc1Epilogue,
+    SwapABFc2Epilogue as _SharedSwapABFc2Epilogue,
+    SwapABGatedActEpilogue as _SharedSwapABGatedActEpilogue,
     make_fc2_redg_process_pipeline,
     make_fc2_stg_process_pipeline,
     make_fc2_ublk_process_pipeline,
 )
-from ..mega.block_scaled_swap_ab_fc12_epilogue import SwapABFc2Epilogue as _SharedSwapABFc2Epilogue
-from ..mega.block_scaled_swap_ab_fc12_epilogue import (
-    SwapABGatedActEpilogue as _SharedSwapABGatedActEpilogue,
-)
-from ..mega.block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
+from .block_scaled_swap_ab_fc12_extension import BlockScaledSwapAbFc12Extension
 from .local_routing import RoutingMetadata
 
 
@@ -74,6 +71,11 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             self.swiglu_alpha = float(self.swiglu_alpha)
             self.swiglu_beta = float(self.swiglu_beta)
         self.situ_beta, self.situ_linear_beta = self._resolve_situ_betas(problem_desc)
+        # quick_geglu is Blackwell-only so far; refuse rather than silently computing SwiGLU.
+        if problem_desc.get("gate_activation") not in (None, "swiglu"):
+            raise NotImplementedError(
+                f"Rubin local epilogue does not support gate_activation={problem_desc.get('gate_activation')!r} yet."
+            )
         self.mma_tiler_mnk = impl_desc["mma_tiler_mnk"]
         self.cluster_shape_mn = impl_desc["cluster_shape_mn"]
         self.use_2cta_instrs = impl_desc["use_2cta_instrs"]
@@ -92,12 +94,8 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
         self.fc2_use_ublk = self.fc2_use_bulk
         self.reduce_topk_in_epilogue = self.reduce_topk_in_kernel
         if not 1 <= self.fc1_epi_flag_batch <= self._EpilogueWarpCnt:
-            raise ValueError(
-                f"Asynchronous FC1 flag batch size must be in [1, {self._EpilogueWarpCnt}]."
-            )
-        self.cluster_tile_intermediate_downproj = (
-            self._EpilogueFc1IntermediateDownTileSize * self.cluster_shape_mn[0]
-        )
+            raise ValueError(f"Asynchronous FC1 flag batch size must be in [1, {self._EpilogueWarpCnt}].")
+        self.cluster_tile_intermediate_downproj = self._EpilogueFc1IntermediateDownTileSize * self.cluster_shape_mn[0]
 
         atom_thr_size = 2 if self.use_2cta_instrs else 1
         self.cta_tile_m = self._EpilogueFc2HiddenTileSize
@@ -115,15 +113,9 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
         if tmem_plan.accumulator_stage_stride_columns != tmem_plan.accumulator_stage_columns:
             raise ValueError("Rubin Local MegaMoE does not support overlapping accumulator stages.")
         if tmem_plan.accumulator_pipeline_stages != tmem_plan.accumulator_stage_count:
-            raise ValueError(
-                "Rubin Local MegaMoE requires one pipeline stage per disjoint accumulator stage."
-            )
+            raise ValueError("Rubin Local MegaMoE requires one pipeline stage per disjoint accumulator stage.")
         self.num_accumulator_tmem_cols = tmem_plan.accumulator_columns
-        self.accumulator_shape = (
-            self.cta_tile_m,
-            self.cta_tile_n,
-            tmem_plan.accumulator_stage_count,
-        )
+        self.accumulator_shape = (self.cta_tile_m, self.cta_tile_n, tmem_plan.accumulator_stage_count)
         self.accumulator_stride = (1 << 16, 1, tmem_plan.accumulator_stage_stride_columns)
 
         self.fc2_hidden_needs_predicate = not (
@@ -131,36 +123,24 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             and self.hidden_size % (self.cta_tile_m * self.cluster_shape_mn[0]) == 0
         )
         self.intermediate_downproj = (
-            self.intermediate_gateup_size // 2
-            if isinstance(self.intermediate_gateup_size, int)
-            else None
+            self.intermediate_gateup_size // 2 if isinstance(self.intermediate_gateup_size, int) else None
         )
         self.subtile_cnt = self.cta_tile_n // self._EpilogueTokenTileSize
 
         self.fc1_staging_stage_bytes = (
-            self._EpilogueTokenTileSize
-            * self._EpilogueFc1IntermediateDownTileSize
-            * self.fc1_output_dtype.width
-            // 8
+            self._EpilogueTokenTileSize * self._EpilogueFc1IntermediateDownTileSize * self.fc1_output_dtype.width // 8
         )
         self.fc1_staging_bytes = self.subtile_cnt * self.fc1_staging_stage_bytes
         self.fc1_amax_token_chunks = self._EpilogueTokenTileSize // 32
         self.fc1_amax_slot_count = (
-            self.fc1_amax_token_chunks * self._EpilogueWarpCnt * 32
-            if self.needs_pair_amax_exchange
-            else 0
+            self.fc1_amax_token_chunks * self._EpilogueWarpCnt * 32 if self.needs_pair_amax_exchange else 0
         )
         if self.fc1_amax_slot_count * 4 > self.fc1_staging_stage_bytes:
             raise ValueError("The paired amax exchange does not fit in one FC1 staging stage.")
 
         requested_fc2_tma_stages = impl_desc.get("fc2_tma_stages")
-        if (
-            requested_fc2_tma_stages is not None
-            and not 1 <= requested_fc2_tma_stages <= self.subtile_cnt
-        ):
-            raise ValueError(
-                f"fc2_tma_stages must be in [1, {self.subtile_cnt}], got {requested_fc2_tma_stages}."
-            )
+        if requested_fc2_tma_stages is not None and not 1 <= requested_fc2_tma_stages <= self.subtile_cnt:
+            raise ValueError(f"fc2_tma_stages must be in [1, {self.subtile_cnt}], got {requested_fc2_tma_stages}.")
         if self.fc2_use_bulk:
             single_stage_region = self._make_fc2_single_stage_region()
             if single_stage_region.nbytes % 16 != 0:
@@ -170,27 +150,16 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             else:
                 bf16_baseline_stages = min(2, self.subtile_cnt)
                 bf16_stage_bytes = (
-                    self._EpilogueTokenTileSize
-                    * self._EpilogueFc2HiddenTileSize
-                    * cutlass.BFloat16.width
-                    // 8
+                    self._EpilogueTokenTileSize * self._EpilogueFc2HiddenTileSize * cutlass.BFloat16.width // 8
                 )
-                available_staging_bytes = max(
-                    self.fc1_staging_bytes, bf16_baseline_stages * bf16_stage_bytes
-                )
-                self.fc2_tma_stages = min(
-                    self.subtile_cnt, available_staging_bytes // single_stage_region.nbytes
-                )
-            self.fc2_staging_spec: Optional[SmemRegion] = self._make_fc2_staging_region(
-                self.fc2_tma_stages
-            )
+                available_staging_bytes = max(self.fc1_staging_bytes, bf16_baseline_stages * bf16_stage_bytes)
+                self.fc2_tma_stages = min(self.subtile_cnt, available_staging_bytes // single_stage_region.nbytes)
+            self.fc2_staging_spec: Optional[SmemRegion] = self._make_fc2_staging_region(self.fc2_tma_stages)
         else:
             self.fc2_tma_stages = 0
             self.fc2_staging_spec = None
 
-    def prepare_tma_store_params(
-        self, fc1_output_template: cute.Tensor
-    ) -> Tuple[cute.CopyAtom, cute.Tensor]:
+    def prepare_tma_store_params(self, fc1_output_template: cute.Tensor) -> Tuple[cute.CopyAtom, cute.Tensor]:
         fc1_operation = cpasync.CopyBulkTensorTileS2GOp()
         fc1_smem_layout = self.fc1_staged_smem_layout(1, without_stage_mode=True)
         fc1_tile = (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize)
@@ -295,9 +264,7 @@ class SwapABGatedActEpilogue(_SharedSwapABGatedActEpilogue):
             cute.arch.cp_async_bulk_wait_group(0)
             wait_only_named_barrier.arrive_and_wait()
             if cur_was_linear1:
-                flag_tracker = fc1_epi.signal_fc1_done(
-                    prev_work_tile_info, work_tile_info, flag_tracker
-                )
+                flag_tracker = fc1_epi.signal_fc1_done(prev_work_tile_info, work_tile_info, flag_tracker)
             else:
                 flag_tracker = fc2_epi.advance_fc1_flag_phase(work_tile_info, flag_tracker)
         flag_tracker.fire()
@@ -364,13 +331,10 @@ class SwapABFc2Epilogue(_SharedSwapABFc2Epilogue):
     @cute.jit
     def _make_output_router(self, work_tile_info: SwapAbFc12WorkTileInfo) -> "Fc2OutputRouter":
         task_tile_data_row_start = (
-            work_tile_info.cumulative_data_physical_row
-            + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
+            work_tile_info.cumulative_data_physical_row + work_tile_info.tile_n_idx * cutlass.Int32(self.cta_tile_n)
         )
         hidden_base_this_cta_tile = work_tile_info.tile_m_idx * cutlass.Int32(self.cta_tile_m)
-        valid_hidden_this_cta_tile = (
-            cutlass.Int32(self.fc2_output.shape[2]) - hidden_base_this_cta_tile
-        )
+        valid_hidden_this_cta_tile = cutlass.Int32(self.fc2_output.shape[2]) - hidden_base_this_cta_tile
         if valid_hidden_this_cta_tile < 0:
             valid_hidden_this_cta_tile = 0
         if valid_hidden_this_cta_tile > self._EpilogueFc2HiddenTileSize:
@@ -425,14 +389,9 @@ class Fc2OutputRouter:
             if token_valid and hidden_valid:
                 valid[iter_idx] = cutlass.Int32(1)
                 metadata = RoutingMetadata.load(
-                    self.routing_metadata.iterator.toint()
-                    + Int64(token_in_tile) * Int64(RoutingMetadata.nbytes)
+                    self.routing_metadata.iterator.toint() + Int64(token_in_tile) * Int64(RoutingMetadata.nbytes)
                 )
-                dst_topk = (
-                    cutlass.Int32(0)
-                    if cutlass.const_expr(self.reduce_topk_in_epilogue)
-                    else metadata.topk_slot
-                )
+                dst_topk = cutlass.Int32(0) if cutlass.const_expr(self.reduce_topk_in_epilogue) else metadata.topk_slot
                 dst_hidden = hidden_in_tile + self.hidden_base_this_cta_tile
                 dst_ptrs[iter_idx] = cute.domain_offset(
                     (Int64(metadata.token), dst_topk, dst_hidden), self.output
@@ -441,9 +400,7 @@ class Fc2OutputRouter:
         return dataclasses.replace(self, dst_ptrs=dst_ptrs, valid=valid)
 
     @cute.jit
-    def get_data_dst(
-        self, iter_idx: Union[int, cutlass.Int32]
-    ) -> Tuple[cute.Pointer, cutlass.Int32]:
+    def get_data_dst(self, iter_idx: Union[int, cutlass.Int32]) -> Tuple[cute.Pointer, cutlass.Int32]:
         ptr = cute.make_ptr(
             self.output.element_type,
             self.dst_ptrs[iter_idx],

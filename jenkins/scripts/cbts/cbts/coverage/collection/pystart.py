@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import configparser
+import contextlib
 import os
 import secrets
 import socket
@@ -66,7 +67,6 @@ class PyStartTracker:
         self._ctx: str = os.environ.get("CBTS_TEST_ID", "") or ""
         self._data: dict[str, set[tuple[str, str]]] = {}  # context -> set((filename, qualname))
         self._outcomes: dict[str, str] = {}  # context -> pytest outcome (outer pytest only)
-        self._expected: dict[str, int] = {}  # context -> pool workers the coordinator spawned
         self._taints: set[Taint] = set()
         self._diagnostics: dict[str, dict[str, str]] = {}  # process_uid -> {key: value}
         # co_filename -> absolute source path, or "" if excluded.
@@ -99,11 +99,12 @@ class PyStartTracker:
         relative = canonicalize_path(absolute, self.repository_root)
         return not self.include or any(fnmatchcase(relative, pattern) for pattern in self.include)
 
-    # Skip synthetic comprehension / genexpr / lambda frames; keep real functions, methods, module bodies.
-    _SKIP_QUALNAMES = frozenset(("<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"))
+    # Skip synthetic genexpr / lambda frames. See COLLECTION.md §5.1 for detail.
+    _SKIP_QUALNAMES = frozenset(("<genexpr>", "<lambda>"))
 
     def _on_py_start(self, code: CodeType, offset: int):
-        try:
+        # A tracker fault must never propagate into monitored host code.
+        with contextlib.suppress(Exception):
             filename = code.co_filename
             fn = self._source_files.get(filename)
             if fn is None:
@@ -112,11 +113,8 @@ class PyStartTracker:
                 )
             if fn:
                 qual = code.co_qualname
-                if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
+                if qual.rpartition(".")[2] not in self._SKIP_QUALNAMES:
                     self._data.setdefault(self._ctx, set()).add((fn, qual))
-        except Exception:
-            # A tracker fault must never propagate into monitored host code.
-            pass
         # Disable this code object's PY_START (for this tool) until the next test's restart_events().
         return _MON.DISABLE
 
@@ -131,10 +129,8 @@ class PyStartTracker:
             _MON.register_callback(self.tool_id, _MON.events.PY_START, self._on_py_start)
             _MON.set_events(self.tool_id, _MON.events.PY_START)
         except Exception:
-            try:
+            with contextlib.suppress(Exception):
                 _MON.free_tool_id(self.tool_id)
-            except Exception:
-                pass
             return False
         self._active = True
         return True
@@ -142,16 +138,16 @@ class PyStartTracker:
     def switch_test_context(self, nodeid: Optional[str]) -> None:
         self._ctx = nodeid or ""
         if self._active:
-            _MON.restart_events()
+            # Same contract as _on_py_start: a tracker fault must never propagate into
+            # the caller, which here is pytest's own per-test hookwrapper (or a
+            # subscriber's context-channel callback) -- never the place to decide
+            # whether a test runs.
+            with contextlib.suppress(Exception):
+                _MON.restart_events()
 
     def record_outcome(self, nodeid: Optional[str], outcome: str) -> None:
         """Record a test's pytest outcome (passed/failed/skipped) for the completeness signal."""
         self._outcomes[nodeid or ""] = outcome
-
-    def note_expected_workers(self, nodeid: Optional[str], n: int) -> None:
-        """Add to the count of subprocess pool workers the coordinator spawned for a test."""
-        key = nodeid or ""
-        self._expected[key] = self._expected.get(key, 0) + int(n)
 
     def note_taint(
         self, process_uid: Optional[str], nodeid: Optional[str], kind: str, reason: str
@@ -181,10 +177,9 @@ class PyStartTracker:
         # Write a compact per-process SQLite that downstream reducers can union directly.
         snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
         outcomes = dict(self._outcomes)
-        expected = dict(self._expected)
         taints = set(self._taints)
         diagnostics = dict(self._diagnostics)
-        if not snap and not outcomes and not expected and not taints and not diagnostics:
+        if not snap and not outcomes and not taints and not diagnostics:
             return None
         # Serialize saves so the periodic-save thread and the atexit final save never race on the
         # shared temp file (a concurrent os.remove(tmp) mid-write surfaces as a sqlite disk I/O error).
@@ -205,7 +200,6 @@ class PyStartTracker:
                 process_uid=process_uid,
                 touches={context: symbols.copy() for context, symbols in snap.items()},
                 outcomes=outcomes,
-                expected_workers=expected,
                 taints=taints,
                 diagnostics=diagnostics,
                 repository_root=self.repository_root,
@@ -217,8 +211,6 @@ class PyStartTracker:
         if not self._active:
             return
         self._active = False
-        try:
+        with contextlib.suppress(Exception):
             _MON.set_events(self.tool_id, 0)
             _MON.free_tool_id(self.tool_id)
-        except Exception:
-            pass

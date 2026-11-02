@@ -41,15 +41,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.ssm.fused_recurrent_gated_delta_rule_cached_replay_update import (  # noqa: E501
     fused_recurrent_gated_delta_rule_cached_replay_update as op,
 )
+from tensorrt_llm._torch.modules.fla.cache_manager import (
+    ReplayStateUpdateMetadata,
+    _advance_replay_state,
+)
 from tensorrt_llm._torch.modules.fla.cached_replay import (
     CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE,
     commit_gdn_cached_replay_history_layers,
 )
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import _build_replay_work_items_triton
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
-    ReplayStateUpdateMetadata,
-    _advance_replay_state,
-)
 
 __extra_import_path__ = ["../../../.."]
 from _validating import ULP, certifying, validating  # noqa: E402,F401 — path above; fixture by name
