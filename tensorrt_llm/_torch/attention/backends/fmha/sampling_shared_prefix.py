@@ -999,7 +999,10 @@ def _ctx_tables(
             count = stop - first
             kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
             if splits > 1:
-                per = -(-count // splits)
+                # Runs of at least MIN_SPLIT_TOKENS: a short prompt uses fewer (non-empty) runs.
+                from .flash_attn4_generation import MIN_SPLIT_TOKENS
+
+                per = max(-(-count // splits), -(-MIN_SPLIT_TOKENS // tokens_per_block))
                 lo = min(split * per, count)
                 hi = min(lo + per, count)
                 first, stop = first + lo, first + hi
