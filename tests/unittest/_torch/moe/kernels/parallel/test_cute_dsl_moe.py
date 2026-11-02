@@ -3295,10 +3295,15 @@ def test_sm107_nvfp4_gather_act_fusion_cache_key_ignores_inplace_output_rows(mon
     assert bucket_map(1024) == bucket_map(1152)
     assert cache_key(1024) == cache_key(1152)
 
-    # Profiling sizes the scale-factor buffer as the kernel asserts it.
+    # Profiling sizes the output and scale-factor buffers as the kernel asserts them.
+    # A shape-only tuner: constructing AutoTuner queries the CUDA device.
+    tuner = object.__new__(AutoTuner)
+    tuner.skip_dynamic_tuning_buckets = False
+    tuner._debug_logger = lambda *_: None
     inputs = [torch.empty(shape, dtype=torch.uint8, device="meta") for shape in input_shapes(1152)]
-    for profile in AutoTuner.get()._optimization_profiles(tuning_config, inputs):
+    for profile in tuner._optimization_profiles(tuning_config, inputs):
         shapes = profile.get_opt_shapes()
+        assert shapes[10] == (shapes[7][0], shard_n // 2)
         assert shapes[11] == (shapes[7][0] * shard_n // 16,)
 
 
