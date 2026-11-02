@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
@@ -39,13 +40,6 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 
 // Please make sure to align with the definition in tensorrt_llm/runtime/kv_cache_manager_v2/_common.py
 constexpr tk::KVCacheIndex::UnderlyingType BAD_PAGE_INDEX = -1;
-
-template <typename DstAddr, typename SrcAddr>
-struct Task
-{
-    DstAddr dst;
-    SrcAddr src;
-};
 
 using PackedInt = union
 {
@@ -100,13 +94,12 @@ private:
     at::Tensor copyIndex_;
 };
 
-CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyHostToHost(std::vector<Task<MemAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
-CUresult copyHostToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
-CUresult copyDeviceToHost(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
-CUresult copyDeviceToDevice(std::vector<Task<MemAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream);
+//! Gathers canonical base-page rows selected by copyIndex into a dense host tensor.
+void gatherBasePageRows(
+    at::Tensor const& source, at::Tensor destination, at::Tensor const& copyIndex, SizeType32 numBlocks);
+
+//! Copies plane-0 base-page rows between contiguous 4-D host and device tables.
+void copyBasePageRowsToDevice(ITensor const& input, ITensor& output, SizeType32 numRows, CUstream stream);
 
 void copyBatchBlockOffsetsToDevice(ITensor const& input, ITensor& output, ITensor const& copyIndex,
     ITensor const& indexScales, ITensor const& kvOffset, CUstream stream) noexcept;

@@ -16,9 +16,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base import Chunk, TokenRange
+from tensorrt_llm._torch.disaggregation.base import TokenRange
 from tensorrt_llm._torch.disaggregation.base.transfer import SessionStatus
 from tensorrt_llm._torch.disaggregation.native import transfer as transfer_mod
+from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.retirement import (
     QuiescenceFatalEvent,
     RetirementWatchdog,
@@ -520,7 +521,6 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     receiver._shutdown = False
     receiver._ownership_admission_lock = threading.Lock()
     receiver._ownership_poisoned = None
-    receiver._bounce = Mock()
     receiver._dealers = {}
     receiver._messenger = Mock()
     receiver.send_cancel_to_senders = Mock(return_value=None)
@@ -539,7 +539,6 @@ def _shutdown_transceiver() -> tuple[KvCacheTransceiverV2, transfer_mod.RxSessio
     worker = transfer_mod.TransferWorker.__new__(transfer_mod.TransferWorker)
     worker._retirement_watchdog = watchdog
     worker._receiver = receiver
-    worker._bounce = receiver._bounce
     worker._registered_mem = []
     instance = KvCacheTransceiverV2.__new__(KvCacheTransceiverV2)
     instance._transfer_worker = worker
@@ -624,8 +623,8 @@ def test_shutdown_retains_receive_reserved_for_blocked_publication() -> None:
         thread.join(timeout=1)
     assert not thread.is_alive()
     assert not errors
-    task.record_writer_result(7, True, wait_for_local_completion=False)
-    session._aux_physical_owner.record_writer_result(7, True, wait_for_local_completion=False)
+    task.record_writer_result(7, True)
+    session._aux_physical_owner.record_writer_result(7, True)
     instance.shutdown()
     assert session.status is SessionStatus.CANCELLED
     aux.free_slot.assert_called_once_with(3)

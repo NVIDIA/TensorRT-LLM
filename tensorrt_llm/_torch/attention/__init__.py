@@ -25,9 +25,14 @@ changing anything here.
 
 The module-layer classes listed in ``__all__`` can be imported from this
 package (``from tensorrt_llm._torch.attention import Attention``). They are
-resolved lazily by the module-level ``__getattr__`` below, so importing this
-package, or any sub-package such as ``backends``, loads none of the modules
-beside it. Keep it that way: those modules pull in torch, the attention
+resolved lazily by the module-level ``__getattr__`` below: importing this
+package or its ``backends`` sub-package loads none of the modules beside it,
+and accessing an exported name imports its defining submodule. Modules
+inside ``backends`` can still import them themselves; several under
+``backends.sparse`` import ``rotary_embedding``, so importing one of those
+loads it.
+
+Keep the package root lazy: those modules pull in torch, the attention
 backends and the distributed layer, so an eager import here would make every
 backend-only caller pay for the whole module layer at import time. It would
 also put this ``__init__`` on the ``backends`` -> ``rotary_embedding`` import
@@ -71,18 +76,19 @@ __all__ = [
 def __getattr__(name: str):
     module_name = _LAZY_ATTRS.get(name)
     if module_name is None:
-        # Also resolve bare submodule access (attention.backends,
-        # attention.rotary_embedding, ...).
-        try:
-            return importlib.import_module(f".{name}", __name__)
-        except ModuleNotFoundError as e:
-            # Only translate "no such submodule" into AttributeError; a
-            # ModuleNotFoundError raised *inside* an existing submodule
-            # (missing dependency) must propagate unchanged.
-            if e.name != f"{__name__}.{name}":
-                raise
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
-    module = importlib.import_module(f".{module_name}", __name__)
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        module = importlib.import_module(f".{module_name}", __name__)
+    except AttributeError as e:
+        # An AttributeError escaping the submodule is a bug inside it, not a
+        # missing name here. Raised as is, hasattr() and getattr() with a
+        # default would hide it, and ``from ... import`` would run the
+        # submodule twice (losing the cause unless the name is a submodule).
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{module_name} raised {e!r}",
+            name=__name__,
+        ) from e
     attr = getattr(module, name)
     globals()[name] = attr  # cache: subsequent access skips __getattr__
     return attr

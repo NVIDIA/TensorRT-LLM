@@ -7,7 +7,7 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,13 @@ from tensorrt_llm._torch.modules.multi_stream_utils import (
 )
 from tensorrt_llm._torch.modules.top_k import TopK, TopKImplementation
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
-from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
+from tensorrt_llm._utils import (
+    get_sm_version,
+    is_sm_100f,
+    is_sm_120f,
+    maybe_pin_memory,
+    prefer_pinned,
+)
 from tensorrt_llm.deep_gemm import (
     fp8_fp4_mqa_logits,
     fp8_fp4_paged_mqa_logits,
@@ -56,6 +62,22 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 # through one helper.
 _INDEXER_MQA_LOGITS_ELEM_BUDGET = get_indexer_mqa_logits_elem_budget()
 
+# Cap on the [sum(q) x sum(kv)] logits of context requests packed into one
+# indexer prefill chunk (in elements; 1 << 28 is 1 GiB of fp32). A packed
+# chunk gathers the KV of every request in it and scores every query against
+# all of it, so its logits grow with the product of the packed totals while
+# each query row only needs its own request's window. Prefix-reuse hits make
+# this explode: each brings few new tokens but its whole cached context. The
+# cap only decides which requests share a chunk; _packed_logits_elem_budget
+# also clamps it to the largest single-request logits tile the configuration
+# can reach. The memory of each logits call is bounded separately by the query
+# tiling under _INDEXER_MQA_LOGITS_ELEM_BUDGET, which also accounts for the
+# per-head dot products of the decoded FP4 path and tiles a request whose own
+# logits exceed this cap in a chunk of its own. Override via env if needed.
+_INDEXER_PACKED_LOGITS_ELEM_BUDGET = int(
+    os.environ.get("TLLM_INDEXER_PACKED_LOGITS_ELEM_BUDGET", 1 << 28)
+)
+
 if TYPE_CHECKING:
     from tensorrt_llm.mapping import Mapping
 
@@ -71,6 +93,17 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 _DG_SCHEDULE_BLOCK_KV = 64
+
+
+def use_cute_dsl_paged_mqa_logits(requested: bool) -> bool:
+    """Whether the CuTe DSL paged MQA logits kernel runs instead of DeepGEMM.
+
+    The indexer and the metadata must both use this: the metadata builds
+    DSL-only buffers (atom-split expansion, padded logits row stride) and
+    skips the sm90 MTP expansion off the same decision. is_sm_100f() is the
+    custom op's own precondition.
+    """
+    return requested and IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()
 
 
 def _pick_dsl_expand(
@@ -126,6 +159,46 @@ def _pick_dsl_expand(
     cands.sort(key=lambda x: (x[0], -x[1]))  # min waves, max factor
     _, factor, eff = cands[0]
     return factor, eff
+
+
+def _atom_ctx_offsets(next_n: int, num_atoms: int) -> List[int]:
+    """Per-atom causal stagger of an in-kernel next_n split: atom i (0 = oldest)
+    sees the context shortened by the tokens of the atoms after it. Same split
+    as the kernel (first ``next_n % num_atoms`` atoms get one extra token)."""
+    base, rem = divmod(next_n, num_atoms)
+    return [
+        next_n - (i * base + min(i, rem) + base + (1 if i < rem else 0)) for i in range(num_atoms)
+    ]
+
+
+def _pick_dsl_split(
+    next_n: int,
+    num_sms: int,
+    batch_size: int = 0,
+    max_ctx: int = 0,
+    kernel_atoms: Tuple[int, ...] = (1, 2, 3),
+) -> Tuple[int, int, int]:
+    """``_pick_dsl_expand`` plus the kernel's in-kernel uneven split.
+
+    Returns ``(expand_factor, atom, num_kernel_atoms)``. When no atom > 1 in
+    ``kernel_atoms`` divides ``next_n`` (e.g. 5 or 7), the caller-side split can
+    only run atom 1 and reads the KV ``next_n`` times; the in-kernel split runs
+    ``ceil(next_n / max(kernel_atoms))`` atoms instead. It is taken when atom 1
+    would need many waves and the split needs fewer, or when the workload is unknown.
+    """
+    factor, atom = _pick_dsl_expand(next_n, num_sms, batch_size, max_ctx, kernel_atoms)
+    if atom != 1 or next_n <= 1 or any(next_n % a == 0 for a in kernel_atoms if a > 1):
+        return factor, atom, 1
+    num_atoms = -(-next_n // max(kernel_atoms))
+    if batch_size > 0 and max_ctx > 0:
+        tiles = -(-max_ctx // 256)
+        waves_split = -(-batch_size * num_atoms * tiles // num_sms)
+        waves_atom1 = -(-batch_size * next_n * tiles // num_sms)
+        # Below ~16 atom-1 waves the split's wider tiles cost more than the KV
+        # re-reads they save (GB300, next_n=7: B=1 0.87-1.00x; >= 24 waves 1.04-2.6x).
+        if waves_split >= waves_atom1 or waves_atom1 < 16:
+            return factor, atom, 1
+    return 1, -(-next_n // num_atoms), num_atoms
 
 
 def _compute_slot_mappings(
@@ -382,6 +455,108 @@ def split_prefill_chunks(
     return chunk_groups
 
 
+def group_prefill_requests_by_logits_budget(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+) -> List[List[int]]:
+    """Group consecutive context requests into indexer prefill chunks.
+
+    A request joins the current group only while the group's packed logits,
+    ``sum(q_lens) * sum(kv_lens)``, stay within ``elem_budget``. A request that
+    exceeds the budget on its own forms a single-request group.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+
+    Returns:
+        Groups of request indices, in order, covering every request once.
+    """
+    assert len(q_lens) == len(kv_lens)
+    groups: List[List[int]] = []
+    group_q = group_kv = 0
+    for req_idx, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens)):
+        if groups and (group_q + q_len) * (group_kv + kv_len) <= elem_budget:
+            groups[-1].append(req_idx)
+            group_q += q_len
+            group_kv += kv_len
+        else:
+            groups.append([req_idx])
+            group_q, group_kv = q_len, kv_len
+    return groups
+
+
+def plan_mla_chunked_prefill_chunks(
+    q_lens: Sequence[int],
+    kv_lens: Sequence[int],
+    elem_budget: int,
+    q_begin: int = 0,
+    q_end: Optional[int] = None,
+) -> List[List[Tuple[int, int, int, int]]]:
+    """Plan the indexer prefill chunks covering context query tokens ``[q_begin, q_end)``.
+
+    Requests that lie fully inside the range are grouped with
+    ``group_prefill_requests_by_logits_budget``. A request cut by the range
+    boundary contributes only its covered query tokens, as a chunk of its own.
+
+    Args:
+        q_lens: New (query) tokens per request.
+        kv_lens: Compressed KV tokens per request, cached plus new.
+        elem_budget: Maximum packed logits elements for a multi-request group.
+        q_begin: First context query token to cover.
+        q_end: End of the covered context query tokens; defaults to all of them.
+
+    Returns:
+        Chunk specs for ``Indexer.prepare_one_prefill_chunk``, in token order:
+        ``(req_idx, token_start_in_req, token_end_in_req, req_cum_start)``.
+    """
+    assert len(q_lens) == len(kv_lens)
+    if q_end is None:
+        q_end = sum(q_lens)
+    q_starts = []
+    q_start = 0
+    for q_len in q_lens:
+        q_starts.append(q_start)
+        q_start += q_len
+
+    chunks: List[List[Tuple[int, int, int, int]]] = []
+    full_run: List[int] = []
+
+    def flush_full_run() -> None:
+        groups = group_prefill_requests_by_logits_budget(
+            [q_lens[i] for i in full_run], [kv_lens[i] for i in full_run], elem_budget
+        )
+        for group in groups:
+            chunks.append(
+                [(full_run[g], 0, q_lens[full_run[g]], q_starts[full_run[g]]) for g in group]
+            )
+        full_run.clear()
+
+    for req_idx, q_len in enumerate(q_lens):
+        begin = max(q_begin, q_starts[req_idx])
+        end = min(q_end, q_starts[req_idx] + q_len)
+        if begin >= end:
+            continue
+        if end - begin == q_len:
+            full_run.append(req_idx)
+        else:
+            flush_full_run()
+            chunks.append(
+                [
+                    (
+                        req_idx,
+                        begin - q_starts[req_idx],
+                        end - q_starts[req_idx],
+                        q_starts[req_idx],
+                    )
+                ]
+            )
+    flush_full_run()
+    return chunks
+
+
 # Shrink the indexer prefill chunk size for very long requests to bound the
 # fp8(_fp4)_mqa_logits activation memory (~ chunk_size * K_compressed), keyed on
 # the largest compressed KV length in the batch. Entries are
@@ -515,6 +690,27 @@ def _split_prefill_queries(
     size, rank = mapping.tp_size, mapping.tp_rank
     sizes = [(r + 1) * count // size - r * count // size for r in range(size)]
     return count * rank // size, count * (rank + 1) // size, sizes
+
+
+def _prefill_q_split_threshold(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Query-token count from which prefill indexer queries are split across TP ranks."""
+    sparse_metadata_params = metadata.sparse_metadata_params
+    return sparse_metadata_params.q_split_threshold if sparse_metadata_params is not None else 8192
+
+
+def _packed_logits_elem_budget(metadata: DSAtrtllmAttentionMetadata) -> int:
+    """Packed-logits cap for grouping context requests into one prefill chunk.
+
+    A single request's logits tile is at most ``min(_INDEXER_MQA_LOGITS_ELEM_BUDGET,
+    max_num_tokens * max_seq_len)`` elements, the size the KV cache estimate
+    reserves for the indexer logits workspace where it reserves one. Clamping
+    the packed cap to it keeps a packed chunk within that reserve.
+    """
+    single_request_tile = min(
+        _INDEXER_MQA_LOGITS_ELEM_BUDGET,
+        metadata.max_num_tokens * metadata.kv_cache_manager.max_seq_len,
+    )
+    return min(_INDEXER_PACKED_LOGITS_ELEM_BUDGET, single_request_tile)
 
 
 @maybe_compile(dynamic=True)
@@ -718,8 +914,8 @@ class Indexer(nn.Module):
         )
         self._prev_topk_copy_pending = False
         self.use_cute_dsl_topk = sparse_params.use_cute_dsl_topk and IS_CUTLASS_DSL_AVAILABLE
-        self.use_cute_dsl_paged_mqa_logits = (
-            sparse_params.use_cute_dsl_paged_mqa_logits and IS_CUTLASS_DSL_AVAILABLE
+        self.use_cute_dsl_paged_mqa_logits = use_cute_dsl_paged_mqa_logits(
+            sparse_params.use_cute_dsl_paged_mqa_logits
         )
         self.weight_scale_factor = self.softmax_scale * self.n_heads**-0.5
 
@@ -1158,21 +1354,37 @@ class Indexer(nn.Module):
         """
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
+        metadata.indexer_prefill_q_split = None
 
-        # When MLA chunked prefill is active, it already handles chunking
-        # Indexer should just process the current MLA chunk as a single chunk
+        # When MLA chunked prefill is active, it already bounds the new tokens per
+        # request, so requests are not split by length here. From
+        # q_split_threshold context query tokens on, the batch's queries are
+        # split evenly across TP ranks and each rank plans chunks for its share
+        # only. Within that share, requests are grouped so that a chunk's packed
+        # logits stay bounded: with cached KV, a request's KV can be far longer
+        # than its new tokens.
         has_mla_chunked_prefill = (
             metadata.enable_context_mla_with_cached_kv and metadata.runtime_features.chunked_prefill
         )
         if has_mla_chunked_prefill:
-            chunk_specs = [
-                (i, 0, seq_lens[i].item(), seq_lens[:i].sum().item() if i > 0 else 0)
+            compress_ratio = _effective_compress_ratio_divisor(
+                _select_indexer_compress_ratio(metadata.compress_ratios)
+            )
+            q_lens = seq_lens[:num_contexts].tolist()
+            cached_indptr = metadata.host_ctx_cached_token_indptr[: num_contexts + 1].tolist()
+            kv_lens = [
+                (cached_indptr[i + 1] - cached_indptr[i] + q_lens[i]) // compress_ratio
                 for i in range(num_contexts)
             ]
+            q_begin, q_end, q_sizes = _split_prefill_queries(
+                sum(q_lens), metadata.mapping, _prefill_q_split_threshold(metadata)
+            )
+            if q_sizes is not None:
+                metadata.indexer_prefill_q_split = (q_begin, q_end, q_sizes)
             metadata.indexer_prefill_chunks = [
-                Indexer.prepare_one_prefill_chunk(
-                    metadata,
-                    chunk_specs,
+                Indexer.prepare_one_prefill_chunk(metadata, chunk_specs)
+                for chunk_specs in plan_mla_chunked_prefill_chunks(
+                    q_lens, kv_lens, _packed_logits_elem_budget(metadata), q_begin, q_end
                 )
             ]
         else:
@@ -1516,7 +1728,7 @@ class Indexer(nn.Module):
             if not 1 <= heads <= 64:
                 raise ValueError("FP4 MQA requires between 1 and 64 index heads")
             # Consumer Blackwell lacks the 8-head FP4 MQA specialization.
-            supported_heads = (16, 32, 64) if get_sm_version() in (120, 121) else (8, 16, 32, 64)
+            supported_heads = (16, 32, 64) if is_sm_120f() else (8, 16, 32, 64)
             padded_heads = next(size for size in supported_heads if size >= heads)
             if padded_heads != heads:
                 q_fp8 = F.pad(q_fp8, (0, 0, 0, padded_heads - heads))
@@ -1640,12 +1852,10 @@ class Indexer(nn.Module):
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
-                sparse_metadata_params = metadata.sparse_metadata_params
-                q_split_threshold = (
-                    sparse_metadata_params.q_split_threshold
-                    if sparse_metadata_params is not None
-                    else 8192
-                )
+                q_split_threshold = _prefill_q_split_threshold(metadata)
+                # Chunks planned for this rank's share of the queries only are
+                # never split again; their top-k rows are gathered after the loop.
+                batch_q_split = metadata.indexer_prefill_q_split
                 k_cache_4d = metadata.kv_cache_manager.get_indexer_k_cache_buffers(self.layer_idx)
                 # FP4 packs two codes per byte so the gathered row holds half
                 # as many bytes as in the FP8 path. The scale (4 bytes) is the
@@ -1670,9 +1880,12 @@ class Indexer(nn.Module):
                     )
 
                     chunk_num_token = chunk.token_end - chunk.token_start
-                    chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
-                        chunk_num_token, metadata.mapping, q_split_threshold
-                    )
+                    if batch_q_split is None:
+                        chunk_q_start, chunk_q_end, q_sizes = _split_prefill_queries(
+                            chunk_num_token, metadata.mapping, q_split_threshold
+                        )
+                    else:
+                        chunk_q_start, chunk_q_end, q_sizes = 0, chunk_num_token, None
 
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
@@ -1719,6 +1932,15 @@ class Indexer(nn.Module):
                             dim=0,
                             sizes=q_sizes,
                         )
+
+                if batch_q_split is not None:
+                    local_q_begin, local_q_end, q_sizes = batch_q_split
+                    topk_indices_buffer[: sum(q_sizes), :] = allgather(
+                        topk_indices_buffer[local_q_begin:local_q_end, :],
+                        metadata.mapping,
+                        dim=0,
+                        sizes=q_sizes,
+                    )
             elif metadata.num_ctx_kv_tokens == 0:
                 # No compressed KV tokens — fill with -1 (no valid indices)
                 topk_indices_buffer[:num_ctx_tokens, :].fill_(-1)
@@ -1771,9 +1993,24 @@ class Indexer(nn.Module):
         )
 
         if has_decode and not metadata.skip_indexer_for_gen_reqs and reuse_topk:
-            topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
-                metadata.shared_topk_indices[:num_generations, :]
+            self._copy_reused_topk(
+                metadata,
+                topk_indices_buffer,
+                token_offset,
+                num_gen_tokens,
+                num_generations,
+                has_prefill,
+                gvr_prior_indices,
             )
+        elif (
+            has_decode
+            and not metadata.skip_indexer_for_gen_reqs
+            and self._fill_decode_topk(
+                metadata, q_fp8, weights, topk_indices_buffer, token_offset, num_gen_tokens
+            )
+        ):
+            # A subclass filled the generation rows.
+            pass
         elif has_decode and not metadata.skip_indexer_for_gen_reqs:
             # Get decode lengths per request (from seq_lens) for validation
             gen_seq_lens = metadata.seq_lens[num_contexts : num_contexts + num_generations]
@@ -1865,6 +2102,17 @@ class Indexer(nn.Module):
                     metadata.dsl_expand_factor > 1
                     and next_n == metadata.dsl_expand_factor * metadata.dsl_atom
                 )
+                # In-kernel uneven split (next_n with no exact atom divisor):
+                # native Q / context_lens / block_table, schedule over the
+                # staggered per-atom rows. Same full-window gate as above.
+                dsl_kernel_split = (
+                    metadata.dsl_kernel_atoms > 1 and next_n == metadata.dsl_kernel_next_n
+                )
+                dsl_split_kwargs: dict = {}
+                if dsl_kernel_split:
+                    dsl_split_kwargs = dict(
+                        num_next_n_atoms=metadata.dsl_kernel_atoms, atom=metadata.dsl_atom
+                    )
                 gvr_emit_kwargs: dict = {}
                 # emitting for a step the Top-K cannot consume only churns
                 # the closed-loop state, so gate on the consumable shape
@@ -1873,6 +2121,7 @@ class Indexer(nn.Module):
                     and gvr_prior_indices is not None
                     and next_n == 1
                     and not dsl_atom_split
+                    and not dsl_kernel_split
                     and num_gen_tokens <= 256
                     # ext tiers are single-CTA/sort-path only; row reordering
                     # routes the Top-K through order_row, which excludes them
@@ -1906,6 +2155,8 @@ class Indexer(nn.Module):
                         dsl_context_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         dsl_block_table = metadata.block_table_expanded[:exp_B]
                         dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        dsl_schedule_meta = metadata.scheduler_metadata_buffer_expanded
 
                     logits_decode = torch.ops.trtllm.cute_dsl_fp4_paged_mqa_logits(
                         dsl_q,
@@ -1917,6 +2168,7 @@ class Indexer(nn.Module):
                         dsl_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
                 else:
                     # FP8 DSL kernel natively supports next_n ∈ {1, 2, 3, 4}.
@@ -1936,6 +2188,8 @@ class Indexer(nn.Module):
                         fp8_ctx_lens = metadata.kv_lens_expanded_cuda[:exp_B]
                         fp8_block_table = metadata.block_table_expanded[:exp_B]
                         fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
+                    elif dsl_kernel_split:
+                        fp8_schedule_meta = metadata.scheduler_metadata_buffer_expanded
                     logits_decode = torch.ops.trtllm.cute_dsl_fp8_paged_mqa_logits(
                         dsl_q,
                         k_cache,
@@ -1945,6 +2199,7 @@ class Indexer(nn.Module):
                         fp8_schedule_meta,
                         indexer_max_seq_len,
                         **gvr_emit_kwargs,
+                        **dsl_split_kwargs,
                     )
             else:
                 decode_q_scale = (
@@ -2034,29 +2289,82 @@ class Indexer(nn.Module):
                 prev_topk_dst.copy_(last_mtp_topk)
 
         if self.mtp_index_share and metadata.in_mtp_draft_loop and not reuse_topk:
-            rows = None
-            if has_decode:
-                next_n = num_gen_tokens // num_generations
-                gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
-                rows = self._mtp_last_accepted_rows(
-                    gen_topk, metadata, num_contexts, num_generations, next_n
-                )
-            if has_prefill:
-                ctx_last = (
-                    torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
-                )
-                ctx_rows = topk_indices_buffer[ctx_last]
-                rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
-            if rows is not None:
-                shared_topk_indices = metadata.shared_topk_indices
-                if shared_topk_indices is None:
-                    metadata.shared_topk_indices = rows.contiguous()
-                else:
-                    row_start = num_contexts if is_generation else 0
-                    shared_topk_indices[
-                        row_start : row_start + rows.shape[0], : rows.shape[1]
-                    ].copy_(rows)
+            self._store_mtp_shared_rows(
+                topk_indices_buffer,
+                metadata,
+                num_contexts,
+                num_generations,
+                num_gen_tokens,
+                token_offset,
+                has_prefill,
+                has_decode,
+                is_generation,
+            )
         return topk_indices_buffer
+
+    def _copy_reused_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+        num_generations: int,
+        has_prefill: bool,
+        gvr_prior_indices: Optional[torch.Tensor],
+    ) -> None:
+        """Copy the shared TopK rows an MTP draft step reuses into its generation rows."""
+        topk_indices_buffer[token_offset : token_offset + num_gen_tokens, :] = (
+            metadata.shared_topk_indices[:num_generations, :]
+        )
+
+    def _fill_decode_topk(
+        self,
+        metadata: DSAtrtllmAttentionMetadata,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        topk_indices_buffer: torch.Tensor,
+        token_offset: int,
+        num_gen_tokens: int,
+    ) -> bool:
+        """Fill the generation TopK rows ahead of the decode branch; True if it filled them.
+
+        This class leaves them to the decode branch of ``sparse_attn_indexer``.
+        """
+        return False
+
+    def _store_mtp_shared_rows(
+        self,
+        topk_indices_buffer: torch.Tensor,
+        metadata: DSAtrtllmAttentionMetadata,
+        num_contexts: int,
+        num_generations: int,
+        num_gen_tokens: int,
+        token_offset: int,
+        has_prefill: bool,
+        has_decode: bool,
+        is_generation: Optional[bool],
+    ) -> None:
+        """Store each request's last accepted TopK row for the next MTP draft step to reuse."""
+        rows = None
+        if has_decode:
+            next_n = num_gen_tokens // num_generations
+            gen_topk = topk_indices_buffer[token_offset : token_offset + num_gen_tokens]
+            rows = self._mtp_last_accepted_rows(
+                gen_topk, metadata, num_contexts, num_generations, next_n
+            )
+        if has_prefill:
+            ctx_last = torch.cumsum(metadata.seq_lens_cuda[:num_contexts].to(torch.long), dim=0) - 1
+            ctx_rows = topk_indices_buffer[ctx_last]
+            rows = ctx_rows if rows is None else torch.cat([ctx_rows, rows])
+        if rows is not None:
+            shared_topk_indices = metadata.shared_topk_indices
+            if shared_topk_indices is None:
+                metadata.shared_topk_indices = rows.contiguous()
+            else:
+                row_start = num_contexts if is_generation else 0
+                shared_topk_indices[row_start : row_start + rows.shape[0], : rows.shape[1]].copy_(
+                    rows
+                )
 
     def _mtp_last_accepted_rows(
         self,

@@ -13,13 +13,127 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.logger import logger
 
+from ..base_weight_loader import ConsumableWeightsDict
 from ..base_weight_mapper import BaseWeightMapper
+
+_COMPRESSED_TENSORS_NVFP4_SUFFIXES = (".weight_packed", ".weight_global_scale",
+                                      ".input_global_scale")
+
+
+def _invert_compressed_tensors_global_scale(value) -> torch.Tensor:
+    """Convert a compressed-tensors global scale to TRT-LLM's divisor form.
+
+    A global scale of 0 marks an expert that saw no calibration data. It is
+    kept as 0 rather than inverted to Inf, which would otherwise win the MoE
+    per-layer max-reduction over experts and corrupt every expert's
+    input_scale; a 0 entry is harmless there and silences the dead expert.
+    """
+    t = value if isinstance(value, torch.Tensor) else value[...]
+    t = t.to(torch.float32)
+    out = torch.where(t > 0,
+                      1.0 / torch.clamp(t, min=torch.finfo(torch.float32).tiny),
+                      torch.zeros_like(t))
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+
+
+def _read_compressed_tensors_global_scale(name: str, value, zero_scales: list,
+                                          invalid_scales: list) -> torch.Tensor:
+    """Read a global scale and record whether it has entries that cannot be inverted."""
+    t = value if isinstance(value, torch.Tensor) else value[...]
+    t32 = t.to(torch.float32)
+    if bool((~torch.isfinite(t32) | (t32 < 0)).any()):
+        invalid_scales.append(name)
+    elif bool((t32 == 0).any()):
+        zero_scales.append(name)
+    return t
+
+
+def _warn_uninvertible_global_scales(zero_scales: list,
+                                     invalid_scales: list) -> None:
+    """Log one summary line for the global scales that were set to 0."""
+    if not zero_scales and not invalid_scales:
+        return
+    parts = []
+    if invalid_scales:
+        parts.append(
+            f"{len(invalid_scales)} with negative or non-finite values, which "
+            f"means a broken checkpoint (e.g. {', '.join(invalid_scales[:3])})")
+    if zero_scales:
+        parts.append(
+            f"{len(zero_scales)} with 0, as stored for experts without "
+            f"calibration data (e.g. {', '.join(zero_scales[:3])})")
+    logger.warning(
+        "compressed-tensors NVFP4 global scales that cannot be inverted: " +
+        "; ".join(parts) + ". They are set to 0; a weight global scale of 0 "
+        "zeroes that expert's output.")
+
+
+def convert_compressed_tensors_nvfp4_weights(
+        weights: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Rename llm-compressor "compressed-tensors" NVFP4 tensors to TRT-LLM's.
+
+    compressed-tensors stores
+      weight_packed        (uint8, packed FP4)
+      weight_scale         (FP8 per-group)
+      weight_global_scale  (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_weight)
+      input_global_scale   (FP32 scalar = (FP8_MAX*FP4_MAX)/amax_input)
+    while TRT-LLM's NVFP4 Linear and MoE loaders expect
+      weight               (uint8 view of float4_e2m1x2)
+      weight_scale         (FP8, same)
+      weight_scale_2       (FP32 scalar = amax_weight/(FP8_MAX*FP4_MAX))
+      input_scale          (FP32 scalar = amax_input/(FP8_MAX*FP4_MAX))
+    so the global scales are inverted on the way through.
+
+    Args:
+        weights: checkpoint weights keyed by checkpoint name; a plain dict or
+            a ``ConsumableWeightsDict``.
+
+    Returns:
+        ``weights`` itself when it holds no compressed-tensors NVFP4 names.
+        Otherwise a converted mapping of the same kind; other keys are passed
+        through unchanged and the caller must not use ``weights`` afterwards
+        (see ``ConsumableWeightsDict.take_ownership``).
+
+    Raises:
+        ValueError: two checkpoint tensors map to the same TRT-LLM name (for
+            example both ``x.weight_packed`` and ``x.weight``), which would
+            otherwise keep whichever came last.
+    """
+    if not any(
+            name.endswith(_COMPRESSED_TENSORS_NVFP4_SUFFIXES)
+            for name in weights.keys()):
+        return weights
+
+    converted, sources = {}, {}
+    zero_scales, invalid_scales = [], []
+    for name, value in weights.items():
+        source = name
+        if name.endswith(".weight_packed"):
+            name = name[:-len(".weight_packed")] + ".weight"
+        elif name.endswith((".weight_global_scale", ".input_global_scale")):
+            value = _read_compressed_tensors_global_scale(
+                name, value, zero_scales, invalid_scales)
+            if name.endswith(".weight_global_scale"):
+                name = name[:-len(".weight_global_scale")] + ".weight_scale_2"
+            else:
+                name = name[:-len(".input_global_scale")] + ".input_scale"
+            value = _invert_compressed_tensors_global_scale(value)
+        if name in converted:
+            raise ValueError(
+                f"compressed-tensors NVFP4 checkpoint maps both {sources[name]!r} "
+                f"and {source!r} to {name!r}")
+        converted[name] = value
+        sources[name] = source
+    _warn_uninvertible_global_scales(zero_scales, invalid_scales)
+    return ConsumableWeightsDict.take_ownership(weights, converted)
 
 
 @register_mapper("MX")

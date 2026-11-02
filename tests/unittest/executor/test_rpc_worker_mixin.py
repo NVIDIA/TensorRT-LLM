@@ -19,6 +19,7 @@ import pytest
 
 from tensorrt_llm.executor.base_worker import AwaitResponseHelper
 from tensorrt_llm.executor.rpc_worker_mixin import RpcWorkerMixin
+from tensorrt_llm.executor.utils import ErrorResponse
 
 pytestmark = pytest.mark.cpu_only
 
@@ -26,11 +27,12 @@ pytestmark = pytest.mark.cpu_only
 class _WorkerBaseStub:
     def await_responses(self, timeout):
         self.await_responses_timeout = timeout
-        return ["forward", "consume", None]
+        return self.engine_responses
 
 
 class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
-    def __init__(self):
+    def __init__(self, engine_responses):
+        self.engine_responses = engine_responses
         self.rank = 0
         self._fetch_timeout = 0.1
         self._response_queue = Queue()
@@ -38,27 +40,40 @@ class _RpcWorkerStub(RpcWorkerMixin, _WorkerBaseStub):
         self._await_response_helper = AwaitResponseHelper(self)
         self._await_response_helper.responses_handler = self._responses_handler
         self.handler_responses = None
-        self.callback_responses = []
 
     def _responses_handler(self, responses):
         self.handler_responses = responses
         if responses:
             self._response_queue.put(responses)
 
-    def _engine_response_callback(self, response):
-        self.callback_responses.append(response)
-        if response in ("consume", None):
-            return None
-        return f"processed-{response}"
 
-
-def test_fetch_responses_processes_and_filters_engine_responses():
-    worker = _RpcWorkerStub()
-    worker._await_response_helper.temp_error_responses.put("temporary-error")
+@pytest.mark.parametrize(
+    "engine_responses, expected_engine_responses",
+    [
+        (["first-response", "second-response"], ["first-response", "second-response"]),
+        (
+            [None, "first-response", None, "second-response", None],
+            ["first-response", "second-response"],
+        ),
+        ([None, None], []),
+        ([], []),
+    ],
+    ids=["normal", "mixed-none", "all-none", "empty"],
+)
+def test_fetch_responses_dispatches_engine_responses_and_submission_errors(
+    engine_responses, expected_engine_responses
+):
+    worker = _RpcWorkerStub(engine_responses)
+    original_responses = list(engine_responses)
+    submission_error = ErrorResponse(client_id=1, error_msg="submit failed", request_id=2)
+    worker._await_response_helper.temp_error_responses.put(submission_error)
 
     responses = worker.fetch_responses(timeout=0.25)
 
     assert worker.await_responses_timeout == 0.25
-    assert worker.callback_responses == ["forward", "consume", None]
-    assert worker.handler_responses == ["processed-forward", "temporary-error"]
-    assert responses == ["processed-forward", "temporary-error"]
+    expected = [*expected_engine_responses, submission_error]
+    assert worker.handler_responses == expected
+    assert responses == expected
+    assert responses[-1] is submission_error
+    assert engine_responses == original_responses
+    assert worker._await_response_helper.temp_error_responses.empty()

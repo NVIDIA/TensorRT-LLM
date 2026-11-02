@@ -45,14 +45,12 @@ disable_overlap_scheduler: True
 internal_request_auth_key: ${internal_request_auth_key}
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 EOL
 
 cat >${work_path}/gen_config.yaml << EOL
 internal_request_auth_key: ${internal_request_auth_key}
 cache_transceiver_config:
   backend: NIXL
-  max_tokens_in_buffer: 2048
 EOL
 
 # Launch a proxy without any context/generation servers.

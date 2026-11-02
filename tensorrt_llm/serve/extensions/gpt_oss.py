@@ -14,20 +14,42 @@
 # limitations under the License.
 """Serving extension for gpt-oss (Harmony) checkpoints."""
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
+from tensorrt_llm.serve.serving_extensions import (
+    OutputMode,
+    ServingExtension,
+    register_serving_extension,
+)
 
 _FINAL_CHANNEL_START = "<|start|>assistant<|channel|>final<|message|>"
 
 
-@register_serving_extension(reasoning_parsers=("gpt_oss",))
+@register_serving_extension(model_types=("gpt_oss",), reasoning_parsers=("gpt_oss",))
 class GptOssServingExtension(ServingExtension):
-    """Structured output for the Harmony ``gpt_oss`` reasoning parser.
+    """Harmony prompt rendering and output mode for gpt-oss.
 
-    Chat-request preprocessing is the generic path; only the placement of the
-    guided-decoding constraint is model specific.
+    Chat-request preprocessing is the generic path. The prompt is rendered to
+    Harmony token ids rather than through a chat template, the output is
+    consumed as tokens, and the guided-decoding constraint is placed on the
+    ``final`` channel.
     """
+
+    def render_prompt(self, request, res: Any = None) -> Optional[List[int]]:
+        """Render ``request`` to Harmony prompt token ids.
+
+        ``res`` may carry the caller's Harmony adapter as ``res.harmony``; the
+        process-wide adapter is used otherwise.
+        """
+        # Deferred: chat_tokenization imports openai_protocol, which imports the
+        # extension registry that loads this module.
+        from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
+
+        return tokenize_harmony_chat_request(request, harmony_adapter=getattr(res, "harmony", None))
+
+    def output_mode(self) -> OutputMode:
+        """Output is consumed as raw token ids by the Harmony adapter."""
+        return OutputMode.HARMONY_TOKENS
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]

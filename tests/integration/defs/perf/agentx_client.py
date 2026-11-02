@@ -53,6 +53,7 @@ as the reference script, so a lane is configured purely through the YAML's
 """
 
 import argparse
+import http.client
 import json
 import os
 import subprocess
@@ -68,6 +69,11 @@ DEFAULT_AIPERF_REF = (
     "git+https://github.com/SemiAnalysisAI/agentx-harness.git"
     "@754356e9a39acc6cc6afb242d123bb57c3fb6f75"
 )
+
+# aiperf's idle-connection keep-alive, in seconds. Must stay below the server's
+# own keep-alive timeout: trtllm-serve's is 5 s (TIMEOUT_KEEP_ALIVE in
+# tensorrt_llm/serve/openai_server.py).
+AIPERF_HTTP_KEEPALIVE_TIMEOUT_S = 4
 
 # aiperf's CLI/serialization/UI dependencies. The TRT-LLM container already
 # carries its ML stack (numpy/pandas/torch/huggingface-hub/aiohttp); installing
@@ -104,6 +110,11 @@ AIPERF_EXTRA_DEPS = [
 # The container ships datasets 3.x, which cannot parse the trace corpus schema
 # ("Feature type 'Json' not found"). 4.x+ is required.
 MIN_DATASETS_MAJOR = 4
+
+# The aiperf scenario that defines the AgentX workload. Only the agentx-harness
+# fork registers it, so its presence is also how the fork is told apart from the
+# upstream PyPI aiperf of the same import name.
+AGENTX_SCENARIO = "inferencex-agentx-mvp"
 
 # PyExecutor's HangDetector is hard-coded at 300 s with no env override, so a
 # multi-minute pip install with zero requests in flight idles the GEN worker
@@ -174,23 +185,68 @@ def _env_float(name: str, default: float) -> float:
 def aiperf_is_usable() -> bool:
     """Return whether the ambient interpreter already has a working agentx stack.
 
-    Checks importability *and* the datasets major version, since a container
-    with aiperf but datasets 3.x fails only later, when loading the corpus.
+    Checks importability, that the ``aiperf`` found is the agentx-harness fork
+    (it alone ships the ``inferencex-agentx-mvp`` scenario), *and* the datasets
+    major version, since a container with aiperf but datasets 3.x fails only
+    later, when loading the corpus. The fork check matters because
+    requirements-dev.txt pins the upstream PyPI ``aiperf``, which imports fine
+    but rejects ``--scenario`` at the start of the run.
+
+    The scenario is looked up through ``aiperf.common.scenario.registry``, the
+    module path in the pinned ``DEFAULT_AIPERF_REF`` build. The reason for a
+    failed probe is logged, so a fork that moves that module shows up as such
+    instead of as a reinstall on every run.
     """
     probe = (
-        "import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson; "
-        f"import sys; sys.exit(0 if int(datasets.__version__.split('.')[0]) >= {MIN_DATASETS_MAJOR} else 1)"
+        "import sys\n"
+        "try:\n"
+        "    import aiperf, cyclopts, datasets, transformers, pydantic, msgspec, orjson\n"
+        "except ImportError as e:\n"
+        "    sys.exit(f'missing module: {e}')\n"
+        "try:\n"
+        "    from aiperf.common.scenario.registry import get_scenario\n"
+        "except ImportError:\n"
+        "    sys.exit('aiperf has no aiperf.common.scenario.registry: not the agentx-harness fork, '\n"
+        "             'or the fork moved its scenario registry')\n"
+        "try:\n"
+        f"    get_scenario({AGENTX_SCENARIO!r})\n"
+        "except Exception as e:\n"
+        f"    sys.exit(f'aiperf does not provide the {AGENTX_SCENARIO} scenario: {{e}}')\n"
+        f"if int(datasets.__version__.split('.')[0]) < {MIN_DATASETS_MAJOR}:\n"
+        f"    sys.exit(f'datasets {{datasets.__version__}} < {MIN_DATASETS_MAJOR}')\n"
     )
-    return (
-        subprocess.call(
-            [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        == 0
+    result = subprocess.run(
+        [sys.executable, "-c", probe], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
     )
+    if result.returncode != 0:
+        lines = result.stderr.strip().splitlines()
+        _log(f"aiperf stack not usable: {lines[-1] if lines else f'exit {result.returncode}'}")
+    return result.returncode == 0
 
 
-def post_one_token(url: str, model: str, timeout: float) -> "str | None":
-    """POST a 1-token non-streaming completion. Returns the body, or None on failure."""
+def _http_error_text(error: urllib.error.HTTPError) -> str:
+    """Describe an HTTP error as ``HTTP <code>: <first 2 KB of its body>`` and close it.
+
+    A body that cannot be read still yields a description, so the best-effort
+    callers never see an exception from here.
+    """
+    with error:
+        try:
+            body = error.read(2048).decode(errors="replace")
+        except (OSError, ValueError, http.client.HTTPException) as read_error:
+            body = f"<unreadable body: {read_error!r}>"
+    return f"HTTP {error.code}: {body}"
+
+
+def post_one_token(
+    url: str, model: str, timeout: float, *, fail_on_client_error: bool = False
+) -> "str | None":
+    """POST one token and return the response body.
+
+    An HTTP error comes back as ``HTTP <code>: <body>`` so callers can report the
+    server's reason. With ``fail_on_client_error``, a permanent 4xx (anything but
+    408/429) raises instead. Transport failures return None.
+    """
     payload = json.dumps(
         {
             "model": model,
@@ -208,6 +264,13 @@ def post_one_token(url: str, model: str, timeout: float) -> "str | None":
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode(errors="replace")
+    except urllib.error.HTTPError as error:
+        reason = _http_error_text(error)
+        if fail_on_client_error and 400 <= error.code < 500 and error.code not in (408, 429):
+            raise RuntimeError(
+                f"{req.full_url} rejected the 1-token readiness request: {reason}"
+            ) from error
+        return reason
     except (urllib.error.URLError, OSError, TimeoutError):
         return None
 
@@ -268,30 +331,37 @@ def ensure_aiperf(url: str, model: str) -> None:
         )
 
 
+def _is_completion(response: "str | None") -> bool:
+    """Whether a post_one_token result is a chat completion, not an error description."""
+    try:
+        payload = json.loads(response or "")
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and "choices" in payload
+
+
 def verify_endpoint(url: str, model: str) -> None:
     """Prove the endpoint serves one real token before spending GPU-hours.
 
-    The harness has already waited for the disagg server, so this is a short
-    confirmation rather than the reference script's 5400 s poll. It exists
-    because a broken ctx->gen KV path answers /health perfectly well and only
-    fails once real traffic arrives -- an hour later, as a client-side error.
+    A healthy process may still reject inference requests or fail to generate.
+    This check applies to both aggregated and disaggregated servers. Permanent
+    request errors fail immediately with the response body; transient failures
+    retain the readiness retry budget.
     """
     timeout = _env_int("AGENTX_READY_TIMEOUT", 900)
     interval = _env_int("AGENTX_READY_INTERVAL", 15)
     deadline = time.monotonic() + timeout
     last = None
     while time.monotonic() < deadline:
-        last = post_one_token(url, model, timeout=300)
-        if last and '"choices"' in last:
-            _log("1-token completion OK -- the disagg path is live")
+        last = post_one_token(url, model, timeout=300, fail_on_client_error=True)
+        if _is_completion(last):
+            _log("1-token completion OK -- the inference endpoint is ready")
             return
         _log(f"not serving yet (response head: {str(last)[:200]})")
         time.sleep(interval)
     raise RuntimeError(
-        f"{url} could not complete ONE token within {timeout}s. This is a "
-        f"SERVER-side failure: inspect the ctx/gen worker logs and the disagg "
-        f"server log, not the client. Suspect the ctx->gen KV transfer "
-        f"(on GB300/NVL72 check UCX_TLS contains no 'rc'). "
+        f"{url} could not complete ONE token within {timeout}s. "
+        f"Inspect the inference server logs and readiness request failures. "
         f"Last response: {str(last)[:500]}"
     )
 
@@ -302,12 +372,19 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     Note ``--url`` carries scheme+host+port only; the request path is a separate
     ``--endpoint``. That is why this client takes ``--host``/``--port`` and
     composes them itself instead of having them appended to the argv.
+
+    aiperf runs as ``python -m aiperf`` under ``sys.executable``, the interpreter
+    that ``aiperf_is_usable`` checked and ``ensure_aiperf`` installed into. A bare
+    ``aiperf`` on PATH could be a different installation, such as the upstream
+    PyPI build that has no AgentX scenario.
     """
     cmd = [
+        sys.executable,
+        "-m",
         "aiperf",
         "profile",
         "--scenario",
-        "inferencex-agentx-mvp",
+        AGENTX_SCENARIO,
         "-m",
         args.model,
         "--tokenizer-trust-remote-code",
@@ -360,6 +437,26 @@ def build_aiperf_cmd(args: argparse.Namespace, url: str, artifact_dir: str) -> "
     if warmup > 0:
         cmd += ["--warmup-requests-per-lane", str(warmup)]
 
+    # The scenario forces ignore_eos, so the model can emit its end-of-sequence
+    # token as an ordinary output token. With the server's default
+    # skip_special_tokens it decodes to no text, and a one-token response
+    # (every warmup request, and every ctx_only request) then carries no
+    # content, which aiperf rejects as InvalidInferenceResultError. Keeping
+    # special tokens in the text makes every generated token visible. The token
+    # counts the metrics are built from stay the same only because the command
+    # also passes --use-server-token-count: without it aiperf would re-tokenize
+    # this text, special-token strings included, and count differently.
+    cmd += ["--extra-inputs", "skip_special_tokens:false"]
+
+    # Prefill-only replay (the perf-sanity ctx_only mode). The trace sets
+    # max_tokens per turn, so a fixed output length cannot be passed the way
+    # benchmark_serving takes --random-output-len. aiperf merges --extra-inputs
+    # into every request body after the turn's own max_completion_tokens, so
+    # this overrides it for every turn, subagent turns included. With the
+    # scenario's forced ignore_eos every request then decodes exactly one token.
+    if args.max_output_tokens is not None:
+        cmd += ["--extra-inputs", f"max_completion_tokens:{args.max_output_tokens}"]
+
     # Plain os.environ.get with a default, mirroring the reference script's
     # `${VAR-default}`: an explicitly empty value must disable the flag, which
     # is how a production (>=900 s) run drops --unsafe-override.
@@ -406,10 +503,6 @@ def check_run_health(export: dict) -> None:
     if export.get("was_cancelled"):
         raise RuntimeError("aiperf reports was_cancelled=true; the measurement is incomplete")
 
-    errors = export.get("error_summary") or []
-    if errors:
-        raise RuntimeError(f"aiperf reported request errors: {json.dumps(errors)[:2000]}")
-
     # Report coverage before the verdict: when submission_valid is false this
     # is the number that says why, so it must be in the log either way.
     for phase in metadata.get("metric_duration_coverage") or []:
@@ -440,16 +533,74 @@ def check_run_health(export: dict) -> None:
     duration = _read_metric(export, "benchmark_duration", "avg", "sec")
     if requests <= 0:
         raise RuntimeError("aiperf completed 0 requests")
+    check_request_errors(export.get("error_summary") or [], requests)
     _log(f"health OK: {int(requests)} requests over {duration:.1f}s, submission_valid=true")
 
 
-def report_metrics(export: dict) -> None:
-    """Print every PERF_METRIC_LOG_QUERIES line from the aiperf export."""
+# A streamed response that closed after the role chunk but before any content.
+# It is a server/transport flake, not a slow or wrong result, and it lands on
+# long-running requests: an e2e lane sees ~1 in 30k, a prefill-only (ctx_only)
+# lane, whose every request is a long prefill before its single token, ~1 in 600.
+EMPTY_CONTENT_ERROR_TYPE = "InvalidInferenceResultError"
+# Largest share of measured requests that may be empty-content before the run
+# fails. Well above the observed ctx_only rate (0.17%), far below anything that
+# could move a throughput or latency statistic.
+MAX_EMPTY_CONTENT_ERROR_RATIO = 0.005
+
+
+def check_request_errors(errors: list, requests: float) -> None:
+    """Fail on request errors, except a small share of empty-content responses.
+
+    Args:
+        errors: ``error_summary`` from the aiperf export: ``{"error_details":
+            {"type": ...}, "count": N}`` entries for the profiling phase.
+        requests: Successful requests in the profiling phase.
+
+    Raises:
+        RuntimeError: On any other error type, or empty-content errors above
+            ``MAX_EMPTY_CONTENT_ERROR_RATIO`` of all measured requests.
+    """
+    if not errors:
+        return
+    other = [
+        e for e in errors if (e.get("error_details") or {}).get("type") != EMPTY_CONTENT_ERROR_TYPE
+    ]
+    if other:
+        raise RuntimeError(f"aiperf reported request errors: {json.dumps(errors)[:2000]}")
+    empty = sum(int(e.get("count", 0)) for e in errors)
+    ratio = empty / (requests + empty)
+    if ratio > MAX_EMPTY_CONTENT_ERROR_RATIO:
+        raise RuntimeError(
+            f"{empty} empty-content responses ({ratio:.2%} of measured requests) exceed the "
+            f"{MAX_EMPTY_CONTENT_ERROR_RATIO:.1%} tolerance: {json.dumps(errors)[:2000]}"
+        )
+    _log(
+        f"tolerating {empty} empty-content responses ({ratio:.3%} of measured requests, "
+        f"limit {MAX_EMPTY_CONTENT_ERROR_RATIO:.1%}); details: {json.dumps(errors)[:500]}"
+    )
+
+
+# Decode-interval metrics. A one-token response has no interval between tokens,
+# so aiperf records none of these for a prefill-only (--max-output-tokens 1) run.
+DECODE_INTERVAL_FIELDS = ("inter_chunk_latency", "inter_token_latency")
+
+
+def report_metrics(export: dict, prefill_only: bool = False) -> None:
+    """Print every PERF_METRIC_LOG_QUERIES line from the aiperf export.
+
+    With ``prefill_only`` every response is one token, so the decode-interval
+    metrics do not exist. They are reported as 0 rather than omitted, because
+    the harness requires every line. The database uses 0 for the same
+    single-token case in benchmark_serving's ctx_only runs, so the series stay
+    comparable. Throughput, TTFT and E2EL are measured normally.
+    """
     for label, field, unit in THROUGHPUT_METRICS:
         _print_metric(label, _read_metric(export, field, "avg", unit))
     for stem, field in LATENCY_METRICS:
+        absent = prefill_only and field in DECODE_INTERVAL_FIELDS and field not in export
         for prefix, stat in (("Mean", "avg"), ("Median", "p50"), ("P99", "p99")):
-            _print_metric(f"{prefix} {stem} (ms)", _read_metric(export, field, stat, "ms"))
+            value = 0.0 if absent else _read_metric(export, field, stat, "ms")
+            _print_metric(f"{prefix} {stem} (ms)", value)
 
 
 def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
@@ -471,7 +622,19 @@ def parse_args(argv: "list[str] | None" = None) -> argparse.Namespace:
         default=os.environ.get("TRTLLM_AGENTX_ARTIFACT_DIR", "agentx_artifacts"),
         help="Parent directory for aiperf artifacts; a concurrency_<N> subdir is created in it.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Cap every request's output to this many tokens, overriding the trace's "
+            "per-turn max_tokens. 1 makes the replay prefill-only (perf-sanity ctx_only)."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.max_output_tokens is not None and args.max_output_tokens < 1:
+        parser.error("--max-output-tokens must be >= 1")
+    return args
 
 
 def _run(args: argparse.Namespace, artifact_dir: str) -> int:
@@ -479,6 +642,12 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
     # Custom tokenizers (e.g. deepseek_v4) are loaded in aiperf's worker
     # processes, which do not inherit a CLI trust flag.
     os.environ["HF_HUB_TRUST_REMOTE_CODE"] = "1"
+    # trtllm-serve closes a connection that has been idle for its keep-alive
+    # timeout (5 s). aiperf keeps idle pooled connections for 300 s, so it can
+    # write a request into a connection the server is closing at that moment,
+    # which fails as ClientOSError "Connection reset by peer". Dropping idle
+    # connections on the client side first avoids that.
+    os.environ.setdefault("AIPERF_HTTP_KEEPALIVE_TIMEOUT", str(AIPERF_HTTP_KEEPALIVE_TIMEOUT_S))
 
     ensure_aiperf(url, args.model)
     verify_endpoint(url, args.model)
@@ -514,7 +683,7 @@ def _run(args: argparse.Namespace, artifact_dir: str) -> int:
         export = json.load(f)
 
     check_run_health(export)
-    report_metrics(export)
+    report_metrics(export, prefill_only=args.max_output_tokens == 1)
     return 0
 
 

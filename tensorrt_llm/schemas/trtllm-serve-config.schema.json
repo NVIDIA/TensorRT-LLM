@@ -64,6 +64,13 @@
           "title": "Enable Balance",
           "type": "boolean"
         },
+        "enable_kv_balanced_admission": {
+          "default": false,
+          "description": "Admit generation-only requests by per-rank KV load. When True and the first 32 queued requests are all generation-only requests without an attention_dp_rank, the attention DP router chooses which of them to admit and which rank takes each, keeping the largest per-rank request count and KV token count low, instead of admitting them in queue order. Request priorities are respected, and a request passed over in 64 admitting rounds is admitted next. Useful on disaggregated generation workers. Has no effect with kv_cache_routing_conversation_affinity, or with enable_kv_cache_aware_routing when KV cache block reuse is enabled.",
+          "status": "prototype",
+          "title": "Enable Kv Balanced Admission",
+          "type": "boolean"
+        },
         "enable_kv_cache_aware_routing": {
           "default": false,
           "description": "Enable internal KV cache-aware routing for attention DP. When enabled, distributes requests among ranks within a single instance's attention DP group, routing them to the rank with the matching prefix KV cache to reduce redundant prefill computation.",
@@ -288,6 +295,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -337,6 +351,13 @@
       "additionalProperties": false,
       "description": "Configuration for KV cache block reuse policies.",
       "properties": {
+        "enable_branch_snapshot": {
+          "default": false,
+          "description": "Keep reusable state where a request's prompt diverges from the prefix cache, so later requests sharing that prefix can reuse up to the fork. For sliding-window attention (SWA), the SWA window at the fork is committed. This helps when only the SWA window at a chunk end is kept: policy 'per_request' or 'per_conversation', or SWA scratch reuse. The fork is aligned down to a block boundary and becomes a forced context chunk boundary. SWA layers skip this with joint target/draft KV cache reuse. For hybrid Mamba models, the recurrent state is snapshotted at the fork. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager v2 and block reuse.",
+          "status": "prototype",
+          "title": "Enable Branch Snapshot",
+          "type": "boolean"
+        },
         "max_num_turns": {
           "default": 1,
           "description": "Maximum number of completed conversation turns whose committed SWA-window blocks and Mamba stable-boundary state are retained by KV cache manager v2. Only used when `policy` is 'per_conversation'.",
@@ -403,7 +424,8 @@
       "properties": {
         "agent_bounce_buffer_enable": {
           "default": false,
-          "description": "Run the KV-cache bounce in the C++ transfer agent instead of the Python transceiver, using one shared kv_cache_bounce_size_mb buffer (use a power of two). Set this identically on context and generation; kv_cache_bounce_size_mb matters only when its usable capacity (rounded down to a power of two) is below max_chunk_size; both sides must then clamp to the same chunk cap, otherwise the pair falls back to standard NIXL. By default only writes with many small descriptors (>= 1024, <= 16 KiB average, i.e. head-mismatch layouts) take the path; head-matched layouts (MLA, symmetric TP) stay on standard NIXL unless agent_bounce_params relaxes the gate. Requires the Python (v2) transceiver; see the disaggregated-serving docs.",
+          "description": "DEPRECATED: no-op kept so existing configs still parse; it will be removed in a future release. kv_cache_bounce_size_mb > 0 alone enables the C++ transfer-agent bounce buffer, and 0 disables it.",
+          "status": "deprecated",
           "title": "Agent Bounce Buffer Enable",
           "type": "boolean"
         },
@@ -420,7 +442,7 @@
             }
           ],
           "default": null,
-          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires agent_bounce_buffer_enable. request_timeout_ms and the effective max_chunk_size (after the arena clamp) must match between context and generation. max_average_descriptor_size=0 stops outbound routing only (arena, handshake and inbound scatter stay active); set agent_bounce_buffer_enable=False to turn the feature off.",
+          "description": "Expert tuning knobs for the C++ transfer-agent bounce pipeline; see tensorrt_llm/_torch/disaggregation/nixl/bounce_knobs.py for the valid keys. Byte-valued knobs accept a KB/MB/GB suffix (e.g. '32MB'). Precedence: this dict > environment variable > built-in default. Requires kv_cache_bounce_size_mb > 0. request_timeout_ms and the effective chunk size (max_chunk_size, capped by the buffer size) must match between context and generation. max_average_descriptor_size=0 stops this worker from sending through the buffer, but it still allocates the buffer and receives bounced writes; set kv_cache_bounce_size_mb=0 to turn the feature off.",
           "title": "Agent Bounce Params"
         },
         "backend": {
@@ -445,13 +467,13 @@
         },
         "enable_pipelined_transfer": {
           "default": false,
-          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Python bounce buffer (the C++ transfer-agent bounce selected by agent_bounce_buffer_enable is allowed) or Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
+          "description": "Transfer each completed prefill chunk's KV cache while later chunks compute. Requires Python NIXL, generation-first scheduling, chunked prefill, pipeline_parallel_size=1, context_parallel_size=1 on both peers, beam_width=1, no Mamba/hybrid cache, and block reuse disabled or set to all_reusable. Invalid static settings fail at startup; per-request constraints reject the request.",
           "title": "Enable Pipelined Transfer",
           "type": "boolean"
         },
         "kv_cache_bounce_size_mb": {
           "default": 0,
-          "description": "Capacity in MiB of the native-disagg KV-cache bounce buffer, which coalesces a request's scattered per-block KV for a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. By default two buffers of this size are allocated (one for send, one for recv); with agent_bounce_buffer_enable a single shared buffer is allocated instead and the size should be a power of two (256/512/1024). Requires the Python (v2) transceiver (transceiver_runtime); the C++ transceiver does not support bounce and ignores this field.",
+          "description": "Size in MiB of the KV-cache bounce buffer in the C++ NIXL transfer agent; 0 (default) turns it off and KV fragments are written directly with standard NIXL. A positive value allocates one buffer of this size per rank, shared by send and receive. Use a power of two such as 256, 512 or 1024; for other values only the largest power of two that fits is used. For an eligible write, the sender gathers the fragments into the buffer and sends them in chunks, and the receiver scatters them into its KV cache. By default a write is eligible only with >= 1024 descriptors averaging <= 16 KiB (typical when context and generation split attention heads differently); agent_bounce_params changes that. Set it on both context and generation servers; if either side has 0, the pair uses standard NIXL. If either side's buffer is smaller than max_chunk_size (32 MiB by default), both sides must use the same size, or the pair uses standard NIXL. Requires the Python (v2) transceiver with the C++ NIXL agent; on a build without bounce support (libzmq) a positive value fails at startup. The C++ transceiver and the pure-Python NIXL agent ignore it with a warning.",
           "minimum": 0,
           "title": "Kv Cache Bounce Size Mb",
           "type": "integer"
@@ -606,6 +628,15 @@
         "FORCE_CHUNK"
       ],
       "title": "ContextChunkingPolicy",
+      "type": "string"
+    },
+    "ContextSchedulingPolicy": {
+      "description": "Order in which the scheduler admits pending context requests.",
+      "enum": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "title": "ContextSchedulingPolicy",
       "type": "string"
     },
     "CpConfig": {
@@ -867,6 +898,20 @@
           "title": "Skip Ctx Buffer Budget Check",
           "type": "boolean"
         },
+        "spec_dec_variant": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Version of the DFlash algorithm: 2 for a DFlash 2 draft checkpoint, 1 otherwise. None until the draft checkpoint's config.json has been read, which for a HF repo id happens only after download. Do not set manually.",
+          "title": "Spec Dec Variant"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -975,7 +1020,7 @@
         },
         "attention_backend": {
           "default": "AUTO",
-          "description": "Block-decode attention backend for a standalone DSpark drafter (one shipped as its own checkpoint, not inside the target's mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent of the backend that builds the drafter's own attention modules.\n\nAUTO resolves per drafter family and is right unless you are pinning a kernel: a GQA backbone degrades when its kernel is missing, an MLA one raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only and needs a cute-dsl MLA decode taking per-token kv_bounds that is not upstream yet. Which kernel each name selects: MLADSparkForCausalLM.",
+          "description": "Block-decode attention backend for a standalone DSpark drafter (one shipped as its own checkpoint, not inside the target's mtp.* namespace). Ignored by the embedded DeepSeek-V4-Pro draft. Independent of the backend that builds the drafter's own attention modules.\n\nAUTO resolves per drafter family and is right unless you are pinning a kernel: TRTLLM for a GQA backbone, which degrades when its kernel is missing, and CUTEDSL for an MLA one, which raises. TRTLLM needs FlashInfer and SM100/SM103. CUTEDSL is MLA-only: one cute-dsl MLA decode pass over context and block, on SM100/SM103/SM107. Which kernel each name selects: MLADSparkForCausalLM.",
           "enum": [
             "AUTO",
             "VANILLA",
@@ -1152,6 +1197,13 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -1388,8 +1440,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1560,8 +1612,8 @@
           "type": "boolean"
         },
         "use_cute_dsl_paged_mqa_logits": {
-          "default": false,
-          "description": "Whether to use CuTE DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM.",
+          "default": true,
+          "description": "Whether to use the CuTe DSL paged MQA logits kernel on SM100-family GPUs instead of C++ DeepGEMM. Falls back to DeepGEMM off the SM100 family or when the cutlass-dsl package is missing.",
           "title": "Use Cute Dsl Paged Mqa Logits",
           "type": "boolean"
         },
@@ -1747,6 +1799,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -1794,7 +1853,7 @@
     },
     "DwdpConfig": {
       "additionalProperties": false,
-      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\ndouble-buffered P2P remote regions), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
+      "description": "Configuration for Distributed Weight Data Parallelism (DWDP).\n\nDWDP accelerates the context (prefill) phase of disaggregated MoE serving\nby combining data parallelism with NVLink-based expert weight sharing.\nEach worker holds a subset of experts locally and asynchronously prefetches\nthe remaining experts from peer workers via CUDA VMM + MNNVL fabric\nhandles (composite virtual-address layout with zero-copy local mapping and\nP2P remote prefetch slots), enabling fully asynchronous execution\nacross ranks without synchronization barriers.\n\nCurrently supported with the CuteDSL MoE backend and NVFP4 quantization\non MNNVL-connected multi-GPU systems (e.g., GB200).",
       "properties": {
         "contention_opt": {
           "default": false,
@@ -1824,6 +1883,13 @@
           "default": 0,
           "description": "The number of prefetch experts per worker.",
           "title": "Num Prefetch Experts",
+          "type": "integer"
+        },
+        "num_prefetch_slots": {
+          "default": 2,
+          "description": "The number of expert prefetch buffer slots. Each slot holds the remote experts of one MoE layer; more slots let the prefetch run further ahead of the MoE compute, at the cost of device memory that is then not available to the KV cache.",
+          "minimum": 2,
+          "title": "Num Prefetch Slots",
           "type": "integer"
         }
       },
@@ -2063,19 +2129,6 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
-        },
         "sa_config": {
           "anyOf": [
             {
@@ -2088,6 +2141,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with Eagle3 speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -2354,18 +2414,12 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
-        "num_eagle_layers": {
-          "anyOf": [
-            {
-              "type": "integer"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Deprecated TensorRT-only field with different semantics from draft model layer count. Do not use on the PyTorch backend.",
-          "title": "Num Eagle Layers"
+        "spec_dec_variant": {
+          "default": 3,
+          "description": "Version of the EAGLE algorithm, 3 for EAGLE3 draft checkpoints. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -2720,6 +2774,19 @@
           "description": "KV cache manager v2 configuration for block reuse policies.",
           "status": "prototype"
         },
+        "cold_tier_offload_min_priority": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Minimum priority for offloading unreferenced blocks from the hot tier to cold tiers. Blocks with priority at or above this value can be offloaded. Defaults to 30 when unset.",
+          "title": "Cold Tier Offload Min Priority"
+        },
         "copy_on_partial_reuse": {
           "default": true,
           "description": "Whether partially matched blocks that are in use can be reused after copying them.",
@@ -2775,7 +2842,7 @@
         },
         "dtype": {
           "default": "auto",
-          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
+          "description": "The data type for the KV cache. 'auto' (default) leaves the checkpoint's own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. 'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. 'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and keeps the first and last N tokens of every sequence in <dtype> ('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and mixed_precision_last_n; requires KV cache manager V2. Resolved at LLM-construction time, including when set via trtllm-serve --extra_llm_api_options.",
           "telemetry": {
             "allowed_values": [
               "auto",
@@ -2784,7 +2851,10 @@
               "float32",
               "fp8",
               "fp8_ds_mla",
-              "nvfp4"
+              "nvfp4",
+              "mixed_nvfp4_fp8",
+              "mixed_nvfp4_float16",
+              "mixed_nvfp4_bfloat16"
             ]
           },
           "title": "Dtype",
@@ -2798,7 +2868,7 @@
         },
         "enable_kv_pool_rebalance": {
           "default": false,
-          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by V2's internal 2000-sample / 120s cooldown. When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
+          "description": "Opt in to the KVCacheManagerV2 auto-tuner (``adjust()``) for rebalancing pool-group ratios between iterations. When True the PyExecutor calls ``adjust()`` opportunistically; the auto-tuner itself remains gated by the ``kv_pool_rebalance_config`` thresholds (2000 samples / 120s by default). When False (default) the rebalance hook is skipped entirely and pool ratios remain at their warmup-derived values. Beta: enable at your own risk. Only used when using KV cache manager v2 (experimental). This option is incompatible with dtype='fp8_ds_mla'.",
           "status": "prototype",
           "title": "Enable Kv Pool Rebalance",
           "type": "boolean"
@@ -2897,6 +2967,11 @@
           "description": "Streaming (push-based) KV cache event publishing (KV cache manager V2 only). When set, each rank publishes its own events directly (e.g. over ZeroMQ) instead of the buffered event_buffer_max_size gather/poll path.",
           "status": "prototype"
         },
+        "kv_pool_rebalance_config": {
+          "$ref": "#/$defs/KvPoolRebalanceConfig",
+          "description": "Tuning for the KVCacheManagerV2 pool rebalance auto-tuner. Only used when ``enable_kv_pool_rebalance`` is True.",
+          "status": "prototype"
+        },
         "mamba_ssm_cache_dtype": {
           "default": "auto",
           "description": "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config.",
@@ -2990,6 +3065,22 @@
           "title": "Max Util For Resume",
           "type": "number"
         },
+        "mixed_precision_first_n": {
+          "default": 256,
+          "description": "Mixed-precision KV only: number of leading tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision First N",
+          "type": "integer"
+        },
+        "mixed_precision_last_n": {
+          "default": 256,
+          "description": "Mixed-precision KV only: number of most recent tokens per sequence kept at the retained dtype. Retention follows the cache page granularity.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Mixed Precision Last N",
+          "type": "integer"
+        },
         "pool_ratio": {
           "anyOf": [
             {
@@ -3018,7 +3109,12 @@
             }
           ],
           "default": null,
-          "description": "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory.",
+          "deprecated": true,
+          "description": "Deprecated alias for cold_tier_offload_min_priority.",
+          "status": "deprecated",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Secondary Offload Min Priority"
         },
         "sink_token_length": {
@@ -3130,6 +3226,13 @@
           "description": "The class name of the worker within the module.",
           "title": "Connector Worker Class"
         },
+        "control_grace_sec": {
+          "default": 60.0,
+          "description": "Grace period in seconds for pending ADP KV connector transfers after cancellation or shutdown. Can only shorten the existing transfer deadline. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Control Grace Sec",
+          "type": "number"
+        },
         "mooncake_store": {
           "anyOf": [
             {
@@ -3154,9 +3257,73 @@
           "default": null,
           "description": "URL for an external connector server (e.g. 'tcp://localhost:5555'). Connectors that run in multi-process mode use this to reach the cache server.",
           "title": "Server Url"
+        },
+        "transfer_timeout_sec": {
+          "default": 600.0,
+          "description": "Deadline in seconds for an outstanding ADP KV connector transfer. Checked at polling gates; cannot interrupt blocking callbacks. Expiration fails all ADP owners and requires process restart. Unused without attention DP.",
+          "exclusiveMinimum": 0,
+          "title": "Transfer Timeout Sec",
+          "type": "number"
         }
       },
       "title": "KvCacheConnectorConfig",
+      "type": "object"
+    },
+    "KvPoolRebalanceConfig": {
+      "additionalProperties": false,
+      "description": "Tuning for the KV cache manager v2 pool rebalance auto-tuner.\n\nOnly used when ``kv_cache_config.enable_kv_pool_rebalance`` is True.",
+      "properties": {
+        "check_interval": {
+          "default": 10,
+          "description": "Number of PyExecutor iterations between checks of whether a pool rebalance should be attempted.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Check Interval",
+          "type": "integer"
+        },
+        "cooldown_secs": {
+          "default": 120.0,
+          "description": "Minimum time, in seconds, between successive rebalance adjustments.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Cooldown Secs",
+          "type": "number"
+        },
+        "min_sampled_kv_caches": {
+          "default": 2000,
+          "description": "Minimum number of sampled (closed) KvCaches observed before the auto-tuner will consider making an adjustment.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Min Sampled Kv Caches",
+          "type": "integer"
+        },
+        "moving_average_decay": {
+          "default": 0.9999,
+          "description": "Decay factor for the exponential moving averages (reused length, capacity, history length) used to compute target pool ratios. Higher values react more slowly to change.",
+          "exclusiveMaximum": 1,
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Moving Average Decay",
+          "type": "number"
+        },
+        "ratio_tolerance": {
+          "default": 0.25,
+          "description": "How far a pool group's current ratio may drift from its target before a rebalance is triggered, as a fraction of the smaller of the two. The comparison is symmetric, so 0.25 means a rebalance is triggered once one of the two exceeds the other by more than 25%.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Ratio Tolerance",
+          "type": "number"
+        },
+        "target_ratio_update_interval": {
+          "default": 100,
+          "description": "Number of newly sampled KvCaches between recomputations of the target pool-group ratios.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Target Ratio Update Interval",
+          "type": "integer"
+        }
+      },
+      "title": "KvPoolRebalanceConfig",
       "type": "object"
     },
     "LayerwiseBenchmarksConfig": {
@@ -3384,6 +3551,28 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_lm_head_dtype": {
+          "default": "auto",
+          "description": "LM head that greedy MTP-Eagle drafts are sampled from. 'auto': the target LM head. 'mxfp8': an MXFP8 copy of the BF16 vocabulary-parallel head (SM 100 / SM 103 with the CuTe DSL, no attention DP), read by a fused GEMV + argmax for draft passes of up to 16 rows; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "mxfp8"
+          ],
+          "status": "prototype",
+          "title": "Draft Lm Head Dtype",
+          "type": "string"
+        },
+        "draft_moe_dtype": {
+          "default": "auto",
+          "description": "Routed experts of an MTP layer that the checkpoint keeps in BF16. 'auto': as loaded. 'nvfp4': quantized to NVFP4 at load time (weight scales from the weights, fixed activation scales) and run on the TRTLLM-gen MoE like the target layers; it changes the drafts, so the acceptance length, but never the output.",
+          "enum": [
+            "auto",
+            "nvfp4"
+          ],
+          "status": "prototype",
+          "title": "Draft Moe Dtype",
+          "type": "string"
+        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -3532,6 +3721,13 @@
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with MTP speculative decoding.",
           "status": "beta"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -3627,9 +3823,11 @@
         },
         "enable_branch_snapshot": {
           "default": false,
-          "description": "Snapshot the Mamba recurrent state where a request's content diverges from the prefix cache, so that later requests sharing the same prefix can reuse up to the fork instead of being truncated to an earlier snapshot. If no periodic or additional snapshot point applies to the prompt, the prompt end is snapshotted as a fallback. Requires KV cache manager V2.",
-          "status": "prototype",
-          "telemetry": {},
+          "description": "Deprecated alias for kv_cache_config.block_reuse_config.enable_branch_snapshot. It takes effect only when block reuse is enabled.",
+          "status": "deprecated",
+          "telemetry": {
+            "exclude": true
+          },
           "title": "Enable Branch Snapshot",
           "type": "boolean"
         },
@@ -3866,47 +4064,13 @@
         "load_balancer": {
           "anyOf": [
             {
-              "additionalProperties": false,
-              "description": "Pydantic configuration model for the Mixture of Experts (MoE) load balancer.\n\nThis model holds configuration data (`num_slots`, etc.) as well as\nruntime state (`_ep_rank`, `_ep_size`) which must be set via the\n`setup()` method before use.",
-              "properties": {
-                "initial_global_assignments": {
-                  "anyOf": [
-                    {
-                      "additionalProperties": {
-                        "items": {
-                          "type": "integer"
-                        },
-                        "type": "array"
-                      },
-                      "type": "object"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Initial Global Assignments"
-                },
-                "layer_updates_per_iter": {
-                  "default": 0,
-                  "title": "Layer Updates Per Iter",
-                  "type": "integer"
-                },
-                "num_slots": {
-                  "anyOf": [
-                    {
-                      "type": "integer"
-                    },
-                    {
-                      "type": "null"
-                    }
-                  ],
-                  "default": null,
-                  "title": "Num Slots"
-                }
-              },
-              "title": "MoeLoadBalancerConfig",
-              "type": "object"
+              "$ref": "#/$defs/MoeLoadBalancerConfig"
+            },
+            {
+              "$ref": "#/$defs/MoePerLayerDynamicLoadBalancerConfig",
+              "required": [
+                "mode"
+              ]
             },
             {
               "type": [
@@ -3914,7 +4078,10 @@
                 "null"
               ]
             }
-          ]
+          ],
+          "default": null,
+          "description": "Configuration for standard or per-layer dynamic EPLB.",
+          "title": "Load Balancer"
         },
         "max_num_tokens": {
           "anyOf": [
@@ -3937,6 +4104,106 @@
         }
       },
       "title": "MoeConfig",
+      "type": "object"
+    },
+    "MoeLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure the standard asynchronous EPLB implementation.",
+      "properties": {
+        "initial_global_assignments": {
+          "anyOf": [
+            {
+              "additionalProperties": {
+                "items": {
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Initial expert placement keyed by MoE layer index. Each value has `num_slots` entries, gives the expert ID held by each global slot, and covers every expert.",
+          "title": "Initial Global Assignments"
+        },
+        "layer_updates_per_iter": {
+          "default": 0,
+          "description": "Number of MoE layers whose expert placement is updated per iteration. 0 keeps the initial placement (static EPLB); a positive value enables online EPLB.",
+          "title": "Layer Updates Per Iter",
+          "type": "integer"
+        },
+        "mode": {
+          "const": "standard",
+          "default": "standard",
+          "description": "EPLB mode. `standard` is static EPLB when `layer_updates_per_iter` is 0 and online EPLB otherwise. Configs without `mode` use `standard`.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size`; each rank hosts `num_slots / ep_size` slots.",
+          "title": "Num Slots"
+        }
+      },
+      "title": "MoeLoadBalancerConfig",
+      "type": "object"
+    },
+    "MoePerLayerDynamicLoadBalancerConfig": {
+      "additionalProperties": false,
+      "description": "Configure per-layer dynamic EPLB with Halo-Q scheduling.",
+      "properties": {
+        "auxiliary_sms": {
+          "default": 4,
+          "description": "Number of SMs that the routed-input quantization and shared-expert FC12 kernels leave free for the kernel that runs the HALO-Q scheduler and then the in-switch copy of its plan on the copy stream, one CTA per SM. Must be smaller than the device SM count.",
+          "maximum": 8,
+          "minimum": 1,
+          "status": "prototype",
+          "title": "Auxiliary Sms",
+          "type": "integer"
+        },
+        "helper_slot_mode": {
+          "default": "per_layer_resident",
+          "description": "Storage of the helper slots. `per_layer_resident` gives every MoE layer its own helper slots and skips copying an expert that a helper slot already holds from that layer's previous forward pass; it costs one helper set per MoE layer, about 6.4 GiB per GPU for DeepSeek-V4-Pro with 3 helper slots per rank. `shared_banks` has all MoE layers alternate between two shared helper banks and copy every helper expert in every forward pass.",
+          "enum": [
+            "per_layer_resident",
+            "shared_banks"
+          ],
+          "status": "prototype",
+          "title": "Helper Slot Mode",
+          "type": "string"
+        },
+        "mode": {
+          "const": "per_layer_dynamic",
+          "default": "per_layer_dynamic",
+          "description": "EPLB mode. `per_layer_dynamic` replicates each MoE layer's hot experts into helper slots in every forward pass, planned from that layer's current routing.",
+          "status": "prototype",
+          "title": "Mode",
+          "type": "string"
+        },
+        "num_slots": {
+          "description": "Total number of expert slots across all EP ranks. Must be divisible by `ep_size` and greater than the number of experts. Each rank keeps its `num_experts / ep_size` resident experts and adds `(num_slots - num_experts) / ep_size` helper slots. Unlike standard EPLB, the helper slots are not static replicas: every forward pass refills them from that layer's routing; see `helper_slot_mode` for their storage.",
+          "exclusiveMinimum": 0,
+          "status": "prototype",
+          "title": "Num Slots",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "num_slots"
+      ],
+      "title": "MoePerLayerDynamicLoadBalancerConfig",
       "type": "object"
     },
     "MooncakeStoreConfig": {
@@ -3996,7 +4263,7 @@
         },
         "role": {
           "default": "both",
-          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without moving any KV, so they pin no staging buffers and pay no per-request cost.",
+          "description": "What this server does with the pool. 'both' reads and writes, 'producer' only writes, 'consumer' only reads, and 'capacity' does neither: its ranks lend memory without registering any KV cache, so it needs no GPUDirect RDMA.",
           "enum": [
             "both",
             "producer",
@@ -4036,8 +4303,8 @@
           "title": "Segment Size"
         },
         "stage_through_host": {
-          "default": true,
-          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. The only transfer path supported today, so 'false' is ignored with a warning. Costs a copy each way and needs no GPUDirect RDMA.",
+          "default": false,
+          "description": "Copy pages through a pinned host buffer instead of registering the KV pools with Mooncake. For a host whose HCA cannot pin GPU pages; costs a copy each way. Ignored when role is 'capacity'.",
           "telemetry": {
             "exclude": true
           },
@@ -4127,29 +4394,37 @@
     },
     "MultimodalEncoderCudaGraphConfig": {
       "additionalProperties": false,
-      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nOne graph is captured per `buckets` entry; replay falls back to eager when the live workload's\npadded shape does not match any bucket.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
+      "description": "CUDA graph capture for multimodal vision / audio encoders.\n\nSet `max_batch_size` to generate capture shapes automatically. Advanced users can instead\nspecify `buckets`. Replay falls back to eager when no captured shape fits the live workload.\n\nNOTE: enabling this will lead to higher GPU memory usage. It is usually more beneficial for\n`buckets` corresponding to lesser compute.",
       "properties": {
         "buckets": {
-          "description": "Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair captures one graph sized for up to `total_tokens` real encoder tokens across exactly `num_contexts` real contexts.",
-          "items": {
-            "maxItems": 2,
-            "minItems": 2,
-            "prefixItems": [
-              {
-                "exclusiveMinimum": 0,
-                "type": "integer"
+          "anyOf": [
+            {
+              "items": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  },
+                  {
+                    "exclusiveMinimum": 0,
+                    "type": "integer"
+                  }
+                ],
+                "type": "array"
               },
-              {
-                "exclusiveMinimum": 0,
-                "type": "integer"
-              }
-            ],
-            "type": "array"
-          },
-          "minItems": 1,
+              "minItems": 1,
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Explicit encoder graph buckets as `(total_tokens, num_contexts)` pairs. Each pair captures one graph sized for up to `total_tokens` real encoder tokens across exactly `num_contexts` real contexts.",
           "status": "prototype",
-          "title": "Buckets",
-          "type": "array"
+          "title": "Buckets"
         },
         "enable_padding": {
           "default": true,
@@ -4165,6 +4440,36 @@
           "title": "Enable Replay Stats",
           "type": "boolean"
         },
+        "max_batch_size": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Maximum number of encoder contexts per CUDA graph. Automatically captures every context count from 1 to this limit, with token capacities derived from the encoder token budget. Contexts are encoder sequences, such as image or video frame groups and audio chunks; they are not concurrent requests. Mutually exclusive with buckets.",
+          "status": "prototype",
+          "title": "Max Batch Size"
+        },
+        "max_num_tokens": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional total token capacity for automatically generated graphs. Defaults to encoder_max_num_tokens, or max_num_tokens when the encoder limit is unset. The encoder adapter defines token units and layout. Larger workloads run eagerly. Mutually exclusive with buckets.",
+          "status": "prototype",
+          "title": "Max Num Tokens"
+        },
         "warmup_steps": {
           "default": 2,
           "description": "Warmup iterations to run per bucket before capturing.",
@@ -4174,9 +4479,6 @@
           "type": "integer"
         }
       },
-      "required": [
-        "buckets"
-      ],
       "title": "MultimodalEncoderCudaGraphConfig",
       "type": "object"
     },
@@ -4370,6 +4672,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -4420,7 +4729,7 @@
       "description": "Configuration for NVFP4 GEMM backend selection.",
       "properties": {
         "allowed_backends": {
-          "description": "List of backends to consider for auto-selection. Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme performance at the cost of longer server launch time.",
+          "description": "List of backends to consider for auto-selection.",
           "items": {
             "enum": [
               "cutlass",
@@ -4619,6 +4928,13 @@
           "default": null,
           "description": "Optional Suffix Automaton configuration. When set, combines SA drafting with PARD speculative decoding.",
           "status": "beta"
+        },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
         },
         "speculative_model": {
           "anyOf": [
@@ -5321,6 +5637,13 @@
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5569,6 +5892,13 @@
           "title": "Output Directory",
           "type": "string"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -5643,6 +5973,27 @@
           "default": null,
           "description": "The context chunking policy to use"
         },
+        "context_scheduling_policy": {
+          "$ref": "#/$defs/ContextSchedulingPolicy",
+          "default": "fcfs",
+          "description": "Order in which pending context requests are admitted: 'fcfs' (arrival order) or 'shortest_uncached_first' (fewest prompt tokens not covered by reusable KV cache first, which lowers TTFT under load at the cost of fairness). Only the KV cache manager V2 scheduler supports 'shortest_uncached_first'.",
+          "status": "prototype"
+        },
+        "context_starvation_iterations": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "With context_scheduling_policy='shortest_uncached_first', chunked prefill and a max_num_tokens budget: a context request pending for more than this many scheduler iterations takes up to a quarter of max_num_tokens of each iteration's budget ahead of the shortest-first order, oldest first. None disables it.",
+          "status": "prototype",
+          "title": "Context Starvation Iterations"
+        },
         "dynamic_batch_config": {
           "anyOf": [
             {
@@ -5653,7 +6004,7 @@
             }
           ],
           "default": null,
-          "description": "The dynamic batch config to use. This only applies for the TensorRT backend and cannot currently be used with the PyTorch backend."
+          "description": "The dynamic batch configuration used by the scheduler to adjust batch size and token limits at runtime. This option currently has no effect since the scheduler does not support dynamic batch adjustments in the pytorch backend."
         },
         "enable_prefix_aware_scheduling": {
           "default": true,
@@ -6056,6 +6407,13 @@
         "resource_manager": {
           "type": "null"
         },
+        "spec_dec_variant": {
+          "default": 1,
+          "description": "Version of the algorithm within its decoding_type family (e.g. DFlash 1 vs. 2), for versions that share one decoding config. Resolved from the draft checkpoint where a family has versions. Do not set manually.",
+          "exclusiveMinimum": 0,
+          "title": "Spec Dec Variant",
+          "type": "integer"
+        },
         "speculative_model": {
           "anyOf": [
             {
@@ -6114,7 +6472,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc1/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -6777,6 +7135,17 @@
       "$ref": "#/$defs/LayerwiseBenchmarksConfig",
       "status": "prototype"
     },
+    "lm_head_output_dtype": {
+      "default": "auto",
+      "description": "Output dtype written by the LM head GEMM. 'auto' uses the model dtype before logits are upcast to float32. 'float32' writes the float32 accumulator directly, avoiding intermediate bf16/fp16 rounding of logits before logprob computation. Weights and inputs remain in the model dtype. Only supported for unquantized LM heads of decoder-only models.",
+      "enum": [
+        "auto",
+        "float32"
+      ],
+      "status": "prototype",
+      "title": "Lm Head Output Dtype",
+      "type": "string"
+    },
     "load_format": {
       "anyOf": [
         {
@@ -6897,6 +7266,13 @@
       "description": "Only load/execute the vision encoder part of the full model. Defaults to False.",
       "status": "prototype",
       "title": "Mm Encoder Only",
+      "type": "boolean"
+    },
+    "mnnvl_allreduce_fp8_payload": {
+      "default": false,
+      "description": "Lossy. MNNVL two-shot all-reduces fused with a residual RMSNorm (BF16, hidden size a multiple of 1024, TP 2/4/8) exchange E4M3 values with one FP32 scale per 256 elements instead of BF16, which halves the NVLink bytes of both stages.",
+      "status": "prototype",
+      "title": "Mnnvl Allreduce Fp8 Payload",
       "type": "boolean"
     },
     "model": {
@@ -7281,6 +7657,13 @@
       "description": "The request reordering policy to use.",
       "status": "prototype"
     },
+    "replicate_embedding": {
+      "default": false,
+      "description": "Keep the whole embedding table on every tensor-parallel rank instead of a vocabulary shard, so a lookup needs no all-reduce (costs vocab_size x hidden_size more memory per GPU). Used by Qwen3-Next / Qwen3.5 models without attention DP.",
+      "status": "prototype",
+      "title": "Replicate Embedding",
+      "type": "boolean"
+    },
     "request_stats_max_iterations": {
       "anyOf": [
         {
@@ -7327,6 +7710,21 @@
       "$ref": "#/$defs/SchedulerConfig",
       "description": "Scheduler config.",
       "status": "prototype"
+    },
+    "serve_frontend_affinity_port_stride": {
+      "anyOf": [
+        {
+          "exclusiveMinimum": 0,
+          "type": "integer"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "With num_serve_frontends=K > 1: frontend i (0 is the launcher) also listens on its own port, port + stride * (i + 1), so a client can send every turn of a conversation to the same frontend process. A disaggregated server does so for context requests that carry a conversation id when its context_servers section sets the same num_serve_frontends and serve_frontend_affinity_port_stride.",
+      "status": "prototype",
+      "title": "Serve Frontend Affinity Port Stride"
     },
     "skip_tokenizer_init": {
       "default": false,
@@ -7586,6 +7984,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc1 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --config",
   "type": "object"
 }

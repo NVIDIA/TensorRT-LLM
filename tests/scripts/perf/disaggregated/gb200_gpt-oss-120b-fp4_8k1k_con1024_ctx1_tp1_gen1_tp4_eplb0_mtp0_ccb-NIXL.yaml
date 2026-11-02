@@ -74,11 +74,9 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
     stream_interval: 20
@@ -103,11 +101,9 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 9216
       backend: NIXL
       transceiver_runtime: PYTHON
       kv_cache_bounce_size_mb: 512
-      agent_bounce_buffer_enable: true
     disable_overlap_scheduler: true
     num_postprocess_workers: 4
     stream_interval: 20

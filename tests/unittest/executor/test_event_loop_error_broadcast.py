@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Unit tests for AwaitResponseHelper.__call__ event-loop crash handling.
 
 When PyExecutor's event-loop thread dies (e.g. KV cache OOM), every
@@ -70,12 +72,6 @@ class _WorkerStub:
         # responses_handler() reads this unguarded (base_worker.py); BaseWorker
         # sets it in __init__, which this stub bypasses, so seed it to None.
         self.frontend_result_queues = None
-
-        # Echoed straight back so __call__'s filter is a no-op.
-        def _engine_response_callback(r):
-            return r
-
-        self._engine_response_callback = _engine_response_callback
 
     def return_queue(self, client_id: int):
         return self._results[client_id].queue

@@ -110,6 +110,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     WFP4A16FusedMoEMethod,
     WInt4AFP8FusedMoEMethod,
 )
+from tensorrt_llm._torch.nccl_window_tensor_scope import nccl_window_tensor_scope
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import get_sm_version, mpi_comm, mpi_rank
 from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
@@ -673,6 +674,8 @@ def _test_moe_worker_impl(
         )
 
         with (
+            # Standalone outputs remain live through reference and accuracy checks.
+            nccl_window_tensor_scope(x),
             moe_load_balancer,
             create_moe(
                 routing_method=routing_method,
@@ -2038,16 +2041,12 @@ def _get_fused_moe_method_class(quant_algo, backend_type):
         return None
 
     # CUTLASS backend
-    # Mapping based on CutlassFusedMoE._get_quant_method() logic
+    # What each CUTLASS leaf's _get_quant_method() returns, for the formats
+    # this test sweeps.
     if backend_str == "CUTLASS":
-        DSFP8BlockScalesFusedMoEMethod = (
-            DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm
-            if get_sm_version() == 120
-            else DeepSeekFP8BlockScalesFusedMoEMethod
-        )
         method_map = {
             QuantAlgo.FP8: FP8QDQFusedMoEMethod,
-            QuantAlgo.FP8_BLOCK_SCALES: DSFP8BlockScalesFusedMoEMethod,
+            QuantAlgo.FP8_BLOCK_SCALES: DeepSeekFP8BlockScalesFusedMoEMethod,
             QuantAlgo.NVFP4: NVFP4CutlassFusedMoEMethod,
             # W4A8_AWQ uses is_int4_weight_only_per_group() -> WInt4AFP8FusedMoEMethod
             QuantAlgo.W4A8_AWQ: WInt4AFP8FusedMoEMethod,

@@ -25,6 +25,101 @@ DISAGG_CONFIG_MODES = DISAGG_BENCHMARK_MODES + AGGREGATED_DISAGG_YAML_MODES
 GEN_ONLY_MODES = ("gen_only", GEN_ONLY_NO_CONTEXT_MODE)
 
 
+def dwdp_ctx_size(config):
+    """DWDP group size of the context side, or 0 when the case does not use DWDP.
+
+    A DWDP context side is ``num_ctx_servers`` single-GPU instances that share
+    expert weights. They must be ranks of one MPI world, which a separate srun
+    per context server cannot provide, so launch scripts start them as one MPI
+    step instead.
+
+    Args:
+        config: The parsed disaggregated config YAML.
+
+    Returns:
+        int: ``worker_config.ctx.dwdp_config.dwdp_size`` if it is > 1, else 0.
+
+    Raises:
+        ValueError: If the DWDP context side is not a set of single-GPU
+            instances that exactly fill ``num_groups`` DWDP groups.
+    """
+    worker_config = (config or {}).get("worker_config", {}) or {}
+    ctx_config = worker_config.get("ctx", {}) or {}
+    dwdp_config = ctx_config.get("dwdp_config") or {}
+    dwdp_size = int(dwdp_config.get("dwdp_size", 1) or 1)
+    if dwdp_size <= 1:
+        return 0
+
+    ctx_world_size = (
+        ctx_config.get("tensor_parallel_size", 1)
+        * ctx_config.get("pipeline_parallel_size", 1)
+        * ctx_config.get("context_parallel_size", 1)
+    )
+    if ctx_world_size != 1:
+        raise ValueError(
+            "DWDP context servers must each run on one GPU "
+            f"(tp * pp * cp == 1), got {ctx_world_size}"
+        )
+    num_groups = int(dwdp_config.get("num_groups", 1) or 1)
+    hardware = config.get("hardware", {}) or {}
+    num_ctx_servers = hardware.get("num_ctx_servers")
+    if num_ctx_servers != dwdp_size * num_groups:
+        raise ValueError(
+            "hardware.num_ctx_servers must equal dwdp_size * num_groups "
+            f"({dwdp_size} * {num_groups}), got {num_ctx_servers}"
+        )
+    return dwdp_size
+
+
+def ctx_only_world_size(config):
+    """GPU count of the single aggregated server a ctx_only case runs.
+
+    A plain ctx side is one server of ``tp * pp * cp`` GPUs. A DWDP ctx side is
+    ``num_ctx_servers`` one-GPU servers; ctx_only folds them into one aggregated
+    server with attention DP over all of them, the layout in which DWDP shares
+    experts outside disaggregated serving (each rank stays a full replica).
+
+    Args:
+        config: The parsed disaggregated config YAML.
+
+    Returns:
+        int: The ctx_only server's world size.
+    """
+    if dwdp_ctx_size(config):
+        return config["hardware"]["num_ctx_servers"]
+    ctx_config = ((config or {}).get("worker_config", {}) or {}).get("ctx", {}) or {}
+    return (
+        ctx_config.get("tensor_parallel_size", 1)
+        * ctx_config.get("pipeline_parallel_size", 1)
+        * ctx_config.get("context_parallel_size", 1)
+    )
+
+
+def dwdp_ctx_layout(config):
+    """Node layout of a DWDP context side: one world rank per context server.
+
+    Args:
+        config: The parsed disaggregated config YAML.
+
+    Returns:
+        tuple: ``(num_ctx_ranks, ctx_nodes, ranks_per_node)``.
+
+    Raises:
+        ValueError: If the context ranks do not fill whole nodes, or the case
+            does not use DWDP.
+    """
+    if not dwdp_ctx_size(config):
+        raise ValueError("dwdp_ctx_layout() requires a DWDP context side")
+    num_ctx_ranks = config["hardware"]["num_ctx_servers"]
+    gpus_per_node = config["hardware"]["gpus_per_node"]
+    if num_ctx_ranks % gpus_per_node:
+        raise ValueError(
+            "DWDP context ranks must fill whole nodes: num_ctx_servers "
+            f"({num_ctx_ranks}) is not a multiple of gpus_per_node ({gpus_per_node})"
+        )
+    return num_ctx_ranks, num_ctx_ranks // gpus_per_node, gpus_per_node
+
+
 def is_gen_only_no_context(benchmark_mode, config):
     """Return True when this case must run with zero context workers.
 

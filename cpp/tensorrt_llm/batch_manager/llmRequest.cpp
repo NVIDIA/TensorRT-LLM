@@ -21,6 +21,15 @@
 namespace tensorrt_llm::batch_manager
 {
 
+namespace
+{
+template <typename T>
+std::optional<T> copyOptionalInput(std::optional<std::shared_ptr<T>> const& input)
+{
+    return input && *input ? std::make_optional(**input) : std::nullopt;
+}
+} // namespace
+
 // Single, process-global storage for the steady-clock offset. Keeping it in this
 // translation unit (rather than as an inline-static member reachable from every
 // shared object) guarantees that libtensorrt_llm.so and the nanobind extension
@@ -52,10 +61,9 @@ runtime::SizeType32 GenericLlmRequest<TTensor>::getBeamWidthByIter(bool const fo
 
 template class GenericLlmRequest<runtime::ITensor::SharedPtr>;
 
-void LlmRequest::createSerializedResult(
-    std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits, int32_t mpiWorldRank)
+void LlmRequest::createSerializedResult(std::vector<char>& serializedResult, bool& isFinal)
 {
-    auto result = createResult(useFastLogits, mpiWorldRank);
+    auto result = createResult();
     if (result.has_value())
     {
         std::ostringstream oStream;
@@ -68,7 +76,7 @@ void LlmRequest::createSerializedResult(
 }
 
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
-std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
+std::optional<executor::Result> LlmRequest::createResult()
 {
     auto const streamingInProgress = mIsStreaming
         && (mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE);
@@ -151,43 +159,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     auto sliceBeams = [&nbBeams](auto beams)
     { return std::vector<typename decltype(beams)::value_type>(beams.begin(), beams.begin() + nbBeams); };
 
-    if (returnLogProbs())
-    {
-        result.cumLogProbs = sliceBeams(getCumLogProbs());
-        result.logProbs = sliceBeams(getLogProbs());
-    }
-
-    if (getReturnContextLogits())
-    {
-        result.contextLogits = executor::detail::ofITensor(getContextLogitsHost());
-    }
-
-    if (getReturnGenerationLogits())
-    {
-        bool hasDraftTokens = mDraftTokens && !mDraftTokens->empty();
-        if (isStreaming() && !hasDraftTokens)
-        {
-            auto startGenTokenPos = startTokenPos - getOrigPromptLen();
-            TensorPtr generationLogitsHostCurrentStep
-                = runtime::ITensor::slice(getGenerationLogitsHost(), startGenTokenPos, maxNbTokensOut);
-            result.generationLogits = executor::detail::ofITensor(generationLogitsHostCurrentStep);
-        }
-        else if (useFastLogits)
-        {
-            result.specDecFastLogitsInfo = executor::SpeculativeDecodingFastLogitsInfo{mRequestId, mpiWorldRank};
-        }
-        else
-        {
-            result.generationLogits
-                = executor::detail::ofITensor(runtime::ITensor::slice(getGenerationLogitsHost(), 0, nbBeams));
-        }
-    }
-
-    if (getReturnEncoderOutput())
-    {
-        result.encoderOutput = executor::detail::ofITensor(getEncoderOutputHost());
-    }
-
     if (getReturnPerfMetrics())
     {
         mPerfMetrics.kvCacheMetrics.kvCacheHitRate = getKVCacheHitRatePerRequest();
@@ -205,22 +176,6 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
     result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
-
-    if (hasAdditionalOutputs())
-    {
-        std::string prefix = "context_";
-        for (auto const& outputTensorMap : {mAdditionalContextOutputTensors, mAdditionalGenerationOutputTensors})
-        {
-            for (auto const& outputTensor : outputTensorMap)
-            {
-                TLLM_LOG_DEBUG("Adding tensor %s with shape %s to result.", outputTensor.first.c_str(),
-                    runtime::ITensor::toString(outputTensor.second->getShape()).c_str());
-                result.additionalOutputs.emplace_back(
-                    prefix + outputTensor.first, executor::detail::ofITensor(outputTensor.second));
-            }
-            prefix = "generation_";
-        }
-    }
 
     // Update position of last sent response
     setMaxSentTokenLen(maxNbTokens);
@@ -242,17 +197,9 @@ bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
         tokens.begin(), tokens.end(), [&vocabSize](auto const& token) { return token >= 0 && token < vocabSize; });
 }
 
-void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
-    std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
+void LlmRequest::validate(
+    SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, bool /*enableKVCacheReuse*/)
 {
-    if (getEncoderInputFeatures()
-        && getEncoderInputFeatures()->getShape().nbDims < 4) // skip encoder shape validation for image inputs
-    {
-        TLLM_CHECK_WITH_INFO(!(maxEncoderInputLen.has_value() && getEncoderInputLen() > maxEncoderInputLen.value()),
-            "Encoder length (%d) exceeds maximum encoder input length (%d).", getEncoderInputLen(),
-            maxEncoderInputLen.value());
-    }
-
     if (mPromptLen > maxInputLen)
     {
         TLLM_THROW(
@@ -297,46 +244,67 @@ void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, Siz
             mPromptLen, mMaxNewTokens, draftLenPerEngineStep, maxSequenceLen, maxNewTokens);
         mMaxNewTokens = maxNewTokens;
     }
+}
 
-    // validate extra ids when enabling kv cache reuse with prompt table
-    if (enableKVCacheReuse && mPromptEmbeddingTable.has_value() && mPromptVocabSize.has_value())
+LlmRequest::LlmRequest(LlmRequest const& parent, RequestIdType requestId)
+    : LlmRequest(requestId, parent.mMaxNewTokens, parent.mTokens.at(0), parent.mSamplingConfig, parent.mIsStreaming,
+        copyOptionalInput(parent.mMultimodalHashes), copyOptionalInput(parent.mMultimodalPositions),
+        copyOptionalInput(parent.mMultimodalLengths), copyOptionalInput(parent.mMultimodalUuids), parent.mLoraTaskId,
+        parent.mLoraWeights, parent.mLoraConfig, parent.mKvCacheRetentionConfig,
+        parent.mDraftTokens ? *parent.mDraftTokens : VecTokens{}, parent.mExcludeInputFromOutput,
+        copyOptionalInput(parent.mEncoderTokens), parent.mPriority, parent.mEncoderInputLength,
+        parent.mEncoderOutputLength, parent.mLlmRequestType, copyOptionalInput(parent.mInputTokenExtraIds),
+        parent.mReturnPerfMetrics, parent.mContextPhaseParams,
+        parent.mReturnPerfMetrics ? std::make_optional(parent.mPerfMetrics.timingMetrics.arrivalTime) : std::nullopt,
+        parent.mAgentHierarchy, copyOptionalInput(parent.mMultimodalItemRunCuOffsets),
+        copyOptionalInput(parent.mMultimodalRunPositions), copyOptionalInput(parent.mMultimodalRunLengths),
+        parent.mCacheSalt)
+{
+    TLLM_CHECK_WITH_INFO(!parent.isChild(), "A child request cannot create its own child.");
+    TLLM_CHECK_WITH_INFO(parent.mChildRequests.size() + 1 < static_cast<size_t>(parent.getNumSubRequests()),
+        "Cannot create child requests more than the number of return sequences (%d)", parent.getNumSubRequests());
+    TLLM_CHECK_WITH_INFO(parent.mDecodingIter == 0 && parent.mContextCurrentPositionTarget == 0
+            && parent.mContextCurrentPositionDraft == 0 && parent.mPromptLen == parent.mOrigPromptLen
+            && parent.mTokens.at(0).size() == static_cast<size_t>(parent.mOrigPromptLen)
+            && (parent.mState == LlmRequestState::kCONTEXT_INIT || parent.mState == LlmRequestState::kENCODER_INIT
+                || parent.mState == LlmRequestState::kDISAGG_GENERATION_INIT),
+        "Children must be constructed before request execution.");
+    mSequenceIndex = static_cast<SizeType32>(parent.mChildRequests.size() + 1);
+    mParentRequestId = parent.mRequestId;
+    mSequenceFinalVec = parent.mSequenceFinalVec;
+    mReturnAllGeneratedTokens = parent.mReturnAllGeneratedTokens;
+    mIsDummyRequest = parent.mIsDummyRequest;
+    mUseDraftModel = parent.mUseDraftModel;
+
+    // Tensor inputs are shared read-only; mutable vector inputs have independent storage.
+    using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
+    mSamplingConfig.setSeed(
+        parent.mSamplingConfig.getSeed().value_or(RandomSeedType{0}) + static_cast<RandomSeedType>(mSequenceIndex));
+}
+
+void LlmRequest::registerChildRequest(std::shared_ptr<LlmRequest> const& child)
+{
+    TLLM_CHECK_WITH_INFO(child && child->isChild() && child->mParentRequestId == mRequestId
+            && child->mSequenceFinalVec == mSequenceFinalVec
+            && child->mSequenceIndex == static_cast<SizeType32>(mChildRequests.size() + 1)
+            && mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()) && !isChild(),
+        "Child does not belong to the next available sequence of this parent.");
+    TLLM_CHECK_WITH_INFO(child->mRequestId != mRequestId
+            && std::none_of(mChildRequests.begin(), mChildRequests.end(),
+                [&child](auto const& existing) { return existing->mRequestId == child->mRequestId; }),
+        "Child request ID must be unique within its sequence group.");
+    mChildRequests.push_back(child);
+    if (!mSamplingConfig.getSeed().has_value())
     {
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.has_value() && mInputTokenExtraIds.value(),
-            "Input token extra ids must be provided when enabling kv cache reuse with prompt table");
-        TLLM_CHECK_WITH_INFO(mInputTokenExtraIds.value()->size() == static_cast<size_t>(mOrigPromptLen),
-            "inputTokenExtraIds vector size (%lu) must be the same as input token vector size (%lu).",
-            mInputTokenExtraIds.value()->size(), static_cast<size_t>(mOrigPromptLen));
+        mSamplingConfig.setSeed(executor::RandomSeedType{0});
     }
 }
 
 std::shared_ptr<LlmRequest> LlmRequest::createChildRequest(RequestIdType requestId)
 {
-    TLLM_CHECK_WITH_INFO(!isChild(), "A child request cannot create its own child.");
-    TLLM_CHECK_WITH_INFO(mChildRequests.size() + 1 < static_cast<size_t>(getNumSubRequests()),
-        "Cannot create child requests more than the number of return sequences (%d)", getNumSubRequests());
-    auto childReq = std::make_shared<LlmRequest>(*this);
-    childReq->mRequestId = requestId;
-    childReq->mSequenceIndex = mChildRequests.size() + 1;
-    childReq->mParentRequestId = this->mRequestId;
-    childReq->mSequenceFinalVec = this->mSequenceFinalVec;
-    childReq->mSeqSlot.reset();
-
-    // To ensure different randomness across children, assign a unique random seed to each child
-    // by adding its sequence index to the base seed. If no seed is provided, the parent's seed defaults to 0.
-    using RandomSeedType = tensorrt_llm::executor::RandomSeedType;
-    if (auto const childSeed = childReq->mSamplingConfig.getSeed(); childSeed.has_value())
-    {
-        childReq->mSamplingConfig.setSeed(childSeed.value() + static_cast<RandomSeedType>(childReq->mSequenceIndex));
-    }
-    else
-    {
-        RandomSeedType defaultSeed{0};
-        mSamplingConfig.setSeed(defaultSeed);
-        childReq->mSamplingConfig.setSeed(defaultSeed + static_cast<RandomSeedType>(childReq->mSequenceIndex));
-    }
-
-    mChildRequests.push_back(childReq);
-    return childReq;
+    auto child = std::make_shared<LlmRequest>(*this, requestId);
+    registerChildRequest(child);
+    return child;
 }
 
 void LlmRequest::removeLoraTensors()

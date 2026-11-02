@@ -69,7 +69,7 @@ KV-cache entry and any internal FP8 staging do not indicate raw FP8 model-input
 support.
 
 See
-[`test_sparse_mla_forward.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
+[`test_sparse_mla_forward.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mla_forward.py)
 for executable sparse MLA examples.
 
 ### Sparse MQA/GQA
@@ -114,7 +114,7 @@ contract of that dedicated backend. Raw E4M3 fused QKV is not a token-sparse
 MQA/GQA input contract.
 
 Backend developers can use
-[`test_sparse_mqa_gqa.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
+[`test_sparse_mqa_gqa.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mqa_gqa.py)
 as an executable integration example.
 
 ### Sparse MHA
@@ -145,7 +145,7 @@ QKV input remains BF16 or FP16; raw E4M3 fused QKV is not supported by the
 page-sparse MHA path.
 
 Backend developers can use
-[`test_sparse_mha.py`](../../../tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
+[`test_sparse_mha.py`](source:tests/unittest/_torch/attention/sparse/test_sparse_mha.py)
 as an executable integration example.
 
 <a id="block-sparse-mha-mqa-gqa"></a>
@@ -190,7 +190,7 @@ request needs a page that holds at least one 64-token route fragment, which is
 why page sizes below `64` are rejected.
 
 Backend developers can use
-[`test_prims_ts_block_sparse.py`](../../../tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
+[`test_prims_ts_block_sparse.py`](source:tests/unittest/_torch/attention/sparse/test_prims_ts_block_sparse.py)
 as an executable integration example; it covers MHA, GQA, and MQA head
 topologies, both model dtypes, KV block sizes `64` and `128`, page sizes `64`
 and `128`, proxy routes, token-validity masks, and CUDA Graph replay.

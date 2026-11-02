@@ -1707,6 +1707,60 @@ def test_trtllm_gen_moe_dummy_topk_local_experts_less_than_topk(
         assert all(0 <= x < num_experts for x in row), row
 
 
+def test_fp4_moe_tunes_on_dummy_topk_and_runs_on_runtime_topk(monkeypatch):
+    """With precomputed top-k (attention DP), the tuner gets the local-shard dummy top-k and the
+    kernel the runtime top-k: restoring the runtime tensors must not reach the tuner's inputs."""
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import \
+        FP4BlockScaleMoERunner
+
+    seen = {}
+
+    def fake_choose_one(self, custom_op, runners, tuning_config, inputs,
+                        **kwargs):
+        seen["tuner"] = list(inputs)
+        return runners[0], -1
+
+    def fake_forward(self, inputs, tactic, output=None, prerouted=None):
+        seen["kernel"] = list(inputs)
+        return [torch.zeros(1, device="cuda")]
+
+    monkeypatch.setattr(AutoTuner, "choose_one", fake_choose_one)
+    monkeypatch.setattr(FP4BlockScaleMoERunner, "forward", fake_forward)
+    num_tokens, top_k = 8, 4
+    num_experts, local_num_experts, local_expert_offset = 32, 8, 8
+    hidden_states = torch.zeros(num_tokens,
+                                64,
+                                dtype=torch.uint8,
+                                device="cuda")
+    # Expert 0 lies outside this rank's shard; the dummy never picks it.
+    topk_ids = torch.zeros(num_tokens, top_k, dtype=torch.int32, device="cuda")
+    topk_weights = torch.ones(num_tokens,
+                              top_k,
+                              dtype=torch.bfloat16,
+                              device="cuda")
+    # Weights, scales and biases: the op only passes them on.
+    passthrough = [torch.zeros(1, device="cuda")] * 13
+    scalars = (num_experts, top_k, None, None, 128, local_expert_offset,
+               local_num_experts, None, 1, True)
+
+    with autotune():
+        torch.ops.trtllm.fp4_block_scale_moe_runner(None,
+                                                    None,
+                                                    hidden_states,
+                                                    *passthrough,
+                                                    *scalars,
+                                                    topk_weights=topk_weights,
+                                                    topk_ids=topk_ids,
+                                                    use_dp=True)
+
+    tuner_ids = seen["tuner"][-1]
+    assert tuner_ids is not topk_ids and seen["tuner"][0] is None
+    assert ((tuner_ids >= local_expert_offset) &
+            (tuner_ids < local_expert_offset + local_num_experts)).all()
+    assert seen["kernel"][-1] is topk_ids
+    assert seen["kernel"][-2] is topk_weights
+
+
 def test_post_tune_merge_tactics_min_time_and_subset_kept():
     tuner = autotuner.AutoTuner()
     tuner.mapping = Mapping(world_size=2, rank=0, tp_size=2)
@@ -1743,6 +1797,52 @@ def test_post_tune_merge_tactics_single_rank_noop():
     tuner.profiling_cache.cache = dict(original)
     tuner.post_tune_merge_tactics()
     assert tuner.profiling_cache.cache == original
+
+
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 4), (2, 2)])
+def test_parallel_tactics_split_across_helix_cp_ranks(tp_size, cp_size):
+    """Helix CP ranks share the PARALLEL tactic sweep with the TP ranks."""
+    from tensorrt_llm.mapping import CpType
+
+    world_size = tp_size * cp_size
+    tactics = list(range(11))
+    shares = []
+    for rank in range(world_size):
+        tuner = autotuner.AutoTuner()
+        mapping = Mapping(world_size=world_size,
+                          rank=rank,
+                          tp_size=tp_size,
+                          cp_size=cp_size,
+                          cp_config={"cp_type": CpType.HELIX})
+        tuner.setup_distributed_state(mapping, dist=object())
+        assert tuner._is_distributed()
+        assert tuner._tuning_group() == (world_size, rank)
+        shares.append(
+            tuner._maybe_parallelize_tactics(
+                tactics, DistributedTuningStrategy.PARALLEL))
+        assert tuner._maybe_parallelize_tactics(
+            tactics, DistributedTuningStrategy.MERGE) == tactics
+
+    # Every tactic is tuned on exactly one rank.
+    assert sorted(t for share in shares for t in share) == tactics
+
+
+def test_parallel_tactics_split_skips_non_helix_cp_ranks():
+    """Non-Helix CP keeps the TP-only tuning group."""
+    from tensorrt_llm.mapping import CpType
+
+    tuner = autotuner.AutoTuner()
+    mapping = Mapping(world_size=4,
+                      rank=3,
+                      tp_size=1,
+                      cp_size=4,
+                      cp_config={"cp_type": CpType.ULYSSES})
+    tuner.setup_distributed_state(mapping, dist=object())
+    assert tuner._tuning_group() == (1, 0)
+    assert not tuner._is_distributed()
+    tactics = list(range(5))
+    assert tuner._maybe_parallelize_tactics(
+        tactics, DistributedTuningStrategy.PARALLEL) == tactics
 
 
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
