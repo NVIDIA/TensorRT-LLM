@@ -19,9 +19,8 @@ Contract under test (see the host module docstring): batch-uniform host-int
 row stride, output = exact (tie-interchangeable) top-K indices of
 ``logits[:, :n_valid]`` per row.
 The production ``run_varlen`` entry additionally accepts native 16-bit logits (BF16 and
-FP16 on every family, the prefill window mode and the near-K complement
-specialization) and per-request device KV lengths, including
-CUDA graph replay.
+FP16 on every family and the near-K complement specialization) and per-request device KV
+lengths, including CUDA graph replay; ``run_prefill`` accepts them for the prefill window mode.
 
 Checks per case:
   - tie-aware exactness: the multiset of gathered output values equals the
@@ -1753,8 +1752,9 @@ def test_validate_run_ws_requires_16_byte_alignment() -> None:
 # ==== prefill: per-row [ks, ke) windows (run_prefill) ======================
 # ===========================================================================
 # Contract: Top-K of logits[r, ks:ke] in the local frame (column - ks), -1 pad,
-# identity for nv <= k. ks % 4 in {1,2,3} is exercised with poison written at
-# [ks-3, ks) and [ke, npad).
+# identity for nv <= k. Misaligned starts (ks % 4 in {1,2,3} for fp32, ks % 8 in
+# 1..7 for 16-bit logits) are exercised with poison written at [ks-7, ks) and
+# [ke, npad).
 
 
 def _prefill_reference(logits, row_starts, row_ends, top_k):
@@ -1829,7 +1829,7 @@ def _make_prefill_case(
     [:, :ncols]; outside-window columns poisoned so an over-read/frame bug is
     caught (+inf at [ks-7, ks), rotating NaN/inf/3e38/-inf elsewhere). 16-bit
     cases are the RNE conversion of the fp32 construction (3e38 -> +inf in fp16,
-    the finite 2.99e38 in bf16)."""
+    the finite 3.004e38 in bf16)."""
     gen = torch.Generator(device=_DEV).manual_seed(seed)
     stride = ((ncols + 256 + 255) // 256) * 256
     if dist == "randn":
@@ -1839,13 +1839,13 @@ def _make_prefill_case(
     elif dist == "twoval":
         full = torch.randint(0, 2, (rows, stride), generator=gen, device=_DEV).float()
     elif dist == "subnormal":
-        # fp16 subnormal band 2^-24 .. 2^-14 with random signs (I1): the K-th lands inside it
+        # fp16 subnormal band 2^-24 .. 2^-14 with random signs: the K-th lands inside it
         full = torch.exp2(torch.rand((rows, stride), generator=gen, device=_DEV) * 10.0 - 24.0)
         full = torch.where(
             torch.rand((rows, stride), generator=gen, device=_DEV) < 0.5, -full, full
         )
     elif dist == "zero_band":
-        # (0, 2^-25] casts to +-0 and (2^-25, 2^-24] to 0x0001 in fp16 (I5): the K-th lands inside
+        # (0, 2^-25] casts to +-0 and (2^-25, 2^-24] to 0x0001 in fp16: the K-th lands inside
         full = torch.rand((rows, stride), generator=gen, device=_DEV) * 2.0**-24
         full = torch.where(
             torch.rand((rows, stride), generator=gen, device=_DEV) < 0.5, -full, full
@@ -1894,7 +1894,7 @@ def test_prefill_causal_ramp(top_k, dtype):
 @pytest.mark.parametrize("top_k", [512, 2048], ids=lambda k: f"k{k}")
 def test_prefill_packed_misaligned_ks(top_k, lead, dtype):
     """Multi-request chunk: request 2 starts at ks % vector == lead (vector =
-    4 fp32 / 8 bf16 elements) with +inf poison at [ks-lead, ks). A leaked lead
+    4 fp32 / 8 16-bit elements) with +inf poison at [ks-lead, ks). A leaked lead
     lane would become top-1 (wrong)."""
     a = 300
     ks1 = ((a + 7) // 8) * 8 + lead
@@ -2070,7 +2070,7 @@ def test_prefill_guards():
 
 
 def test_prefill_fp16_exact() -> None:
-    """Stage A of the FP16 arm: the fp16 prefill engine (main family, window mode) is exact
+    """The fp16 prefill engine (main family, window mode) is exact
     across misaligned window starts, a short row, an identity row and poisoned out-of-window
     columns, and the readiness query sees the compiled engine."""
     rows, n, k = 8, 8192, 512
@@ -2235,11 +2235,12 @@ def _bf16_varlen_lengths(kv: list[int], next_n: int, compress_ratio: int, ncols:
     ]
 
 
-_LOW_DTYPES = (torch.bfloat16, torch.float16)
+_DTYPES_16BIT = (torch.bfloat16, torch.float16)
 _LOW_DTYPE_PARAMS = pytest.mark.parametrize(
-    "dtype", _LOW_DTYPES, ids=[_DTYPE_IDS[dtype] for dtype in _LOW_DTYPES]
+    "dtype", _DTYPES_16BIT, ids=[_DTYPE_IDS[dtype] for dtype in _DTYPES_16BIT]
 )
-# fp16 edge patterns of DESIGN 2.8 (each exercises a numbered invariant; valid, if unremarkable, in bf16)
+# fp16 encoding edge patterns (subnormals, zero band, signed zeros, +inf runs, the fp16 maximum);
+# bf16 runs the same rows as ordinary data
 _FP16_EDGE_PATTERNS = (
     "subnormal",
     "zero_band",
@@ -2262,11 +2263,11 @@ def _make_low_varlen_case(
     """16-bit varlen case in an arena of ``dtype`` (RNE cast of the fp32 construction): aligned
     storage offset, odd logical width (rounded up to a multiple of 8 for a single row, whose
     width is its npad), per-request windows (full row, shortened row, short path, empty).
-    Patterns: the BF16 originals (ties / infinities / crosszero) and the fp16 edge patterns --
-    subnormal band 2^-24..2^-14 with the K-th inside it (I1), zero band (0, 2^-25] -> +-0 and
-    (2^-25, 2^-24] -> 0x0001 with the K-th inside it (I5), the K-th exactly +0.0 or -0.0 (6.N6),
-    more than K elements equal to +inf (6.N7), the K-th at the fp16 maximum 65504 with fp32
-    values above it casting to +inf (I6)."""
+    Patterns: the generic ones (ties / infinities / crosszero) and the fp16 edge patterns --
+    subnormal band 2^-24..2^-14 with the K-th inside it, zero band (0, 2^-25] -> +-0 and
+    (2^-25, 2^-24] -> 0x0001 with the K-th inside it, the K-th exactly +0.0 or -0.0, more than K
+    elements equal to +inf, the K-th at the fp16 maximum 65504 with fp32 values above it casting
+    to +inf."""
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     # An aligned storage offset and an odd logical width exercise arena views.
     stride = (ncols + 255) // 256 * 256 + (256 if rows > 1 else 0)
@@ -2358,11 +2359,6 @@ def _check_low_varlen_exact(
             assert bool((output_values[row, count:] == torch.finfo(torch.float32).min).all())
 
 
-# stage-A names of the two helpers (kept for tests written against them)
-_make_bf16_varlen_case = _make_low_varlen_case
-_check_bf16_varlen_exact = _check_low_varlen_exact
-
-
 def _launcher_family(
     dtype: torch.dtype,
     logits: torch.Tensor,
@@ -2388,7 +2384,7 @@ def _launcher_family(
 
 
 _LOW_VARLEN_CASES = [
-    pytest.param(1, 65536, 2048, 1, 1, "ties", id="hybrid128"),
+    pytest.param(1, 65536, 2048, 1, 1, "ties", id="regclus_bs1_k2048"),
     pytest.param(4, 131072, 1024, 1, 4, "infinities", id="regclus_cr4"),
     pytest.param(4, 262144, 2048, 1, 1, "infinities", id="regclus_cs16"),
     pytest.param(4, 32768, 512, 4, 4, "ties", id="regclus_mtp4"),
@@ -2415,8 +2411,8 @@ def test_selfsampling_topk_varlen_16bit_exactness(
     pattern: str,
     dtype: torch.dtype,
 ) -> None:
-    """Native 16-bit paths preserve values, index validity and padded row windows (an fp16 case
-    control)."""
+    """Native 16-bit paths give the exact top-K value multiset, valid unique indices, -1 tails and
+    the FP32 values output under per-request row windows."""
     logits, kv_lens, lengths = _make_low_varlen_case(
         rows, ncols, top_k, next_n, compress_ratio, pattern, dtype
     )
@@ -2441,7 +2437,7 @@ def test_selfsampling_topk_varlen_16bit_exactness(
     "rows,ncols,top_k,compress_ratio,family",
     [
         pytest.param(128, 65536, 2048, 1, "main", id="main_dense"),
-        pytest.param(512, 8192, 512, 4, "main", id="main_v16"),
+        pytest.param(512, 16384, 512, 4, "main", id="main_v16"),
         pytest.param(64, 65536, 1024, 4, "clus", id="clus"),
         pytest.param(4, 2048, 1024, 4, None, id="reg_small"),
         pytest.param(4, 131072, 1024, 4, None, id="regclus_cr4"),
@@ -2457,7 +2453,7 @@ def test_selfsampling_topk_varlen_16bit_edge_patterns(
     pattern: str,
     dtype: torch.dtype,
 ) -> None:
-    """fp16 edge patterns (DESIGN 2.8, 6.N5-N7) on every family -- subnormal band, zero band,
+    """fp16 edge patterns on every family -- subnormal band, zero band,
     K-th exactly +-0, more than K infinities, 65504 at the K-th -- with bf16 running the same
     rows as the control."""
     logits, kv_lens, lengths = _make_low_varlen_case(
@@ -2546,18 +2542,16 @@ def _make_fp16_reg_case(
     compress_ratio: int,
     pattern: str,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """fp16 twin of ``_make_bf16_varlen_case``: an fp32 arena built per pattern and cast once
-    (RNE) to float16, so the reference is torch.topk of exactly the rows the kernel reads.
+    """fp16 register-family case with the arena layout and request windows of
+    ``_make_low_varlen_case``: an fp32 arena built per pattern and cast once (RNE) to float16, so
+    the reference is torch.topk of exactly the rows the kernel reads.
 
-    Beyond the three bf16 patterns, the fp16 ones exercise the numbered invariants of the FP16
-    design: ``narrow_band`` (one binade [-2, -1) on a 1/256 grid: the K-th sits inside the 990-code
-    bits-domain window, whole-bin emit of a tie class), ``subnormal_band`` (the first K columns hold
-    the top-K with magnitudes 2^-24 .. 1.5 * 2^-14, so the window anchored at the K-th contains
-    subnormal codes: every code16 site must take the halfword / cvt.rn path, I1), ``zero_band``
-    ((0, 2^-25] -> +-0 and (2^-25, 2^-24] -> 0x0001, I5), ``zero_kth`` (the K-th exactly +-0),
-    ``max65504`` (ties at -65504 / -65472 so the window anchor is the code next to -inf; fp32
-    magnitudes above 65504 saturate to +-inf, I6) and ``posinf_many`` (more than K elements equal
-    to +inf: the key-space escape).
+    Beyond the three generic patterns: ``narrow_band`` (one binade [-2, -1] on a 1/256 grid, so the
+    K-th sits in a large tie class), ``subnormal_band`` (the first K columns hold the top-K with
+    magnitudes 2^-24 .. 1.5 * 2^-14, so the codes around the K-th are subnormal), ``zero_band``
+    ((0, 2^-25] -> +-0 and (2^-25, 2^-24] -> 0x0001), ``zero_kth`` (the K-th exactly +-0),
+    ``max65504`` (ties at -65504 / -65472, next to -inf; fp32 magnitudes above 65504 saturate to
+    +-inf) and ``posinf_many`` (more than K elements equal to +inf: the key-space escape).
     """
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     stride = (ncols + 255) // 256 * 256 + (256 if rows > 1 else 0)
@@ -2609,9 +2603,8 @@ def _make_fp16_reg_case(
         base[1::2, 5::97] = -70000.0
         base[:, 11::131] = 70000.0
     elif pattern == "posinf_many":
-        base[:, torch.randperm(stride, generator=generator, device=_DEV)[: top_k + 7]] = float(
-            "inf"
-        )
+        many = torch.randperm(ncols, generator=generator, device=_DEV)[: top_k + 7]
+        base[:, many] = float("inf")
     else:
         raise ValueError(f"unknown fp16 test pattern: {pattern}")
     arena.copy_(base)
@@ -2621,6 +2614,9 @@ def _make_fp16_reg_case(
     lengths = _bf16_varlen_lengths(kv, next_n, compress_ratio, ncols)
     for row, valid in enumerate(lengths):
         arena[row, valid:] = float("inf")
+    if pattern == "posinf_many":
+        # the edge case is present: more than K +inf inside row 0's window
+        assert int(torch.isposinf(logits[0, : lengths[0]]).sum()) > top_k
     return logits, torch.tensor(kv, dtype=torch.int32, device=_DEV), lengths
 
 
@@ -2637,11 +2633,10 @@ def _make_fp16_reg_case(
 def test_selfsampling_topk_varlen_fp16_reg_exactness(
     rows: int, ncols: int, top_k: int, next_n: int, compress_ratio: int, pattern: str
 ) -> None:
-    """Native FP16 on the register family: the four register-routed shapes of the
-    bf16 exactness set (bits-domain DEG window with and without the live packed words, bin
-    proof, regimg, eager prefetch) under the bf16 patterns and the fp16 invariant patterns;
-    tie-aware exact values, valid unique indices, -1 tails and the FP32 values output, with the
-    register family asserted on the fp16 launcher cache."""
+    """Native FP16 on the register family under default routing (which sends most of these shapes
+    to the code-radix kernels): the four register-routed shapes of the 16-bit exactness set under
+    the generic and the fp16 edge patterns; tie-aware exact values, valid unique indices, -1 tails
+    and the FP32 values output, with the register family asserted on the fp16 launcher cache."""
     logits, kv_lens, lengths = _make_fp16_reg_case(
         rows, ncols, top_k, next_n, compress_ratio, pattern
     )
@@ -2664,20 +2659,20 @@ def test_selfsampling_topk_varlen_fp16_reg_exactness(
         if key[:6] == (rows, npad, top_k, ncols, next_n, compress_ratio)
     }
     assert set(families.values()) == {"reg"}, families
-    _check_bf16_varlen_exact(logits, indices, lengths, values)
+    _check_low_varlen_exact(logits, indices, lengths, values)
 
 
 _FP16_REGCLUS_SHAPES = [
-    pytest.param(1, 65536, 2048, 1, 1, id="hybrid128"),
+    pytest.param(1, 65536, 2048, 1, 1, id="regclus_bs1_k2048"),
     pytest.param(4, 131072, 1024, 1, 4, id="regclus_cr4"),
     pytest.param(4, 262144, 2048, 1, 1, id="regclus_cs16"),
     pytest.param(4, 32768, 512, 4, 4, id="regclus_mtp4"),
-    # fp16 fkey16 window (stage B5) on the K=2048 geometries the bf16 window never ran (VPT == 1):
-    # cs 2 / cs 4 / cs 8 single-vector builds and an MTP row set; the window either hits (whole-bin
-    # emit of the K-th code) or misses into the linear rebuild, both tie-aware exact
-    pytest.param(2, 16400, 2048, 1, 1, id="window_cs2"),
-    pytest.param(4, 32768, 2048, 1, 1, id="window_cs4"),
-    pytest.param(2, 65551, 2048, 1, 1, id="window_cs8_odd"),
+    # fp16 window on single-vector (VPT == 1) K=2048 builds at N = 16K, 32K and 64K (odd width) and
+    # an MTP row set; the window either hits (whole-bin emit of the K-th code) or misses into the
+    # linear rebuild, both tie-aware exact
+    pytest.param(2, 16400, 2048, 1, 1, id="window_n16k"),
+    pytest.param(4, 32768, 2048, 1, 1, id="window_n32k"),
+    pytest.param(2, 65551, 2048, 1, 1, id="window_n64k_odd"),
     pytest.param(4, 32768, 2048, 4, 1, id="window_mtp4"),
 ]
 _FP16_PATTERNS = (
@@ -2750,7 +2745,7 @@ def test_selfsampling_topk_fp16_dense_window_geometry() -> None:
         pytest.param(16, 262144, 2048, id="split"),
         pytest.param(128, 65536, 2048, id="blk1024"),
         pytest.param(1024, 65551, 2048, id="blk256_packed_idx"),
-        pytest.param(512, 16399, 2048, id="v16"),
+        pytest.param(512, 24591, 2048, id="v16"),
     ],
 )
 def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
@@ -2782,7 +2777,50 @@ def test_selfsampling_topk_varlen_fp16_dense_window_exactness(
     torch.cuda.synchronize()
     key = _varlen_cache_key(rows, stride, top_k, ncols, 1, 1, torch.cuda.current_device())
     assert ss_host._VARLEN_CACHE_FP16[key][0] == "main"
-    _check_bf16_varlen_exact(logits, indices, lengths, values)
+    _check_low_varlen_exact(logits, indices, lengths, values)
+
+
+@_LOW_DTYPE_PARAMS
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,compress_ratio",
+    [
+        pytest.param(64, 32783, 2048, 1, id="regclus_k2048"),
+        pytest.param(16, 163775, 2048, 1, id="clus_k2048"),
+        pytest.param(64, 65536, 1024, 4, id="clus_k1024"),
+        pytest.param(512, 16384, 512, 4, id="main_v16"),
+        pytest.param(8, 8195, 512, 1, id="reg"),
+        pytest.param(2, 32783, 2048, 1, id="bs2_k2048"),
+    ],
+)
+def test_selfsampling_topk_varlen_16bit_near_k_rows(
+    rows: int, ncols: int, top_k: int, compress_ratio: int, dtype: torch.dtype
+) -> None:
+    """Rows of K+3, K+2, K+1, K and K-3 valid elements next to full and empty rows, on half-integer
+    data with ties at every K-th: the K-th of a near-K row sits at the row minimum, outside the
+    sampled window, and short rows wider than one CTA still get the identity + (-1) tail."""
+    generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
+    stride = (ncols + 63) // 64 * 64
+    arena = (torch.randn((rows, stride), generator=generator, device=_DEV) * 6).round() / 2
+    arena = arena.to(dtype)
+    pattern = [ncols, top_k + 3, top_k + 2, top_k + 1, top_k, top_k - 3, 0, ncols - 7]
+    kv = [pattern[row % len(pattern)] * compress_ratio for row in range(rows)]
+    lengths = _bf16_varlen_lengths(kv, 1, compress_ratio, ncols)
+    for row, valid in enumerate(lengths):
+        arena[row, valid:] = float("inf")
+    logits = arena[:, :ncols]
+    kv_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    indices = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    values = torch.full((rows, top_k + 13), 7.0, dtype=torch.float32, device=_DEV)
+    ss_host.run_varlen(
+        logits,
+        kv_lens,
+        indices,
+        compress_ratio=compress_ratio,
+        values=values,
+        max_seq_len=ncols * compress_ratio,
+    )
+    torch.cuda.synchronize()
+    _check_low_varlen_exact(logits, indices, lengths, values)
 
 
 def _make_fp16_varlen_case(
@@ -2793,12 +2831,12 @@ def _make_fp16_varlen_case(
     compress_ratio: int,
     pattern: str,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int]]:
-    """fp16 twin of ``_make_bf16_varlen_case`` (same arena layout and KV pattern) with the fp16 patterns
-    of DESIGN 2.8: ``subnormal`` = magnitudes 2^-24 .. 2^-14 around the K-th (I1 on every code16 site),
-    ``zero_kth`` = more than K signed zeros so the K-th is exactly +-0 (6.N6), ``large`` = values near
-    65504 with ties at 65504 and fp32 values above it saturating to +inf (I6), ``zero_band`` = elements in
-    (0, 2^-24] that cast to +-0 or 0x0001 (I5), ``posinf_many`` = more than K elements equal to +inf
-    (6.N7).  The fp32 construction is cast once (RNE) and the reference is the cast tensor."""
+    """fp16 reg_clus case (same arena layout and KV pattern as ``_make_low_varlen_case``) with the
+    fp16 patterns: ``subnormal`` = magnitudes 2^-24 .. 2^-14 around the K-th, ``zero_kth`` = more
+    than K signed zeros so the K-th is exactly +-0, ``large`` = values near 65504 with ties at 65504
+    and fp32 values above it saturating to +inf, ``zero_band`` = elements in (0, 2^-24] that cast to
+    +-0 or 0x0001, ``posinf_many`` = more than K elements equal to +inf. The fp32 construction is
+    cast once (RNE) and the reference is the cast tensor."""
     generator = torch.Generator(device=_DEV).manual_seed(rows + ncols + top_k)
     stride = (ncols + 255) // 256 * 256 + (256 if rows > 1 else 0)
     offset = 8
@@ -2839,9 +2877,8 @@ def _make_fp16_varlen_case(
         base[:, band] *= signs
     elif pattern == "posinf_many":
         base = base * 1.5 - 3.5
-        base[:, torch.randperm(stride, generator=generator, device=_DEV)[: top_k + 7]] = float(
-            "inf"
-        )
+        many = torch.randperm(ncols, generator=generator, device=_DEV)[: top_k + 7]
+        base[:, many] = float("inf")
     else:
         raise ValueError(f"unknown fp16 test pattern: {pattern}")
     arena.copy_(base)
@@ -2851,6 +2888,9 @@ def _make_fp16_varlen_case(
     lengths = _bf16_varlen_lengths(kv, next_n, compress_ratio, ncols)
     for row, valid in enumerate(lengths):
         arena[row, valid:] = float("inf")
+    if pattern == "posinf_many":
+        # the edge case is present: more than K +inf inside row 0's window
+        assert int(torch.isposinf(logits[0, : lengths[0]]).sum()) > top_k
     return logits, torch.tensor(kv, dtype=torch.int32, device=_DEV), lengths
 
 
@@ -2865,12 +2905,12 @@ def test_selfsampling_topk_varlen_fp16_regclus_exactness(
     pattern: str,
     monkeypatch,
 ) -> None:
-    """Native FP16 on the clustered register family: the four bf16 reg_clus routes
-    (hybrid128 = dense-key hybrid walk, cr4, cs16 = bits-domain window, mtp4) stay on reg_clus and are
-    tie-aware exact on the bf16 patterns and the fp16-specific ones, with the FP32 values output.  The
-    K=2048 shapes run the fp16 fkey16 window (stage B5: sampled-anchor single-code bins, 1024 bins);
-    fp16 takes no hybrid plan, so hybrid128 is a window build too. The FP16 code-radix routes (which take
-    some of these shapes in production) are switched off so the reg_clus kernel stays under test."""
+    """Native FP16 on the clustered register family: the reg_clus shapes (BS 1 at K=2048, cr4, cs16,
+    mtp4 and the single-vector window builds) stay on reg_clus and are tie-aware exact on the generic
+    and the fp16-specific patterns, with the FP32 values output. The K=2048 shapes run the fp16
+    bits-domain window anchored at the sampled K-th (single-code bins). The FP16 code-radix routes
+    (which take some of these shapes in production) are switched off so the reg_clus kernel stays
+    under test."""
     monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_16BIT", False)
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
     logits, kv_lens, lengths = _make_fp16_varlen_case(
@@ -2893,7 +2933,7 @@ def test_selfsampling_topk_varlen_fp16_regclus_exactness(
         rows, npad, top_k, ncols, next_n, compress_ratio, torch.cuda.current_device()
     )
     assert ss_host._VARLEN_CACHE_FP16[key][0] == "reg_clus"
-    _check_bf16_varlen_exact(logits, indices, lengths, values)
+    _check_low_varlen_exact(logits, indices, lengths, values)
 
 
 @_LOW_DTYPE_PARAMS
@@ -2948,13 +2988,14 @@ def test_selfsampling_topk_varlen_16bit_complement_patterns(
     _check_low_varlen_exact(logits, indices, lengths)
 
 
-# stage B6: register plans of both 16-bit dtypes under the code-radix kernel (`kern_cr`) and, with the
-# host switch forced off, under the bracket kernel; eager / DEG, regimg, binproof geometry, pk16,
-# BLK-256 remap and staged-output (rows > SMs) plans with short, shortened and empty request windows
-_B6_RADIX_PATTERNS = ("ties", "infinities", "subnormal", "zero_kth_neg", "fp16max")
-_B6_RADIX_CASES = [
+# Register plans of both 16-bit dtypes under the code-radix kernel (`kern_cr`; some FP16 plans take
+# its cluster variant) and, with the host switch forced off, under the bracket kernel: eager / DEG,
+# odd-width MTP, bin-proof, pk16, BLK-256 remap and staged-output (rows > SMs) plans with short,
+# shortened and empty request windows
+_REG_CODE_RADIX_PATTERNS = ("ties", "infinities", "subnormal", "zero_kth_neg", "fp16max")
+_REG_CODE_RADIX_CASES = [
     pytest.param(4, 2048, 1024, 1, 4, id="reg_small"),
-    pytest.param(8, 4099, 512, 4, 4, id="regimg_odd_width"),
+    pytest.param(8, 4099, 512, 4, 4, id="reg_odd_width"),
     pytest.param(4, 8192, 2048, 4, 1, id="reg_mtp4_k2048"),
     pytest.param(1, 8195, 1024, 1, 4, id="reg_8k_bs1"),
     pytest.param(32, 16387, 1024, 1, 4, id="reg_16k_pk16"),
@@ -2985,14 +3026,10 @@ def _launcher_entry(
     return ss_host._varlen_cache_for(dtype)[key]
 
 
-# position of `bool(code_radix)` in get_compiled__reg's cache key (tagged FP16 fields follow the fixed ones)
-_REG_KEY_CODE_RADIX = 21
-
-
 @_LOW_DTYPE_PARAMS
 @pytest.mark.parametrize("code_radix", (True, False), ids=("radix", "bracket"))
-@pytest.mark.parametrize("pattern", _B6_RADIX_PATTERNS)
-@pytest.mark.parametrize("rows,ncols,top_k,next_n,compress_ratio", _B6_RADIX_CASES)
+@pytest.mark.parametrize("pattern", _REG_CODE_RADIX_PATTERNS)
+@pytest.mark.parametrize("rows,ncols,top_k,next_n,compress_ratio", _REG_CODE_RADIX_CASES)
 def test_selfsampling_topk_varlen_16bit_reg_code_radix(
     rows: int,
     ncols: int,
@@ -3011,6 +3048,16 @@ def test_selfsampling_topk_varlen_16bit_reg_code_radix(
     monkeypatch.setattr(ss_host, "_REG_CODE_RADIX_FORCE", code_radix)
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_BF16", {})
     monkeypatch.setattr(ss_host, "_VARLEN_CACHE_FP16", {})
+    device = ss_host._device()
+    get_compiled_reg = device.get_compiled__reg
+    reg_requests = []  # (compiled kernel, requested code_radix) per register compile request
+
+    def record_reg_request(*args: object, **kwargs: object) -> object:
+        compiled = get_compiled_reg(*args, **kwargs)
+        reg_requests.append((compiled, bool(kwargs.get("code_radix", False))))
+        return compiled
+
+    monkeypatch.setattr(device, "get_compiled__reg", record_reg_request)
     logits, kv_lens, lengths = _make_low_varlen_case(
         rows, ncols, top_k, next_n, compress_ratio, pattern, dtype
     )
@@ -3027,13 +3074,9 @@ def test_selfsampling_topk_varlen_16bit_reg_code_radix(
     )
     torch.cuda.synchronize()
     family, compiled = _launcher_entry(dtype, logits, top_k, ncols, next_n, compress_ratio)[:2]
-    assert family in ("reg", "regimg"), family
-    # the launcher's compiled register kernel carries the requested mode (code_radix field of its cache key)
-    modes = {
-        key[_REG_KEY_CODE_RADIX]
-        for key, fn in ss_host._device()._COMPILE_CACHE__reg.items()
-        if fn is compiled
-    }
+    assert family == "reg", family
+    # the launcher's register kernel was requested in the forced mode
+    modes = {mode for fn, mode in reg_requests if fn is compiled}
     assert modes == {code_radix}, modes
     _check_low_varlen_exact(logits, indices, lengths, values)
 
@@ -3063,7 +3106,7 @@ def test_selfsampling_topk_varlen_bf16_unpadded_single_row(pattern: str, monkeyp
     [
         pytest.param(8, 8195, 512, 4, 4, id="reg_mtp4"),
         pytest.param(4, 32768, 1024, 1, 4, id="regclus"),
-        pytest.param(1, 65536, 2048, 1, 1, id="hybrid128"),
+        pytest.param(1, 65536, 2048, 1, 1, id="regclus_bs1_k2048"),
         pytest.param(16, 262144, 2048, 1, 1, id="main_split"),
         pytest.param(4, 1027, 1024, 1, 4, id="complement"),
     ],
@@ -3129,8 +3172,33 @@ def test_selfsampling_topk_varlen_16bit_layout_guards(dtype: torch.dtype) -> Non
     ):
         with pytest.raises(RuntimeError, match=message):
             ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=8192)
-    with pytest.raises(RuntimeError, match="float32"):
+    with pytest.raises(RuntimeError, match="values must be CUDA float32"):
         ss_host.run_varlen(arena, kv_lens, indices, values=torch.empty_like(indices, dtype=dtype))
+
+
+@_LOW_DTYPE_PARAMS
+def test_selfsampling_topk_16bit_rejects_deterministic(dtype: torch.dtype) -> None:
+    """The deterministic engines are FP32-only: 16-bit logits with deterministic mode (or, for
+    decode, a sorting order) raise in run_varlen, run_prefill and both warmups."""
+    message = "deterministic mode requires float32"
+    logits = torch.zeros((2, 8192), dtype=dtype, device=_DEV)
+    kv_lens = torch.full((2,), 8192, dtype=torch.int32, device=_DEV)
+    indices = torch.empty((2, 512), dtype=torch.int32, device=_DEV)
+    for options in (
+        {"deterministic": True},
+        {"deterministic": True, "sorting": "ascending"},
+        {"sorting": "ascending"},
+    ):
+        with pytest.raises(RuntimeError, match=message):
+            ss_host.run_varlen(logits, kv_lens, indices, max_seq_len=8192, **options)
+    row_starts = torch.zeros((2,), dtype=torch.int32, device=_DEV)
+    row_ends = torch.full((2,), 8192, dtype=torch.int32, device=_DEV)
+    with pytest.raises(RuntimeError, match=message):
+        ss_host.run_prefill(logits, row_starts, row_ends, indices, deterministic=True)
+    with pytest.raises(RuntimeError, match=message):
+        ss_host.warmup_varlen(512, 8192, deterministic=True, dtype=dtype)
+    with pytest.raises(RuntimeError, match=message):
+        ss_host.warmup_prefill(512, 8192, deterministic=True, dtype=dtype)
 
 
 def test_selfsampling_topk_varlen_cache_dtype_device_isolation(
@@ -3252,8 +3320,9 @@ def test_selfsampling_topk_regclus_mixed_dtype(
 ) -> None:
     """Interleaved specializations preserve FP32 defaults and immutable layouts: regclus engines
     of every dtype (4-slot tpl; 512- and 1024-bin bf16, fp16) plus one main, clus, reg and
-    complement engine per 16-bit dtype compile under the same module-constant guard (R8), and
-    the compiled regclus engines run interleaved on their own dtype."""
+    complement engine per 16-bit dtype compile under the same guard (module-level int constants
+    are unchanged by compilation), and the compiled regclus engines run interleaved on their own
+    dtype."""
     from tensorrt_llm._torch.kernels.blackwell.top_k import gvr_topk_decode_self_sampling as device
 
     constants = {
@@ -3286,7 +3355,7 @@ def test_selfsampling_topk_regclus_mixed_dtype(
     assert fp32 is not bf16_512 and fp32 is not bf16_1024
     assert bf16_512 is not bf16_1024
     assert device.get_compiled__regclus(tpl, **options) is fp32
-    # one engine of every other family per 16-bit dtype under the same guard (census tuples)
+    # one engine of every other family per 16-bit dtype under the same guard
     for tag in ("bf16", "f16") if with_fp16 else ("bf16",):
         device.get_compiled(
             (1024, 1, 1, 256, 2, True, False, 1, 0, 40), hint_free=True, dtype=tag, dense=True

@@ -46,6 +46,7 @@ CUDA-graph capture.
 
 import math
 import operator
+import struct
 import threading
 from collections.abc import Sequence
 
@@ -793,21 +794,20 @@ def route_streaming(
     return _main(256, 4, 8, False)
 
 
-def _bf16_halve_u(plan: dict) -> dict:
-    """bf16 streaming arms read 8-element 16B vectors, so one vector covers
-    what two fp32 float4s did: halve the per-thread vector batch U (tuple slot
-    1) to keep per-tile ELEMENT coverage — and the 32-bit classify mask —
-    identical while halving the load-instruction count."""
+def _halve_u_16bit(plan: dict) -> dict:
+    """Halve the per-thread vector batch (tuple slot 1, floor 1) of a 16-bit plan in place.
+
+    Slot 1 is U on main/clus plans and VPT on reg_clus plans. A 16-bit arm reads 8-element 16-byte
+    vectors, so one vector covers two FP32 float4s; halving U keeps the per-tile element count and
+    the 32-bit classify mask while halving the load instructions. Returns the same plan dict.
+    """
     tpl = list(plan["tpl"])
     tpl[1] = max(int(tpl[1]) // 2, 1)
     plan["tpl"] = tuple(tpl)
     return plan
 
 
-_halve_u16 = _bf16_halve_u  # dtype-neutral name: the fp16 arm shares the bf16 route twins
-
-
-def _halve_u16_streaming(plan: dict, b: int = 0, n: int = 0, k: int = 0) -> dict:
+def _halve_u_streaming_16bit(plan: dict, b: int = 0, n: int = 0, k: int = 0) -> dict:
     """U halving for the 16-bit streaming arms, except main plans at U = 8 on the long-row, many-row shapes
     where 64-element tiles (two-word classify mask) win; shorter rows or fewer rows keep 32-element tiles."""
     if (
@@ -819,7 +819,7 @@ def _halve_u16_streaming(plan: dict, b: int = 0, n: int = 0, k: int = 0) -> dict
         )
     ):
         return plan
-    return _bf16_halve_u(plan)
+    return _halve_u_16bit(plan)
 
 
 def _gvr_main_gate(blk: int, kpt: int, split: bool = True) -> tuple[int, int]:
@@ -840,7 +840,7 @@ def _degen_gate_ok(blk_old: int, kpt_old: int, blk_new: int, kpt_new: int) -> bo
     return s_n >= s_o and c_n >= c_o
 
 
-def _route_bf16_table(
+def _route_table_16bit(
     b: int,
     n: int,
     npad: int,
@@ -848,16 +848,13 @@ def _route_bf16_table(
     num_sms: int = 148,
     sm_version: int = 100,
 ) -> dict[str, object]:
-    """FP32 dispatch table the BF16 router starts from: the table before PR #20106.
+    """Base plan of ``_route_16bit``: an FP32-style dispatch table kept separate from ``route``.
 
-    #20106 re-tuned ``route`` around register-path options (dense bracket, warp
-    rank, staged output, late loads) that only the FP32 specialization compiles;
-    measured on the 9,746-case grid, the BF16 kernels lose with that table and
-    keep the one they were tuned against. Pure; see the module doc.
-
-    Deviations from the CUDA reference (self-sampling only): the 4K < n <= 8K
-    register rungs, QC = QUADC for every register plan, NB bins for the
-    not-wide register plans up to n4 <= 2048."""
+    It lacks several of ``route``'s register rungs, and keeping it separate stops FP32 re-tunes of
+    ``route`` from moving 16-bit plans. Pure; see the module doc. Deviations from the CUDA reference
+    (self-sampling only): the 4K < n <= 8K register rungs and NB bins for the not-wide register
+    plans up to n4 <= 2048.
+    """
     if b < 1:
         raise RuntimeError(f"route requires b >= 1, got {b}")
     if num_sms < 1:
@@ -870,11 +867,9 @@ def _route_bf16_table(
     # ======================= register-resident block ========================
     n4 = n >> 2
     CMP = n if n < 2560 else 2560
-    # QC = QUADC for every register plan: the O(mc^2) rank loop is taken only
-    # for mc <= QC, so a wider gate lets one row whose first-k bracket misses
-    # the k-th value stall the whole one-wave launch. Rows with mc <= QUADC
-    # take the same branch under either gate.
-    QC = 160  # floor-0.97 step 3: #20106's register-plan rank gate
+    # QC gates the O(mc^2) rank loop, which runs only for mc <= QC. 160 is the
+    # register-plan gate of route (QUADC = 96 gates the streaming paths).
+    QC = 160
     CURE = not (n < 2 * k and b > num_sms)
     DEGE = (n <= 3 * k) or (n <= 4 * k + 64)
     if DEGE and CMP < n:
@@ -983,11 +978,8 @@ def _route_bf16_table(
     if n4 <= 2048:
         if wide:
             return _reg(1024, 2, 1, 2 * NB)
-        # On SM103 with 148 SMs, the existing register plan remains faster
-        # across the measured b=512..1024, k=2048 range. Keep the exception
-        # architecture- and shape-exact: smaller K and nearby lower batches
-        # have different winners, while SM100 retains its original streaming
-        # route byte-for-byte.
+        # On SM103 with 148 SMs, k=2048 rows at b=512..1024 also keep the register plan;
+        # every other batch above 2 * num_sms takes the streaming path.
         sm103_large_batch_k2048 = (
             sm_version == 103 and num_sms == 148 and 512 <= b <= 1024 and k == 2048
         )
@@ -1174,17 +1166,18 @@ def _route_bf16_table(
     return _main(256, 4, 8, False)
 
 
-def _route_bf16_override(
+def _route_override_16bit(
     b: int, n: int, npad: int, k: int, kernel: str, dtype: torch.dtype
 ) -> dict | None:
-    """16-bit plans that replace the table plan on the shapes where they measure faster (cold L2, 9,746-case
-    grid); None keeps the table plan."""
+    """Shape-specific 16-bit plan that replaces the table plan of family ``kernel``; None keeps it.
+
+    Some streaming and reg_clus shapes become reg_clus plans (``ab`` requests the bits-domain
+    window) and some main and register shapes become register plans.
+    """
     bf16 = dtype is not torch.float16
     if kernel in ("main", "clus", "reg_clus"):
         cluster = None
-        if cluster is not None:
-            pass
-        elif k == 2048 and 131000 < n <= 131100 and 16 <= b <= 32:
+        if k == 2048 and 131000 < n <= 131100 and 16 <= b <= 32:
             cluster = (4, 4, False)
         elif k == 2048 and 163000 < n <= 164000 and b == 8:
             cluster = (4, 8, False)
@@ -1233,7 +1226,54 @@ def _route_bf16_override(
     }
 
 
-def _route_bf16(
+def _clus_plan_bf16(b: int, n: int, npad: int, k: int, R: int) -> dict:
+    big = b * R <= 148
+    scap = 8192 if big else 4096
+    cmp_ = (4096 if k > 1024 else 2048) if big else 1024
+    aim = 2 * k if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+    r_ = int(0.5 + math.sqrt(float(6 * n)))
+    if r_ > aim:
+        aim = r_
+    amin = (7 * k) // 2
+    if aim < amin:
+        aim = amin
+    if aim > (scap >> 1):
+        aim = scap >> 1
+    n4s = n >> 2
+    sel = min(max(16 * n // aim, 256), n // 2)
+    quads = max(sel >> 4, 1)
+    quarter = max(n4s >> 2, 1)
+    ss2 = max(quarter // min(quads, quarter), 1)
+    smp = max(quarter // ss2, 1)
+    tgt = max((aim * (smp * 16)) // n, 1)
+    tgt2 = max((k * (smp * 16)) // n, 1)
+    q_ = (n4s + R - 1) // R
+    per = q_ >> 10
+    u_ = 8 if per >= 8 else (4 if per >= 4 else (2 if per >= 2 else 1))
+    return {
+        "kernel": "clus",
+        "tpl": (1024, u_, 1, SNB, R),
+        "rt": {
+            "n": n,
+            "npad": npad,
+            "k": k,
+            "SCAP": scap,
+            "CMP": cmp_,
+            "SMP": smp,
+            "TGT": tgt,
+            "Q": q_,
+            "SS2": ss2,
+            "TGT2": tgt2,
+        },
+        "grid": (R, b),
+        "cluster": R,
+        "block": 1024,
+        "smem": SNB * 8 + (scap + 4) * 8 + cmp_ * 8,
+        "ws": False,
+    }
+
+
+def _route_16bit(
     b: int,
     n: int,
     npad: int,
@@ -1242,11 +1282,13 @@ def _route_bf16(
     sm_version: int = 100,
     dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, object]:
-    """16-bit dispatch table (``dtype``: bfloat16, or float16 sharing the bf16 routes and tuning
-    until it is tuned on its own timing). ``_route_bf16_table`` (the fp32 table before #20106) is
-    the starting point; bf16-specific re-tunes (16B-vector U
-    halving, register-family capacity fitting, bin-count halving) are applied
-    to the returned copy only."""
+    """Dispatch plan for 16-bit logits; ``dtype`` is bfloat16 or float16.
+
+    A few FP16 shapes return their own plan before the table is read. Otherwise the plan starts from
+    ``_route_table_16bit``; shape-specific 16-bit plans, including ``_route_override_16bit``,
+    replace it, and the remaining 16-bit adjustments (16-byte-vector U halving, register capacity
+    fitting, histogram bin counts) edit it in place. Rules that differ by dtype test ``dtype``.
+    """
     if dtype is torch.float16 and k == 2048 and 32768 < n <= 32768 + 64 and 32 < b <= 64:
         return {
             "kernel": "reg_clus",
@@ -1283,18 +1325,25 @@ def _route_bf16(
             "pk16": False,
             "ws": False,
         }
-    plan = _route_bf16_table(b, n, npad, k, num_sms, sm_version)
-    override = _route_bf16_override(b, n, npad, k, plan["kernel"], dtype)
+    plan = _route_table_16bit(b, n, npad, k, num_sms, sm_version)
+    if dtype is torch.bfloat16:
+        if (
+            plan["kernel"] == "main"
+            and plan["tpl"][5]
+            and k in (512, 1024)
+            and n >= 196608
+            and b == 8
+        ):
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 8), b, n, k)
+        if (
+            b == 16 and ((k == 512 and n >= 196608) or (k in (512, 1024) and 131070 < n <= 131080))
+        ) or (b in (8, 16) and k == 1024 and n >= 196608):
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4), b, n, k)
+        if k == 2048 and b in (16, 32) and n >= 163000:
+            return _halve_u_streaming_16bit(_clus_plan_bf16(b, n, npad, k, 4), b, n, k)
+    override = _route_override_16bit(b, n, npad, k, plan["kernel"], dtype)
     if override is not None:
         return override
-    if plan["kernel"] == "reg" and k == 1024 and not plan["tpl"][5] and plan["tpl"][7] == 1024:
-        # floor-0.97: the K=1024 linear-bin register plans take FP32's 2048 bins (half the crossing-bin
-        # population under the sampled bracket); IMGOFF == NBH at every register site
-        tpl = list(plan["tpl"])
-        tpl[7] = 2048
-        plan["tpl"] = tuple(tpl)
-        plan["rt"]["IMGOFF"] = 2048
-        plan["smem"] += 4 * 1024
     if plan["kernel"] in ("reg", "regimg") and k == 512 and (n <= 1280) and (b > 148):
         plan["tpl"] = (256, 1, 8, 1, True, True, False, 512)
         plan["block"] = 256
@@ -1303,15 +1352,15 @@ def _route_bf16(
         n4q = n >> 2
         if 1152 < n4q <= 3072 and (
             b <= 256
-            or (k == 512 and b >= 1024)
+            or (k == 512 and b >= (512 if dtype is torch.bfloat16 else 1024))
             or k == 2048
             or (dtype is torch.float16 and k == 1024 and 8190 < n <= 8200)
         ):
-            # floor-0.97 step 1: the N <= 12K register rung of #20106 (`_reg(512, ceil(n4/512), 2, NBSEL)`)
-            # for the big-batch rows the BF16 table kept on the main kernel; K=2048 takes it at every
-            # large batch (the main kernel's block64 sampling pays off only on the K <= 1024 rows there)
+            # 512-thread register plan (as route's N <= 12K rung) for the big-batch rows the 16-bit
+            # table keeps on the main kernel; K=2048 takes it at every large batch (the main
+            # kernel's block64 sampling pays off only on the K <= 1024 rows there)
             CMP = n if n < 2560 else 2560
-            QC = 160  # floor-0.97 step 3: #20106's register-plan rank gate
+            QC = 160  # route's register-plan rank gate
             CURE = not (n < 2 * k and b > 148)
             vptx = (n4q + 511) // 512
             kpt = 1 if k <= 512 else 2
@@ -1324,6 +1373,8 @@ def _route_bf16(
                 if CMP < n:
                     CMP = n
             tpl = (512, vptx, 4 if k == 512 else 2, kpt, CURE, DEGE, False, nbins)
+            if dtype is torch.bfloat16 and k == 512 and 2 * vptx <= 8:
+                tpl = (256, 2 * vptx, 4, 2, CURE, DEGE, False, nbins)
             return {
                 "kernel": "reg",
                 "tpl": tpl,
@@ -1337,7 +1388,7 @@ def _route_bf16(
             }
         if 1024 < n4q <= 1152:
             CMP = n if n < 2560 else 2560
-            QC = 160  # floor-0.97 step 3: #20106's register-plan rank gate
+            QC = 160  # route's register-plan rank gate
             CURE = not (n < 2 * k and b > 148)
             DEGE = n <= 3 * k or n <= 4 * k + 64
             if DEGE and CMP < n:
@@ -1381,7 +1432,7 @@ def _route_bf16(
     ):
         n4q = n >> 2
         CMP = n if n < 2560 else 2560
-        QC = 160  # floor-0.97 step 3: #20106's register-plan rank gate
+        QC = 160  # route's register-plan rank gate
         CURE = not (n < 2 * k and b > 148)
         DEGE = n <= 3 * k or n <= 4 * k + 64
         if DEGE and CMP < n:
@@ -1409,8 +1460,7 @@ def _route_bf16(
             amax <<= 1
         vsel = 0
         cs = 0
-        g4_skip = False
-        if amax >= 2 and (not g4_skip):
+        if amax >= 2:
             for v in (1, 2):
                 c = 1
                 while c * BLKC * v * 8 + BLKC < n:
@@ -1437,7 +1487,7 @@ def _route_bf16(
                 "ws": False,
             }
     if plan["kernel"] in ("main", "clus"):
-        plan = _halve_u16_streaming(plan, b, n, k)
+        plan = _halve_u_streaming_16bit(plan, b, n, k)
     elif plan["kernel"] == "reg_clus":
         av = 148 // (b if b > 0 else 1)
         amax = 1
@@ -1461,7 +1511,7 @@ def _route_bf16(
             plan["grid"] = (cs, b)
             plan["cluster"] = cs
         else:
-            plan = _bf16_halve_u(plan)
+            plan = _halve_u_16bit(plan)
     elif plan["kernel"] in ("reg", "regimg"):
         tpl = list(plan["tpl"])
         n4r = n >> 2
@@ -1479,10 +1529,16 @@ def _route_bf16(
             and not tpl[5]
         )
         if keep_fp32_bins:
-            tpl[2] = 1  # floor-0.97 step 3 probe: FP32's 2048-bin / MINB 1 register plan
+            tpl[2] = 1  # MINB 1 with FP32's 2048 bins
         elif tpl[7] > target_nbh:
             tpl[7] = target_nbh
-        if b > 296 and k <= 1024 and (tpl[0] == 512) and (tpl[2] == 4) and (tpl[1] <= 2):
+        if (
+            (b > 296 or (dtype is torch.bfloat16 and b > 148 and not (k == 1024 and tpl[1] == 2)))
+            and k <= 1024
+            and (tpl[0] == 512)
+            and (tpl[2] == 4)
+            and (tpl[1] <= 2)
+        ):
             tpl[0] = 256
             tpl[1] *= 2
             tpl[2] = 8
@@ -1536,7 +1592,7 @@ def _route_bf16(
     return plan
 
 
-def _route_streaming_bf16(
+def _route_streaming_16bit(
     b: int,
     n: int,
     npad: int,
@@ -1544,16 +1600,14 @@ def _route_streaming_bf16(
     force_main: bool = False,
     dtype: torch.dtype = torch.bfloat16,
 ) -> dict[str, object]:
-    """16-bit twin of route_streaming (see _route_bf16; ``dtype`` as there).
+    """16-bit form of ``route_streaming``.
 
-    Split-aware vector-width pick: the fp32 table derives the split count R so
-    each CTA's chunk (~n/R) fills one fp32 tile of BLK*U*4 elements. When
-    U == 1 the 16-byte bf16 tile cannot shrink with U and spans BLK*8 -- a
-    ~BLK*4 chunk then idles half the threads and halves the outstanding-load
-    parallelism exactly in the latency-bound deep-split regime. Route those
-    plans to the 8-byte-vector engine (fp32 tile geometry, all threads
-    active); keep the 16-byte engine when the chunk actually fills >= 3/4 of
-    the wider tile (fewer load instructions at full thread activity)."""
+    ``dtype`` is accepted for call-site parity and no rule reads it. Adjusts the FP32 streaming
+    plan's block size, split count, vector width and U for 16-bit vectors. A 16-byte tile spans
+    BLK*8 elements and cannot shrink below U == 1, so for K != 2048 a split main plan at U == 1
+    (n >= 16384, b*R < 148) whose chunk fills less than 3/4 of that tile takes the 8-byte-vector
+    engine (``vec4``: FP32 tile geometry, all threads active).
+    """
     plan = route_streaming(b, n, npad, k, force_main=force_main)
     if plan["kernel"] in ("main", "clus"):
         tpl = plan["tpl"]
@@ -1631,7 +1685,7 @@ def _route_streaming_bf16(
             rolls_half_s = -(-chunk // (int(tpl[0]) * 2 * 8))
             if rolls_full_s < rolls_half_s:
                 return plan
-        plan = _halve_u16_streaming(plan, b, n, k)
+        plan = _halve_u_streaming_16bit(plan, b, n, k)
         tpl = plan["tpl"]
         if plan["kernel"] == "main" and tpl[5] and (int(tpl[0]) == 1024) and (int(tpl[1]) < 4):
             r_const = int(plan["rt"]["R"])
@@ -1650,32 +1704,25 @@ def _route_streaming_bf16(
     return plan
 
 
-def _route_fp16(
-    b: int, n: int, npad: int, k: int, num_sms: int = 148, sm_version: int = 100
-) -> dict[str, object]:
-    """fp16 dispatch = the bf16 table with the dtype threaded (no fp16-specific re-tune yet)."""
-    return _route_bf16(b, n, npad, k, num_sms, sm_version, dtype=torch.float16)
-
-
 # Native 16-bit logits dtypes and the device-module dtype tags.
-_LOW_DTYPES = (torch.bfloat16, torch.float16)
+_DTYPES_16BIT = (torch.bfloat16, torch.float16)
 _DTYPE_TAG = {torch.float32: "f32", torch.bfloat16: "bf16", torch.float16: "f16"}
 
-# 16-bit register plans (reg / regimg, N <= 16K) take the code-radix kernel: the exact K-th 16-bit code
-# from two 8-bit-digit histogram passes over the packed halfwords and a counted-cut emit, no bracket,
-# window or refinement.  One switch for the A/B against the bracket kernel (`kern`); FP32 never reads it.
+# Code-radix switches (16-bit only; FP32 never reads them). The code-radix kernels find the exact
+# K-th 16-bit code with 8-bit-digit histogram passes over the packed halfwords and emit by a counted
+# cut. Clearing _REG_CODE_RADIX_16BIT turns them off for every plan; _REG_CODE_RADIX_FORCE is a test
+# hook (None: the routing rules, True / False: force on / off).
 _REG_CODE_RADIX_16BIT = True
-# Tests: True / False forces the 16-bit register mode (code radix / bracket) on every register plan,
-# overriding the geometry rules and the packed clamp window; None keeps the routing.
 _REG_CODE_RADIX_FORCE = None
 
 
-# Dtype-isolated launch caches preserve the original FP32 key and hot lookup.
-# The 16-bit caches additionally key by device because their cold compilation uses that device.
+# Launcher caches, one per logits dtype. FP32 key: (rows, npad, k, n_env, next_n, cr, packed
+# device profile[, det]); the 16-bit keys insert the device index before the profile (cold
+# compilation runs on that device), and the FP16 key ends with the two code-radix switches.
 _VARLEN_CACHE = {}
 _VARLEN_CACHE_BF16: dict[tuple[int, ...], tuple] = {}
 _VARLEN_CACHE_FP16: dict[tuple[int, ...], tuple] = {}
-_BF16_COMPILE_LOCK = threading.RLock()
+_COMPILE_LOCK_16BIT = threading.RLock()
 
 
 def _varlen_cache_for(dtype: torch.dtype) -> dict:
@@ -1734,10 +1781,10 @@ def _prefill_launcher(
     """Prefill plan + compiled launcher: ``_varlen_launcher``'s main branch with
     r_const=1, split=False and the prefill compile flag. SCAP_/CMP_ are envelope
     upper bounds; npad is filled per call in ``run_prefill``. The 16-bit dtypes
-    (bfloat16, float16) take the bf16 streaming plan (halved per-thread vector
-    batch, 16-byte x8 loads) and the r_const == 1 bf16 tuning scalars of
-    ``_varlen_launcher``."""
-    low = dtype in _LOW_DTYPES
+    (bfloat16, float16) take the 16-bit streaming plan (halved per-thread vector
+    batch, 16-byte x8 loads) and the 16-bit r_const == 1 tuning scalars of
+    ``_varlen_launcher`` without its decode-only BF16 aim_base rungs."""
+    low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
     key = _prefill_cache_key(tier, k, n_bucket, _DTYPE_TAG[dtype], det)
@@ -1747,7 +1794,7 @@ def _prefill_launcher(
     b_route = _PREFILL_TIER_ROWS[tier]
     n_route = max(n_bucket, k + 1)
     if low:
-        plan = _route_streaming_bf16(b_route, n_route, n_route, k, force_main=True, dtype=dtype)
+        plan = _route_streaming_16bit(b_route, n_route, n_route, k, force_main=True, dtype=dtype)
     else:
         plan = route_streaming(b_route, n_route, n_route, k, force_main=True)
     if plan["kernel"] != "main":
@@ -1767,8 +1814,9 @@ def _prefill_launcher(
     )
     big = tier == 0
     if low:
-        # r_const==1 branch of the 16-bit _varlen_launcher tuning scalars (the
-        # prefill envelope is <= 32768, so the n_env >= 131072 aim rung never applies)
+        # r_const==1 branch of the 16-bit _varlen_launcher tuning scalars, without its
+        # decode-only BF16 aim_base rungs (the prefill envelope is <= 32768, so the
+        # n_env >= 131072 aim rung never applies)
         unsplit_aim = 3 * k // 2 if k == 1024 else 2 * k
         aim_base = unsplit_aim if big else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
         amin = 2 * k if k > 1024 else (7 * k) // 2
@@ -1788,27 +1836,85 @@ def _prefill_launcher(
     return lc
 
 
-def _reg_code_radix_bf16(k: int, n_kernel: int, num_rows: int, plan: dict) -> bool:
-    """Whether a 16-bit register plan takes the code-radix kernel (`_REG_CODE_RADIX_16BIT` A/B switch).
+def _f32(x: float) -> float:
+    return struct.unpack("f", struct.pack("f", float(x)))[0]
 
-    Geometry-only (capture-stable) rule from the g43_b6_r3 panel (258 register cases, cold L2, 24 reps):
-    the code-radix kernel beats the bracket kernel on the near-K Flash rows (K=512, N <= 1280, every batch
-    size: +7%), on the K=512 N <= 2051 rows at >= 512 rows (+1..+6%) and on the V3.2 rows that the bracket
-    kernel runs with the bin proof (K=2048, <= 148 rows, N <= 8207: parity to +5%); everywhere else the
-    bracket kernel is 8-18% faster (its whole path does ~12 SASS per element, the three radix sweeps ~26)."""
-    if not _REG_CODE_RADIX_16BIT or plan["kernel"] not in ("reg", "regimg"):
-        return False
-    if k == 512:
-        return n_kernel <= 1280 or (n_kernel <= 2051 and num_rows >= 512)
-    return k == 2048 and num_rows <= 148 and n_kernel <= 8207
+
+def _main_env_samples(n, k, aim_base, sfac, amin, sd_en, scpb, r_const):
+    """Sampling schedule the main kernel derives for a row of exactly n valid columns."""
+    x6 = 6 * n
+    ri = math.isqrt(x6)
+    r6 = ri + 1 if x6 - ri * ri > ri else ri
+    aim = max(aim_base, r6)
+    if r_const > 1:
+        aim = max(aim, amin)
+    aim = min(aim, scpb >> 1)
+    aim = max(aim, k)
+    n4w = n >> 2
+    gate = n > scpb or (sd_en != 0 and 2 * k < n <= scpb)
+    if n4w < 4 or not gate:
+        return 0, 0, 1, 0
+    sel = int(_f32(_f32(sfac * n) * _f32(1.0 / _f32(aim))))
+    sel = min(max(sel, 256), n >> 1)
+    half = max(n4w >> 1, 1)
+    pairs = min(max(sel >> 3, 1), half)
+    ss2 = max(int(_f32(_f32(half) * _f32(1.0 / _f32(pairs)))), 1)
+    smp = int(_f32(_f32(half) * _f32(1.0 / _f32(ss2))))
+    if smp * ss2 > half:
+        smp -= 1
+    smp = max(smp, 1)
+    rn = _f32(1.0 / _f32(n))
+    smp8f = _f32(smp * 8.0)
+    tgt = max(int(_f32(_f32(_f32(aim) * smp8f) * rn)), 1)
+    tgt2 = max(int(_f32(_f32(_f32(k) * smp8f) * rn)), 1)
+    return smp, tgt, ss2, tgt2
+
+
+def _clus_env_samples(n, k, cs, num_rows, scap, floor):
+    """Sampling schedule the clus kernel derives for a row of exactly n valid columns."""
+    x6 = 6 * n
+    ri = math.isqrt(x6)
+    r6 = ri + 1 if x6 - ri * ri > ri else ri
+    aim = 2 * k
+    if num_rows * cs > 148:
+        aim = (11 * k) >> 3 if k >= 1024 else (3 * k) >> 1
+    aim = max(aim, r6)
+    amin = 3 * k if cs == 2 else (7 * k) >> 1
+    aim = max(aim, amin)
+    aim = min(aim, scap >> 1)
+    aim = max(aim, k)
+    n4v = n >> 3
+    sel = int(_f32(_f32(_f32(n) * (32.0 if cs == 2 else 16.0)) * _f32(1.0 / _f32(aim))))
+    sel = max(sel, floor)
+    sel = min(sel, n >> 1)
+    quads = max(sel >> 4, 1)
+    quarter = max(n4v >> 1, 1)
+    quads = min(quads, quarter)
+    ss2 = max(int(_f32(_f32(quarter) * _f32(1.0 / _f32(quads)))), 1)
+    smp = int(_f32(_f32(quarter) * _f32(1.0 / _f32(ss2))))
+    if smp * ss2 > quarter:
+        smp -= 1
+    smp = max(smp, 1)
+    rn = _f32(1.0 / _f32(n))
+    smp16f = _f32(smp * 16.0)
+    tgt = max(int(_f32(_f32(_f32(aim) * smp16f) * rn)), 1)
+    tgt2 = max(int(_f32(_f32(_f32(k) * smp16f) * rn)), 1)
+    return smp, tgt, ss2, tgt2
 
 
 def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None) -> bool:
-    """Whether a 16-bit register plan takes the code-radix kernel: BF16 rule, or the FP16 geometries below."""
-    if dtype is not torch.float16:
-        return _reg_code_radix_bf16(k, n_kernel, num_rows, plan)
-    if not _REG_CODE_RADIX_16BIT:
+    """Code-radix choice for a 16-bit register plan, before the launcher's per-dtype overrides.
+
+    ``_REG_CODE_RADIX_FORCE`` True forces it onto register plans with VPT <= 8; False, or clearing
+    ``_REG_CODE_RADIX_16BIT``, turns it off. Otherwise FP16 first checks its own envelope windows,
+    and both dtypes fall back to ``_reg_code_radix_base``.
+    """
+    if not _REG_CODE_RADIX_16BIT or _REG_CODE_RADIX_FORCE is False:
         return False
+    if _REG_CODE_RADIX_FORCE is True:
+        return plan["kernel"] in ("reg", "regimg") and plan["tpl"][1] <= 8
+    if dtype is not torch.float16:
+        return _reg_code_radix_base(k, n_kernel, num_rows, plan)
     if (
         dtype is torch.float16
         and plan["kernel"] in ("reg", "regimg")
@@ -1861,6 +1967,11 @@ def _reg_code_radix(k: int, n_kernel: int, num_rows: int, plan: dict, dtype=None
 
 
 def _reg_code_radix_base(k: int, n_kernel: int, num_rows: int, plan: dict) -> bool:
+    """Base code-radix rule for a 16-bit register plan (geometry only, so capture-stable).
+
+    True for K=512 rows with N <= 1280, or N <= 2051 at >= 512 rows, and for K=2048 rows with
+    N <= 8207 at <= 148 rows; False for other plans and while ``_REG_CODE_RADIX_16BIT`` is off.
+    """
     if not _REG_CODE_RADIX_16BIT or plan["kernel"] not in ("reg", "regimg"):
         return False
     if k == 512:
@@ -1868,9 +1979,14 @@ def _reg_code_radix_base(k: int, n_kernel: int, num_rows: int, plan: dict) -> bo
     return k == 2048 and num_rows <= 148 and n_kernel <= 8207
 
 
-def _f16_main_samp_rounds(n, k, blk, kpt, split, r_const, aim_base, sfac, amin, sd_en):
-    kbig = kpt >= 2 and kpt * blk >= 2048
-    scap = (8192 if split else 16384) if blk >= 1024 else (8192 if kbig else 4096)
+def _main_samp_rounds_fp16(n, k, blk, kpt, split, r_const, aim_base, sfac, amin, sd_en):
+    """FP16 main-kernel ``samp_rounds``: register sample-prefetch rounds for an n-column row.
+
+    ceil(SMP / blk) of the pair-sample count the kernel derives, capped at 4; 0 when the row is
+    unsampled or needs fewer than 2 rounds. A mismatch costs speed only: the kernel loads the
+    remaining samples in its loop.
+    """
+    scap = _gvr_main_gate(blk, kpt, split)[0]
     x6 = 6 * n
     ri = math.isqrt(x6)
     r6 = ri + 1 if x6 - ri * ri > ri else ri
@@ -1896,39 +2012,59 @@ def _f16_main_samp_rounds(n, k, blk, kpt, split, r_const, aim_base, sfac, amin, 
     return min(rounds, 4) if rounds >= 2 else 0
 
 
-def _f16_crc_plan(k: int, n_kernel: int, num_rows: int, num_sms: int):
+def _code_radix_cluster_plan_fp16(k: int, n_kernel: int, num_rows: int, num_sms: int):
+    """FP16 cluster code-radix geometry ``(blk, vpt, cluster_size, candidate_list)``, or None.
+
+    Only envelopes just above 8K, 16K, 32K, 64K and 128K, or just below 160K and 256K, have one;
+    the choice depends on K and on how many rows fit the SMs.
+    """
+    if 8192 < n_kernel <= 8192 + 64 and (
+        (k == 512 and num_rows <= 32) or (k == 2048 and num_rows <= 2)
+    ):
+        return (256, 2, 4, False)
     if k == 1024 and 8192 < n_kernel <= 8192 + 64:
         if num_rows * 4 <= num_sms:
             return (256, 2, 4, False)
         if num_rows * 2 <= num_sms:
             return (512, 2, 2, False)
     if 16384 < n_kernel <= 16384 + 512:
+        if num_rows <= 8:
+            return (256, 2, 8, False)
         if num_rows * 4 <= num_sms:
             return (512, 2, 4, False)
         if num_rows * 2 <= num_sms and k <= 1024:
-            return (1024, 2, 2, False)
+            return (512, 4, 2, False)
     if 32768 < n_kernel <= 32768 + 512:
         if num_rows <= 8:
             return (512, 2, 8, False)
         if num_rows * 4 <= num_sms:
-            return (1024, 2, 4, False)
+            return (512, 4, 4, False)
         if k <= 1024 and num_rows * 2 <= num_sms:
-            return (1024, 4, 2, True)
+            return (512, 8, 2, True)
     if 65536 < n_kernel <= 65536 + 512:
-        if num_rows <= 8:
-            return (1024, 2, 8, True)
+        if num_rows <= 8 or (k == 2048 and num_rows <= 18):
+            return (512, 4, 8, True)
         if num_rows * 4 <= num_sms:
+            if k <= 1024:
+                return (512, 8, 4, True)
             return (1024, 4, 4, True)
+        if num_rows <= 64:
+            return (512, 8, 4, True)
         if num_rows * 2 <= num_sms:
             return (1024, 8, 2, True)
     if 131072 < n_kernel <= 131072 + 512:
         if num_rows <= 8:
-            return (1024, 4, 8, True)
+            return (512, 8, 8, True)
         if num_rows * 4 <= num_sms:
             return (1024, 8, 4, True)
     if 163840 - 128 < n_kernel <= 163840 and num_rows <= 8:
-        return (1024, 5, 8, True)
-    # B = 16 at N 256K: the 8-CTA cluster plan loses 8-18% to `main`; B <= 8 keeps it
+        return (512, 8, 10, True)
+    if k == 2048 and 163840 - 128 < n_kernel <= 163840 and 9 <= num_rows <= 16:
+        return (1024, 7, 6, True)
+    if 163840 - 128 < n_kernel <= 163840 and num_rows * 5 <= num_sms and num_rows <= 16:
+        return (1024, 8, 5, True)
+    if 262144 - 64 < n_kernel <= 262144 and num_rows <= 4:
+        return (512, 8, 16, True)
     if 262144 - 64 < n_kernel <= 262144 and num_rows <= 8:
         return (1024, 8, 8, True)
     return None
@@ -1948,17 +2084,15 @@ def _varlen_launcher(
     device_index: int | None = None,
     det: bool = False,
 ) -> tuple:
-    """Build a capture-stable launcher from the shared dtype kernel templates.
+    """Capture-time varlen plan + compiled launcher for one logits dtype.
 
-    FP32 keeps its original routes, tuning scalars and cache key. The 16-bit
-    dtypes use the same family selection and ABI assembly with their packed-load
-    routes, refinement parameters and near-K complement specialization; FP16
-    shares the BF16 routes and tuning. All choices depend only on the
-    capture-stable geometry and dtype.
+    FP32 picks the family with ``route``; the 16-bit dtypes pick it with ``_route_16bit`` and add
+    their own plans, compile options and tuning scalars (many of them per dtype) and a near-K
+    ``complement`` launcher. Every choice is a function of capture-stable quantities only.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode launcher requires float32, bfloat16 or float16, got {dtype}")
-    low = dtype in _LOW_DTYPES
+    low = dtype in _DTYPES_16BIT
     if low and det:
         raise RuntimeError("deterministic mode requires float32 logits")
     profile = _pack_device_profile(num_sms, sm_version)
@@ -1979,16 +2113,23 @@ def _varlen_launcher(
     cr_shift = 0 if cr == 1 else 2
     dev = _device()
     dtype_options = {"dtype": _DTYPE_TAG[dtype]} if low else {}
+    # Near-K envelopes (k < n <= k + 3): the complement kernel finds the at most three
+    # excluded indices of each row and emits all the others.
     if low and k in (512, 1024, 2048) and 0 < n_kernel - k <= 3:
-        complement_threads = 128 if dtype is torch.float16 and num_rows > num_sms else 256
-        fn = dev.get_compiled_complement(
-            k, n_kernel, next_n, cr_shift, block_threads=complement_threads, **dtype_options
-        )
+        if dtype is torch.bfloat16 and num_rows >= 256 and n_kernel == k + 3:
+            fn = dev.get_compiled_complement(
+                k, n_kernel, next_n, cr_shift, packed_bf16_keys=True, **dtype_options
+            )
+        else:
+            complement_threads = 128 if dtype is torch.float16 and num_rows > num_sms else 256
+            fn = dev.get_compiled_complement(
+                k, n_kernel, next_n, cr_shift, block_threads=complement_threads, **dtype_options
+            )
         lc = ("complement", fn, n_kernel)
         cache[key] = lc
         return lc
     if low:
-        plan_free = _route_bf16(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
+        plan_free = _route_16bit(num_rows, n_route, npad, k, num_sms, sm_version, dtype=dtype)
     else:
         plan_free = route(num_rows, n_route, npad, k, num_sms, sm_version, det=det)
     if (
@@ -1998,10 +2139,75 @@ def _varlen_launcher(
         and 8207 < n_kernel <= 8 * BLKC * 2 + 512
     ):
         plan_free = {"kernel": "reg_clus", "tpl": (BLKC, 1, 2, k)}
+    if (
+        dtype is torch.float16
+        and _REG_CODE_RADIX_16BIT
+        and _REG_CODE_RADIX_FORCE is not False
+        and plan_free["kernel"] == "main"
+        and k == 512
+        and 4100 < n_kernel <= 8207
+        and 2 * num_sms < num_rows <= 4 * num_sms
+    ):
+        plan_free = {
+            "kernel": "reg",
+            "tpl": (512, 4, 4, 1, True, False, False, 1024),
+            "rt": {"n": n_route, "npad": npad, "k": k, "CMP": 4, "IMGOFF": 1024, "QC": 160},
+            "grid": (num_rows, 1),
+            "cluster": 1,
+            "block": 512,
+            "smem": (1024 + 4) * 4,
+            "pk16": False,
+            "ws": False,
+            "cr2_large": True,
+        }
+    if (
+        dtype is torch.float16
+        and _REG_CODE_RADIX_16BIT
+        and _REG_CODE_RADIX_FORCE is not False
+        and plan_free["kernel"] == "main"
+        and num_rows > num_sms
+        and 8448 < n_kernel <= 16448
+        and (
+            k in (1024, 2048) or (k == 512 and (num_rows <= 2 * num_sms or num_rows > 4 * num_sms))
+        )
+    ):
+        plan_free = {
+            "kernel": "reg",
+            "tpl": (512, 8, 2, 1, True, False, False, 1024),
+            "rt": {"n": n_route, "npad": npad, "k": k, "CMP": 4, "IMGOFF": 1024, "QC": 160},
+            "grid": (num_rows, 1),
+            "cluster": 1,
+            "block": 512,
+            "smem": (1024 + 4) * 4,
+            "pk16": False,
+            "ws": False,
+            "cr2_large": True,
+        }
+    if (
+        dtype is torch.float16
+        and _REG_CODE_RADIX_16BIT
+        and _REG_CODE_RADIX_FORCE is not False
+        and plan_free["kernel"] == "main"
+        and 32768 < n_kernel <= 33280
+        and num_sms // 2 < num_rows <= num_sms
+    ):
+        plan_free = {
+            "kernel": "reg",
+            "tpl": (1024, 8, 1, 1, True, False, False, 1024),
+            "rt": {"n": n_route, "npad": npad, "k": k, "CMP": 4, "IMGOFF": 1024, "QC": 160},
+            "grid": (num_rows, 1),
+            "cluster": 1,
+            "block": 1024,
+            "smem": (1024 + 4) * 4,
+            "pk16": False,
+            "ws": False,
+            "cr2_large": True,
+        }
     crc = (
-        _f16_crc_plan(k, n_kernel, num_rows, num_sms)
+        _code_radix_cluster_plan_fp16(k, n_kernel, num_rows, num_sms)
         if dtype is torch.float16
         and _REG_CODE_RADIX_16BIT
+        and _REG_CODE_RADIX_FORCE is not False
         and plan_free["kernel"] in ("reg", "reg_clus", "main", "clus")
         and n_kernel > k
         and sm_version in (100, 103)
@@ -2018,8 +2224,9 @@ def _varlen_launcher(
             static_k=k,
             static_npad=npad,
             code_radix=True,
+            static_n=n_kernel,
             clus=crc_cs,
-            listc=crc_list,
+            candidate_list=crc_list,
             **dtype_options,
         )
         crc_words = 1024 + 512 * crc_cs + (6 * crc_blk * crc_vpt + crc_blk if crc_list else 0)
@@ -2032,8 +2239,8 @@ def _varlen_launcher(
             cluster_options["nbh"] = (
                 512 if k > 1024 or (k in (512, 1024) and n_env >= 65536) else 1024
             )
-            # The (BLK, 2, 4) geometry (N 33K-66K, BS >= 16) is 5-7% faster with 1024 bins (finer crossing
-            # bin, cheap 4-rank merge); the cs >= 8 and vpt = 1 geometries lose with 1024 bins and keep 512.
+            # The (BLK, 2, 4) geometry (N 33K-66K, BS >= 16) takes 1024 bins even at n_env >= 65536
+            # (finer crossing bin, cheap 4-rank merge); cs >= 8 and vpt = 1 geometries keep 512.
             if k <= 1024 and tuple(plan_free["tpl"][:3]) == (BLKC, 2, 4):
                 cluster_options["nbh"] = 1024
             if (
@@ -2043,23 +2250,74 @@ def _varlen_launcher(
             ):
                 cluster_options["tailsamp"] = 193
             cluster_options["quadc"] = (
-                96 if k > 1024 and num_rows > 1 and plan_free["tpl"][2] >= 8 else 384
+                96
+                if k > 1024
+                and num_rows > 1
+                and plan_free["tpl"][2] >= 8
+                and dtype is not torch.bfloat16
+                else 384
             )
+            if (
+                (
+                    dtype is torch.bfloat16
+                    and k <= 1024
+                    and num_rows <= 8
+                    and n_env >= 65536
+                    and int(plan_free["tpl"][2]) in (2, 8, 16)
+                )
+                or (
+                    dtype is torch.bfloat16
+                    and k <= 1024
+                    and num_rows <= 64
+                    and tuple(plan_free["tpl"][1:3]) in ((1, 4), (2, 4), (2, 2))
+                )
+                or (
+                    dtype is torch.bfloat16
+                    and k == 2048
+                    and num_rows <= 64
+                    and int(plan_free["tpl"][1]) <= 4
+                    and int(plan_free["tpl"][2]) in (4, 8, 16)
+                    and tuple(plan_free["tpl"][1:3]) != (1, 4)
+                )
+            ):
+                cluster_options["fused_scan_bf16"] = True
+            if dtype is torch.bfloat16 and k == 512 and n_kernel == 262127 and num_rows == 1:
+                cluster_options["hint_samples"] = 128
+            if (
+                dtype is torch.bfloat16
+                and k == 1024
+                and num_rows <= 4
+                and n_kernel >= 196608
+                and int(plan_free["tpl"][2]) >= 16
+            ):
+                cluster_options["hint_samples"] = 256
         if low and (k == 2048 or plan_free.get("ab", False)):
-            # bits-domain window (single-valued crossing bin): bf16 = the negative-side code window at the
-            # sample minimum, fp16 = the fkey16 window at the sampled K-th anchor (stage B5)
+            # bits-domain window (single-valued crossing bin): BF16 = the negative-side code window
+            # at the sample minimum, FP16 = the fkey16 window at the sampled K-th anchor
             cluster_options["alignbins"] = True
-        cluster_tpl = tuple(plan_free["tpl"])
+
         if (
-            dtype is torch.float16
-            and k == 2048
-            and 0 < num_rows <= 8
-            and cluster_tpl[:3] in ((BLKC, 1, 2), (BLKC, 1, 4))
-            and n_kernel <= 8 * cluster_tpl[0] * cluster_tpl[1] * cluster_tpl[2] + 512
+            dtype is torch.bfloat16
+            and k == 1024
+            and num_rows <= 8
+            and int(plan_free["tpl"][2]) >= 8
+            and n_kernel >= 98304
         ):
-            cluster_tpl = (512, cluster_tpl[1], 2 * cluster_tpl[2], cluster_tpl[3])
-            cluster_options["quadc"] = 384
-            cluster_options["tailsamp"] = 193
+            cluster_options["static_env_bf16"] = (n_kernel, npad, k)
+        if (
+            dtype is torch.bfloat16
+            and k <= 1024
+            and int(plan_free["tpl"][1]) <= 2
+            and (
+                int(plan_free["tpl"][2]) <= 4
+                or int(plan_free["tpl"][2]) == 16
+                or int(plan_free["tpl"][2]) == 8
+            )
+        ) or (dtype is torch.bfloat16 and k == 2048 and int(plan_free["tpl"][1]) == 1):
+            cluster_options["async_refine_bf16"] = True
+        if dtype is torch.bfloat16:
+            cluster_options["push_merge_bf16"] = True
+        cluster_tpl = tuple(plan_free["tpl"])
         if dtype is torch.float16 and k == 512 and tuple(cluster_tpl[:3]) == (BLKC, 1, 4):
             cluster_options["nbh"] = 512
         if dtype is torch.float16 and k == 2048 and tuple(cluster_tpl[:3]) == (BLKC, 2, 8):
@@ -2077,6 +2335,8 @@ def _varlen_launcher(
     elif plan_free["kernel"] in ("reg", "regimg"):
         reg_options = dict(dtype_options)
         pcw = False
+        if dtype is torch.bfloat16:
+            reg_options["packed_signcount_bf16"] = num_rows <= 8
         if low:
             reg_options["pk16"] = bool(plan_free.get("pk16", False))
             if k == 2048 and num_rows <= 148 and n_kernel > 2048:
@@ -2090,8 +2350,9 @@ def _varlen_launcher(
                         plan_free["smem"] += 4 * (1024 - old_bins)
             if n_kernel <= 2048:
                 reg_options["packed_prefetch"] = False
-            # bits-domain bracket on DEG rows only; where the bin proof already applies (K=2048,
-            # <= 148 rows) the proof with 1024 bins beats the window by ~5% cold
+            # BF16 bits-domain bracket: DEG rows, and non-DEG rows with >= 1024 bins outside
+            # 4100 <= N <= 8200; never FP16, nor where the bin proof applies (K=2048, <= 148 rows,
+            # N > 2048). Partitioned K=1024 rows reset it below.
             reg_options["alignbins"] = (
                 dtype is not torch.float16
                 and (
@@ -2101,76 +2362,21 @@ def _varlen_launcher(
                 and not reg_options.get("binproof", False)
             )
             reg_options["code_radix"] = (
-                _reg_code_radix(k, n_kernel, num_rows, plan_free, dtype)
-                if _REG_CODE_RADIX_FORCE is None
-                else _REG_CODE_RADIX_FORCE
-            )
-            pcw = (
-                dtype is torch.bfloat16
-                and _REG_CODE_RADIX_FORCE is None
-                and plan_free["kernel"] == "reg"
-                and npad % 64 == 0  # the packed clamp window kernel needs a 64-element row stride
-                and num_rows <= 64
-                and 2 * num_rows <= num_sms
-                and (
-                    (k == 1024 and 4100 < n_kernel <= 16400)
-                    or (k == 512 and 2048 < n_kernel <= 2100)
-                    or (k == 512 and 4096 < n_kernel <= 4100)
-                    or (k == 512 and 16380 < n_kernel <= 16400)
-                    or (k == 2048 and 16380 < n_kernel <= 16416 and num_rows >= 4)
+                bool(plan_free.get("cr2_large", False))
+                or _reg_code_radix(k, n_kernel, num_rows, plan_free, dtype)
+                or (
+                    dtype is torch.float16
+                    and k == 512
+                    and 4100 < n_kernel <= 8207
+                    and num_sms < num_rows <= 2 * num_sms
+                    and plan_free["kernel"] == "reg"
+                    and plan_free["tpl"][1] <= 8
                 )
             )
-            if pcw:
+            if dtype is torch.float16 and (
+                not _REG_CODE_RADIX_16BIT or _REG_CODE_RADIX_FORCE is False
+            ):
                 reg_options["code_radix"] = False
-                if k == 2048:
-                    plan_free["tpl"] = (1024, 4, 1, 2, True, False, False, 1024)
-            keep_parts = (
-                dtype is torch.bfloat16
-                and plan_free["kernel"] == "reg"
-                and not reg_options["code_radix"]
-                and 2 * num_rows <= num_sms
-                and (
-                    (k == 1024 and n_kernel <= 4100)
-                    or (k == 512 and 4096 < n_kernel <= 4100)
-                    or (k == 512 and 16380 < n_kernel <= 16400)
-                )
-            )
-            if (
-                dtype is torch.bfloat16
-                and _REG_CODE_RADIX_FORCE is None
-                and k == 2048
-                and n_kernel <= 16416
-                and not pcw
-            ):
-                reg_options["code_radix"] = True
-            if (
-                dtype is torch.bfloat16
-                and _REG_CODE_RADIX_FORCE is None
-                and not keep_parts
-                and not pcw
-                and plan_free["kernel"] == "reg"
-                and k in (512, 1024)
-                and n_kernel > (k + 3 if k == 512 else 2 * k)
-                and 1 <= plan_free["tpl"][1] <= 8
-                and plan_free["tpl"][0] * plan_free["tpl"][1] <= 4096
-                and (k % plan_free["tpl"][0] == 0 or num_rows <= num_sms)
-            ):
-                tpl = list(plan_free["tpl"])
-                old_bins = tpl[7]
-                tpl[7] = max(old_bins, 512)
-                plan_free["tpl"] = tuple(tpl)
-                plan_free["smem"] += 4 * (tpl[7] - old_bins)
-                reg_options["code_radix"] = True
-            if dtype is torch.bfloat16 and k == 512 and reg_options["code_radix"]:
-                tpl = list(plan_free["tpl"])
-                old_bins = tpl[7]
-                tpl[7] = max(old_bins, 1024)
-                plan_free["tpl"] = tuple(tpl)
-                plan_free["smem"] += 4 * (tpl[7] - old_bins)
-            if dtype is torch.bfloat16 and reg_options["code_radix"] and num_rows <= num_sms:
-                tpl = list(plan_free["tpl"])
-                tpl[2] = 1
-                plan_free["tpl"] = tuple(tpl)
             if dtype is torch.float16 and reg_options["code_radix"] and num_rows <= num_sms:
                 tpl = list(plan_free["tpl"])
                 tpl[2] = 1
@@ -2195,7 +2401,7 @@ def _varlen_launcher(
                 and plan_free["kernel"] == "reg"
                 and plan_free["tpl"][0] == 1024
                 and plan_free["tpl"][1] * 2 <= 8
-                and k != 1024
+                and (k != 1024 or (16384 < n_kernel <= 16448 and num_rows <= num_sms))
             ):
                 tpl = list(plan_free["tpl"])
                 tpl[0] = 512
@@ -2231,6 +2437,201 @@ def _varlen_launcher(
             and (num_rows <= num_sms or k == 2048 or n_kernel > 8000)
         ):
             reg_options["lane_hash"] = True
+        if low:
+            reg_options["cr2"] = bool(
+                dtype is torch.float16
+                and reg_options["code_radix"]
+                and sm_version in (100, 103)
+                and (
+                    n_kernel > 8448
+                    or (num_rows > num_sms and not (n_kernel <= 2112 and num_rows <= 2 * num_sms))
+                )
+            )
+            if reg_options["cr2"]:
+                reg_options.pop("lane_hash", None)
+                tpl_c = tuple(plan_free["tpl"])
+                if (
+                    num_rows > num_sms
+                    and 4096 < n_kernel <= 8207
+                    and tpl_c[0] == 512
+                    and tpl_c[1] <= 4
+                    and (n_kernel <= 6144 or num_rows > 2 * num_sms)
+                ):
+                    plan_free["tpl"] = (
+                        256,
+                        2 * tpl_c[1],
+                        min(2 * tpl_c[2], 8 if tpl_c[1] <= 2 else 4),
+                    ) + tpl_c[3:]
+                    plan_free["block"] = 256
+                tpl_d = tuple(plan_free["tpl"])
+                if (tpl_d[:3] == (512, 8, 2) and num_rows > 2 * num_sms) or (
+                    tpl_d[:3] == (256, 8, 4) and num_rows > 4 * num_sms
+                ):
+                    if (
+                        dtype is torch.float16
+                        and n_kernel <= 4 * tpl_d[0] * tpl_d[1] + tpl_d[0] // 2
+                        and (tpl_d[0] == 512 or k <= 1024)
+                    ):
+                        plan_free["tpl"] = (tpl_d[0] // 2, 16, 2 * tpl_d[2]) + tpl_d[3:]
+                        plan_free["block"] = tpl_d[0] // 2
+                    else:
+                        plan_free["tpl"] = (tpl_d[0], 8, tpl_d[2] + 1) + tpl_d[3:]
+                tpl_e = tuple(plan_free["tpl"])
+                if (
+                    dtype is torch.float16
+                    and num_rows > num_sms
+                    and tpl_e[0] == 256
+                    and tpl_e[1] <= 2
+                    and tpl_e[2] == 8
+                ):
+                    plan_free["tpl"] = (128, 2 * tpl_e[1], 16) + tpl_e[3:]
+                    plan_free["block"] = 128
+            if dtype is torch.float16 and reg_options["code_radix"]:
+                reg_options["static_n"] = n_kernel
+            pcw = (
+                dtype is torch.bfloat16
+                and _REG_CODE_RADIX_FORCE is None
+                and plan_free["kernel"] == "reg"
+                and npad % 64 == 0
+                and num_rows <= 64
+                and 2 * num_rows <= num_sms
+                and (
+                    (k == 1024 and 2048 < n_kernel <= 16400)
+                    or (k == 512 and 2048 < n_kernel <= 2100)
+                    or (k == 512 and 4096 < n_kernel <= 4100)
+                    or (k == 512 and 16380 < n_kernel <= 16400)
+                    or (k == 512 and 8190 < n_kernel <= 8200)
+                    or (k == 512 and 1024 < n_kernel <= 1028 and num_rows <= 64)
+                    or (k == 2048 and 16380 < n_kernel <= 16416)
+                    or (k == 2048 and 4096 < n_kernel <= 4200 and 4 * num_rows <= num_sms)
+                    or (k == 2048 and 8190 < n_kernel <= 8256 and num_rows <= 32)
+                )
+            )
+            if pcw:
+                reg_options["code_radix"] = False
+                if k == 2048 and n_kernel > 8256 and 8 * num_rows > num_sms:
+                    plan_free["tpl"] = (512, 8, 1, 2, True, False, False, 1024)
+                elif k == 2048 and n_kernel > 8256:
+                    plan_free["tpl"] = (1024, 4, 1, 2, True, False, False, 1024)
+                elif k == 2048 and 4096 < n_kernel <= 4200:
+                    plan_free["tpl"] = (512, 2, 1, 1, True, True, False, 1024)
+                elif k == 2048 and 8190 < n_kernel <= 8256:
+                    plan_free["tpl"] = (512, 4, 1, 1, True, True, False, 1024)
+                elif k == 1024 and 8190 < n_kernel <= 8200:
+                    plan_free["tpl"] = (512, 4, 1, 1, True, False, False, 2048)
+                elif k == 512 and 8190 < n_kernel <= 8200:
+                    plan_free["tpl"] = (512, 4, 1, 1, True, False, False, 1024)
+                elif (
+                    k in (512, 1024)
+                    and 16380 < n_kernel <= 16400
+                    and (k == 1024 or 8 * num_rows > num_sms)
+                ):
+                    plan_free["tpl"] = (512, 8, 1, 1, True, False, False, plan_free["tpl"][7])
+                elif k == 1024 and 2048 < n_kernel <= 2100 and num_rows < 64:
+                    plan_free["tpl"] = (256, 2) + tuple(plan_free["tpl"][2:])
+            keep_parts = (
+                dtype is torch.bfloat16
+                and plan_free["kernel"] == "reg"
+                and not reg_options["code_radix"]
+                and 2 * num_rows <= num_sms
+                and (
+                    (k == 1024 and n_kernel <= 4100)
+                    or (k == 512 and 4096 < n_kernel <= 4100)
+                    or (k == 512 and 16380 < n_kernel <= 16400)
+                )
+            )
+            if (
+                dtype is torch.bfloat16
+                and _REG_CODE_RADIX_16BIT
+                and _REG_CODE_RADIX_FORCE is None
+                and k == 2048
+                and n_kernel <= 16416
+                and not pcw
+            ):
+                reg_options["code_radix"] = True
+                if num_rows <= num_sms and tuple(plan_free["tpl"][:2]) == (1024, 1):
+                    tpl = list(plan_free["tpl"])
+                    tpl[0] = 512
+                    tpl[1] *= 2
+                    plan_free["tpl"] = tuple(tpl)
+                if 64 < num_rows <= num_sms and tuple(plan_free["tpl"][:2]) == (512, 8):
+                    plan_free["tpl"] = (
+                        (1024, 4) + (plan_free["tpl"][2], 2) + tuple(plan_free["tpl"][4:])
+                    )
+            if (
+                dtype is torch.bfloat16
+                and _REG_CODE_RADIX_16BIT
+                and _REG_CODE_RADIX_FORCE is None
+                and not keep_parts
+                and not pcw
+                and plan_free["kernel"] == "reg"
+                and k in (512, 1024)
+                and n_kernel > (k + 3 if k == 512 else 2 * k)
+                and 1 <= plan_free["tpl"][1] <= 8
+                and plan_free["tpl"][0] * plan_free["tpl"][1] <= 4096
+                and (k % plan_free["tpl"][0] == 0 or num_rows <= num_sms)
+            ):
+                tpl = list(plan_free["tpl"])
+                old_bins = tpl[7]
+                tpl[7] = max(old_bins, 512)
+                plan_free["tpl"] = tuple(tpl)
+                plan_free["smem"] += 4 * (tpl[7] - old_bins)
+                reg_options["code_radix"] = True
+            if dtype is torch.bfloat16 and k == 512 and reg_options["code_radix"]:
+                tpl = list(plan_free["tpl"])
+                old_bins = tpl[7]
+                tpl[7] = max(old_bins, 1024)
+                plan_free["tpl"] = tuple(tpl)
+                plan_free["smem"] += 4 * (tpl[7] - old_bins)
+            if dtype is torch.bfloat16 and reg_options["code_radix"] and num_rows <= num_sms:
+                tpl = list(plan_free["tpl"])
+                tpl[2] = 1
+                plan_free["tpl"] = tuple(tpl)
+            if (
+                dtype is torch.bfloat16
+                and reg_options["code_radix"]
+                and k == 1024
+                and 64 < num_rows <= num_sms
+                and plan_free["tpl"][0] == 1024
+                and 2 * plan_free["tpl"][1] <= 8
+            ):
+                tpl = list(plan_free["tpl"])
+                tpl[0] //= 2
+                tpl[1] *= 2
+                plan_free["tpl"] = tuple(tpl)
+            if (
+                dtype is torch.bfloat16
+                and reg_options["code_radix"]
+                and num_sms < num_rows <= 4 * num_sms
+                and (num_rows > 2 * num_sms or k == 1024)
+            ):
+                tpl = list(plan_free["tpl"])
+                waves = (num_rows + num_sms - 1) // num_sms
+                need = 1
+                while need < waves:
+                    need <<= 1
+                if need < tpl[2]:
+                    tpl[2] = need
+                    plan_free["tpl"] = tuple(tpl)
+            if (
+                dtype is torch.bfloat16
+                and reg_options["code_radix"]
+                and k == 2048
+                and num_rows >= 512
+                and int(plan_free["tpl"][1]) <= 4
+            ):
+                tpl = list(plan_free["tpl"])
+                tpl[2] = 3
+                plan_free["tpl"] = tuple(tpl)
+        if (
+            dtype is torch.bfloat16
+            and k == 2048
+            and reg_options["code_radix"]
+            and num_rows > 2 * num_sms
+            and n_kernel <= 8256
+        ):
+            plan_free["tpl"] = (256, 4 if n_kernel <= 4200 else 8, 4, 1, True, True, False, 1024)
+            plan_free["block"] = 256
         stage_output = False
         reg_parts = 1
         tpl_r = tuple(plan_free["tpl"])
@@ -2242,27 +2643,49 @@ def _varlen_launcher(
             and not reg_options["code_radix"]
             and (tpl_r[2] * tpl_r[0] <= 1024 or tpl_r[1] == 1)
             # K=512 linear-bin rows (4100..8200, no bits-domain window) refine too often: partitioning loses
-            and not (k == 512 and 4100 <= n_kernel <= 8200)
-            # K=1024 N~2K at 3-8 rows: partitioned emit's 12-32 CTAs leave the small-grid regime on some B200s
-            # (0.97-0.98x there, 1.02-1.11x unpartitioned); K=512 keeps it (+6%)
-            and not (k == 1024 and 2048 < n_kernel <= 2100 and 3 <= num_rows <= 8)
+            and not (k == 512 and 4100 <= n_kernel <= 8200 and not pcw)
         ):
-            if 4 >= 4 and 4 * num_rows <= num_sms:
+            if (
+                pcw
+                and 8 * num_rows <= num_sms
+                and (tpl_r[1] >= 4 or (k == 2048 and tpl_r[1] >= 2))
+                and not (k == 1024 and n_kernel > 16000 and tpl_r[0] == 512)
+            ):
+                reg_parts = 8
+            elif 4 * num_rows <= num_sms:
                 reg_parts = 4
             elif 2 * num_rows <= num_sms:
                 reg_parts = 2
+        if (
+            dtype is torch.bfloat16
+            and pcw
+            and reg_parts > 1
+            and (k == 1024 or (k == 512 and n_kernel <= 1028))
+            and plan_free["tpl"][2] > 1
+        ):
+            tpl_m1 = list(plan_free["tpl"])
+            tpl_m1[2] = 1
+            plan_free["tpl"] = tuple(tpl_m1)
+            tpl_r = tuple(plan_free["tpl"])
         if reg_parts > 1 and k == 1024 and not reg_options.get("binproof", False):
             # K=1024 linear-bin rows refine; partitioned rows take the bits-domain window
             reg_options["alignbins"] = tpl_r[7] >= 1024
         if low:
-            # the dtype-neutral #20106 register-path options, FP32 rules (floor-0.97 step 1)
-            bf16_small_k_resident = (
+            # FP32's register-path option rules, then the 16-bit overrides
+            small_k_resident_16bit = (
                 k == 512 and num_rows > num_sms and n_kernel > 4096 and sm_version in (100, 103)
             )
             stage_output = num_rows > num_sms and not (
                 k <= 512 and n_kernel <= 2 * k and num_rows <= 2 * num_sms
             )
             if k == 2048 and n_kernel > k and num_rows <= num_sms and sm_version in (100, 103):
+                stage_output = True
+            if (
+                dtype is torch.bfloat16
+                and k == 1024
+                and reg_options["code_radix"]
+                and 64 < num_rows <= num_sms
+            ):
                 stage_output = True
             if (
                 dtype is torch.float16
@@ -2275,18 +2698,21 @@ def _varlen_launcher(
                 stage_output = True
             if reg_parts > 1:
                 stage_output = False
-            bf16_static_k = (
+            if reg_options.get("cr2", False):
+                stage_output = True
+            static_k_16bit = (
                 None
                 if k <= 512
                 and tuple(plan_free["tpl"][:2]) == (1024, 1)
                 and not (dtype is torch.bfloat16 and reg_options["code_radix"])
+                and not reg_options.get("cr2", False)
                 else k
             )
-            bf16_static_npad = (
+            static_npad_16bit = (
                 npad
                 if (
                     k in (1024, 2048)
-                    or bf16_small_k_resident
+                    or small_k_resident_16bit
                     or (k == 1024 and plan_free["tpl"][0] == 512 and plan_free["tpl"][1] >= 5)
                     or (k == 1024 and num_rows in (512, 1024) and 1536 < (n_kernel >> 2) <= 2048)
                 )
@@ -2294,6 +2720,38 @@ def _varlen_launcher(
                 and sm_version in (100, 103)
                 else None
             )
+            if (
+                dtype is torch.bfloat16
+                and k == 1024
+                and num_rows <= 64
+                and not pcw
+                and not reg_options["code_radix"]
+            ):
+                reg_options["static_env_bf16"] = (n_kernel, npad, k)
+            if dtype is torch.bfloat16 and pcw and k == 1024 and num_rows <= 2:
+                tpl = list(plan_free["tpl"])
+                if (
+                    tpl[0] >= 512
+                    and tpl[0] * 4 * tpl[1] < 16384
+                    and 2 * tpl[1] <= 10
+                    and n_kernel <= tpl[0] * 4 * tpl[1] + tpl[0] // 2
+                ):
+                    tpl[0] //= 2
+                    tpl[1] *= 2
+                    plan_free["tpl"] = tuple(tpl)
+            if (
+                dtype is torch.float16
+                and k <= 1024
+                and (num_rows <= num_sms or n_kernel <= 2112)
+                and (num_rows <= 2 * num_sms or n_kernel <= 1088)
+                and (
+                    (n_kernel <= 4160 and plan_free["tpl"][1] <= 2)
+                    or (n_kernel <= 8448 and plan_free["tpl"][1] <= 4)
+                )
+                and reg_options.get("code_radix", False)
+                and not reg_options.get("cr2", False)
+            ):
+                reg_options["fp16_radix_impl"] = 2
             fn = dev.get_compiled__reg(
                 tuple(plan_free["tpl"]),
                 varlen=True,
@@ -2301,14 +2759,16 @@ def _varlen_launcher(
                 cr_shift=cr_shift,
                 hint_free=True,
                 stage_output=stage_output,
-                static_k=bf16_static_k,
-                static_npad=bf16_static_npad,
+                static_k=static_k_16bit,
+                static_npad=static_npad_16bit,
                 dense_bracket=k <= 512,
                 dense_lower_bound=k > 512 and n_kernel < 2 * k,
                 bracket_sample_lanes=32 if k == 1024 and 6144 < n_kernel <= 8256 else 1,
                 warp_rank=n_kernel > k and sm_version in (100, 103),
                 parts=reg_parts,
                 pcw=pcw,
+                pcw_cluster=pcw and reg_parts > 1 and (reg_parts < 8 or reg_parts * num_rows <= 64),
+                pcw_bins=512 if (pcw and dtype is torch.bfloat16 and k == 2048) else 1024,
                 **reg_options,
             )
         else:
@@ -2375,6 +2835,28 @@ def _varlen_launcher(
         )
     elif plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
+        clus_options = dict(dtype_options)
+        if (
+            dtype is torch.bfloat16
+            and int(plan_free["tpl"][4]) == 4
+            and (k >= 1024 or n_kernel <= 196608)
+        ):
+            clus_options["sample_floor_bf16"] = 3072
+        if (
+            dtype is torch.bfloat16
+            and int(plan_free["tpl"][4]) == 8
+            and k == 1024
+            and n_kernel > 196608
+        ):
+            clus_options["sample_floor_bf16"] = 3072
+        if dtype is torch.bfloat16:
+            clus_options["envf"] = True
+        if dtype is torch.bfloat16:
+            clus_options["async_refine_bf16"] = True
+        if dtype is torch.bfloat16 and int(plan_free["tpl"][4]) >= 4:
+            clus_options["fused_merge_bf16"] = True
+        if dtype is torch.bfloat16 and k <= 1024:
+            clus_options["push_merge_bf16"] = True
         fn = dev.get_compiled__clus(
             tuple(plan_free["tpl"]),
             scap=rt_f["SCAP"],
@@ -2384,15 +2866,29 @@ def _varlen_launcher(
             cr_shift=cr_shift,
             hint_free=True,
             det=det,
-            **dtype_options,
+            **clus_options,
         )
-        lc = ("clus", fn, (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], 0, 0, 0, 0, 0))
+        e_smp, e_tgt, e_ss2, e_tgt2 = 0, 0, 0, 0
+        if clus_options.get("envf", False):
+            e_smp, e_tgt, e_ss2, e_tgt2 = _clus_env_samples(
+                n_kernel,
+                k,
+                int(plan_free["tpl"][4]),
+                num_rows,
+                rt_f["SCAP"],
+                int(clus_options.get("sample_floor_bf16", 256)),
+            )
+        lc = (
+            "clus",
+            fn,
+            (n_kernel, npad, k, rt_f["SCAP"], rt_f["CMP"], e_smp, e_tgt, 0, e_ss2, e_tgt2),
+        )
     else:
         if low:
-            plan = _route_streaming_bf16(num_rows, n_route, npad, k, force_main=True, dtype=dtype)
+            plan = _route_streaming_16bit(num_rows, n_route, npad, k, force_main=True, dtype=dtype)
         else:
             plan = route_streaming(num_rows, n_route, npad, k, force_main=True)
-        tpl = tuple(plan["tpl"])
+        tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
         rt = plan["rt"]
         r_const = rt["R"]
         main_options = dict(dtype_options)
@@ -2422,6 +2918,14 @@ def _varlen_launcher(
                     )
                 ):
                     main_options["dense"] = False
+                if dtype is torch.bfloat16 and num_rows > 4 * num_sms:
+                    main_options["regsel"] = True
+                if dtype is torch.bfloat16:
+                    main_options["envf"] = True
+                if dtype is torch.bfloat16 and sm_version in (100, 103):
+                    main_options["warp_rank"] = True
+                    if r_const == 1 and (k == 2048 or main_options["v16"]):
+                        main_options["staged_k"] = k
                 if dtype is torch.float16 and not tpl[5]:
                     main_options["p2"] = (
                         int(tpl[0]) < 512 or n_kernel * num_rows <= 48 * 1024 * 1024
@@ -2437,7 +2941,6 @@ def _varlen_launcher(
                 warp_rank=k == 2048 and sm_version in (100, 103),
                 staged_k=k if k == 2048 and r_const == 1 and sm_version in (100, 103) else 0,
             )
-        # TSHG is dead under varlen; normalize it out of the compile key.
         big = num_rows * r_const <= 148
         if low:
             if r_const > 2 and k > 1024:
@@ -2454,6 +2957,10 @@ def _varlen_launcher(
             split_sfac = 32 if r_const == 2 else 48 if k > 1024 else 16
             unsplit_aim = 4 * k if k >= 1024 else 2 * k
             amin = 3 * k if r_const == 2 else 7 * k // 2
+            # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
+            # num_rows > 15 would strand small batches in SPLIT-main without the
+            # staged floor (a distribution-dependent tail regression); the kernel
+            # gates TSH per row at runtime anyway.
             tsh_en = 1 if tpl[5] and k <= 1024 else 0
         aim_base = (
             (unsplit_aim if r_const == 1 else split_aim)
@@ -2464,17 +2971,26 @@ def _varlen_launcher(
         )
         if (
             dtype is torch.bfloat16
+            and k == 1024
+            and r_const == 1
+            and num_rows > num_sms
+            and int(tpl[0]) == 256
+            and 100000 < n_kernel <= 140000
+        ):
+            aim_base = 2 * k
+        if (
+            dtype is torch.bfloat16
             and k <= 512
             and r_const == 1
             and num_rows > num_sms
             and int(tpl[0]) == 256
-            and not 16000 < n_kernel <= 16500
+            and not (16000 < n_kernel <= 16500)
         ):
-            aim_base = 2 * k
+            aim_base = 7 * k // 4 if (n_env <= 16400 or 65536 < n_env <= 131100) else 2 * k
         sfac = split_sfac if r_const > 1 else 64 if k >= 1024 else 32
         sd_en = 1 if k > 1024 and not big else 0
         if dtype is torch.float16:
-            main_options["samp_rounds"] = _f16_main_samp_rounds(
+            main_options["samp_rounds"] = _main_samp_rounds_fp16(
                 n_kernel,
                 k,
                 int(tpl[0]),
@@ -2486,8 +3002,26 @@ def _varlen_launcher(
                 amin,
                 sd_en,
             )
-            if not tpl[5] and int(tpl[0]) == 256:
+            if not tpl[5] and (
+                int(tpl[0]) == 256
+                or (
+                    k <= 1024
+                    and 131072 < n_kernel <= 131584
+                    and num_rows > num_sms
+                    and int(tpl[0]) >= 512
+                )
+            ):
                 main_options["env_first"] = True
+            if (
+                not tpl[5]
+                and int(tpl[0]) == 256
+                and int(tpl[1]) == 8
+                and num_rows > 4 * num_sms
+                and k == 2048
+            ):
+                main_options["load_ahead"] = True
+
+        # TSHG (tpl[6]) is dead under varlen; normalize it out of the compile key.
         fn = dev.get_compiled(
             tpl[:6] + (False,) + (next_n, cr_shift, r_const),
             hint_free=True,
@@ -2506,6 +3040,26 @@ def _varlen_launcher(
             0,
             0,
         )
+        if main_options.get("envf", False):
+            blk_m, kpt_m, split_m = int(tpl[0]), int(tpl[4]), bool(tpl[5])
+            scpb_m = _gvr_main_gate(blk_m, kpt_m, split_m)[0]
+            e_smp, e_tgt, e_ss2, e_tgt2 = _main_env_samples(
+                n_kernel, k, aim_base, sfac, amin, sd_en, scpb_m, r_const
+            )
+            e_q = ((n_kernel >> 3) + r_const - 1) // r_const if split_m else 0
+            pre = (
+                n_kernel,
+                npad,
+                k,
+                rt["SCAP_"],
+                rt["CMP_"],
+                r_const,
+                e_smp,
+                e_tgt,
+                e_q,
+                e_ss2,
+                e_tgt2,
+            )
         tail = (aim_base, sfac, amin, sd_en, tsh_en)
         lc = ("main", fn, pre, tail)
     cache[key] = lc
@@ -3060,7 +3614,8 @@ def run_varlen(
 
     The 16-bit dtypes (bfloat16, float16) use the shared kernel templates with 16-bit
     tuning; they require a row stride divisible by eight and a 16-byte aligned base;
-    optional values remain FP32. Input conversion, if needed, belongs to the caller.
+    optional values remain FP32, and ``deterministic`` / ``sorting`` raise (float32 only).
+    Input conversion, if needed, belongs to the caller.
 
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
@@ -3073,10 +3628,10 @@ def run_varlen(
     function of the capture-stable launcher key.
     """
     if logits.dtype is not torch.float32:
-        if logits.dtype in _LOW_DTYPES:
+        if logits.dtype in _DTYPES_16BIT:
             if deterministic or sorting is not None:
                 raise RuntimeError("deterministic mode requires float32 logits")
-            return _run_varlen_16(
+            return _run_varlen_16bit(
                 logits,
                 kv_lens,
                 indices,
@@ -3228,7 +3783,7 @@ def run_varlen(
     return
 
 
-def _run_varlen_16(
+def _run_varlen_16bit(
     logits: torch.Tensor,
     kv_lens: torch.Tensor,
     indices: torch.Tensor,
@@ -3246,7 +3801,7 @@ def _run_varlen_16(
     output view and -FLT_MAX padding as FP32 decode. Supplying
     max_seq_len avoids device-to-host reads; use the exact uncompressed
     envelope, not the padded storage width, to preserve dispatch."""
-    if logits.dtype not in _LOW_DTYPES:
+    if logits.dtype not in _DTYPES_16BIT:
         raise RuntimeError(
             f"logits must be bfloat16 or float16 (got {logits.dtype}); fp32 -> run_varlen"
         )
@@ -3288,8 +3843,6 @@ def _run_varlen_16(
         ws = _ws_hot.get(d)
         if ws is None:
             ws = default_workspace(logits)
-    if not (logits.is_cuda and indices.is_cuda):
-        raise RuntimeError("all tensors must be CUDA")
     if indices.dtype is not _I32:
         raise RuntimeError("indices must be int32")
     if len(indices.shape) != 2 or indices.shape[0] != num_rows:
@@ -3346,7 +3899,7 @@ def _run_varlen_16(
             )
         # Serialize cold compilation across 16-bit families. Shared-memory layouts
         # are instance constants; warmed launches never take the lock.
-        with _BF16_COMPILE_LOCK, torch.cuda.device(d):
+        with _COMPILE_LOCK_16BIT, torch.cuda.device(d):
             num_sms, sm_version = _unpack_device_profile(profile)
             lc = _varlen_launcher(
                 num_rows,
@@ -3383,9 +3936,6 @@ def _run_varlen_16(
     return
 
 
-_run_varlen_bf16 = _run_varlen_16  # name kept for existing callers
-
-
 def run_prefill(
     logits: torch.Tensor,
     row_starts: torch.Tensor,
@@ -3407,7 +3957,7 @@ def run_prefill(
     if logits.dtype not in _DTYPE_TAG:
         raise RuntimeError(f"logits must be float32, bfloat16 or float16 (got {logits.dtype})")
     dtype_tag = _DTYPE_TAG[logits.dtype]
-    if logits.dtype in _LOW_DTYPES and det:
+    if logits.dtype in _DTYPES_16BIT and det:
         raise RuntimeError("deterministic mode requires float32 logits")
     elems16 = 16 // logits.element_size()  # elements per 16-byte vector
     for _nm, _t in (("row_starts", row_starts), ("row_ends", row_ends)):
@@ -3500,7 +4050,7 @@ def prefill_ready(
     deterministic: bool = False,
 ) -> bool:
     """True iff ``run_prefill(logits, ..., indices, max_row_len)`` would launch
-    without compiling — the same (tier, k, envelope bucket) keys it looks up, so
+    without compiling — the same (tier, k, envelope bucket, dtype) keys it looks up, so
     a caller can route around the engine under CUDA graph capture. Host-only.
     Pass the same ``max_row_len`` as the ``run_prefill`` call (the envelope
     bucket, and with it the tier, is derived from it)."""
@@ -3587,10 +4137,13 @@ def warmup_varlen(
     must pass it; the 64-element default only matches producers that round
     the same way.
 
+    ``dtype`` (keyword-only) selects the float32, bfloat16 or float16 engines. The 16-bit
+    dtypes launch every requested row count (no band enumeration), need a row stride that is
+    a multiple of 8 and reject ``deterministic``.
     """
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"decode warmup requires float32, bfloat16 or float16, got {dtype}")
-    low = dtype in _LOW_DTYPES
+    low = dtype in _DTYPES_16BIT
     if low and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
@@ -3702,7 +4255,8 @@ def warmup_varlen(
             bands_done = key in _VARLEN_WARMUP_DONE
     if not bands_done:
         rows_max = rows_list[-1]
-        # Both dtypes share one arena; shorter geometries use contiguous views.
+        # one allocation at the largest geometry; smaller row counts run on
+        # contiguous prefix views (compile keys depend on shapes only)
         logits = torch.zeros((rows_max, npad), dtype=dtype, device=dev)
         kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
         out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
@@ -3763,7 +4317,7 @@ def warmup_prefill(
     if dtype not in _DTYPE_TAG:
         raise RuntimeError(f"warmup_prefill supports float32, bfloat16 or float16, got {dtype}")
     elems16 = 16 // dtype.itemsize
-    if dtype in _LOW_DTYPES and deterministic:
+    if dtype in _DTYPES_16BIT and deterministic:
         raise RuntimeError("deterministic mode requires float32 logits")
     dev = torch.cuda.current_device()
     k = int(top_k)

@@ -333,6 +333,8 @@ def test_gvr_v2_decode_is_hint_free(monkeypatch) -> None:
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("padded_rows", [False, True])
 def test_gvr_v2_decode_preserves_native_input(monkeypatch, dtype, padded_rows) -> None:
+    """Aligned FP32, BF16 and FP16 decode scores reach the self-sampling runner as the caller's
+    tensor, without a copy or a cast."""
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
@@ -393,7 +395,9 @@ def test_gvr_v2_decode_forwards_deterministic_kwargs(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gvr_v2_decode_deterministic_low_precision_widens_to_fp32(monkeypatch, dtype) -> None:
+def test_gvr_v2_decode_deterministic_16bit_widens_to_fp32(monkeypatch, dtype) -> None:
+    """Deterministic decode widens 16-bit scores to an aligned FP32 copy for the FP32-only
+    deterministic engine and forwards the deterministic options."""
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
@@ -475,6 +479,8 @@ def test_gvr_v2_hardware_gate_falls_back_without_prior(monkeypatch) -> None:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("layout", ["row_stride", "inner_stride", "base", "single_row_width"])
 def test_gvr_v2_16bit_unaligned_layout_falls_back(monkeypatch, layout, dtype) -> None:
+    """16-bit scores that break the 16-byte load layout (row stride or single-row width not a
+    multiple of 8, strided columns, unaligned base) fall back to indexer_topk_decode."""
     runner = _install_fake_selfsampling_runner(monkeypatch)
     decode = Mock()
     monkeypatch.setattr(torch.ops.trtllm, "indexer_topk_decode", decode)
