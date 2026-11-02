@@ -266,7 +266,7 @@ class MiniMaxH3Attention(Attention):
 
     def _out_proj(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """``to_out`` on the attention output; with a static-NVFP4 ``to_out`` the BF16 output is quantized
-        by ``fused_out_quant`` (lever 17) instead of the Linear's ``fp4_quantize`` and handed over as
+        by ``fused_out_quant`` instead of the Linear's ``fp4_quantize`` and handed over as
         ``Fp4QuantizedTensor``. ``H3_OUT_QUANT=0`` keeps the Linear's own quantize."""
         out = self.to_out[0]
         if (
