@@ -1092,7 +1092,8 @@ def test_t5_encoder_input_above_max_num_tokens_fails_alone(
             RequestError,
             match=(
                 rf"encoder tokens \({len(too_long_ids)}\) exceeds the limit value "
-                rf"\({_MAX_SEQUENCE_LENGTH}\) of one encoder iteration"
+                rf"\({_MAX_SEQUENCE_LENGTH}\) of one encoder iteration "
+                rf"\(max_num_tokens={_MAX_SEQUENCE_LENGTH},"
             ),
         ):
             llm.generate(too_long_ids, sampling_params=sampling_params, use_tqdm=False)
