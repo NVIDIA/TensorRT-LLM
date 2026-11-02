@@ -191,3 +191,72 @@ def test_arrival_time_is_set():
     with TestClient(app) as client:
         response = client.get("/probe")
     assert response.json() == {"server_arrival_time": 123.25}
+
+
+_SETDEFAULT_FAILURE = (
+    "ServerArrivalTimeMiddleware replaced scope['state']; it must use setdefault, so state "
+    "set by outer middleware or the lifespan survives"
+)
+
+
+class _OuterStateMiddleware:
+    """Pure ASGI middleware that writes into the request state before the built-ins run."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            scope.setdefault("state", {})["outer"] = 1
+        await self.app(scope, receive, send)
+
+
+def test_state_from_an_outer_middleware_survives():
+    app = FastAPI()
+    register_middlewares(
+        app,
+        collect_perf_metrics=False,
+        expose_perf_metrics=False,
+        perf_metrics_writer=None,
+    )
+    app.add_middleware(_OuterStateMiddleware)
+
+    @app.get("/probe")
+    async def probe(request: Request) -> dict:
+        return {
+            "outer": request.state.outer,
+            "has_arrival_time": hasattr(request.state, "server_arrival_time"),
+        }
+
+    with TestClient(app) as client:
+        response = client.get("/probe")
+    assert response.status_code == 200 and response.json() == {
+        "outer": 1,
+        "has_arrival_time": True,
+    }, _SETDEFAULT_FAILURE
+
+
+def test_lifespan_state_survives():
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app):
+        yield {"from_lifespan": 1}
+
+    app = FastAPI(lifespan=lifespan)
+    register_middlewares(
+        app,
+        collect_perf_metrics=False,
+        expose_perf_metrics=False,
+        perf_metrics_writer=None,
+    )
+
+    @app.get("/probe")
+    async def probe(request: Request) -> dict:
+        return {"from_lifespan": request.state.from_lifespan}
+
+    with TestClient(app) as client:
+        response = client.get("/probe")
+    assert response.status_code == 200 and response.json() == {"from_lifespan": 1}, (
+        _SETDEFAULT_FAILURE
+    )

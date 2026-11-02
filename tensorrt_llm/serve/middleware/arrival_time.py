@@ -35,7 +35,7 @@ class ServerArrivalTimeMiddleware:
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             # Add arrival time to scope
-            scope["state"] = {}
+            scope.setdefault("state", {})
             scope["state"]["server_arrival_time"] = self._adjusted_clock.now()
 
         # Pass through the original receive/send - no wrapping!
