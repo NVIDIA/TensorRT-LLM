@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Dict, List, Literal, Optional, Tuple, Union)
 
 import msgspec
 import uvicorn
@@ -237,6 +237,17 @@ def _warn_unresolvable_thinking_once(reasoning_parser: str) -> None:
         "a relayed mode from a context worker. Reasoning content will not be "
         "separated correctly. Check that the context worker is running a "
         "build that relays 'resolved_thinking'.")
+
+
+# The request field that asks each generation route for a structured output.
+# The Anthropic Messages route runs on the chat route, which receives the
+# Messages `output_config.format` as `response_format`.
+_OUTPUT_FORMAT_FIELDS = {
+    "chat": ("Chat Completions API: 'response_format' (Anthropic Messages "
+             "API: 'output_config.format')"),
+    "completions": ("Completions API: 'response_format'"),
+    "responses": ("Responses API: 'text.format'"),
+}
 
 
 def _validate_required_tool_grammar_request(
@@ -1086,6 +1097,28 @@ class OpenAIServer(_VideoRoutesMixin):
                 getattr(self, "_internal_disagg_auth_key", None), request,
                 getattr(self, "server_role", None),
                 None if raw_request is None else raw_request.headers))
+
+    def _warn_if_output_format_unenforced(
+            self, sampling_params: SamplingParams,
+            route: Literal["chat", "completions", "responses"]) -> None:
+        """Warn, once per route, that a requested output format is not enforced.
+
+        A requested output format arrives as
+        ``sampling_params.guided_decoding``. Without a guided decoding backend
+        the engine builds no grammar for it and generates unconstrained, so
+        the request is served as if no format had been requested; this
+        warning is the only sign of that.
+        """
+        if (sampling_params.guided_decoding is None
+                or self.generator.args.guided_decoding_backend is not None):
+            return
+        logger.warning_once(
+            f"{_OUTPUT_FORMAT_FIELDS[route]} is accepted but not enforced: "
+            "the server has no guided decoding backend, so the output is not "
+            "constrained to the requested format. Set "
+            "`guided_decoding_backend: xgrammar` (or `llguidance`) in the "
+            "--config YAML to enforce it.",
+            key=f"{route}_output_format_unenforced")
 
     def _has_cache_transceiver_config(self) -> bool:
         cache_transceiver_config = getattr(
@@ -2127,6 +2160,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
             if required_tool_grammar:
                 _validate_required_tool_grammar_request(
                     request,
@@ -3080,6 +3114,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 gather_generation_logits=self.generator.args.
                 gather_generation_logits,
                 backend=self.generator.args.backend)
+            self._warn_if_output_format_unenforced(sampling_params,
+                                                   "completions")
             add_thinking_budget_logits_processor(
                 sampling_params,
                 reasoning_parser=self.generator.args.reasoning_parser,
@@ -3254,6 +3290,7 @@ class OpenAIServer(_VideoRoutesMixin):
             sampling_params = request.to_sampling_params(
                 vocab_size=self._logit_bias_vocab_size(),
                 reasoning_parser="gpt_oss")
+            self._warn_if_output_format_unenforced(sampling_params, "chat")
             if sampling_params.thinking_token_budget is not None:
                 raise ValueError(
                     "thinking_token_budget is not supported by the Harmony "
@@ -3473,6 +3510,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
+            self._warn_if_output_format_unenforced(sampling_params, "responses")
             if not self.use_harmony:
                 # Detokenize as chat completions does for these parsers: a
                 # parser that reads special tokens needs them kept, and Kimi-K3's
