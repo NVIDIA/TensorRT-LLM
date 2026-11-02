@@ -15,6 +15,25 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def _record_cluster_launches(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record the token count of every call that reaches the cluster kernel.
+
+    The model falls back silently for inputs the kernel rejects, so a test
+    that compares against the fallback must show the kernel actually ran.
+    """
+    from tensorrt_llm._torch.models import musespark_open_boundary
+
+    launches = []
+    cluster_boundary = musespark_open_boundary.cluster_boundary
+
+    def recorded(residual, *args):
+        launches.append(residual.shape[0])
+        return cluster_boundary(residual, *args)
+
+    monkeypatch.setattr(musespark_open_boundary, "cluster_boundary", recorded)
+    return launches
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4, 8, 16, 17, 32])
 @pytest.mark.parametrize("with_gain", [False, True])
 @pytest.mark.parametrize("eps", [1e-6, 1e-5])
@@ -34,11 +53,13 @@ def test_cluster_boundary_rounding_and_mutable_graph(
     if gain is not None:
         gain.normal_(1, 0.1)
 
+    launches = _record_cluster_launches(monkeypatch)
     # Compile on the eager stream, then capture on the graph stream.
     gate.add_after_rmsnorm_and_norm(residual, branch, eps, norm, gain)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = gate.add_after_rmsnorm_and_norm(residual, branch, eps, norm, gain)
+    assert launches == [tokens, tokens]
     for scale in (1e-3, 1.0, 1e3):
         residual.normal_().mul_(scale)
         branch.normal_().mul_(scale)
@@ -144,10 +165,12 @@ def test_cluster_boundary_side_stream_and_gate_cache(
                 gate.cache_derived_state()
             norm = RMSNorm(hidden_size=8192, eps=1e-5, dtype=torch.bfloat16, use_gemma=True).cuda()
             norm.weight.normal_(0, 0.02)
+            launches = _record_cluster_launches(monkeypatch)
             gate.add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm, gain)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 actual = gate.add_after_rmsnorm_and_norm(residual, branch, 1e-5, norm, gain)
+            assert launches == [tokens, tokens]
             for _ in range(8):
                 residual.normal_()
                 branch.normal_()

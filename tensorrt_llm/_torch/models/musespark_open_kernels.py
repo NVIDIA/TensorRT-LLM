@@ -353,7 +353,7 @@ def _router_tensorcore_kernel(
     hidden_states,
     weight,
     partials,
-    TOKENS: tl.constexpr,
+    num_tokens,
 ):
     # Sixteen tokens share each weight tile. The 8192-wide dot product is split
     # into sixteen 512-wide chunks whose FP32 partials the reduce kernel sums;
@@ -366,28 +366,28 @@ def _router_tensorcore_kernel(
         hidden = split * 512 + block * 128 + tl.arange(0, 128)
         x = tl.load(
             hidden_states + tokens[:, None] * 8192 + hidden[None, :],
-            tokens[:, None] < TOKENS,
+            tokens[:, None] < num_tokens,
             other=0.0,
         ).to(tl.float32)
         w = tl.load(weight + experts[None, :] * 8192 + hidden[:, None])
         acc = tl.dot(x, w, acc, input_precision="tf32x3")
     tl.store(
-        partials + split * TOKENS * 256 + tokens[:, None] * 256 + experts[None, :],
+        partials + split * num_tokens * 256 + tokens[:, None] * 256 + experts[None, :],
         acc,
-        tokens[:, None] < TOKENS,
+        tokens[:, None] < num_tokens,
     )
 
 
 @triton.jit
-def _router_tensorcore_reduce_kernel(partials, output, scale, SIZE: tl.constexpr):
+def _router_tensorcore_reduce_kernel(partials, output, scale, size):
     offsets = tl.program_id(0) * 128 + tl.arange(0, 128)
     splits = tl.arange(0, 16)
     values = tl.load(
-        partials + splits[:, None] * SIZE + offsets[None, :],
-        offsets[None, :] < SIZE,
+        partials + splits[:, None] * size + offsets[None, :],
+        offsets[None, :] < size,
         other=0.0,
     )
-    tl.store(output + offsets, tl.sum(values, axis=0) * scale, offsets < SIZE)
+    tl.store(output + offsets, tl.sum(values, axis=0) * scale, offsets < size)
 
 
 def router_projection_supported(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -436,10 +436,10 @@ def router_projection(
     if tokens >= 16:
         partials = torch.empty((16, tokens, 256), device=hidden_states.device, dtype=torch.float32)
         _router_tensorcore_kernel[(triton.cdiv(tokens, 16), 8, 16)](
-            hidden_states, weight, partials, TOKENS=tokens, num_warps=4
+            hidden_states, weight, partials, num_tokens=tokens, num_warps=4
         )
         _router_tensorcore_reduce_kernel[(triton.cdiv(tokens * 256, 128),)](
-            partials, output, scale, SIZE=tokens * 256, num_warps=4
+            partials, output, scale, size=tokens * 256, num_warps=4
         )
         return output
     rows, warps = _router_launch(tokens, overlapped)
