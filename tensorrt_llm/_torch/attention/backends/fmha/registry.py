@@ -20,6 +20,7 @@ from typing import TypeAlias
 from .beam_shared_prefix import BeamSharedPrefixFmha
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flash_attn4_generation import FlashAttn4GenerationFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
@@ -77,6 +78,10 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # batch it supports. It declines eager batches without a shared prefix
         # but serves every n-sample batch a CUDA graph is captured for.
         "sampling_shared_prefix": SamplingSharedPrefixFmha,
+        # Opt-in FlashAttention-4 generation path on SM90 (TLLM_FMHA_LIBS=+flash_attn4_generation):
+        # decode and linear speculative verification. After sampling_shared_prefix, which takes the
+        # n-sample batches it plans.
+        "flash_attn4_generation": FlashAttn4GenerationFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -95,9 +100,11 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
 # Libraries left out of the default set and enabled explicitly through
 # TLLM_FMHA_LIBS: dense PrimTS can add host overhead; beam_shared_prefix and
-# sampling_shared_prefix are narrow-scope beam-search / n-sample paths.
+# sampling_shared_prefix are narrow-scope beam-search / n-sample paths;
+# flash_attn4_generation is an SM90 generation path under evaluation.
 _OPT_IN_FMHA_LIBS: frozenset[str] = frozenset(
-    {"prims_ts", "beam_shared_prefix", "sampling_shared_prefix"})
+    {"prims_ts", "beam_shared_prefix", "sampling_shared_prefix", "flash_attn4_generation"}
+)
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
