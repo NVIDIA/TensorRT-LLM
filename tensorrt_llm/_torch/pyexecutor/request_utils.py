@@ -20,9 +20,6 @@ from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
 
-# Type alias for request queue items (to avoid circular import)
-# The actual RequestQueueItem class is defined in executor_request_queue.py
-
 
 def get_num_child_requests(request: ExecutorRequest) -> int:
     """Get the number of child requests for a given request.
@@ -65,7 +62,9 @@ def derive_attention_dp_per_rank_request_cap(
 
 
 def can_process_attention_dp_request(
-    req_item, all_ranks_num_active_requests: list[int], max_num_active_requests: int
+    req_item: "RequestQueueItem",
+    all_ranks_num_active_requests: list[int],
+    max_num_active_requests: int,
 ) -> bool:
     """Check if a request can be processed immediately for attention DP.
 
@@ -336,7 +335,7 @@ class RequestBroadcaster:
         dist: Distributed,
         hang_detector: HangDetector,
         sync_clock: bool = False,
-    ):
+    ) -> None:
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
