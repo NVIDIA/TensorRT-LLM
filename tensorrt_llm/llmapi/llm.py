@@ -735,7 +735,7 @@ class BaseLLM:
             lora_request (tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest], optional):
                 LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
-                Prompt Adapter request to use for generation, if any. Defaults to None.
+                Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
                 Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
@@ -831,7 +831,7 @@ class BaseLLM:
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
-            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.

@@ -48,7 +48,8 @@ from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
-from tensorrt_llm.inputs.media_io import BaseMediaIO
+from tensorrt_llm.inputs.media_io import (BaseMediaIO,
+                                          log_allowed_local_media_path)
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage
@@ -698,6 +699,7 @@ class OpenAIServer(_VideoRoutesMixin):
             thread_name_prefix="trtllm_media_load",
         )
         BaseMediaIO.set_executor(self._media_load_executor)
+        log_allowed_local_media_path()
         # /metrics reads iteration stats with a blocking call that waits up to
         # 2 s. A dedicated thread keeps those waits off the default executor,
         # which request handling also uses; get_iteration_stats runs at most
@@ -2012,18 +2014,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    if woken_by_timer:
-                        # Idle poll: a non-blocking read on the metrics
-                        # thread, idle while this loop owns the queue.
-                        for llm_stat in await asyncio.get_running_loop(
-                        ).run_in_executor(self._metrics_stats_executor,
-                                          self.generator.get_stats, 0):
-                            self._record_iteration_stat(llm_stat)
-                    else:
-                        async for llm_stat in self.generator.get_stats_async(
-                                timeout=0.5):
-                            self._record_iteration_stat(llm_stat)
+                    # A timer wakeup (multi-frontend launcher poll) reads
+                    # without waiting.
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats,
+                                      0 if woken_by_timer else 0.5):
+                        self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",

@@ -158,7 +158,7 @@ def _sender_and_meta(
     )
     task = transfer_mod.KVSendTask(chunk, DisaggregatedParams(disagg_request_id=401), 0, prompt_len)
     task._unique_rid = 401
-    req_info = transfer_mod.RecvReqInfo(1, "gen", 0, dst_blocks, 401, bounce_dst_base=0x900000)
+    req_info = transfer_mod.RecvReqInfo(1, "gen", 0, dst_blocks, 401)
     meta = sender._build_kv_write_meta(task, req_info)
     sender._enforce_physical_ownership = True
     sender._ownership_poisoned = None
@@ -201,8 +201,10 @@ def test_registration_separates_memory_types_and_device_ids() -> None:
     assert worker._agent.register_memory.call_count == 2
 
 
-@pytest.mark.parametrize("src_offload,dst_offload", [(False, False), (False, True), (True, False)])
-def test_receiver_bypasses_device_bounce_for_host_pools(
+@pytest.mark.parametrize(
+    "src_offload,dst_offload", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_receiver_dispatches_host_and_device_pool_requests(
     src_offload: bool, dst_offload: bool
 ) -> None:
     receiver = object.__new__(transfer_mod.Receiver)
@@ -215,7 +217,6 @@ def test_receiver_bypasses_device_bounce_for_host_pools(
     )
     receiver._enforce_physical_ownership = False
     receiver._get_sender_info = Mock(return_value=src)
-    receiver._bounce = Mock(reserve=Mock(return_value=False))
     receiver._get_session = Mock(return_value=Mock(_sender_endpoints=set()))
     receiver._request_sender_data = Mock()
     task = SimpleNamespace(
@@ -227,8 +228,10 @@ def test_receiver_bypasses_device_bounce_for_host_pools(
     req_info = transfer_mod.RecvReqInfo(1, "gen", 0, [np.array([0])], 401)
     receiver._build_recv_req_info = Mock(return_value=req_info)
     receiver.dispatch_task(task)
-    assert receiver._bounce.reserve.call_count == int(not src_offload and not dst_offload)
-    receiver._request_sender_data.assert_called_once()
+    assert task.expected_transfers == 1
+    receiver._request_sender_data.assert_called_once_with(
+        src.sender_endpoints[0], req_info.to_bytes()
+    )
 
 
 @pytest.mark.parametrize("offload", [False, True])
@@ -241,7 +244,6 @@ def test_transfer_groups_keep_the_same_byte_ranges(offload: bool) -> None:
     assert {(g.src_memory_type, g.dst_memory_type) for g in meta.transfer_groups} == (
         {("VRAM", "DRAM"), ("VRAM", "VRAM")} if offload else {("VRAM", "VRAM")}
     )
-    assert meta.bounce_dst_base == (None if offload else 0x900000)
     request = sender._make_agent_request(meta, 3)
     requests = request.requests if offload else (request,)
     assert len(requests) == (2 if offload else 1)
@@ -303,7 +305,6 @@ def test_one_logical_completion_after_all_grouped_writes(enforce_ownership: bool
     sender._sessions = {401: session}
     sender._device_id = 3
     sender._instance_rank = 0
-    sender._bounce = Mock()
     dealer = Mock()
     sender._get_result_dealer = Mock(return_value=dealer)
 
@@ -323,7 +324,6 @@ def test_one_logical_completion_after_all_grouped_writes(enforce_ownership: bool
     assert task.resources_drained
     assert task.is_done
     dealer.send.assert_called_once()
-    sender._bounce.build_request.assert_not_called()
 
 
 @pytest.mark.parametrize("first_completes", [False, True])
