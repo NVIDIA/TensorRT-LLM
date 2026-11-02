@@ -140,6 +140,13 @@ def RUN_TESTS_EXIT_TESTS_FAILED = 1
 @Field
 def RUN_TESTS_EXIT_TESTS_NOT_RERUN = 4
 
+// Exit code of a failed `sh` step, or null when the step failed for another reason.
+@NonCPS
+def shStepExitCode(Throwable error) {
+    def match = (error?.message ?: "") =~ /script returned exit code (\d+)/
+    return match.find() ? (match.group(1) as int) : null
+}
+
 @Field
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
@@ -5320,6 +5327,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     stage ("[${stageName}] Run Pytest")
     {
         def runTestsExitCode = 0
+        def runTestsError = null
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
@@ -5446,53 +5454,64 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 // No XML_PATH: run_tests.py writes regular, isolated and rerun XMLs to
                 // different files, so the watcher uploads on every interval and relies
                 // on the snapshot's content hash to skip unchanged dirs.
-                withCredentials([usernamePassword(
-                        credentialsId: 'urm-artifactory-creds',
-                        usernameVariable: 'ART_USER',
-                        passwordVariable: 'ART_PASS')]) {
-                    runTestsExitCode = sh(returnStatus: true, script: """
-                        set +e
-                        export STAGE_NAME='${stageName}'
-                        export PROGRESS_TAR='${progressTar}'
-                        export PROGRESS_URL='${progressUrl}'
-                        export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
-                        export POST_TAG='${postTag}'
-                        # ---- background watcher ----
-                        PROGRESS_DONE_FILE='${pytestDoneFile}' \\
-                        PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
-                        LABEL_PREFIX='checkpoint' \\
-                        bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
-                        WATCHER_PID=\$!
+                // Let a non-zero exit throw, so classifyFailure can read this step's log.
+                try {
+                    withCredentials([usernamePassword(
+                            credentialsId: 'urm-artifactory-creds',
+                            usernameVariable: 'ART_USER',
+                            passwordVariable: 'ART_PASS')]) {
+                        sh(script: """
+                            set +e
+                            export STAGE_NAME='${stageName}'
+                            export PROGRESS_TAR='${progressTar}'
+                            export PROGRESS_URL='${progressUrl}'
+                            export TIMEOUT_XML_SCRIPT='${llmSrc}/jenkins/scripts/generate_timeout_xml.py'
+                            export POST_TAG='${postTag}'
+                            # ---- background watcher ----
+                            PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                            PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                            LABEL_PREFIX='checkpoint' \\
+                            bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
+                            WATCHER_PID=\$!
 
-                        # ---- foreground run_tests.py ----
-                        rm -rf '${stageName}/'
-                        cd '${llmSrc}/tests/integration/defs'
-                        python3 ${llmSrc}/jenkins/scripts/run_tests.py \\
-                            --render \\
-                            --test-db-list ${testDBList} \\
-                            --splits ${splits} \\
-                            --group ${splitId} \\
-                            ${perfMode ? '--perf-mode' : ''} \\
-                            --pytest-base-cmd ${pytestBaseCmdArg} \\
-                            ${pytestTargetArgs} \\
-                            --stage-name ${stageName} \\
-                            --output-dir ${WORKSPACE}/${stageName} \\
-                            --working-dir ${llmSrc}/tests/integration/defs \\
-                            --fail-signatures '${failSignaturesList}' \\
-                            ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
-                        rc=\$?
+                            # ---- foreground run_tests.py ----
+                            rm -rf '${stageName}/'
+                            cd '${llmSrc}/tests/integration/defs'
+                            python3 ${llmSrc}/jenkins/scripts/run_tests.py \\
+                                --render \\
+                                --test-db-list ${testDBList} \\
+                                --splits ${splits} \\
+                                --group ${splitId} \\
+                                ${perfMode ? '--perf-mode' : ''} \\
+                                --pytest-base-cmd ${pytestBaseCmdArg} \\
+                                ${pytestTargetArgs} \\
+                                --stage-name ${stageName} \\
+                                --output-dir ${WORKSPACE}/${stageName} \\
+                                --working-dir ${llmSrc}/tests/integration/defs \\
+                                --fail-signatures '${failSignaturesList}' \\
+                                ${clusterDurationsPath ? "--durations-path ${clusterDurationsPath}" : ''}
+                            rc=\$?
 
-                        touch '${pytestDoneFile}'
-                        wait \$WATCHER_PID 2>/dev/null || true
+                            touch '${pytestDoneFile}'
+                            wait \$WATCHER_PID 2>/dev/null || true
 
-                        # ---- immediate final snapshot ----
-                        if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                            LABEL='final snapshot' FINAL_SNAPSHOT=1 \\
-                            bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
-                        fi
+                            # ---- immediate final snapshot ----
+                            if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                                LABEL='final snapshot' FINAL_SNAPSHOT=1 \\
+                                bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                            fi
 
-                        exit \$rc
-                    """)
+                            exit \$rc
+                        """)
+                    }
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    runTestsExitCode = shStepExitCode(e)
+                    if (runTestsExitCode == null) {
+                        throw e
+                    }
+                    runTestsError = e
                 }
                 if (runTestsExitCode != 0) {
                     // Turn "[${stageName}] Run Pytest" red now; the terminal error is
@@ -5572,7 +5591,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // classifySlurmFailure keys off "still failed after rerun attempts" to treat
         // the failure as deterministic and skip the infra retry, so keep that wording
         // for test failures only, and check it before the timeout path.
+        // A test failure whose step log carries an infra signature is rethrown as that
+        // InfraFailure, so the outer retry layer can retry it on a fresh node.
+        def runTestsInfraFailure = null
+        if (runTestsError != null &&
+                runTestsExitCode in [RUN_TESTS_EXIT_TESTS_FAILED, RUN_TESTS_EXIT_TESTS_NOT_RERUN]) {
+            def classified = classifyFailure(
+                pipeline, runTestsError, retryContext?.scope ?: InfraFailure.K8S, retryContext)
+            if (classified instanceof InfraFailure) {
+                runTestsInfraFailure = classified
+            }
+        }
         if (runTestsExitCode == RUN_TESTS_EXIT_TESTS_FAILED) {
+            if (runTestsInfraFailure != null) {
+                throw runTestsInfraFailure
+            }
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
@@ -5581,6 +5614,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         if (runTestsExitCode == RUN_TESTS_EXIT_TESTS_NOT_RERUN) {
+            if (runTestsInfraFailure != null) {
+                throw runTestsInfraFailure
+            }
             error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
 

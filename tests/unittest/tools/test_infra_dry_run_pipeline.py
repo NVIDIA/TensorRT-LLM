@@ -122,24 +122,33 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             classifier.index("retryContext.failureEvidence = evidence"),
         )
 
-    def test_no_rerun_failure_preserves_initial_infra_classification(self) -> None:
-        isolated = _function_body(L0_TEST, "runIsolatedTests", "getInfraDryRunPytestTargets")
+    def test_run_tests_failure_preserves_infra_classification(self) -> None:
         platform = _function_body(
             L0_TEST, "runLLMTestlistOnPlatformImpl", "runLLMTestlistOnPlatform"
         )
-        classify_initial_failure = "classifyFailure(pipeline, e, scope, retryContext)"
 
-        self.assertIn(classify_initial_failure, isolated)
-        self.assertIn("unrerunInfraFailure: unrerunInfraFailure", isolated)
-        self.assertIn(classify_initial_failure, platform)
+        # The run_tests.py step must throw so classifyFailure can read its log.
+        self.assertNotIn("runTestsExitCode = sh(returnStatus", platform)
+        self.assertIn("runTestsExitCode = shStepExitCode(e)", platform)
+        self.assertIn("runTestsError = e", platform)
         self.assertIn(
-            "unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure",
+            "pipeline, runTestsError, retryContext?.scope ?: InfraFailure.K8S, retryContext",
             platform,
         )
+        throw_infra = platform.index("throw runTestsInfraFailure")
         self.assertLess(
-            platform.index("throw unrerunInfraFailure"),
-            platform.rindex('error "Some tests failed and were not eligible for rerun'),
+            throw_infra,
+            platform.index('error "Some tests still failed after rerun attempts'),
         )
+        self.assertLess(
+            platform.rindex("throw runTestsInfraFailure"),
+            platform.index('error "Some tests failed and were not eligible for rerun'),
+        )
+
+    def test_sh_step_exit_code_is_parsed_from_the_step_error(self) -> None:
+        helper = _function_body(L0_TEST, "shStepExitCode", "BUILD_CONFIGS")
+        self.assertIn("@NonCPS", L0_TEST[: L0_TEST.index("def shStepExitCode")][-40:])
+        self.assertIn("script returned exit code (\\d+)", helper)
 
     def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
         result_handler = _function_body(
