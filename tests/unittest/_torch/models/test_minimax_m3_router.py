@@ -17,7 +17,7 @@ from tensorrt_llm._utils import get_sm_version
 HIDDEN, EXPERTS = 6144, 128
 
 
-def test_parse_rows():
+def test_parse_rows() -> None:
     assert _parse_rows("off") == ()
     assert _parse_rows("0") == ()
     assert _parse_rows("8625-16384") == ((8625, 16384),)
@@ -26,7 +26,7 @@ def test_parse_rows():
         _parse_rows("30-20")
 
 
-def _stock_logits(x, split_weight):
+def _stock_logits(x: torch.Tensor, split_weight: torch.Tensor) -> torch.Tensor:
     terms = split_weight.shape[1] // x.shape[1]
     return torch.ops.trtllm.cublas_mm(
         torch.cat([x] * terms, dim=-1), split_weight.t(), bias=None, out_dtype=torch.float32
@@ -38,7 +38,7 @@ def _stock_logits(x, split_weight):
     reason="bitwise equality is verified on SM103 only",
 )
 @pytest.mark.parametrize("rows", [8625, 9000, 12288, 16266, 16322, 16384])
-def test_router_split_logits_bitwise(rows):
+def test_router_split_logits_bitwise(rows: int) -> None:
     torch.manual_seed(rows)
     weight = torch.randn(EXPERTS, HIDDEN, device="cuda") * 0.02
     split_weight = split_router_weight_bf16(weight)
@@ -52,7 +52,7 @@ def test_router_split_logits_bitwise(rows):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_router_split_skips_rows_outside_range(monkeypatch):
+def test_router_split_skips_rows_outside_range(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(minimax_m3_router, "ROUTER_TRITON_ROWS", ((100, 200),))
     split_weight = torch.zeros(EXPERTS, 3 * HIDDEN, dtype=torch.bfloat16, device="cuda")
     x = torch.zeros(99, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -62,7 +62,7 @@ def test_router_split_skips_rows_outside_range(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_router_split_skips_unverified_shapes(monkeypatch):
+def test_router_split_skips_unverified_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(minimax_m3_router, "ROUTER_TRITON_ROWS", ((100, 200),))
     x = torch.zeros(150, HIDDEN, dtype=torch.bfloat16, device="cuda")
     assert not router_split_applies(

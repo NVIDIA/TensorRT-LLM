@@ -403,7 +403,9 @@ def test_cutedsl_score_helper_falls_back_on_unsupported_geometry():
 
 @skip_not_sm100
 @pytest.mark.parametrize("decode_query_len", [1, 7])
-def test_cutedsl_score_helper_matches_registered_op(decode_query_len, monkeypatch):
+def test_cutedsl_score_helper_matches_registered_op(
+    decode_query_len: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """_cutedsl_score calls the runner directly in eager mode; the bytes must match the op's."""
     _runner()
     seq_lens = [max(s, decode_query_len) for s in (300, 4097, 129)]
@@ -416,7 +418,7 @@ def test_cutedsl_score_helper_matches_registered_op(decode_query_len, monkeypatc
     )
 
     # Eager dispatch must not go through the registered op.
-    def _op_must_not_run(*args, **kwargs):
+    def _op_must_not_run(*args: object, **kwargs: object) -> None:
         raise AssertionError("_cutedsl_score called the registered op in eager mode")
 
     monkeypatch.setattr(
