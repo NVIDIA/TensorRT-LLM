@@ -771,6 +771,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             raise RuntimeError(
                 "FlashInfer metadata cannot mix shared and separate draft KV "
                 "views.")
+        if not uses_shared_kv_cache:
+            # The separate view runs on the target's staging copy of the draft manager.
+            self.sync_draft_mixed_precision_staging()
         return self._draft_metadata
 
     def _sync_draft_view(self, target: "FlashInferAttentionMetadata") -> None:
@@ -791,6 +794,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv = None
             self.num_contexts = target.num_contexts
             self._uses_full_draft_page_table = False
+            # Reuse the target's staging copy of a mixed draft manager, which overlap
+            # speculation corrects together with the target's.
+            self.mixed_precision_staging = target.draft_mixed_precision_staging
+            self.draft_mixed_precision_staging = None
             self.prepare()
             torch.add(
                 target._cached_token_lens[:num_seqs],

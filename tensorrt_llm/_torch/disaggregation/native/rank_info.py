@@ -49,6 +49,8 @@ class RankInfo:
     aux_meta: Optional[AuxBufferMeta] = None
     page_table: Optional[KVCachePageTable] = None
     bounded_replay_on_generation: bool = False
+    # Mixed-precision KV: [low dtype, high dtype, first_n, last_n]; None without it.
+    mixed_precision_kv: Optional[List] = None
 
     @property
     def tp_size_per_dp_group(self) -> int:
@@ -114,6 +116,16 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
+            mixed_precision_kv=(
+                [
+                    str(kvm.mixed_precision_low_dtype),
+                    str(kvm.mixed_precision_high_dtype),
+                    kvm.first_n,
+                    kvm.last_n,
+                ]
+                if getattr(kvm, "mixed_precision_low_dtype", None) is not None
+                else None
+            ),
         )
 
     @classmethod

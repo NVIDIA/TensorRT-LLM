@@ -180,7 +180,11 @@ def declared_global_layer_ids(manager: KVCacheManagerV2) -> dict[int, int] | Non
     if getter is None:
         return None
     table: dict[int, int] = {}
+    high_layers = getattr(manager, "mixed_precision_high_layers", None)
+    high = set(high_layers.values()) if isinstance(high_layers, dict) else set()
     for layer_group, layer_ids in enumerate(manager.impl.layer_grouping):
+        if layer_ids and all(int(layer_id) in high for layer_id in layer_ids):
+            continue  # Mixed-precision high layers: KVCacheManagerV2.mixed_precision_transfer_ids.
         ids = [int(value) for value in getter(layer_group)]
         if len(ids) != len(layer_ids):
             raise ValueError(

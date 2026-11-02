@@ -60,7 +60,7 @@ from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils impo
     copy_batch_block_offsets_to_device,
     gather_base_page_rows,
 )
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KVEventsConfig, MixedPrecisionKV
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_hash import get_effective_kv_cache_event_hash_algo
@@ -193,13 +193,6 @@ _RESERVED_REQUEST_IDS = frozenset({_GUARD_PAGE_REQUEST_ID})
 
 # Storage dtypes accepted as the history half of a mixed-precision KV cache.
 _MIXED_PRECISION_LOW_DTYPES = {"nvfp4": DataType.NVFP4}
-
-
-class _MixedPrecisionLayerKind(IntEnum):
-    """Which of a mixed-precision layer's two pools a runtime layer id refers to."""
-
-    PRIMARY = 0
-    HIGH = 1
 
 
 def _parse_kv_fill_value(setting: str, name: str) -> Optional[float]:
@@ -909,6 +902,26 @@ def _get_static_cache_size_layer_components(
             for layer_idx, window in zip(local_layer_ids, attention_windows)
         ]
     return layer_sizes, attention_windows
+
+
+def _mixed_precision_cost_components(
+    layer_sizes: List[int], attention_windows: List[Optional[int]], mixed: MixedPrecisionKV
+) -> tuple[List[int], List[Optional[int]]]:
+    """Cost each mixed-precision layer as its NVFP4 history plus a first/last-token high layer.
+
+    ``layer_sizes`` are bytes per token in the mixed-precision high dtype. Sliding-window layers
+    stay native and keep their cost.
+    """
+    sizes, windows = [], []
+    for size, window in zip(layer_sizes, attention_windows):
+        if window is not None:
+            sizes.append(size)
+            windows.append(window)
+            continue
+        elements = size // (1 if mixed.high == "fp8" else 2)
+        sizes += [math.ceil(elements / 2) + math.ceil(elements / 16), size]
+        windows += [None, mixed.first_n + mixed.last_n + 1]
+    return sizes, windows
 
 
 def _get_layer_spec_cache_size_components(
@@ -1918,9 +1931,17 @@ class KVCacheManagerV2(BaseResourceManager):
             from tensorrt_llm._torch.speculative import get_num_spec_layers
 
             if get_num_spec_layers(spec_config) > 0:
-                self._first_spec_layer_id = getattr(
-                    kwargs.get("pretrained_config"), "num_hidden_layers", num_layers
-                )
+                pretrained_config = kwargs.get("pretrained_config")
+                if pretrained_config is not None:
+                    self._first_spec_layer_id = pretrained_config.num_hidden_layers
+                elif layer_mask is None:
+                    # Draft layers are appended after the declared target layers.
+                    self._first_spec_layer_id = num_layers
+                else:
+                    raise ValueError(
+                        "Mixed-precision KV with a drafter that is not MTP needs pretrained_config "
+                        "to tell the drafter layers of a layer_mask apart."
+                    )
         self.is_draft = is_draft
         self._legacy_draft_layer_ids = {
             global_layer_id
@@ -4102,24 +4123,27 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
-        if not self.mixed_precision_high_layers:
-            return config
-        # Disaggregated transfer derives collision-free ids for the mixed-precision high layers
-        # from this (model layer, kind) mapping; a manager with its own mapping keeps it unchanged.
-        if getattr(self, "_layer_attn_to_layer_id", None) is None:
-            self._layer_attn_to_layer_id = {
-                (model, _MixedPrecisionLayerKind.PRIMARY): LayerId(local)
-                for local, model in enumerate(self.pp_layers)
-            }
-            self._layer_attn_to_layer_id.update(
-                {
-                    (self.pp_layers[local], _MixedPrecisionLayerKind.HIGH): LayerId(high_layer)
-                    for local, high_layer in self.mixed_precision_high_layers.items()
-                }
-            )
         # A configured pool_ratio must now cover the appended mixed-precision high
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
+
+    def mixed_precision_transfer_ids(
+        self, internal_ids: List[int], own_ids: Callable[[List[int]], List[int]]
+    ) -> List[int] | None:
+        """Transfer ids of ``internal_ids`` under mixed-precision KV; None without it.
+
+        Every layer but a mixed-precision high layer doubles the id ``own_ids`` gives it, and the
+        high layer of global model layer L gets 2L + 1: collision-free, and the same on every
+        pipeline rank, whether or not that rank holds a mixed-precision layer.
+        """
+        if self.mixed_precision_low_dtype is None:
+            return None
+        high = {
+            int(high_layer): 2 * int(self.pp_layers[local]) + 1
+            for local, high_layer in self.mixed_precision_high_layers.items()
+        }
+        own = iter(2 * i for i in own_ids([i for i in internal_ids if i not in high]))
+        return [high[i] if i in high else next(own) for i in internal_ids]
 
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
@@ -4150,6 +4174,20 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_layout == "HND":
             shape[2], shape[3] = shape[3], shape[2]
         return convert_to_torch_tensor(TensorWrapper(address, dtype, shape))
+
+    def mixed_precision_page_table_key(self, layer_idx: int) -> tuple[tuple[int, int], ...]:
+        """(layer group, page-index scale) of the low and high pools of a mixed-precision layer.
+
+        Layers with equal keys have identical low and high page tables.
+        """
+        local = self.layer_offsets[layer_idx]
+        return tuple(
+            (
+                int(self.impl.get_layer_group_id(layer)),
+                int(self.impl.get_page_index_converter(layer, Role.KEY).scale),
+            )
+            for layer in (local, self.mixed_precision_high_layers[local])
+        )
 
     def fill_mixed_precision_page_tables(
         self, request_ids: List[int], layer_idx: int, out: np.ndarray
@@ -7633,6 +7671,11 @@ class KVCacheManagerV2(BaseResourceManager):
                     and spec_config.spec_dec_mode.is_external_drafter()
                 ),
             )
+            mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
+            if mixed is not None and not cls._mixed_precision_native_pool:
+                layer_sizes, attention_windows = _mixed_precision_cost_components(
+                    layer_sizes, attention_windows, mixed
+                )
         reuse_backoff_enabled = (
             kv_cache_config is not None
             and kv_cache_config.enable_block_reuse

@@ -47,6 +47,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
     KVCacheManagerV2,
     Role,
+    _mixed_precision_cost_components,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -54,6 +55,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     CacheTypeCpp,
     DataType,
+    KVCacheManager,
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -488,6 +490,34 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if max_resident_sequences > 0:
                 attention_page_bytes_override = attention_intercept // max_resident_sequences
 
+        mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
+        if mixed is not None and attention_slope_override is None:
+            # Mixed-precision attention layers hold an NVFP4 history plus the first/last tokens.
+            _, _, local_attention_layers = _get_local_mamba_cache_layout(
+                model_config,
+                mapping,
+                spec_config=spec_config,
+                is_draft=kwargs.get("is_draft", False),
+                use_separate_draft_kv_cache=kwargs.get("use_separate_draft_kv_cache", False),
+            )
+            high = (
+                KVCacheManager.get_cache_size_per_token(
+                    model_config, mapping, num_layers=local_attention_layers, **kwargs
+                )
+                if local_attention_layers > 0
+                else 0
+            )
+            (attention_slope_override, _), (_, window) = _mixed_precision_cost_components(
+                [high], [None], mixed
+            )
+            attention_intercept = (
+                max_batch_size
+                * mapping.pp_size
+                * math.ceil(window / tokens_per_block)
+                * tokens_per_block
+                * high
+            )
+
         slope, intercept = _estimate_mamba_hybrid_cache_cost(
             model_config,
             mapping,
@@ -535,23 +565,13 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         layer. With it, the MLA latent and HP-ring layers use the policy's
         ``2 * L`` / ``2 * L + 1`` encoding, and recurrent layers use ``2 * L``
         so that the IDs stay collision-free across all of the manager's
-        layers and identical under any pipeline split. Mixed-precision high layers
-        use the same encoding: ``2 * L`` for the model's layers, ``2 * L + 1``
-        for the mixed-precision high layer of layer ``L``.
+        layers and identical under any pipeline split.
         """
         layout_policy = self._attention_cache_layout_policy
-        high_layer_owner = {
-            high_layer: local for local, high_layer in self.mixed_precision_high_layers.items()
-        }
         result = []
         for layer_id in self.impl.layer_grouping[layer_group_id]:
             internal_layer = int(layer_id)
-            if layout_policy is None and high_layer_owner:
-                if internal_layer in high_layer_owner:
-                    global_layer_id = 2 * int(self.pp_layers[high_layer_owner[internal_layer]]) + 1
-                else:
-                    global_layer_id = 2 * int(self.pp_layers[internal_layer])
-            elif layout_policy is None:
+            if layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
