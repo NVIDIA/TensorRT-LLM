@@ -20,7 +20,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     find_closest_target_size,
     resolve_checkpoint_policy_defaults,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     resolve_domain_action_config,
 )
 

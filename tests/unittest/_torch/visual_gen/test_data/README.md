@@ -60,10 +60,10 @@ ffmpeg -y -framerate 24 -i frame_%02d.png \
 
 ## `cosmos3_checkpoint_configs.json`
 
-The settings `config_resolver.RULES` reads, extracted from the
+The settings `parameter_resolver.CHECKPOINT_RULES` reads, extracted from the
 published Cosmos3 checkpoints on Hugging Face (`main`, Fri 23 Oct 2026): for each
 repo, file and key path a rule names, the value at that path, nested back into its
-file. Nothing else from the checkpoints is kept. `test_cosmos3_config_resolver.py`
+file. Nothing else from the checkpoints is kept. `test_cosmos3_parameter_resolver.py`
 resolves every entry, so a new export whose files disagree in a way the precedence
 table does not expect fails the test.
 

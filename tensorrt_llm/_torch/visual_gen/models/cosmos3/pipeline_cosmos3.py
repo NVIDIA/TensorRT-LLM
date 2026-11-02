@@ -68,7 +68,6 @@ from .action import (
     resolve_action_size,
     resolve_domain_id,
 )
-from .config_resolver import Cosmos3ConfigResolver
 from .defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_ASPECT_RATIO_BUCKETS,
@@ -88,7 +87,12 @@ from .defaults import (
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .negative_prompt import COSMOS3_VIDEO_NEGATIVE_PROMPT
-from .request_resolver import RequestContext, resolve_domain_action_config, resolve_generation
+from .parameter_resolver import (
+    RequestContext,
+    resolve_checkpoint,
+    resolve_domain_action_config,
+    resolve_generation,
+)
 from .sampling import DISTILLED_GUIDANCE_SCALE, Cosmos3SamplingPolicy, load_scheduler
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
@@ -616,7 +620,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         # The transformer config is read from the checkpoint directory, not from the
         # loaded pretrained config, whose omitted keys the transformer has already filled.
-        self.cosmos3_config = Cosmos3ConfigResolver(checkpoint_dir).resolve()
+        self.cosmos3_config = resolve_checkpoint(checkpoint_dir)
         logger.info(self.cosmos3_config.describe())
         cfg = self.cosmos3_config
         self.default_use_system_prompt = cfg.prompt.use_system_prompt

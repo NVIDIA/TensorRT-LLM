@@ -25,7 +25,7 @@ from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig, DiffusionPipelineConfig
-from tensorrt_llm._torch.visual_gen.models.cosmos3.config_resolver import fill_pretrained_config
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import fill_pretrained_config
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (
     Cosmos3VFMTransformer,
     Qwen3VLTextRotaryEmbedding,

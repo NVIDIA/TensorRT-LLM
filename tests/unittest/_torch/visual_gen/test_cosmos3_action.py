@@ -37,7 +37,7 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     resolve_checkpoint_policy_defaults,
     resolve_raw_action_dim,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.request_resolver import (
+from tensorrt_llm._torch.visual_gen.models.cosmos3.parameter_resolver import (
     resolve_domain_action_config,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import (

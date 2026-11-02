@@ -43,7 +43,7 @@ from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .config_resolver import fill_pretrained_config
+from .parameter_resolver import fill_pretrained_config
 
 
 def uses_static_fp8(model_config: DiffusionModelConfig) -> bool:
