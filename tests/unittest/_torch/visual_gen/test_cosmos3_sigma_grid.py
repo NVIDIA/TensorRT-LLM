@@ -24,10 +24,15 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler, UniPCMultistepScheduler
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
-from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
+from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
+    Cosmos3OmniMoTPipeline,
+    _transfer_flow_shift,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
     Cosmos3SamplingPolicy,
+    SamplingSchedule,
     native_flow_base_sigmas,
+    native_flow_upper_sigma,
     resolve_sampling_schedule,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
@@ -392,7 +397,7 @@ def _programmed(policy, base, schedule, steps):
     scheduler = policy.set_flow_shift(
         base, schedule.flow_shift, use_karras_sigmas=schedule.use_karras_sigmas
     )
-    policy.set_timesteps(scheduler, steps, device="cpu", grid=schedule.grid)
+    policy.set_timesteps(scheduler, steps, device="cpu", schedule=schedule)
     return scheduler
 
 
@@ -424,6 +429,9 @@ class TestNativeGrid:
         np.testing.assert_allclose(
             _trajectory(scheduler).flatten().tolist(), fixture["final"], rtol=0, atol=1e-7
         )
+
+    def test_grid_starts_at_the_shared_endpoint(self):
+        assert native_flow_base_sigmas(35, 1000)[0] == native_flow_upper_sigma(1000)
 
     def test_upper_level_is_the_framework_float32_endpoint(self):
         levels = native_flow_base_sigmas(35, 1000)
@@ -513,15 +521,15 @@ class TestKarrasGrid:
 
 
 class TestOmittedSelector:
-    """Without sigma_grid every mode keeps its existing grid and shift."""
+    """Without sigma_grid every mode resolves to the grid and shift it ran before."""
 
     def test_base_video_keeps_karras_and_mode_shift(self):
         policy, base = _policy()
         schedule = _resolve(policy, mode_flow_shift=1.0)
         assert (schedule.grid, schedule.flow_shift, schedule.use_karras_sigmas) == (
-            None,
+            "karras",
             1.0,
-            None,
+            True,
         )
         assert not schedule.inactive_flow_shift
         scheduler = _programmed(policy, base, schedule, 35)
@@ -534,7 +542,7 @@ class TestOmittedSelector:
         policy, base = _policy()
         schedule = _resolve(policy, mode_flow_shift=10.0, mode_karras=False)
         assert (schedule.grid, schedule.flow_shift, schedule.use_karras_sigmas) == (
-            None,
+            "diffusers",
             10.0,
             False,
         )
@@ -549,7 +557,7 @@ class TestOmittedSelector:
     def test_native_flow_checkpoint_keeps_its_legacy_grid(self, mode_karras):
         policy, base = _policy(native_flow_schedule=True)
         schedule = _resolve(policy, mode_flow_shift=3.0, mode_karras=mode_karras)
-        assert schedule.grid is None
+        assert schedule.grid == "checkpoint_native_flow"
         scheduler = _programmed(policy, base, schedule, 35)
         legacy = UniPCMultistepScheduler.from_config(
             BASE_UNIPC_CONFIG, flow_shift=3.0, use_karras_sigmas=False
@@ -561,13 +569,15 @@ class TestOmittedSelector:
     def test_explicit_flow_shift_alone_keeps_the_grid_and_is_marked_inactive(self):
         policy, _ = _policy()
         schedule = _resolve(policy, flow_shift=10.0, mode_flow_shift=1.0)
-        assert schedule.grid is None
+        assert schedule.grid == "karras"
         assert schedule.flow_shift == 10.0
+        assert schedule.flow_shift_explicit
         assert schedule.inactive_flow_shift
 
     def test_distilled_keeps_its_fixed_schedule(self):
         schedule = _resolve(_distilled_policy(), flow_shift=5.0, mode_flow_shift=1.0)
-        assert schedule.grid is None
+        assert schedule.grid == "fixed"
+        assert not schedule.inactive_flow_shift
 
 
 class TestRequestContract:
@@ -651,7 +661,20 @@ class TestIsolation:
     def test_grid_mismatch_with_the_scheduler_config_is_an_error(self):
         policy, base = _policy()
         with pytest.raises(RuntimeError, match="does not match"):
-            policy.set_timesteps(base, 35, device="cpu", grid="native")
+            policy.set_timesteps(
+                base, 35, device="cpu", schedule=SamplingSchedule(grid="native", flow_shift=10.0)
+            )
+
+    def test_fixed_grid_only_runs_on_a_distilled_checkpoint(self):
+        policy, base = _policy()
+        with pytest.raises(RuntimeError, match="does not match a base checkpoint"):
+            policy.set_timesteps(
+                base, 35, device="cpu", schedule=SamplingSchedule(grid="fixed", flow_shift=1.0)
+            )
+
+    def test_unknown_grid_names_are_rejected(self):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 sigma grid"):
+            SamplingSchedule(grid="natvie", flow_shift=10.0)
 
     def test_requests_never_mutate_the_checkpoint_scheduler(self):
         policy, base = _policy()
@@ -704,7 +727,7 @@ class TestRepeatedLeadingTimesteps:
         assert scheduler.step_index == steps
         assert torch.isfinite(first).all()
 
-        policy.set_timesteps(scheduler, steps, device="cpu", grid=schedule.grid)
+        policy.set_timesteps(scheduler, steps, device="cpu", schedule=schedule)
         assert torch.equal(_trajectory(scheduler), first)
 
 
@@ -724,24 +747,20 @@ class TestPipelineSchedulerCache:
     def test_linear_grids_get_separate_cache_entries(self):
         policy, base = _policy()
         pipeline = _bare_pipeline(policy, base)
-        native = pipeline._scheduler_for_schedule(
-            _resolve(policy, sigma_grid="native", flow_shift=10.0)
-        )
-        diffusers = pipeline._scheduler_for_schedule(
+        native = pipeline._scheduler_for(_resolve(policy, sigma_grid="native", flow_shift=10.0))
+        diffusers = pipeline._scheduler_for(
             _resolve(policy, sigma_grid="diffusers", flow_shift=10.0)
         )
         assert native is not diffusers
         assert {key[0] for key in pipeline._scheduler_cache} == {"native", "diffusers"}
         # A recipe is built once and reused.
-        again = pipeline._scheduler_for_schedule(
-            _resolve(policy, sigma_grid="native", flow_shift=10.0)
-        )
+        again = pipeline._scheduler_for(_resolve(policy, sigma_grid="native", flow_shift=10.0))
         assert again is native
 
     def test_caller_supplied_shifts_stay_out_of_the_cache(self):
         policy, base = _policy()
         pipeline = _bare_pipeline(policy, base)
-        pipeline._scheduler_for_schedule(_resolve(policy, sigma_grid="native", flow_shift=7.25))
+        pipeline._scheduler_for(_resolve(policy, sigma_grid="native", flow_shift=7.25))
         assert pipeline._scheduler_cache == {}
 
 
@@ -790,7 +809,7 @@ class TestRequestPath:
             _forward(pipeline, sigma_grid="native", flow_shift=10.0)
         assert float(pipeline.scheduler.config.flow_shift) == 10.0
         assert pipeline.scheduler.config.use_karras_sigmas is False
-        assert ("native", 10.0, False, "video") in pipeline._scheduler_cache
+        assert ("native", 10.0, "video") in pipeline._scheduler_cache
         # The checkpoint scheduler is untouched; the next omitted request uses it again.
         assert base.config.use_karras_sigmas is True
         with pytest.raises(_StopAfterTokenize):
@@ -854,7 +873,7 @@ class TestRequestPath:
         for scheduler in (pipeline.scheduler, pipeline.audio_scheduler, pipeline.action_scheduler):
             assert float(scheduler.config.flow_shift) == 10.0
             assert scheduler.config.use_karras_sigmas is False
-        assert {key[3] for key in pipeline._scheduler_cache} == {"video", "audio", "action"}
+        assert {key[2] for key in pipeline._scheduler_cache} == {"video", "audio", "action"}
         assert {key[0] for key in pipeline._scheduler_cache} == {"native"}
 
     def test_v2v_honors_an_explicit_grid(self):
@@ -867,7 +886,7 @@ class TestRequestPath:
             _forward(pipeline, video=_V2V_FIXTURE_MP4.read_bytes(), sigma_grid="native")
         assert pipeline.scheduler.config.use_karras_sigmas is False
         assert float(pipeline.scheduler.config.flow_shift) == 10.0
-        assert ("native", 10.0, False, "video") in pipeline._scheduler_cache
+        assert ("native", 10.0, "video") in pipeline._scheduler_cache
 
 
 _V2V_FIXTURE_MP4 = Path(__file__).parent / "test_data" / "cosmos3_v2v_ref_9f_bframes.mp4"
@@ -900,8 +919,18 @@ class TestTransferRequestPath:
             sigma_grid="native",
             flow_shift=10.0,
         )
-        assert captured["sigma_grid"] == "native"
-        assert captured["flow_shift"] == 10.0
+        assert captured["schedule"] == SamplingSchedule(
+            grid="native", flow_shift=10.0, flow_shift_explicit=True
+        )
+
+    def test_transfer_without_a_selection_keeps_its_preset_shift(self):
+        captured = {}
+        policy, base = _policy()
+        pipeline = self._pipeline(policy, base, captured)
+        _forward(pipeline, video=_V2V_FIXTURE_MP4.read_bytes(), transfer_config=_transfer_config())
+        assert captured["schedule"].grid == "diffusers"
+        assert captured["schedule"].flow_shift == _transfer_flow_shift(_transfer_config())
+        assert not captured["schedule"].flow_shift_explicit
 
     @pytest.mark.parametrize(
         "policy_factory,overrides,match",

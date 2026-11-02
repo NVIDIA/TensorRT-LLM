@@ -198,6 +198,9 @@ class StubSamplingPolicy:
     what it was asked for; ``is_distilled`` flips the distilled contract on.
     """
 
+    native_flow_schedule = False
+    unipc_base_config = None
+
     def __init__(self, is_distilled=False, fixed_sigmas=(1.0, 0.75, 0.5, 0.25)):
         self.is_distilled = is_distilled
         self.fixed_sigmas = fixed_sigmas
@@ -219,7 +222,7 @@ class StubSamplingPolicy:
         self.flow_shift_calls.append(target_shift)
         return StubScheduler()
 
-    def set_timesteps(self, scheduler, num_inference_steps, device=None, grid=None):
+    def set_timesteps(self, scheduler, num_inference_steps, device=None, schedule=None):
         self.set_timesteps_calls.append(num_inference_steps)
         if self.is_distilled:
             scheduler.set_timesteps(sigmas=list(self.fixed_sigmas), device=device)
@@ -871,6 +874,7 @@ class TestForwardTransferChunks:
                 timer=_started_timer(),
                 transfer_config=cfg,
                 video=b"input-clip",
+                schedule=pipeline._transfer_schedule(cfg),
             )
 
         assert windows == [(0, 188)]
@@ -944,6 +948,7 @@ class TestForwardTransferChunks:
             timer=_started_timer(),
             transfer_config=cfg,
             video=b"input-clip",
+            schedule=pipeline._transfer_schedule(cfg),
         )
 
         assert captured["conditional_frames"] == [2, 1]
@@ -1062,6 +1067,7 @@ class TestControlLengthMismatch:
             timer=_started_timer(),
             transfer_config=cfg,
             video=None,
+            schedule=pipeline._transfer_schedule(cfg),
         )
         # (B, T, H, W, C): frames are dim 1.
         assert output.video.shape[1] == 8
@@ -1108,6 +1114,7 @@ class TestTransferFrameRateResolution:
             timer=_started_timer(),
             transfer_config=cfg,
             video=None,
+            schedule=pipeline._transfer_schedule(cfg),
         ).frame_rate
 
     def test_source_rate_reaches_the_output(self, monkeypatch):
@@ -1178,6 +1185,7 @@ class TestTransferSamplingAndSafety:
             timer=_started_timer(),
             transfer_config=cfg,
             video=None,
+            schedule=pipeline._transfer_schedule(cfg),
         )
 
     def test_control_directive_reaches_the_tokenizer(self, monkeypatch):

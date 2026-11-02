@@ -268,11 +268,11 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 
 ## Sampling schedule
 
-Each mode samples with the sigma grid it has always used unless the request
-selects one. On Nano and Super, T2V, I2V and T2I use the checkpoint's Karras
-grid, and V2V and transfer use the Diffusers shifted-linear flow grid. Edge uses
-its checkpoint-declared linear flow grid in every mode. `extra_params.sigma_grid`
-selects a grid explicitly for base (non-distilled) checkpoints:
+Without a selection, each mode samples its own grid. On Nano and Super, T2V, I2V
+and T2I use the checkpoint's Karras grid, and V2V and transfer use the Diffusers
+shifted-linear flow grid. Edge uses its checkpoint-declared linear flow grid in
+every mode. `extra_params.sigma_grid` selects a grid explicitly for base
+(non-distilled) checkpoints:
 
 | `sigma_grid` | Grid | `flow_shift` |
 |---|---|---|

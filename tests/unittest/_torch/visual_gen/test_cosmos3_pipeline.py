@@ -55,7 +55,10 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     _load_reference_image,
     _normalize_condition_video_latent_indexes,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import Cosmos3SamplingPolicy
+from tensorrt_llm._torch.visual_gen.models.cosmos3.sampling import (
+    Cosmos3SamplingPolicy,
+    SamplingSchedule,
+)
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import QWEN3_RECIPE
 from tensorrt_llm._torch.visual_gen.models.wan.vae_loader import TRTLLM_USE_DIFFUSER_VAE_ENV
 from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE
@@ -923,6 +926,8 @@ class TestCosmos3V2V:
             """
 
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -985,6 +990,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1049,6 +1056,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1088,9 +1097,9 @@ class TestCosmos3V2V:
         assert token_calls[0] is False
 
     def test_action_restores_the_checkpoint_flow_shift(self):
-        """set_flow_shift is a no-op when both knobs are None, and the pipeline
-        instance outlives the request. An action request that followed a V2V one
-        would otherwise keep V2V's uniform sigmas instead of the checkpoint's."""
+        """The pipeline instance outlives the request, so an action request that
+        follows a V2V one must rebuild its schedulers for the checkpoint's Karras
+        grid and shift rather than keep V2V's uniform sigmas."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline._device = torch.device("cpu")
         pipeline.transformer = SimpleNamespace(
@@ -1107,6 +1116,8 @@ class TestCosmos3V2V:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = {"use_karras_sigmas": True, "use_flow_sigmas": True}
             checkpoint_flow_shift = 7.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1145,11 +1156,11 @@ class TestCosmos3V2V:
                 action_chunk_size=NUM_FRAMES - 1,
             )
 
-        assert calls == [("video", 7.0, None), ("action", 7.0, None)]
+        assert calls == [("video", 7.0, True), ("action", 7.0, True)]
 
     def test_scheduler_for_serves_every_stream(self):
         """Video, audio and action denoise in lockstep, so one resolved
-        (shift, karras) configuration must yield a scheduler per stream --
+        schedule must yield a scheduler per stream --
         separate instances (schedulers mutate state on every .step()) built
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
@@ -1169,7 +1180,9 @@ class TestCosmos3V2V:
         pipeline.action_scheduler = SimpleNamespace(name="action")
 
         for stream in ("video", "audio", "action"):
-            pipeline._scheduler_for(10.0, False, stream=stream)
+            pipeline._scheduler_for(
+                SamplingSchedule(grid="diffusers", flow_shift=10.0), stream=stream
+            )
 
         assert rebuilt == [
             ("video", 10.0, False),
@@ -1214,6 +1227,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):
@@ -1269,6 +1284,8 @@ class TestCosmos3TransferRouting:
 
         class FakeSampling:
             is_distilled = False
+            native_flow_schedule = False
+            unipc_base_config = None
             checkpoint_flow_shift = 1.0
 
             def validate_request(self, num_inference_steps, guidance_scale):

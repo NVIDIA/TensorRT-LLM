@@ -787,8 +787,8 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
             "Sigma grid for base (non-distilled) checkpoints. 'karras': the checkpoint's "
             "Karras levels; 'native': the Cosmos framework's shifted-linear flow grid; "
             "'diffusers': the Diffusers UniPC shifted-linear flow grid. Both linear grids "
-            "use flow_shift, or the mode default when it is omitted. Unset keeps each "
-            "mode's existing grid. Rejected for distilled checkpoints."
+            "use flow_shift, or the mode default when it is omitted. Unset uses the mode's "
+            "grid (see the Cosmos3 README). Rejected for distilled checkpoints."
         ),
     ),
     "action_mode": ExtraParamSchema(
