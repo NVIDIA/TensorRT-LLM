@@ -82,6 +82,7 @@ layers on the regular kernel."""
 
 
 PAGE_TABLE_CACHE_KEY = f"{LIB_NAME}.page_tables"
+SPLIT_TABLE_CACHE_KEY = f"{LIB_NAME}.split_tables"
 """Key of the per-step page tables in ``TrtllmAttentionMetadata.fmha_step_caches``."""
 
 
@@ -106,6 +107,41 @@ FA4_NUM_THREADS = 256
 """FA4 SM90 tile for generation rows. With GQA packing a row holds ``q_len * heads_per_kv_head``
 query rows (28 for Qwen2.5-7B at q_len 4), so a 64-row tile wastes less than the default 128-row
 one: 193 vs 282 us per layer for 120 rows over 4.5k cached tokens (Qwen2.5-7B shapes, H100)."""
+
+
+SPLITS_ENV = "TLLM_FLASH_ATTN4_GENERATION_SPLITS"
+"""KV splits of a generation call: unset or 0 picks them from the grid (``generation_splits``),
+1 turns splitting off, a larger value fixes the count."""
+MAX_SPLITS = 16
+
+
+def generation_splits(
+    rows: int, num_heads: int, num_kv_heads: int, q_len: int, num_sms: int
+) -> int:
+    """KV splits of a generation call (flash decoding), fixed per batch shape.
+
+    FA4 launches one CTA per (row, KV head, 64-row tile of the row's packed GQA queries) and
+    streams the row's whole cache in it; SM90 FA4 has no split-KV. A small batch then leaves
+    most SMs idle while each CTA walks thousands of keys: on H100 (Qwen2.5-7B, K=8, 1-4 rows,
+    ~5k cached tokens) 16 CTAs took ~65 us per layer. When the grid fills less than half the
+    SMs, the row's cache is cut into up to one wave's worth of splits (at most ``MAX_SPLITS``).
+    """
+    fixed = os.environ.get(SPLITS_ENV, "").strip()
+    if fixed and int(fixed) > 0:
+        return int(fixed)
+    gqa = num_heads // num_kv_heads
+    if gqa > 1:
+        ctas = rows * num_kv_heads * -(-(q_len * gqa) // FA4_TILE_MN[0])
+    else:
+        ctas = rows * num_heads * -(-q_len // FA4_TILE_MN[0])
+    if 2 * ctas > num_sms:
+        return 1
+    return max(1, min(MAX_SPLITS, -(-num_sms // ctas)))
+
+
+@functools.lru_cache(maxsize=8)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
 @functools.lru_cache(maxsize=1)
@@ -349,6 +385,210 @@ def write_kv_paged(
     )
 
 
+@triton.jit
+def _split_tables_kernel(
+    page_table_ptr,
+    page_table_stride,
+    kv_lens_ptr,
+    split_table_ptr,
+    split_table_stride,
+    split_lens_ptr,
+    last_table_ptr,
+    last_table_stride,
+    last_lens_ptr,
+    width,
+    Q_LEN: tl.constexpr,
+    SPLITS: tl.constexpr,
+    CHUNK_WIDTH: tl.constexpr,
+    LAST_WIDTH: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Program (r, c): row r's cached pages before the page of its first step token,
+    # [0, p0), cut into SPLITS chunks of up to ceil(p0 / SPLITS) pages (c < SPLITS), or the
+    # row's last part, pages [p0, ...) holding the step's tokens (c == SPLITS).
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    kv_len = tl.load(kv_lens_ptr + r)
+    p0 = tl.maximum(kv_len - Q_LEN, 0) // TOKENS_PER_BLOCK
+    offs = tl.arange(0, BLOCK)
+    src_row = page_table_ptr + r.to(tl.int64) * page_table_stride
+    if c < SPLITS:
+        per = (p0 + SPLITS - 1) // SPLITS
+        start = c * per
+        count = tl.minimum(tl.maximum(p0 - start, 0), per)
+        dst_row = split_table_ptr + (r * SPLITS + c).to(tl.int64) * split_table_stride
+        for p0_ in range(0, CHUNK_WIDTH, BLOCK):
+            p = p0_ + offs
+            page = tl.load(src_row + start + p, mask=(p < count) & (start + p < width), other=0)
+            tl.store(dst_row + p, page, mask=p < CHUNK_WIDTH)
+        tl.store(split_lens_ptr + r * SPLITS + c, (count * TOKENS_PER_BLOCK).to(tl.int32))
+    else:
+        tail = kv_len - p0 * TOKENS_PER_BLOCK
+        count = (tail + TOKENS_PER_BLOCK - 1) // TOKENS_PER_BLOCK
+        p = tl.arange(0, LAST_WIDTH)
+        page = tl.load(src_row + p0 + p, mask=(p < count) & (p0 + p < width), other=0)
+        tl.store(last_table_ptr + r.to(tl.int64) * last_table_stride + p, page)
+        tl.store(last_lens_ptr + r, tail.to(tl.int32))
+
+
+@triton.jit
+def _merge_splits_kernel(
+    split_out_ptr,
+    split_lse_ptr,
+    split_lens_ptr,
+    last_out_ptr,
+    last_lse_ptr,
+    out_ptr,
+    out_token_stride,
+    H: tl.constexpr,
+    HP: tl.constexpr,
+    D: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    # Program t = r * Q_LEN + j joins the SPLITS non-causal states of row r (skipping empty
+    # splits) and its causal last part; FA4's states are normalized outputs with natural-log
+    # LSEs laid out [batch, heads, Q_LEN].
+    LOG2E: tl.constexpr = 1.4426950408889634
+    t = tl.program_id(0)
+    r = t // Q_LEN
+    j = t % Q_LEN
+    heads = tl.arange(0, HP)
+    h_ok = heads < H
+    dims = tl.arange(0, D)
+    lse = tl.load(last_lse_ptr + (r * H + heads) * Q_LEN + j, mask=h_ok, other=0.0) * LOG2E
+    peak = lse
+    for c in tl.static_range(SPLITS):
+        b = r * SPLITS + c
+        ok = tl.load(split_lens_ptr + b) > 0
+        lc = tl.load(split_lse_ptr + (b * H + heads) * Q_LEN + j, mask=h_ok & ok, other=-1.0e30)
+        peak = tl.maximum(peak, tl.where(ok, lc * LOG2E, -1.0e30))
+    w = tl.exp2(lse - peak)
+    l_tot = w
+    acc = w[:, None] * tl.load(
+        last_out_ptr + (t.to(tl.int64) * H + heads[:, None]) * D + dims[None, :],
+        mask=h_ok[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    for c in tl.static_range(SPLITS):
+        b = r * SPLITS + c
+        ok = tl.load(split_lens_ptr + b) > 0
+        lc = tl.load(split_lse_ptr + (b * H + heads) * Q_LEN + j, mask=h_ok & ok, other=-1.0e30)
+        wc = tl.where(ok, tl.exp2(lc * LOG2E - peak), 0.0)
+        oc = tl.load(
+            split_out_ptr + ((b * Q_LEN + j).to(tl.int64) * H + heads[:, None]) * D + dims[None, :],
+            mask=h_ok[:, None] & ok,
+            other=0.0,
+        ).to(tl.float32)
+        l_tot += wc
+        acc += wc[:, None] * oc
+    tl.store(
+        out_ptr + t.to(tl.int64) * out_token_stride + heads[:, None] * D + dims[None, :],
+        (acc / l_tot[:, None]).to(out_ptr.dtype.element_ty),
+        mask=h_ok[:, None],
+    )
+
+
+def split_tables(
+    page_table: torch.Tensor, kv_lens: torch.Tensor, q_len: int, splits: int, tokens_per_block: int
+) -> tuple:
+    """Page tables and KV lengths of a split generation call (see ``_split_tables_kernel``):
+    ``(split_table [rows * splits, chunk], split_lens, last_table [rows, last], last_lens)``."""
+    rows, width = page_table.shape
+    chunk = max(1, -(-width // splits))
+    last = triton.next_power_of_2(-(-(tokens_per_block - 1 + q_len) // tokens_per_block))
+    device = page_table.device
+    split_table = torch.empty((rows * splits, chunk), dtype=torch.int32, device=device)
+    split_lens = torch.empty((rows * splits,), dtype=torch.int32, device=device)
+    last_table = torch.empty((rows, last), dtype=torch.int32, device=device)
+    last_lens = torch.empty((rows,), dtype=torch.int32, device=device)
+    _split_tables_kernel[(rows, splits + 1)](
+        page_table, page_table.stride(0), kv_lens, split_table, split_table.stride(0), split_lens,
+        last_table, last_table.stride(0), last_lens, width, Q_LEN=q_len, SPLITS=splits,
+        CHUNK_WIDTH=chunk, LAST_WIDTH=last, TOKENS_PER_BLOCK=tokens_per_block, BLOCK=128,
+    )  # fmt: skip
+    return split_table, split_lens, last_table, last_lens
+
+
+_split_buffers: dict = {}
+
+
+def _split_workspace(
+    rows: int, splits: int, q_len: int, num_heads: int, head_dim: int, dtype, device
+) -> tuple:
+    """Fixed-address partial-state buffers of a split call shape, shared by the layers:
+    ``(q_rep, split_out, split_lse, last_out, last_lse)``."""
+    key = (device, dtype, rows, splits, q_len, num_heads, head_dim)
+    bufs = _split_buffers.get(key)
+    if bufs is None:
+        n = rows * splits
+        # Normal (not inference) tensors: the buffers outlive the call that creates them.
+        with torch.inference_mode(False):
+            bufs = _split_buffers[key] = (
+                torch.empty((n, q_len, num_heads, head_dim), dtype=dtype, device=device),
+                torch.empty((n, q_len, num_heads, head_dim), dtype=dtype, device=device),
+                torch.empty((n, num_heads, q_len), dtype=torch.float32, device=device),
+                torch.empty((rows, q_len, num_heads, head_dim), dtype=dtype, device=device),
+                torch.empty((rows, num_heads, q_len), dtype=torch.float32, device=device),
+            )
+    return bufs
+
+
+def fa4_paged_generation_split(
+    pool: torch.Tensor,
+    q: torch.Tensor,
+    out: torch.Tensor,
+    tables: tuple,
+    q_len: int,
+    splits: int,
+    sm_scale: float,
+) -> None:
+    """FA4 generation with the cached keys split ``splits`` ways (flash decoding).
+
+    Every row's pages before the page of its first step token are attended in ``splits``
+    non-causal chunks (one FA4 call over ``rows * splits`` batch entries, the queries
+    replicated), the rest of its cache, which holds the step's tokens, in one causal call;
+    a merge kernel joins the states. The step's K/V must already be in the pool.
+
+    Args:
+        q: [rows * q_len, heads, head_dim] (rotary embedding applied).
+        out: [rows * q_len, heads, head_dim] output.
+        tables: ``split_tables(page_table, kv_lens, q_len, splits, tokens_per_block)``.
+    """
+    fwd = _fa4_forward()
+    if fwd is None:
+        raise RuntimeError(f"{LIB_NAME}: FlashAttention-4 is unavailable.")
+    tokens, num_heads, head_dim = q.shape
+    rows = tokens // q_len
+    split_table, split_lens, last_table, last_lens = tables
+    q_rep, split_out, split_lse, last_out, last_lse = _split_workspace(
+        rows, splits, q_len, num_heads, head_dim, q.dtype, q.device
+    )
+    q_rep.view(rows, splits, q_len, num_heads, head_dim).copy_(
+        q.view(rows, 1, q_len, num_heads, head_dim).expand(rows, splits, q_len, num_heads, head_dim)
+    )
+    k_pages = pool[:, 0].transpose(1, 2)
+    v_pages = pool[:, 1].transpose(1, 2)
+    common = dict(
+        softmax_scale=sm_scale,
+        tile_mn=FA4_TILE_MN,
+        num_threads=FA4_NUM_THREADS,
+        num_splits=1,
+        pack_gqa=None,
+        return_lse=True,
+    )
+    fwd(q_rep, k_pages, v_pages, seqused_k=split_lens, page_table=split_table, causal=False,
+        out=split_out, lse=split_lse, **common)  # fmt: skip
+    fwd(q.view(rows, q_len, num_heads, head_dim), k_pages, v_pages, seqused_k=last_lens,
+        page_table=last_table, causal=True, out=last_out, lse=last_lse, **common)  # fmt: skip
+    _merge_splits_kernel[(tokens,)](
+        split_out, split_lse, split_lens, last_out, last_lse, out, out.stride(0),
+        H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, Q_LEN=q_len,
+        SPLITS=splits, num_warps=4,
+    )  # fmt: skip
+
+
 def fa4_paged_generation(
     pool: torch.Tensor,
     q: torch.Tensor,
@@ -561,6 +801,28 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             self._check_page_table(params, table)
         return table
 
+    def _split_tables(
+        self,
+        params: FmhaParams,
+        page_table: torch.Tensor,
+        kv_lens: torch.Tensor,
+        q_len: int,
+        splits: int,
+        tokens_per_block: int,
+    ) -> tuple:
+        """``split_tables`` of the phase's rows, shared per step like the page table."""
+        metadata = params.meta
+        step_caches = getattr(metadata, "fmha_step_caches", None)
+        cache = None if step_caches is None else step_caches.setdefault(SPLIT_TABLE_CACHE_KEY, {})
+        key = (page_table.data_ptr(), kv_lens.data_ptr(), params.batch_size, q_len, splits)
+        entry = None if cache is None else cache.get(key)
+        if entry is not None and entry[0] != self.attn.layer_idx:
+            return entry[1]
+        tables = split_tables(page_table, kv_lens, q_len, splits, tokens_per_block)
+        if cache is not None:
+            cache[key] = (self.attn.layer_idx, tables)
+        return tables
+
     def _check_page_table(self, params: FmhaParams, table: torch.Tensor) -> None:
         """Compare with the host table read the way the n-sample library reads it."""
         from .sampling_shared_prefix import _page_layout
@@ -623,6 +885,21 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         )
         q_size = num_heads * head_dim
         q = qkv[:, :q_size].reshape(tokens, num_heads, head_dim)
+        sm_scale = 1.0 / (head_dim**0.5 * attn.q_scaling)
+        splits = generation_splits(
+            rows, num_heads, num_kv_heads, q_len, _num_sms(qkv.device.index or 0)
+        )
+        if splits > 1:
+            fa4_paged_generation_split(
+                pool,
+                q,
+                output.view(tokens, num_heads, head_dim),
+                self._split_tables(params, page_table, kv_lens, q_len, splits, pool.shape[3]),
+                q_len,
+                splits,
+                sm_scale,
+            )
+            return
         fa4_paged_generation(
             pool,
             q,
@@ -632,7 +909,7 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             page_table,
             kv_lens,
             q_len,
-            1.0 / (head_dim**0.5 * attn.q_scaling),
+            sm_scale,
         )
 
 
@@ -640,6 +917,9 @@ __all__ = [
     "FlashAttn4GenerationFmha",
     "LIB_NAME",
     "fa4_paged_generation",
+    "fa4_paged_generation_split",
+    "generation_splits",
     "rope_write_kv_paged",
+    "split_tables",
     "write_kv_paged",
 ]
