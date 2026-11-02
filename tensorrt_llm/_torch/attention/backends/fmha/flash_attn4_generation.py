@@ -20,12 +20,14 @@ linear speculative-decoding verification (``q_len = 1 + K`` tokens per row), for
 GQA/MHA layers with an unquantized bf16/fp16 paged KV cache (KV cache manager V2).
 Per layer it
 
-1. applies the op's NeoX RoPE to the packed Q/K heads in place (``rope_qkv_inplace``);
-2. writes the step's K/V at ``kv_len - q_len + j`` of every row into the paged pool;
-3. runs FA4's paged forward over the whole cache (``seqused_k`` = device KV lengths,
+1. applies the op's NeoX RoPE to the packed Q heads in place and writes the step's rotated K
+   and its V at ``kv_len - q_len + j`` of every row into the paged pool, in one launch
+   (``rope_write_kv_paged``);
+2. runs FA4's paged forward over the whole cache (``seqused_k`` = device KV lengths,
    causal, bottom-right aligned), so the step's tokens see each other causally.
 
-The page table is derived on the device from the attention op's block offsets, and every
+The page table is derived on the device from the attention op's block offsets once per step and
+shared by the layers of a forward (``fmha_step_caches``), and every
 launch reads only fixed-address tensors, so the layer can be captured in a CUDA graph.
 Draft layers (they run on a draft KV-cache manager) are served too unless ``TLLM_FLASH_ATTN4_GENERATION_DRAFT=0``.
 In a mixed context+generation batch the library serves the generation rows while the regular op serves
@@ -58,7 +60,6 @@ from tensorrt_llm.quantization.mode import QuantMode
 from .interface import FmhaPhase
 from .phased import FmhaParams, PhasedFmha
 from .sampling_shared_prefix import _fused_rope_supported, _rotary_dim
-from .sampling_shared_prefix_kernels import rope_qkv_inplace
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -78,6 +79,10 @@ and its block offsets into the metadata (``draft_kv_cache_context``), so the pag
 below follow it. On H100 (Qwen2.5-7B, 120 rows, 4k-token prompts) the multi-token XQA kernel took 515 us
 (K=3) / 990 us (K=8) for the first draft step and ~260 us for each later one; set to 0 to keep draft
 layers on the regular kernel."""
+
+
+PAGE_TABLE_CACHE_KEY = f"{LIB_NAME}.page_tables"
+"""Key of the per-step page tables in ``TrtllmAttentionMetadata.fmha_step_caches``."""
 
 
 MIXED_MIN_KV_ENV = "TLLM_FLASH_ATTN4_GENERATION_MIXED_MIN_KV"
@@ -159,6 +164,146 @@ def _write_kv_paged_kernel(
     tl.store(dst + pool_kv_stride, tl.load(v_ptr + src, mask=mask), mask=mask)
 
 
+@triton.jit
+def _rope_write_kv_paged_kernel(
+    qkv_ptr,
+    qkv_row_stride,
+    cos_sin_ptr,
+    pool_ptr,
+    pool_page_stride,
+    pool_kv_stride,
+    pool_head_stride,
+    pool_slot_stride,
+    page_table_ptr,
+    page_table_stride,
+    kv_lens_ptr,
+    Q_LEN: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    HALF: tl.constexpr,
+    BLOCK_Q_HEADS: tl.constexpr,
+    BLOCK_KV_HEADS: tl.constexpr,
+    TOKENS_PER_BLOCK: tl.constexpr,
+    HAS_ROPE: tl.constexpr,
+):
+    # Program t takes token t = row * Q_LEN + j at position kv_len - Q_LEN + j of its row:
+    # rotates its Q heads in place (NeoX pairs (d, d + HALF), d < HALF) and writes its rotated
+    # K and its V into the row's page.
+    t = tl.program_id(0)
+    row = t // Q_LEN
+    j = t % Q_LEN
+    pos = tl.load(kv_lens_ptr + row).to(tl.int64) - Q_LEN + j
+    valid = pos >= 0
+    pos = tl.maximum(pos, 0)
+    base = qkv_ptr + t.to(tl.int64) * qkv_row_stride
+    kv_heads = tl.arange(0, BLOCK_KV_HEADS)
+    kv_ok = kv_heads[:, None] < NUM_KV_HEADS
+    dims = tl.arange(0, HEAD_DIM)
+    k_ptrs = base + NUM_HEADS * HEAD_DIM + kv_heads[:, None] * HEAD_DIM + dims[None, :]
+    if HAS_ROPE:
+        pairs = tl.arange(0, HALF)
+        cos = tl.load(cos_sin_ptr + pos * (2 * HALF) + 2 * pairs)
+        sin = tl.load(cos_sin_ptr + pos * (2 * HALF) + 2 * pairs + 1)
+        q_heads = tl.arange(0, BLOCK_Q_HEADS)
+        q_ok = q_heads[:, None] < NUM_HEADS
+        q1_ptrs = base + q_heads[:, None] * HEAD_DIM + pairs[None, :]
+        q1 = tl.load(q1_ptrs, mask=q_ok, other=0.0)
+        q2 = tl.load(q1_ptrs + HALF, mask=q_ok, other=0.0)
+        f1 = q1.to(tl.float32)
+        f2 = q2.to(tl.float32)
+        tl.store(q1_ptrs, (f1 * cos[None, :] - f2 * sin[None, :]).to(q1.dtype), mask=q_ok)
+        tl.store(q1_ptrs + HALF, (f2 * cos[None, :] + f1 * sin[None, :]).to(q1.dtype), mask=q_ok)
+    k = tl.load(k_ptrs, mask=kv_ok, other=0.0)
+    v = tl.load(k_ptrs + NUM_KV_HEADS * HEAD_DIM, mask=kv_ok, other=0.0)
+    if HAS_ROPE:
+        # K goes to the pool only (qkv keeps the unrotated K): dimension d < 2 * HALF pairs
+        # with d +- HALF, the rest of the head is copied as is.
+        rot = dims < 2 * HALF
+        low = dims < HALF
+        partner = tl.where(low, dims + HALF, dims - HALF)
+        kp = tl.load(
+            base + NUM_HEADS * HEAD_DIM + kv_heads[:, None] * HEAD_DIM + partner[None, :],
+            mask=kv_ok & rot[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        pair = tl.where(low, dims, dims - HALF) % HALF
+        cos_d = tl.load(cos_sin_ptr + pos * (2 * HALF) + 2 * pair, mask=rot, other=1.0)
+        sin_d = tl.load(cos_sin_ptr + pos * (2 * HALF) + 2 * pair + 1, mask=rot, other=0.0)
+        sign = tl.where(low, -1.0, 1.0)
+        k_rot = k.to(tl.float32) * cos_d[None, :] + sign[None, :] * kp * sin_d[None, :]
+        k = tl.where(rot[None, :], k_rot, k.to(tl.float32)).to(v.dtype)
+    page = tl.load(page_table_ptr + row.to(tl.int64) * page_table_stride + pos // TOKENS_PER_BLOCK)
+    dst = (
+        pool_ptr
+        + page.to(tl.int64) * pool_page_stride
+        + kv_heads[:, None].to(tl.int64) * pool_head_stride
+        + (pos % TOKENS_PER_BLOCK) * pool_slot_stride
+        + dims[None, :]
+    )
+    tl.store(dst, k, mask=kv_ok & valid)
+    tl.store(dst + pool_kv_stride, v, mask=kv_ok & valid)
+
+
+def rope_write_kv_paged(
+    qkv: torch.Tensor,
+    cos_sin: Optional[torch.Tensor],
+    pool: torch.Tensor,
+    page_table: torch.Tensor,
+    kv_lens: torch.Tensor,
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    q_len: int,
+) -> None:
+    """One launch: NeoX RoPE on the Q heads of packed QKV (in place) and the step's rotated K and
+    its V into the paged pool; the pool and Q end as after ``rope_qkv_inplace`` followed by
+    ``write_kv_paged`` (only the K columns of ``qkv`` stay unrotated).
+
+    Args:
+        qkv: [rows * q_len, (heads + 2 * kv_heads) * head_dim], columns contiguous.
+        cos_sin: the attention op's float32 [position][pair][cos, sin] table, or None for no RoPE.
+        pool: [pages, 2, kv_heads, tokens_per_block, head_dim] layer pool (HND).
+        page_table: [rows, max_pages] int32 pool pages of every row.
+        kv_lens: [rows] int32 device KV lengths including the step's ``q_len`` tokens.
+        rotary_dim: rotated leading dimensions of each head (a power of two, at most head_dim).
+    """
+    tokens = qkv.shape[0]
+    if tokens == 0:
+        return
+    if qkv.stride(1) != 1:
+        raise ValueError(f"qkv columns must be contiguous, got strides {qkv.stride()}.")
+    if pool.stride(4) != 1:
+        raise ValueError(f"pool must be contiguous in head_dim, got strides {pool.stride()}.")
+    half = rotary_dim // 2
+    if cos_sin is not None and (rotary_dim % 2 or half & (half - 1) or rotary_dim > head_dim):
+        raise ValueError(f"unsupported rotary dim {rotary_dim} for head dim {head_dim}.")
+    _rope_write_kv_paged_kernel[(tokens,)](
+        qkv,
+        qkv.stride(0),
+        cos_sin if cos_sin is not None else kv_lens,
+        pool,
+        pool.stride(0),
+        pool.stride(1),
+        pool.stride(2),
+        pool.stride(3),
+        page_table,
+        page_table.stride(0),
+        kv_lens,
+        Q_LEN=q_len,
+        NUM_HEADS=num_heads,
+        NUM_KV_HEADS=num_kv_heads,
+        HEAD_DIM=head_dim,
+        HALF=max(half, 1),
+        BLOCK_Q_HEADS=triton.next_power_of_2(num_heads),
+        BLOCK_KV_HEADS=triton.next_power_of_2(num_kv_heads),
+        TOKENS_PER_BLOCK=pool.shape[3],
+        HAS_ROPE=cos_sin is not None,
+    )
+
+
 def write_kv_paged(
     pool: torch.Tensor,
     k: torch.Tensor,
@@ -207,8 +352,8 @@ def write_kv_paged(
 def fa4_paged_generation(
     pool: torch.Tensor,
     q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    k: Optional[torch.Tensor],
+    v: Optional[torch.Tensor],
     out: torch.Tensor,
     page_table: torch.Tensor,
     kv_lens: torch.Tensor,
@@ -220,7 +365,7 @@ def fa4_paged_generation(
     Args:
         pool: [pages, 2, kv_heads, tokens_per_block, head_dim] layer pool (HND), bf16/fp16.
         q: [rows * q_len, heads, head_dim]; k, v: [rows * q_len, kv_heads, head_dim], row major
-            (rotary embedding already applied).
+            (rotary embedding already applied), or None when the step's K/V is already in the pool.
         out: [rows * q_len, heads, head_dim] output.
         page_table: [rows, max_pages] int32 pool pages of every row.
         kv_lens: [rows] int32 device KV lengths including the step's ``q_len`` tokens.
@@ -230,7 +375,8 @@ def fa4_paged_generation(
         raise RuntimeError(f"{LIB_NAME}: FlashAttention-4 is unavailable.")
     tokens, num_heads, head_dim = q.shape
     rows = tokens // q_len
-    write_kv_paged(pool, k, v, page_table, kv_lens, q_len)
+    if k is not None:
+        write_kv_paged(pool, k, v, page_table, kv_lens, q_len)
     # FA4 takes NHD pages [pages, page_size, kv_heads, head_dim]; the HND pool transposes without a copy.
     k_pages = pool[:, 0].transpose(1, 2)
     v_pages = pool[:, 1].transpose(1, 2)
@@ -384,7 +530,10 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         """[rows, max_pages] int32 pool pages of the phase's rows, derived on the device.
 
         The attention op's K block offset of a page is ``page * kv_factor`` in the
-        layer's pool view, which folds K and V into one page.
+        layer's pool view, which folds K and V into one page. The layers of a forward share
+        one table per (KV manager, pool, rows): the first layer to ask for it after the
+        metadata's ``prepare`` derives it in every forward of that step (so a captured graph
+        records the derivation), and the later layers reuse it.
         """
         metadata = params.meta
         manager = metadata.kv_cache_manager
@@ -393,7 +542,21 @@ class FlashAttn4GenerationFmha(PhasedFmha):
         )
         rows = slice(params.seq_offset, params.seq_offset + params.batch_size)
         offsets = metadata.kv_cache_block_offsets[pool_index, rows, 0, :]
+        step_caches = getattr(metadata, "fmha_step_caches", None)
+        tables = None if step_caches is None else step_caches.setdefault(PAGE_TABLE_CACHE_KEY, {})
+        key = (
+            id(manager),
+            pool_index,
+            params.seq_offset,
+            params.batch_size,
+            metadata.kv_cache_block_offsets.data_ptr(),
+        )
+        entry = None if tables is None else tables.get(key)
+        if entry is not None and entry[0] != self.attn.layer_idx:
+            return entry[1]
         table = torch.div(offsets, int(manager.kv_factor), rounding_mode="floor")
+        if tables is not None:
+            tables[key] = (self.attn.layer_idx, table)
         if os.environ.get(CHECK_ENV, "0") == "1" and not torch.cuda.is_current_stream_capturing():
             self._check_page_table(params, table)
         return table
@@ -442,32 +605,41 @@ class FlashAttn4GenerationFmha(PhasedFmha):
             )
         num_heads, num_kv_heads, head_dim = attn.num_heads, attn.num_kv_heads, attn.head_dim
         kv_lens = params.meta.kv_lens_cuda_runtime[params.seq_offset : params.seq_offset + rows]
-        if PositionEmbeddingType(attn.position_embedding_type).is_rope():
-            rope_qkv_inplace(
-                qkv,
-                attn.rotary_cos_sin,
-                kv_lens,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                rotary_dim=_rotary_dim(attn),
-                q_len=q_len,
-            )
-        q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
+        rope = PositionEmbeddingType(attn.position_embedding_type).is_rope()
+        pool = self._pool_view(params.meta)
+        page_table = self._page_table(params)
+        # RoPE on Q (in place) and K, and the step's K/V into the pool, in one launch.
+        rope_write_kv_paged(
+            qkv,
+            attn.rotary_cos_sin if rope else None,
+            pool,
+            page_table,
+            kv_lens,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            rotary_dim=_rotary_dim(attn) if rope else head_dim,
+            q_len=q_len,
+        )
+        q_size = num_heads * head_dim
         q = qkv[:, :q_size].reshape(tokens, num_heads, head_dim)
-        k = qkv[:, q_size : q_size + kv_size].view(tokens, num_kv_heads, head_dim)
-        v = qkv[:, q_size + kv_size : q_size + 2 * kv_size].view(tokens, num_kv_heads, head_dim)
         fa4_paged_generation(
-            self._pool_view(params.meta),
+            pool,
             q,
-            k,
-            v,
+            None,
+            None,
             output.view(tokens, num_heads, head_dim),
-            self._page_table(params),
+            page_table,
             kv_lens,
             q_len,
             1.0 / (head_dim**0.5 * attn.q_scaling),
         )
 
 
-__all__ = ["FlashAttn4GenerationFmha", "LIB_NAME", "fa4_paged_generation", "write_kv_paged"]
+__all__ = [
+    "FlashAttn4GenerationFmha",
+    "LIB_NAME",
+    "fa4_paged_generation",
+    "rope_write_kv_paged",
+    "write_kv_paged",
+]
