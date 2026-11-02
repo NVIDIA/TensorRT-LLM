@@ -27,7 +27,7 @@ class K3RouteQuant(OpWrapper):
     grid-dependency wait, before the outputs are written; for a dependent that waits for this whole grid before
     reading them, as ``trtllm::k3_moe`` does."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
@@ -94,7 +94,7 @@ class K3RouteQuant(OpWrapper):
     with interleaved eager calls and retain the isolated calls' bits.
     Invalid shapes, dtypes, layouts and token counts raise ValueError;
     the tests retain those refusals and both cold-capture refusals.
-    Certification is SM100 only; the stock comparator requires SM10.x.
+    The stock comparator requires SM10.x.
     """
 
     def __call__(

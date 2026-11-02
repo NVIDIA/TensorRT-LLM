@@ -35,6 +35,10 @@ def pytest_runtest_setup(item):
     _prefetch.pytest_runtest_setup(item)
 
 
+def pytest_runtest_teardown(item):
+    _reuse.pytest_runtest_teardown(item)
+
+
 def pytest_runtest_logreport(report):
     # Reuse's failure fence (drain pools after a failed test); previously not
     # wired in the fallback dirs at all.
