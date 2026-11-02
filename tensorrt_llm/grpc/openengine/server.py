@@ -563,10 +563,7 @@ def launch_server(
             startup_cancelled.set()
             try:
                 if coordinator is not None:
-                    try:
-                        await coordinator.stop_admission()
-                    except (CoordinationError, RuntimeError) as error:
-                        fail(f"OpenEngine admission shutdown failed: {error}")
+                    await coordinator.stop_admission()
                 elif mode.is_attached_frontend and frontend is not None:
                     try:
                         await frontend.request("withdraw", frontend=frontend.frontend_id)

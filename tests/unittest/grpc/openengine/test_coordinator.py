@@ -483,8 +483,10 @@ async def test_peer_abort_rpc_deadline_preserves_group(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_slow_abort_requests_do_not_starve_reservations_or_heartbeats():
+async def test_slow_abort_requests_do_not_starve_reservations_or_heartbeats(monkeypatch):
     """A saturated abort pool must not block control-plane progress."""
+    # Leave no backlog room, so the next abort is rejected rather than queued.
+    monkeypatch.setattr(coordination, "_MAX_ABORT_RPCS", coordination._ABORT_THREADS)
     all_started = asyncio.Event()
     release = asyncio.Event()
     started = 0
@@ -537,6 +539,73 @@ async def test_slow_abort_requests_do_not_starve_reservations_or_heartbeats():
             results = await asyncio.wait_for(asyncio.gather(*aborts), 3)
         assert all(result == {"aborted": 1, "failed": 0} for result in results)
         assert not failures
+
+
+@pytest.mark.asyncio
+async def test_abort_burst_above_worker_count_is_queued():
+    """Concurrent aborts to responsive frontends wait for a worker instead of failing."""
+    count = 4 * coordination._ABORT_THREADS
+    async with group() as (_, (first, second), failures):
+        handles = []
+        for i in range(count):
+            reservation = await first.reserve(f"burst-{i}")
+            handles.append(Handle())
+            reservation.bind(handles[-1])
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(second.request("abort", request_id=f"burst-{i}") for i in range(count))
+            ),
+            10,
+        )
+        assert results == [{"aborted": 1, "failed": 0}] * count
+        assert all(handle.aborted for handle in handles)
+        assert not failures
+
+
+@pytest.mark.asyncio
+async def test_aborts_queued_past_their_budget_keep_the_group_serving(monkeypatch):
+    """Time spent in the abort backlog counts against the caller's deadline."""
+    monkeypatch.setattr(coordination, "_ABORT_TIMEOUT", 2.0)
+    monkeypatch.setattr(coordination, "_RPC_TIMEOUT", 1.0)
+    all_started = asyncio.Event()
+    started = 0
+
+    class StalledFrontend(FrontendClient):
+        async def _abort(self, message, context):
+            nonlocal started
+            started += 1
+            if started == coordination._ABORT_THREADS:
+                all_started.set()
+            await asyncio.Event().wait()
+
+    async with group(client_type=StalledFrontend) as (_, (first, second), failures):
+        await first.reserve("stalled")
+        running = [
+            asyncio.create_task(second.request("abort", request_id="stalled"))
+            for _ in range(coordination._ABORT_THREADS)
+        ]
+        await asyncio.wait_for(all_started.wait(), 3)
+        # Every worker now waits on the stalled frontend, so these start only
+        # after most of their own deadline has passed in the backlog. Two waves:
+        # a budget measured from worker pickup would run the second wave a full
+        # RPC interval past its caller's deadline.
+        queued = [
+            asyncio.create_task(second.request("abort", request_id="stalled"))
+            for _ in range(2 * coordination._ABORT_THREADS)
+        ]
+        results = await asyncio.wait_for(
+            asyncio.gather(*running, *queued, return_exceptions=True), 5
+        )
+        assert results[: len(running)] == [{"aborted": 0, "failed": 1}] * len(running)
+        for result in results[len(running) :]:
+            # A late start may still dispatch with what remains, or be rejected
+            # as retryable. Running past the caller's deadline would fail the group.
+            assert result == {"aborted": 0, "failed": 1} or (
+                isinstance(result, CoordinationError)
+                and str(result) == "OpenEngine abort capacity exhausted"
+            ), result
+        assert not failures
+        assert (await first.request("status"))["ready"]
 
 
 @pytest.mark.asyncio

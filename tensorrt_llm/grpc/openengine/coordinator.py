@@ -30,6 +30,10 @@ _ABORT_TIMEOUT = 30.0
 _HEARTBEAT_TIMEOUT = 10.0
 _CONTROL_THREADS = 4
 _ABORT_THREADS = 4
+# Aborts beyond the running threads wait in a bounded backlog. Each abort's
+# dispatch budget is measured from its caller's deadline, so time spent waiting
+# cannot make the caller time out and stop the group.
+_MAX_ABORT_RPCS = 64
 _MAX_REQUEST_ID_BYTES = 1024
 # At most six JSON bytes per UTF-8 byte, plus the fixed UUID and framing:
 # 128 accepted entries occupy less than 1 MiB, well below the 64 MiB limit.
@@ -72,8 +76,8 @@ def _address(directory: str, name: str) -> str:
 
 
 def _server(
-    address: str, handler: Callable, server: grpc.aio.Server | None = None
-) -> grpc.aio.Server:
+    address: str, handler: Callable, server: grpc.Server | grpc.aio.Server | None = None
+) -> grpc.Server | grpc.aio.Server:
     if server is None:
         server = grpc.aio.server(options=_OPTIONS)
     server.add_generic_rpc_handlers(
@@ -88,7 +92,8 @@ def _server(
             ),
         )
     )
-    server.add_insecure_port(address)
+    if not server.add_insecure_port(address):
+        raise RuntimeError(f"Failed to bind OpenEngine private endpoint {address}")
     return server
 
 
@@ -160,7 +165,7 @@ class Coordinator:
                 )
             for name, handler, workers, limit in (
                 ("coordinator", self._dispatch, _CONTROL_THREADS, None),
-                ("coordinator-abort", self._abort, _ABORT_THREADS, _ABORT_THREADS),
+                ("coordinator-abort", self._abort, _ABORT_THREADS, _MAX_ABORT_RPCS),
             ):
                 pool = concurrent.futures.ThreadPoolExecutor(
                     max_workers=workers, thread_name_prefix=f"openengine-{name}"
@@ -168,24 +173,7 @@ class Coordinator:
                 self._pools.append(pool)
                 server = grpc.server(pool, options=_OPTIONS, maximum_concurrent_rpcs=limit)
                 self._servers.append(server)
-                server.add_generic_rpc_handlers(
-                    (
-                        grpc.method_handlers_generic_handler(
-                            _SERVICE,
-                            {
-                                "Call": grpc.unary_unary_rpc_method_handler(
-                                    handler,
-                                    request_deserializer=json.loads,
-                                    response_serializer=_encode,
-                                )
-                            },
-                        ),
-                    )
-                )
-                address = _address(self._directory, name)
-                if not server.add_insecure_port(address):
-                    raise RuntimeError(f"Failed to bind OpenEngine private endpoint {address}")
-                server.start()
+                _server(_address(self._directory, name), handler, server).start()
         except BaseException:
             self.close()
             raise
@@ -260,6 +248,15 @@ class Coordinator:
     def _abort(self, message: dict, context: grpc.ServicerContext) -> dict:
         if message.get("operation") != "abort":
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "Unknown private operation")
+        # Measure the budget from the caller's deadline, not from when a worker
+        # took this abort from the backlog, and reserve one control-RPC interval
+        # to deliver partial outcomes before the caller's deadline expires.
+        remaining = context.time_remaining()
+        budget = _ABORT_TIMEOUT if remaining is None else min(_ABORT_TIMEOUT, remaining)
+        deadline = monotonic() + budget - _RPC_TIMEOUT
+        if deadline <= monotonic():
+            # Nothing was dispatched, so the caller can retry without fencing.
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "OpenEngine abort backlog expired")
         # Keep generation tokens in the snapshot, then release the state lock
         # before any RPC; a slow frontend must not block normal control traffic.
         with self._admission_lock:
@@ -273,7 +270,6 @@ class Coordinator:
         for key, (token, frontend) in snapshot:
             by_frontend[frontend].append([key, token])
 
-        deadline = monotonic() + _ABORT_TIMEOUT - _RPC_TIMEOUT
         completed: queue.Queue[tuple[int | None, grpc.Future | None]] = queue.Queue()
         if not context.add_callback(lambda: completed.put((None, None))):
             context.abort(grpc.StatusCode.CANCELLED, "Abort request cancelled")
@@ -416,8 +412,9 @@ class FrontendClient:
             return await connection.request({"operation": operation, **fields})
         except grpc.aio.AioRpcError as error:
             if operation == "abort" and error.code() == grpc.StatusCode.RESOURCE_EXHAUSTED:
-                # The bounded abort pool is busy; ownership remains intact and
-                # a caller may retry without invalidating the serving group.
+                # The abort backlog is full or this abort waited past its budget.
+                # Ownership remains intact, so a caller may retry without
+                # invalidating the serving group.
                 raise CoordinationError("OpenEngine abort capacity exhausted") from error
             # A reserve reply may have been lost after committing. Fail the
             # entire group rather than retry with ambiguous ownership.
