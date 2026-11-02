@@ -1,3 +1,4 @@
+import base64
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -746,6 +747,78 @@ class TestMakeMediaIo:
         io = _make_media_io("video", server, request)
         assert io._num_frames == 32
         assert io._fps == 30  # default, not the server's overridden value
+
+    @pytest.mark.parametrize("server", [None, MultimodalServerConfig()])
+    def test_video_gets_default_decoded_frame_cap(self, server):
+        io = _make_media_io("video", server, {"video": {"num_frames": 500, "fps": 1000}})
+        assert io._max_decoded_frame_bytes == _chat_utils._DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES
+
+    def test_server_decoded_frame_cap_wins_over_default(self):
+        server = MultimodalServerConfig(
+            media_io_kwargs={"video": {"max_decoded_frame_bytes": 1 << 20}}
+        )
+        io = _make_media_io("video", server, {"video": {"num_frames": 32}})
+        assert io._max_decoded_frame_bytes == 1 << 20
+
+    @pytest.mark.parametrize("key", ["max_decoded_frame_bytes", "decoded_memory_reserver"])
+    def test_request_cannot_set_server_only_video_kwargs(self, key):
+        server = MultimodalServerConfig(
+            media_io_kwargs={"video": {"max_decoded_frame_bytes": 1 << 20}}
+        )
+        with pytest.raises(ValueError, match=key):
+            _make_media_io("video", server, {"video": {key: 1 << 40}})
+
+    def test_non_video_modalities_have_no_decoded_frame_cap(self):
+        io = _make_media_io("image", None, {"video": {"max_decoded_frame_bytes": 1}})
+        assert not hasattr(io, "_max_decoded_frame_bytes")
+
+
+@pytest.fixture(scope="module")
+def video_data_uri(tmp_path_factory):
+    """A 40-frame 64x64 mp4 as a base64 data URI."""
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    width, height, num_frames = 64, 64, 40
+    path = tmp_path_factory.mktemp("bounded_video") / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (width, height))
+    for i in range(num_frames):
+        writer.write(np.full((height, width, 3), i, dtype=np.uint8))
+    writer.release()
+    return "data:video/mp4;base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+class TestRequestVideoDecodeIsBounded:
+    """A request's `num_frames`/`fps` cannot push decoding past the server cap."""
+
+    @staticmethod
+    async def _load(video_data_uri, server_kwargs, request_kwargs):
+        tracker = MultimodalDataTracker(
+            model_type="dummy",
+            multimodal_server_config=MultimodalServerConfig(media_io_kwargs=server_kwargs),
+            request_media_io_kwargs=request_kwargs,
+        )
+        part = {"type": "video_url", "video_url": {"url": video_data_uri}}
+        return await parse_chat_message_content_part(part, tracker)["data"]
+
+    @pytest.mark.asyncio
+    async def test_request_within_server_cap_decodes(self, video_data_uri):
+        # 10 frames * 64 * 64 * 3 values * 9 peak bytes ("pt") = 1,105,920 bytes.
+        video = await self._load(
+            video_data_uri,
+            {"video": {"max_decoded_frame_bytes": 2_000_000}},
+            {"video": {"num_frames": 10, "fps": 1000}},
+        )
+        assert len(video.frames) == 10
+
+    @pytest.mark.asyncio
+    async def test_request_exceeding_server_cap_is_rejected(self, video_data_uri):
+        with pytest.raises(ValueError, match="exceeding the limit of 2000000 bytes"):
+            await self._load(
+                video_data_uri,
+                {"video": {"max_decoded_frame_bytes": 2_000_000}},
+                {"video": {"num_frames": 40, "fps": 1000}},
+            )
 
 
 class TestMediaIoKwargsLoaderForwarding:

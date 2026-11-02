@@ -91,6 +91,19 @@ MM_PARSER_MAP: dict[str, Callable[[ChatCompletionContentPartParam], Union[
             "data", None),
     }
 
+# MediaIO kwargs that bound decoded memory. Only the server may set them, so a
+# per-request `media_io_kwargs` cannot lift the limit.
+_SERVER_ONLY_MEDIA_IO_KWARGS: Dict[str, frozenset] = {
+    "video": frozenset({"max_decoded_frame_bytes", "decoded_memory_reserver"}),
+}
+
+# Default cap on the frame buffers a single video decode may allocate. Requests
+# choose `num_frames`/`fps`, so without a cap a small encoded clip can expand
+# into tens of GiB of decoded frames. 4 GiB fits e.g. 76 frames at 1080p or 172
+# frames at 720p with the default `"pt"` format. Raise it with
+# `--media_io_kwargs '{"video": {"max_decoded_frame_bytes": <bytes>}}'`.
+_DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES = 4 * 1024**3
+
 
 def _make_media_io(
     modality: str,
@@ -105,10 +118,20 @@ def _make_media_io(
     if media_io_cls is None:
         raise ValueError(f"Unsupported modality {modality!r}. "
                          f"Registered modalities: {list(MEDIA_IO_REGISTRY)}")
-    return media_io_cls.create(
-        server_kwargs.get(modality),
-        request_kwargs.get(modality),
-    )
+    modality_request_kwargs = request_kwargs.get(modality)
+    server_only = _SERVER_ONLY_MEDIA_IO_KWARGS.get(modality, frozenset())
+    rejected = server_only.intersection(modality_request_kwargs or {})
+    if rejected:
+        raise ValueError(
+            f"media_io_kwargs[{modality!r}] cannot set {sorted(rejected)}; "
+            "these limits are configured by the server.")
+    modality_server_kwargs = server_kwargs.get(modality)
+    if modality == "video":
+        modality_server_kwargs = {
+            "max_decoded_frame_bytes": _DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES,
+            **(modality_server_kwargs or {}),
+        }
+    return media_io_cls.create(modality_server_kwargs, modality_request_kwargs)
 
 
 def _parse_chat_message_content_mm_part(
