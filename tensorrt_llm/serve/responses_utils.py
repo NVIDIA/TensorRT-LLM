@@ -61,7 +61,8 @@ from tensorrt_llm.executor import (EngineDeadError, GenerationResult,
                                    RequestError)
 from tensorrt_llm.inputs import PromptInputs, prompt_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.inputs.utils import resolve_hf_chat_template
+from tensorrt_llm.inputs.utils import (resolve_hf_chat_template,
+                                       uses_tokenizer_native_renderer)
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.disagg_utils import get_usage_tokens_from_ctx
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -916,11 +917,15 @@ def _render_developer_as_system(
 
     A chat template that does not render a ``developer`` message (it has no
     branch for the role, or rejects it) loses that message unless it is sent
-    as ``system``. The DeepSeek tokenizers render ``developer`` themselves.
+    as ``system``. The DeepSeek tokenizers render ``developer`` themselves. A
+    tokenizer that renders the conversation in Python, with no Jinja template,
+    is left to ``apply_chat_template``, which decides the same for it.
     """
     if not any(message.get("role") == "developer" for message in messages):
         return messages
     if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
+        return messages
+    if uses_tokenizer_native_renderer(tokenizer, processor, chat_template):
         return messages
     template = resolve_hf_chat_template(getattr(tokenizer, "tokenizer",
                                                 tokenizer),

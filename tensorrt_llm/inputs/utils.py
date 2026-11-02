@@ -3,6 +3,8 @@
 
 import asyncio
 import base64
+import threading
+import weakref
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
@@ -13,6 +15,7 @@ from urllib.parse import urlparse
 import numpy as np
 import soundfile
 import torch
+from jinja2.exceptions import TemplateError
 from PIL import Image
 from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
@@ -625,6 +628,24 @@ def _has_python_chat_template(tokenizer: PreTrainedTokenizerBase) -> bool:
             is not PreTrainedTokenizerBase.apply_chat_template)
 
 
+def uses_tokenizer_native_renderer(tokenizer: Union[TransformersTokenizer,
+                                                    TokenizerBase],
+                                   processor: ProcessorMixin,
+                                   chat_template: Optional[str]) -> bool:
+    """Whether `apply_chat_template` renders with the tokenizer's own renderer.
+
+    It does when no Jinja template is declared anywhere (the call, the
+    processor or the tokenizer) and the tokenizer overrides
+    `apply_chat_template` in Python, as the kimi_k3 checkpoint tokenizer does.
+    """
+    if isinstance(tokenizer, TransformersTokenizer):
+        tokenizer = tokenizer.tokenizer
+    return (chat_template is None
+            and getattr(processor, "chat_template", None) is None
+            and getattr(tokenizer, "chat_template", None) is None
+            and _has_python_chat_template(tokenizer))
+
+
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
     processor: ProcessorMixin,
@@ -719,6 +740,87 @@ def _build_openai_content(
     return content_list
 
 
+_ROLE_PROBE = "trtllm-chat-renderer-role-probe"
+# What a renderer may raise for a conversation it does not accept. One written
+# in Python may also assert, or leave a role unimplemented.
+_RENDER_ERRORS = (TemplateError, TypeError, KeyError, IndexError, ValueError,
+                  AttributeError, AssertionError, NotImplementedError)
+# Per tokenizer: whether its own renderer is handed a developer message as a
+# system message (see _native_renderer_needs_developer_as_system).
+_DEVELOPER_AS_SYSTEM: "weakref.WeakKeyDictionary[Any, bool]" = (
+    weakref.WeakKeyDictionary())
+_DEVELOPER_AS_SYSTEM_LOCK = threading.Lock()
+
+
+def _native_renderer_renders(tokenizer: Any, role: str) -> bool:
+    """Whether the tokenizer's own renderer renders a ``role`` message's content.
+
+    Decided by rendering one such message, followed by a user message, rather
+    than by reading the renderer's code. A renderer that raises renders
+    nothing.
+    """
+    conversation = [{
+        "role": role,
+        "content": _ROLE_PROBE
+    }, {
+        "role": "user",
+        "content": "hi"
+    }]
+    try:
+        rendered = tokenizer.apply_chat_template(conversation,
+                                                 tokenize=False,
+                                                 add_generation_prompt=True)
+    except _RENDER_ERRORS as error:
+        logger.debug("The chat renderer of %s rejects a %s message: %r",
+                     type(tokenizer).__name__, role, error)
+        return False
+    return isinstance(rendered, str) and _ROLE_PROBE in rendered
+
+
+def _native_renderer_needs_developer_as_system(tokenizer: Any) -> bool:
+    """Whether the tokenizer's own renderer gets developer messages as system.
+
+    It does when it leaves out a developer message's content (it has no branch
+    for the role, or rejects it) and renders a system message's. When it
+    renders neither, the probe tells nothing, and developer messages are passed
+    to it unchanged. Decided once per tokenizer.
+    """
+    with _DEVELOPER_AS_SYSTEM_LOCK:
+        needed = _DEVELOPER_AS_SYSTEM.get(tokenizer)
+        if needed is None:
+            needed = False
+            if not _native_renderer_renders(tokenizer, "developer"):
+                needed = _native_renderer_renders(tokenizer, "system")
+                if not needed:
+                    logger.warning(
+                        "Cannot tell whether the chat renderer of %s renders "
+                        "developer messages: it rendered neither a developer "
+                        "nor a system message. Developer messages are passed "
+                        "to it unchanged.",
+                        type(tokenizer).__name__)
+            _DEVELOPER_AS_SYSTEM[tokenizer] = needed
+    return needed
+
+
+def _developer_as_system_for_native_renderer(
+        tokenizer: Any,
+        conversation: list[ConversationMessage]) -> list[ConversationMessage]:
+    """``conversation`` as the tokenizer's own renderer should receive it.
+
+    A renderer that drops developer messages gets them as system messages, in
+    place, so the order of the messages is kept. Any other renderer, and a
+    conversation without a developer message, gets the conversation unchanged.
+    """
+    if not any(message.get("role") == "developer" for message in conversation):
+        return conversation
+    if not _native_renderer_needs_developer_as_system(tokenizer):
+        return conversation
+    return [{
+        **message, "role": "system"
+    } if message.get("role") == "developer" else message
+            for message in conversation]
+
+
 def apply_chat_template(
     *,
     model_type: str,
@@ -743,6 +845,7 @@ def apply_chat_template(
     Uses content-format-driven dispatch:
     - PASSTHROUGH: skip template rendering, just concatenate content strings
     - PYTHON: use a tokenizer-native renderer when no Jinja template is declared
+      (it gets developer messages as system messages if it drops the role)
     - OPENAI: reconstructs content as list of dicts for the template to handle
     - STRING: keeps flattened text with pre-inserted placeholders
     """
@@ -785,15 +888,12 @@ def apply_chat_template(
     if isinstance(tokenizer, TransformersTokenizer):
         tokenizer = tokenizer.tokenizer  # we need the TokenizerBase for apply_chat_template
 
-    if (chat_template is None
-            and getattr(processor, "chat_template", None) is None
-            and getattr(tokenizer, "chat_template", None) is None
-            and _has_python_chat_template(tokenizer)):
+    if uses_tokenizer_native_renderer(tokenizer, processor, chat_template):
         native_kwargs = dict(chat_template_kwargs or {})
         if documents is not None:
             native_kwargs["documents"] = documents
         return tokenizer.apply_chat_template(
-            conversation,
+            _developer_as_system_for_native_renderer(tokenizer, conversation),
             tools=tools,
             tokenize=enable_tokenize,
             add_generation_prompt=add_generation_prompt,
