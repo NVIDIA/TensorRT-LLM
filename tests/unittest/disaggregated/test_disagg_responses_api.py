@@ -649,9 +649,12 @@ def _sse(event) -> str:
 
 
 def _generation_frames(request: ResponsesRequest) -> list[str]:
-    """A generation worker's stream for ``request``: its opening, "hello", the completion."""
+    """A generation worker's stream for ``request``: its opening, "hello", the completion.
+
+    Its response objects are created at 0, so they differ from any built elsewhere.
+    """
     opening = ResponsesStreamingProcessor(
-        request, request.to_sampling_params(), model_name=_MODEL
+        request, request.to_sampling_params(), model_name=_MODEL, create_time=0
     ).get_initial_responses()
     delta = ResponseTextDeltaEvent(
         type="response.output_text.delta",
@@ -730,15 +733,44 @@ class _Workers:
         async def stream():
             try:
                 await self.context_done.wait()
-                self.frames = _generation_frames(received)
-                data = "".join(self.frames).encode()
-                for start in range(0, len(data), 61):
-                    yield data[start : start + 61]
+                async for piece in self.generation_stream(received):
+                    yield piece
             except asyncio.CancelledError:
                 self.generation_cancelled.set()
                 raise
 
         return stream()
+
+    async def generation_stream(self, received: ResponsesRequest):
+        """The generation worker's stream, in pieces cut anywhere, as the transport delivers it."""
+        self.frames = _generation_frames(received)
+        data = "".join(self.frames).encode()
+        for start in range(0, len(data), 61):
+            yield data[start : start + 61]
+
+
+class _WorkersSilentAfterTheFirstOutput(_Workers):
+    """Workers whose generation worker is silent for a while after its first output.
+
+    The silence outlasts the keepalive interval, so the worker's own keepalive sends its
+    response.in_progress again, with its own response object, before the rest of its stream.
+    """
+
+    async def generation_stream(self, received: ResponsesRequest):
+        frames = _generation_frames(received)
+
+        async def produced():
+            # The opening and the first output, then the rest after a silence.
+            for frame in frames[:3]:
+                yield frame
+            await asyncio.sleep(0.3)
+            for frame in frames[3:]:
+                yield frame
+
+        self.frames = []
+        async for frame in responses_utils.keep_responses_stream_alive(produced()):
+            self.frames.append(frame)
+            yield frame.encode()
 
 
 def _responses_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
@@ -907,6 +939,64 @@ async def test_responses_stream_opens_and_keeps_alive_while_the_context_phase_ru
         _without_number(data) for data in answered
     ]
     # One sequence, for one response: the one the generation worker was asked for.
+    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+    (generation_request,) = workers.generation_requests
+    assert {data["response"]["id"] for _, data in events if "response" in data} == {
+        generation_request.request_id
+    }
+
+
+def _frame_events(frames: list[str]) -> list[tuple[str, dict]]:
+    """The (event, data) pairs of SSE frames."""
+    return [
+        (frame.split("\n", 1)[0].removeprefix("event: "), json.loads(frame.split("data: ", 1)[1]))
+        for frame in frames
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_every_keepalive_of_an_opened_stream_repeats_its_opening(monkeypatch, schedule_style):
+    """The worker's own keepalives, which carry its response object, never reach the client."""
+    _short_waits(monkeypatch)
+    kept_alive = asyncio.Event()
+    workers = _WorkersSilentAfterTheFirstOutput(_waits_for(kept_alive))
+
+    sent = await _post_responses(
+        _responses_server(schedule_style, workers).app, on_send=_on_keepalive(kept_alive)
+    )
+
+    assert _status(sent) == 200
+    events = _sse_events(sent)
+    types = [event for event, _ in events]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    first_output = types.index("response.output_text.delta")
+    # The worker kept its own stream alive while it was silent after its first output.
+    answered = _frame_events(workers.frames)
+    answered_types = [event for event, _ in answered]
+    assert (
+        "response.in_progress"
+        in answered_types[answered_types.index("response.output_text.delta") :]
+    )
+    # The client was kept alive meanwhile, and every response.in_progress it got is
+    # the opening's, only numbered on; none is one of the worker's.
+    assert "response.in_progress" in types[first_output:]
+    opening = _without_number(events[1][1])
+    assert all(
+        _without_number(data) == opening
+        for event, data in events
+        if event == "response.in_progress"
+    )
+    assert opening not in [
+        _without_number(data) for event, data in answered if event == "response.in_progress"
+    ]
+    # The worker's other events follow, in one sequence, for one response.
+    relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
+    assert [_without_number(data) for data in relayed] == [
+        _without_number(data)
+        for event, data in answered
+        if event not in ("response.created", "response.in_progress")
+    ]
     assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
     (generation_request,) = workers.generation_requests
     assert {data["response"]["id"] for _, data in events if "response" in data} == {
@@ -1163,7 +1253,7 @@ async def _transport(data: str, piece: int):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("piece", [1, 7, 4096])
-async def test_the_relay_drops_the_worker_opening_and_numbers_the_rest_to_follow(piece):
+async def test_the_relay_drops_the_worker_opening_and_keepalives_and_numbers_the_rest(piece):
     worker = "".join(
         [
             _frame("response.created", 0),
@@ -1181,8 +1271,7 @@ async def test_the_relay_drops_the_worker_opening_and_numbers_the_rest_to_follow
 
     assert [frame async for frame in relayed] == [
         _frame("response.output_text.delta", 2, delta="hi"),
-        _frame("response.in_progress", 3),
-        _frame("response.completed", 4),
+        _frame("response.completed", 3),
     ]
 
 

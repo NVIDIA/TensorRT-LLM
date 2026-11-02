@@ -531,8 +531,8 @@ class OpenAIDisaggServer:
             # The opening is built from the request alone; a request it cannot
             # be built from is answered when its pipeline answers.
             return await pipeline
-        # keep_responses_stream_alive repeats response.in_progress whenever the
-        # stream is silent, as it is while the pipeline runs.
+        # keep_responses_stream_alive repeats the opening's response.in_progress
+        # whenever the stream is silent, as it is while the pipeline runs.
         return _ResponsesStreamingResponse(
             pipeline=pipeline,
             content=keep_responses_stream_alive(
@@ -545,8 +545,10 @@ class OpenAIDisaggServer:
         """The stream of a Responses request whose pipeline outlasted the start wait.
 
         ``opening`` is the request's response.created and response.in_progress,
-        and the pipeline's stream follows it without the worker's own opening
-        (relay_after_opening). The status line is already out, so a pipeline
+        and the pipeline's stream follows it without the worker's own
+        response.created and response.in_progress events (relay_after_opening),
+        so that every keepalive the client gets repeats ``opening``'s
+        response.in_progress. The status line is already out, so a pipeline
         that fails ends the stream with error and response.failed, which carry
         the message of its error response. A stream abandoned before the
         pipeline answers, as when the client disconnects, cancels the pipeline.
