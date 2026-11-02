@@ -15,9 +15,11 @@
 
 // Prunes SLURM job output that L0_Test keeps on the clusters for debugging:
 // sbatch job workspaces (bloom/scripts/<host>-multi_node_test-*) in which no
-// file has changed within the retention period, and agent job logs
-// (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than it. Also prunes enroot
-// layer cache files neither read nor modified within the retention period.
+// file has changed within the retention period, agent job dirs
+// (bloom/scripts/<host>-test-*) in which nothing has been read or changed within
+// it, and agent job logs (slurm-logs/slurm-<jobid>-<host>-test-*.out) older than
+// it. Also prunes enroot layer cache files neither read nor modified within the
+// retention period.
 
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
@@ -96,11 +98,16 @@ def defaultClusterNames() {
 def pruneCommands(String homeDir, String days, boolean dryRun) {
     def removeDir = dryRun ? "echo would remove {}" : "(echo removing {} && rm -rf {})"
     def deleteLog = dryRun ? "" : "-delete"
+    // An agent job dir is kept while it or anything in it was modified, or any file
+    // in it was read, within `days`. Only files' access times count: find reads the
+    // dirs it walks, which refreshes theirs, but only stats files.
+    def agentDirInUse = "find {} -mtime -${days} -print -quit | grep -q . || find {} -type f -atime -${days} -print -quit | grep -q ."
     // Agent logs can number in the hundreds of thousands, so print only the count and
     // the oldest few / newest one (sorted by mtime) instead of every name.
     def summarizeLogs = "awk 'NR <= 3 { printf \"  oldest: \"; print } END { if (NR) { printf \"  newest: \"; print } print \"agent logs ${dryRun ? 'to prune' : 'pruned'}: \" NR }'"
     return [
         "find -H ${homeDir}/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-multi_node_test-*' -exec bash -c 'find {} -mtime -${days} -print -quit | grep -q . || ${removeDir}' \\; 2>/dev/null || true",
+        "find -H ${homeDir}/bloom/scripts -mindepth 1 -maxdepth 1 -type d -name '*-test-*' ! -name '*-multi_node_test-*' -exec bash -c '${agentDirInUse} || ${removeDir}' \\; 2>/dev/null || true",
         "find -H ${homeDir}/slurm-logs -maxdepth 1 -type f -name 'slurm-*-test-*.out' ! -mtime -${days} -printf '%TY-%Tm-%Td %p\\n' ${deleteLog} 2>/dev/null | sort | ${summarizeLogs}",
     ].join(" ; ")
 }
@@ -172,7 +179,7 @@ pipeline {
         string(
             name: 'RETENTION_DAYS',
             defaultValue: '10',
-            description: 'Prune SLURM job output not modified, and enroot layer cache files neither read nor modified, within this many days.')
+            description: 'Prune SLURM job output not modified, and agent job dirs and enroot layer cache files neither read nor modified, within this many days.')
         string(
             name: 'CLUSTERS',
             defaultValue: '',
