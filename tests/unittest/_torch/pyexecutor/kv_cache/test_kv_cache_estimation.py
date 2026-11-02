@@ -2390,10 +2390,13 @@ def _make_v2_estimation_creator(
     max_gpu_total_bytes: int | None = None,
 ) -> tuple[KvCacheCreator, KvCacheConfig]:
     """Construct a minimal V2 creator for memory budgeting tests."""
+    quota_kwargs = {}
+    if max_gpu_total_bytes is not None:
+        quota_kwargs["max_gpu_total_bytes"] = max_gpu_total_bytes
     kv_cache_config = KvCacheConfig(
         free_gpu_memory_fraction=0.9,
-        max_gpu_total_bytes=max_gpu_total_bytes,
         enable_block_reuse=False,
+        **quota_kwargs,
     )
     model_engine = Mock()
     model_engine.model.model_config.attn_backend = "TRTLLM"
