@@ -490,8 +490,13 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> No
     assert (ancestral == K).all()
 
     # The scheme this replaces: greedy-chained rows, each sampled on its own.
+    # The worker's greedy chain is a CUDA kernel; its eager reference runs here.
     old_meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
-    refined = worker._refine_block_logits(drafter, base, {"first_prev_tokens": anchors}, old_meta)
+
+    def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
+        return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
+
+    _, refined = dspark_markov_chain(base, anchors, step_bias, cast_bias_to_logits=True)
     with patch.object(
         SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(_cpu_sampler(generator))
     ):
