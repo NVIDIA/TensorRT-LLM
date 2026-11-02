@@ -36,6 +36,11 @@ def test_minimax_uses_precompiled_fmha_with_cold_cache(
     cache = tmp_path / "cold-fmha-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache))
 
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
+        require_msa_module,
+    )
+
+    require_msa_module()
     from fmha_sm100 import jit
 
     for kind in ("variants", "plan", "sparse_topk", "reduction"):
