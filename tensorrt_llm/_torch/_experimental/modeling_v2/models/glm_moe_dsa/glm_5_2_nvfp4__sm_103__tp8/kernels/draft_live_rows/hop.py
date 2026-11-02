@@ -34,9 +34,8 @@ any order on the stream that issues the TP group's hops.
 
 Eligibility is decided from rank-uniform host facts only (the selection, the
 post_attention_hop's agreed SM budget, shapes and dtypes), before any device work. The
-one rank-local fact, whether this process carries the operator, is agreed
-over the post_attention_hop's TP communicator when the live-row hop is built: it exists on
-every rank of the group or on none.
+operator itself is not rank-local: it comes from the target's native library, which the
+target package loads at import or fails to import, so every rank of the group carries it.
 """
 
 from typing import Any, Dict, Optional, Tuple
@@ -103,11 +102,10 @@ class LiveRowHop:
 
         Must be called at the same point of model construction on every rank
         of the post_attention_hop's TP group. The post_attention_hop exists on every rank or on
-        none; whether the operator is loaded is agreed over the post_attention_hop's
-        communicator the first time a post_attention_hop is seen (one collective, also on
-        a rank without the operator), so either every rank gets the live-row
-        hop or every rank keeps the post_attention_hop. Later calls for the same post_attention_hop
-        return the recorded decision without communicating.
+        none, and every rank carries the operator (see the module docstring), so either
+        every rank gets the live-row hop or every rank keeps the post_attention_hop. The
+        decision is recorded the first time a post_attention_hop is seen; later calls for
+        the same post_attention_hop return it.
         """
         if post_attn_hop is None or not getattr(post_attn_hop, "enabled", False):
             log_capability(
@@ -130,7 +128,7 @@ class LiveRowHop:
 
     @classmethod
     def _agreed(cls, post_attn_hop: Any) -> Tuple[Optional["LiveRowHop"], str]:
-        """Build the live-row hop if every rank of the post_attention_hop's group carries the operator."""
+        """Build the live-row hop on the post_attention_hop's workspace, or say why not."""
         comm = getattr(post_attn_hop, "comm", None)
         if comm is None:
             # An enabled post_attention_hop always has its communicator; without one there is no

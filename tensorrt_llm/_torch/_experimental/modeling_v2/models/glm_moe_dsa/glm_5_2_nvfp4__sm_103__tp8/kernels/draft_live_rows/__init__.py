@@ -18,9 +18,9 @@ Entry points registered with ``dispatch``:
 
 * ``make_live_row_hop(post_attn_hop)`` returns the :class:`LiveRowHop` on the
   workspace of the MTP layer's post_attention_hop, or None (the layer keeps the post_attention_hop).
-  Call it at the same point of model construction on every rank: the first
-  call for a post_attention_hop agrees over its TP communicator whether every rank
-  carries the operator, so the answer is the same on all ranks.
+  Call it at the same point of model construction on every rank; every rank
+  carries the operator (the target's native library), so the answer is the same
+  on all ranks.
 * ``select_step0(worker, draft_model, spec_metadata, draft_loop_ops)`` returns the
   draft step-0 arming (:class:`Step0LiveRows`) of one one-model MTP forward,
   or None to keep every row; decided on the host before any device work.

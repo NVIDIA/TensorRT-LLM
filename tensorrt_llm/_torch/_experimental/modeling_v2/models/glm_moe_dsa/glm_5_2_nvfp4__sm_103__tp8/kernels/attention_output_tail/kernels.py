@@ -175,7 +175,7 @@ _MAX_BLOCK_K = 512
 
 def pdl_enabled() -> bool:
     """Return whether attention_output_tail may use programmatic dependent launch at all."""
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
 
 
 def pdl_entry_enabled() -> bool:

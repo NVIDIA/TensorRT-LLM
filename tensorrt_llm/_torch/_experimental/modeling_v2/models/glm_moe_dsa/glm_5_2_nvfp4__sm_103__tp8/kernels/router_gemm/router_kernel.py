@@ -75,7 +75,7 @@ DEFAULT_PAIRED_FMA = False
 
 def pdl_enabled() -> bool:
     """Whether kernels launch with programmatic dependent launch."""
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
+    return os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
 
 
 def router_gemm_supported(hidden: torch.Tensor, weight: torch.Tensor) -> Tuple[bool, str]:

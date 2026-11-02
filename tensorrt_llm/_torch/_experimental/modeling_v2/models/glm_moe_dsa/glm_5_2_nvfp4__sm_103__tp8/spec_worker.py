@@ -75,7 +75,7 @@ class GlmMtpWorker(MTPEagleWorker):
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
         if runtime_draft_len == 0:
-            return self.skip_drafting(
+            outputs = self.skip_drafting(
                 input_ids,
                 position_ids,
                 hidden_states,
@@ -84,6 +84,10 @@ class GlmMtpWorker(MTPEagleWorker):
                 spec_metadata,
                 draft_model,
             )
+            # The skip path samples from, and returns, the same shard.
+            if spec_metadata.sharded_target_logits:
+                outputs["logits_vocab_shard"] = True
+            return outputs
 
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -139,6 +143,7 @@ class GlmMtpWorker(MTPEagleWorker):
                 max_draft_len=runtime_draft_len,
             )
 
+        loop_next_new_tokens = None
         if self._uses_external_shared_target_kv:
             next_draft_tokens = self._forward_external_shared_target_kv_draft_loop(
                 position_ids=position_ids,
@@ -152,6 +157,8 @@ class GlmMtpWorker(MTPEagleWorker):
                 batch_size=batch_size,
             )
         else:
+            # The step-0 sequence lengths, before the draft loop rewrites them.
+            pre_draft_seq_lens = attn_metadata._seq_lens_cuda
             # Save the old attn_metadata and spec_metadata
             self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
@@ -178,7 +185,7 @@ class GlmMtpWorker(MTPEagleWorker):
             # Get the draft KV cache manager if using separate layouts
             draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            next_draft_tokens = self._forward_draft_loop(
+            next_draft_tokens, loop_next_new_tokens = self._forward_draft_loop(
                 inputs,
                 attn_metadata,
                 spec_metadata,
@@ -190,6 +197,8 @@ class GlmMtpWorker(MTPEagleWorker):
                 num_accepted_tokens,
                 original_all_rank_num_tokens,
                 resource_manager,
+                accepted_tokens,
+                pre_draft_seq_lens,
             )
             # restore attn_metadata to support cuda graph
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -200,6 +209,8 @@ class GlmMtpWorker(MTPEagleWorker):
         # prepare next new tokens to support overlap scheduler
         if draft_loop_ops is not None and draft_loop_ops.next_new_tokens is not None:
             next_new_tokens = draft_loop_ops.next_new_tokens
+        elif loop_next_new_tokens is not None:
+            next_new_tokens = loop_next_new_tokens
         else:
             next_new_tokens = self._prepare_next_new_tokens(
                 accepted_tokens,
@@ -222,13 +233,16 @@ class GlmMtpWorker(MTPEagleWorker):
                 num_contexts,
             )
 
-        return {
+        outputs = {
             "logits": raw_logits,
             "new_tokens": accepted_tokens,
             "new_tokens_lens": num_accepted_tokens,
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+        if spec_metadata.sharded_target_logits:
+            outputs["logits_vocab_shard"] = True
+        return outputs
 
     def _forward_linear_draft_loop(
         self,
@@ -241,8 +255,15 @@ class GlmMtpWorker(MTPEagleWorker):
         batch_size,
         num_accepted_tokens,
         original_all_rank_num_tokens,
+        accepted_tokens=None,
+        pre_draft_seq_lens=None,
     ):
-        """Linear draft loop, unified for Eagle3 and MTP Eagle."""
+        """Linear draft loop, unified for Eagle3 and MTP Eagle.
+
+        Returns ``(next_draft_tokens, next_new_tokens)`` like the base loop. The decode
+        loop below builds no ``next_new_tokens`` (``None``); ``accepted_tokens`` and
+        ``pre_draft_seq_lens`` feed only the base loop's step-0 epilogue.
+        """
         if dispatch.phase() is not dispatch.Phase.DECODE:
             return super()._forward_linear_draft_loop(
                 inputs=inputs,
@@ -254,6 +275,8 @@ class GlmMtpWorker(MTPEagleWorker):
                 batch_size=batch_size,
                 num_accepted_tokens=num_accepted_tokens,
                 original_all_rank_num_tokens=original_all_rank_num_tokens,
+                accepted_tokens=accepted_tokens,
+                pre_draft_seq_lens=pre_draft_seq_lens,
             )
         from tensorrt_llm._torch.attention.backends.sparse.dsa import is_dsa_cache_manager
 
@@ -501,7 +524,8 @@ class GlmMtpWorker(MTPEagleWorker):
                         draft_step=i,
                         mapping_lm_head_tp=mapping_lm_head_tp,
                     )
-                if use_lm_head_tp_in_adp:
+                if use_lm_head_tp_in_adp and draft_tokens is None:
+                    # Only the LM-head path padded the rows to max_num_requests.
                     new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
@@ -588,7 +612,7 @@ class GlmMtpWorker(MTPEagleWorker):
             gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(gen_draft_tokens)
             next_draft_tokens[num_contexts:] = gen_draft_tokens
 
-        return next_draft_tokens
+        return next_draft_tokens, None
 
     def _run_draft_forward(self, draft_model, inputs, spec_metadata, step_idx: int):
         """Invoke the draft model for one iteration, branching on mode.

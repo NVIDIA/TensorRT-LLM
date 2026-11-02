@@ -329,10 +329,6 @@ class RoutedMoeKernel:
         stream,
     ):
         self._setup()
-        print(f"[routed_moe] a_smem {self.a_smem_layout_staged}")
-        print(f"[routed_moe] b_smem {self.b_smem_layout_staged}")
-        print(f"[routed_moe] sfa_smem {self.sfa_smem_layout_staged}")
-        print(f"[routed_moe] sfb_smem {self.sfb_smem_layout_std} -> {self.sfb_smem_layout_staged}")
         # A operands: [rows, K, experts], K-major FP4.
         w13 = cute.make_tensor(
             w13_ptr, cute.make_ordered_layout((2 * INTER, HIDDEN, NUM_EXPERTS), order=(1, 0, 2))

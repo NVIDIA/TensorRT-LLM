@@ -229,8 +229,8 @@ def route(
     )
     pattern = tuple(getattr(pretrained_config, name, None) for name in _TP8_PATTERN_FIELDS)
     # GLM-5.2-NVFP4 (bf16 MTP layer) on 8 B300s (sm103), tp8, one-model MTP-Eagle as a
-    # linear chain of five draft tokens. The quantization is read last, and only for
-    # such a deployment.
+    # linear chain of five draft tokens, with an fp8 latent KV cache. The quantization is
+    # read last, and only for such a deployment.
     quantization = "not read"
     if (
         compute_capability == (10, 3)
@@ -238,6 +238,7 @@ def route(
         and pattern == _TP8_PATTERN
         and tp8
         and _mtp_eagle_linear(spec_config, _TP8_DRAFT_LEN)
+        and kv_cache_quant_algo == QuantAlgo.FP8
     ):
         served, quantization = _nvfp4_with_bf16_mtp_layer(pretrained_config)
         if served:
@@ -271,5 +272,5 @@ def route(
         "GLM-5.2 modelopt NVFP4 checkpoint (bf16 MTP layer) on sm103, tp8 (8 ranks, "
         "tensor-parallel attention and experts, no attention DP), with one-model "
         "MTP-Eagle as a linear chain at max_draft_len=5, without the suffix-automaton "
-        "enhancer or relaxed acceptance"
+        "enhancer or relaxed acceptance, also with an fp8 latent KV cache"
     )
