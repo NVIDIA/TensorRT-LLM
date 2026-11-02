@@ -394,6 +394,7 @@ def test_minicpmv46_multimodal_forward():
 def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6VisionModel
+    from tensorrt_llm._torch.pyexecutor.engine.multimodal import setup_mm_encoder_attn_metadata
 
     raw = _minicpmv4_6_config_dict()
     raw.update(torch_dtype="bfloat16", image_size=8, insert_layer_id=0)
@@ -421,3 +422,11 @@ def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
     assert large.seq_lens.tolist() == [64]
     with pytest.raises(ValueError, match="exceeds the configured maximum"):
         vision._make_attn_metadata([65])
+
+    # The engine's encoder token budget, not the LLM limit, bounds later grids.
+    setup_mm_encoder_attn_metadata(
+        vision, input_processor=None, encoder_max_num_tokens=128, attention_metadata_capacity=None
+    )
+    grown = vision._make_attn_metadata([100])
+    assert grown.max_seq_len == 128
+    assert grown.seq_lens.tolist() == [100]
