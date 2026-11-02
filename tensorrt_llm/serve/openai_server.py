@@ -67,6 +67,7 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
     convert_anthropic_count_tokens_request, convert_anthropic_request,
@@ -718,12 +719,13 @@ class OpenAIServer(_VideoRoutesMixin):
             self.model = model
         self.metrics_collector = None
         args = getattr(self.generator, "args", None)
-        self._expose_perf_metrics = bool(
-            args and getattr(args, "return_perf_metrics", False))
         perf_metrics_output_dir = (getattr(args, "perf_metrics_output_dir",
                                            None) if args else None)
-        self._collect_perf_metrics = (self._expose_perf_metrics
-                                      or perf_metrics_output_dir is not None)
+        perf_metrics = resolve_perf_metrics_config(
+            getattr(args, "return_perf_metrics", False),
+            perf_metrics_output_dir)
+        self._expose_perf_metrics = perf_metrics.expose_response_metrics
+        self._collect_perf_metrics = perf_metrics.collect_request_metrics
         # Per-request spec-decode acceptance stats. Deliberately independent of
         # return_perf_metrics: coupling them would mean asking for acceptance
         # numbers silently mounts the Prometheus endpoint too.
@@ -1034,31 +1036,12 @@ class OpenAIServer(_VideoRoutesMixin):
 
         if self.generator.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
-            args = self.generator.args
-            pmc = getattr(args, "prometheus_metrics_config", None)
-            self.metrics_collector = MetricsCollector(
-                {
-                    "model_name": self.model,
-                    "engine_type": args.backend or "unknown"
-                },
-                e2e_request_latency_buckets=(pmc.e2e_request_latency_buckets
-                                             if pmc else None),
-                time_to_first_token_buckets=(pmc.time_to_first_token_buckets
-                                             if pmc else None),
-                time_per_output_token_buckets=(pmc.time_per_output_token_buckets
-                                               if pmc else None),
-                request_queue_time_buckets=(pmc.request_queue_time_buckets
-                                            if pmc else None),
-                request_prefill_time_buckets=(pmc.request_prefill_time_buckets
-                                              if pmc else None),
-                request_decode_time_buckets=(pmc.request_decode_time_buckets
-                                             if pmc else None),
-                request_inference_time_buckets=(
-                    pmc.request_inference_time_buckets if pmc else None),
-            )
+            self.metrics_collector = MetricsCollector.from_args(
+                self.generator.args, self.model)
             # One config-info series per server, not per frontend process.
             if self._launcher_forwarder is None:
-                self._log_config_info_metrics()
+                self.metrics_collector.log_config_from_args(
+                    self.generator.args, self.model)
 
     @staticmethod
     def _ensure_post_processor_hook_supported(
@@ -1112,95 +1095,6 @@ class OpenAIServer(_VideoRoutesMixin):
             return cache_transceiver_config.get("backend") is not None
         return (cache_transceiver_config is not None and getattr(
             cache_transceiver_config, "backend", None) is not None)
-
-    def _log_config_info_metrics(self) -> None:
-        """Extract configuration from generator args and log as Prometheus info gauges."""
-        args = self.generator.args
-
-        # Model config
-        model_config = {
-            "model": str(args.model),
-            "served_model_name": self.model,
-            "dtype": str(args.dtype),
-        }
-        quant_config = getattr(args, "quant_config", None)
-        if quant_config is not None:
-            quant_algo = getattr(quant_config, "quant_algo", None)
-            model_config["quantization"] = str(
-                quant_algo) if quant_algo else "none"
-        else:
-            model_config["quantization"] = "none"
-        max_seq_len = getattr(args, "max_seq_len", None)
-        if max_seq_len is not None:
-            model_config["max_model_len"] = str(max_seq_len)
-        try:
-            import torch
-            if torch.cuda.is_available():
-                model_config["gpu_type"] = torch.cuda.get_device_name(0)
-        except (ImportError, RuntimeError) as e:
-            logger.debug("Could not detect GPU type for config metrics: %s", e)
-
-        # Parallel config — prefer parallel_config from generator args
-        # for accurate values including cp_size and world_size.
-        par_cfg = getattr(args, "parallel_config", None)
-        if par_cfg is not None:
-            tp_size = getattr(par_cfg, "tp_size", 1) or 1
-            pp_size = getattr(par_cfg, "pp_size", 1) or 1
-            cp_size = getattr(par_cfg, "cp_size", 1) or 1
-            world_size = getattr(par_cfg, "world_size",
-                                 tp_size * pp_size * cp_size)
-        else:
-            tp_size = getattr(args, "tensor_parallel_size", 1) or 1
-            pp_size = getattr(args, "pipeline_parallel_size", 1) or 1
-            cp_size = 1
-            world_size = tp_size * pp_size * cp_size
-        parallel_config = {
-            "tensor_parallel_size": str(tp_size),
-            "pipeline_parallel_size": str(pp_size),
-            "context_parallel_size": str(cp_size),
-            "gpu_count": str(world_size),
-        }
-        ep_size = getattr(par_cfg, "moe_ep_size", None) if par_cfg else \
-            getattr(args, "moe_expert_parallel_size", None)
-        if ep_size is not None and ep_size > 0:
-            parallel_config["expert_parallel_size"] = str(ep_size)
-
-        # Speculative decoding config
-        spec_config_obj = getattr(args, "speculative_config", None) or getattr(
-            args, "decoding_config", None)
-        speculative_config = None
-        if spec_config_obj is not None:
-            speculative_config = {"spec_enabled": "true"}
-            decoding_type = getattr(spec_config_obj, "decoding_type", None)
-            if decoding_type is not None:
-                speculative_config["spec_method"] = str(decoding_type)
-            max_draft_len = getattr(spec_config_obj, "max_draft_len", None)
-            if max_draft_len is not None:
-                speculative_config["spec_num_tokens"] = str(max_draft_len)
-            draft_model = getattr(spec_config_obj, "speculative_model", None)
-            if draft_model is not None:
-                speculative_config["spec_draft_model"] = str(draft_model)
-
-        # KV cache config
-        kv_cache_config_obj = getattr(args, "kv_cache_config", None)
-        kv_cache_config = None
-        if kv_cache_config_obj is not None:
-            kv_cache_config = {}
-            for field in ("page_size", "enable_block_reuse",
-                          "enable_partial_reuse", "free_gpu_memory_fraction"):
-                val = getattr(kv_cache_config_obj, field, None)
-                if val is not None:
-                    kv_cache_config[field] = str(val)
-            kv_dtype = getattr(kv_cache_config_obj, "dtype", None)
-            if kv_dtype is not None:
-                kv_cache_config["cache_dtype"] = str(kv_dtype)
-
-        self.metrics_collector.log_config_info(
-            model_config=model_config,
-            parallel_config=parallel_config,
-            speculative_config=speculative_config,
-            kv_cache_config=kv_cache_config if kv_cache_config else None,
-        )
 
     @staticmethod
     def _attach_multimodal_data(
@@ -2118,18 +2012,16 @@ class OpenAIServer(_VideoRoutesMixin):
                 self._iteration_stats_wakeup_event.clear()
 
                 # Drain all available iteration stats and log each one to Prometheus.
+                # The fetch blocks for up to its timeout, so it runs on the
+                # metrics thread, which /metrics leaves idle while this loop runs.
                 try:
-                    if woken_by_timer:
-                        # Idle poll: a non-blocking read on the metrics
-                        # thread, idle while this loop owns the queue.
-                        for llm_stat in await asyncio.get_running_loop(
-                        ).run_in_executor(self._metrics_stats_executor,
-                                          self.generator.get_stats, 0):
-                            self._record_iteration_stat(llm_stat)
-                    else:
-                        async for llm_stat in self.generator.get_stats_async(
-                                timeout=0.5):
-                            self._record_iteration_stat(llm_stat)
+                    # A timer wakeup (multi-frontend launcher poll) reads
+                    # without waiting.
+                    for llm_stat in await asyncio.get_running_loop(
+                    ).run_in_executor(self._metrics_stats_executor,
+                                      self.generator.get_stats,
+                                      0 if woken_by_timer else 0.5):
+                        self._record_iteration_stat(llm_stat)
                 except Exception as e:
                     # Log errors but continue collecting stats
                     logger.error(f"Error collecting iteration stats: {e}",
@@ -3581,6 +3473,17 @@ class OpenAIServer(_VideoRoutesMixin):
                 chat_template=self.chat_template
                 if not self.use_harmony else None,
             )
+            if not self.use_harmony:
+                # Detokenize as chat completions does for these parsers: a
+                # parser that reads special tokens needs them kept, and Kimi-K3's
+                # tags also need them without spaces in between. Without this,
+                # `<|open|>tools<|sep|>` arrives as `<|open|> tools <|sep|>` and
+                # every K3 tool call reaches the client as message text.
+                _configure_parser_special_token_decoding(
+                    sampling_params,
+                    reasoning_parser_name=self.generator.args.reasoning_parser,
+                    tool_parser_name=self.tool_parser,
+                    has_tools=bool(request.tools))
 
             streaming_processor = None
             if request.stream:

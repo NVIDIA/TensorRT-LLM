@@ -405,6 +405,7 @@ def test_mla_chunked_prefill_dispatch_by_sm(sm_version, expected_path,
     import tensorrt_llm._torch.attention.mla as mla_module
 
     class FakeTrtllmAttention:
+        uses_fp4_mla_attention = False
 
         @staticmethod
         def has_cached_kv_for_mla_context_warmup(_metadata):
@@ -1461,11 +1462,66 @@ def test_context_prefix_counts_tokens_not_rows():
     assert state.mla_prepare_ctx_cu_seqlens().tolist() == [0, 2, 5, 12]
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "mapping_override,backend,cp_size,sparse,rejected",
+    [
+        (False, "FLASHINFER", 2, False, True),
+        (False, "VANILLA", 2, False, True),
+        (False, "TRTLLM", 2, False, False),
+        (True, "FLASHINFER", 2, False, True),
+        (True, "TRTLLM", 2, False, False),
+        (False, "FLASHINFER", 1, False, False),
+        (False, "FLASHINFER", 2, True, False),
+    ],
+)
+def test_mla_helix_backend_validation(monkeypatch, mapping_override, backend,
+                                      cp_size, sparse, rejected):
+    """Reject unsupported dense Helix backends before allocating projections."""
+    mapping = Mapping(world_size=cp_size,
+                      cp_size=cp_size,
+                      cp_config={"cp_type": "HELIX"})
+    config = mla_module.ModelConfig(
+        mapping=Mapping() if mapping_override else mapping,
+        attn_backend=backend,
+    )
+    hooks = types.SimpleNamespace() if sparse else None
+    monkeypatch.setattr(mla_module, "get_sparse_mla_hooks", lambda _: hooks)
+    # Stop accepted configurations before projection/backend allocation.
+    quant_config = mock.Mock(side_effect=RuntimeError("quantization setup"))
+    monkeypatch.setattr(mla_module.ModelConfig, "get_quant_config",
+                        quant_config)
+    expected_error = NotImplementedError if rejected else RuntimeError
+    expected_message = "Dense MLA.*TRTLLM" if rejected else "quantization setup"
+    with pytest.raises(expected_error, match=expected_message):
+        mla_module.MLA(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            v_head_dim=16,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            predicted_tokens_per_seq=1,
+            max_position_embeddings=128,
+            bias=False,
+            pos_embd_params=PositionalEmbeddingParams(
+                type=PositionEmbeddingType.rope_gpt_neox,
+                rope=RopeParams(dim=8, max_positions=128),
+            ),
+            config=config,
+            mapping_with_cp=mapping if mapping_override else None,
+        )
+    assert quant_config.call_count == (0 if rejected else 1)
+
+
 def _context_projection(device: str,
                         dtype: torch.dtype,
                         bias: bool = False) -> types.SimpleNamespace:
     model = types.SimpleNamespace(
         num_heads_tp=4,
+        num_context_heads=4,
         qk_nope_head_dim=16,
         qk_rope_head_dim=8,
         qk_head_dim=24,
@@ -1483,6 +1539,8 @@ def _context_projection(device: str,
         mla_module.MLA._use_kvbproj_strided_out, model)
     model._get_kvbproj_head_weights = types.MethodType(
         mla_module.MLA._get_kvbproj_head_weights, model)
+    model._project_context_kv = types.MethodType(
+        mla_module.MLA._project_context_kv, model)
     return model
 
 

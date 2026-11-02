@@ -20,13 +20,14 @@ if TYPE_CHECKING:
         MixedMambaHybridCacheManager,
         PythonMambaCacheManager,
     )
-    from .mamba_cache_manager_v2 import MambaHybridCacheManagerV2
+    from .mamba_cache_manager_v2 import InforwardSnapshotEntry, MambaHybridCacheManagerV2
 
 _EXPORTS = {
     "get_tensor_size_bytes": ("common", "get_tensor_size_bytes"),
     "_estimate_mamba_hybrid_cache_cost": ("common", "_estimate_mamba_hybrid_cache_cost"),
     "BaseMambaCacheManager": ("common", "BaseMambaCacheManager"),
     "CppMambaHybridCacheManager": ("legacy", "CppMambaHybridCacheManager"),
+    "InforwardSnapshotEntry": ("mamba_cache_manager_v2", "InforwardSnapshotEntry"),
     "MambaCacheManager": ("legacy", "MambaCacheManager"),
     "MambaHybridCacheManager": ("common", "MambaHybridCacheManager"),
     "MambaHybridCacheManagerV2": (
@@ -67,6 +68,7 @@ def __dir__() -> list[str]:
 __all__ = [
     "BaseMambaCacheManager",
     "CppMambaHybridCacheManager",
+    "InforwardSnapshotEntry",
     "MambaCacheManager",
     "MambaHybridCacheManager",
     "MambaHybridCacheManagerV2",

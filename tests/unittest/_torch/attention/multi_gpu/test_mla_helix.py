@@ -386,13 +386,11 @@ def _run_mla_distributed(
         input_ctx, position_ids_ctx, scenario, rank, world_size
     )
 
-    # Context step — populate KV cache only; output is discarded.
-    # We call forward_impl directly instead of mla.forward() because
-    # o_proj is sized for helix-gen (num_heads_tp_cp * v_head_dim) and would
-    # crash on the full-width context attention output.
+    # This decode fixture populates each rank's cache from a different token
+    # chunk. Complete, replicated-input prefill outputs are checked separately.
     activate_all_ranks_for_context(attn_metadata, position_ids_ctx_rank)
     ctx_output = input_ctx_rank.new_empty(
-        [input_ctx_rank.shape[0], mla.num_heads_tp * mla.v_head_dim], dtype=input_ctx_rank.dtype
+        [input_ctx_rank.shape[0], mla.mha.num_heads * mla.v_head_dim], dtype=input_ctx_rank.dtype
     )
     mla.forward_impl(position_ids_ctx_rank, input_ctx_rank, attn_metadata, attn_output=[ctx_output])
 

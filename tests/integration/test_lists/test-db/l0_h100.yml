@@ -18,18 +18,19 @@ l0_h100:
   tests:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on H100; its cpu_only cases
+  # run on CPU (l0_cpu). kernels/ has no entry of its own on any list, so this entry is
+  # what runs it here. multi_gpu/ cases need >= 2 GPUs and most also need Blackwell, so
+  # they skip here and run on Blackwell multi-GPU stages: l0_gb300_multi_gpus (post_merge)
+  # and l0_dgx_b300, which runs test_helix_zero_kv.py in its pre_merge block and the rest
+  # in post_merge. Collecting them still runs their helix files' import-time rebinding of
+  # mpi4py's serializer, which applies to the whole pytest process.
+  # The GPU cases of kernels/parallel_hw_agnostic/ run here; l0_b200 and l0_b300 ignore
+  # that directory, so on Blackwell only GB300 (l0_gb300_multi_gpus, post_merge) runs them.
   - unittest/_torch/attention
   - unittest/_torch/compilation
   - unittest/_torch/debugger
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   - unittest/_torch/peft
   - unittest/others/test_lora_manager.py
@@ -83,6 +84,8 @@ l0_h100:
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/visual_gen/test_attention_flashinfer.py
+  - unittest/_torch/visual_gen/test_block_causal_attention.py
+  - unittest/_torch/visual_gen/test_block_causal_kv_cache.py
   - unittest/_torch/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/kernels/parallel_hw_agnostic
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
@@ -94,6 +97,8 @@ l0_h100:
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling -k "modeling_gemma4"
   - unittest/_torch/modeling -k "modeling_whisper"  # CPU-only log-mel parity
+  - unittest/_torch/modeling/test_gemma4_unified.py
+  - unittest/_torch/modeling/test_modeling_deepseekv3.py
   - unittest/_torch/modeling/test_modeling_deepseekv32.py
   - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_sanity
   # Real-weight Nano CG/overlap and chunked-prefill path smoke (MoE L0 cannot
@@ -264,12 +269,13 @@ l0_h100:
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logits[True-Qwen3-0.6B]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[False-Qwen3-0.6B]
     - disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_logprobs[True-Qwen3-0.6B]
-    - unittest/_torch/executor/test_overlap_scheduler.py
+    - unittest/_torch/pyexecutor/test_overlap_scheduler.py
     - unittest/_torch/modeling/test_modeling_nemotron_h.py::test_nemotron_h_breakable_prefill_cuda_graph -k "tp1" TIMEOUT (90)
     - unittest/executor/test_ray_sleep_state.py
     - unittest/executor/test_shim_ray.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_sleep.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_postproc_workers.py
+    - unittest/_torch/ray_orchestrator/single_gpu/test_kv_cache_reset_events.py
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part0"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part1"
     - unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py -m "part2"
@@ -376,6 +382,8 @@ l0_h100:
   - kv_cache/test_kv_cache_iteration_stats.py::TestKvCacheIterationStats::test_field_completeness
   - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (300)
   - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (300)
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_native_fp8_lora_matches_bf16_reference[eager]
+  - llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_native_fp8_lora_matches_bf16_reference[cudagraph]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=True-enable_max_concurrency=False-enable_draft_len_schedule=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=False-enable_draft_len_schedule=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_8B::test_eagle3[eagle3_one_model=True-enable_chunked_prefill=False-enable_max_concurrency=True-enable_draft_len_schedule=False]

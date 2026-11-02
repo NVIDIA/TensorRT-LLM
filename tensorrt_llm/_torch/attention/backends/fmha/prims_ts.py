@@ -157,6 +157,7 @@ class PrimsTSFmha(PhasedFmha):
 
     supports_per_tensor_fp8 = True
 
+    SUPPORTED_SMS = frozenset({100, 103})
     SUPPORTED_PAGE_SIZES = {16, 32, 64, 128}
     SUPPORTED_CONTEXT_HEAD_DIMS = {128, 256}
     SUPPORTED_DECODE_HEAD_DIMS = {64, 128, 256}
@@ -190,7 +191,7 @@ class PrimsTSFmha(PhasedFmha):
     @classmethod
     def _is_available(cls, attn: "TrtllmAttention") -> bool:
         sm = get_sm_version()
-        if sm not in (100, 103):
+        if sm not in cls.SUPPORTED_SMS:
             logger.debug(f"PrimTS FMHA is unavailable: requires SM100 or SM103, got SM{sm}.")
             return False
         try:
