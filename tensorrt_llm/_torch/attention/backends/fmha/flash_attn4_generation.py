@@ -213,6 +213,7 @@ def _rope_write_kv_paged_kernel(
     page_table_ptr,
     page_table_stride,
     kv_lens_ptr,
+    page_lens_ptr,
     Q_LEN: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -222,16 +223,23 @@ def _rope_write_kv_paged_kernel(
     BLOCK_KV_HEADS: tl.constexpr,
     TOKENS_PER_BLOCK: tl.constexpr,
     HAS_ROPE: tl.constexpr,
+    HAS_PAGE_LENS: tl.constexpr,
 ):
     # Program t takes token t = row * Q_LEN + j at position kv_len - Q_LEN + j of its row:
     # rotates its Q heads in place (NeoX pairs (d, d + HALF), d < HALF) and writes its rotated
-    # K and its V into the row's page.
+    # K and its V into the row's page, at slot page_len - Q_LEN + j of the row's page table
+    # (page_len = kv_len unless the table starts later in the row).
     t = tl.program_id(0)
     row = t // Q_LEN
     j = t % Q_LEN
     pos = tl.load(kv_lens_ptr + row).to(tl.int64) - Q_LEN + j
-    valid = pos >= 0
     pos = tl.maximum(pos, 0)
+    if HAS_PAGE_LENS:
+        slot = tl.load(page_lens_ptr + row).to(tl.int64) - Q_LEN + j
+    else:
+        slot = tl.load(kv_lens_ptr + row).to(tl.int64) - Q_LEN + j
+    valid = slot >= 0
+    slot = tl.maximum(slot, 0)
     base = qkv_ptr + t.to(tl.int64) * qkv_row_stride
     kv_heads = tl.arange(0, BLOCK_KV_HEADS)
     kv_ok = kv_heads[:, None] < NUM_KV_HEADS
@@ -269,12 +277,12 @@ def _rope_write_kv_paged_kernel(
         sign = tl.where(low, -1.0, 1.0)
         k_rot = k.to(tl.float32) * cos_d[None, :] + sign[None, :] * kp * sin_d[None, :]
         k = tl.where(rot[None, :], k_rot, k.to(tl.float32)).to(v.dtype)
-    page = tl.load(page_table_ptr + row.to(tl.int64) * page_table_stride + pos // TOKENS_PER_BLOCK)
+    page = tl.load(page_table_ptr + row.to(tl.int64) * page_table_stride + slot // TOKENS_PER_BLOCK)
     dst = (
         pool_ptr
         + page.to(tl.int64) * pool_page_stride
         + kv_heads[:, None].to(tl.int64) * pool_head_stride
-        + (pos % TOKENS_PER_BLOCK) * pool_slot_stride
+        + (slot % TOKENS_PER_BLOCK) * pool_slot_stride
         + dims[None, :]
     )
     tl.store(dst, k, mask=kv_ok & valid)
@@ -293,6 +301,7 @@ def rope_write_kv_paged(
     head_dim: int,
     rotary_dim: int,
     q_len: int,
+    page_lens: Optional[torch.Tensor] = None,
 ) -> None:
     """One launch: NeoX RoPE on the Q heads of packed QKV (in place) and the step's rotated K and
     its V into the paged pool; the pool and Q end as after ``rope_qkv_inplace`` followed by
@@ -303,8 +312,11 @@ def rope_write_kv_paged(
         cos_sin: the attention op's float32 [position][pair][cos, sin] table, or None for no RoPE.
         pool: [pages, 2, kv_heads, tokens_per_block, head_dim] layer pool (HND).
         page_table: [rows, max_pages] int32 pool pages of every row.
-        kv_lens: [rows] int32 device KV lengths including the step's ``q_len`` tokens.
+        kv_lens: [rows] int32 device KV lengths including the step's ``q_len`` tokens (they
+            give the RoPE positions).
         rotary_dim: rotated leading dimensions of each head (a power of two, at most head_dim).
+        page_lens: [rows] int32 lengths within ``page_table`` when the table covers only the
+            end of each row (its first entry is not the row's first page); default ``kv_lens``.
     """
     tokens = qkv.shape[0]
     if tokens == 0:
@@ -328,6 +340,7 @@ def rope_write_kv_paged(
         page_table,
         page_table.stride(0),
         kv_lens,
+        page_lens if page_lens is not None else kv_lens,
         Q_LEN=q_len,
         NUM_HEADS=num_heads,
         NUM_KV_HEADS=num_kv_heads,
@@ -337,6 +350,7 @@ def rope_write_kv_paged(
         BLOCK_KV_HEADS=triton.next_power_of_2(num_kv_heads),
         TOKENS_PER_BLOCK=pool.shape[3],
         HAS_ROPE=cos_sin is not None,
+        HAS_PAGE_LENS=page_lens is not None,
     )
 
 
@@ -441,12 +455,15 @@ def _merge_splits_kernel(
     last_lse_ptr,
     out_ptr,
     out_token_stride,
+    lse_out_ptr,
     H: tl.constexpr,
     HP: tl.constexpr,
     D: tl.constexpr,
     Q_LEN: tl.constexpr,
     SPLITS: tl.constexpr,
+    WRITE_LSE: tl.constexpr,
 ):
+    # HP: heads per program (program_id(1) picks the block of heads).
     # Program t = r * Q_LEN + j joins the SPLITS non-causal states of row r (skipping empty
     # splits) and its causal last part; FA4's states are normalized outputs with natural-log
     # LSEs laid out [batch, heads, Q_LEN].
@@ -454,7 +471,7 @@ def _merge_splits_kernel(
     t = tl.program_id(0)
     r = t // Q_LEN
     j = t % Q_LEN
-    heads = tl.arange(0, HP)
+    heads = tl.program_id(1) * HP + tl.arange(0, HP)
     h_ok = heads < H
     dims = tl.arange(0, D)
     lse = tl.load(last_lse_ptr + (r * H + heads) * Q_LEN + j, mask=h_ok, other=0.0) * LOG2E
@@ -488,6 +505,13 @@ def _merge_splits_kernel(
         (acc / l_tot[:, None]).to(out_ptr.dtype.element_ty),
         mask=h_ok[:, None],
     )
+    if WRITE_LSE:
+        # Natural-log LSE in FA4's [rows, heads, Q_LEN] layout.
+        tl.store(
+            lse_out_ptr + (r * H + heads) * Q_LEN + j,
+            (peak + tl.log2(l_tot)) / LOG2E,
+            mask=h_ok,
+        )
 
 
 def split_tables(
@@ -543,6 +567,7 @@ def fa4_paged_generation_split(
     q_len: int,
     splits: int,
     sm_scale: float,
+    lse: Optional[torch.Tensor] = None,
 ) -> None:
     """FA4 generation with the cached keys split ``splits`` ways (flash decoding).
 
@@ -555,6 +580,7 @@ def fa4_paged_generation_split(
         q: [rows * q_len, heads, head_dim] (rotary embedding applied).
         out: [rows * q_len, heads, head_dim] output.
         tables: ``split_tables(page_table, kv_lens, q_len, splits, tokens_per_block)``.
+        lse: optional [rows, heads, q_len] float32 output, the natural-log LSE (FA4's layout).
     """
     fwd = _fa4_forward()
     if fwd is None:
@@ -582,10 +608,13 @@ def fa4_paged_generation_split(
         out=split_out, lse=split_lse, **common)  # fmt: skip
     fwd(q.view(rows, q_len, num_heads, head_dim), k_pages, v_pages, seqused_k=last_lens,
         page_table=last_table, causal=True, out=last_out, lse=last_lse, **common)  # fmt: skip
-    _merge_splits_kernel[(tokens,)](
+    # A few heads per program: a small batch has few tokens, and each program walks every split.
+    heads_per_program = 4
+    _merge_splits_kernel[(tokens, triton.cdiv(num_heads, heads_per_program))](
         split_out, split_lse, split_lens, last_out, last_lse, out, out.stride(0),
-        H=num_heads, HP=triton.next_power_of_2(num_heads), D=head_dim, Q_LEN=q_len,
-        SPLITS=splits, num_warps=4,
+        lse if lse is not None else last_lse,
+        H=num_heads, HP=heads_per_program, D=head_dim, Q_LEN=q_len,
+        SPLITS=splits, WRITE_LSE=lse is not None, num_warps=2,
     )  # fmt: skip
 
 

@@ -266,3 +266,40 @@ def test_generation_splits_follow_the_grid(monkeypatch):
     assert generation_splits(4, 20, 20, 9, 132) == 1  # MHA: 80 CTAs
     monkeypatch.setenv(SPLITS_ENV, "1")
     assert generation_splits(1, 28, 4, 1, 132) == 1
+
+
+@pytest.mark.parametrize("q_len", [4, 9])
+def test_rope_write_kv_paged_with_page_lens_uses_absolute_rope_positions(q_len):
+    """A page table covering only the end of each row (``page_lens`` < ``kv_lens``, as for the n-sample
+    library's private pages): RoPE at the absolute positions, K/V at slot ``page_len - q_len + j``."""
+    from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+        rope_write_kv_paged,
+        write_kv_paged,
+    )
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_kernels import (
+        rope_qkv_inplace,
+    )
+
+    device = torch.device("cuda")
+    num_heads, num_kv_heads, head_dim, tpb, rows, width = 28, 4, 128, 32, 7, 6
+    gen = torch.Generator(device=device).manual_seed(1)
+    shared_tokens = 4 * tpb
+    page_lens = torch.randint(q_len, width * tpb, (rows,), generator=gen, device=device).to(torch.int32)
+    kv_lens = page_lens + shared_tokens
+    tail_table = torch.randperm(rows * width, device=device).view(rows, width).to(torch.int32)
+    pool = torch.randn(rows * width, 2, num_kv_heads, tpb, head_dim, generator=gen, device=device).bfloat16()
+    cols = (num_heads + 2 * num_kv_heads) * head_dim
+    qkv = torch.randn(rows * q_len, cols, generator=gen, device=device).bfloat16()
+    cos_sin = torch.randn(width * tpb + shared_tokens, head_dim, generator=gen, device=device)
+    ref_qkv, ref_pool = qkv.clone(), pool.clone()
+    rope_qkv_inplace(ref_qkv, cos_sin, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                     head_dim=head_dim, rotary_dim=head_dim, q_len=q_len)  # fmt: skip
+    q_size, kv_size = num_heads * head_dim, num_kv_heads * head_dim
+    write_kv_paged(ref_pool, ref_qkv[:, q_size : q_size + kv_size].view(-1, num_kv_heads, head_dim),
+                   ref_qkv[:, q_size + kv_size :].view(-1, num_kv_heads, head_dim), tail_table, page_lens, q_len)  # fmt: skip
+    rope_write_kv_paged(qkv, cos_sin, pool, tail_table, kv_lens, num_heads=num_heads, num_kv_heads=num_kv_heads,
+                        head_dim=head_dim, rotary_dim=head_dim, q_len=q_len, page_lens=page_lens)  # fmt: skip
+    torch.cuda.synchronize()
+    assert torch.equal(pool[:, 1], ref_pool[:, 1])
+    torch.testing.assert_close(pool[:, 0].float(), ref_pool[:, 0].float(), rtol=2**-7, atol=0)
+    assert torch.equal(qkv[:, :q_size], ref_qkv[:, :q_size])

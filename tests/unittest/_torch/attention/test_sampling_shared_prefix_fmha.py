@@ -1269,7 +1269,7 @@ def _fused_spec_case(
     )  # fmt: skip
 
 
-def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
+def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx", splits=1):
     """Prefix-kernel tables of a fused-spec case (skips when the kernel is unavailable): the TRTLLM-Gen
     context kernel (``ctx``) or FlashAttention-4 (``fa4``)."""
     from types import SimpleNamespace
@@ -1297,14 +1297,16 @@ def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
         prefix_indices=torch.tensor(t["prefix_indices"], dtype=torch.int32),
         prefix_last_page_len=torch.tensor(t["prefix_last"], dtype=torch.int32),
     )
-    requests = CtxPrefix.num_requests_for(groups + 2, case["ntok"], q_len)
+    requests = CtxPrefix.num_requests_for(groups + 2, case["ntok"], q_len) * splits
     max_pages = 8
+    kwargs = dict(splits=splits) if splits > 1 else {}
     ctx = CtxPrefix(
         case["ntok"], num_heads, head_dim, q_len, requests, max_pages, 16384, torch.bfloat16,
-        torch.device("cuda"), case["tpb"],
+        torch.device("cuda"), case["tpb"], **kwargs,
     )  # fmt: skip
     for dst, host in zip(
-        ctx.table_arrays(), _ctx_tables(fake, case["tpb"], ctx.chunk_tokens, requests, max_pages)
+        ctx.table_arrays(),
+        _ctx_tables(fake, case["tpb"], ctx.chunk_tokens, requests, max_pages, splits=splits),
     ):
         dst.copy_(torch.from_numpy(host))
     return ctx
@@ -1347,7 +1349,7 @@ def _run_fused_spec(
     )  # fmt: skip
 
 
-def _make_fa4_tail(case, num_heads, head_dim, q_len, prefix_pages=4, kv_factor=2):
+def _make_fa4_tail(case, num_heads, head_dim, q_len, prefix_pages=4, kv_factor=2, splits=1):
     """``Fa4Tail`` of a fused-spec case with its step tables built from a device block-offset table
     (batch order, ``kv_factor`` entries per pool-view page, a row's shared pages first)."""
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import Fa4Tail
@@ -1368,7 +1370,7 @@ def _make_fa4_tail(case, num_heads, head_dim, q_len, prefix_pages=4, kv_factor=2
         offsets[b, : len(pages)] = torch.tensor(pages, dtype=torch.int32) * kv_factor
         shared.append(prefix_pages if sharing else 0)
         kv_lens[b] = shared[-1] * tpb + case["cached"][i] + q_len
-    tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_blocks, torch.bfloat16, device)
+    tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_blocks, torch.bfloat16, device, splits=splits)
     tail.build_tables(
         offsets.to(device),
         t["perm"],
@@ -1535,11 +1537,14 @@ def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
      (20, 20, 128, 9, True, 2, False)],
 )
 @pytest.mark.parametrize("massive", [False, True])
+@pytest.mark.parametrize("prefix_splits,tail_splits", [(1, 1), (3, 1), (8, 1), (1, 4), (8, 16)])
 def test_fused_spec_attention_with_fa4_prefix_and_tail_matches_dense_and_writes_kv(
-    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive
+    num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, overshoot, massive,
+    prefix_splits, tail_splits,
 ):
-    """FlashAttention-4 for the shared pages and the private pages (SM90) + their merge against the
-    float64 reference (also with massive activations), and the step's K/V written at cached + j."""
+    """FlashAttention-4 for the shared pages (whole, or split into runs, some empty: 4 shared pages
+    split 8 ways) and the private pages (SM90) + their merge against the float64 reference (also
+    with massive activations), and the step's K/V written at cached + j."""
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
         FusedWorkspace,
     )
@@ -1550,8 +1555,8 @@ def test_fused_spec_attention_with_fa4_prefix_and_tail_matches_dense_and_writes_
             num_heads, num_kv_heads, head_dim, q_len, shuffled, placeholder_rows, seed, overshoot,
             massive=massive,
         )  # fmt: skip
-        ctx = _make_ctx(case, num_heads, head_dim, q_len, kind="fa4")
-        tail = _make_fa4_tail(case, num_heads, head_dim, q_len)
+        ctx = _make_ctx(case, num_heads, head_dim, q_len, kind="fa4", splits=prefix_splits)
+        tail = _make_fa4_tail(case, num_heads, head_dim, q_len, splits=tail_splits)
         pool = case["pool"]
         before = pool.clone()
         out = torch.empty_like(case["q"])
@@ -1719,6 +1724,17 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
     )
     assert off is not None and on is not None, "no speculative-decoding stats reported"
     assert abs(on - off) <= 0.05 * off, (on, off)
+
+
+def test_fa4_prefix_splits_follow_the_grid():
+    from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
+        fa4_prefix_splits,
+    )
+
+    assert fa4_prefix_splits(120, 9, 28, 4, 132) == 1  # 60 tiles x 4 KV heads
+    assert fa4_prefix_splits(60, 4, 28, 4, 132) == 3  # 14 tiles x 4 KV heads
+    assert fa4_prefix_splits(4, 9, 28, 4, 132) == 8  # 2 tiles x 4 KV heads, capped
+    assert fa4_prefix_splits(4, 9, 20, 20, 132) == 7  # MHA: 1 tile x 20 heads
 
 
 def test_ctx_tail_splits_cover_the_sms(monkeypatch):
