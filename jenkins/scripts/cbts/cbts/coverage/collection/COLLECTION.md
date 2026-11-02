@@ -23,19 +23,15 @@ No line numbers, no call counts, no call graph.
 
 The default runtime config collects `tensorrt_llm/**/*.py` (from the checkout and the installed
 wheel), `examples/**/*.py`, `scripts/**/*.py`, `tests/test_common/**/*.py`, the checkout's root
-`conftest.py`, every `tests/**/conftest.py`, and the standalone stress harness
-`tests/integration/defs/stress_test/stress_test.py`.
+`conftest.py`, and every `tests/**/conftest.py`.
 `[run] source` bounds the physical source trees; the bootstrap resolves `%(repository_root)s` from
 its own checkout location. That root maps checkout paths to stable
 repository-relative names; `include` selects those names using `fnmatch` patterns (`*` also matches
 directory separators). Installed wheel paths still map to `tensorrt_llm/...`, so wheel and checkout
 copies merge into the same file identity. Other Python files under `tests/` are excluded.
 
-Collection scope is independent of scheduling: including the stress harness does not add it to
-the test-db or launch it. It earns coverage only when executed in an instrumented process;
-outer-pytest collection alone is not test-attributed execution. Existing DB artifacts do not gain
-rows until collection runs again. The selector accepts Python residuals from any repository
-directory when test-attributed DB records and the remaining impact checks are available.
+Collection scope is independent of selection eligibility: the coverage selector still accepts only
+core Python residuals. Extra rows accumulate evidence for future support.
 
 ## 2. How
 
@@ -167,7 +163,7 @@ These rows describe execution, not every test that depends on a shared fixture. 
 | Blind spot                                     | Reason                                                                                                                                                     |
 |------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | C++ / nanobind implementations                 | PY_START only sees Python frames; the C++ side of KV cache manager, scheduler and decoder is invisible                                                     |
-| Other test bodies and helpers                  | Under `tests/`, the default include patterns select `test_common/`, `conftest.py`, and the standalone `stress_test/stress_test.py` harness; other files remain excluded |
+| Other test bodies and helpers                  | Under `tests/`, the default include patterns select only `test_common/` and `conftest.py`                                                                  |
 | A Ray stage's GPU worker                       | `RayGPUWorker` lives in the opted-out `default_worker.py`                                                                                                  |
 | Multi-GPU / multi-node stages                  | phase 1 collects on single-GPU stages only; the channel design is single-producer, so a multi-node stage would need its address published somewhere shared |
 | A channel failure inside an inner-pytest batch | `test_unittests_v2` has no `cbts_plugin` (§3's `inner_pytest` row), so nothing records a taint if a subscriber it spawns falls behind                      |
