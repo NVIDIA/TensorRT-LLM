@@ -7,7 +7,7 @@ import json
 
 import pytest
 import torch
-from test_sampled_accept_tp8_exchange import (
+from _torch.modeling_v2.models.minimax_m3.comm.test_sampled_accept_tp8_exchange import (
     _CASES,
     _DRAFT,
     _assert_collective,

@@ -135,6 +135,14 @@ def _is_entry_module(module: str, target_dir: Path) -> bool:
     return any(module == root or module.startswith(root + ".") for root in roots)
 
 
+def _is_family_support_module(module: str, target_dir: Path) -> bool:
+    family = f"{_modeling_v2.__name__}.models.{target_dir.parent.name}."
+    if not module.startswith(family):
+        return False
+    name = module[len(family) :].split(".", 1)[0]
+    return not (target_dir.parent / name).is_dir() and (target_dir.parent / f"{name}.py").is_file()
+
+
 def test_targets_do_not_share_files():
     for arch in _ARCHS:
         for target_dir, name in _routed_targets(arch):
@@ -165,6 +173,7 @@ def test_targets_do_not_share_files():
                             module == own_target
                             or module.startswith(own_target + ".")
                             or _is_entry_module(module, target_dir)
+                            or _is_family_support_module(module, target_dir)
                             or module == family_kernels
                             or module.startswith(family_kernels + ".")
                         ), (
@@ -183,6 +192,10 @@ def test_targets_do_not_share_files():
         ("modeling.py", "from ..sibling.ops.attention.entry import op", False),
         ("modeling.py", "from ...other.ops.attention.entry import op", False),
         ("modeling.py", "from ..helper import op", False),
+        ("modeling.py", "from ..modeling_support import op", True),
+        ("modeling.py", "from ..sibling.modeling_support import op", False),
+        ("modeling.py", "from ...other.modeling_support import op", False),
+        ("modeling.py", "from {package}.models.family.modeling_support import op", True),
         ("modeling.py", "from {package}.models.family.ops.attention.entry import op", True),
         ("modeling.py", "from {package}.models.family.target.ops.attention.entry import op", True),
         ("modeling.py", "import {package}.models.family.sibling.ops.attention.entry", False),
@@ -200,6 +213,10 @@ def test_target_import_isolation(tmp_path, monkeypatch, source_file, statement, 
     source = target_dir / source_file
     source.parent.mkdir(parents=True)
     source.write_text(statement.format(package=_modeling_v2.__name__))
+    (target_dir.parent / "modeling_support.py").touch()
+    sibling = target_dir.parent / "sibling"
+    sibling.mkdir()
+    (sibling / "modeling_support.py").touch()
     monkeypatch.setattr(sys.modules[__name__], "_ROOT", tmp_path)
     monkeypatch.setattr(sys.modules[__name__], "_ARCHS", ["family"])
     monkeypatch.setattr(
