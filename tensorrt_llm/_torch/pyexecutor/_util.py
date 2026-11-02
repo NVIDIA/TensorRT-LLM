@@ -933,17 +933,22 @@ def _derive_draft_max_attention_window(
     return None
 
 
-def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
-    """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
+def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
+                          retained_window: bool = False) -> None:
+    """Adapt the target's pool_ratio to a separate one-model draft manager's pools.
+
+    ``retained_window``: the cold-page first/last-N window gives an MTP draft
+    manager a retained-token pool, as ``mixed_precision_kv`` does.
+    """
     if draft_kv_config.pool_ratio is None:
         return
-    if draft_kv_config.mixed_precision_kv is not None:
-        # The mixed MTP draft manager has its own pool plus a retained-token
-        # pool; the target's ratios describe the target's pools.
+    if draft_kv_config.mixed_precision_kv is not None or retained_window:
+        # The MTP draft manager has its own pool plus a retained-token pool;
+        # the target's ratios describe the target's pools.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
-            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
-            "its pools automatically.")
+            "target KV cache only; the MTP draft KV cache with retained-token "
+            "layers sizes its pools automatically.")
         draft_kv_config.pool_ratio = None
     elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
           and len(draft_kv_config.pool_ratio) != 1):
@@ -2434,7 +2439,12 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        _fit_draft_pool_ratio(draft_kv_config)
+        _fit_draft_pool_ratio(
+            draft_kv_config,
+            retained_window=self._speculative_config.spec_dec_mode.
+            is_mtp_one_model()
+            and getattr(cold_page_codec_provider, "retained_token_window",
+                        None) is not None)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "

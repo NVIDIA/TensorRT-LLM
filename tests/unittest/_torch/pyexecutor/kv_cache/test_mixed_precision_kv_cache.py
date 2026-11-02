@@ -490,7 +490,12 @@ def test_cold_page_window_appended_draft_layers(make_manager, drafter):
 
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
 def test_cold_page_window_separate_draft_manager(make_manager, drafter):
-    """A separate MTP draft manager takes the cold-page window; another drafter keeps a plain cache."""
+    """A separate MTP draft manager takes the cold-page window; another drafter keeps a plain cache.
+
+    The target's pool_ratio is fitted like the mixed-precision draft manager's: dropped for the
+    MTP manager with its retained-token pool, collapsed to [1.0] for a plain one-group cache.
+    """
+    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
 
     spec_config = (
@@ -499,8 +504,11 @@ def test_cold_page_window_separate_draft_manager(make_manager, drafter):
         else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
     )
     provider = _ColdPageProvider()
+    config = cold_page_config()
+    _fit_draft_pool_ratio(config, retained_window=drafter == "mtp")
+    assert config.pool_ratio == (None if drafter == "mtp" else [1.0])
     manager = make_manager(
-        config=cold_page_config(pool_ratio=None),
+        config=config,
         num_layers=1,
         layer_mask=[False, False, True],
         spec_config=spec_config,
