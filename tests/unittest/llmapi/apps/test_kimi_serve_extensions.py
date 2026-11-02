@@ -420,7 +420,8 @@ class TestKimiGenericThinkingKwargs:
             ({"enable_thinking": True, "reasoning_effort": "none"}, {"thinking": True}),
             # Only a bool is a thinking setting.
             ({"enable_thinking": "false"}, {}),
-            # "none" turns thinking off even beside a native effort, which is kept.
+            # "none" turns thinking off even beside a native effort, which is kept; the template
+            # ignores it while thinking is off.
             (
                 {"thinking_effort": "high", "reasoning_effort": "none"},
                 {"thinking": False, "thinking_effort": "high"},

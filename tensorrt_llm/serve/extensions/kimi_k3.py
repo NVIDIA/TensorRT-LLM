@@ -214,8 +214,9 @@ class KimiK3ServingExtension(ServingExtension):
         #      ``chat_template_kwargs`` (the Anthropic adapter maps ``thinking``
         #      and ``output_config.effort`` onto them);
         #   5. the template default: thinking on, effort ``max``.
-        # An effort of ``"none"`` turns thinking off, and no effort is derived
-        # for a request whose thinking is off.
+        # An effort of ``"none"`` turns thinking off. No effort is derived for a
+        # request whose thinking is off; a ``thinking_effort`` the client sets is
+        # passed through, and the template ignores it while thinking is off.
         derived: dict[str, Any] = {}
         if request.thinking is not None:
             enabled = request.thinking.type != "disabled"

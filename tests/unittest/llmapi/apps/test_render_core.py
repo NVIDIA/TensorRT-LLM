@@ -566,6 +566,7 @@ class TestExtensions:
         [
             ({"reasoning_effort": "LOW"}, "{{ thinking_effort }}", "low"),
             ({"reasoning_effort": "none"}, "{{ thinking }}", "False"),
+            ({"enable_thinking": False}, "{{ thinking }}", "False"),
             (
                 {"reasoning_effort": "low", "thinking_effort": "high"},
                 "{{ thinking_effort }}",
@@ -627,6 +628,9 @@ class TestExtensions:
 
         low = render(reasoning_effort="low")
         assert low == default.replace("`thinking_effort=max`", "`thinking_effort=low`")
+
+        # A native effort is passed through while thinking is off, and the template ignores it.
+        assert render(thinking_effort="high", reasoning_effort="none") == off
 
 
 class TestRenderConversation:
