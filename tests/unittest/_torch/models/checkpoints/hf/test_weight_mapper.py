@@ -76,8 +76,10 @@ def _hf_mapper_with_config(config) -> HfWeightMapper:
             _PerLayerConfig({"num_attention_heads"}, num_attention_heads=8, num_key_value_heads=2),
             2,
         ),
+        # Nemotron-NAS stores a per-layer list that its mapper indexes by layer.
+        (SimpleNamespace(num_attention_heads=8, num_key_value_heads=[2, 4]), [2, 4]),
     ],
-    ids=["gqa", "kv_heads_none", "mha", "per_layer_query_heads"],
+    ids=["gqa", "kv_heads_none", "mha", "per_layer_query_heads", "per_layer_list"],
 )
 def test_num_kv_heads_reads_global_config(config, expected) -> None:
     assert _hf_mapper_with_config(config)._num_kv_heads == expected

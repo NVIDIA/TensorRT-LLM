@@ -193,7 +193,9 @@ class HfWeightMapper(BaseWeightMapper):
         return super().should_skip_module(module_name)
 
     @property
-    def _num_kv_heads(self) -> int:
+    def _num_kv_heads(self) -> int | list[int]:
+        """The KV-head count, or the per-layer list some configs (such as
+        Nemotron-NAS) store in ``num_key_value_heads``."""
         config = self.model.config
         # A heterogeneous transformers config lists the attributes that vary
         # per layer, and reading one of them on the global config raises.
@@ -207,8 +209,9 @@ class HfWeightMapper(BaseWeightMapper):
             raise NotImplementedError(
                 f"{type(config).__name__} sets {name} per layer, so one "
                 f"KV-head count cannot duplicate the KV weights of every "
-                f"layer. {type(self).__name__} must duplicate them per layer, "
-                f"as Gemma4HfWeightMapper.apply_callbacks does.")
+                f"layer. {type(self).__name__} must override apply_callbacks "
+                f"to duplicate them with each layer's own KV-head count, as "
+                f"NemotronNasHfWeightMapper and Gemma4HfWeightMapper do.")
         return getattr(config, name)
 
     def _duplicate_kv_weights(
