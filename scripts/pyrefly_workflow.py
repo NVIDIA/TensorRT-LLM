@@ -31,12 +31,27 @@ def copy_untracked_product_files(source_root: Path, worktree: Path) -> None:
         if not target.parent.resolve().is_relative_to(worktree.resolve()):
             raise ValueError(f"Untracked file destination escapes the worktree: {relative}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_root / relative, target, follow_symlinks=False)
+        # Materialize symlinks so relative targets remain readable after relocation.
+        shutil.copy2(source_root / relative, target)
         subprocess.run(
             ["git", "add", "--intent-to-add", "--force", "--", str(relative)],
             cwd=worktree,
             check=True,
         )
+
+
+def report_status(report_path: Path) -> int:
+    """Fail strict checks on remaining diagnostics or an unsuccessful tool invocation."""
+    report = json.loads(report_path.read_text())
+    if report.get("report_error") or report.get("workflow_error"):
+        return 2
+    status = report.get("pyrefly_exit_code", 0)
+    if status not in (0, 1):
+        return status
+    result = report.get("result", report)
+    if not isinstance(result, dict) or not isinstance(result.get("errors"), list):
+        raise ValueError("Pyrefly report must contain an errors array")
+    return int(bool(result["errors"]))
 
 
 def print_summary(report_path: Path) -> None:
@@ -263,6 +278,9 @@ def main() -> int:
     summary_parser = subparsers.add_parser("print-summary")
     summary_parser.add_argument("report", type=Path)
 
+    status_parser = subparsers.add_parser("report-status")
+    status_parser.add_argument("report", type=Path)
+
     config_parser = subparsers.add_parser("clear-exclusions-config")
     config_parser.add_argument("source", type=Path)
     config_parser.add_argument("destination", type=Path)
@@ -301,6 +319,8 @@ def main() -> int:
         copy_untracked_product_files(args.source_root, args.worktree)
     elif args.command == "print-summary":
         print_summary(args.report)
+    elif args.command == "report-status":
+        return report_status(args.report)
     elif args.command == "clear-exclusions-config":
         clear_path_module_exclusions(args.source, args.destination)
     elif args.command == "wrap-unfiltered-report":
