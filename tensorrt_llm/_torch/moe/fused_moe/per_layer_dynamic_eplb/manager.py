@@ -173,7 +173,13 @@ class PerLayerDynamicMoeLoadBalancer(BaseMoeLoadBalancer):
         """Create a per-layer provider scoped to this model manager."""
         from .arena import SharedSlotArenaProvider
 
-        provider = SharedSlotArenaProvider(self, per_layer_helper_sets=self.helper_residency)
+        # HALO-R writes helper rows with unicast stores only, so its helper
+        # sets need no multicast object; HALO-Q's copy stores through them.
+        provider = SharedSlotArenaProvider(
+            self,
+            per_layer_helper_sets=self.helper_residency,
+            helper_multicast=self.planner == "halo_q",
+        )
         self._arena_providers.append(provider)
         return provider
 

@@ -251,6 +251,17 @@ def test_manager_keeps_halo_r_helper_slots_resident_per_layer():
     assert manager.helper_residency
 
 
+@pytest.mark.parametrize("helper_slot_mode", ["per_layer_resident", "shared_banks"])
+@pytest.mark.parametrize(("planner_name", "multicast"), [("halo_q", True), ("halo_r", False)])
+def test_only_halo_q_helper_sets_get_multicast(planner_name, multicast, helper_slot_mode):
+    config = _Config(planner_name)
+    config.helper_slot_mode = helper_slot_mode
+    manager = PerLayerDynamicMoeLoadBalancer(ep_rank=0, ep_size=4, config=config)
+    provider = manager.create_arena_provider()
+    assert provider._helper_multicast is multicast
+    assert provider._per_layer_helper_sets is (helper_slot_mode == "per_layer_resident")
+
+
 def test_reference_keeps_resident_experts_in_their_slots():
     histogram = [0, 0, 80, 10, 40, 200, 40, 10, 10, 80, 200, 0, 0, 80, 0, 200]
     ascending = plan_halo_r(histogram, ep=4, helper_slots=4, send_count=4)

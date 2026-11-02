@@ -935,7 +935,12 @@ set wrong has a test that catches it:
   layout and the `CudaPhysicalSlotScheduler` buffers. Its group subclasses
   `RebalanceSlotSchedulerGroup`, so generations, the route hold, the deferred
   route wait, the lent routes, the lease and `SchedulerSpinBound` are HALO-Q's;
-  `HaloRRelayEndpoint` replaces the TMA endpoint. Contract tests in
+  `HaloRRelayEndpoint` replaces the TMA endpoint.
+  HALO-R's helper sets get no multicast object (`helper_multicast=False` on
+  `SharedSlotArenaProvider`): the relay writes peers' helper rows through
+  `peer_helper_bases`, and the provider returns the layer's base
+  `LiveWeightArena`, whose helper planes have `mc_view=None` and no HALO
+  levels. Only the READY record pages keep their multicast objects. Contract tests in
   `test_halo_r_contracts.py` pin the attributes HALO-R sets for HALO-Q's
   methods and the methods it overrides. Each CTA checks every status word and
   then raises the route counter; a failure traps before that, so MegaMoE never

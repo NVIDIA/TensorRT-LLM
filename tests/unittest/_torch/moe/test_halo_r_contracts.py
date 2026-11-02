@@ -999,6 +999,163 @@ def test_peer_helper_mapping_refuses_mismatched_chunks():
         pool.peer_helper_bases(0)
 
 
+class _FakeChunkVmm(_FakeVmm):
+    def create(self, nbytes):
+        self.trace.append(("create", nbytes))
+        index = sum(1 for entry in self.trace if entry[0] == "create")
+        return f"chunk{index}", f"shareable{index}"
+
+
+def _set_pool(trace, *, helper_multicast):
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.arena import _SharedSlotPool
+
+    pool = _SharedSlotPool.__new__(_SharedSlotPool)
+    pool.rank = 5
+    pool.home_count = 4
+    # EP 8: the HALO levels are the whole world and this rank's aligned half.
+    pool.groups = (tuple(range(8)), (4, 5, 6, 7))
+    pool.large = (SimpleNamespace(name="w13", nbytes=1024), SimpleNamespace(name="w2", nbytes=512))
+    pool.home_bytes = {"w13": 8192, "w2": 4096}
+    pool.helper_bytes = {"w13": 4096, "w2": 2048}
+    pool.mc_offsets = {"w13": 0, "w2": 4096}
+    pool.set_bytes = 6144
+    pool.helper_multicast = helper_multicast
+    pool.vmm = _FakeChunkVmm(trace)
+    return pool
+
+
+@pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
+def test_halo_q_helper_sets_keep_a_multicast_object_per_level(monkeypatch, count):
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
+
+    calls = []
+    monkeypatch.setattr(
+        arena_module,
+        "_create_multicast",
+        lambda vmm, comm, rank, specs: calls.append((rank, specs)),
+    )
+    pool = _set_pool([], helper_multicast=True)
+    sets = pool._create_sets(count, comm="comm")
+    # One collective creation per call: every set at every level, set-major.
+    assert len(calls) == 1 and calls[0][0] == 5
+    specs = calls[0][1]
+    assert [spec.members for spec in specs] == list(pool.groups) * count
+    for index, helper_set in enumerate(sets):
+        assert helper_set.level_specs == tuple(specs[2 * index : 2 * index + 2])
+        for bases, spec in zip(helper_set.level_bases, helper_set.level_specs, strict=True):
+            assert spec.nbytes == pool.set_bytes
+            assert spec.binds == [
+                (0, helper_set.chunks["w13"], 4096),
+                (4096, helper_set.chunks["w2"], 2048),
+            ]
+            # Row 0 of each plane's view sits H rows before the plane's chunk.
+            assert bases == {
+                "w13": spec.mappings[0] - 4 * 1024,
+                "w2": spec.mappings[1] + 4096 - 4 * 512,
+            }
+
+
+@pytest.mark.parametrize("count", [1, 2], ids=["per-layer", "shared-banks"])
+def test_halo_r_helper_sets_get_no_multicast_object(monkeypatch, count):
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
+
+    def create_multicast(*args):
+        raise AssertionError("HALO-R helper sets must not create multicast objects")
+
+    monkeypatch.setattr(arena_module, "_create_multicast", create_multicast)
+    trace = []
+    pool = _set_pool(trace, helper_multicast=False)
+    sets = pool._create_sets(count, comm="comm")
+    # Only the chunks: no multicast object and no view reservation for one.
+    assert trace == [("create", 4096), ("create", 2048)] * count
+    for helper_set in sets:
+        assert helper_set.level_bases == () and helper_set.level_specs == ()
+        assert set(helper_set.chunks) == set(helper_set.shareables) == {"w13", "w2"}
+
+
+def _cuda_view(shape, stride, dtype, element_size, pointer):
+    return SimpleNamespace(
+        data_ptr=lambda: pointer,
+        shape=shape,
+        stride=lambda: stride,
+        dtype=dtype,
+        element_size=lambda: element_size,
+        is_cuda=True,
+        device="cuda:0",
+    )
+
+
+def _live_arena(world, slots, unicast_planes):
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.arena import (
+        LivePlaneView,
+        LiveTerminalView,
+        LiveWeightArena,
+    )
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami.geometry import BundleLayout
+
+    bundle = BundleLayout.create(hidden=256, intermediate=128)
+    addresses = iter(range(1 << 32, 1 << 40, 1 << 28))
+
+    def view(layout):
+        shape, stride, dtype, element_size, _ = layout.kernel_metadata(slots)
+        return _cuda_view(shape, stride, dtype, element_size, next(addresses))
+
+    planes = tuple(
+        LivePlaneView(
+            name=layout.name,
+            uc_views=tuple(view(layout) for _ in range(world)),
+            mc_view=None if index < unicast_planes else view(layout),
+            aliases_same_backing=True,
+            backing_owner=object(),
+        )
+        for index, layout in enumerate(bundle.planes)
+    )
+    terminals = LiveTerminalView(
+        local_view=_cuda_view((world,), (1,), "torch.uint64", 8, next(addresses)),
+        mc_view=_cuda_view((world,), (1,), "torch.uint64", 8, next(addresses)),
+        aliases_same_backing=True,
+        backing_owner=object(),
+    )
+    return LiveWeightArena(planes=planes, terminals=terminals), bundle
+
+
+@pytest.mark.parametrize("unicast_planes", [0, 2], ids=["multicast", "unicast-helpers"])
+def test_live_arena_binds_planes_without_a_multicast_alias(unicast_planes):
+    world, rank, home, helpers = 2, 1, 4, 2
+    arena, bundle = _live_arena(world, home + helpers, unicast_planes)
+    bound = arena.bind(
+        world=world, rank=rank, home_count=home, helper_count=helpers, bundle=bundle, device=0
+    )
+    # The unicast copy reads every expert from its owner's view either way.
+    assert len(bound.scatter_source_ptrs) == world * home * len(bundle.planes)
+    assert bound.local_plane_views == tuple(plane.uc_views[rank] for plane in arena.planes)
+    # Multicast destinations, which only the HALO-Q copy uses, need every alias.
+    expected = 0 if unicast_planes else helpers * len(bundle.planes)
+    assert len(bound.destination_ptrs) == expected
+
+
+def test_hierarchical_arena_refuses_planes_without_a_multicast_alias():
+    from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import (
+        HierarchicalLiveWeightArena,
+        hierarchy_group_sizes,
+    )
+
+    world, home, helpers = 2, 4, 2
+    base, bundle = _live_arena(world, home + helpers, unicast_planes=2)
+    arena = HierarchicalLiveWeightArena(
+        base=base,
+        group_sizes=hierarchy_group_sizes(world),
+        group_mc_views=tuple(() if p.mc_view is None else (p.mc_view,) for p in base.planes),
+        group_mc_owners=tuple(() if p.mc_view is None else (object(),) for p in base.planes),
+        aliases_same_backing=True,
+    )
+    # The HALO-Q copy cannot bind an arena whose helper rows have no multicast alias.
+    with pytest.raises(ValueError, match="hierarchy depth"):
+        arena.bind(
+            world=world, rank=0, home_count=home, helper_count=helpers, bundle=bundle, device=0
+        )
+
+
 def test_weight_reload_forgets_residency_between_layer_calls(monkeypatch):
     env = _build(monkeypatch, helper_residency=True)
     table = env.endpoint.residency

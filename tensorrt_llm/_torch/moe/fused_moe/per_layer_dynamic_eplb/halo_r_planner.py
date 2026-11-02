@@ -116,8 +116,10 @@ def validate_halo_r_geometry(
 
 def _relay_tables(arena: Any, pool: Any, *, ep_rank: int, home_experts: int) -> tuple:
     """The relay's source and destination address tables, plane sizes and READY cell."""
-    bound = arena.bound.base
-    live = arena.arena.base
+    # HALO-R's helper sets have no multicast object, so its provider hands out
+    # the base arena without HALO levels; a hierarchical arena has it as ``base``.
+    bound = getattr(arena.bound, "base", arena.bound)
+    live = getattr(arena.arena, "base", arena.arena)
     planes = len(bound.plane_bytes)
     if not 1 <= planes <= HALO_R_MAX_PLANES:
         raise ValueError(f"HALO-R relays 1 to {HALO_R_MAX_PLANES} weight planes; got {planes}")

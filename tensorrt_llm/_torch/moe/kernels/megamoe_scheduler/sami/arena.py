@@ -99,11 +99,15 @@ class LivePlaneView:
     ``aliases_same_backing`` is an explicit provider attestation.  Pointer
     arithmetic alone cannot prove a CUDA UC/MC alias relationship, so an
     un-attested collection of unrelated tensors is rejected.
+
+    ``mc_view`` is None for a plane whose helper rows peers write with unicast
+    stores only.  The bound arena then has no multicast destinations, which
+    the HALO-Q copy needs, so only a unicast copy can use it.
     """
 
     name: str
     uc_views: tuple[object, ...] = field(repr=False, compare=False)
-    mc_view: object = field(repr=False, compare=False)
+    mc_view: object | None = field(repr=False, compare=False)
     aliases_same_backing: bool = False
     backing_owner: object | None = field(default=None, repr=False, compare=False)
 
@@ -223,7 +227,7 @@ class LiveWeightArena:
         mc_ranges: list[tuple[int, int, str]] = []
 
         plane_identities: list[tuple[_TensorIdentity, ...]] = []
-        mc_identities: list[_TensorIdentity] = []
+        mc_identities: list[_TensorIdentity | None] = []
         for plane_index, (view, layout) in enumerate(zip(self.planes, bundle.planes)):
             if view.aliases_same_backing is not True:
                 raise ValueError(f"{view.name} UC/MC alias is not provider-attested")
@@ -234,7 +238,11 @@ class LiveWeightArena:
                 _TensorIdentity.capture(value, name=f"{view.name}.uc[{peer}]")
                 for peer, value in enumerate(view.uc_views)
             )
-            mc = _TensorIdentity.capture(view.mc_view, name=f"{view.name}.mc")
+            mc = (
+                None
+                if view.mc_view is None
+                else _TensorIdentity.capture(view.mc_view, name=f"{view.name}.mc")
+            )
             reference = captured[rank]
             (
                 expected_shape,
@@ -250,7 +258,7 @@ class LiveWeightArena:
                 expected_element_size,
                 device,
             )
-            for identity in (*captured, mc):
+            for identity in (*captured, *(() if mc is None else (mc,))):
                 if identity.metadata != expected_metadata:
                     raise ValueError(
                         f"{view.name} must have exact MegaMoE "
@@ -264,7 +272,7 @@ class LiveWeightArena:
                     )
             if len({identity.pointer for identity in captured}) != world:
                 raise ValueError(f"{view.name} UC rank mappings must have distinct pointers")
-            if mc.pointer in {identity.pointer for identity in captured}:
+            if mc is not None and mc.pointer in {identity.pointer for identity in captured}:
                 raise ValueError(f"{view.name} MC and UC mappings must be distinct")
             if layout.nbytes % reference.element_size:
                 raise ValueError(f"{view.name} bytes/expert are not dtype aligned")
@@ -291,9 +299,10 @@ class LiveWeightArena:
                         view.name,
                     )
                 )
-            mc_ranges.append(
-                (mc.pointer, mc.pointer + slot_count * layout.nbytes, view.name)
-            )
+            if mc is not None:
+                mc_ranges.append(
+                    (mc.pointer, mc.pointer + slot_count * layout.nbytes, view.name)
+                )
 
         weight_ranges = [
             (begin, end, f"{name}.uc[{peer}]")
@@ -318,7 +327,9 @@ class LiveWeightArena:
                     plane_identities[plane_index][owner].pointer
                     + local_expert * layout.nbytes
                 )
-        for helper_index in range(helper_count):
+        # Multicast destinations exist only if every plane has its alias.
+        multicast = all(mc is not None for mc in mc_identities)
+        for helper_index in range(helper_count if multicast else 0):
             physical_slot = home_count + helper_index
             for plane_index, layout in enumerate(bundle.planes):
                 destinations.append(

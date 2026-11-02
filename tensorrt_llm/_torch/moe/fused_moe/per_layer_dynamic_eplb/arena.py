@@ -497,7 +497,8 @@ def _create_multicast(vmm: _Vmm, comm: Any, rank: int, specs: List[_MulticastSpe
 @dataclass
 class _HelperSet:
     """One physical helper-slot set: a chunk per large plane, one multicast
-    object per hierarchy level, and that object's view base per plane."""
+    object per hierarchy level, and that object's view base per plane. A pool
+    without helper multicast keeps only the chunks."""
 
     chunks: Dict[str, Any]
     level_bases: Tuple[Dict[str, int], ...]
@@ -540,6 +541,11 @@ class _SharedSlotPool:
 
     READY terminals stay per layer because one forward shares its generation
     across layers. They and the fp32 planes live in per-layer records.
+
+    Without ``helper_multicast`` (HALO-R) a helper set gets no multicast
+    object: peers write its rows with unicast stores through mappings of its
+    chunks (``peer_helper_bases``). Every multicast object and bind then
+    belongs to the record pages, and per-layer sets add none.
     """
 
     def __init__(
@@ -554,6 +560,7 @@ class _SharedSlotPool:
         comm: Any,
         owner_registry: List["_SharedSlotPool"],
         per_layer_sets: bool,
+        helper_multicast: bool = True,
     ) -> None:
         from tensorrt_llm._torch.moe.kernels.megamoe_scheduler.sami import hierarchy_group_sizes
 
@@ -607,6 +614,7 @@ class _SharedSlotPool:
         self.layer_count = 0
         self.sets: Tuple[_HelperSet, ...] = ()
         self.per_layer_sets = per_layer_sets
+        self.helper_multicast = helper_multicast
         self._peer_helper_bases: Dict[int, Dict[Tuple[int, str], int]] = {}
         self._construction_complete = False
         self._owner_registry = owner_registry
@@ -734,7 +742,8 @@ class _SharedSlotPool:
             chunks = {name: handle for name, (handle, _) in created.items()}
             shareables = {name: shareable for name, (_, shareable) in created.items()}
             level_bases, level_specs = [], []
-            for members in self.groups:
+            # Unicast-only sets keep their chunks and get no multicast object.
+            for members in self.groups if self.helper_multicast else ():
                 bases: Dict[str, int] = {}
                 mappings: List[int] = []
                 for plane in self.large:
@@ -763,7 +772,8 @@ class _SharedSlotPool:
             sets.append(
                 _HelperSet(chunks, tuple(level_bases), tuple(level_specs), shareables=shareables)
             )
-        _create_multicast(self.vmm, comm, self.rank, specs)
+        if self.helper_multicast:
+            _create_multicast(self.vmm, comm, self.rank, specs)
         return tuple(sets)
 
     def _create_page(self, comm: Any) -> _RecordPage:
@@ -913,7 +923,8 @@ class _SharedSlotPool:
                 LivePlaneView(
                     name=plane.name,
                     uc_views=uc_views,
-                    mc_view=level_views[0],
+                    # A unicast-only helper set has no multicast alias.
+                    mc_view=level_views[0] if level_views else None,
                     aliases_same_backing=True,
                     backing_owner=layer,
                 )
@@ -928,8 +939,13 @@ class _SharedSlotPool:
             aliases_same_backing=True,
             backing_owner=layer,
         )
+        base = LiveWeightArena(planes=tuple(planes), terminals=terminals)
+        if not self.helper_multicast:
+            # Without helper multicast there are no HALO levels to bind: the
+            # unicast copy binds the base arena directly.
+            return base, tekit_views, layer, sum(self.home_bytes.values())
         arena = HierarchicalLiveWeightArena(
-            base=LiveWeightArena(planes=tuple(planes), terminals=terminals),
+            base=base,
             group_sizes=self.group_sizes,
             group_mc_views=tuple(group_views),
             group_mc_owners=tuple(group_owners),
@@ -945,9 +961,19 @@ class SharedSlotArenaProvider:
     maps one of the two banks shared by all layers. The broadcaster requests
     the arena again after Parameters are bound, so a provider memoizes its
     first build and requires identical geometry.
+
+    ``helper_multicast`` off (HALO-R) gives helper sets no multicast object;
+    the provider then returns the layer's base ``LiveWeightArena``, without
+    HALO levels.
     """
 
-    def __init__(self, owner: Any, *, per_layer_helper_sets: bool = False) -> None:
+    def __init__(
+        self,
+        owner: Any,
+        *,
+        per_layer_helper_sets: bool = False,
+        helper_multicast: bool = True,
+    ) -> None:
         # The model-level per-layer dynamic manager owns both the geometry cache
         # and creation order. No Mapping attribute or process-global registry
         # participates in allocation lifetime.
@@ -959,6 +985,7 @@ class SharedSlotArenaProvider:
         self._pools = pools
         self._pool_order = order
         self._per_layer_helper_sets = bool(per_layer_helper_sets)
+        self._helper_multicast = bool(helper_multicast)
         self.buffer_bytes = 0
         self.group_sizes: Tuple[int, ...] = ()
         self.pool: Optional[_SharedSlotPool] = None
@@ -986,6 +1013,7 @@ class SharedSlotArenaProvider:
             int(device),
             bundle,
             self._per_layer_helper_sets,
+            self._helper_multicast,
         )
         if self._built is not None:
             if self._signature != signature:
@@ -1018,6 +1046,7 @@ class SharedSlotArenaProvider:
                 comm=comm,
                 owner_registry=self._pool_order,
                 per_layer_sets=self._per_layer_helper_sets,
+                helper_multicast=self._helper_multicast,
             )
             self._pools[key] = pool
         self._built, self._tekit_views, self.layer, self.buffer_bytes = pool.build_layer(comm)
@@ -1073,7 +1102,8 @@ def allocate_rebalance_arena(
     )
     # Initialize READY terminals explicitly before peers can observe them.
     # This startup-only reset does not depend on allocator initialization details.
-    arena.base.terminals.local_view.zero_()
+    # A pool without helper multicast returns the base arena itself.
+    getattr(arena, "base", arena).terminals.local_view.zero_()
     torch.cuda.synchronize()
     ep_comm.barrier()
     bound = arena.bind(
@@ -1093,7 +1123,7 @@ def allocate_rebalance_arena(
         bundle=bundle,
         plane_names=plane_names,
         # The bound hierarchy exposes local plane views through its base arena.
-        local_plane_views=tuple(bound.base.local_plane_views),
+        local_plane_views=tuple(getattr(bound, "base", bound).local_plane_views),
         tekit_alias_views=tuple(provider.tekit_alias(name) for name in plane_names),
         home_experts=int(home_experts),
         helper_slots=int(helper_slots),

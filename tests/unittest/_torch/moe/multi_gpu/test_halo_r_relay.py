@@ -399,6 +399,11 @@ class _Layers:
                     layer_idx=layer,
                 )
             )
+        # HALO-R's helper sets carry no multicast object, so its arenas have
+        # neither HALO levels nor multicast destinations.
+        pool = self.arenas[0].provider.pool
+        assert not pool.helper_multicast and not any(s.level_specs for s in pool.sets)
+        assert not any(arena.bound.destination_ptrs for arena in self.arenas)
         # The helper set of each layer: shared banks alternate, per-layer slots do not.
         self.banks = [int(arena.provider.layer.helper_set) for arena in self.arenas]
         self._helper_views = {}
@@ -443,7 +448,7 @@ class _Layers:
         """This rank's helper rows of ``layer``, one uint8 view per plane, made outside any capture."""
         views = self._helper_views.get(layer)
         if views is None:
-            bound = self.arenas[layer].bound.base
+            bound = self.arenas[layer].bound
             views = self._helper_views[layer] = [
                 _row(
                     int(bound.local_plane_views[plane].data_ptr()) + _HOME_EXPERTS * int(nbytes),
@@ -456,7 +461,7 @@ class _Layers:
 
     def load_weights(self, layer: int) -> None:
         """Write this rank's home experts of ``layer`` with the pattern of its current weights."""
-        bound = self.arenas[layer].bound.base
+        bound = self.arenas[layer].bound
         for plane, nbytes in enumerate(bound.plane_bytes):
             base = int(bound.local_plane_views[plane].data_ptr())
             for local in range(_HOME_EXPERTS):
@@ -609,7 +614,7 @@ class _Layers:
     def _row_failures(self, layer: int, plan, rows: list, where: str) -> list:
         """Every helper row this rank received holds the owner's expert, byte for byte."""
         failures = []
-        bound = self.arenas[layer].bound.base
+        bound = self.arenas[layer].bound
         for helper, expert in enumerate(plan.helper_table[self.rank]):
             if expert < 0:
                 continue
@@ -762,7 +767,7 @@ def _case_resident_repeat(layers: _Layers) -> list:
     if not holders:
         raise _Skip(f"no rank receives a helper expert in these routes at EP {layers.ep}")
     sentinel_rank = holders[0]
-    nbytes = int(layers.arenas[0].bound.base.plane_bytes[0])
+    nbytes = int(layers.arenas[0].bound.plane_bytes[0])
     row = layers.helper_rows(0)[0][:nbytes]
     sentinel = torch.full((nbytes,), 0x5A, dtype=torch.uint8, device=layers.device)
     if rank == sentinel_rank:
