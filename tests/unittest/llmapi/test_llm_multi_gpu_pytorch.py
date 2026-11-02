@@ -41,7 +41,10 @@ def test_tinyllama_logits_processor_2gpu(tp_size: int, pp_size: int):
 
 @skip_ray
 @pytest.mark.gpu2
-def test_llm_rpc_tp2():
+@pytest.mark.private_mpi_session
+def test_llm_rpc_tp2() -> None:
+    # RPC builds rank 0's engine on another thread. Reusing IPC workers would
+    # leave asymmetric thread-local allreduce caches across the ranks.
     with LLM(model=llama_model_path,
              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
              orchestrator_type="rpc",
@@ -60,7 +63,8 @@ def test_llm_rpc_tp2():
 @skip_ray
 @pytest.mark.gpu2
 @pytest.mark.asyncio
-async def test_llm_rpc_streaming_tp2():
+@pytest.mark.private_mpi_session
+async def test_llm_rpc_streaming_tp2() -> None:
     with LLM(model=llama_model_path,
              kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
              orchestrator_type="rpc",

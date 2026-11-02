@@ -39,6 +39,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -70,6 +71,8 @@ class _TensorSpec:
 
 
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(
         self,
         *,
@@ -86,6 +89,7 @@ class _Attention:
         self.qk_rope_head_dim = 64 if is_mla else None
         self.qk_nope_head_dim = 128 if is_mla else None
         self.v_head_dim = 128 if is_mla else None
+        self.rope_append = True
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
         self.skip_correction_threshold = 0.0

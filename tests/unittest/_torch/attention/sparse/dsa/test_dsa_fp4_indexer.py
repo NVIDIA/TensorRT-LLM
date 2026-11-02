@@ -28,9 +28,12 @@ import tensorrt_llm  # noqa: F401
 
 try:
     from tensorrt_llm import deep_gemm
-except ImportError:
-    # Only skip on actual module-missing failures — any other error should
-    # surface rather than silently turn into a test-wide skip.
+except ImportError as e:
+    # An ImportError chained to an AttributeError (from
+    # tensorrt_llm.__getattr__) means deep_gemm raised while importing; surface
+    # it instead of skipping the tests gated on HAS_DEEP_GEMM.
+    if isinstance(e.__cause__, AttributeError):
+        raise
     HAS_DEEP_GEMM = False
 else:
     HAS_DEEP_GEMM = hasattr(deep_gemm, "fp8_fp4_mqa_logits")

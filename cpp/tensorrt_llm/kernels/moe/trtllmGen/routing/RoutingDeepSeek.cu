@@ -25,6 +25,7 @@
 //   6. launchOffsetsKernel              — prefix-scan + permutation
 
 #include "RoutingCustomPolicy.cuh"
+#include "RoutingCustomSelection.h"
 #include "RoutingKernel.cuh"
 
 namespace moe::dev::routing
@@ -623,7 +624,7 @@ void run(Data& data, void* stream)
         {
             launchClusterKernel(data, numThreadsHist, stream);
         }
-        else if ((smMajor >= 9) && (data.mNumTokens <= maxTokensCoop))
+        else if (!routingCustom::coopLaunchDisabled() && (smMajor >= 9) && (data.mNumTokens <= maxTokensCoop))
         {
             launchCoopKernel(data, numBlocksCoop, numThreadsHist, stream);
         }

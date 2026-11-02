@@ -124,6 +124,45 @@ def validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
 class KimiK3ServingExtension(ServingExtension):
     """Kimi/Moonshot API semantics for kimi_k3 chat requests."""
 
+    # Trailing tokens of the native K3 generation prompt (the channel opener
+    # ``<|open|>think|response<|sep|>``) that are not reported as prompt usage.
+    _GENERATION_CHANNEL_OPENER_TOKENS = 3
+
+    def allows_required_tool_choice(self) -> bool:
+        """K3 enforces ``tool_choice="required"`` through its template."""
+        return True
+
+    def serialize_tool(self, tool) -> Dict[str, Any]:
+        """Drop pydantic-injected null defaults (strict, description, parameters).
+
+        They would otherwise leak into the rendered tool-declaration JSON and
+        skew prompt-token parity with the reference renderer.
+        """
+        return tool.model_dump(exclude_none=True)
+
+    def dynamic_tools(self, messages: Optional[List[ChatCompletionMessageParam]]) -> List[dict]:
+        """Message-level (dynamic) tools are a Kimi API extension."""
+        return dynamic_tool_dicts(messages)
+
+    def prompt_tokens_excluded_from_usage(self, request: ChatCompletionRequest) -> int:
+        """Exclude the generation channel opener from prompt usage.
+
+        Kimi's prompt-token accounting excludes the trailing generation channel
+        opener; the model still sees the full rendered prompt. Pre-tokenized
+        requests (``prompt_token_ids`` or its base64 relay) render nothing here,
+        so there is no opener to exclude. An explicit request-level template
+        may end differently, so report unadjusted usage for it. The caller also
+        skips the adjustment when the server was started with ``--chat_template``.
+        """
+        if (
+            request.add_generation_prompt
+            and request.prompt_token_ids is None
+            and request.prompt_token_ids_b64 is None
+            and request.chat_template is None
+        ):
+            return self._GENERATION_CHANNEL_OPENER_TOKENS
+        return 0
+
     def apply_chat_extensions(self, request: ChatCompletionRequest) -> None:
         """Derive chat-template kwargs and defaults from request-level fields.
 

@@ -12,8 +12,8 @@ from tensorrt_llm._utils import get_sm_version
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not IS_CUTLASS_DSL_AVAILABLE
-    or get_sm_version() not in (100, 103),
-    reason="DSpark fused RMSNorm+RoPE requires an SM100 or SM103 CUDA GPU",
+    or get_sm_version() not in (100, 103, 107),
+    reason="DSpark fused RMSNorm+RoPE requires an SM100, SM103, or SM107 CUDA GPU",
 )
 
 
@@ -65,6 +65,19 @@ def _reference(
         flat[:, -rope_dim::2] = real * cos - imag * sin
         flat[:, -rope_dim + 1 :: 2] = imag * cos + real * sin
     return output.to(x.dtype)
+
+
+def test_fused_dspark_rmsnorm_rope_supported_architectures():
+    from tensorrt_llm._torch.custom_ops.dspark_rmsnorm_rope_custom_op import (
+        _get_dspark_arch_str,
+        _is_dspark_rmsnorm_rope_sm_supported,
+    )
+
+    assert all(_is_dspark_rmsnorm_rope_sm_supported(sm) for sm in (100, 103, 107))
+    assert not any(_is_dspark_rmsnorm_rope_sm_supported(sm) for sm in (90, 101, 110, 120))
+    assert _is_dspark_rmsnorm_rope_sm_supported()
+    # The DSV4 DSpark attention kernel keeps its own, narrower gate.
+    assert _get_dspark_arch_str(107) is None
 
 
 @pytest.mark.parametrize(

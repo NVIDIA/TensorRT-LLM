@@ -41,6 +41,7 @@
 #include <system_error>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -156,38 +157,152 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 // HostMem implementation
 // ---------------------------------------------------------------------------
 
-size_t HostMem::chunkCount() const noexcept
+namespace
 {
-    return mChunkSize == 0 ? 0 : divUp(mSize, mChunkSize);
-}
 
-//! Commits [beginOffset, mSize) in chunk-sized steps, publishing the watermark
-//! after each one.
+//! Threads that populate the initial fill alongside the one committing it.
+//! Populating scales with threads until the kernel's page allocator saturates.
+constexpr int kInitialFillHelpers = 7;
+
+} // namespace
+
+//! Steps the backing to its target, publishing the watermark after each step.
 //!
-//! `beginOffset` is a byte offset rather than a chunk index because a grow
-//! resumes at the old size, which need not fall on a chunk boundary. The step
-//! that straddles the boundary is committed as a short range, so no byte is
-//! ever committed twice.
-void HostMem::commitRange(size_t beginOffset)
+//! With `helperCount` > 0 the range is opened up front and that many threads
+//! populate it step by step ahead of the commits. Populating in parallel slows
+//! everything else in the process, so only the initial fill, which runs before
+//! serving, uses helpers. Until it ends, a reader that skips waitUsable() reads
+//! zeros past the watermark instead of faulting.
+//!
+//! A step is populated by whichever thread claims it first, and one a helper has
+//! claimed is committed only once that helper is done with it; a helper that
+//! fails hands its step back. Where MADV_POPULATE_WRITE is unavailable populating
+//! means zeroing, which must not reach a step already handed out.
+void HostMem::fillToTarget(int helperCount)
 {
-    size_t offset = beginOffset;
-    while (offset < mSize)
+    enum StepState : uint8_t
     {
-        size_t const end = std::min(roundUp(offset + 1, mChunkSize), mSize);
-        mBacking.commit(offset, end - offset);
-        offset = end;
-        // A chunk counts as usable only once it is committed to its end, so a
-        // partially committed trailing chunk does not advance the watermark.
-        mFilledChunks.store(
-            static_cast<uint32_t>(offset == mSize ? chunkCount() : offset / mChunkSize), std::memory_order_release);
-        mFilledChunks.notify_all();
+        kPending,
+        kClaimed,
+        kPopulated
+    };
+
+    size_t const begin = mBacking.committedSize();
+    size_t const target = mBacking.targetSize();
+    size_t const chunk = HostMemBacking::commitChunkSize();
+    // Only a grow is populated ahead: a shrink releases pages rather than taking
+    // them, and a single-step range has nothing to overlap with.
+    bool const useHelpers = helperCount > 0 && target > begin && target - begin > chunk;
+    size_t const firstChunk = begin / chunk;
+    // One entry per step, indexed by its chunk relative to firstChunk.
+    std::vector<std::atomic<uint8_t>> stepStates(useHelpers ? divUp(target, chunk) - firstChunk : 0);
+    auto const stepRange = [&](size_t step)
+    {
+        size_t const chunkIndex = firstChunk + step;
+        return std::pair{std::max(chunkIndex * chunk, begin), std::min((chunkIndex + 1) * chunk, target)};
+    };
+    std::atomic<size_t> nextHelperStep{0};
+    // Declared after what they use: destruction stops and joins them on every
+    // way out of this function.
+    std::vector<std::jthread> helpers;
+    if (useHelpers)
+    {
+        mBacking.open(begin, target - begin);
+        try
+        {
+            for (int i = 0; i < helperCount; ++i)
+            {
+                helpers.emplace_back(
+                    [this, &stepStates, &stepRange, &nextHelperStep](std::stop_token stop)
+                    {
+                        try
+                        {
+                            TLLM_CUDA_CHECK(cudaSetDevice(mDevice));
+                            runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
+                            for (size_t step;
+                                 !stop.stop_requested() && (step = nextHelperStep.fetch_add(1)) < stepStates.size();)
+                            {
+                                auto& state = stepStates[step];
+                                uint8_t expected = kPending;
+                                if (!state.compare_exchange_strong(expected, kClaimed, std::memory_order_relaxed))
+                                {
+                                    continue;
+                                }
+                                auto const [stepBegin, stepEnd] = stepRange(step);
+                                try
+                                {
+                                    mBacking.populate(stepBegin, stepEnd - stepBegin);
+                                }
+                                catch (...)
+                                {
+                                    // Handed back for the committing thread to populate.
+                                    state.store(kPending, std::memory_order_release);
+                                    state.notify_all();
+                                    throw;
+                                }
+                                state.store(kPopulated, std::memory_order_release);
+                                state.notify_all();
+                            }
+                        }
+                        catch (...)
+                        {
+                            // The committing thread populates whatever a helper
+                            // leaves, and reports any failure itself.
+                        }
+                    });
+            }
+        }
+        catch (std::system_error const&)
+        {
+            // Out of threads: those running and the committing thread cover the range.
+        }
     }
+
+    // Whether a helper populated the step; if not, this thread now owns it.
+    auto const claimOrAwaitStep = [&](size_t step)
+    {
+        auto& state = stepStates[step];
+        for (;;)
+        {
+            uint8_t seen = kPending;
+            if (state.compare_exchange_strong(seen, kClaimed, std::memory_order_acquire))
+            {
+                return false;
+            }
+            if (seen == kPopulated)
+            {
+                return true;
+            }
+            state.wait(kClaimed, std::memory_order_acquire);
+        }
+    };
+
+    while (mBacking.committedSize() != mBacking.targetSize())
+    {
+        bool const populated = useHelpers && claimOrAwaitStep(mBacking.committedSize() / chunk - firstChunk);
+        // Clamped because a shrink's steps report a registered end that is still
+        // above the target; the watermark must never run ahead of it.
+        mUsable.store(std::min(mBacking.resizeStep(populated), mBacking.targetSize()), std::memory_order_release);
+        mUsable.notify_all();
+    }
+    // The target rather than the registered end, which trails it by whatever
+    // does not fill a whole register unit. No consumer can use a remainder
+    // smaller than that, and publishing the shorter value would hang a wait for
+    // the whole range.
+    //
+    // Checked rather than assumed: a larger gap publishes memory the GPU cannot
+    // reach, and nothing notices until a copy fails far from here.
+    TLLM_CHECK_WITH_INFO(mBacking.targetSize() - mBacking.registeredSize() < mBacking.registerUnit(),
+        "HostMem: %zu of %zu bytes unregistered at the target, which is a whole register unit of %zu or more",
+        mBacking.targetSize() - mBacking.registeredSize(), mBacking.targetSize(), mBacking.registerUnit());
+    mUsable.store(mBacking.targetSize(), std::memory_order_release);
+    mUsable.notify_all();
 }
 
-void HostMem::startFill(size_t beginOffset)
+void HostMem::startFill(int helperCount)
 {
     mFillWorker = std::thread(
-        [this, beginOffset]
+        [this, helperCount]
         {
             // A new thread starts on device 0 whatever the creator selected, and
             // registration needs a context on the right one. Selecting it here
@@ -203,15 +318,22 @@ void HostMem::startFill(size_t beginOffset)
                 cudaStreamCaptureMode captureMode = cudaStreamCaptureModeRelaxed;
                 TLLM_CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&captureMode));
                 runtime::TopologyDetector::getInstance().bindThreadByCurrentGpu();
-                commitRange(beginOffset);
+                fillToTarget(helperCount);
             }
             catch (...)
             {
+                if (helperCount > 0)
+                {
+                    // Helpers may have populated past the failed step, which
+                    // released only its own range.
+                    size_t const committed = mBacking.committedSize();
+                    mBacking.discardUncommitted(committed, mBacking.targetSize() - committed);
+                }
                 // Stored before the sentinel: a waiter that observes the
                 // sentinel through an acquire load is guaranteed to see it.
                 mFillFailure = std::current_exception();
-                mFilledChunks.store(kFillFailed, std::memory_order_release);
-                mFilledChunks.notify_all();
+                mUsable.store(kFillFailed, std::memory_order_release);
+                mUsable.notify_all();
             }
         });
 }
@@ -226,18 +348,17 @@ void HostMem::joinFill() noexcept
 
 void HostMem::waitUsable(size_t endOffset) const
 {
-    if (endOffset == 0 || mChunkSize == 0)
+    if (endOffset == 0)
     {
         return;
     }
     TLLM_CHECK_DEBUG(endOffset <= mSize);
-    auto const needed = static_cast<uint32_t>(divUp(endOffset, mChunkSize));
 
-    uint32_t current = mFilledChunks.load(std::memory_order_acquire);
-    while (current < needed)
+    size_t current = mUsable.load(std::memory_order_acquire);
+    while (current < endOffset)
     {
-        mFilledChunks.wait(current, std::memory_order_acquire);
-        current = mFilledChunks.load(std::memory_order_acquire);
+        mUsable.wait(current, std::memory_order_acquire);
+        current = mUsable.load(std::memory_order_acquire);
     }
     if (current == kFillFailed)
     {
@@ -246,7 +367,7 @@ void HostMem::waitUsable(size_t endOffset) const
 }
 
 HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const& options, bool waitForFill)
-    : mBacking(options)
+    : mBacking(vmSize, options)
     , mWaitForFill(waitForFill)
 {
     TLLM_CUDA_CHECK(cudaGetDevice(&mDevice));
@@ -259,16 +380,14 @@ HostMem::HostMem(size_t vmSize, size_t initialSize, HostMemBackingOptions const&
     size_t const granularity = mBacking.commitGranularity();
     TLLM_CHECK_WITH_INFO(initialSize % granularity == 0,
         "HostMem size %zu is not a multiple of the commit granularity %zu", initialSize, granularity);
-    mChunkSize = roundUp(kFillChunkSize, granularity);
 
     try
     {
-        // The reservation is rounded up so that the largest accepted resize is
-        // itself a valid, aligned size.
-        mVmSize = roundUp(vmSize, granularity);
+        mVmSize = mBacking.reservedSize();
         mSize = initialSize;
-        mAddr = mBacking.reserve(mVmSize);
-        startFill(0);
+        mAddr = mBacking.address();
+        mBacking.setTargetSize(mSize);
+        startFill(kInitialFillHelpers);
         if (mWaitForFill)
         {
             waitUsable(mSize);
@@ -299,13 +418,24 @@ HostMem::~HostMem()
 void HostMem::destroy()
 {
     joinFill();
+    // Tearing down with a waiter outstanding is a caller error; the sentinel makes it one
+    // that reports itself rather than blocking forever on a watermark that never rises.
+    //
+    // Set before the sentinel and kept afterwards: waitUsable() reads it only once it has
+    // observed the sentinel through an acquire load, and rethrowing a null is undefined. A
+    // fill that already failed keeps its own exception, which says more than this one.
+    if (mFillFailure == nullptr)
+    {
+        mFillFailure = std::make_exception_ptr(LogicError("HostMem was destroyed while a wait on it was outstanding"));
+    }
+    // Published before the mapping goes: a watermark left standing names memory that is
+    // already gone, and a reader taking it at its word faults.
+    mUsable.store(kFillFailed, std::memory_order_release);
+    mUsable.notify_all();
     mBacking.destroy();
     mAddr = 0;
     mSize = 0;
     mVmSize = 0;
-    mChunkSize = 0;
-    mFillFailure = nullptr;
-    mFilledChunks.store(0, std::memory_order_release);
 }
 
 void HostMem::resize(size_t newSize)
@@ -315,7 +445,7 @@ void HostMem::resize(size_t newSize)
     // The fill must be finished before the mapping changes underneath it, and a
     // failed fill has to surface here rather than be resized over.
     joinFill();
-    if (mFilledChunks.load(std::memory_order_acquire) == kFillFailed)
+    if (mUsable.load(std::memory_order_acquire) == kFillFailed)
     {
         std::rethrow_exception(mFillFailure);
     }
@@ -330,29 +460,31 @@ void HostMem::resize(size_t newSize)
     TLLM_CHECK_WITH_INFO(newSize <= mVmSize,
         "HostMem resize to %zu exceeds the reserved maximum of %zu; raise the tier's maxQuota", newSize, mVmSize);
 
+    mBacking.setTargetSize(newSize);
     if (newSize < mSize)
     {
         // Shrink within the existing reservation: only the tail is released and
-        // the base address is unchanged. The release is exact, because newSize
-        // is a multiple of the unit the backing allocates in.
-        mBacking.decommit(newSize, mSize - newSize);
+        // the base address is unchanged. Done on this thread, because the caller
+        // has already had to stop every consumer for the range to be releasable
+        // at all, so there is nothing for a worker to overlap with.
         mSize = newSize;
-        mFilledChunks.store(static_cast<uint32_t>(chunkCount()), std::memory_order_release);
-        mFilledChunks.notify_all();
+        // Lowered before anything is released, not after, so no waiter is ever
+        // holding a watermark that covers memory already gone.
+        mUsable.store(newSize, std::memory_order_release);
+        // A shrink releases pages rather than taking them, so there is nothing
+        // for a helper to populate ahead of.
+        fillToTarget(0);
         return;
     }
 
     // Grow: the address space is already reserved, so this only commits the new
     // tail. Everything below keeps its contents and its address.
-    size_t const oldSize = mSize;
     mSize = newSize;
-    // The watermark counts whole chunks, and the old size rounded up to one.
-    // Growing makes that rounding wrong -- it would claim the new tail is
-    // already usable -- so it is rebased to the chunks genuinely complete.
-    mFilledChunks.store(static_cast<uint32_t>(oldSize / mChunkSize), std::memory_order_release);
     try
     {
-        startFill(oldSize);
+        // No helpers once serving has begun: populating in parallel slows every
+        // other thread in the process.
+        startFill(0);
     }
     catch (...)
     {
@@ -360,8 +492,8 @@ void HostMem::resize(size_t newSize)
         // wait past the old size would block on a watermark that no worker is
         // left to advance.
         mFillFailure = std::current_exception();
-        mFilledChunks.store(kFillFailed, std::memory_order_release);
-        mFilledChunks.notify_all();
+        mUsable.store(kFillFailed, std::memory_order_release);
+        mUsable.notify_all();
         throw;
     }
     if (mWaitForFill)

@@ -58,6 +58,7 @@ class _StatsRequest:
     is_disagg_generation_transmission_complete: bool = False
     is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
+    kv_cache_retention_config: None = None
     return_perf_metrics: bool = False
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
@@ -318,6 +319,7 @@ def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
     manager = object.__new__(KVCacheManagerV2)
     execution_stream = object()
     manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    manager._on_allocation_stream = set()
     calls: list[str] = []
 
     def resume(actual_stream: object) -> bool:

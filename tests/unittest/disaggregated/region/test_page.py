@@ -22,6 +22,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     KVCachePageTable,
     LayerGroup,
     LocalLayer,
+    MambaLayerGroup,
     MapperKind,
     PhysicalPool,
     PhysicalPoolGroup,
@@ -47,7 +48,6 @@ def test_physical_pool_construction():
     assert pool.slot_bytes == 256
     assert pool.num_slots == 4
     assert pool.slot_stride_bytes == 256
-    assert pool.layer_stride_bytes == 1024
 
 
 def test_physical_pool_roundtrip():
@@ -56,7 +56,6 @@ def test_physical_pool_roundtrip():
         slot_bytes=256,
         num_slots=4,
         slot_stride_bytes=2048,
-        layer_stride_bytes=512,
     )
     d = pool.to_dict()
     restored = PhysicalPool.from_dict(d)
@@ -64,7 +63,6 @@ def test_physical_pool_roundtrip():
     assert restored.slot_bytes == pool.slot_bytes
     assert restored.num_slots == pool.num_slots
     assert restored.slot_stride_bytes == pool.slot_stride_bytes
-    assert restored.layer_stride_bytes == pool.layer_stride_bytes
 
 
 def test_pool_view_roundtrip():
@@ -120,6 +118,33 @@ def test_layer_group_roundtrip():
     assert restored.sliding_window_size is None
     assert len(restored.local_layers) == 2
     assert len(restored.pool_views) == 1
+
+
+@pytest.mark.parametrize("include_layout", [False, True])
+def test_mamba_v2_peer_layout_roundtrip(include_layout: bool) -> None:
+    """V2 peers with an absent or true layout marker remain readable."""
+    group = MambaLayerGroup(
+        pool_group_idx=0,
+        local_layers=[LocalLayer(0, 5)],
+        pool_views=[PoolView(pool_idx=0, buffer_entries=_make_buffer_entries())],
+    )
+    data = group.to_dict()
+    if not include_layout:
+        data.pop("slot_major_layout")
+    restored = LayerGroup.from_dict(data)
+    assert isinstance(restored, MambaLayerGroup)
+    assert restored.local_layers == group.local_layers
+    np.testing.assert_array_equal(restored.pool_views[0].buffer_entries, _make_buffer_entries())
+
+
+def test_page_table_rejects_legacy_mamba_peer_layout() -> None:
+    """Reject a peer's explicit V1 layout through the page-table intake path."""
+    group = MambaLayerGroup(pool_group_idx=0, local_layers=[], pool_views=[]).to_dict()
+    group["slot_major_layout"] = False
+    with pytest.raises(ValueError, match="layer-major recurrent-state layout"):
+        KVCachePageTable.from_dict(
+            {"tokens_per_block": 64, "layer_groups": [group], "pool_groups": []}
+        )
 
 
 def test_kv_cache_page_table_roundtrip():

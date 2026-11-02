@@ -18,6 +18,7 @@ from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_nemotron import NemotronForCausalLM
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -336,7 +337,7 @@ class TestNemotron(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                key = (1, 0)
+                key = KeyType(batch_size=1, draft_len=0)
                 graph_runner.capture(key,
                                      lambda inputs: nemotron.forward(**inputs),
                                      inputs)

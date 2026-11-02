@@ -17,6 +17,8 @@
 #include "tensorrt_llm/kernels/mamba2MTPSSMCache/mamba2MTPSSMCache.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
+#include <algorithm>
+
 namespace th = torch;
 namespace tk = tensorrt_llm::kernels;
 
@@ -47,13 +49,22 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
     th::optional<th::Tensor> intermediate_states_indices, th::optional<th::Tensor> retrieve_parent_token,
     int64_t const cache_steps, int64_t const pad_slot_id, bool const disable_state_update)
 {
-    TORCH_CHECK(ssm.dim() == 4 && ssm.is_cuda() && ssm.is_contiguous(), "ssm should be a 4D contiguous CUDA tensor");
+    TORCH_CHECK(ssm.dim() == 4 && ssm.is_cuda(), "ssm should be a 4D CUDA tensor");
     TORCH_CHECK(x.dim() == 4, "x should be a 4D tensor");
     auto device = ssm.device();
     int const bs = x.size(0);
     int const nheads = ssm.size(1);
     int const head_dim = ssm.size(2);
     int const ssm_dim = ssm.size(3);
+    int64_t const state_size = ssm.size(1) * ssm.size(2) * ssm.size(3);
+    TORCH_CHECK(ssm.stride(3) == 1 && ssm.stride(2) == ssm.size(3) && ssm.stride(1) == ssm.size(2) * ssm.size(3)
+            && ssm.stride(0) >= state_size,
+        "ssm must have contiguous inner dimensions and non-overlapping slots");
+    // Vectorized state loads/stores require alignment at every slot boundary.
+    auto const state_alignment = std::min<int64_t>(16, (ssm_dim / 32) * ssm.element_size());
+    TORCH_CHECK(state_alignment > 0 && reinterpret_cast<uintptr_t>(ssm.data_ptr()) % state_alignment == 0
+            && (ssm.stride(0) * ssm.element_size()) % state_alignment == 0,
+        "ssm slots must be aligned for vectorized state access");
 
     // ssm.size(0) is the Mamba cache capacity — independent of the
     // current batch (may include parked requests or reserved dummy
@@ -205,6 +216,7 @@ void mamba2_mtp_ssm_cache_update(th::Tensor ssm, th::Tensor x, th::Tensor dt, th
     params.head_dim = head_dim;
     params.ssm_dim = ssm_dim;
     params.ngroups = ngroups;
+    params.ssm_batch_stride = ssm.stride(0);
 
     params.ssm_dtype = torchToMamba2Dtype(ssm.scalar_type());
     params.in_out_dtype = torchToMamba2Dtype(x.scalar_type());
