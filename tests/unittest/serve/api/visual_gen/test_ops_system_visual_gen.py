@@ -45,6 +45,8 @@ def test_version(visual_gen_client):
 
 
 def test_models_lists_the_served_model(visual_gen_client):
-    body = visual_gen_client.get("/v1/models").json()
+    response = visual_gen_client.get("/v1/models")
+    assert response.status_code == 200
+    body = response.json()
     assert body["object"] == "list"
     assert [entry["id"] for entry in body["data"]] == ["fake-visual-gen"]

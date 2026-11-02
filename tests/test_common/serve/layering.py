@@ -181,7 +181,11 @@ def _edge_triples(edge: ImportEdge) -> List[Tuple[str, str, str]]:
 
 
 def check_contracts(edges: Sequence[ImportEdge], contracts: Sequence[Contract]) -> List[str]:
-    """Violations of each contract, as messages that name the contract and the fix."""
+    """Violations of each contract, as messages that name the contract and the fix.
+
+    A from-import is matched as ``<module>.<name>``, so ``from pkg import sub``
+    and ``from .. import sub`` count as imports of the submodule ``pkg.sub``.
+    """
     problems = []
     for contract in contracts:
         for edge in edges:
@@ -189,16 +193,16 @@ def check_contracts(edges: Sequence[ImportEdge], contracts: Sequence[Contract]) 
                 continue
             if not any(_matches_prefix(edge.importer, prefix) for prefix in contract.importers):
                 continue
-            if not any(_matches_prefix(edge.imported, prefix) for prefix in contract.forbidden):
-                continue
             for triple in _edge_triples(edge):
+                importer, imported, name = triple
+                target = f"{imported}.{name}" if name else imported
+                if not any(_matches_prefix(target, prefix) for prefix in contract.forbidden):
+                    continue
                 if triple in contract.allowed:
                     continue
-                importer, imported, name = triple
-                what = f"`{imported}.{name}`" if name else f"`{imported}`"
                 problems.append(
                     f"contract '{contract.name}': {importer} (line {edge.lineno}) imports "
-                    f"{what}. {contract.fix}"
+                    f"`{target}`. {contract.fix}"
                 )
     return problems
 

@@ -66,11 +66,15 @@ Name files and symbols here, never line numbers.
 
 ## Commands
 
-- All serve CPU tests: `PYTHONPATH=tests python3 -m test_common.serve.cpu_tests`
+- All serve CPU tests (the runner exits when `LLM_MODELS_ROOT` is unset):
+  `LLM_MODELS_ROOT=/path/to/models PYTHONPATH=tests python3 -m test_common.serve.cpu_tests`
 - Route snapshot: `pytest -m cpu_only tests/unittest/api_stability/test_serve_routes.py tests/unittest/serve/api/visual_gen/test_routes_visual_gen.py`
 - Regenerate the route snapshot: `PYTHONPATH=tests python3 -m test_common.serve.routes --write`
 - API gates: `pytest tests/unittest/api_stability/test_serve_api.py tests/unittest/api_stability/test_serve_cli.py`
 - Extensions and parsers: `pytest tests/unittest/llmapi/apps/test_serving_extensions.py tests/unittest/llmapi/apps/test_tool_parsers.py`
 - Disaggregated router and coordinator (CPU): `pytest tests/unittest/disaggregated -m cpu_only -q`
-- Which CI stage runs a test: `python scripts/test_to_stage_mapping.py --tests "<test>"`
+- Which CI stage runs a test: `python scripts/test_to_stage_mapping.py --tests "<test>"`. It
+  matches the text of list entries and does not expand directories: a file listed through its
+  directory maps only when you pass the directory entry, e.g. `--tests "unittest/serve"` for
+  anything under `tests/unittest/serve/`.
 - Tests that load model files need `LLM_MODELS_ROOT` (the harmony tests' autouse fixture does).

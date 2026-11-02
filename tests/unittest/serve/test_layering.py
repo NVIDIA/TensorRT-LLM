@@ -183,6 +183,40 @@ def test_contract_violation_and_allowance(synthetic_package):
     assert len(messages) == 1 and "the baseline only shrinks" in messages[0]
 
 
+def test_parent_package_import_of_a_forbidden_module(synthetic_package):
+    # Both forms record the edge against the parent package, with the forbidden
+    # submodule only as an imported name.
+    (synthetic_package / "via_parent.py").write_text(
+        textwrap.dedent(
+            """
+            from layerpkg import inner, top
+            from . import inner as relative_inner
+            """
+        )
+    )
+    edges = build_import_graph(synthetic_package, "layerpkg")
+    contract = Contract(
+        name="no inner",
+        importers=("layerpkg.via_parent",),
+        forbidden=("layerpkg.inner",),
+        fix="Import VALUE through layerpkg.top.",
+    )
+    problems = check_contracts(edges, [contract])
+    assert len(problems) == 2  # `top` from the same statement is not flagged
+    assert "(line 2) imports `layerpkg.inner`." in problems[0]  # from layerpkg import inner
+    assert "(line 3) imports `layerpkg.inner`." in problems[1]  # from . import inner
+
+    allowed = Contract(
+        name="no inner",
+        importers=("layerpkg.via_parent",),
+        forbidden=("layerpkg.inner",),
+        allowed=frozenset({("layerpkg.via_parent", "layerpkg", "inner")}),
+        fix="Import VALUE through layerpkg.top.",
+    )
+    assert check_contracts(edges, [allowed]) == []
+    assert stale_allowances(edges, [allowed]) == []
+
+
 def test_type_checking_imports_are_skipped_by_default(synthetic_package):
     edges = build_import_graph(synthetic_package, "layerpkg")
     contract = Contract(

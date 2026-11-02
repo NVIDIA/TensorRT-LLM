@@ -42,7 +42,7 @@ PATH_ROOTS = (
     "examples/",
 )
 ROOT_FILES = ("AGENTS.md", "CLAUDE.md", "legacy-files.txt", "CODING_GUIDELINES.md")
-COMMAND_STARTS = ("pytest", "python", "python3", "PYTHONPATH=")
+COMMAND_STARTS = ("pytest", "python", "python3", "PYTHONPATH=", "LLM_MODELS_ROOT=")
 
 _INLINE_CODE = re.compile(r"`([^`]+)`")
 _LINE_ANCHOR = re.compile(r"\.(py|md|ya?ml|groovy|txt)\s*:\s*\d")
