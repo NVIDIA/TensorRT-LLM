@@ -16,7 +16,7 @@ Pass the Hub ID or local path via `--model`:
 
 - [`nvidia/Cosmos3-Nano`](https://huggingface.co/nvidia/Cosmos3-Nano)
 - [`nvidia/Cosmos3-Super`](https://huggingface.co/nvidia/Cosmos3-Super)
-- [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `configs/cosmos3-t2i-1gpu.yaml`.
+- [`nvidia/Cosmos3-Super-Text2Image-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Text2Image-4Step) — DMD2-distilled text-to-image: fixed 4-step schedule with classifier-free guidance baked into the weights. Steps/guidance are read from the checkpoint; conflicting request values are rejected. Use with `../../configs/cosmos3-t2i-1gpu.yaml`.
 - [`nvidia/Cosmos3-Super-Image2Video-4Step`](https://huggingface.co/nvidia/Cosmos3-Super-Image2Video-4Step) — DMD2-distilled image-to-video: same fixed 4-step, guidance-baked-in contract. The default omni video shape (720p × 189 frames) is the deployed shape, so no dedicated config is needed. This checkpoint declares `default_use_system_prompt: true` in its `model_index.json`, which the pipeline applies automatically (override with `--use_system_prompt` / `--no-use_system_prompt`).
 - [`nvidia/Cosmos3-Edge`](https://huggingface.co/nvidia/Cosmos3-Edge) — 4B Nemotron-dense backbone with no audio tower. 480p-native defaults (832×480 × 121 frames, 50 UniPC steps on the checkpoint-declared native flow schedule with shift 3.0, guidance 5.0; T2I defaults to 640×640), so no dedicated config is needed. The model card validates 256p/480p, 50–150 frames, and 12–30 FPS; requests outside that envelope run with an advisory log.
 - [`nvidia/Cosmos3-Edge-Policy-DROID`](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) — state-conditioned DROID policy on the Edge Nemotron-dense backbone. Its `checkpoint.json` selects policy mode and supplies the 32-action horizon, 15 FPS, and `droid_lerobot` domain. TensorRT-LLM supplies the remaining reference recipe: an 8-D current state followed by 32 generated 8-D joint-position/gripper actions, 33 rollout frames, four UniPC steps at flow shift 5, guidance 3 only at the highest-noise step, empty unconditional text, and the native Cosmos3 VAE. The prompt and observation layout remain request-owned; no RoboLab/OpenPI adapter runs in the model pipeline.
@@ -34,12 +34,12 @@ BF16 builds rather than under a separate model ID, so select them with
 ```bash
 python cosmos3.py --model nvidia/Cosmos3-Nano --revision fp8 \
     --prompt_file prompts/t2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # FP8 distilled 4-step text-to-image
 python cosmos3.py --model nvidia/Cosmos3-Super-Text2Image-4Step --revision fp8 \
     --prompt_file prompts/t2i.json --output_type image \
-    --visual_gen_args ../configs/cosmos3-t2i-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-t2i-1gpu.yaml
 
 # FP8 distilled 4-step image-to-video
 python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 \
@@ -49,7 +49,7 @@ python cosmos3.py --model nvidia/Cosmos3-Super-Image2Video-4Step --revision fp8 
 `nvidia/Cosmos3-Super` works the same way. A local checkout of that branch is
 equally fine; pass its directory to `--model` and omit `--revision`.
 
-`../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
+`../../configs/cosmos3-fp8-1gpu.yaml` carries the same `revision: fp8` for callers
 that would rather set it in the config than on the command line.
 
 Static FP8 runs on a single GPU or with Tensor Parallel, Ulysses, and CFG
@@ -125,19 +125,19 @@ the action text when using a different domain or reference aspect ratio.
 # T2V: text-to-video
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # I2V/TI2V: image-conditioned video (vision_path is read from the prompt file;
 # local path, file://, http(s):// URL, or data: URI are all accepted)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/i2v.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # I2V with an explicit conditioning image (overrides the prompt file)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/i2v.json \
     --image_path https://example.com/frame.jpg \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # V2V: video-conditioned video (continues the first frames of --video_path).
 # Best results when the prompt describes the input video — e.g. continue a
@@ -147,17 +147,17 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model /path/to/Cosmos3-Nano \
     --prompt_file prompts/v2v.json \
     --video_path /path/to/Cosmos3-Nano/assets/example_i2v_output.mp4 \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # T2AV: text-to-video with synchronized audio
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2av.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # T2I: text-to-image
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2i.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --output_path output.png
 
 # T2I, distilled 4-step checkpoint (use the T2I config so warmup runs the
@@ -182,7 +182,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "The same scene rendered as a photorealistic video, sharp detail." \
     --video_path /path/to/reference.mp4 \
     --extra_params '{"edge": true}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Transfer with a fully synthetic control (no assets): generate an edge-map
 # video of a bouncing ball, then let the prompt paint it photoreal.
@@ -194,7 +194,7 @@ python generate_bouncing_ball_control.py --out_dir ./ball_control
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A photorealistic beach ball with colorful panels bouncing between the walls of an enclosed room, studio lighting." \
     --extra_params '{"edge": "./ball_control/control.mp4"}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Multi-hint transfer: edge pins the layout, blur pins the palette/lighting.
 # Hints must describe the same underlying video as each other and the prompt.
@@ -202,7 +202,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "The same scene, ultra sharp, professional photography." \
     --video_path /path/to/reference.mp4 \
     --extra_params '{"edge": true, "blur": true}' \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Cosmos3-Edge image-to-video (480p-native defaults: 832x480 x 121 frames).
 # Reproduces the model-card sample: the checkpoint ships a structured prompt and
@@ -217,12 +217,12 @@ python cosmos3.py --model nvidia/Cosmos3-Edge \
 # Inline prompt (--prompt or a JSON file path)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt "A cute puppy playing with a ball in a park" \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml
 
 # Action — policy (first frame + instruction -> predicted action + rollout video)
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_policy.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode policy \
     --domain_name bridge_orig_lerobot \
     --raw_action_dim 10 \
@@ -248,7 +248,7 @@ python cosmos3.py --model nvidia/Cosmos3-Edge-Policy-DROID \
 # width (9 for av) and a mismatch is rejected.
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_forward_dynamics.json \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode forward_dynamics \
     --domain_name av \
     --action_json action_trajectory.json \
@@ -258,7 +258,7 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
 python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/action_inverse_dynamics.json \
     --video_path /path/to/observation_clip.mp4 \
-    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
+    --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
     --action_mode inverse_dynamics \
     --domain_name bridge_orig_lerobot \
     --raw_action_dim 10 \

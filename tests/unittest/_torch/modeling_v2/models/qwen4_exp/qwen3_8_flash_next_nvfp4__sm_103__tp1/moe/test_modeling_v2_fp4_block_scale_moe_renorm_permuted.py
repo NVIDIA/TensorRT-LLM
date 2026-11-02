@@ -7,12 +7,10 @@ finalized entry's output on identical operands (so the fold a consumer makes
 with the same arithmetic is bitwise what the runner's finalize stored), the
 outputs have the documented shapes, dtypes and index map, and the finalized
 rows sit inside the pre-routed entry's band against the fp32 reference. The
-operand construction is the finalized entry's test's, loaded by path.
+operand construction uses the shared NVFP4 test helpers.
 """
 
-import importlib.util
 import zlib
-from pathlib import Path
 
 import pytest
 import torch
@@ -26,23 +24,17 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flas
 from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.fp4_block_scale_moe_renorm_routed import (  # noqa: E501
     fp4_block_scale_moe_renorm_routed as finalized,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp.qwen3_8_flash_next_nvfp4__sm_103__tp1.ops.moe.renorm_moe_routing_op import (  # noqa: E501
+    renorm_moe_routing_op,
+)
 
 __extra_import_path__ = ["../../../.."]
+import _fp4_moe_test_utils as H  # noqa: E402
+from _fp4_moe_test_utils import many_expert_layer  # noqa: E402,F401 — fixture by name
+from _precision import true_fp32_matmul  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "fp4_block_scale_moe_renorm_permuted requires a CUDA device"
-
-
-def _routed_test():
-    path = Path(__file__).resolve().parent / "test_modeling_v2_fp4_block_scale_moe_renorm_routed.py"
-    spec = importlib.util.spec_from_file_location("_fp4_moe_renorm_routed_test", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-R = _routed_test()
-H = R.H
 
 
 def _args(args, data, sf, logits, scalars, spec, top_k=None):
@@ -62,12 +54,14 @@ def _args(args, data, sf, logits, scalars, spec, top_k=None):
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
-def test_certified_cells(cell, certifying):  # noqa: F811
+def test_certified_cells(cell, certifying, many_expert_layer):  # noqa: F811
     certifying(op)
     spec = cell.spec
     t, k, hidden = spec["tokens"], spec["top_k"], spec["hidden"]
     seed = zlib.crc32(cell.why.encode()) % 2**31
-    args, ref, data, sf, x, logits, ids, wts, g2, scalars = R._operands(spec, seed)
+    args, ref, data, sf, x, logits, ids, wts, g2, scalars = H.renorm_operands(
+        many_expert_layer(), spec, seed, renorm_moe_routing_op
+    )
     call = _args(args, data, sf, logits, scalars, spec)
 
     rows, topk_w, topk_rows = op(*call)
@@ -87,20 +81,25 @@ def test_certified_cells(cell, certifying):  # noqa: F811
     assert differing == 0, f"{differing} of {t} rows differ from the finalized entry"
 
     # 2. The fp32 reference, through the pre-routed entry's gate.
-    exp = op.reference(logits, x, k, ref["up"], ref["gate"], ref["down"], g2)
+    with true_fp32_matmul():
+        exp = op.reference(logits, x, k, ref["up"], ref["gate"], ref["down"], g2)
     H._compare(y, exp.to(torch.bfloat16))
 
 
-def test_uncertified_pair_refused():
+def test_uncertified_pair_refused(many_expert_layer):  # noqa: F811
     spec = op.CELLS[0].spec
-    args, _, data, sf, _, logits, _, _, _, scalars = R._operands(spec, 13)
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 13, renorm_moe_routing_op
+    )
     with validating(op), pytest.raises(AssertionError, match="certified Renormalize"):
         op(*_args(args, data, sf, logits, scalars, spec, top_k=9))
 
 
-def test_cuda_graph_capture_and_replay():
+def test_cuda_graph_capture_and_replay(many_expert_layer):  # noqa: F811
     spec = next(c.spec for c in op.CELLS if c.spec["tokens"] == 1)
-    args, _, data, sf, _, logits, _, _, _, scalars = R._operands(spec, 43)
+    args, _, data, sf, _, logits, _, _, _, scalars = H.renorm_operands(
+        many_expert_layer(), spec, 43, renorm_moe_routing_op
+    )
     call = list(_args(args, data, sf, logits, scalars, spec))
     warmup = torch.cuda.Stream()
     warmup.wait_stream(torch.cuda.current_stream())

@@ -25,12 +25,23 @@ from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      is_torch_compiling)
 from .backends import (AttentionForwardArgs, AttentionMetadata,
                        FlashInferAttentionMetadata, TrtllmAttentionMetadata)
+from .backends.fmha.gqa_decode import GqaDecodeSetup, KvAppendPlan
 from .backends.interface import (AttentionMask, CustomAttentionMask,
                                  PositionalEmbeddingParams,
                                  PredefinedAttentionMask)
 from .backends.sparse.hooks import get_sparse_attention_hooks
 from .backends.utils import create_attention, get_attention_backend
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
+
+
+def _inherit_process_group_attrs(mapping: Mapping, source: Mapping) -> Mapping:
+    """Preserve out-of-band process group routing on derived TP mappings."""
+    tp_group_pg = getattr(source, "_tp_group_pg", None)
+    if tp_group_pg is not None:
+        mapping._tp_group_pg = tp_group_pg
+    if getattr(source, "_use_torch_distributed_allreduce", False):
+        mapping._use_torch_distributed_allreduce = True
+    return mapping
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -291,7 +302,8 @@ def _helix_post_process(
 
     This is shared by both MHA (Attention) and MLA modules.  The only
     dimension that differs between the two callers is *value_dim*
-    (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
+    (``head_dim`` for MHA; for MLA ``kv_lora_rank``, or ``v_head_dim`` when
+    the V up-projection runs before the exchange).
 
     zero_kv_mask marks tokens this CP rank owns no KV for; those rows are forced
     to a no-op contribution before the exchange, exactly once per backend:
@@ -499,6 +511,8 @@ class Attention(nn.Module):
         reduce_output: bool = True,
         mapping_with_cp: Optional[Mapping] = None,
         head_dim: Optional[int] = None,
+        use_gqa_decode_fmha: bool = False,
+        cache_context_plan: bool = False,
     ):
         """
         Initialize the Attention module.
@@ -520,6 +534,9 @@ class Attention(nn.Module):
             disable_deep_gemm (bool): Whether to disable the use of DeepGEMM in Linear layers (currently only matters on SM100 + FP8).
             attn_output_gate (Optional[bool]): Determines whether to use an output gate in the attention Op. If False, the decision is automatically handled by the attention backend based on its capabilities.
             mapping_with_cp (Optional[Mapping]): Override mapping with CP configuration.
+            use_gqa_decode_fmha (bool): With the TRTLLM backend, serve generation calls with the GQA decode FMHA
+                library (backends/fmha/gqa_decode.py), offering it the output gate and the prologue's FP8 KV append.
+            cache_context_plan (bool): Let the TRTLLM backend plan a context-only forward once for all layers.
         """
         super().__init__()
         self.layer_idx = layer_idx
@@ -613,14 +630,40 @@ class Attention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        mapping = _inherit_process_group_attrs(mapping, self.mapping)
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.tp_rank = mapping.tp_rank
         assert self.num_heads % (tp_size * cp_size) == 0
         self.num_heads = self.num_heads // tp_size
         self.num_heads_tp_cp = self.num_heads // cp_size
+        total_kv_heads = self.num_key_value_heads
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
+        # Not with Helix CP: its backend call takes no KV-append plan, so a
+        # folded prologue would leave the projection un-normalized.
+        self.use_gqa_decode_fmha = (use_gqa_decode_fmha
+                                    and config.attn_backend == "TRTLLM"
+                                    and not self.mapping.has_cp_helix())
+        gqa_decode = None
+        if self.use_gqa_decode_fmha:
+            # Consecutive TP ranks that hold the same KV head may split its pages in generation.
+            kv_replicas = (tp_size // total_kv_heads if
+                           (cp_size == 1 and dp_size == 1
+                            and tp_size > total_kv_heads
+                            and tp_size % total_kv_heads == 0) else 1)
+            if kv_replicas > 1:
+                from ..distributed.ll_exchange import TPGroupExchange
+
+                # The split needs the TP group exchange (e.g. not with PP or
+                # Ray); without it the rank decodes its whole KV head.
+                if not TPGroupExchange.is_supported(self.mapping, kv_replicas):
+                    kv_replicas = 1
+            gqa_decode = GqaDecodeSetup(
+                kv_replicas=kv_replicas,
+                mapping=self.mapping,
+                tokens_per_gen_step=(config.spec_config.tokens_per_gen_step
+                                     if config.spec_config is not None else 1))
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
@@ -671,6 +714,7 @@ class Attention(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        mapping_o = _inherit_process_group_attrs(mapping_o, self.mapping)
         self.mapping_o = mapping_o
 
         self.o_proj = Linear(
@@ -780,7 +824,12 @@ class Attention(nn.Module):
             q_scaling=self.q_scaling,
             attention_chunk_size=self.attention_chunk_size,
             sparse_params=sparse_params,
+            gqa_decode=gqa_decode,
+            cache_context_plan=cache_context_plan,
         )
+        self.cache_context_plan = cache_context_plan
+        # (_use_quantize_output(), FP4 KV cache) once the weights are loaded, with cache_context_plan.
+        self._output_quant_flags: Optional[Tuple[bool, bool]] = None
 
         self.support_fused_qkv = self.attn.support_fused_qkv()
 
@@ -806,18 +855,27 @@ class Attention(nn.Module):
         return q, k, v
 
     def preprocess_qkv(
-        self, qkv: torch.Tensor, position_ids: Optional[torch.Tensor]
+        self,
+        qkv: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: Optional[AttentionMetadata] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor],
-               Optional[torch.Tensor]]:
+               Optional[torch.Tensor], Optional[KvAppendPlan]]:
         """Transform the fused QKV projection into attention inputs.
 
         Splits out the optional attention output gate and applies RoPE (plus
         any subclass-specific processing such as QK norm, via apply_rope).
         Subclasses may override this to fuse these steps into a single kernel.
 
+        Args:
+            attn_metadata: Set for a GQA decode layer whose subclass may also
+                write the FP8 query and K / V of a generation-only step.
+
         Returns:
-            tuple: (q, k, v, gate). k and v are None when q holds the fused
-            QKV tensor; gate is None when attn_output_gate is disabled.
+            tuple: (q, k, v, gate, kv_append). k and v are None when q holds
+            the fused QKV tensor; gate is None when attn_output_gate is
+            disabled; kv_append is the plan of a KV append done here, else
+            None.
         """
         gate = None
         if self.attn_output_gate:
@@ -832,7 +890,7 @@ class Attention(nn.Module):
         else:
             q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
-        return q, k, v, gate
+        return q, k, v, gate, None
 
     def apply_output_gate(self, attention_output: torch.Tensor,
                           gate: torch.Tensor) -> torch.Tensor:
@@ -877,6 +935,16 @@ class Attention(nn.Module):
 
         return self.has_quant_scale and not self.attn_output_gate and not has_awq_pre_quant_scale and not self.is_marlin_enabled
 
+    def _get_output_quant_flags(self) -> Tuple[bool, bool]:
+        """(_use_quantize_output(), FP4 KV cache); both depend only on the loaded quant config and o_proj."""
+        flags = self._output_quant_flags
+        if flags is None:
+            flags = (self._use_quantize_output(), self.quant_config is not None
+                     and self.quant_config.layer_quant_mode.has_fp4_kv_cache())
+            if self.cache_context_plan:
+                self._output_quant_flags = flags
+        return flags
+
     def create_output(self, q: torch.Tensor, attn_metadata: AttentionMetadata,
                       mask_type: str):
         # Attention is treated as mixed request by default.
@@ -917,7 +985,11 @@ class Attention(nn.Module):
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
+        output_gate: Optional[torch.Tensor] = None,
+        kv_append: Optional[KvAppendPlan] = None,
     ):
+        """Run the attention backend; with output_gate, the returned output has the gate applied (by the backend or
+        here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
         num_tokens = attn_metadata.num_tokens
 
         q = q[:num_tokens, :]
@@ -961,6 +1033,8 @@ class Attention(nn.Module):
                 attn_output = attn_output[0]
             attn_output = self._helix_post_process(attn_output, softmax_stats,
                                                    attn_metadata)
+            if output_gate is not None:
+                attn_output = self.apply_output_gate(attn_output, output_gate)
             return attn_output, None
 
         # Don't set out_scale if o_proj has pre_quant_scale — this prevents
@@ -974,47 +1048,50 @@ class Attention(nn.Module):
         # not populated yet at this call site.
         out_scale = None
         out_scale_sf = None
-        if self._use_quantize_output() and not has_lora:
+        quantize_output, fp4_kv_cache = self._get_output_quant_flags()
+        if quantize_output and not has_lora:
             out_scale = self.o_proj.inv_input_scale
             out_scale_sf = self.o_proj.input_scale
 
         kv_scale_orig_quant = None
         kv_scale_quant_orig = None
-        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp4_kv_cache(
-        ):
+        if fp4_kv_cache:
             kv_scale_orig_quant = self.qkv_proj.inv_kv_scales
             kv_scale_quant_orig = self.qkv_proj.kv_scales
 
+        forward_args = AttentionForwardArgs(
+            out_scale=out_scale,
+            out_scale_sf=out_scale_sf,
+            kv_scale_orig_quant=kv_scale_orig_quant,
+            kv_scale_quant_orig=kv_scale_quant_orig,
+            attention_mask=attention_mask,
+            mrope_rotary_cos_sin=mrope_rotary_cos_sin,
+            mrope_position_deltas=mrope_position_deltas,
+            attention_window_size=attention_window_size,
+            attention_mask_data=attention_mask_data,
+            output=output[:num_tokens, :] if output is not None else None,
+            output_sf=output_sf,
+            attention_sinks=attention_sinks,
+            relative_attention_bias=relative_attention_bias,
+            relative_attention_max_distance=relative_attention_max_distance,
+            output_gate=output_gate,
+            kv_append=kv_append,
+        )
         with attn_metadata.mixed_precision_kv_staging(self.attn.layer_idx):
-            attn_output = self.attn.forward(
-                q,
-                k,
-                v,
-                attn_metadata,
-                forward_args=AttentionForwardArgs(
-                    out_scale=out_scale,
-                    out_scale_sf=out_scale_sf,
-                    kv_scale_orig_quant=kv_scale_orig_quant,
-                    kv_scale_quant_orig=kv_scale_quant_orig,
-                    attention_mask=attention_mask,
-                    mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-                    mrope_position_deltas=mrope_position_deltas,
-                    attention_window_size=attention_window_size,
-                    attention_mask_data=attention_mask_data,
-                    output=output[:num_tokens, :]
-                    if output is not None else None,
-                    output_sf=output_sf,
-                    attention_sinks=attention_sinks,
-                    relative_attention_bias=relative_attention_bias,
-                    relative_attention_max_distance=
-                    relative_attention_max_distance,
-                ))
+            attn_output = self.attn.forward(q,
+                                            k,
+                                            v,
+                                            attn_metadata,
+                                            forward_args=forward_args)
+        attn_output_sf = None
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
             ) == 2, "attn_output should be a tuple of (output, output_sf)"
-            return attn_output[0], attn_output[1]
-        return attn_output, None
+            attn_output, attn_output_sf = attn_output
+        if output_gate is not None and not forward_args.output_gate_applied:
+            attn_output = self.apply_output_gate(attn_output, output_gate)
+        return attn_output, attn_output_sf
 
     def forward_impl(
         self,
@@ -1031,6 +1108,7 @@ class Attention(nn.Module):
         relative_attention_max_distance: int = 0,
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
+        kv_append: Optional[KvAppendPlan] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -1062,12 +1140,11 @@ class Attention(nn.Module):
             if "mrope_position_deltas" in mrope_config:
                 mrope_position_deltas = mrope_config["mrope_position_deltas"]
 
-        # Currently only TRTLLM and FLASHINFER support the custom inplace op.
-        use_custom_inplace_op = (
-            self.register_to_config and
-            (self.attn_backend == "TRTLLM" or self.attn_backend == "FLASHINFER")
-            and (is_torch_compiling() or is_in_breakable_cuda_graph())
-            and not self.is_marlin_enabled)
+        use_custom_inplace_op = self._use_custom_inplace_op()
+        # A GQA decode layer offers its output gate to the backend kernels; the custom op cannot carry it.
+        backend_gate = (output_gate if self.use_gqa_decode_fmha
+                        and self.sparse_attn_hooks is None
+                        and not use_custom_inplace_op else None)
 
         if use_custom_inplace_op:
             outputs = create_attn_outputs(q, attention_mask, self.layer_idx_str)
@@ -1105,13 +1182,25 @@ class Attention(nn.Module):
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
                 has_lora=has_lora,
+                output_gate=backend_gate,
+                kv_append=kv_append,
             )
         if output_sf is not None:
             output = Fp4QuantizedTensor(output, output_sf)
-        if output_gate is not None:
+        if output_gate is not None and backend_gate is None:
             output = self.apply_output_gate(output, output_gate)
 
         return output
+
+    def _use_custom_inplace_op(self) -> bool:
+        """Whether forward_impl runs the backend through attn_custom_op_inplace (torch.compile or breakable CUDA
+        graph)."""
+        # Currently only TRTLLM and FLASHINFER support the custom inplace op.
+        return (self.register_to_config
+                and (self.attn_backend == "TRTLLM"
+                     or self.attn_backend == "FLASHINFER")
+                and (is_torch_compiling() or is_in_breakable_cuda_graph())
+                and not self.is_marlin_enabled)
 
     def forward(
         self,
@@ -1172,7 +1261,10 @@ class Attention(nn.Module):
             position_ids = self._adjust_position_ids_for_spec_dec(
                 position_ids, attn_metadata)
 
-        q, k, v, gate = self.preprocess_qkv(qkv, position_ids)
+        # The custom op cannot carry a KV-append plan to the backend.
+        q, k, v, gate, kv_append = self.preprocess_qkv(
+            qkv, position_ids, attn_metadata if self.use_gqa_decode_fmha
+            and not self._use_custom_inplace_op() else None)
         q, k, v = self.convert_qkv(q, k, v)
 
         if attention_sinks is not None:
@@ -1196,6 +1288,7 @@ class Attention(nn.Module):
             relative_attention_max_distance=relative_attention_max_distance,
             has_lora=bool(lora_params),
             output_gate=gate,
+            kv_append=kv_append,
             **kwargs,
         )
 

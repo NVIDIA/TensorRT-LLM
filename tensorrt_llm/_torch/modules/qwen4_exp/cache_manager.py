@@ -688,7 +688,7 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     @override
     def _initialize_spec_state(self) -> GDNIntermediateState | GDNReplayState:
-        state = create_gdn_state(self, self._requested_replay)
+        state = create_gdn_state(self, self._requested_replay, allow_flashinfer_ring=True)
 
         validate_gdn_layout(self, state)
         params = self._ple_params
@@ -747,6 +747,11 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
     def get_replay_state_update_metadata(self) -> ReplayStateUpdateMetadata | None:
         state = self._speculative_state
         return state.get_replay_metadata() if isinstance(state, GDNReplayState) else None
+
+    @property
+    def use_gdn_flashinfer_ring_replay(self) -> bool:
+        state = self._speculative_state
+        return isinstance(state, GDNReplayState) and state.use_flashinfer_ring
 
     @property
     def use_gdn_cached_replay_all_layer_commit(self) -> bool:

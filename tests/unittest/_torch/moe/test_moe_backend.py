@@ -14,6 +14,7 @@
 # limitations under the License.
 """MoE backend unit tests."""
 
+import collections
 import dataclasses
 import importlib
 import itertools
@@ -102,9 +103,11 @@ from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoECommPlan,
     MoEDeployment,
     MoEEnvironment,
+    MoEInputRequirement,
     MoEProblem,
     MoERejection,
     MoERejectReason,
+    MoEReplicaPlan,
     MoEResolutionReport,
     MoERunContext,
     MoEStaticCapability,
@@ -131,6 +134,10 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import (
     ExternalCommMoEScheduler,
     FusedCommMoEScheduler,
+)
+from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb.planner import (
+    RebalanceSlotSchedulerGroup,
+    _LiveBankLeaseProvider,
 )
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
@@ -366,6 +373,53 @@ def test_fused_comm_scheduler_indexes_full_ep_token_metadata():
     assert had_meta
 
 
+def _split_chunk(tokens, chunks):
+    return [tokens // chunks + 1] * (tokens % chunks) + [tokens // chunks] * (
+        chunks - tokens % chunks
+    )
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_scheduler_passes_unpadded_single_chunk_inputs_through():
+    moe = SimpleNamespace(
+        mapping=SimpleNamespace(moe_ep_rank=1, moe_ep_size=2),
+        moe_max_num_tokens=8,
+        split_chunk=_split_chunk,
+    )
+    scheduler = FusedCommMoEScheduler(moe)
+    x = torch.randn(6, 8)
+    router_logits = torch.randn(6, 4)
+    input_ids = torch.arange(6)
+
+    x_real, rl_real, ids_real, counts, ep_rank, had_meta = scheduler._strip_adp_padding(
+        x, router_logits, input_ids, [4, 6]
+    )
+    # This rank carries no ADP padding and fits one chunk: no view is taken.
+    assert x_real is x and rl_real is router_logits and ids_real is input_ids
+    assert (counts, ep_rank, had_meta) == ([4, 6], 1, True)
+    num_chunks, x_chunks, rl_chunks, chunk_sizes = scheduler._compute_chunk_layout(
+        x_real, rl_real, counts, ep_rank
+    )
+    assert num_chunks == 1
+    assert x_chunks[0] is x and rl_chunks[0] is router_logits
+    assert chunk_sizes == [[4], [6]]
+
+    # Padding is still stripped and several chunks are still split.
+    x_real, rl_real, _, counts, ep_rank, _ = scheduler._strip_adp_padding(
+        x, router_logits, None, [4, 5]
+    )
+    assert x_real.shape[0] == 5 and torch.equal(x_real, x[:5])
+    moe.moe_max_num_tokens = 2
+    num_chunks, x_chunks, rl_chunks, chunk_sizes = scheduler._compute_chunk_layout(
+        x_real, rl_real, counts, ep_rank
+    )
+    assert num_chunks == 3
+    assert [chunk.shape[0] for chunk in x_chunks] == [2, 2, 1]
+    assert torch.equal(torch.cat(x_chunks), x[:5])
+    assert torch.equal(torch.cat(rl_chunks), router_logits[:5])
+    assert chunk_sizes == [[2, 1, 1], [2, 2, 1]]
+
+
 def test_fused_comm_scheduler_rejects_partial_ep_token_metadata():
     mapping = SimpleNamespace(moe_ep_rank=1, moe_ep_size=4)
     scheduler = FusedCommMoEScheduler(SimpleNamespace(mapping=mapping))
@@ -513,6 +567,29 @@ def test_cutedsl_direct_metadata_tuning_buckets_capacity_and_legacy_uses_tokens(
     legacy_dynamic_spec = legacy_config.dynamic_tensor_specs[0]
     assert legacy_dynamic_spec.gen_tuning_buckets(expert_capacity_rows)[-1] == 512
     assert legacy_dynamic_spec.map_to_tuning_buckets(expert_capacity_rows) == 512
+
+
+@pytest.mark.parametrize("decode_tuning", [False, True])
+def test_fp4_block_scale_moe_decode_tuning(decode_tuning: bool) -> None:
+    """Only a model that declares decode tuning gets the decode-step buckets and rank 0's tactic on every
+    rank; otherwise every rank tunes on its own over the power-of-2 ladder."""
+    from tensorrt_llm._torch.autotuner import DistributedTuningStrategy
+    from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import FP4BlockScaleMoERunner
+
+    config = FP4BlockScaleMoERunner.get_tuning_config(4, decode_tuning=decode_tuning)
+    assert config.distributed_tuning_strategy == (
+        DistributedTuningStrategy.BROADCAST
+        if decode_tuning
+        else DistributedTuningStrategy.INDEPENDENT
+    )
+    (spec,) = config.dynamic_tensor_specs
+    pow2 = (1, 2, 4, 8, 16, 32, 64, 128)
+    if decode_tuning:
+        assert {3, 7, 24, 120} <= set(spec.gen_tuning_buckets)
+        assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [7, 8, 24, 128]
+    else:
+        assert set(spec.gen_tuning_buckets) & set(range(1, 129)) == set(pow2)
+        assert [spec.map_to_tuning_buckets(m) for m in (7, 14, 28, 130)] == [4, 8, 16, 128]
 
 
 @pytest.mark.parametrize(
@@ -2038,6 +2115,429 @@ def test_nvfp4_trtllm_gen_tp_accepts_logical_group_aligned_shard() -> None:
     assert backend.intermediate_size_per_partition % backend.quant_method.weight_alignment != 0
 
 
+@pytest.mark.cpu_only
+def test_megamoe_quant_method_defines_canonical_live_plane_spec():
+    method = NVFP4MegaMoECuteDslMethod()
+    module = SimpleNamespace(
+        hidden_size=7168,
+        intermediate_size_per_partition=3072,
+        expand_intermediate_size_per_partition=6144,
+    )
+
+    spec = method.live_weight_plane_spec(module)
+
+    assert (spec.hidden, spec.intermediate, spec.expand_intermediate) == (7168, 3072, 6144)
+    assert tuple(plane.name for plane in spec.planes) == (
+        "mega_fc1_weight",
+        "mega_fc1_weight_sf",
+        "mega_fc2_weight",
+        "mega_fc2_weight_sf",
+        "fc31_alpha",
+        "fc2_alpha",
+        "fc1_norm_const",
+    )
+
+    # Exercise the storage-to-kernel dtype/view bridge on a small legal
+    # geometry; production metadata is covered by the independent goldens.
+    bridge = method._live_weight_bundle_layout(160, 80, 160)
+    for plane in bridge.planes:
+        shape, stride, dtype_name, element_size, pointer_alignment = plane.storage_metadata(3)
+        tensor = torch.empty(shape, dtype=getattr(torch, dtype_name))
+        assert tuple(tensor.stride()) == stride
+        assert tensor.element_size() == element_size
+        assert tensor.data_ptr() % pointer_alignment == 0
+
+        kernel_shape, kernel_stride, _, kernel_element_size, _ = plane.kernel_metadata(3)
+        kernel_view = tensor
+        if plane.name in ("mega_fc1_weight", "mega_fc2_weight"):
+            kernel_view = kernel_view.transpose(1, 2)
+        assert tuple(kernel_view.shape) == kernel_shape
+        assert tuple(kernel_view.stride()) == kernel_stride
+        assert kernel_view.element_size() == kernel_element_size
+
+
+@pytest.mark.cpu_only
+def test_megamoe_live_plane_spec_rejects_expand_before_allocation():
+    method = NVFP4MegaMoECuteDslMethod()
+    module = SimpleNamespace(
+        hidden_size=160,
+        intermediate_size_per_partition=80,
+        expand_intermediate_size_per_partition=176,
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        method.live_weight_plane_spec(module)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_rejects_expand_before_arena_allocation():
+    allocate_arena = MagicMock()
+    module = SimpleNamespace(
+        hidden_size=160,
+        intermediate_size_per_partition=80,
+        expand_intermediate_size_per_partition=176,
+        layer_load_balancer=SimpleNamespace(
+            produces_replica_plan=True, allocate_arena=allocate_arena
+        ),
+    )
+
+    with pytest.raises(ValueError, match="expand_intermediate == 2"):
+        NVFP4MegaMoECuteDslMethod().create_weights(module)
+
+    allocate_arena.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("produces_replica_plan", [True, False, None])
+def test_megamoe_quant_method_allocates_and_binds_the_arena_through_the_layer_handle(
+    monkeypatch, produces_replica_plan
+):
+    method = NVFP4MegaMoECuteDslMethod()
+    bundle = method._live_weight_bundle_layout(160, 80, 160)
+    resident, helpers = 2, 1 if produces_replica_plan else 0
+    arena = object()
+    events = []
+
+    def create_parent_weights(self, module, *args):
+        events.append("parent")
+        for name in NVFP4MegaMoECuteDslMethod._STREAMED_SOURCE_PARAMS:
+            module.register_parameter(
+                name, torch.nn.Parameter(torch.empty(1, dtype=torch.uint8), requires_grad=False)
+            )
+        for name in ("fc31_alpha", "fc2_alpha"):
+            shape, _, dtype_name, _, _ = method._live_weight_plane(bundle, name).storage_metadata(
+                resident
+            )
+            module.register_parameter(
+                name,
+                torch.nn.Parameter(
+                    torch.ones(shape, dtype=getattr(torch, dtype_name)), requires_grad=False
+                ),
+            )
+
+    def allocate_arena(**kwargs):
+        events.append(("allocate", kwargs))
+        return arena
+
+    monkeypatch.setattr(NVFP4FusedMoEMethod, "create_weights", create_parent_weights)
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
+    monkeypatch.setattr(
+        NVFP4MegaMoECuteDslMethod,
+        "_bind_live_weight_planes",
+        lambda self, module, bound: events.append(("bind", bound)),
+    )
+    module = torch.nn.Module()
+    module.hidden_size = 160
+    module.intermediate_size_per_partition = 80
+    module.expand_intermediate_size_per_partition = 160
+    module.bias = False
+    module.expert_size_per_partition = resident
+    module.compute_slot_count = resident + helpers
+    module.rebuild_tensor_metadata = {}
+    module.ep_process_group = "ep_group"
+    module.mapping = SimpleNamespace(local_rank=3)
+    module.layer_idx = 5
+    module.layer_load_balancer = (
+        None
+        if produces_replica_plan is None
+        else SimpleNamespace(
+            produces_replica_plan=produces_replica_plan, allocate_arena=allocate_arena
+        )
+    )
+
+    method.create_weights(module)
+
+    assert module.mega_fc1_weight.shape[0] == resident + helpers
+    if not produces_replica_plan:
+        assert events == ["parent"]
+        return
+    # Every rank allocates the arena before any Parameter exists and binds the
+    # seven planes once all of them are registered.
+    assert events == [
+        (
+            "allocate",
+            dict(
+                bundle=bundle,
+                ep_process_group="ep_group",
+                mapping=module.mapping,
+                device=3,
+                layer_idx=5,
+            ),
+        ),
+        "parent",
+        ("bind", arena),
+    ]
+
+
+@pytest.mark.cpu_only
+def test_megamoe_quant_method_builds_the_producer_after_checking_the_planes(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        NVFP4FusedMoEMethod, "cache_derived_state", lambda self, module: events.append("parent")
+    )
+    monkeypatch.setattr(
+        NVFP4MegaMoECuteDslMethod,
+        "assert_live_weight_aliases",
+        lambda self, module, arena: events.append(("aliases", arena)),
+    )
+    arena = SimpleNamespace(assert_identity=lambda: events.append("identity"))
+    handle = SimpleNamespace(
+        produces_replica_plan=True,
+        live_weight_arena=arena,
+        bind_backend=lambda module: events.append(("bind_backend", module)),
+    )
+    module = SimpleNamespace(layer_load_balancer=handle)
+    method = NVFP4MegaMoECuteDslMethod()
+
+    method.cache_derived_state(module)
+
+    assert events == ["parent", "identity", ("aliases", arena), ("bind_backend", module)]
+
+    # Standard EPLB and EPLB-off layers only refresh the parent state.
+    events.clear()
+    method.cache_derived_state(SimpleNamespace(layer_load_balancer=None))
+    method.cache_derived_state(
+        SimpleNamespace(layer_load_balancer=SimpleNamespace(produces_replica_plan=False))
+    )
+    assert events == ["parent", "parent"]
+
+    handle.live_weight_arena = None
+    with pytest.raises(RuntimeError, match="no live-weight arena"):
+        method.cache_derived_state(module)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_live_plane_identity_guard_detects_parameter_replacement():
+    class Tensor:
+        def __init__(self, pointer):
+            self.shape = (2, 3)
+            self.dtype = "u8"
+            self.device = "cuda:0"
+            self.is_meta = False
+            self._pointer = pointer
+
+        def stride(self):
+            return (3, 1)
+
+        def data_ptr(self):
+            return self._pointer
+
+    arena_view = Tensor(17)
+    alias = Tensor(17)
+    plane = SimpleNamespace(name="weight")
+    bundle = SimpleNamespace(planes=(plane,))
+    arena = SimpleNamespace(
+        bundle=bundle,
+        local_plane_views=(arena_view,),
+        tekit_alias_views=(alias,),
+    )
+    module = SimpleNamespace(weight=Tensor(17))
+    method = NVFP4MegaMoECuteDslMethod()
+    method.live_weight_plane_spec = MagicMock(return_value=bundle)
+
+    method.assert_live_weight_aliases(module, arena)
+
+    module.weight = Tensor(23)
+    with pytest.raises(RuntimeError, match="changed storage"):
+        method.assert_live_weight_aliases(module, arena)
+
+
+def _per_layer_dynamic_handle(helper_slots_per_rank):
+    return SimpleNamespace(produces_replica_plan=True, helper_slots_per_rank=helper_slots_per_rank)
+
+
+@pytest.mark.cpu_only
+def test_megamoe_compute_slots_come_from_the_layer_handle():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe.layer_load_balancer = None
+    assert moe.compute_slot_count == 8
+
+    # Standard EPLB produces no replica plan and adds no helper slot.
+    moe.layer_load_balancer = SimpleNamespace(produces_replica_plan=False)
+    assert moe.compute_slot_count == 8
+
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
+    assert moe.compute_slot_count == 11
+    assert moe.expert_size_per_partition == 8
+
+
+@pytest.mark.cpu_only
+def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
+    wait_for_routes = MagicMock()
+    ready_flags = torch.empty(8, dtype=torch.int64)
+    plan = MoEReplicaPlan(
+        resident_experts_per_rank=8,
+        compute_slots_per_rank=11,
+        ready_flags=ready_flags,
+        ready_generation=7,
+        reserved_sms=4,
+        _wait_for_routes=wait_for_routes,
+    )
+
+    compute_slots, helper_slots, actual_flags, generation, reserved_sms = (
+        moe._replica_plan_launch_args(plan)
+    )
+    assert (compute_slots, helper_slots, generation, reserved_sms) == (11, 3, 7, 4)
+    assert actual_flags is ready_flags
+    moe._wait_rebalance_routes(plan)
+    wait_for_routes.assert_called_once_with()
+
+    moe._wait_rebalance_routes()
+    wait_for_routes.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._last_staged_T = {8: 6}
+    trace = []
+    moe._wait_rebalance_routes = lambda replica_plan=None: trace.append(("wait", replica_plan))
+    bufs = SimpleNamespace(
+        activation=torch.zeros(8, 16, dtype=torch.uint8),
+        activation_sf=torch.zeros(8, 4, dtype=torch.uint8),
+        topk_weights=torch.ones(8, 4, dtype=torch.float32),
+        topk_idx_local=torch.full((8, 4), 5, dtype=torch.int64),
+    )
+    routes = torch.tensor([[0, 3, -1, 2**31 - 1], [7, 6, 5, 4], [1, 1, 1, 1]], dtype=torch.int32)
+    weights = torch.full((3, 4), 0.25, dtype=torch.float32)
+
+    moe._stage_inputs(
+        bufs=bufs,
+        x=torch.ones(3, 16, dtype=torch.uint8),
+        x_sf=torch.ones(3, 4, dtype=torch.uint8),
+        topk_idx=routes,
+        topk_weights=weights,
+        num_tokens=3,
+        top_k=4,
+        stage_activation=True,
+        replica_plan="plan",
+    )
+
+    # One copy widens the int32 routes into the int64 kernel index buffer.
+    assert bufs.topk_idx_local.dtype == torch.int64
+    assert torch.equal(bufs.topk_idx_local[:3], routes.to(torch.int64))
+    # Rows a previous launch wrote, and only those, are reset to -1.
+    assert torch.equal(bufs.topk_idx_local[3:6], torch.full((3, 4), -1, dtype=torch.int64))
+    assert torch.equal(bufs.topk_idx_local[6:], torch.full((2, 4), 5, dtype=torch.int64))
+    assert torch.equal(bufs.topk_weights[:3], weights)
+    assert not bufs.topk_weights[3:].any()
+    assert trace == [("wait", "plan")]
+
+
+@pytest.mark.cpu_only
+def test_megamoe_run_moe_hands_routes_to_staging_unconverted():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.ep_size = 1
+    moe._weights_created = True
+    moe.quant_method = object()
+    moe.hidden_size = 16
+    moe.dtype = torch.bfloat16
+    moe._topk_idx_dtype = torch.int64
+    moe._build_weight_view = lambda: "weights"
+    moe._wait_rebalance_routes = MagicMock()
+    captured = {}
+    moe._run_moe = lambda **kwargs: captured.update(kwargs) or "out"
+    routes = torch.zeros(3, 4, dtype=torch.int32)
+    scales = torch.ones(3, 4, dtype=torch.float32)
+
+    out = moe.run_moe(
+        MoERunContext(
+            token_selected_experts=routes,
+            token_final_scales=scales,
+            x=torch.zeros(3, 8, dtype=torch.uint8),
+            x_sf=torch.zeros(3, 4, dtype=torch.uint8),
+            output_dtype=torch.bfloat16,
+        )
+    )
+
+    assert out == "out"
+    # No conversion kernel and no early route wait: staging reads the routes.
+    assert captured["topk_idx"] is routes
+    assert captured["topk_weights"] is scales
+    moe._wait_rebalance_routes.assert_not_called()
+
+    half_scales = scales.to(torch.float16)
+    moe.run_moe(
+        MoERunContext(
+            token_selected_experts=routes,
+            token_final_scales=half_scales,
+            x=torch.zeros(3, 8, dtype=torch.uint8),
+            x_sf=torch.zeros(3, 4, dtype=torch.uint8),
+            output_dtype=torch.bfloat16,
+        )
+    )
+    assert captured["topk_weights"].dtype == torch.float32
+    assert torch.equal(captured["topk_weights"], scales)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_sm_budget", [True, False])
+def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(monkeypatch, request, has_sm_budget):
+    from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_cute_dsl
+
+    calls = []
+
+    def outputs(x):
+        rows = x.shape[0]
+        return (
+            torch.zeros(rows, x.shape[1] // 2, dtype=torch.uint8),
+            torch.zeros(rows * x.shape[1] // 16, dtype=torch.uint8),
+        )
+
+    def fp4_quantize(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled):
+        calls.append(("default", sf_vec_size, sf_use_ue8m0, is_sf_swizzled))
+        return outputs(x)
+
+    def sm_budget(x, scale, sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms):
+        calls.append(("sm_budget", sf_vec_size, sf_use_ue8m0, is_sf_swizzled, reserved_sms))
+        return outputs(x)
+
+    if has_sm_budget:
+        fp4_quantize.sm_budget = sm_budget
+    monkeypatch.setattr(torch.ops.trtllm, "fp4_quantize", fp4_quantize, raising=False)
+    mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear()
+    request.addfinalizer(mega_moe_cute_dsl._fp4_quantize_has_sm_budget.cache_clear)
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.fc31_input_scale = torch.ones(1)
+    x = torch.zeros(3, 64, dtype=torch.bfloat16)
+
+    moe.quantize_input(x)
+    moe.quantize_input(x, reserved_sms=4)
+
+    default = ("default", 16, False, False)
+    budget = ("sm_budget", 16, False, False, 4) if has_sm_budget else default
+    assert calls == [default, budget]
+
+
+@pytest.mark.cpu_only
+def test_megamoe_replica_plan_rejects_unallocated_geometry():
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe.expert_size_per_partition = 8
+    moe.layer_load_balancer = _per_layer_dynamic_handle(3)
+    plan = MoEReplicaPlan(
+        resident_experts_per_rank=8,
+        compute_slots_per_rank=12,
+        ready_flags=torch.empty(8, dtype=torch.int64),
+        ready_generation=7,
+        reserved_sms=8,
+        _wait_for_routes=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="geometry does not match"):
+        moe._replica_plan_launch_args(plan)
+
+
+@pytest.mark.cpu_only
 def test_megamoe_cutedsl_post_load_weights_uses_staged_hooks():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
@@ -2094,6 +2594,149 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
         world_size=8,
         device_id=torch.device("cuda", 2),
     )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_cutedsl_cache_derived_state_reuses_rebalance_binding(
+    monkeypatch,
+):
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import (
+        PerLayerDynamicMoeLoadBalancer,
+        planner,
+    )
+    from tensorrt_llm._torch.moe.fused_moe.per_layer_dynamic_eplb import arena as arena_module
+
+    config = SimpleNamespace(
+        num_slots=24,
+        auxiliary_sms=8,
+        validate_expert_capacity=lambda num_experts: None,
+    )
+    manager = PerLayerDynamicMoeLoadBalancer(
+        ep_rank=0,
+        ep_size=4,
+        config=config,
+    )
+    layer = manager.add_layer(
+        expert_count=16,
+        top_k=2,
+        slot_count_per_rank=6,
+    )
+    bundle = NVFP4MegaMoECuteDslMethod._live_weight_bundle_layout(160, 80, 160)
+    arena = MagicMock(home_experts=4, helper_slots=2, bundle=bundle)
+    arena.assert_identity = MagicMock()
+    allocate = MagicMock(return_value=arena)
+    monkeypatch.setattr(arena_module, "allocate_rebalance_arena", allocate)
+    monkeypatch.setattr(manager, "get_ep_comm", lambda process_group: "ep_comm")
+    monkeypatch.setattr(manager, "create_arena_provider", lambda: "provider")
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    torch.nn.Module.__init__(moe)
+    moe._ep_pg = object()
+    moe._maxt_buckets = [64, 128]
+    moe.mapping = SimpleNamespace(local_rank=0)
+    moe.layer_idx = 5
+    moe.layer_load_balancer = layer
+    moe.initial_global_assignments = list(range(16))
+    # The quant method's create_weights allocates through the handle; a second
+    # call with the same plane spec returns the same arena.
+    for _ in range(2):
+        assert (
+            layer.allocate_arena(
+                bundle=bundle,
+                ep_process_group=moe.ep_process_group,
+                mapping=moe.mapping,
+                device=0,
+                layer_idx=5,
+            )
+            is arena
+        )
+    allocate.assert_called_once()
+    moe.quant_method = NVFP4MegaMoECuteDslMethod()
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "setup_quant_scales", lambda self, module: None)
+    assert_aliases = MagicMock()
+    monkeypatch.setattr(NVFP4MegaMoECuteDslMethod, "assert_live_weight_aliases", assert_aliases)
+    builder = MagicMock(return_value=SimpleNamespace(home_experts=4, helper_slots=2))
+    monkeypatch.setattr(
+        planner,
+        "build_rebalance_slot_scheduler_group",
+        builder,
+    )
+
+    moe.cache_derived_state()
+    moe.cache_derived_state()
+
+    assert arena.assert_identity.call_count == 2
+    assert assert_aliases.call_count == 2
+    assert layer.live_weight_arena is arena
+    builder.assert_called_once_with(
+        arena=arena,
+        manager=manager,
+        mapping=moe.mapping,
+        ep_process_group=moe._ep_pg,
+        home_experts=4,
+        helper_slots=2,
+        topk=2,
+        max_tokens_per_rank=128,
+        layer_idx=5,
+    )
+
+
+@pytest.mark.cpu_only
+def test_rebalance_discard_plan_orders_release_and_allows_next_reuse():
+    trace = []
+    outputs = SimpleNamespace(physical_slot_ids=[3, 4])
+    part = (outputs, 2)
+    copy_stream = object()
+
+    group = RebalanceSlotSchedulerGroup.__new__(RebalanceSlotSchedulerGroup)
+    group._check_owner = MagicMock()
+    group._lent_rows = -1
+    group._lent_routes = None
+    group._plan_part = part
+    group._generation = 1
+    group._finished_generation = 0
+    group._scheduled_generation = 1
+    group._route_wait_generation = 0
+    group._pending_release = None
+    group.plan_calls = 0
+    group._execution_stream_handle = 23
+    group.copy_stream = copy_stream
+    group.scheduler_stream = copy_stream
+
+    def wait_for_routes():
+        trace.append("wait_routes")
+        group._route_wait_generation = group._generation
+
+    def release_generation_after(generation, event):
+        # Without an event, the release follows the MAIN work queued so far.
+        assert (generation, event) == (1, None)
+        trace.append("release_generation")
+
+    broadcaster = SimpleNamespace(
+        release_generation_after=MagicMock(side_effect=release_generation_after),
+        mark_collective_reuse_safe=MagicMock(
+            side_effect=lambda authority, generation: trace.append("prove_reuse")
+        ),
+    )
+    group.wait_for_routes = wait_for_routes
+    group.broadcaster = broadcaster
+
+    group.discard_plan(part)
+
+    assert group._plan_part is None
+    assert group.plan_calls == 1
+    assert group._finished_generation == 1
+    assert group._pending_release == (1, None)
+    assert trace == ["wait_routes", "release_generation"]
+
+    # The next schedule advances this counter before proving that generation 1
+    # can be reused. Exercise the real lease check to show cleanup left a valid
+    # transition rather than a permanently poisoned group.
+    group._scheduled_generation = 2
+    lease = _LiveBankLeaseProvider(group)
+    lease.prove(1)
+
+    assert lease.proved_generation == 1
+    assert trace[-1] == "prove_reuse"
 
 
 def test_megamoe_load_weights_invalidates_cached_deepgemm_views():
@@ -2673,6 +3316,7 @@ def _fused_comm_scheduler(
     enable_attention_dp: bool = False,
     reduce_results: bool = False,
     accepts_global_routed_output: bool = False,
+    run_moe_reuses_buffers: bool = False,
 ) -> FusedCommMoEScheduler:
     mapping = Mapping(
         world_size=tp_size,
@@ -2689,6 +3333,7 @@ def _fused_comm_scheduler(
             "reduce_results",
             "accepts_global_routed_output",
             "mapping",
+            "backend",
         ]
     )
     moe.parallel_size = tp_size
@@ -2696,6 +3341,10 @@ def _fused_comm_scheduler(
     moe.reduce_results = reduce_results
     moe.accepts_global_routed_output = accepts_global_routed_output
     moe.mapping = mapping
+    # ``forward`` reads the declaration off the backend before it chunks.
+    moe.backend = SimpleNamespace(
+        input_requirement=MoEInputRequirement(run_moe_reuses_buffers=run_moe_reuses_buffers)
+    )
     return FusedCommMoEScheduler(moe)
 
 
@@ -2794,6 +3443,26 @@ def test_fused_comm_forward_returns_what_the_caller_reduces(
             assert torch.equal(output, global_output)
         else:
             assert not output.any()
+
+
+@pytest.mark.cpu_only
+def test_fused_comm_forward_refuses_a_backend_that_reuses_its_buffers() -> None:
+    """``_run_chunks`` keeps the tensor each chunk returned, so a backend whose
+    next ``run_moe`` overwrites it would collect the same storage for every
+    chunk. Only ``ExternalCommMoEScheduler`` copies chunks out; here the
+    combination is a named refusal rather than the last chunk's rows repeated."""
+    scheduler = _fused_comm_scheduler(rank=0, run_moe_reuses_buffers=True)
+
+    with pytest.raises(NotImplementedError, match="run_moe_reuses_buffers"):
+        scheduler.forward(
+            torch.randn(5, 16, dtype=torch.bfloat16),
+            torch.randn(5, 8),
+            do_finalize=True,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=None,
+            use_dp_padding=None,
+            input_ids=None,
+        )
 
 
 @pytest.mark.cpu_only
@@ -3326,29 +3995,32 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     decode = megamoe_op.enumerate_megamoe_candidate_tactics(1024, sm_version=sm_version)
     prefill = megamoe_op.enumerate_megamoe_candidate_tactics(16384, sm_version=sm_version)
     assert (len(decode), len(prefill)) == (decode_count, prefill_count)
-    assert all(len(t) == 10 for t in decode + prefill)
-    assert {t[-1] for t in decode} == {(1, 1)}
-    assert {t[-1] for t in prefill} == {(2, 4)}
+    assert all(len(t) == 11 for t in decode + prefill)
+    assert {t[-2] for t in decode} == {(1, 1)}
+    assert {t[-2] for t in prefill} == {(2, 4)}
+    assert {t[-1] for t in decode + prefill} == {"expert"}
     for tactic in decode + prefill:
         megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
-    for num_tokens in (64, 4096, 16384):
-        megamoe_op.validate_megamoe_tactic(
-            megamoe_op.default_megamoe_tactic(num_tokens), sm_version=sm_version
-        )
+    default_tactics = [
+        megamoe_op.default_megamoe_tactic(num_tokens) for num_tokens in (64, 4096, 16384)
+    ]
+    assert all(len(tactic) == 11 for tactic in default_tactics)
+    assert {tactic[-1] for tactic in default_tactics} == {"expert"}
+    for tactic in default_tactics:
+        megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
     if sm_version == 107:
         for bucket, tactic in megamoe_op._SM107_GENPHASE_TACTICS.items():
             megamoe_op.validate_megamoe_tactic(tactic, sm_version=sm_version)
-            assert (
-                megamoe_op._default_megamoe_tactic_for_problem(
-                    sm_version=sm_version,
-                    max_tokens_per_rank=bucket,
-                    num_tokens=bucket,
-                    apply_topk_in_fc1=False,
-                    in_kernel_fc2_reduce=False,
-                    combine_format="bf16",
-                )
-                == tactic
+            selected = megamoe_op._default_megamoe_tactic_for_problem(
+                sm_version=sm_version,
+                max_tokens_per_rank=bucket,
+                num_tokens=bucket,
+                apply_topk_in_fc1=False,
+                in_kernel_fc2_reduce=False,
+                combine_format="bf16",
             )
+            assert len(selected) == 11
+            assert selected == megamoe_op._unpack_tactic(tactic)
     invalid_tactic = list(megamoe_op.default_megamoe_tactic(64))
     invalid_tactic[3] = ("grouped", 0)
     with pytest.raises(ValueError, match=r"schedule_policy hint must be a positive int or None"):
@@ -3356,6 +4028,9 @@ def test_enumerate_megamoe_candidate_tactics_curated_space(
     legacy = ([256, 128, 256], [2, 1, 1], 512, "static", "epi_warps", True, 1, (1, 1))
     megamoe_op.validate_megamoe_tactic(legacy, sm_version=sm_version)
     assert megamoe_op._unpack_tactic(legacy) == megamoe_op.default_megamoe_tactic(64)
+    v4 = megamoe_op.default_megamoe_tactic(64)[:-1]
+    megamoe_op.validate_megamoe_tactic(v4, sm_version=sm_version)
+    assert megamoe_op._unpack_tactic(v4) == megamoe_op.default_megamoe_tactic(64)
 
 
 @pytest.mark.gpu
@@ -3816,8 +4491,9 @@ def run_backend_moe(
     - MegaMoE backends: token_selected_experts=int64, output_dtype
 
     Args:
-        trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing.
-            If False, uses token_selected_experts and token_final_scales.
+        trtllm_use_router_logits: If True, TRTLLM backend uses router_logits for routing,
+            unless the backend routes outside its kernel. Otherwise it uses
+            token_selected_experts and token_final_scales.
             Note: When both are provided, TRTLLM only uses (topk_ids and topk_weights).
     """
     # Common args for all backends (default: token_final_scales=float32)
@@ -3834,7 +4510,9 @@ def run_backend_moe(
         args["output_dtype"] = dtype
     elif backend_type == MoeBackendType.TRTLLM:
         args["token_final_scales"] = token_final_scales.to(torch.bfloat16)
-        if trtllm_use_router_logits:
+        # A leaf whose kernel cannot route (e.g. FlashInfer BF16) takes top-k
+        # from the host, as the scheduler supplies it in production.
+        if trtllm_use_router_logits and not backend._routes_outside_the_kernel():
             # Use router_logits for routing (TRTLLM will compute topk internally)
             args["router_logits"] = router_logits
             args["token_selected_experts"] = None
@@ -4597,9 +5275,9 @@ def test_moe_backend(
 # =====================================================================
 # BF16 (unquantized) TRTLLM-Gen MoE: DeepSeekV3 / Renormalize routing
 # =====================================================================
-# The main test_moe_backend skips TRTLLM + quant_algo=None, so cover the BF16
-# FlashInfer path here (Nemotron-H enablement): DeepSeekV3/Renormalize routing
-# x Relu2/Swiglu, via both fused and separated routing.
+# Covers the BF16 FlashInfer path beyond the Renormalize/SwiGLU cases of the
+# main test_moe_backend matrix (Nemotron-H enablement): DeepSeekV3/Renormalize
+# routing x Relu2/Swiglu, via both fused and separated routing.
 
 # DeepSeekV3 trtllm-gen routing requires num_experts >= 22, multiple of 4.
 _BF16_UNQUANT_NUM_EXPERTS = 72
@@ -5633,6 +6311,166 @@ def test_b12x_reaches_the_cutlass_op_only_for_an_nvfp4_prefill_chunk(
     assert len(calls) == int(reaches_cutlass)
     assert leaf._run_b12x_decode.called is not reaches_cutlass
     assert out.shape == (num_tokens, 8)
+
+
+# =====================================================================
+# Multi-chunk forwards: a backend whose run_moe reuses its buffers
+# across calls.
+# =====================================================================
+
+_MAIN_STREAM = "main"
+_AUX_STREAM = "aux"
+
+
+def _record_streams(monkeypatch) -> list:
+    """Replace ``torch.cuda.stream`` with a CPU stand-in; the returned stack's
+    top is the stream work is being issued on."""
+    stack = [_MAIN_STREAM]
+
+    @contextmanager
+    def stream(s):
+        stack.append(s)
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    monkeypatch.setattr(torch.cuda, "stream", stream)
+    return stack
+
+
+class _OneBufferB12xWrapper:
+    """``B12xMoEWrapper`` as built with ``use_cuda_graph=True``: every call
+    writes into one preallocated buffer and returns its leading rows, so
+    consecutive calls hand back the same storage."""
+
+    def __init__(self, max_num_tokens: int, hidden_size: int, stream_stack: list) -> None:
+        self._moe_output = torch.empty((max_num_tokens, hidden_size), dtype=torch.bfloat16)
+        self._stream_stack = stream_stack
+        self.streams = []
+
+    def run(self, *, x, token_selected_experts, token_final_scales, **weights) -> torch.Tensor:
+        self.streams.append(self._stream_stack[-1])
+        out = self._moe_output[: x.shape[0]]
+        out.copy_(x * 2)  # any per-token function of the input
+        return out
+
+
+class _FreshOutputBackend:
+    """A backend whose ``run_moe`` allocates its output, as the CUTLASS op does."""
+
+    capabilities = MoEStaticCapability()
+    input_requirement = MoEInputRequirement()
+
+    def __init__(self, stream_stack: list) -> None:
+        self._stream_stack = stream_stack
+        self.streams = []
+
+    def _supports_load_balancer(self) -> bool:
+        return True
+
+    def try_fused_route_quant(self, x, router_logits):
+        return None
+
+    def quantize_input(self, x, post_quant_comm=True):
+        return x, None
+
+    def run_moe(self, ctx: MoERunContext, *, workspace=None) -> torch.Tensor:
+        self.streams.append(self._stream_stack[-1])
+        return ctx.x * 2
+
+
+def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
+    """What ``ExternalCommMoEScheduler`` reads off a single-rank layer with no
+    communication strategy and no EPLB, whose ``moe_max_num_tokens`` is below
+    the batch so it has an aux stream for chunk overlap."""
+
+    def no_op(*args, **kwargs):
+        return None
+
+    def route(router_logits, input_ids=None):
+        num_tokens = router_logits.shape[0]
+        return (
+            torch.zeros((num_tokens, 1), dtype=torch.int32),
+            torch.ones((num_tokens, 1), dtype=torch.float32),
+        )
+
+    return SimpleNamespace(
+        backend=backend,
+        comm=None,
+        use_dp=False,
+        enable_alltoall=False,
+        parallel_size=1,
+        reduce_results=False,
+        apply_router_weight_on_input=False,
+        layer_idx=0,
+        num_slots=4,
+        repeat_idx=0,
+        repeat_count=1,
+        layer_load_balancer=None,
+        aux_stream=_AUX_STREAM,
+        event_dict=collections.defaultdict(Mock),
+        routing_method=SimpleNamespace(
+            experts_per_token=1, requires_separated_routing=True, apply=route
+        ),
+        calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
+        split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
+        determine_communication_method=no_op,
+        _using_load_balancer=lambda: False,
+        _load_balancer_start_wait_gpu_stage=no_op,
+        _load_balancer_start_set_cpu_stage=no_op,
+        _load_balancer_done_set_cpu_stage=no_op,
+        _maybe_get_perfect_router_expert_ids=lambda token_selected_experts: token_selected_experts,
+    )
+
+
+def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eight tokens through the external-comm scheduler, split into two chunks
+    of four. Integer-valued, so the expected ``x * 2`` is exact in bfloat16."""
+    x = torch.arange(8 * 8, dtype=torch.bfloat16).reshape(8, 8)
+    out = ExternalCommMoEScheduler(_chunking_moe(backend, num_chunks=2)).forward(
+        x,
+        torch.zeros((8, 4)),
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+    )
+    return x, out
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
+)
+def test_b12x_multi_chunk_forward_keeps_every_chunk(leaf_cls, monkeypatch):
+    """Every b12x call returns the same storage, so a two-chunk forward has to
+    copy the first chunk out before the second overwrites it. The two calls
+    also share the wrapper's workspace, so they must not be in flight on two
+    streams at once. Chunks of four tokens stay below the NVFP4 leaf's
+    CUTLASS threshold, so both leaves run the b12x kernel."""
+    stream_stack = _record_streams(monkeypatch)
+    leaf = leaf_cls.__new__(leaf_cls)
+    leaf.fc31_act_scale = None
+    leaf.b12x_wrapper = _OneBufferB12xWrapper(4, 8, stream_stack)
+    leaf._b12x_weights = {}
+
+    x, out = _forward_in_two_chunks(leaf)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert leaf.b12x_wrapper.streams == [_MAIN_STREAM, _MAIN_STREAM]
+
+
+@pytest.mark.cpu_only
+def test_multi_chunk_forward_overlaps_chunks_of_a_backend_that_allocates_its_output(monkeypatch):
+    """The serialization is the declaration's doing: a backend that does not
+    declare ``run_moe_reuses_buffers`` keeps the aux-stream overlap."""
+    backend = _FreshOutputBackend(_record_streams(monkeypatch))
+
+    x, out = _forward_in_two_chunks(backend)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert backend.streams == [_AUX_STREAM, _MAIN_STREAM]
 
 
 @pytest.mark.cpu_only

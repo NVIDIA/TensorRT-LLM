@@ -23,6 +23,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <limits>
 #include <numeric>
 #include <string>
@@ -36,7 +38,6 @@ namespace tb = tensorrt_llm::batch_manager;
 using VecTokens = tb::LlmRequest::VecTokens;
 using SizeType32 = tb::LlmRequest::SizeType32;
 using VecTokenExtraIds = tb::LlmRequest::VecTokenExtraIds;
-using VecUniqueTokens = tb::LlmRequest::VecUniqueTokens;
 
 class LlmRequestTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
 {
@@ -52,8 +53,8 @@ TEST_F(LlmRequestTest, encoderInputLengthValidation)
     auto const makeRequest = [&inputTokens](std::optional<SizeType32> encoderInputLength)
     {
         return tb::LlmRequest(/*requestId=*/77, /*maxNewTokens=*/10, inputTokens, texec::SamplingConfig{},
-            /*isStreaming=*/false, /*promptEmbeddingTable=*/std::nullopt, /*promptVocabSize=*/std::nullopt,
-            /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt, /*multimodalLengths=*/std::nullopt,
+            /*isStreaming=*/false, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+            /*multimodalLengths=*/std::nullopt,
             /*multimodalUuids=*/std::nullopt, /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
             /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
             /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt, texec::Request::kDefaultPriority,
@@ -128,36 +129,34 @@ TEST_F(LlmRequestTest, fromExecutorRequest)
         EXPECT_FALSE(llmReq.mSeqSlot);
         // No speculative decoding config, draft tokens should be empty
         EXPECT_EQ(llmReq.getNumDraftTokens(), 0);
-        EXPECT_FALSE(llmReq.getPromptEmbeddingTable().has_value());
-        EXPECT_FALSE(llmReq.getPromptVocabSize().has_value());
     }
+}
 
-    // Prompt tuning
+TEST_F(LlmRequestTest, extraIdsWithoutPromptTuning)
+{
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{1, 2, 3});
+    auto const makeRequest = [&inputTokens](VecTokenExtraIds extraIds)
     {
-        texec::Request execReq(inputTokens, maxNewTokens);
-        SizeType32 vocabSize = 100;
-        SizeType32 hiddenSize = 64;
-        auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {vocabSize, hiddenSize});
-        VecTokenExtraIds extraIds{1, 1, 1, 0, 0};
-        texec::PromptTuningConfig config(embeddingTable, extraIds);
-        execReq.setPromptTuningConfig(config);
-        tb::LlmRequest llmReq(requestId, execReq);
+        texec::SamplingConfig samplingConfig;
+        samplingConfig.setNumReturnSequences(2);
+        return tb::LlmRequest(77, 10, inputTokens, samplingConfig, /*isStreaming=*/false,
+            /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+            /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
+            /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
+            /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+            /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt, texec::Request::kDefaultPriority,
+            /*encoderInputLength=*/std::nullopt,
+            /*encoderOutputLength=*/std::nullopt, tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
+            std::make_shared<VecTokenExtraIds>(std::move(extraIds)));
+    };
 
-        EXPECT_TRUE(llmReq.getPromptEmbeddingTable().has_value());
-        EXPECT_TRUE(llmReq.getPromptVocabSize().has_value());
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().nbDims, 3);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[0], 1);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[1], vocabSize);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getShape().d[2], hiddenSize);
-        EXPECT_EQ(llmReq.getPromptEmbeddingTable().value()->getDataType(), tensorrt_llm::DataType::kFLOAT);
-        EXPECT_EQ(llmReq.getPromptVocabSize().value(), vocabSize);
-        VecUniqueTokens uniqueTokens;
-        for (size_t i = 0; i < inputTokens.size(); ++i)
-        {
-            uniqueTokens.push_back({inputTokens[i], extraIds[i]});
-        }
-        EXPECT_EQ(llmReq.getUniqueTokens(0), uniqueTokens);
-    }
+    EXPECT_THROW(makeRequest(VecTokenExtraIds{1, 1}), tc::TllmException);
+    auto request = makeRequest(VecTokenExtraIds{1, 1, 0});
+    auto const other = makeRequest(VecTokenExtraIds{2, 2, 0});
+    EXPECT_NE(request.getUniqueTokens(0), other.getUniqueTokens(0));
+    auto const child = request.createChildRequest(78);
+    EXPECT_EQ(child->getUniqueTokens(0), request.getUniqueTokens(0));
+    EXPECT_EQ(child->getOrigPromptLen(), inputTokens->size());
 }
 
 TEST_F(LlmRequestTest, invalidExecRequest)
@@ -189,48 +188,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
             llmReq.validate(500, 1000, 0);
         };
         lambdaErrMsgs.emplace_back(lambda, "beamWidth > 0");
-    }
-
-    // Invalid ptable shape
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {17, 32, 69});
-            texec::PromptTuningConfig config(embeddingTable);
-            execReq.setPromptTuningConfig(config);
-            tb::LlmRequest llmReq(requestId, execReq);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "Expected prompt embedding table to have shape");
-    }
-
-    // Invalid extra id vector's size
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {4, 8});
-            VecTokenExtraIds extraIds(inputTokens.size() - 1, 0);
-            texec::PromptTuningConfig config(embeddingTable, extraIds);
-            execReq.setPromptTuningConfig(config);
-            tb::LlmRequest llmReq(requestId, execReq);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "must be the same as input token vector size");
-    }
-
-    // Extra ids not provided when enabling kv cache reuse with prompt table
-    {
-        auto lambda = [&inputTokens, maxNewTokens, requestId]()
-        {
-            texec::Request execReq(inputTokens, maxNewTokens);
-            auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {4, 8});
-            texec::PromptTuningConfig config(embeddingTable);
-            execReq.setPromptTuningConfig(config);
-            tb::LlmRequest llmReq(requestId, execReq);
-
-            llmReq.validate(500, 1000, 1, true);
-        };
-        lambdaErrMsgs.emplace_back(lambda, "Input token extra ids must be provided");
     }
 
     for (auto& lambdaErrMsg : lambdaErrMsgs)
@@ -265,18 +222,6 @@ TEST_F(LlmRequestTest, invalidExecRequest)
         tb::LlmRequest llmReq(requestId, execReq);
         llmReq.validate(10, 60, 2);
         EXPECT_EQ(llmReq.mMaxNewTokens, 60 - inputTokens.size() - 2);
-    }
-    {
-        // Validate extra ids when enabling kv cache reuse with prompt table
-        texec::Request execReq(inputTokens, maxNewTokens);
-        auto embeddingTable = texec::Tensor::cpu(texec::DataType::kFP32, {6, 42});
-        VecTokenExtraIds extraIds(inputTokens.size(), 1);
-        texec::PromptTuningConfig config(embeddingTable, extraIds);
-        execReq.setPromptTuningConfig(config);
-        tb::LlmRequest llmReq(requestId, execReq);
-
-        EXPECT_EQ(static_cast<size_t>(llmReq.getOrigPromptLen()), inputTokens.size());
-        llmReq.validate(500, 1000, 1, true);
     }
     {
         using AdditionalModelOutput = texec::AdditionalModelOutput;
@@ -428,6 +373,70 @@ TEST_F(LlmRequestTest, testCreateRequests)
         EXPECT_EQ(childReq1->mSamplingConfig.getSeed().value(), texec::RandomSeedType{8});
         EXPECT_EQ(llmReq2.mSamplingConfig.getSeed().value(), texec::RandomSeedType{7});
     }
+}
+
+TEST_F(LlmRequestTest, childrenOwnMutableInputsAndFreshRuntimeState)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(3);
+    texec::Request input(VecTokens{1, 2, 3}, 10, false, samplingConfig);
+    input.setEncoderInputTokenIds(VecTokens{4, 5});
+    input.setEncoderOutputLength(1);
+    tb::LlmRequest parent(77, input);
+    parent.setDraftTokens(std::make_shared<VecTokens>(VecTokens{6, 7}));
+    parent.mSeqSlot = 9;
+
+    auto const child = parent.createChildRequest(78);
+    auto const sibling = parent.createChildRequest(79);
+    EXPECT_EQ(parent.getChildRequests().at(0).get(), child.get());
+    EXPECT_EQ(parent.getChildRequests().at(1).get(), sibling.get());
+    EXPECT_TRUE(child->getChildRequests().empty());
+    EXPECT_TRUE(sibling->getChildRequests().empty());
+    EXPECT_FALSE(child->mSeqSlot.has_value());
+    EXPECT_EQ(child->getDecodingIter(), 0);
+    EXPECT_EQ(child->getContextCurrentPosition(), 0);
+    EXPECT_FALSE(child->getContextProgress());
+    EXPECT_EQ(child->tryGetEncoderOutputLen(), 1);
+    EXPECT_EQ(parent.mSamplingConfig.getSeed(), texec::RandomSeedType{0});
+    EXPECT_EQ(child->mSamplingConfig.getSeed(), texec::RandomSeedType{1});
+    EXPECT_EQ(sibling->mSamplingConfig.getSeed(), texec::RandomSeedType{2});
+
+    child->getDraftTokens()->pop_back();
+    child->getEncoderTokens().value()->push_back(8);
+    EXPECT_EQ(*parent.getDraftTokens(), (VecTokens{6, 7}));
+    EXPECT_EQ(*sibling->getDraftTokens(), (VecTokens{6, 7}));
+    EXPECT_EQ(*parent.getEncoderTokens().value(), (VecTokens{4, 5}));
+    EXPECT_EQ(*sibling->getEncoderTokens().value(), (VecTokens{4, 5}));
+}
+
+TEST_F(LlmRequestTest, rejectChildConstructionAfterExecution)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(2);
+    tb::LlmRequest parent(77, texec::Request(VecTokens{1, 2, 3}, 10, false, samplingConfig));
+    parent.addNewTokens(VecTokens{4});
+    parent.setState(tb::LlmRequestState::kGENERATION_IN_PROGRESS);
+    EXPECT_THROW(parent.createChildRequest(78), tc::TllmException);
+    EXPECT_TRUE(parent.getChildRequests().empty());
+    EXPECT_FALSE(parent.mSamplingConfig.getSeed().has_value());
+}
+
+TEST_F(LlmRequestTest, childRegistrationRejectsDuplicateIdentity)
+{
+    texec::SamplingConfig samplingConfig;
+    samplingConfig.setNumReturnSequences(3);
+    tb::LlmRequest parent(77, texec::Request(VecTokens{1, 2, 3}, 10, false, samplingConfig));
+    parent.setDraftTokens(nullptr);
+    EXPECT_THROW(parent.createChildRequest(77), tc::TllmException);
+    EXPECT_TRUE(parent.getChildRequests().empty());
+    auto const child = parent.createChildRequest(78);
+    EXPECT_EQ(child->getNumDraftTokens(), 0);
+    EXPECT_THROW(parent.createChildRequest(78), tc::TllmException);
+    EXPECT_THROW(parent.registerChildRequest(child), tc::TllmException);
+    EXPECT_THROW(child->createChildRequest(79), tc::TllmException);
+    EXPECT_EQ(parent.getChildRequests().size(), 1);
+    auto const sibling = parent.createChildRequest(79);
+    EXPECT_EQ(sibling->mSamplingConfig.getSeed(), texec::RandomSeedType{2});
 }
 
 using ParamType = std::tuple<bool, bool, bool, SizeType32, SizeType32, SizeType32>;
