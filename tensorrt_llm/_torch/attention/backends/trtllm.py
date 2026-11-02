@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from ...model_config import ModelConfig
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
+    from .fmha.gqa_decode import GqaDecodeFmha, GqaDecodeSetup
+    from .fmha.interface import Fmha
     from .sparse.dsa.metadata import TokenMajorGenView
 
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
@@ -104,6 +106,20 @@ def _resolve_uses_spcompress(sparse_params: Optional[SparseParams],
     return False
 
 
+class _ContextPlan:
+    """Host state of a context-only trtllm-gen call, shared by the layers of one forward.
+
+    TrtllmAttentionMetadata drops it whenever the lengths or the batch can change (prepare(), KV-length and
+    spec-dec updates, draft swaps); the bound tensors are also compared by identity. ``sig`` is the
+    TrtllmAttention._context_plan_sig of the layer that built it.
+    """
+
+    __slots__ = ("kv_lens", "prompt_lens", "kv_lens_cuda", "prompt_lens_cuda",
+                 "num_contexts", "num_ctx_tokens", "block_offsets", "workspace",
+                 "kv_cache_manager", "pool_pointers", "sig", "fmha_cls",
+                 "counter_rows", "total_num_blocks", "max_q_len", "max_kv_len")
+
+
 @functools.cache
 def generate_spec_decoding_position_offsets(max_num_requests: int,
                                             draft_len: int) -> torch.Tensor:
@@ -136,6 +152,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
     cuda_graph_workspace: Optional[torch.Tensor] = None
     workspace_reclaimable: bool = field(default=True, init=False)
+    # batch_block_table_key of the target / draft KV cache manager at the last
+    # block-offset copy of prepare_steady_decode_step or of a prepare() keyed
+    # by key_prepared_block_offsets; prepare() clears them.
+    _steady_block_table_keys: tuple = field(default=(None, None),
+                                            init=False,
+                                            repr=False,
+                                            compare=False)
+    # Whether the last prepare() copied the full block-offset table width.
+    _prepared_full_block_offsets: bool = field(default=False,
+                                               init=False,
+                                               repr=False,
+                                               compare=False)
 
     # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
@@ -151,6 +179,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # kv_cache_block_offsets while a mixed-precision layer runs.
     _mixed_precision_block_offsets: Optional[torch.Tensor] = field(
         init=False, default=None, repr=False, compare=False)
+    # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
+    context_plan: Optional[_ContextPlan] = field(init=False,
+                                                 default=None,
+                                                 repr=False,
+                                                 compare=False)
 
     @property
     def effective_beam_width(self) -> int:
@@ -661,6 +694,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def on_update_kv_lens(self):
         # KV lengths can change between speculative decoding sub-steps.
+        self.context_plan = None
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
@@ -669,6 +703,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             state.on_update_kv_lens(self)
 
     def update_for_spec_dec(self) -> None:
+        self.context_plan = None
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
@@ -685,6 +720,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
+        self.context_plan = None
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.restore_from_spec_dec(self)
 
@@ -807,6 +843,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Shared by ``prepare``, ``prepare_encoder_only`` and the encoder CUDA
         graph binding so the set of runtime views stays in sync across paths.
         """
+        self.context_plan = None
         self.kv_lens_cuda_runtime = kv_lens_cuda
         self.kv_lens_runtime: torch.Tensor = kv_lens
         self.prompt_lens_cuda_runtime: torch.Tensor = prompt_lens_cuda
@@ -876,6 +913,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Rebind name to draft_value, recording the original first."""
         self.record_draft_swap(name)
         setattr(self, name, draft_value)
+        self.context_plan = None
 
     def restore_draft_swaps(self) -> None:
         """Rebind every recorded attribute to its original and clear the record.
@@ -885,6 +923,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         for name, original in self.draft_replay_swapped_attrs.items():
             setattr(self, name, original)
         self.draft_replay_swapped_attrs = {}
+        self.context_plan = None
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
@@ -955,8 +994,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare(self) -> None:
         super().prepare()
+        self.context_plan = None
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
+        self._steady_block_table_keys = (None, None)
+        self._prepared_full_block_offsets = False
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
@@ -1092,6 +1134,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.num_contexts,
                     self.num_seqs,
                     max_blocks=max_blocks)
+            self._prepared_full_block_offsets = max_blocks is None
 
         # Don't pass self.kv_lens as kv_lens here because it includes extra
         # tokens. Use the actual KV length (without extra tokens) for
@@ -1208,6 +1251,80 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             kv_lens=kv_lens,
             prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
             prompt_lens_cpu=prompt_lens,
+            host_request_types=self.host_request_types[:num_seqs],
+        )
+
+    @property
+    def supports_steady_decode_step(self) -> bool:
+        """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
+        prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
+        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        return (type(self).prepare is TrtllmAttentionMetadata.prepare
+                and self.kv_cache_manager is not None
+                and not self.enable_flash_mla and not self.enable_helix
+                and not self.enable_context_mla_with_cached_kv
+                and self.fp4_mla_state is None
+                and not self._has_mixed_precision_kv()
+                and not self.kv_cache_params.use_full_generation_page_table)
+
+    def key_prepared_block_offsets(self) -> None:
+        """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips
+        its copy while they are unchanged. A no-op unless that prepare() copied the full table width."""
+        if not self._prepared_full_block_offsets:
+            return
+        keys = []
+        for manager in (self.kv_cache_manager, self.draft_kv_cache_manager):
+            keys.append(None if manager is None else manager.
+                        batch_block_table_key(self.request_ids))
+        self._steady_block_table_keys = tuple(keys)
+
+    def prepare_steady_decode_step(self, kv_lens: List[int]) -> None:
+        """prepare() of a generation-only step that runs the batch of the previous prepare() one step later.
+
+        Requires supports_steady_decode_step and the same requests, prompt lengths, request types and beam width
+        as that prepare(); kv_lens_cuda[:num_seqs] already holds the new lengths on the device. Sets the host
+        state that follows from ``kv_lens`` (KV lengths without the extra speculative tokens) and copies the
+        block offsets of a KV cache manager only when its batch_block_table_key changed. Speculative decoding
+        copies the full table width (max_blocks None), as prepare() does.
+        """
+        AttentionMetadata.prepare(self)
+        self._invalidate_mla_scheduler_buffers()
+        if get_model_extra_attrs() is None:
+            get_global_attrs().attention_metadata = weakref.ref(self)
+        num_seqs = self.num_seqs
+        assert len(kv_lens) == num_seqs and self.num_contexts == 0
+        num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens
+        host_kv_lens = torch.tensor(kv_lens, dtype=torch.int)
+        self.kv_lens[:num_seqs].copy_(host_kv_lens + num_extra_kv_tokens)
+        self.host_total_kv_lens[0] = 0
+        self.host_total_kv_lens[1] = sum(kv_lens)
+        max_kv_len = max(kv_lens) + num_extra_kv_tokens
+        assert max_kv_len <= self.kv_cache_manager.max_seq_len, (
+            f"The max KV cache length of input sequences ({max_kv_len}) "
+            f"exceeds the KV cache manager's maximum supported length "
+            f"({self.kv_cache_manager.max_seq_len}).")
+        keys = []
+        for manager, block_offsets, last_key in zip(
+            (self.kv_cache_manager, self.draft_kv_cache_manager),
+            (self.kv_cache_block_offsets, self.draft_kv_cache_block_offsets),
+                self._steady_block_table_keys):
+            key = None
+            if manager is not None:
+                key = manager.batch_block_table_key(self.request_ids)
+                if key is None or key != last_key:
+                    manager.copy_batch_block_offsets(block_offsets,
+                                                     self.request_ids,
+                                                     self.beam_width,
+                                                     self.num_contexts,
+                                                     num_seqs,
+                                                     max_blocks=None)
+            keys.append(key)
+        self._steady_block_table_keys = tuple(keys)
+        self._bind_runtime_views(
+            kv_lens_cuda=self.kv_lens_cuda[:num_seqs],
+            kv_lens=host_kv_lens,
+            prompt_lens_cuda=self.prompt_lens_cuda[:num_seqs],
+            prompt_lens_cpu=self.prompt_lens_cpu[:num_seqs],
             host_request_types=self.host_request_types[:num_seqs],
         )
 
@@ -1534,6 +1651,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 metadata only describes the gen rows, so we must source from
                 ``[num_contexts:batch_size]`` rather than ``[:batch_size]``.
         '''
+        self.context_plan = None
 
         # Blackwell trtllm-gen spec-dec is enabled only for dynamic-tree masks.
         self.is_spec_decoding_enabled = is_spec_decoding_enabled and (
@@ -1670,6 +1788,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
     Metadata = TrtllmAttentionMetadata
+    # Run context-only calls from the forward's shared TrtllmAttentionMetadata.context_plan.
+    cache_context_plan: bool = False
     # FMHA library classes this instance tries before the registry's libraries.
     prepended_fmha_lib_classes: tuple = ()
 
@@ -1714,6 +1834,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sparse_params: Optional[SparseParams] = None,
         kv_cache_dtype: str = "auto",
         skip_correction_threshold: float = 0.0,
+        gqa_decode: Optional["GqaDecodeSetup"] = None,
+        cache_context_plan: bool = False,
         **kwargs,
     ) -> None:
         """
@@ -1738,6 +1860,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 used by DeepSeek-V4 and DSA on SM120/SM121.
             skip_correction_threshold (float): Runtime MLA threshold. Zero disables
                 skip-correction.
+            gqa_decode (GqaDecodeSetup): Enables the GQA decode FMHA library
+                (fmha/gqa_decode.py) for this layer.
+            cache_context_plan (bool): Plan a context-only forward once for the
+                layers that share its metadata and run the trtllm-gen context
+                kernel from that plan (dense, non-sparse layers only).
         """
         super().__init__(layer_idx, num_heads, head_dim, num_kv_heads,
                          quant_config, **kwargs)
@@ -1810,6 +1937,20 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         self.local_layer_idx: Optional[int] = None
         self._fmha_manager: Optional[FmhaManager] = None
+        self.gqa_decode = gqa_decode
+        # A GQA decode library of this layer, which plans the module's KV append and deferred prologue (set with
+        # the FMHA manager).
+        self.gqa_decode_fmha: Optional["GqaDecodeFmha"] = None
+        self.cache_context_plan = (cache_context_plan and not self.is_mla_enable
+                                   and self.sparse_params is None
+                                   and not self.print_skip_softmax_stat)
+        # Layer part of the context plan key (set with the FMHA manager).
+        self._context_plan_layer_key: tuple = ()
+        # This layer's instance of the plan's FMHA class, the manager owning it,
+        # and the multi-CTA counter rows the instance was prepared for.
+        self._context_plan_fmha: Optional["Fmha"] = None
+        self._context_plan_fmha_owner: Optional[FmhaManager] = None
+        self._context_plan_counter_rows = 0
         if not skip_create_weights_in_init:
             self.update_quant_config(self.quant_config)
 
@@ -1838,6 +1979,21 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
         self._fmha_manager = FmhaManager(self)
+        # Every layer input of the FMHA selection and of the context workspace size.
+        self._context_plan_layer_key = ()
+        if self.cache_context_plan:
+            self._context_plan_layer_key = (tuple(
+                type(fmha)
+                for fmha in self._fmha_manager.fmha_libs), self.num_heads,
+                                            self.num_kv_heads, self.head_dim,
+                                            self.rope_dim, self.quant_mode,
+                                            self.position_embedding_type,
+                                            self.attention_chunk_size,
+                                            self.q_scaling, self.kv_cache_dtype)
+        from .fmha.gqa_decode import GqaDecodeFmha
+        self.gqa_decode_fmha = next((fmha
+                                     for fmha in self._fmha_manager.fmha_libs
+                                     if isinstance(fmha, GqaDecodeFmha)), None)
 
     @classmethod
     def runtime_workspace_bytes_per_token(cls, model_config: "ModelConfig",
@@ -2269,6 +2425,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Execute the TRTLLM attention backend."""
         forward_args = merge_attention_forward_args(forward_args, kwargs)
+        if self.cache_context_plan and self._run_context_plan(
+                q, k, v, metadata, forward_args):
+            return forward_args.output
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -2613,6 +2772,190 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return forward_args.output
         else:
             return forward_args.output, forward_args.output_sf
+
+    def _context_plan_sig(self, q: torch.Tensor, fwd: AttentionForwardArgs,
+                          metadata: TrtllmAttentionMetadata) -> tuple:
+        """Key of a context plan besides the forward state that the metadata invalidates.
+
+        With the layer's KV-pool bound (checked in _run_context_plan) it holds
+        every input of the FMHA selection and of the context workspace size
+        that _is_plain_context_call leaves variable.
+        """
+        return (self._context_plan_layer_key, q.dtype, fwd.output.dtype,
+                fwd.attention_input_type, fwd.attention_window_size,
+                fwd.attention_sinks is None, fwd.out_scale
+                is None, metadata.use_paged_context_fmha)
+
+    def _is_plain_context_call(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                               v: Optional[torch.Tensor],
+                               metadata: TrtllmAttentionMetadata,
+                               fwd: AttentionForwardArgs) -> bool:
+        """Whether a call is a fused-QKV context-only call without an optional input that a plan does not cover."""
+        return (k is None and v is None and fwd.output is not None
+                and fwd.output_sf is None and fwd.out_scale_sf is None and
+                fwd.attention_input_type != AttentionInputType.generation_only
+                and fwd.attention_mask == PredefinedAttentionMask.CAUSAL
+                and fwd.attention_mask_data is None
+                and fwd.relative_attention_bias is None and fwd.cross_kv is None
+                and fwd.latent_cache is None and fwd.q_pe is None
+                and fwd.mrope_rotary_cos_sin is None
+                and fwd.mrope_position_deltas is None
+                and fwd.softmax_stats_tensor is None
+                and fwd.quant_q_buffer is None and fwd.quant_scale_qkv is None
+                and not fwd.enable_dsv4_epilogue_fusion
+                and fwd.kv_norm_weight is None
+                and fwd.sage_attn_qk_dtype is None and not fwd.qk_fp8_per_tensor
+                and not fwd.v_fp8_per_tensor and fwd.kv_append is None
+                and fwd.sparse_backend_args is None
+                and not fwd.skip_mla_rope_generation
+                and metadata.num_generations == 0 and metadata.num_contexts > 0
+                and not metadata.is_cross
+                and q.shape[0] == metadata.num_ctx_tokens and q.size(-1)
+                == (self.num_heads + 2 * self.num_kv_heads) * self.head_dim)
+
+    def _context_plan_matches(self, plan: Optional[_ContextPlan], sig: tuple,
+                              metadata: TrtllmAttentionMetadata) -> bool:
+        return (plan is not None and plan.sig == sig
+                and plan.kv_lens is metadata.kv_lens_runtime
+                and plan.prompt_lens is metadata.prompt_lens_cpu_runtime
+                and plan.kv_lens_cuda is metadata.kv_lens_cuda_runtime
+                and plan.prompt_lens_cuda is metadata.prompt_lens_cuda_runtime
+                and plan.num_contexts == metadata.num_contexts
+                and plan.num_ctx_tokens == metadata.num_ctx_tokens
+                and plan.block_offsets is metadata.kv_cache_block_offsets
+                and plan.workspace is metadata.effective_workspace
+                and plan.kv_cache_manager is metadata.kv_cache_manager
+                and plan.pool_pointers is metadata.host_kv_cache_pool_pointers)
+
+    def _build_context_plan(self, q: torch.Tensor,
+                            metadata: TrtllmAttentionMetadata,
+                            fwd: AttentionForwardArgs,
+                            sig: tuple) -> _ContextPlan:
+        """Build the context plan the way forward() and PhasedFmha.forward() would, selecting for this layer.
+
+        plan.fmha_cls stays None when the plan does not cover the call.
+        """
+        plan = _ContextPlan()
+        plan.kv_lens = metadata.kv_lens_runtime
+        plan.prompt_lens = metadata.prompt_lens_cpu_runtime
+        plan.kv_lens_cuda = metadata.kv_lens_cuda_runtime
+        plan.prompt_lens_cuda = metadata.prompt_lens_cuda_runtime
+        plan.num_contexts = metadata.num_contexts
+        plan.num_ctx_tokens = metadata.num_ctx_tokens
+        plan.block_offsets = metadata.kv_cache_block_offsets
+        plan.workspace = metadata.effective_workspace
+        plan.kv_cache_manager = metadata.kv_cache_manager
+        plan.pool_pointers = metadata.host_kv_cache_pool_pointers
+        plan.sig = sig
+        plan.fmha_cls = None
+        if (metadata.kv_cache_manager is None or plan.block_offsets is None
+                or plan.workspace is None or metadata.beam_width != 1
+                or metadata.max_context_q_len_override is not None
+                or metadata.spec_decoding_bl_tree_mask is not None
+                or metadata.spec_bl_tree_first_sparse_mask_offset_kv is not None
+                or metadata.helix_position_offsets is not None
+                or metadata.enable_flash_mla):
+            return plan
+        from .fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+        fmha = self._fmha_manager.select(self, q, None, None, metadata, fwd)
+        if not isinstance(fmha, FlashInferTrtllmGenFmha):
+            return plan
+        # PhasedFmha.forward, context part (seq_offset 0, every sequence a context request)
+        n = plan.num_contexts
+        fmha.prepare_workspace(q, None, None, metadata, fwd, plan.workspace)
+        plan.counter_rows = (metadata.max_num_sequences
+                             or metadata.max_num_requests)
+        plan.total_num_blocks = fmha._get_total_num_blocks(metadata)
+        plan.max_q_len = int(plan.prompt_lens[0:n].max())
+        plan.max_kv_len = int(plan.kv_lens[0:n].max())
+        plan.fmha_cls = type(fmha)
+        self._context_plan_fmha = fmha
+        self._context_plan_fmha_owner = self._fmha_manager
+        self._context_plan_counter_rows = plan.counter_rows
+        return plan
+
+    def _context_plan_fmha_for(self, plan: _ContextPlan) -> Optional["Fmha"]:
+        """This layer's library instance of plan.fmha_cls, prepared for the plan's counter rows."""
+        fmha = self._context_plan_fmha
+        if (type(fmha) is not plan.fmha_cls
+                or self._context_plan_fmha_owner is not self._fmha_manager):
+            fmha = next((f for f in self._fmha_manager.fmha_libs
+                         if type(f) is plan.fmha_cls), None)
+            if fmha is None:
+                return None
+            self._context_plan_fmha = fmha
+            self._context_plan_fmha_owner = self._fmha_manager
+            self._context_plan_counter_rows = 0
+        return fmha
+
+    def _run_context_plan(self, q: torch.Tensor, k: Optional[torch.Tensor],
+                          v: Optional[torch.Tensor],
+                          metadata: TrtllmAttentionMetadata,
+                          fwd: AttentionForwardArgs) -> bool:
+        """Run a context-only call on the forward's plan; False: take the regular path."""
+        if (not self._is_plain_context_call(q, k, v, metadata, fwd)
+                or metadata.kv_lens_runtime is None
+                or metadata.prompt_lens_cpu_runtime is None):
+            return False
+        # forward(): fused QKV input that also updates the KV cache, rope table,
+        # layer index, window and KV scale defaults
+        fwd.is_fused_qkv = True
+        fwd.update_kv_cache = True
+        if fwd.cu_q_seqlens is None:
+            fwd.cu_q_seqlens = metadata.cu_q_seqlens
+        if fwd.cu_kv_seqlens is None:
+            fwd.cu_kv_seqlens = metadata.cu_kv_seqlens
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        self.local_layer_idx = self.get_local_layer_idx(metadata)
+        if (fwd.attention_window_size is None
+                and metadata.kv_cache_manager is not None):
+            fwd.attention_window_size = (
+                metadata.kv_cache_manager.max_attention_window_vec[
+                    self.local_layer_idx])
+        if fwd.attention_window_size is None:
+            fwd.attention_window_size = metadata.max_seq_len
+        if fwd.kv_scale_orig_quant is None:
+            fwd.kv_scale_orig_quant = self.kv_scale_orig_quant
+        if fwd.kv_scale_quant_orig is None:
+            fwd.kv_scale_quant_orig = self.kv_scale_quant_orig
+
+        sig = self._context_plan_sig(q, fwd, metadata)
+        plan = metadata.context_plan
+        if not self._context_plan_matches(plan, sig, metadata):
+            plan = self._build_context_plan(q, metadata, fwd, sig)
+            metadata.context_plan = plan
+        if plan.fmha_cls is None:
+            return False
+        fmha = self._context_plan_fmha_for(plan)
+        if fmha is None:
+            return False
+        total_num_blocks = fmha._get_total_num_blocks(metadata)
+        if total_num_blocks != plan.total_num_blocks:
+            # The selection also depends on the KV-pool bound of the layer.
+            plan = self._build_context_plan(q, metadata, fwd, sig)
+            metadata.context_plan = plan
+            if plan.fmha_cls is None:
+                return False
+            fmha = self._context_plan_fmha_for(plan)
+            if fmha is None:
+                return False
+            total_num_blocks = plan.total_num_blocks
+        if self._context_plan_counter_rows != plan.counter_rows:
+            fmha.prepare_workspace(q, None, None, metadata, fwd, plan.workspace)
+            self._context_plan_counter_rows = plan.counter_rows
+        if metadata.is_cuda_graph or not fmha.supports_workspace_reclamation:
+            metadata.workspace_reclaimable = False
+        params = fmha.context_params(q, None, None, metadata, fwd,
+                                     plan.workspace, total_num_blocks,
+                                     plan.max_q_len, plan.max_kv_len)
+        try:
+            fmha.run_context(params)
+        except RuntimeError as exc:
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                fwd.attention_window_size, exc)
+            raise
+        return True
 
     @classmethod
     def support_fused_rope(cls) -> bool:
