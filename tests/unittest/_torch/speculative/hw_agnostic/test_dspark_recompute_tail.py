@@ -163,6 +163,29 @@ class TestWindowResolution:
     def test_a_speculators_drafter_has_no_window(self, tmp_path: Path) -> None:
         assert _window(tmp_path, _copy(_SPECULATORS)) is None
 
+    def test_an_mla_drafter_attends_to_its_whole_context(self, tmp_path: Path) -> None:
+        # MLADSparkForCausalLM masks only by the stored context length, so a
+        # window in its dflash_config does not narrow what it reads.
+        config = {
+            "model_type": "deepseek_v3",
+            "architectures": ["DeepseekV3ForCausalLM"],
+            "num_hidden_layers": 2,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "kv_lora_rank": 32,
+            "q_lora_rank": 32,
+            "qk_rope_head_dim": 16,
+            "qk_nope_head_dim": 16,
+            "v_head_dim": 16,
+            "vocab_size": 128,
+            "dflash_config": {"use_swa": True, "swa_window_size": 512},
+        }
+        assert dflash_context_attention_window(SimpleNamespace(**config)) == 512
+        assert _window(tmp_path, config) is None
+
     @pytest.mark.parametrize(
         "fields, expected",
         [

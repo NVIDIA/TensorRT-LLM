@@ -3643,12 +3643,18 @@ def dspark_context_attention_window(model_dir: str) -> Optional[int]:
     (``external_drafter_config_kwargs``), so a speculators-format checkpoint is
     translated (which drops its window), a MiniMax-M3 drafter's VL-shaped
     config is flattened, and HF config classes normalize their window fields
-    exactly as at runtime.
+    exactly as at runtime. An MLA-shaped drafter (``MLADSparkForCausalLM``,
+    picked the way ``_build_dspark_draft`` picks it) attends to its whole
+    context whatever its config declares, so it has no window.
     """
-    from tensorrt_llm._torch.pyexecutor.config_utils import \
-        load_pretrained_config
-    return dflash_context_attention_window(
-        load_pretrained_config(model_dir, trust_remote_code=True))
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        MINIMAX_DSPARK_DRAFT_ARCH, is_mla, load_pretrained_config)
+    config = load_pretrained_config(model_dir, trust_remote_code=True)
+    architectures = getattr(config, "architectures", None) or []
+    if not (architectures and architectures[0]
+            == MINIMAX_DSPARK_DRAFT_ARCH) and is_mla(config):
+        return None
+    return dflash_context_attention_window(config)
 
 
 def is_lilicorr_checkpoint(architectures: Optional[List[str]],
