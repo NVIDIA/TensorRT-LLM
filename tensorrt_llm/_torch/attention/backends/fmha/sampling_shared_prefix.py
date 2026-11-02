@@ -136,6 +136,7 @@ if IS_FLASHINFER_AVAILABLE:
         Fa4Prefix,
         Fa4Tail,
         FusedWorkspace,
+        fa4_prefix_splits,
         ctx_prefix_supported,
         default_prefix_splits,
         fa4_prefix_supported,
@@ -968,11 +969,15 @@ def _ctx_tables(
     chunk_tokens: int,
     num_requests: int,
     max_pages: int,
+    splits: int = 1,
 ) -> tuple:
     """Request tables of the context-kernel prefix call (``CtxPrefix``).
 
     Every group with query rows becomes one request per ``chunk_tokens`` query tokens, each
-    over the group's shared pages; the rest of the ``num_requests`` entries are empty.
+    over the group's shared pages; the rest of the ``num_requests`` entries are empty. With
+    ``splits`` > 1 the queries are replicated ``splits`` times (copy ``s`` at query offset
+    ``s * tokens``) and copy ``s`` of a request attends only the ``s``-th of ``splits``
+    near-equal runs of the group's pages (possibly empty).
     Returns ``(block_tables, seq_lens, cum_q, cum_kv)`` as int32 arrays.
     """
     qo = grouping.qo_indptr.numpy()
@@ -984,24 +989,34 @@ def _ctx_tables(
     cum_q = np.zeros((num_requests + 1,), dtype=np.int32)
     cum_kv = np.zeros((num_requests + 1,), dtype=np.int32)
     request = 0
-    for group in range(grouping.num_groups):
-        q0, q1 = int(qo[group]), int(qo[group + 1])
-        if q1 == q0:
-            continue
-        first, stop = int(pages_ptr[group]), int(pages_ptr[group + 1])
-        count = stop - first
-        kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
-        for start in range(q0, q1, chunk_tokens):
-            if request >= num_requests:
-                raise RuntimeError(
-                    f"{LIB_NAME}: the step needs more context-kernel requests than the "
-                    f"{num_requests} its CUDA graph buffers hold."
-                )
-            block_tables[request, :count] = pages[first:stop]
-            seq_lens[request] = kv_len
-            cum_q[request + 1] = min(start + chunk_tokens, q1)
-            cum_kv[request + 1] = cum_kv[request] + kv_len
-            request += 1
+    tokens = int(qo[grouping.num_groups])
+    for split in range(splits):
+        for group in range(grouping.num_groups):
+            q0, q1 = int(qo[group]), int(qo[group + 1])
+            if q1 == q0:
+                continue
+            first, stop = int(pages_ptr[group]), int(pages_ptr[group + 1])
+            count = stop - first
+            kv_len = (count - 1) * tokens_per_block + int(last[group]) if count else 0
+            if splits > 1:
+                per = -(-count // splits)
+                lo = min(split * per, count)
+                hi = min(lo + per, count)
+                first, stop = first + lo, first + hi
+                # Only the group's last page may be partly filled.
+                kv_len = max(min(kv_len - lo * tokens_per_block, (hi - lo) * tokens_per_block), 0)
+                count = hi - lo
+            for start in range(q0, q1, chunk_tokens):
+                if request >= num_requests:
+                    raise RuntimeError(
+                        f"{LIB_NAME}: the step needs more context-kernel requests than the "
+                        f"{num_requests} its CUDA graph buffers hold."
+                    )
+                block_tables[request, :count] = pages[first:stop]
+                seq_lens[request] = kv_len
+                cum_q[request + 1] = split * tokens + min(start + chunk_tokens, q1)
+                cum_kv[request + 1] = cum_kv[request] + kv_len
+                request += 1
     cum_q[request + 1 :] = cum_q[request]
     cum_kv[request + 1 :] = cum_kv[request]
     return block_tables, seq_lens, cum_q, cum_kv
@@ -1213,6 +1228,7 @@ class _GraphBuffers:
             ctx.chunk_tokens,
             ctx.num_requests,
             ctx.block_tables.shape[1],
+            splits=getattr(ctx, "splits", 1),
         )
         for staging, device, host in zip(self.ctx_staging, ctx.table_arrays(), tables):
             staging.numpy()[...] = host
@@ -1632,23 +1648,65 @@ def _maybe_enable_ctx_prefix(
     tokens_per_block = int(metadata.tokens_per_block)
     max_kv_len = int(metadata.max_seq_len or max_pages * tokens_per_block)
     fa4 = _fa4_prefix_active(head_dim, q_len)
-    prefix_cls = Fa4Prefix if fa4 else CtxPrefix
     if fa4 and os.environ.get(TAIL_KERNEL_ENV, "auto").strip().lower() != "triton":
-        graph.fa4_tail = Fa4Tail(rows, q_len, num_heads, head_dim, max_pages, torch.bfloat16, device)
-    graph.enable_ctx(
-        prefix_cls(
+        from .flash_attn4_generation import generation_splits
+
+        graph.fa4_tail = Fa4Tail(
+            rows,
+            q_len,
+            num_heads,
+            head_dim,
+            max_pages,
+            torch.bfloat16,
+            device,
+            splits=generation_splits(
+                rows,
+                num_heads,
+                num_kv_heads,
+                q_len,
+                torch.cuda.get_device_properties(device).multi_processor_count,
+            ),
+        )
+    if fa4:
+        # Split prefix states are merged by the FA4-tail merge only.
+        splits = (
+            fa4_prefix_splits(
+                rows,
+                q_len,
+                num_heads,
+                num_kv_heads,
+                torch.cuda.get_device_properties(device).multi_processor_count,
+            )
+            if graph.fa4_tail is not None
+            else 1
+        )
+        ctx = Fa4Prefix(
             tokens,
             num_heads,
             head_dim,
             q_len,
-            prefix_cls.num_requests_for(graph.num_groups, tokens, q_len),
+            Fa4Prefix.num_requests_for(graph.num_groups, tokens, q_len) * splits,
+            max_pages,
+            max_kv_len,
+            torch.bfloat16,
+            device,
+            tokens_per_block,
+            splits=splits,
+        )
+    else:
+        ctx = CtxPrefix(
+            tokens,
+            num_heads,
+            head_dim,
+            q_len,
+            CtxPrefix.num_requests_for(graph.num_groups, tokens, q_len),
             max_pages,
             max_kv_len,
             torch.bfloat16,
             device,
             tokens_per_block,
         )
-    )
+    graph.enable_ctx(ctx)
 
 
 def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
@@ -2522,7 +2580,38 @@ class SamplingSharedPrefixFmha(PhasedFmha):
 
         q_size = num_heads * head_dim
         kv_size = num_kv_heads * head_dim
-        if PositionEmbeddingType(attn.position_embedding_type).is_rope():
+        fa4_tail = None
+        if fused:
+            ctx = graph.ctx
+            fa4_tail = graph.fa4_tail
+            if ctx is not None and (
+                qkv.dtype != ctx.q.dtype
+                or (getattr(ctx, "tokens", ctx.q.shape[0]), *ctx.q.shape[1:])
+                != (rows, num_heads, head_dim)
+            ):
+                ctx = None
+            if ctx is None or fa4_tail is None or fa4_tail.out.dtype != qkv.dtype:
+                fa4_tail = None
+        rope = PositionEmbeddingType(attn.position_embedding_type).is_rope()
+        if rope and fa4_tail is not None:
+            # RoPE and the step's K/V into the rows' private pages in one launch (the K
+            # columns of qkv stay unrotated; only the pool is read for K from here on).
+            from .flash_attn4_generation import rope_write_kv_paged
+
+            rope_write_kv_paged(
+                qkv,
+                attn.rotary_cos_sin,
+                pool,
+                fa4_tail.table,
+                metadata.kv_lens_cuda_runtime[: plan.num_rows],
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                rotary_dim=_rotary_dim(attn),
+                q_len=q_len,
+                page_lens=fa4_tail.tail_lens,
+            )
+        elif rope:
             rope_qkv_inplace(
                 qkv,
                 attn.rotary_cos_sin,
@@ -2543,14 +2632,6 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         if fused:
             assert graph is not None
             group_rows = min(FUSED_GROUP_ROWS, plan.num_rows)
-            ctx = graph.ctx
-            fa4_tail = graph.fa4_tail
-            if ctx is not None and (
-                qkv.dtype != ctx.q.dtype or tuple(ctx.q.shape) != (rows, num_heads, head_dim)
-            ):
-                ctx = None
-            if ctx is None or fa4_tail is None or fa4_tail.out.dtype != qkv.dtype:
-                fa4_tail = None
             if ctx is not None:
                 prefix_splits = 0
                 tail_kwargs = dict(
@@ -2563,6 +2644,7 @@ class SamplingSharedPrefixFmha(PhasedFmha):
                     tail_num_warps=CTX_TAIL_WARPS,
                     ctx=ctx,
                     fa4_tail=fa4_tail,
+                    fa4_tail_kv_written=rope and fa4_tail is not None,
                 )
             else:
                 prefix_splits = FUSED_PREFIX_SPLITS or default_prefix_splits(
