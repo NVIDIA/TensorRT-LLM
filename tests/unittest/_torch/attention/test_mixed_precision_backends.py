@@ -1001,16 +1001,15 @@ def test_store_mixed_precision_high_generation_rows_rotates_k_pe():
 
     store_mixed_precision_high_generation_rows(owner, meta, rows, position_ids)
 
-    expected = torch.zeros(2 * tokens_per_block, width, dtype=torch.bfloat16, device="cuda")
-    for token, pos in enumerate(gen_positions):
-        row = rows[token].clone()
-        even, odd = row[nope::2].float(), row[nope + 1 :: 2].float()
-        cos, sin = cos_sin[pos, : rope_dim // 2, 0], cos_sin[pos, : rope_dim // 2, 1]
-        row[nope::2] = (even * cos - odd * sin).to(torch.bfloat16)
-        row[nope + 1 :: 2] = (odd * cos + even * sin).to(torch.bfloat16)
-        page = int(table[0, pos // tokens_per_block])
-        expected[page * tokens_per_block + pos % tokens_per_block] = row
-    assert torch.equal(pool.view(-1, width), expected)
+    # Each row lands in its position's slot only: the latent part as is, the rope part rotated.
+    stored = pool.view(-1, width)
+    slots = [
+        int(table[0, pos // tokens_per_block]) * tokens_per_block + pos % tokens_per_block
+        for pos in gen_positions
+    ]
+    assert torch.equal(stored[slots, :nope], rows[:, :nope])
+    assert not torch.equal(stored[slots, nope:], rows[:, nope:])
+    assert not stored[[slot for slot in range(len(stored)) if slot not in slots]].any()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -1098,6 +1097,13 @@ def test_mixed_precision_high_dtype_must_match_model_dtype():
         validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_float16")
     validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_bfloat16")
     assert sparse.quant_config.kv_cache_quant_algo == "NVFP4"
+    # SM107 has no NVFP4 sparse MLA: mixed KV fails instead of silently falling back to FP8.
+    with (
+        patch(f"{validate_and_set_kv_cache_quant.__module__}.get_sm_version", return_value=107),
+        patch("torch.cuda.is_available", return_value=True),
+        pytest.raises(ValueError, match="SM107"),
+    ):
+        validate_and_set_kv_cache_quant(sparse, "mixed_nvfp4_bfloat16")
 
 
 @pytest.mark.cpu_only
@@ -1326,6 +1332,70 @@ def _small_metadata(backend, manager, mapping: Mapping, block: int, cached: int,
         mapping=mapping,
         runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
     )
+
+
+def test_draft_staging_follows_corrected_kv_lens_in_cuda_graph():
+    """Inside a CUDA graph, each draft forward's staging copy follows the corrected KV lengths."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager, draft = (_small_manager(block, mapping) for _ in range(2))
+    try:
+        for kv_cache in (manager, draft):
+            kv_cache.add_dummy_requests([0], [cached + block], is_gen=False)
+        # A separate MTP draft manager holds the same tokens; graph metadata is a one-token decode.
+        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached, draft=draft)
+        metadata = metadata.create_cuda_graph_metadata(1, buffers=Buffers())
+        metadata.prepare()
+        offsets = torch.zeros(1, dtype=torch.int32, device="cuda")
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            # Overlap speculation corrects the KV lengths on the device, then a draft forward runs.
+            metadata.kv_lens_cuda[:1] += offsets
+            metadata.on_update_kv_lens()
+            metadata.prepare_for_draft_forward()
+            metadata.restore_draft_swaps()
+        for offset in (-1, -3):
+            # Each step, prepare() writes uncorrected lengths; the replay must correct both copies.
+            metadata.prepare()
+            offsets.fill_(offset)
+            graph.replay()
+            corrected = [[cached + offset], [cached + 1 + offset]]
+            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
+            assert metadata.draft_mixed_precision_staging.lengths.tolist() == corrected
+    finally:
+        manager.shutdown()
+        draft.shutdown()
+
+
+@pytest.mark.parametrize(
+    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
+)
+def test_staging_covers_allocated_capacity(backend):
+    """Staging covers the allocated KV capacity, where MTP draft tokens go past the batch."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 128
+    # Three MTP draft tokens past the batch's 256 tokens start a new staging page:
+    # TRTLLM staging pages hold 32 tokens and FlashInfer staging pages 128.
+    capacity = cached + block + 3
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping)
+    try:
+        manager.add_dummy_requests([0], [cached + block], is_gen=False)
+        assert manager.kv_cache_map[0].resize(capacity)
+        metadata = _small_metadata(backend, manager, mapping, block, cached)
+        metadata.prepare()
+        view = metadata.mixed_precision_staging
+        pages = -(-capacity // view.tokens_per_block)
+        assert view.page_counts == [pages]
+        assert view.read_capacity >= capacity
+        if backend is TrtllmAttention:
+            # Every staging page up to the capacity has key and value block offsets.
+            assert -1 not in view.block_offsets[0, 0, :, :pages].flatten().tolist()
+    finally:
+        manager.shutdown()
 
 
 @pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16"])

@@ -221,6 +221,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             and not supports_fp4_mla_attention(model_config)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
+        if pyt_kv_cache_dtype.startswith("mixed_"):
+            raise ValueError(
+                f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
+                "in NVFP4, which sparse MLA does not support on SM107.")
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
