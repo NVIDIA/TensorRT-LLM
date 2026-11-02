@@ -14,13 +14,9 @@
 # limitations under the License.
 """Block verification for one-model speculative decoding.
 
-Token-level rejection sampling (Leviathan et al., 2023) tests the drafts one at
-a time: draft ``j`` survives with probability ``min(1, p_j(x_j) / q_j(x_j))``
-and the first failure resamples from ``max(p_j - q_j, 0)``. Block verification
-(Sun et al., 2024, https://arxiv.org/abs/2403.10444) judges the drafted block
-jointly, so a draft the drafter over-proposed can still be kept when the drafts
-after it make up for it. It is lossless like the token-level rule, identical to
-it for a single draft, and accepts at least as many tokens in expectation.
+Block verification (Sun et al., 2024, https://arxiv.org/abs/2403.10444) judges
+the drafted block jointly. It is lossless, equals token-level rejection sampling
+for one draft, and accepts at least as many tokens in expectation.
 
 With 0-based draft positions ``j = 0..K-1``, drafts ``x_j ~ q_j``, target rows
 ``p_j`` (``p_K`` is the bonus row) and i.i.d. uniforms ``u_j``:
@@ -72,13 +68,8 @@ def _mix_u32(values: torch.Tensor) -> torch.Tensor:
 
 
 def counter_uniforms(seed: torch.Tensor, offset: torch.Tensor, num_draws: int) -> torch.Tensor:
-    """Counter-based uniforms in the open interval (0, 1).
-
-    Draw ``d`` of row ``r`` is a hash of ``(seed[r], offset[r], d)``: the same
-    key gives the same value on every rank and in every replay of a captured
-    graph, and a key never seen before gives a fresh, independent value. That
-    makes it the uniform source for the per-request ``(seed, offset)`` streams
-    the one-model samplers already carry.
+    """Counter-based uniforms in (0, 1): draw ``d`` of row ``r`` hashes
+    ``(seed[r], offset[r], d)``, so it is identical on every rank and replay.
 
     Args:
         seed: ``[rows]`` integer seeds.
@@ -99,14 +90,8 @@ def counter_uniforms(seed: torch.Tensor, offset: torch.Tensor, num_draws: int) -
 
 
 def sample_from_weights(weights: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
-    """Inverse-CDF draw from each row's nonnegative, unnormalized weights.
-
-    Args:
-        weights: ``[rows, vocab]``.
-        uniforms: ``[rows]`` values in (0, 1).
-    Returns:
-        ``[rows]`` int64 indices. A row whose weights sum to zero gets an index
-        of no meaning; callers must not pass one.
+    """Inverse-CDF draw from each ``[rows, vocab]`` row of nonnegative weights
+    with ``[rows]`` uniforms; returns int64 indices (meaningless for an all-zero row).
     """
     cdf = weights.to(torch.float64).cumsum(-1)
     threshold = uniforms.to(torch.float64).unsqueeze(-1) * cdf[:, -1:]

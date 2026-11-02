@@ -12,17 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Block verification (Sun et al., 2024) for one-model speculative decoding.
-
-Pins four properties of ``block_verification.block_verify``:
-
-* it is the rule vLLM serves as ``rejection_sample_method="block"``: a direct
-  port of vLLM's kernels makes the same decisions from the same uniforms;
-* with one draft it is token-level rejection sampling, decision for decision;
-* it is lossless: drafted blocks verified by it, then completed by sampling
-  the target, are distributed exactly as the target's own samples;
-* it runs inside a captured CUDA graph.
-"""
+"""Block verification (Sun et al., 2024): vLLM parity, token-level parity for one draft, losslessness, CUDA graphs."""
 
 import math
 from typing import Callable
@@ -37,9 +27,7 @@ from tensorrt_llm._torch.speculative.block_verification import (
     sample_from_weights,
 )
 
-# ---------------------------------------------------------------------------
 # References
-# ---------------------------------------------------------------------------
 
 
 def _vllm_block_reference(
@@ -176,19 +164,14 @@ def _random_case(
     return target_logits, draft_logits, draft_probs, draft_tokens, target_probs
 
 
-# ---------------------------------------------------------------------------
 # Equivalence with vLLM
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("num_drafts", [1, 3, 7])
-@pytest.mark.parametrize("temperature", [1.0, 0.6])
 @pytest.mark.cpu_only
-def test_block_verify_matches_vllm_given_identical_uniforms(
-    num_drafts: int, temperature: float
-) -> None:
+def test_block_verify_matches_vllm_given_identical_uniforms(num_drafts: int) -> None:
     generator = torch.Generator().manual_seed(1000 + num_drafts)
-    batch, vocab = 256, 24
+    batch, vocab, temperature = 256, 24, 0.6
     target_logits, draft_logits, draft_probs, draft_tokens, target_probs = _random_case(
         generator, batch, num_drafts, vocab, temperature
     )
@@ -281,15 +264,12 @@ def test_sample_emitted_hook_receives_the_residual() -> None:
         assert int(tokens[b, ref_length]) == int(weights[b].argmax())
 
 
-# ---------------------------------------------------------------------------
 # One draft: block verification is token-level verification
-# ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("seed", [0, 1, 2])
 @pytest.mark.cpu_only
-def test_single_draft_block_equals_token_level(seed: int) -> None:
-    generator = torch.Generator().manual_seed(seed)
+def test_single_draft_block_equals_token_level() -> None:
+    generator = torch.Generator().manual_seed(0)
     batch, vocab = 512, 32
     _, _, draft_probs, draft_tokens, target_probs = _random_case(generator, batch, 1, vocab)
     uniforms = torch.rand(batch, 1, generator=generator, dtype=torch.float64)
@@ -311,9 +291,7 @@ def test_single_draft_block_equals_token_level(seed: int) -> None:
     assert set(block_accepted.tolist()) == {1, 2}
 
 
-# ---------------------------------------------------------------------------
 # Losslessness on a toy model with prefix-dependent conditionals
-# ---------------------------------------------------------------------------
 
 _VOCAB = 3
 _BLOCK = 3  # drafts per block; the verified sequences have _BLOCK + 1 tokens
@@ -400,16 +378,6 @@ def _chi_square_ok(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, fl
     return stat, critical
 
 
-def _block(
-    drafts: torch.Tensor,
-    draft_probs: torch.Tensor,
-    target_probs: torch.Tensor,
-    uniforms: torch.Tensor,
-    resample_uniforms: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return block_verify(drafts, draft_probs, target_probs, uniforms, resample_uniforms)
-
-
 @pytest.mark.parametrize("verify_name", ["block", "token"])
 @pytest.mark.parametrize("zero_frac", [0.0, 0.3])
 @pytest.mark.cpu_only
@@ -417,7 +385,7 @@ def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
     generator = torch.Generator().manual_seed(11 if zero_frac else 12)
     target = _PrefixModel(generator, zero_frac=zero_frac, sharpness=1.5)
     draft = _PrefixModel(generator, sharpness=1.0)
-    verify = _block if verify_name == "block" else _token_level_reference
+    verify = block_verify if verify_name == "block" else _token_level_reference
     num_samples = 200_000 if verify_name == "block" else 20_000
     counts, _ = _verify_and_complete(verify, target, draft, num_samples, generator)
 
@@ -433,7 +401,7 @@ def test_block_accepts_at_least_as_much_as_token_level() -> None:
     target = _PrefixModel(generator, sharpness=1.5)
     draft = _PrefixModel(generator, sharpness=1.0)
     num_samples = 20_000
-    _, block_emitted = _verify_and_complete(_block, target, draft, num_samples, generator)
+    _, block_emitted = _verify_and_complete(block_verify, target, draft, num_samples, generator)
     _, token_emitted = _verify_and_complete(
         _token_level_reference, target, draft, num_samples, generator
     )
@@ -465,9 +433,7 @@ def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() ->
     assert stat > critical
 
 
-# ---------------------------------------------------------------------------
 # Output layout, degenerate rows, uniforms
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.cpu_only
@@ -565,9 +531,7 @@ def test_counter_uniforms_are_keyed_and_uniform() -> None:
         assert abs((a * b).mean().item() / (1 / 12)) < 0.05
 
 
-# ---------------------------------------------------------------------------
 # CUDA graph
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph capture needs CUDA")

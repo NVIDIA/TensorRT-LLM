@@ -12,15 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sampled DSpark drafting and the rejection options through their production entry points.
-
-One ``DSparkWorker._forward_impl`` step on a generation batch: the step verifies the
-previous block with the configured rule, then drafts the next block. Only the drafter's
-attention plumbing is stubbed (KV buffers, attention metadata, the block forward, which
-returns fixed hidden states); target and draft sampling, verification and the Markov head
-run as in production. Config validation and metadata propagation go through
-``TorchLlmArgs`` and ``get_spec_metadata``.
-"""
+"""Sampled DSpark drafting and the rejection options through _forward_impl, get_spec_metadata and TorchLlmArgs."""
 
 import contextlib
 import types

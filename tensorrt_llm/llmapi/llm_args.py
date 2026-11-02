@@ -3631,13 +3631,9 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
 def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
     """Widest context-attention window over a DFlash/DSpark drafter's layers.
 
-    ``draft_config`` is the config object the drafter is built from. Each
-    layer's window is resolved the way ``DFlashForCausalLM`` resolves it: the
-    block-decode window of ``dflash_config.use_swa`` / ``swa_window_size``
-    first (on every layer, or only on the 'sliding_attention' layers named by
-    ``layer_types``; ``dspark_layer_window_size``), then the HF fields
-    (``get_layer_attention_window``). Returns None when any layer attends to
-    its whole context, or when no layers are declared.
+    Layers resolve as in ``DFlashForCausalLM``: the ``dflash_config`` SWA
+    window first, then the HF fields. None when any layer attends to its whole
+    context, or when no layers are declared.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import \
         get_layer_attention_window
@@ -3663,14 +3659,9 @@ def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
 def dspark_context_attention_window(model_dir: str) -> Optional[int]:
     """Widest context-attention window of a standalone DSpark drafter.
 
-    ``dflash_context_attention_window`` of the config the drafter is built
-    from: ``load_pretrained_config`` with the drafter's arguments
-    (``external_drafter_config_kwargs``), so a speculators-format checkpoint is
-    translated (which drops its window), a MiniMax-M3 drafter's VL-shaped
-    config is flattened, and HF config classes normalize their window fields
-    exactly as at runtime. An MLA-shaped drafter (``MLADSparkForCausalLM``,
-    picked the way ``_build_dspark_draft`` picks it) attends to its whole
-    context whatever its config declares, so it has no window.
+    Reads the config the drafter is built from (``load_pretrained_config`` with
+    the drafter's arguments), so checkpoint formats normalize as at runtime. An
+    MLA-shaped drafter attends to its whole context, so it has no window.
     """
     from tensorrt_llm._torch.pyexecutor.config_utils import (
         MINIMAX_DSPARK_DRAFT_ARCH, is_mla, load_pretrained_config)
@@ -3961,14 +3952,8 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     @model_validator(mode="after")
     def default_embedded_recompute_tail(self) -> "DSparkDecodingConfig":
         """Resolve ``context_recompute_tail: None`` to 0 without a drafter
-        checkpoint.
-
-        Without one the draft is the target's own mtp.* namespace (the embedded
-        DeepSeek-V4 flavour; ``TorchLlmArgs`` points ``speculative_model`` at
-        the target for it), whose worker has no recompute. Resolving it here
-        keeps a config that never goes through ``TorchLlmArgs`` validation from
-        handing the KV cache managers an unresolved None, which they treat as a
-        full re-prefill on every hit.
+        checkpoint (the embedded draft has no recompute), so a config that skips
+        ``TorchLlmArgs`` validation never hands the managers an unresolved None.
         """
         if self.context_recompute_tail is None and self.speculative_model is None:
             self.context_recompute_tail = 0
@@ -3989,17 +3974,11 @@ class DSparkDecodingConfig(DecodingBaseConfig):
     def resolve_context_recompute_tail(self) -> None:
         """Resolve ``context_recompute_tail: None`` from the drafter's window.
 
-        A windowed drafter never attends to prompt context older than its
-        attention window, and its context K/V are per-token projections of
-        target hidden states (the receptive field does not grow with drafter
-        depth), so recomputing that many prompt tokens gives a cache-hit
-        request exactly the drafter inputs it would have had without reuse. An
-        unwindowed drafter needs the whole prompt, so None resolves to -1
-        there, as for DFlash. The embedded drafter resolves to 0
-        (``DSv4DSparkWorker`` keeps its own rolling captured-context window).
-        Leaves None while a standalone drafter's ``config.json`` is not
-        readable yet (a hub repo id before download; ``resolve_from_checkpoint``
-        retries).
+        The drafter's context K/V are per-token projections of target hidden
+        states, so recomputing its attention window restores exactly its
+        inputs; an unwindowed drafter resolves to -1, the embedded one to 0.
+        Stays None until a hub drafter's ``config.json`` is downloaded
+        (``resolve_from_checkpoint`` retries).
         """
         if self.context_recompute_tail is not None:
             return
@@ -7653,12 +7632,8 @@ class TorchLlmArgs(BaseLlmArgs):
     def _validate_rejection_sampling_options(self) -> None:
         """Reject rejection-sampling options that would have no effect.
 
-        ``rejection_sample_method`` and ``draft_temperature_only`` only change
-        the rejection path, so setting them while it is off is a configuration
-        mistake. Neither is wired into the dynamic tree, whose drafts come from
-        a softmax top-k of the raw draft logits, and relaxed thinking-phase
-        acceptance replaces the rejection rule, so block verification would
-        never run under it.
+        Both options need the rejection path; neither reaches the dynamic
+        tree, and relaxed thinking-phase acceptance bypasses block verification.
         """
         spec_cfg = self.speculative_config
         method = getattr(spec_cfg, "rejection_sample_method", "standard")

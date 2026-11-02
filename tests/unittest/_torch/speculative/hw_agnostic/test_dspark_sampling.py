@@ -12,16 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Sampled DSpark drafting and the rejection path's verification rules.
-
-Under ``use_rejection_sampling`` the DSpark worker draws each block position
-from ``softmax((base_k + markov_bias(d_{k-1})) / T)`` with ``d_{k-1}`` the token
-it drew before (ancestral sampling of the Markov head), and stores exactly that
-distribution as the position's proposal. These tests pin the conditioning, the
-stored proposal, the sampling parameters, losslessness with both verification
-rules, the acceptance gain over the old greedy-chained proposal, and CUDA
-graph capture with the real sampler kernels.
-"""
+"""Ancestral DSpark draft sampling: conditioning, stored proposals, sampling parameters, losslessness, CUDA graphs."""
 
 import math
 import types
@@ -34,7 +25,6 @@ import torch
 from tensorrt_llm._torch.models.modeling_dspark import _DSparkHeadMixin
 from tensorrt_llm._torch.models.modeling_speculative import (
     dspark_markov_chain,
-    dspark_markov_chain_ancestral,
     dspark_markov_step_bias,
 )
 from tensorrt_llm._torch.speculative.block_verification import block_verify, counter_uniforms
@@ -179,9 +169,7 @@ def _expected_rows(
     return torch.softmax(logits.double() / temperature, -1).float()
 
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.cpu_only
@@ -219,54 +207,38 @@ def test_rejection_options_require_rejection_sampling(options: dict) -> None:
 
 
 @pytest.mark.parametrize(
-    "options",
-    [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
-    ids=["block", "temperature_only"],
+    "mode, option",
+    [
+        ("use_dynamic_tree", dict(rejection_sample_method="block")),
+        ("use_dynamic_tree", dict(draft_temperature_only=True)),
+        ("use_relaxed_acceptance_for_thinking", dict(rejection_sample_method="block")),
+    ],
+    ids=["tree-block", "tree-temperature_only", "relaxed-block"],
 )
 @pytest.mark.cpu_only
-def test_rejection_options_are_rejected_with_the_dynamic_tree(options: dict) -> None:
-    # The dynamic tree drafts from a softmax top-k of the raw draft logits and
-    # verifies token by token, so neither option would take effect there.
-    spec_config = types.SimpleNamespace(
-        use_rejection_sampling=True,
-        use_dynamic_tree=True,
-        rejection_sample_method="standard",
-        draft_temperature_only=False,
-    )
-    TorchLlmArgs._validate_rejection_sampling_options(
-        types.SimpleNamespace(speculative_config=spec_config)
-    )
-    for name, value in options.items():
-        setattr(spec_config, name, value)
-    with pytest.raises(ValueError, match="use_dynamic_tree=True"):
-        TorchLlmArgs._validate_rejection_sampling_options(
-            types.SimpleNamespace(speculative_config=spec_config)
-        )
-
-
-# ---------------------------------------------------------------------------
-# The ancestral chain
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.cpu_only
-def test_block_verification_is_rejected_with_relaxed_acceptance() -> None:
-    # Relaxed thinking-phase acceptance returns before the rejection rule runs.
+def test_rejection_options_are_rejected_where_they_would_not_apply(mode: str, option: dict) -> None:
+    # The dynamic tree drafts from a softmax top-k of the raw draft logits; relaxed
+    # thinking-phase acceptance returns before the rejection rule runs.
     spec_config = types.SimpleNamespace(
         use_rejection_sampling=True,
         use_dynamic_tree=False,
-        use_relaxed_acceptance_for_thinking=True,
+        use_relaxed_acceptance_for_thinking=False,
         rejection_sample_method="standard",
-        draft_temperature_only=True,
+        draft_temperature_only=False,
     )
+    setattr(spec_config, mode, True)
     TorchLlmArgs._validate_rejection_sampling_options(
         types.SimpleNamespace(speculative_config=spec_config)
     )
-    spec_config.rejection_sample_method = "block"
-    with pytest.raises(ValueError, match="use_relaxed_acceptance_for_thinking=True"):
+    for name, value in option.items():
+        setattr(spec_config, name, value)
+    with pytest.raises(ValueError, match=f"{mode}=True"):
         TorchLlmArgs._validate_rejection_sampling_options(
             types.SimpleNamespace(speculative_config=spec_config)
         )
+
+
+# The ancestral chain
 
 
 @pytest.mark.cpu_only
@@ -283,14 +255,12 @@ def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
         rows.append((step, step_logits))
         return step_logits.argmin(-1)
 
-    def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
-        return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
-
-    tokens = dspark_markov_chain_ancestral(base, anchors, step_bias, argmin_step)
+    tokens = drafter.sample_markov_chain(base, anchors, argmin_step)
     prev = anchors
     for step in range(K):
         assert rows[step][0] == step
-        torch.testing.assert_close(rows[step][1], base[:, step] + step_bias(prev, None))
+        bias = dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
+        torch.testing.assert_close(rows[step][1], base[:, step] + bias)
         prev = tokens[:, step]
     assert tokens.dtype == torch.long and tokens.shape == (B, K)
 
@@ -310,9 +280,7 @@ def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
     assert torch.equal(tokens, greedy)
 
 
-# ---------------------------------------------------------------------------
 # The worker's sampled path
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.cpu_only
@@ -393,9 +361,7 @@ def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
     torch.testing.assert_close(top_ps, torch.full((2 * (B - 1),), 0.9))
 
 
-# ---------------------------------------------------------------------------
 # End to end on a toy vocabulary: losslessness and acceptance
-# ---------------------------------------------------------------------------
 
 _TOY_VOCAB = 4
 
@@ -518,10 +484,8 @@ def test_sampled_drafts_verify_losslessly(verify: str) -> None:
 
 @pytest.mark.cpu_only
 def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> None:
-    """Target = the drafter's own Markov chain. Drawing ancestrally proposes exactly
-    the target, so every draft is accepted; the old proposal (independent draws from
-    rows biased by the argmax chain) is conditioned on tokens the block does not
-    contain and is rejected whenever a draw leaves the argmax."""
+    """Target = the drafter's Markov chain: ancestral drafts are always accepted;
+    independent draws from greedy-chained rows are not."""
     generator = torch.Generator().manual_seed(23)
     num = 20_000
     worker = _worker()
@@ -545,9 +509,8 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> No
     ancestral = accepted_lengths(drafts, meta.draft_probs[meta.batch_slot_ids])
     assert (ancestral == K).all()
 
-    # The scheme this replaces: greedy-chained rows, each sampled on its own.
-    # The worker's greedy chain is a CUDA kernel; its eager reference runs here.
-    old_meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
+    # Greedy-chained rows sampled independently (eager reference of the CUDA chain).
+    greedy_meta = _metadata(num, vocab=_TOY_VOCAB, num_slots=num + 1)
 
     def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
         return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
@@ -556,14 +519,12 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> No
     with patch.object(
         SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(_cpu_sampler(generator))
     ):
-        old_drafts = worker.sample_draft_tokens(refined, old_meta, num, num_contexts=0)
-    old = accepted_lengths(old_drafts, old_meta.draft_probs[old_meta.batch_slot_ids])
-    assert old.mean() < K - 0.2, f"old scheme accepted {old.mean():.2f} of {K}"
+        greedy_drafts = worker.sample_draft_tokens(refined, greedy_meta, num, num_contexts=0)
+    greedy = accepted_lengths(greedy_drafts, greedy_meta.draft_probs[greedy_meta.batch_slot_ids])
+    assert greedy.mean() < K - 0.2, f"greedy-chained rows accepted {greedy.mean():.2f} of {K}"
 
 
-# ---------------------------------------------------------------------------
 # CUDA graphs and the real sampler kernels
-# ---------------------------------------------------------------------------
 
 _needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 

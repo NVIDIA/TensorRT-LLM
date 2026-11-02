@@ -12,17 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A standalone DSpark drafter's context on KV-cache prefix hits (CPU only).
+"""DSpark context_recompute_tail: the target recomputes the prompt tail the drafter attends to on prefix hits."""
 
-A prefix hit skips the target forward for the reused prompt, and the drafter
-builds its context K/V from that forward. Unless its draft pool is paired with
-the target's block reuse, a cache-hit request drafts from only the uncached
-tail of its prompt. ``context_recompute_tail`` makes the target recompute the
-part of the prompt the drafter attends to; ``None`` resolves it from the
-drafter's attention window, which must be read the way the drafter reads it
-(the MiniMax-M3.1 drafter declares it only inside its VL-shaped config).
-"""
-
+import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,11 +89,6 @@ _SPECULATORS = {
 }
 
 
-def _copy(config: dict) -> dict:
-    """Deep copy of a JSON config."""
-    return json.loads(json.dumps(config))
-
-
 def _runtime_windows(config_dict: dict) -> list:
     """The block decode's per-layer window, from the config the drafter is built with."""
     flat = build_minimax_dspark_draft_config(config_dict)
@@ -126,18 +113,15 @@ def _window(tmp_path: Path, config: dict) -> Optional[int]:
 
 
 class TestWindowResolution:
-    def test_the_m31_drafter_window_is_read_from_its_nested_config(self, tmp_path: Path) -> None:
-        assert _window(tmp_path, _copy(_M31)) == 4096
+    def test_the_m31_drafter_window_is_the_one_the_runtime_applies(self, tmp_path: Path) -> None:
+        assert _window(tmp_path, copy.deepcopy(_M31)) == 4096
+        assert _runtime_windows(copy.deepcopy(_M31)) == [4096] * 5
         # The top level alone declares no window: a reader that skips the
         # flattening would mistake the drafter for an unwindowed one.
-        assert dflash_context_attention_window(SimpleNamespace(**_copy(_M31))) is None
-
-    def test_the_resolved_window_is_the_one_the_runtime_applies(self, tmp_path: Path) -> None:
-        assert _runtime_windows(_copy(_M31)) == [4096] * 5
-        assert _window(tmp_path, _copy(_M31)) == max(_runtime_windows(_copy(_M31)))
+        assert dflash_context_attention_window(SimpleNamespace(**copy.deepcopy(_M31))) is None
 
     def test_a_window_declared_only_in_text_config_is_read(self, tmp_path: Path) -> None:
-        config = _copy(_M31)
+        config = copy.deepcopy(_M31)
         for scope in (config, config["dflash_config"]):
             scope.pop("sliding_window", None)
         config["text_config"]["sliding_window"] = 2048
@@ -146,7 +130,7 @@ class TestWindowResolution:
         assert _runtime_windows(config) == [2048] * 5
 
     def test_a_full_attention_layer_needs_the_whole_prompt(self, tmp_path: Path) -> None:
-        config = _copy(_M31)
+        config = copy.deepcopy(_M31)
         types = [SLIDING] * 4 + [FULL]
         config["dflash_config"]["layer_types"] = types
         config["text_config"]["layer_types"] = types
@@ -155,13 +139,13 @@ class TestWindowResolution:
         assert _runtime_windows(config)[-1] is None
 
     def test_a_disabled_window_needs_the_whole_prompt(self, tmp_path: Path) -> None:
-        config = _copy(_M31)
+        config = copy.deepcopy(_M31)
         config["text_config"]["use_sliding_window"] = False
         assert _window(tmp_path, config) is None
         assert _runtime_windows(config) == [None] * 5
 
     def test_a_speculators_drafter_has_no_window(self, tmp_path: Path) -> None:
-        assert _window(tmp_path, _copy(_SPECULATORS)) is None
+        assert _window(tmp_path, copy.deepcopy(_SPECULATORS)) is None
 
     def test_an_mla_drafter_attends_to_its_whole_context(self, tmp_path: Path) -> None:
         # MLADSparkForCausalLM masks only by the stored context length, so a

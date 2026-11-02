@@ -1441,13 +1441,10 @@ class DFlashWorker(SpecWorkerBase):
     def _report_prefix_reuse(self, target_cache_manager: Optional[BaseResourceManager]) -> None:
         """Report how this drafter's context is served on KV-cache prefix hits.
 
-        A prefix hit skips the target forward for the reused prompt, and the
-        drafter builds its context K/V from that forward. Only a draft pool
-        paired with the target's block reuse (``_ctx_reuse_addressable``) hands
-        the reused prefix's drafter K/V back; anywhere else the target has to
-        recompute the part of the prompt the drafter attends to
-        (``context_recompute_tail``), or a cache-hit request drafts from only
-        the uncached tail of its prompt.
+        Unless the draft pool is paired with the target's block reuse, the
+        target must recompute the prompt tail the drafter attends to
+        (``context_recompute_tail``), or a cache hit drafts from only the
+        uncached tail of the prompt.
         """
         if self._ctx_reuse_addressable or not getattr(
             target_cache_manager, "enable_block_reuse", False
@@ -2156,28 +2153,12 @@ class DFlashWorker(SpecWorkerBase):
     def _samples_block_ancestrally(
         self, draft_model: nn.Module, spec_metadata: SpecMetadata
     ) -> bool:
-        """Whether this step's drafts come from :meth:`_sample_block_ancestrally`.
+        """Whether the drafter family draws its block itself (``_sample_block_ancestrally``).
 
-        Plain DFlash positions are independent given the block forward, so
-        sampling every logits row on its own is exact. Drafter families whose
-        positions condition on the previous draft override this.
+        Plain DFlash positions are independent given the block forward; families
+        whose positions condition on the previous draft override this.
         """
         return False
-
-    def _sample_block_ancestrally(
-        self,
-        draft_model: nn.Module,
-        gen_logits: torch.Tensor,
-        inputs: dict,
-        spec_metadata: SpecMetadata,
-        num_contexts: int,
-        batch_size: int,
-    ) -> tuple[torch.Tensor, int]:
-        """Draw the block position by position; returns int32 tokens and the vocab width.
-
-        Only called when :meth:`_samples_block_ancestrally` holds.
-        """
-        raise NotImplementedError(f"{type(self).__name__} does not sample blocks ancestrally")
 
     def _apply_dflash2_selector(
         self,

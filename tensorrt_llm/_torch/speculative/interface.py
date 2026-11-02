@@ -2630,15 +2630,9 @@ class SpecWorkerBase(nn.Module, ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per-row ``(temperatures, top_ks, top_ps, min_ps)`` for drawing drafts.
 
-        The request's own parameters, or -- with ``draft_temperature_only`` --
-        its temperature alone, every filter at its disable value (vLLM's
-        probabilistic drafting). Either way the sampler returns the distribution
-        it drew from, which is what verification divides by, so both are
-        lossless; they differ in acceptance rate.
-
-        ``start`` / ``end`` select the request subset (e.g. the gen slice);
-        ``repeat`` expands each request to the rows a block sampler flattens it
-        into.
+        The request's parameters, or with ``draft_temperature_only`` its
+        temperature alone (filters disabled). ``start`` / ``end`` select the
+        requests; ``repeat`` expands each to the rows a block sampler flattens.
         """
         temperatures = spec_metadata.request_temperatures[start:end]
         top_ks = spec_metadata.request_top_ks[start:end]
@@ -3030,15 +3024,10 @@ class SpecWorkerBase(nn.Module, ABC):
             draft_probs: torch.Tensor, target_probs: torch.Tensor,
             seed: torch.Tensor,
             offset: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Block verification of the gen subset (see ``block_verification``).
-
-        Same contract as ``rejection_sampling_one_model``: ``[num_gens, K + 1]``
-        tokens and ``[num_gens]`` accepted counts including the emitted token.
-        Both random draws are keyed by each request's acceptance-slot
-        ``(seed, offset)``, which is fresh every step, so no two steps of a
-        request reuse a draw: the ``K`` acceptance uniforms come from
-        ``counter_uniforms``, and the emitted token from the seeded sampler run
-        on the residual (temperature 1, every filter off).
+        """Block verification of the gen subset, with the contract of
+        ``rejection_sampling_one_model``. The acceptance uniforms
+        (``counter_uniforms``) and the emitted token (seeded sampler on the
+        residual) are both keyed by the request's acceptance-slot RNG state.
         """
         num_drafts = draft_tokens.shape[1]
         uniforms = counter_uniforms(seed, offset, num_drafts)

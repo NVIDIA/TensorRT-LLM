@@ -1283,14 +1283,7 @@ class DSparkWorker(DFlashWorker):
     def _samples_block_ancestrally(
         self, draft_model: torch.nn.Module, spec_metadata: SpecMetadata
     ) -> bool:
-        """Sampled drafts walk the Markov head ancestrally.
-
-        The head biases position k by the token at position k-1 and is trained on
-        the true previous token. Argmax drafting keeps the greedy chain of
-        :meth:`_refine_block_logits`, which is that chain; sampled drafts must be
-        conditioned on what was actually drawn, or every position after the first
-        draw that leaves the argmax is proposed from the wrong distribution.
-        """
+        """Sampled drafts walk the Markov head ancestrally; argmax drafts keep the greedy chain."""
         return bool(
             getattr(draft_model, "has_markov_head", False)
             and spec_metadata.wants_advanced_draft_sampling
@@ -1305,18 +1298,11 @@ class DSparkWorker(DFlashWorker):
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:
-        """Draw the block through the Markov head, one position at a time.
+        """Draw each position from ``softmax((base_k + bias(d_{k-1})) / T)`` with the seeded draft
+        sampler and store that distribution as its proposal in ``draft_probs``.
 
-        Position k is drawn with the worker's seeded draft sampler from
-        ``softmax((base_k + bias(d_{k-1})) / T)``, ``d_{-1}`` being the anchor,
-        with the request's top-k / top-p / min-p unless ``draft_temperature_only``
-        is set. The distribution each position was drawn from is stored as its
-        rejection-sampling proposal in ``draft_probs``.
-
-        Args:
-            gen_logits: ``[num_gens, K, vocab]`` backbone (unbiased) block logits.
-        Returns:
-            The ``[num_gens, K]`` int32 draft tokens and the stored vocab width.
+        ``gen_logits`` are the ``[num_gens, K, vocab]`` unbiased block logits. Returns the
+        ``[num_gens, K]`` int32 draft tokens and the stored vocab width.
         """
         num_gens, num_drafts, _ = gen_logits.shape
         # The chain indexes the full Markov table, and verification reads
@@ -1369,8 +1355,7 @@ class DSparkWorker(DFlashWorker):
     ) -> torch.Tensor:
         """Add the greedy-chained Markov intra-block bias to the block logits.
 
-        This is the argmax-drafting path; sampled drafts are drawn by
-        :meth:`_sample_block_ancestrally` instead. A DSpark drafter checkpoint
+        Argmax drafting only (see :meth:`_sample_block_ancestrally`). A DSpark drafter checkpoint
         may omit the Markov head (``markov_rank`` 0), which loads as a drafter
         without one; that case falls through to the unmodified backbone logits.
         """
@@ -1391,9 +1376,7 @@ class DSparkWorker(DFlashWorker):
         logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
         is the greedy token from step i-1's biased logits. Greedy per-position
         argmax of the returned logits therefore reproduces the reference
-        chain. Sampled drafts do not come through here: they are drawn by
-        :meth:`_sample_block_ancestrally`, which conditions each position on
-        the token actually drawn before it.
+        chain.
 
         A TP vocab-sharded draft lm_head yields this rank's vocab shard of the
         logits; the chain then takes each step's global argmax over the TP

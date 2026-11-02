@@ -12,12 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A DSpark ``context_recompute_tail`` caps a real V2 manager's reuse claim.
-
-The target KV cache manager reads the tail off the spec config, so a cache-hit
-request recomputes the prompt tail a standalone DSpark drafter needs in its
-context, whether or not a draft pool is paired with the target's block reuse.
-"""
+"""A DSpark context_recompute_tail caps a real V2 manager's reuse claim, paired or not."""
 
 import gc
 from contextlib import ExitStack, contextmanager

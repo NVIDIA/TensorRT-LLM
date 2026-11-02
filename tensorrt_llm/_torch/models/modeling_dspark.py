@@ -127,7 +127,6 @@ from .modeling_speculative import (
     DSparkConfidenceHead,
     SpecDecOneEngineForCausalLM,
     build_markov_head,
-    dspark_markov_chain_ancestral,
     dspark_markov_step_bias,
 )
 from .modeling_utils import (
@@ -2702,28 +2701,25 @@ class _DSparkHeadMixin:
     ) -> torch.Tensor:
         """Draw a block ancestrally through the vanilla-Markov head.
 
-        Each position is drawn under the bias of the token drawn before it; see
-        :func:`dspark_markov_chain_ancestral`. ``base_logits`` must span the full
-        vocab. Without a Markov head the positions are drawn independently from
-        ``base_logits``.
-
-        Returns:
-            ``[B, K]`` long token ids.
+        Position k is drawn by ``sample_step(k, base_logits[:, k] + bias(prev))``,
+        ``prev`` being the token drawn at k - 1 (the anchor for k = 0); the
+        distribution ``sample_step`` draws from is that position's proposal. The
+        greedy chain (``apply_markov_chain_logits``) is the same chain only for
+        argmax draws. ``base_logits`` must span the full vocab. Returns ``[B, K]``
+        long token ids.
         """
-        markov_w1, markov_w2 = self.markov_w1, self.markov_w2
-        has_head = self.has_markov_head
-
-        def _step_bias(
-            prev_tokens: torch.Tensor, step_hidden: Optional[torch.Tensor]
-        ) -> torch.Tensor:
-            del step_hidden
-            if not has_head:
-                return torch.zeros((), dtype=base_logits.dtype, device=base_logits.device)
-            return dspark_markov_step_bias(prev_tokens, markov_w1, markov_w2)
-
-        return dspark_markov_chain_ancestral(
-            base_logits, first_prev_tokens, _step_bias, sample_step, cast_bias_to_logits=True
-        )
+        drawn = []
+        prev = first_prev_tokens.long()
+        for k in range(base_logits.shape[1]):
+            step_logits = base_logits[:, k]
+            if self.has_markov_head:
+                bias = dspark_markov_step_bias(prev, self.markov_w1, self.markov_w2)
+                step_logits = step_logits + bias.to(base_logits.dtype)
+            prev = sample_step(k, step_logits).long()
+            drawn.append(prev)
+        if not drawn:
+            return base_logits.new_empty((base_logits.shape[0], 0), dtype=torch.long)
+        return torch.stack(drawn, dim=1)
 
     def _take_dspark_head_weights(self, weights: Dict) -> tuple[Dict, Dict]:
         """Pull the head tensors out of ``weights`` and load them onto self.

@@ -5248,15 +5248,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def context_reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Reuse-claim cap that leaves ``req`` its spec recompute tail, or None.
 
-        Hidden-state drafters need a recomputed prompt tail: cap the reuse
-        CLAIM rather than rewinding the cursor afterwards. A capped claim is
-        just a shorter match, so the core materializes every page the
-        recompute needs (for SWA life cycles only sink and live-window pages
-        at the matched endpoint are onboarded; a cursor rewound below that
-        endpoint would read and write spans with no pages behind them). The
-        scheduler applies it to a claim paired with a draft pool as well. The
-        tail check runs first: partially constructed managers carry only the
-        class-level zero tail.
+        The claim is capped rather than the cursor rewound afterwards: a capped
+        claim is a shorter match, so the core materializes every page the
+        recompute needs (SWA life cycles onboard only the sink and live-window
+        pages at the matched endpoint). The tail check runs first: partially
+        constructed managers carry only the class-level zero tail.
         """
         if not self._spec_recompute_tail:
             return None
