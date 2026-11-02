@@ -344,8 +344,8 @@ commands:
         - "--num_postprocess_workers"
       num_serve_frontends:
         type: int
-        default: 1
-        status: prototype
+        default: 8
+        status: beta
         required: false
         multiple: false
         is_flag: false
