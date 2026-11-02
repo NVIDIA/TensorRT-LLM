@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+
+import pytest
+import torch
+
+from tensorrt_llm._torch.attention.backends.fmha.flash_attn4_generation import (
+    _fa4_forward,
+    fa4_paged_generation,
+)
+from tensorrt_llm._utils import get_sm_version
+
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or get_sm_version() != 90 or _fa4_forward() is None,
+        reason="FlashAttention-4 generation path is SM90-only",
+    ),
+]
+
+
+def _case(num_heads, num_kv_heads, head_dim, q_len, rows, seed, massive=False, tpb=64):
+    """Scattered pages, cached lengths around page boundaries, page tables one page longer than needed."""
+    device = torch.device("cuda")
+    gen = torch.Generator().manual_seed(seed)
+    special = [tpb - q_len, tpb - 1, tpb, tpb + 1, 2 * tpb - q_len, 0, 3 * tpb + 7]
+    cached = [
+        special[r % len(special)] if r % 2 == 0 else int(torch.randint(0, 600, (1,), generator=gen))
+        for r in range(rows)
+    ]
+    kv_lens = [c + q_len for c in cached]
+    blocks = [(n + tpb - 1) // tpb + 1 for n in kv_lens]
+    num_pages = sum(blocks) + 3
+    perm = torch.randperm(num_pages, generator=gen).tolist()
+    tables, nxt = [], 0
+    for b in blocks:
+        tables.append(perm[nxt : nxt + b])
+        nxt += b
+    width = max(blocks)
+    page_table = torch.tensor(
+        [t + [0] * (width - len(t)) for t in tables], dtype=torch.int32, device=device
+    )
+    dgen = torch.Generator(device=device).manual_seed(seed)
+    pool = (
+        0.7 * torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, generator=dgen, device=device)
+    ).bfloat16()
+    ntok = rows * q_len
+    q = torch.randn(ntok, num_heads, head_dim, generator=dgen, device=device).bfloat16()
+    k = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
+    v = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
+    if massive:
+        # Qwen2.5-7B-like magnitudes: keys ~600x, queries ~80x, odd heads with every logit hugely negative.
+        pool[:, 0] = (pool[:, 0].float().abs() * 600.0).bfloat16()
+        k = (k.float().abs() * 600.0).bfloat16()
+        sign = torch.where(torch.arange(num_heads, device=device) % 2 == 1, -1.0, 1.0)[
+            None, :, None
+        ]
+        q = (q.float().abs() * 80.0 * sign).bfloat16()
+    return dict(
+        pool=pool, q=q, k=k, v=v, tables=tables, page_table=page_table, cached=cached,
+        kv_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device), tpb=tpb, rows=rows,
+    )  # fmt: skip
+
+
+def _reference(case, num_heads, num_kv_heads, head_dim, q_len):
+    """float64 causal attention over each row's cached tokens plus its own step tokens."""
+    pool, q, k, v = case["pool"].double(), case["q"], case["k"], case["v"]
+    gs = num_heads // num_kv_heads
+    ref = torch.zeros(q.shape, dtype=torch.float64, device=q.device)
+    for r in range(case["rows"]):
+        cached = case["cached"][r]
+        pages = case["tables"][r]
+        kv = (
+            pool[pages].permute(1, 2, 0, 3, 4).reshape(2, num_kv_heads, -1, head_dim)[:, :, :cached]
+        )
+        for t in range(q_len):
+            keys = torch.cat([kv[0], k[r * q_len : r * q_len + t + 1].double().permute(1, 0, 2)], 1)
+            vals = torch.cat([kv[1], v[r * q_len : r * q_len + t + 1].double().permute(1, 0, 2)], 1)
+            qh = q[r * q_len + t].double().view(num_kv_heads, gs, head_dim)
+            probs = torch.softmax(
+                torch.einsum("hgd,htd->hgt", qh, keys) / math.sqrt(head_dim), dim=-1
+            )
+            ref[r * q_len + t] = torch.einsum("hgt,htd->hgd", probs, vals).reshape(
+                num_heads, head_dim
+            )
+    return ref
+
+
+@pytest.mark.parametrize(
+    "num_heads,num_kv_heads,head_dim,q_len,massive",
+    [
+        (28, 4, 128, 1, False),
+        (28, 4, 128, 4, False),
+        (28, 4, 128, 9, False),
+        (20, 20, 128, 1, False),
+        (20, 20, 128, 4, False),
+        (20, 20, 128, 9, False),
+        (16, 8, 64, 9, False),
+        (28, 4, 128, 4, True),
+    ],
+)
+def test_fa4_paged_generation_matches_dense_and_writes_kv(
+    num_heads, num_kv_heads, head_dim, q_len, massive
+):
+    """The step's tokens attend the row's cache and each other causally; their K/V land at
+    kv_len - q_len + j (page crossings, page tables a page longer than needed); no zero heads
+    under massive activations."""
+    for seed in range(2):
+        case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=13, seed=seed, massive=massive)
+        before = case["pool"].clone()
+        ref = _reference(case, num_heads, num_kv_heads, head_dim, q_len)
+        out = torch.empty_like(case["q"])
+        fa4_paged_generation(
+            case["pool"], case["q"], case["k"], case["v"], out, case["page_table"], case["kv_lens"],
+            q_len, 1.0 / math.sqrt(head_dim),
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        head_max = ref.abs().amax(-1)
+        err = (out.double() - ref).abs().amax(-1)
+        assert not bool(((out.abs().amax(-1) == 0) & (head_max > 1e-3)).any()), "zero head"
+        assert float((err / head_max.clamp(min=1e-3)).max()) < 2e-2, f"seed {seed}"
+        expect = before.clone()
+        tpb = case["tpb"]
+        for r in range(case["rows"]):
+            for j in range(q_len):
+                pos = case["cached"][r] + j
+                page = case["tables"][r][pos // tpb]
+                expect[page, 0, :, pos % tpb] = case["k"][r * q_len + j]
+                expect[page, 1, :, pos % tpb] = case["v"][r * q_len + j]
+        assert torch.equal(case["pool"], expect)
+
+
+def test_fa4_paged_generation_graph_replay_matches_eager():
+    """One CUDA graph, replayed on new inputs and lengths of the same shape, equals eager."""
+    num_heads, num_kv_heads, head_dim, q_len = 28, 4, 128, 4
+    case = _case(num_heads, num_kv_heads, head_dim, q_len, rows=16, seed=3)
+    q, k, v = case["q"].clone(), case["k"].clone(), case["v"].clone()
+    kv_lens, pool = case["kv_lens"].clone(), case["pool"].clone()
+    out = torch.zeros_like(q)
+    args = (case["page_table"], kv_lens, q_len, 1.0 / math.sqrt(head_dim))
+    fa4_paged_generation(pool, q, k, v, out, *args)  # warm up / compile
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fa4_paged_generation(pool, q, k, v, out, *args)
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    for step in range(3):
+        q.copy_(torch.randn(q.shape, generator=gen, device="cuda").bfloat16())
+        k.copy_(torch.randn(k.shape, generator=gen, device="cuda").bfloat16())
+        v.copy_(torch.randn(v.shape, generator=gen, device="cuda").bfloat16())
+        kv_lens.sub_(1 if step % 2 else 0)
+        eager_pool, eager_out = pool.clone(), torch.zeros_like(q)
+        fa4_paged_generation(eager_pool, q, k, v, eager_out, *args)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager_out)
+        assert torch.equal(pool, eager_pool)
