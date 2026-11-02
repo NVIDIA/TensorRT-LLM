@@ -35,6 +35,7 @@ from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
 
 from ..conftest import get_device_count, llm_models_root, trt_environment
 from ._model_paths import HF_MODEL_PATH, LORA_MODEL_PATH, MODEL_PATH_DICT
+from .bench_warmup import bench_warmup_requests
 from .pytorch_model_config import get_model_yaml_config
 from .sampler_options_config import get_sampler_options_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
@@ -1143,8 +1144,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             benchmark_cmd += [f"--pp={self._config.pp_size}"]
         if self._config.streaming == "streaming":
             benchmark_cmd += [f"--streaming"]
-        if self._config.num_gpus > 1:
-            benchmark_cmd += [f"--warmup={2 * self._config.num_gpus}"]
+        kv_cache_config = self._get_model_yaml_config().get('kv_cache_config') or {}
+        warmup_requests = bench_warmup_requests(
+            self._config.num_gpus, self._config.concurrency,
+            self._config.num_reqs, self._config.max_batch_size,
+            bool(kv_cache_config.get('enable_block_reuse')))
+        if warmup_requests:
+            benchmark_cmd += [f"--warmup={warmup_requests}"]
 
         # Add extra-llm-api-config.yml for the PyTorch backend.
         if self._config.backend == "pytorch":
