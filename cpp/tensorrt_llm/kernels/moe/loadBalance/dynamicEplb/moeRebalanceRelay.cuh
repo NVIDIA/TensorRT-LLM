@@ -212,10 +212,37 @@ __device__ __forceinline__ int relayIssuers(unsigned dynamicBytes, int warps)
     return totalSlots ? 1 : 0;
 }
 
+//! Completion of one issuer's stores. The copy loop reports each bulk group it commits and each run of plain stores;
+//! every report covers the stores of `bytes` bytes of broadcast `b` into the helper slot of every receiver in
+//! `receivers`. At the end, relayIssuerDone waits until every store of this issuer has completed.
+struct RelayCompletion
+{
+};
+
+__device__ __forceinline__ void relayGroupCommitted(
+    MoeRebalanceHaloRParams const&, RelayCompletion&, int /*b*/, unsigned /*receivers*/, unsigned long long /*bytes*/)
+{
+}
+
+__device__ __forceinline__ void relayStoresIssued(
+    MoeRebalanceHaloRParams const&, RelayCompletion&, int /*b*/, unsigned /*receivers*/, unsigned long long /*bytes*/)
+{
+}
+
+__device__ __forceinline__ void relayIssuerDone(MoeRebalanceHaloRParams const&, RelayCompletion&)
+{
+    // READY covers the completion of the destination writes, not only their shared-memory reads.
+    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    asm volatile("fence.proxy.alias;" ::: "memory");
+    asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
+
 //! Lane 0 of one issuer warp: copy every work item dealt to this warp.
 __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& work, unsigned char* buffer,
     RelaySlotControl* control, int slots, int issuers, int warp)
 {
+    static_assert(kRelayMaxBatch == 1, "each bulk group holds one slice of one broadcast");
+    RelayCompletion completion{};
     for (int s = 0; s < slots; ++s)
     {
         asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;" ::"r"(relaySharedAddress(&control[s].barrier))
@@ -282,6 +309,7 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
                         relayScalarCopy(relayDestination(p, work, b, d, plane, offset), source, bytes);
                     }
                 }
+                relayStoresIssued(p, completion, b, mask, bytes);
                 continue;
             }
             int const s = bank * bankSlots + count;
@@ -312,12 +340,10 @@ __device__ void relayIssue(MoeRebalanceHaloRParams const& p, RelayWork const& wo
         {
             asm volatile("cp.async.bulk.commit_group;" ::: "memory");
             pending[bank] = true;
+            relayGroupCommitted(p, completion, work.broadcast[entryOf[0]], work.need[entryOf[0]], bytesOf[0]);
         }
     }
-    // READY covers the completion of the destination writes, not only their shared-memory reads.
-    asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
-    asm volatile("fence.proxy.alias;" ::: "memory");
-    asm volatile("fence.acq_rel.sys;" ::: "memory");
+    relayIssuerDone(p, completion);
 }
 
 //! This CTA's share of the relay copy. Every thread of the CTA calls it; returns false, uniformly, when the dynamic
