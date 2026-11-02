@@ -142,6 +142,8 @@ EPLB hooks fire only at the first/last chunk of the first/last `repeat_idx`. Mul
 
 No external `Communication.dispatch` / `.combine`. Zero-token chunks still launch the kernel so peer EP ranks can cross the in-kernel NVLink barrier.
 
+`run_moe` may return a view of a persistent workspace that later MoE launches rewrite. The MegaMoE CuteDSL leaf returns rows of its adaptive bucket's combine region, which at EP > 1 every layer with the same layout shares and a zero-token launch may rewrite whole. So `_run_chunks` copies every chunk's output except the last before the next chunk launches, and `forward` concatenates the chunks after the last launch. The copy needs no event or host sync: local writers queue behind it on the stream, and peers write the region only for tokens this rank has published, which each launch does in its first kernel, a non-PDL token-comm kernel that starts after the copy. The only chunk of a single-chunk forward is not copied, so the caller must consume the output before the next MoE launch.
+
 The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 
 ### Communication timeouts

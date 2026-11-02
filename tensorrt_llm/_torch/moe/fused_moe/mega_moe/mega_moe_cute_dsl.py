@@ -1526,6 +1526,12 @@ class TrtllmCutedslMegaMoeNvfp4Impl(MoEImplBase):
         happen through the module-level :func:`_as_nvfp4` /
         :func:`_as_fp8_sf` helpers (the kernel rejects raw uint8 byte
         tensors).
+
+        With a bf16 ``output_dtype`` the result is a view of
+        ``combine_output``, which the next launch in this bucket rewrites (at
+        EP > 1 a launch of any layer with the same layout, as they share the
+        symmetric region): consume or copy it first (``FusedCommMoEScheduler``
+        class invariant 10).
         """
         # Hand the symmetric profiling scratch (or a deferred factory) to the
         # op for tuning-mode profiling launches; cleared in the ``finally`` so
