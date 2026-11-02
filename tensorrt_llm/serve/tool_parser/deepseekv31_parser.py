@@ -145,7 +145,7 @@ class DeepSeekV31Parser(BaseToolParser):
             if not pending or (
                 len(pending) < len(_TOOL_CALL_END) and _TOOL_CALL_END.startswith(pending)
             ):
-                self._buffer = pending
+                self._buffer = pending if pending else current_text
                 return StreamingParseResult()
             if pending.startswith(_TOOL_CALL_END):
                 self._buffer = pending[len(_TOOL_CALL_END) :]

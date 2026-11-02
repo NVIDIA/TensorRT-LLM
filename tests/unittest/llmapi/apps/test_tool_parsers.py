@@ -3903,6 +3903,30 @@ def test_deepseek_v31_end_token_split_after_complete_json(
     assert parser.prev_tool_call_arr[0]["arguments"] == {"location": "Paris"}
 
 
+@pytest.mark.parametrize("whitespace", [" ", "\n", "\n\t "])
+@pytest.mark.parametrize("call_end", ["", "<｜tool▁call▁end｜>"])
+def test_deepseek_v31_preserves_whitespace_after_complete_json(
+        sample_tools: list[ChatCompletionToolsParam], whitespace: str,
+        call_end: str) -> None:
+    """Whitespace is content unless a following call-end token consumes it."""
+    deltas = [
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+        '{"location": "Paris"}', whitespace, call_end, "Summary"
+    ]
+    parser = DeepSeekV31Parser()
+    results = [
+        parser.parse_streaming_increment(delta, sample_tools)
+        for delta in deltas
+    ]
+    results.append(parser.finish(sample_tools))
+
+    expected = "Summary" if call_end else whitespace + "Summary"
+    assert "".join(result.normal_text for result in results) == expected
+    assert "".join(call.parameters for result in results
+                   for call in result.calls) == '{"location": "Paris"}'
+    assert parser.prev_tool_call_arr[0]["arguments"] == {"location": "Paris"}
+
+
 @pytest.mark.parametrize("partial_token",
                          ["<｜tool▁call▁en", "<｜tool▁calls▁e", "<｜tool▁ca"])
 def test_deepseek_v31_streams_text_before_a_partial_token(
