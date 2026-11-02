@@ -146,7 +146,7 @@ TensorRT-LLM provides many MoE implementations, differing in supported quantizat
 | `CUTEDSL_FC12` | SM107 | NVFP4 |
 | `DEEPGEMM` | SM100 / SM103 / SM107 | FP8 block-scale |
 | `DENSEGEMM` | SM100 / SM103 | NVFP4 |
-| `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4 |
+| `MEGAMOE_CUTEDSL` | SM100 / SM103 / SM107 | NVFP4, BF16 (SM100 / SM103) |
 | `MEGAMOE_DEEPGEMM` | SM100 / SM103 | W4A8_MXFP4_MXFP8 |
 | `MARLIN` | SM89 – SM99 | NVFP4, W4A16_NVFP4 (BF16 activations) |
 | `TRITON` (Deprecated) | SM90 (GPT-OSS) | BF16, FP8 QDQ, W4A16_MXFP4, W4A8_MXFP4_FP8 |

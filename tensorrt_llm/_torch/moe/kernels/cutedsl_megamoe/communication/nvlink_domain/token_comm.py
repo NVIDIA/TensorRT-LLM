@@ -54,7 +54,8 @@ class TokenCommArgs:
     """
 
     activation: cute.Tensor
-    activation_sf: cute.Tensor
+    # None for the unquantized bf16 kind, whose dispatch payload is the bf16 row alone.
+    activation_sf: Optional[cute.Tensor]
     pre_reduced_activation: cute.Tensor
     pre_reduced_activation_sf: Optional[cute.Tensor]
     peer_rank_ptr_mapper: SymmetricBufferDevice
@@ -1285,6 +1286,8 @@ class TokenCommNonDeterministic(KernelComponent):
     grid_sync_barrier_id: ClassVar[int] = 10
     standalone_size_barrier_id: ClassVar[int] = 11
     token_in_size_barrier_id: ClassVar[int] = 12
+    # hidden granule for a kind without scale factors; see _validate_configuration.
+    _unscaled_hidden_granule: ClassVar[int] = 64
 
     fc1_ready_region = "nvlink.token_comm.fc1_ready"
     fc1_activation_region = "nvlink.token_comm.fc1_activation"
@@ -1412,7 +1415,13 @@ class TokenCommNonDeterministic(KernelComponent):
             )
         if self.reduce_topk_in_kernel and self.combine_format.act_dtype is not cutlass.BFloat16:
             raise ValueError("In-kernel top-k reduction requires BF16 combine data.")
-        element_block = self.activation_sf_vector_size * 4
+        if self.has_activation_sf:
+            element_block = self.activation_sf_vector_size * 4
+        else:
+            # A bf16 row only needs 16 B granularity for its bulk copies (hidden % 8), but the
+            # FC2 / combine store paths it shares with the block-scaled kinds have only ever run
+            # on hidden in whole 64-element blocks, so bf16 keeps that granule.
+            element_block = self._unscaled_hidden_granule
         if self.hidden_size % element_block != 0:
             raise ValueError(
                 f"{self.quant_kind} requires hidden_size divisible by {element_block}."
@@ -1429,12 +1438,17 @@ class TokenCommNonDeterministic(KernelComponent):
         return self.quant_kind.activation_dtype
 
     @property
-    def activation_sf_dtype(self) -> type:
-        return self.quant_kind.sf_dtype
+    def has_activation_sf(self) -> bool:
+        """Whether dispatched tokens carry a scale-factor row (every kind except bf16)."""
+        return self.quant_kind.is_block_scaled
 
     @property
-    def activation_sf_vector_size(self) -> int:
-        return self.quant_kind.sf_vec_size
+    def activation_sf_dtype(self) -> Optional[type]:
+        return self.quant_kind.sf_dtype if self.has_activation_sf else None
+
+    @property
+    def activation_sf_vector_size(self) -> Optional[int]:
+        return self.quant_kind.sf_vec_size if self.has_activation_sf else None
 
     @property
     def bytes_per_token(self) -> int:
@@ -1442,6 +1456,9 @@ class TokenCommNonDeterministic(KernelComponent):
 
     @property
     def activation_sf_hidden_padded(self) -> int:
+        """Scale-factor elements per dispatched token row; 0 when tokens carry none (bf16)."""
+        if not self.has_activation_sf:
+            return 0
         valid_hidden = self.hidden_size // self.activation_sf_vector_size
         elements_per_16_bytes = 128 // int(self.activation_sf_dtype.width)
         return int(round_up(valid_hidden, elements_per_16_bytes))
@@ -1643,16 +1660,17 @@ class TokenCommNonDeterministic(KernelComponent):
             buffer_space="local",
             byte_alignment=128,
         )
-        activation_sf_element_count = (
-            self.worst_case_sf_token_count * self.activation_sf_hidden_padded
-        )
-        workspace.register(
-            self.fc1_activation_sf_region,
-            self.activation_sf_dtype,
-            (activation_sf_element_count,),
-            buffer_space="local",
-            byte_alignment=128,
-        )
+        if self.has_activation_sf:
+            activation_sf_element_count = (
+                self.worst_case_sf_token_count * self.activation_sf_hidden_padded
+            )
+            workspace.register(
+                self.fc1_activation_sf_region,
+                self.activation_sf_dtype,
+                (activation_sf_element_count,),
+                buffer_space="local",
+                byte_alignment=128,
+            )
 
         if self.token_back_enabled:
             workspace.register(
@@ -1726,16 +1744,17 @@ class TokenCommNonDeterministic(KernelComponent):
             (self.transfer_warp_count, self.hidden_size),
             byte_alignment=16,
         )
-        token_in_lifetime.register_tensor(
-            self.token_in_sf_smem_region,
-            self.activation_sf_dtype,
-            (
-                self.transfer_warp_count,
-                (self.activation_sf_vector_size, self.activation_sf_hidden_padded),
-            ),
-            stride=(self.activation_sf_hidden_padded, (0, 1)),
-            byte_alignment=16,
-        )
+        if self.has_activation_sf:
+            token_in_lifetime.register_tensor(
+                self.token_in_sf_smem_region,
+                self.activation_sf_dtype,
+                (
+                    self.transfer_warp_count,
+                    (self.activation_sf_vector_size, self.activation_sf_hidden_padded),
+                ),
+                stride=(self.activation_sf_hidden_padded, (0, 1)),
+                byte_alignment=16,
+            )
         if not self.token_back_enabled:
             return
 
@@ -1750,7 +1769,11 @@ class TokenCommNonDeterministic(KernelComponent):
             available_bytes_per_warp = self.standalone_chunk_bytes
         else:
             activation_bytes = self.bytes_per_token
-            sf_bytes = self.activation_sf_hidden_padded * int(self.activation_sf_dtype.width) // 8
+            sf_bytes = 0
+            if self.has_activation_sf:
+                sf_bytes = (
+                    self.activation_sf_hidden_padded * int(self.activation_sf_dtype.width) // 8
+                )
             available_bytes_per_warp = activation_bytes + sf_bytes
 
         if self.token_back_push_data:
@@ -1807,6 +1830,8 @@ class TokenCommNonDeterministic(KernelComponent):
 
     @cute.jit
     def fc1_activation_sf_tensor(self, device_workspace: DeviceWorkspace) -> cute.Tensor:
+        if cutlass.const_expr(not self.has_activation_sf):
+            raise ValueError(f"{self.quant_kind} dispatches no activation scale factors.")
         layout = tile_atom_to_shape_SF(
             (self.worst_case_sf_token_count, self.hidden_size, 1), self.activation_sf_vector_size
         )
@@ -1945,27 +1970,35 @@ class TokenCommNonDeterministic(KernelComponent):
         iket.range_push("token_in.pull_payload")
         token_in_mbarriers = smem_workspace.ptr(self.token_in_mbarrier_region, smem_base)
         token_in_activation = smem_workspace.tensor(self.token_in_activation_smem_region, smem_base)
-        token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
+        if cutlass.const_expr(self.has_activation_sf):
+            token_in_sf = smem_workspace.tensor(self.token_in_sf_smem_region, smem_base)
         warp_mbarrier = token_in_mbarriers + transfer_warp_idx
         warp_activation_stage = token_in_activation[transfer_warp_idx, None]
-        warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
+        if cutlass.const_expr(self.has_activation_sf):
+            warp_sf_stage = token_in_sf[transfer_warp_idx, (None, None)]
         if lane_idx == Int32(0):
             cute.arch.mbarrier_init(warp_mbarrier, 1)
         cute.arch.sync_warp()
 
         fc1_activation_pointer = self._device_workspace.ptr(self.fc1_activation_region)
-        fc1_activation_sf = self.fc1_activation_sf_tensor(self._device_workspace)
+        if cutlass.const_expr(self.has_activation_sf):
+            fc1_activation_sf = self.fc1_activation_sf_tensor(self._device_workspace)
         fc1_ready_counter = self._device_workspace.ptr(self.fc1_ready_region)
         activation_bytes = (
             cute.cosize(warp_activation_stage) * int(self.activation_dtype.width) // 8
         )
-        activation_sf_bytes = cute.cosize(warp_sf_stage) * int(self.activation_sf_dtype.width) // 8
-        sf_copy_elements = 4
-        source_sf_values = cute.slice_(warp_sf_stage, (0, None))
-        source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
-        sf_copy_atom = _copy_atom(
-            self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width)
-        )
+        # A bf16 token is its data row alone: no scale-factor leg, so the barrier expects only it.
+        activation_sf_bytes = 0
+        if cutlass.const_expr(self.has_activation_sf):
+            activation_sf_bytes = (
+                cute.cosize(warp_sf_stage) * int(self.activation_sf_dtype.width) // 8
+            )
+            sf_copy_elements = 4
+            source_sf_values = cute.slice_(warp_sf_stage, (0, None))
+            source_sf_vectors = cute.zipped_divide(source_sf_values, (sf_copy_elements,))
+            sf_copy_atom = _copy_atom(
+                self.activation_sf_dtype, sf_copy_elements * int(self.activation_sf_dtype.width)
+            )
 
         next_dense_token = global_warp_idx
         expert_valid_begin = Int32(0)
@@ -2011,16 +2044,19 @@ class TokenCommNonDeterministic(KernelComponent):
                     + peer_offset
                     + Int64(metadata.src_token) * Int64(self.bytes_per_token)
                 )
-                remote_sf = cute.make_tensor(
-                    cute.make_ptr(
-                        self._token_comm_args.activation_sf.dtype,
-                        self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
-                        AddressSpace.gmem,
-                        assumed_align=(self._token_comm_args.activation_sf.iterator.max_alignment),
-                    ),
-                    self._token_comm_args.activation_sf.layout,
-                )
-                remote_sf_row = remote_sf[Int64(metadata.src_token), None]
+                if cutlass.const_expr(self.has_activation_sf):
+                    remote_sf = cute.make_tensor(
+                        cute.make_ptr(
+                            self._token_comm_args.activation_sf.dtype,
+                            self._token_comm_args.activation_sf.iterator.toint() + peer_offset,
+                            AddressSpace.gmem,
+                            assumed_align=(
+                                self._token_comm_args.activation_sf.iterator.max_alignment
+                            ),
+                        ),
+                        self._token_comm_args.activation_sf.layout,
+                    )
+                    remote_sf_row = remote_sf[Int64(metadata.src_token), None]
 
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(
@@ -2032,12 +2068,13 @@ class TokenCommNonDeterministic(KernelComponent):
                         warp_mbarrier,
                         Int32(activation_bytes),
                     )
-                    tma_load_1d(
-                        warp_sf_stage.iterator,
-                        remote_sf_row.iterator,
-                        warp_mbarrier,
-                        Int32(activation_sf_bytes),
-                    )
+                    if cutlass.const_expr(self.has_activation_sf):
+                        tma_load_1d(
+                            warp_sf_stage.iterator,
+                            remote_sf_row.iterator,
+                            warp_mbarrier,
+                            Int32(activation_sf_bytes),
+                        )
                 cute.arch.sync_warp()
                 cute.arch.mbarrier_wait(warp_mbarrier, pull_phase)
 
@@ -2057,21 +2094,25 @@ class TokenCommNonDeterministic(KernelComponent):
                 cute.arch.sync_warp()
                 cute.arch.cp_async_bulk_commit_group()
 
-                destination_sf_row = fc1_activation_sf[Int64(sf_token_idx), ((None, None), None)]
-                destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
-                destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
-                destination_sf_vectors = cute.zipped_divide(
-                    destination_sf_values, (sf_copy_elements,)
-                )
-                sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
-                for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
-                    sf_vector_idx = Int32(sf_round * 32) + lane_idx
-                    if sf_vector_idx < Int32(sf_vector_count):
-                        cute.copy(
-                            sf_copy_atom,
-                            source_sf_vectors[None, sf_vector_idx],
-                            destination_sf_vectors[None, sf_vector_idx],
-                        )
+                if cutlass.const_expr(self.has_activation_sf):
+                    # The scale row is re-swizzled into the MMA's SF atom layout as it lands.
+                    destination_sf_row = fc1_activation_sf[
+                        Int64(sf_token_idx), ((None, None), None)
+                    ]
+                    destination_sf_values = cute.slice_(destination_sf_row, (0, None, None))
+                    destination_sf_values = cute.group_modes(destination_sf_values, 0, 2)
+                    destination_sf_vectors = cute.zipped_divide(
+                        destination_sf_values, (sf_copy_elements,)
+                    )
+                    sf_vector_count = cute.size(destination_sf_vectors, mode=[1])
+                    for sf_round in cutlass.range_constexpr(ceil_div(sf_vector_count, 32)):
+                        sf_vector_idx = Int32(sf_round * 32) + lane_idx
+                        if sf_vector_idx < Int32(sf_vector_count):
+                            cute.copy(
+                                sf_copy_atom,
+                                source_sf_vectors[None, sf_vector_idx],
+                                destination_sf_vectors[None, sf_vector_idx],
+                            )
 
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.sync_warp()

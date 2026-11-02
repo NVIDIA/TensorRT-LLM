@@ -14,7 +14,7 @@
 # limitations under the License.
 """MegaMoE first-class MoE backends.
 
-Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
+Three backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
 
 * :class:`DeepgemmCudaW4a8Mxfp4Mxfp8Impl` — DeepGEMM ``fp8_fp4_mega_moe``
   fused kernel for W4A8_MXFP4_MXFP8 weights, aliased as ``MegaMoEDeepGemm``.
@@ -26,13 +26,23 @@ Two backends share the ``MoESchedulerKind.FUSED_COMM`` contract:
   into ``tensorrt_llm/_torch/moe/kernels/cutedsl_megamoe``;
   ``NVFP4MegaMoECuteDslMethod`` owns the NVFP4 weight tensors, MegaMoE-format
   derived buffers, and per-expert scale tensors consumed by the kernel ABI.
+* :class:`TrtllmCutedslMegaMoeBf16Impl` — the same CuteDSL kernel with
+  unquantized BF16 weights and activations (SM100/SM103);
+  ``UnquantizedMegaMoECuteDslMethod`` owns its bf16 weights. Both CuteDSL
+  leaves share :class:`MegaMoECuteDslBase`.
 """
 
-from ..quantization import NVFP4MegaMoECuteDslMethod, W4A8MXFP4MXFP8MegaMoEDeepGemmMethod
+from ..quantization import (
+    NVFP4MegaMoECuteDslMethod,
+    UnquantizedMegaMoECuteDslMethod,
+    W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
+)
 from .mega_moe_cute_dsl import (
     MegaMoECuteDsl,
+    MegaMoECuteDslBase,
     MegaMoeCuteDslUnavailable,
     MegaMoECuteDslWeightView,
+    TrtllmCutedslMegaMoeBf16Impl,
     TrtllmCutedslMegaMoeNvfp4Impl,
     is_megamoe_cute_dsl_runtime_available,
 )
@@ -41,11 +51,14 @@ from .mega_moe_deepgemm import DeepgemmCudaW4a8Mxfp4Mxfp8Impl, MegaMoEDeepGemm
 __all__ = [
     "DeepgemmCudaW4a8Mxfp4Mxfp8Impl",
     "MegaMoECuteDsl",
+    "MegaMoECuteDslBase",
     "MegaMoECuteDslWeightView",
     "MegaMoeCuteDslUnavailable",
     "MegaMoEDeepGemm",
     "NVFP4MegaMoECuteDslMethod",
+    "TrtllmCutedslMegaMoeBf16Impl",
     "TrtllmCutedslMegaMoeNvfp4Impl",
+    "UnquantizedMegaMoECuteDslMethod",
     "W4A8MXFP4MXFP8MegaMoEDeepGemmMethod",
     "is_megamoe_cute_dsl_runtime_available",
 ]
