@@ -5,9 +5,9 @@ import functools
 import math
 import os
 from collections import defaultdict
+from collections.abc import Callable, Hashable, Iterator
 from contextlib import contextmanager
-from typing import (Any, Callable, Dict, Hashable, Iterator, List, Optional,
-                    Tuple, Type, Union)
+from typing import Any
 
 import torch
 import torch._dynamo.config
@@ -18,19 +18,20 @@ from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
 from tensorrt_llm._utils import mpi_disabled, release_gc
-from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
-                                          create_input_processor)
-from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
-                                          EncodeCudaGraphConfig,
-                                          PrefillCudaGraphBackend,
-                                          TorchCompileConfig, TorchLlmArgs)
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
+from tensorrt_llm.llmapi.llm_args import (
+    DecodingBaseConfig,
+    EncodeCudaGraphConfig,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 
 # isort: split
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention.backends.interface import (AttentionMetadata,
-                                            AttentionRuntimeFeatures)
+from ..attention.backends.interface import AttentionMetadata, AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
@@ -41,7 +42,7 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
-from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
 from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
@@ -52,31 +53,55 @@ from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import plan_cuda_graphs
 from .engine.lora import resolve_lora_owner
 from .engine.model_call import ModelCaller
-from .engine.multimodal import (MultimodalItemScheduler, is_multimodal,
-                                mm_encoder_cache_enabled,
-                                setup_mm_encoder_attn_metadata,
-                                setup_mm_encoder_cuda_graphs, use_mrope)
+from .engine.multimodal import (
+    MultimodalItemScheduler,
+    is_multimodal,
+    mm_encoder_cache_enabled,
+    setup_mm_encoder_attn_metadata,
+    setup_mm_encoder_cuda_graphs,
+    use_mrope,
+)
 from .engine.runners import resolve_runner_type
-from .engine.runners.common import (make_scheduled_inputs,
-                                    resolve_mrope_position_deltas_cache)
+from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
 from .engine.runners.decoder.runner import PrefillCompiledModel
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
-from .engine.runners.encoder_decoder import (EncoderDecoderRunner,
-                                             EncoderDecoderRunnerConfig,
-                                             EncoderStageConfig)
-from .engine.runners.interface import (ModelRunner, PackedInputs,
-                                       PackedModelRunner, ScheduledInputs,
-                                       ScheduledModelRunner)
+from .engine.runners.encoder_decoder import (
+    EncoderDecoderRunner,
+    EncoderDecoderRunnerConfig,
+    EncoderStageConfig,
+)
+from .engine.runners.interface import (
+    ModelRunner,
+    PackedInputs,
+    PackedModelRunner,
+    ScheduledInputs,
+    ScheduledModelRunner,
+)
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
-from .model_loader import ModelLoader, _construct_checkpoint_loader
+from .model_loader import ModelLoader
 from .resource_manager import ResourceManager, ResourceManagerType
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
+
+
+def _spec_decode_fast_paths(model: torch.nn.Module) -> bool:
+    """``spec_decode_fast_paths`` of the one-engine speculative language model
+    (the model itself, or a multimodal model's language model); False for any
+    other model."""
+    from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
+
+    if isinstance(model, MultimodalModelMixin):
+        try:
+            model = model.language_model
+        except NotImplementedError:
+            return False
+    return isinstance(model, SpecDecOneEngineForCausalLM) and model.spec_decode_fast_paths
+
 
 # Refit only needs the compile wrapper removed before weights are loaded: the
 # wrapper inserts "_orig_mod" into every parameter path, and load_weights()
@@ -119,20 +144,20 @@ class ModelEngine:
         *,
         model_path: str,
         llm_args: TorchLlmArgs,
-        mapping: Optional[Mapping] = None,
-        attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
-        dist: Optional[Distributed] = None,
-        spec_config: Optional[DecodingBaseConfig] = None,
-        model: Optional[torch.nn.Module] = None,
-        checkpoint_loader: Optional[BaseCheckpointLoader] = None,
-        model_weights_memory_tag: Optional[str] = None,
+        mapping: Mapping,
+        attn_runtime_features: AttentionRuntimeFeatures | None = None,
+        dist: Distributed | None = None,
+        spec_config: DecodingBaseConfig | None = None,
+        model: torch.nn.Module | None = None,
+        checkpoint_loader: BaseCheckpointLoader | None = None,
+        model_weights_memory_tag: str | None = None,
         model_weights_restore_mode=None,
     ):
         # cleanup() also runs on an engine whose construction failed part-way.
         self._cleanup_done = False
-        self.model_loader: Optional[ModelLoader] = None
-        self._runner: Optional[ModelRunner] = None
-        self._torch_compile_backend: Optional[Backend] = None
+        self.model_loader: ModelLoader | None = None
+        self._runner: ModelRunner | None = None
+        self._torch_compile_backend: Backend | None = None
         configured_encoder_max_num_tokens = self._init_from_args(
             model_path=model_path,
             llm_args=llm_args,
@@ -158,19 +183,18 @@ class ModelEngine:
         *,
         model_path: str,
         llm_args: TorchLlmArgs,
-        mapping: Optional[Mapping],
-        attn_runtime_features: Optional[AttentionRuntimeFeatures],
-        dist: Optional[Distributed],
-        spec_config: Optional[DecodingBaseConfig],
-    ) -> Optional[int]:
+        mapping: Mapping,
+        attn_runtime_features: AttentionRuntimeFeatures | None,
+        dist: Distributed | None,
+        spec_config: DecodingBaseConfig | None,
+    ) -> int | None:
         """Resolve the requested sizes, the original speculation widths and the
         services derived from the arguments; capacity may still be unset.
         Returns the encoder token budget before any multimodal increase."""
         _configure_deep_gemm_pdl()
 
         if llm_args.encode_only and llm_args.mm_encoder_only:
-            raise ValueError(
-                "encode_only and mm_encoder_only are mutually exclusive.")
+            raise ValueError("encode_only and mm_encoder_only are mutually exclusive.")
         (
             max_beam_width,
             max_num_tokens,
@@ -182,15 +206,19 @@ class ModelEngine:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
-        self.encoder_batch_size = (llm_args.encoder_max_batch_size
-                                   if llm_args.encoder_max_batch_size
-                                   is not None else self.batch_size)
+        self.encoder_batch_size = (
+            llm_args.encoder_max_batch_size
+            if llm_args.encoder_max_batch_size is not None
+            else self.batch_size
+        )
         # The multimodal encoder token budget falls back to the LLM-side value
         # when unset. It may be raised after model load because atomic MM items
         # cannot be split.
         configured_encoder_max_num_tokens = (
-            llm_args.encoder_max_num_tokens if llm_args.encoder_max_num_tokens
-            is not None else self.max_num_tokens)
+            llm_args.encoder_max_num_tokens
+            if llm_args.encoder_max_num_tokens is not None
+            else self.max_num_tokens
+        )
         self.encoder_max_num_tokens = configured_encoder_max_num_tokens
 
         self.mapping = mapping
@@ -204,70 +232,62 @@ class ModelEngine:
         # default: it captures one extra graph per enabled tier, which costs
         # startup time and memory that deployments not bound by sampling
         # overhead should not pay.
-        self.enable_in_graph_sampling = bool(
-            getattr(llm_args, "enable_in_graph_sampling", False))
+        self.enable_in_graph_sampling = bool(getattr(llm_args, "enable_in_graph_sampling", False))
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.original_max_total_draft_tokens = (
-            spec_config.tokens_per_gen_step -
-            1) if spec_config is not None else 0
+            (spec_config.tokens_per_gen_step - 1) if spec_config is not None else 0
+        )
         # Saved before zeroing for draft models; used by update_spec_dec_param.
         self._spec_dec_max_total_draft_tokens = (
-            spec_config.max_total_draft_tokens
-            if spec_config is not None else 0)
+            spec_config.max_total_draft_tokens if spec_config is not None else 0
+        )
 
         # Dynamic tree draft loop produces up to K * max_draft_len tokens,
         # which may exceed max_total_draft_tokens. Use the larger value for
         # KV cache reservation only; verify/tree output stays at max_total_draft_tokens.
-        if (spec_config is not None
-                and getattr(spec_config, 'use_dynamic_tree', False)
-                and getattr(spec_config, 'dynamic_tree_max_topK', 0) > 0):
+        if (
+            spec_config is not None
+            and getattr(spec_config, "use_dynamic_tree", False)
+            and getattr(spec_config, "dynamic_tree_max_topK", 0) > 0
+        ):
             self.max_draft_loop_tokens = max(
                 self.original_max_total_draft_tokens,
-                spec_config.dynamic_tree_max_topK * spec_config.max_draft_len)
+                spec_config.dynamic_tree_max_topK * spec_config.max_draft_len,
+            )
         else:
             self.max_draft_loop_tokens = self.original_max_total_draft_tokens
 
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
 
-        self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures(
-        )
+        self.attn_runtime_features = attn_runtime_features or AttentionRuntimeFeatures()
 
         input_processor_kwargs = {}
         video_pruning_rate = llm_args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
-            input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+            input_processor_kwargs["video_pruning_rate"] = video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
             checkpoint_format=llm_args.checkpoint_format,
             trust_remote_code=llm_args.trust_remote_code,
-            **input_processor_kwargs)
+            **input_processor_kwargs,
+        )
         return configured_encoder_max_num_tokens
 
     def _load_model(
         self,
         *,
         model_path: str,
-        model: Optional[torch.nn.Module],
-        checkpoint_loader: Optional[BaseCheckpointLoader],
-        model_weights_memory_tag: Optional[str],
+        model: torch.nn.Module | None,
+        checkpoint_loader: BaseCheckpointLoader | None,
+        model_weights_memory_tag: str | None,
         model_weights_restore_mode,
     ) -> None:
-        """Resolve the checkpoint loader, then load the model, or take the given
-        one, at the requested capacity."""
-        if checkpoint_loader is None:
-            checkpoint_loader = _construct_checkpoint_loader(
-                self.llm_args.checkpoint_loader,
-                self.llm_args.checkpoint_format,
-                mx_config=self.llm_args.mx_config,
-                checkpoint_io_policy=self.llm_args.checkpoint_io_policy,
-                load_format=self.llm_args.load_format,
-                partial_model_loading=self.llm_args.is_partial_model_loading,
-            )
-        self.moe_load_balancer: Optional[MoeLoadBalancer] = None
+        """Load the model, or take the given one, at the requested capacity."""
+        self.moe_load_balancer: BaseMoeLoadBalancer | None = None
         if model is None:
-            lora_config: Optional[LoraConfig] = self.llm_args.lora_config
+            lora_config: LoraConfig | None = self.llm_args.lora_config
             # Keep the model_loader to support reloading the model weights later
             self.model_loader = ModelLoader(
                 llm_args=self.llm_args,
@@ -282,20 +302,24 @@ class ModelEngine:
             )
             # Open checkpoint and load the LLM module object.
             self.model, moe_load_balancer = self.model_loader.load(
-                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
-            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader
+            )
+            if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                 self.moe_load_balancer = moe_load_balancer
         else:
             self.model = model
+        self.spec_decode_fast_paths = _spec_decode_fast_paths(self.model)
         self._validate_breakable_cuda_graph_compatibility()
 
     def _init_from_model(self) -> None:
         """Copy the loaded model's facts onto the engine, rewriting the requested
         capacity, encoder token budget and in-graph sampling flag from them,
         and leave the model in its final pre-compile form."""
-        from ._util import (compute_max_num_sequences,
-                            resolved_kv_cache_manager_is_v2,
-                            should_enable_overlap_headroom)
+        from ._util import (
+            compute_max_num_sequences,
+            resolved_kv_cache_manager_is_v2,
+            should_enable_overlap_headroom,
+        )
 
         # In-graph sampling needs the full vocabulary: top-k / top-p over a
         # tensor-parallel shard would rank against a slice of the logits and
@@ -303,11 +327,13 @@ class ModelEngine:
         # the draft models of some speculation modes turn that off, so refuse
         # the fast path rather than sample a sharded row.
         if self.enable_in_graph_sampling and not getattr(
-                self.model.model_config, "lm_head_gather_output", True):
+            self.model.model_config, "lm_head_gather_output", True
+        ):
             logger.warning(
                 "Disabling enable_in_graph_sampling: this model's LM head does not "
                 "gather its output, so the logits are sharded across tensor "
-                "parallel ranks and cannot be sampled in-graph.")
+                "parallel ranks and cannot be sampled in-graph."
+            )
             self.enable_in_graph_sampling = False
         pretrained_config = self.model.model_config.pretrained_config
         self.enable_overlap_headroom = should_enable_overlap_headroom(
@@ -316,10 +342,11 @@ class ModelEngine:
             kv_cache_manager_is_v2=resolved_kv_cache_manager_is_v2(
                 self.llm_args.kv_cache_config,
                 self.max_beam_width,
-                enable_sleep=self.llm_args.sleep_config is not None),
+                enable_sleep=self.llm_args.sleep_config is not None,
+            ),
             is_hybrid=is_hybrid_linear(pretrained_config),
-            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(
-                self.model) is not None)
+            has_mrope_delta_cache=resolve_mrope_position_deltas_cache(self.model) is not None,
+        )
         self.max_num_seq_slots = compute_max_num_sequences(
             self.mapping,
             self.batch_size,
@@ -328,7 +355,7 @@ class ModelEngine:
         )
         # AutoModelForCausalLM sets extra_attrs; a model passed in through
         # `model=`, such as a test stub, may not have it.
-        if not hasattr(self.model, 'extra_attrs'):
+        if not hasattr(self.model, "extra_attrs"):
             self.model.extra_attrs = {}
         # Router Replay (R3) capturer owned by this engine (None when disabled).
         # Registered in the model extra attrs so the MoE
@@ -339,7 +366,8 @@ class ModelEngine:
             model_engine=self,
             enabled=self.llm_args.enable_return_routed_experts,
             pp_size=self.mapping.pp_size,
-            is_spec_decode=self.is_spec_decode)
+            is_spec_decode=self.is_spec_decode,
+        )
         if self.route_capture is not None:
             self.model.extra_attrs[ROUTE_CAPTURE_ATTR] = self.route_capture
         # Every MM item-scheduling decision -- policy, capability, feature
@@ -349,39 +377,46 @@ class ModelEngine:
             llm_args=self.llm_args,
             model=self.model,
             input_processor=self.input_processor,
-            encoder_max_num_tokens=self.encoder_max_num_tokens)
+            encoder_max_num_tokens=self.encoder_max_num_tokens,
+        )
         self._mm_item_scheduler = mm_item_scheduler
         # Read by py_executor.py and _util.py.
         self.mm_encoder_item_scheduling_enabled = mm_item_scheduler is not None
-        self.mm_encoder_output_budget_bytes: Optional[int] = None
-        self.bytes_per_mm_encoder_embedding: Optional[int] = None
+        self.mm_encoder_output_budget_bytes: int | None = None
+        self.bytes_per_mm_encoder_embedding: int | None = None
         if mm_item_scheduler is not None:
             # The raised encoder token budget is read back off the engine by
             # `_util.py`, and sizes the encoder metadata set up below.
             self.encoder_max_num_tokens = mm_item_scheduler.encoder_max_num_tokens
             self.mm_encoder_output_budget_bytes = mm_item_scheduler.output_budget_bytes
             self.bytes_per_mm_encoder_embedding = mm_item_scheduler.bytes_per_embedding
-        if isinstance(self.model,
-                      MultimodalModelMixin) and self.mapping.is_first_pp_rank():
+        if isinstance(self.model, MultimodalModelMixin) and self.mapping.is_first_pp_rank():
             multimodal_config = self.model.model_config.multimodal_config
-            reuse_capacity_bytes = (multimodal_config.encoder_cache_max_bytes
-                                    if self.model.encoder_cache_active else 0)
+            reuse_capacity_bytes = (
+                multimodal_config.encoder_cache_max_bytes if self.model.encoder_cache_active else 0
+            )
             cache_capacity_bytes = max(
                 self.mm_encoder_output_budget_bytes or 0,
                 reuse_capacity_bytes,
             )
-            self.model._initialize_multimodal_encoder_cache(
-                cache_capacity_bytes)
+            self.model._initialize_multimodal_encoder_cache(cache_capacity_bytes)
         setup_mm_encoder_attn_metadata(
-            self.model, self.input_processor, self.encoder_max_num_tokens,
+            self.model,
+            self.input_processor,
+            self.encoder_max_num_tokens,
             mm_item_scheduler.attention_metadata_capacity
-            if mm_item_scheduler is not None else None)
+            if mm_item_scheduler is not None
+            else None,
+        )
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
-            module_prefix = 'Model'
-            if self.model.model_config and self.model.model_config.pretrained_config and self.model.model_config.pretrained_config.architectures:
-                module_prefix = '|'.join(
-                    self.model.model_config.pretrained_config.architectures)
+            module_prefix = "Model"
+            if (
+                self.model.model_config
+                and self.model.model_config.pretrained_config
+                and self.model.model_config.pretrained_config.architectures
+            ):
+                module_prefix = "|".join(self.model.model_config.pretrained_config.architectures)
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
@@ -391,14 +426,17 @@ class ModelEngine:
         """Size the decode and prefill CUDA graphs from the clamped capacity."""
         self.cuda_graph_config = self.llm_args.cuda_graph_config
 
-        if (isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
-                and self.model.model_config.is_encoder_decoder):
+        if (
+            isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
+            and self.model.model_config.is_encoder_decoder
+        ):
             logger.warning(
                 "EncodeCudaGraphConfig is not supported for encoder-decoder "
                 "models through cuda_graph_config. Use DecodeCudaGraphConfig "
                 "for cuda_graph_config and configure encoder graphs through "
                 "encoder_cuda_graph_config. Decoder CUDA graphs will be "
-                "disabled.")
+                "disabled."
+            )
             self.cuda_graph_config = None
 
         plan = plan_cuda_graphs(
@@ -414,37 +452,46 @@ class ModelEngine:
         self.max_cuda_graph_batch_size = plan.max_batch_size
         self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
 
-    def _compile_model(
-            self, configured_encoder_max_num_tokens: Optional[int]) -> None:
+    def _compile_model(self, configured_encoder_max_num_tokens: int | None) -> None:
         """Compile the model, or install the eager NCCL window tensor scopes,
         capture the local multimodal encoders' CUDA graphs, and wrap the result
         in the model caller."""
         torch_compile_config = self.llm_args.torch_compile_config
         prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
         torch_compile_enabled = bool(torch_compile_config is not None)
-        torch_compile_fullgraph = torch_compile_config.enable_fullgraph if torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'enable_fullgraph'].default
+        torch_compile_fullgraph = (
+            torch_compile_config.enable_fullgraph
+            if torch_compile_config is not None
+            else TorchCompileConfig.model_fields["enable_fullgraph"].default
+        )
         compile_only_piecewise_graphs = (
             torch_compile_config.compile_only_piecewise_graphs
-            if torch_compile_config is not None else TorchCompileConfig.
-            model_fields['compile_only_piecewise_graphs'].default)
-        torch_compile_inductor_enabled = torch_compile_config.enable_inductor if torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'enable_inductor'].default
+            if torch_compile_config is not None
+            else TorchCompileConfig.model_fields["compile_only_piecewise_graphs"].default
+        )
+        torch_compile_inductor_enabled = (
+            torch_compile_config.enable_inductor
+            if torch_compile_config is not None
+            else TorchCompileConfig.model_fields["enable_inductor"].default
+        )
         torch_compile_piecewise_cuda_graph = (
-            prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE)
-        torch_compile_enable_userbuffers = torch_compile_config.enable_userbuffers if torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'enable_userbuffers'].default
-        torch_compile_max_num_streams = torch_compile_config.max_num_streams if torch_compile_config is not None else TorchCompileConfig.model_fields[
-            'max_num_streams'].default
+            prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        )
+        torch_compile_enable_userbuffers = (
+            torch_compile_config.enable_userbuffers
+            if torch_compile_config is not None
+            else TorchCompileConfig.model_fields["enable_userbuffers"].default
+        )
+        torch_compile_max_num_streams = (
+            torch_compile_config.max_num_streams
+            if torch_compile_config is not None
+            else TorchCompileConfig.model_fields["max_num_streams"].default
+        )
 
         self._torch_compile_prefill_only = False
 
         backend_num_streams = None
         try:
-            use_ub_for_nccl = (
-                self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
-                and self._init_userbuffers(self.model.config.hidden_size))
-            self._nccl_window_tensor_scope_hooks = []
             if torch_compile_enabled:
                 set_torch_compiling(True)
                 if mpi_disabled() and self.mapping.world_size > 1:
@@ -465,43 +512,45 @@ class ModelEngine:
                 num_mnnvl_allreduces = 0
                 for module in self.model.modules():
                     if isinstance(module, MNNVLAllReduce):
-                        module.prescale_workspace(self.max_num_tokens,
-                                                  self.model.config.hidden_size)
+                        module.prescale_workspace(
+                            self.max_num_tokens, self.model.config.hidden_size
+                        )
                         num_mnnvl_allreduces += 1
                 if num_mnnvl_allreduces:
-                    logger.info(f"Pre-scaled the MNNVL allreduce workspace for "
-                                f"{num_mnnvl_allreduces} modules to cover "
-                                f"max_num_tokens={self.max_num_tokens} before "
-                                "torch.compile.")
-                use_ub = not use_ub_for_nccl and (
-                    torch_compile_enable_userbuffers
-                    and self._init_userbuffers(self.model.config.hidden_size))
-                backend_num_streams = Backend.Streams([
-                    torch.cuda.Stream()
-                    for _ in range(torch_compile_max_num_streams - 1)
-                ])
+                    logger.info(
+                        f"Pre-scaled the MNNVL allreduce workspace for "
+                        f"{num_mnnvl_allreduces} modules to cover "
+                        f"max_num_tokens={self.max_num_tokens} before "
+                        "torch.compile."
+                    )
+                use_ub = torch_compile_enable_userbuffers and self._init_userbuffers(
+                    self.model.config.hidden_size
+                )
+                backend_num_streams = Backend.Streams(
+                    [torch.cuda.Stream() for _ in range(torch_compile_max_num_streams - 1)]
+                )
                 self._torch_compile_backend = Backend(
                     torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=(
-                        torch_compile_piecewise_cuda_graph),
+                    enable_piecewise_cuda_graph=(torch_compile_piecewise_cuda_graph),
                     capture_num_tokens=self._prefill_cuda_graph_num_tokens,
                     max_num_streams=torch_compile_max_num_streams,
-                    mapping=self.mapping)
+                    mapping=self.mapping,
+                )
                 if compile_only_piecewise_graphs and not isinstance(
-                        self.model, DecoderModelForCausalLM):
+                    self.model, DecoderModelForCausalLM
+                ):
                     raise ValueError(
                         "TorchCompileConfig."
                         "compile_only_piecewise_graphs=True is "
-                        "only supported for DecoderModelForCausalLM models.")
+                        "only supported for DecoderModelForCausalLM models."
+                    )
 
-                self._apply_torch_compile(self._torch_compile_backend,
-                                          torch_compile_fullgraph)
+                self._apply_torch_compile(self._torch_compile_backend, torch_compile_fullgraph)
                 torch._dynamo.config.cache_size_limit = 16
             else:
                 set_torch_compiling(False)
-                self._nccl_window_tensor_scope_hooks = (
-                    install_eager_nccl_window_tensor_scopes(self.model))
+                install_eager_nccl_window_tensor_scopes(self.model)
 
             # Capture local encoders after their metadata is sized and before
             # KV-cache estimation, so graph memory is included in the profile.
@@ -509,9 +558,11 @@ class ModelEngine:
             setup_mm_encoder_cuda_graphs(
                 self.model,
                 mm_config.encoder_cuda_graph if mm_config is not None else None,
-                max_num_tokens=configured_encoder_max_num_tokens)
+                max_num_tokens=configured_encoder_max_num_tokens,
+            )
         except Exception as e:
             import traceback
+
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
         self._model_caller = ModelCaller(
@@ -530,23 +581,28 @@ class ModelEngine:
         self._set_warmup_effects(False)
 
         sparse_attention_config = self.model.model_config.sparse_attention_config
-        sparse_params = (sparse_attention_config.to_sparse_params(
-            pretrained_config=self.model.model_config.pretrained_config)
-                         if sparse_attention_config is not None else None)
-        self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
-                                                  sparse_params=sparse_params)
+        sparse_params = (
+            sparse_attention_config.to_sparse_params(
+                pretrained_config=self.model.model_config.pretrained_config
+            )
+            if sparse_attention_config is not None
+            else None
+        )
+        self.attn_backend = get_attention_backend(
+            self.llm_args.attn_backend, sparse_params=sparse_params
+        )
 
         runner_cls = resolve_runner_type(self.model, self.llm_args)
         if self.is_spec_decode and issubclass(runner_cls, NoKVCacheRunner):
             raise ValueError(
                 f"{runner_cls.__name__} does not support speculative decoding; "
                 "pooling and multimodal encoder models must not set "
-                "speculative_config.")
+                "speculative_config."
+            )
 
         if self.is_spec_decode:
             update_spec_config_from_loaded_model(self.spec_config, self.model)
-            self.without_logits = self.spec_config.spec_dec_mode.without_logits(
-            )
+            self.without_logits = self.spec_config.spec_dec_mode.without_logits()
             self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
             self.max_draft_len = self.spec_config.max_draft_len
         else:
@@ -556,9 +612,9 @@ class ModelEngine:
 
         self._metrics: dict[str, float] = defaultdict(float)
         self.iter_states: dict[str, Any] = {}
-        self.lora_model_config: Optional[LoraModelConfig] = None
-        self._lora_owner: Optional[DecoderLoraOwner] = None
-        self._lora_model: Optional[torch.nn.Module] = None
+        self.lora_model_config: LoraModelConfig | None = None
+        self._lora_owner: DecoderLoraOwner | None = None
+        self._lora_model: torch.nn.Module | None = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._runner = self._initialize_runner(runner_cls)
@@ -566,13 +622,12 @@ class ModelEngine:
         layer_quant_mode = self.model.model_config.quant_config.layer_quant_mode
         if layer_quant_mode.has_fp4_kv_cache():
             self.kv_cache_dtype_byte_size = 1 / 2
-        elif (layer_quant_mode.has_fp8_kv_cache()
-              or layer_quant_mode.has_int8_kv_cache()):
+        elif layer_quant_mode.has_fp8_kv_cache() or layer_quant_mode.has_int8_kv_cache():
             self.kv_cache_dtype_byte_size = 1
         else:
             self.kv_cache_dtype_byte_size = 2
 
-    def _initialize_runner(self, runner_cls: Type[ModelRunner]) -> ModelRunner:
+    def _initialize_runner(self, runner_cls: type[ModelRunner]) -> ModelRunner:
         assert self._model_caller is not None
         if issubclass(runner_cls, EncoderRunner):
             return self._initialize_encoder_runner(runner_cls)
@@ -582,16 +637,20 @@ class ModelEngine:
             return self._initialize_no_kv_cache_runner(runner_cls)
         if issubclass(runner_cls, DecoderRunner):
             return self._initialize_decoder_runner(runner_cls)
-        raise TypeError(f"No runner initializer registered for "
-                        f"{runner_cls.__module__}.{runner_cls.__qualname__}")
+        raise TypeError(
+            f"No runner initializer registered for "
+            f"{runner_cls.__module__}.{runner_cls.__qualname__}"
+        )
 
-    def _initialize_encoder_runner(
-            self, runner_cls: Type[EncoderRunner]) -> EncoderRunner:
+    def _initialize_encoder_runner(self, runner_cls: type[EncoderRunner]) -> EncoderRunner:
         runner_config = EncoderRunnerConfig.create(
             model=self.model,
             mapping=self.mapping,
-            graph_config=(self.cuda_graph_config if isinstance(
-                self.cuda_graph_config, EncodeCudaGraphConfig) else None),
+            graph_config=(
+                self.cuda_graph_config
+                if isinstance(self.cuda_graph_config, EncodeCudaGraphConfig)
+                else None
+            ),
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_seq_len=self.max_seq_len,
@@ -611,8 +670,8 @@ class ModelEngine:
         )
 
     def _initialize_encoder_decoder_runner(
-            self,
-            runner_cls: Type[EncoderDecoderRunner]) -> EncoderDecoderRunner:
+        self, runner_cls: type[EncoderDecoderRunner]
+    ) -> EncoderDecoderRunner:
         encoder_config = EncoderStageConfig.create(
             model=self.model,
             mapping=self.mapping,
@@ -629,16 +688,17 @@ class ModelEngine:
         runner_config = self._decoder_runner_config(
             EncoderDecoderRunnerConfig,
             enable_encoder_decoder_mixed_cuda_graph=(
-                self.llm_args.enable_encoder_decoder_mixed_cuda_graph),
+                self.llm_args.enable_encoder_decoder_mixed_cuda_graph
+            ),
         )
         return self._initialize_decoder_runner(
             runner_cls,
             runner_config,
             encoder_config=encoder_config,
-            input_processor=self.input_processor)
+            input_processor=self.input_processor,
+        )
 
-    def _initialize_no_kv_cache_runner(
-            self, runner_cls: Type[NoKVCacheRunner]) -> NoKVCacheRunner:
+    def _initialize_no_kv_cache_runner(self, runner_cls: type[NoKVCacheRunner]) -> NoKVCacheRunner:
         runner_config = NoKVCacheRunnerConfig(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -671,9 +731,8 @@ class ModelEngine:
         )
 
     def _decoder_runner_config(
-            self,
-            config_cls: Type[DecoderRunnerConfig] = DecoderRunnerConfig,
-            **extra_fields: Any) -> DecoderRunnerConfig:
+        self, config_cls: type[DecoderRunnerConfig] = DecoderRunnerConfig, **extra_fields: Any
+    ) -> DecoderRunnerConfig:
         return config_cls(
             max_batch_size=self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -684,7 +743,6 @@ class ModelEngine:
             dtype=self.model.config.torch_dtype,
             enable_attention_dp=self.enable_attention_dp,
             disable_overlap_scheduler=self.llm_args.disable_overlap_scheduler,
-            is_encode_only=self.llm_args.encode_only,
             is_spec_decode=self.is_spec_decode,
             max_draft_len=self.max_draft_len,
             max_total_draft_tokens=self.max_total_draft_tokens,
@@ -692,10 +750,8 @@ class ModelEngine:
             spec_config=self.spec_config,
             num_seq_slots=self.max_num_seq_slots,
             original_max_draft_len=self.original_max_draft_len,
-            original_max_total_draft_tokens=(
-                self.original_max_total_draft_tokens),
-            spec_dec_max_total_draft_tokens=(
-                self._spec_dec_max_total_draft_tokens),
+            original_max_total_draft_tokens=(self.original_max_total_draft_tokens),
+            spec_dec_max_total_draft_tokens=(self._spec_dec_max_total_draft_tokens),
             cuda_graph_config=self.cuda_graph_config,
             cuda_graph_batch_sizes=self._cuda_graph_batch_sizes,
             cuda_graph_padding_enabled=self._cuda_graph_padding_enabled,
@@ -705,12 +761,12 @@ class ModelEngine:
             enable_in_graph_sampling=self.enable_in_graph_sampling,
             torch_compile_enabled=self._torch_compile_backend is not None,
             torch_compile_piecewise_cuda_graph=(
-                self.llm_args.prefill_cuda_graph_backend ==
-                PrefillCudaGraphBackend.PIECEWISE),
+                self.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+            ),
             torch_compile_prefill_only=self._torch_compile_prefill_only,
             compile_only_piecewise_graphs=(
-                self.llm_args.torch_compile_config is not None and
-                self.llm_args.torch_compile_config.compile_only_piecewise_graphs
+                self.llm_args.torch_compile_config is not None
+                and self.llm_args.torch_compile_config.compile_only_piecewise_graphs
             ),
             use_mrope=use_mrope(self.model),
             is_multimodal=is_multimodal(self.model, self.input_processor),
@@ -718,15 +774,18 @@ class ModelEngine:
             enable_autotuner=self.llm_args.enable_autotuner,
             cuda_graph_specialize_lora=(
                 self.llm_args.lora_config is not None
-                and self.llm_args.lora_config.cuda_graph_specialize_lora),
+                and self.llm_args.lora_config.cuda_graph_specialize_lora
+            ),
+            spec_decode_fast_paths=self.spec_decode_fast_paths,
             **extra_fields,
         )
 
     def _initialize_decoder_runner(
-            self,
-            runner_cls: Type[DecoderRunner],
-            runner_config: Optional[DecoderRunnerConfig] = None,
-            **runner_kwargs: Any) -> DecoderRunner:
+        self,
+        runner_cls: type[DecoderRunner],
+        runner_config: DecoderRunnerConfig | None = None,
+        **runner_kwargs: Any,
+    ) -> DecoderRunner:
         assert self._model_caller is not None
         if runner_config is None:
             runner_config = self._decoder_runner_config()
@@ -737,12 +796,13 @@ class ModelEngine:
             mapping=self.mapping,
             dist=self.dist,
             moe_load_balancer=self.moe_load_balancer,
-            sparse_attention_config=(
-                self.model.model_config.sparse_attention_config),
+            sparse_attention_config=(self.model.model_config.sparse_attention_config),
             attention_runtime_features=self.attn_runtime_features,
             get_runtime_tokens_per_gen_step=(
-                self.spec_config.get_runtime_tokens_per_gen_step if
-                self.spec_config is not None else lambda runtime_draft_len: 1),
+                self.spec_config.get_runtime_tokens_per_gen_step
+                if self.spec_config is not None
+                else lambda runtime_draft_len: 1
+            ),
             warmup_timer=self._warmup_timer,
             iter_states=self.iter_states,
             metrics=self._metrics,
@@ -751,19 +811,19 @@ class ModelEngine:
         )
 
     @property
-    def attn_metadata(self) -> Optional[AttentionMetadata]:
+    def attn_metadata(self) -> AttentionMetadata | None:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.attn_metadata
         return None
 
     @property
-    def spec_metadata(self) -> Optional[SpecMetadata]:
+    def spec_metadata(self) -> SpecMetadata | None:
         if isinstance(self._runner, DecoderRunner):
             return self._runner.spec_metadata
         return None
 
     @property
-    def cuda_graph_runner(self) -> Optional[CUDAGraphRunner]:
+    def cuda_graph_runner(self) -> CUDAGraphRunner | None:
         # PyExecutor suspends the padding dummies around a KV pool rebalance.
         if not isinstance(self._runner, DecoderRunner):
             return None
@@ -780,6 +840,59 @@ class ModelEngine:
         return self._cuda_graph_padding_enabled
 
     @property
+    def _dspark_confidence_enabled(self) -> bool:
+        return isinstance(self._runner, DecoderRunner) and self._runner._dspark_confidence_enabled
+
+    @property
+    def _dspark_trims_submitted_tokens(self) -> bool:
+        return (
+            isinstance(self._runner, DecoderRunner) and self._runner._dspark_trims_submitted_tokens
+        )
+
+    @property
+    def _dspark_sps_cost_table(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return self._runner._dspark_sps_cost_table
+
+    @property
+    def _dspark_exact_candidate_cells(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner._dspark_exact_candidate_cells
+
+    @property
+    def _dspark_exact_identity_words(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return (0,) * 8
+        return self._runner._dspark_exact_identity_words
+
+    @property
+    def _dspark_device_budget(self):
+        if not isinstance(self._runner, DecoderRunner):
+            return None
+        return getattr(self._runner, "_dspark_device_budget", None)
+
+    @_dspark_device_budget.setter
+    def _dspark_device_budget(self, value) -> None:
+        if isinstance(self._runner, DecoderRunner):
+            self._runner._dspark_device_budget = value
+
+    def ragged_verify_token_buckets(self, batch_size: int):
+        if not isinstance(self._runner, DecoderRunner):
+            return ()
+        return self._runner.ragged_verify_token_buckets(batch_size)
+
+    def fit_ragged_verify_lens(self, *args, **kwargs):
+        assert isinstance(self._runner, DecoderRunner)
+        return self._runner.fit_ragged_verify_lens(*args, **kwargs)
+
+    def _get_spec_worker(self):
+        if isinstance(self._runner, DecoderRunner):
+            return self._runner._get_spec_worker()
+        return None
+
+    @property
     def metrics(self) -> dict[str, float]:
         """Return model-engine warmup time metrics."""
         return self._metrics
@@ -789,21 +902,19 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             self._runner.forward_pass_callable = callable
 
-    def register_sample_in_graph_callable(self,
-                                          callable: Optional[Callable]) -> None:
+    def register_sample_in_graph_callable(self, callable: Callable | None) -> None:
         """Register the hook that samples at the tail of the forward graph."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.sample_in_graph_callable = callable
 
-    def register_beam_histories_callable(self,
-                                         callable: Optional[Callable]) -> None:
+    def register_beam_histories_callable(self, callable: Callable | None) -> None:
         """Register where logits post-processors get live beam histories."""
         if isinstance(self._runner, DecoderRunner):
             self._runner.start_beam_histories_callable = callable
 
-    def register_sample_type_resolver(self,
-                                      resolver: Optional[Callable],
-                                      stage: Optional[Callable] = None) -> None:
+    def register_sample_type_resolver(
+        self, resolver: Callable | None, stage: Callable | None = None
+    ) -> None:
         """Register how a batch maps to its sampling tier, for the graph key."""
         assert isinstance(self._runner, DecoderRunner)
         self._runner.register_sample_type_resolver(resolver, stage)
@@ -812,7 +923,8 @@ class ModelEngine:
         """Bind the decoder owner once, across resource-capacity estimation passes."""
         if self._lora_owner is None:
             self._lora_owner, self._lora_model = resolve_lora_owner(
-                self.model, self.input_processor)
+                self.model, self.input_processor
+            )
         return self._lora_owner
 
     def set_lora_model_config(self, lora_model_config: LoraModelConfig) -> None:
@@ -825,11 +937,14 @@ class ModelEngine:
         """Build LoRA preparation state for the current executor resources."""
         if isinstance(self._runner, DecoderRunner):
             assert self._lora_model is not None
-            self._runner.init_cuda_graph_lora_manager(lora_config,
-                                                      self._lora_model)
+            self._runner.init_cuda_graph_lora_manager(lora_config, self._lora_model)
 
-    def set_guided_decoder(self,
-                           guided_decoder: CapturableGuidedDecoder) -> bool:
+    def drop_greedy_only_outputs(self) -> None:
+        """Have every batch return logits, for an executor-side guided decoder that reads them."""
+        if isinstance(self._runner, DecoderRunner):
+            self._runner.keep_greedy_only_outputs = False
+
+    def set_guided_decoder(self, guided_decoder: CapturableGuidedDecoder) -> bool:
         if hasattr(self.model, "set_guided_decoder"):
             success = self.model.set_guided_decoder(guided_decoder)
             if success and isinstance(self._runner, DecoderRunner):
@@ -841,8 +956,8 @@ class ModelEngine:
         set_moe_comm_warmup(in_warmup)
         if self.moe_load_balancer is not None:
             self.moe_load_balancer.set_iter_info(
-                enable_statistic=not in_warmup,
-                enable_update_weights=not in_warmup)
+                enable_statistic=not in_warmup, enable_update_weights=not in_warmup
+            )
 
     @contextmanager
     def warmup_scope(self) -> Iterator[None]:
@@ -884,22 +999,23 @@ class ModelEngine:
         """
 
         @functools.wraps(method)
-        def wrapper(self,
-                    resource_manager: Optional[ResourceManager] = None,
-                    *args,
-                    **kwargs):
+        def wrapper(self, resource_manager: ResourceManager | None = None, *args, **kwargs):
             with timing_metric("total_warmup_seconds", self._metrics):
                 result = method(self, resource_manager, *args, **kwargs)
                 with timing_metric("kv_cache_cleanup_seconds", self._metrics):
-                    kv_cache_manager = (resource_manager.get_resource_manager(
-                        ResourceManagerType.KV_CACHE_MANAGER) if
-                                        resource_manager is not None else None)
+                    kv_cache_manager = (
+                        resource_manager.get_resource_manager(ResourceManagerType.KV_CACHE_MANAGER)
+                        if resource_manager is not None
+                        else None
+                    )
                     if kv_cache_manager is not None:
                         has_invalid_values = kv_cache_manager.check_invalid_values_in_kv_cache(
-                            fill_with_zero=True)
+                            fill_with_zero=True
+                        )
                         if has_invalid_values:
                             logger.warning(
-                                "NaNs/Infs have been introduced to KVCache during warmup, KVCache was filled with zeros to avoid potential issues"
+                                "NaNs/Infs have been introduced to KVCache during warmup, "
+                                "KVCache was filled with zeros to avoid potential issues"
                             )
             return result
 
@@ -919,21 +1035,19 @@ class ModelEngine:
 
     def forward_encoder(
         self,
-        encoder_requests: List[LlmRequest],
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> Tuple[torch.Tensor, List[int]]:
+        encoder_requests: list[LlmRequest],
+        resource_manager: ResourceManager | None = None,
+    ) -> tuple[torch.Tensor, list[int]]:
         if not isinstance(self._runner, EncoderDecoderRunner):
             raise RuntimeError(
                 "Encoder phase requires an initialized encoder-decoder model runner."
             )
-        assert resource_manager is not None, (
-            "the encoder phase requires a resource manager")
+        assert resource_manager is not None, "the encoder phase requires a resource manager"
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = list(encoder_requests)
         outputs = self._runner.forward_encoder(
             ScheduledInputs(batch=scheduled_requests),
             resource_manager=resource_manager,
-            is_dummy=self._warmup_depth > 0,
         )
         return (
             outputs["encoder_hidden_states"],
@@ -941,15 +1055,12 @@ class ModelEngine:
         )
 
     @warmup_with_kv_cache_cleanup
-    def warmup(self,
-               resource_manager: Optional[ResourceManager] = None) -> None:
+    def warmup(self, resource_manager: ResourceManager | None = None) -> None:
         """Run model warmup and record its total wall-clock duration."""
         with self.warmup_scope():
             self._warmup_impl(resource_manager)
 
-    def _warmup_impl(self,
-                     resource_manager: Optional[ResourceManager] = None
-                     ) -> None:
+    def _warmup_impl(self, resource_manager: ResourceManager | None = None) -> None:
         """
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
@@ -957,8 +1068,7 @@ class ModelEngine:
         if isinstance(self._runner, PackedModelRunner):
             self._runner.warmup()
             return
-        assert resource_manager is not None, (
-            "scheduled warmup requires a resource manager")
+        assert resource_manager is not None, "scheduled warmup requires a resource manager"
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
 
@@ -971,31 +1081,31 @@ class ModelEngine:
         if isinstance(self.model, DecoderModelForCausalLM):
             return
         decoder_model = getattr(self.model, "llm", None)
-        if (self.llm_args.disable_mm_encoder
-                and isinstance(decoder_model, DecoderModelForCausalLM)
-                and getattr(self.model, "mm_encoder", None) is None):
+        if (
+            self.llm_args.disable_mm_encoder
+            and isinstance(decoder_model, DecoderModelForCausalLM)
+            and getattr(self.model, "mm_encoder", None) is None
+        ):
             return
-        if (isinstance(self.model, MultimodalModelMixin) or isinstance(
-                self.input_processor, BaseMultimodalInputProcessor)):
-            raise ValueError(
-                "breakable prefill CUDA graph does not support multimodal models"
-            )
+        if isinstance(self.model, MultimodalModelMixin) or isinstance(
+            self.input_processor, BaseMultimodalInputProcessor
+        ):
+            raise ValueError("breakable prefill CUDA graph does not support multimodal models")
 
     def forward_multimodal_encoder_items(
         self,
-        requests: List[LlmRequest],
-        scheduled_items: Dict[int, List[int]],
+        requests: list[LlmRequest],
+        scheduled_items: dict[int, list[int]],
     ) -> None:
         """Forward selected MM encoder items into the unified output cache."""
         if not scheduled_items:
             return
         if self._mm_item_scheduler is None:
-            raise TypeError(
-                "Item-level MM scheduling requires MultimodalModelMixin")
+            raise TypeError("Item-level MM scheduling requires MultimodalModelMixin")
         self._mm_item_scheduler.forward_items(requests, scheduled_items)
 
     @property
-    def mm_encoder_cache(self) -> Optional[TensorLRUCache]:
+    def mm_encoder_cache(self) -> TensorLRUCache | None:
         """Return the model-owned encoder-output cache used by this engine."""
         # Whole-model torch.compile wraps the model after its cache is created.
         model = getattr(self.model, "_orig_mod", self.model)
@@ -1005,8 +1115,7 @@ class ModelEngine:
             return None
         return model._multimodal_encoder_cache
 
-    def get_mm_encoder_item_cache_keys(
-            self, request: LlmRequest) -> Optional[List[Hashable]]:
+    def get_mm_encoder_item_cache_keys(self, request: LlmRequest) -> list[Hashable] | None:
         """Return stable cache keys for an item-scheduled request, when available."""
         if self._mm_item_scheduler is None:
             return None
@@ -1018,92 +1127,108 @@ class ModelEngine:
         if encoder_cache is not None:
             encoder_cache.clear()
 
-    def cleanup(self) -> None:
-        """Release resources owned by this model engine.
+    def prepare_cleanup(self, *, release_nccl_window_owners: bool = True) -> None:
+        """Release local graph captures before collective model teardown."""
+        if self._cleanup_done:
+            return
+        self._release_cuda_graphs(release_nccl_window_owners=release_nccl_window_owners)
 
-        Tears down, in order:
+    def shutdown_moe_load_balancer(self, *, local_safe: bool) -> bool:
+        """Run the manager's rank-aligned teardown preflight and collectives."""
+        if self._cleanup_done:
+            return True
+        moe_load_balancer = getattr(self, "moe_load_balancer", None)
+        if moe_load_balancer is None:
+            return bool(local_safe)
+        return moe_load_balancer.shutdown(local_safe=bool(local_safe)) is not False
 
-        1. The optional ``ModelLoader`` (which in turn releases any
-           GMS client; see :meth:`ModelLoader.cleanup`).
-        2. Runner resources and executor-owned CUDA Graph captures (via
-           :meth:`_release_cuda_graphs`).
-        3. The runner, model caller, MM item scheduler, and model references.
-        4. Input processors.
-
-        Idempotency:
-            Subsequent calls are no-ops (guarded by ``_cleanup_done``).
-            The flag is set only at the end, so a partial cleanup that
-            raises mid-way will be retried on the next call.
-
-        Called from:
-            :meth:`__del__`, and only from there. ``PyExecutor.shutdown``
-            deliberately does *not* call this: it is also invoked mid-init by
-            ``configure_kv_cache_capacity``, which reads ``model`` right
-            afterwards, so clearing ``model`` here would break it. That path
-            uses an explicit temporary-executor shutdown and then drops its
-            reference instead.
-        """
+    def finish_cleanup(self) -> None:
+        """Release rank-local model resources after collective teardown."""
         if self._cleanup_done:
             return
 
-        # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
-        # rolled back.  Keep each handle live until its own release succeeds,
-        # so a failed cleanup can be retried without double-freeing resources
-        # that were already released.
-        model_loader = self.model_loader
-        if model_loader is not None:
-            model_loader.cleanup()
-            self.model_loader = None
-
-        # Release runner-owned graphs before dropping the runner. Keep the
-        # handle available if graph release fails and cleanup is retried.
-        # Destruction timing is not rank-symmetric; only explicit shutdown releases owners.
-        self._release_cuda_graphs(release_nccl_window_owners=False)
-
-        # The runner, caller and scheduler retain the model, so
-        # clearing the engine's attribute alone would leave the weights
-        # reachable past `release_gc()` below.
+        self._release_model_loader()
+        self.moe_load_balancer = None
+        # The runner, caller and scheduler retain the model, so clearing the
+        # engine's attribute alone would leave the weights reachable.
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
         self._lora_model = None
         self._lora_owner = None
         self.model = None
-
         self.input_processor = None
-
-        # Release model weights.
         release_gc()
         self._cleanup_done = True
 
-    def __del__(self) -> None:
-        """Best-effort cleanup during garbage collection.
+    def _release_model_loader(self) -> None:
+        # Keep the handle live until its release succeeds, so a failed cleanup
+        # can be retried without releasing the loader twice.
+        model_loader = self.model_loader
+        if model_loader is not None:
+            model_loader.cleanup()
+            self.model_loader = None
 
-        Delegates to :meth:`cleanup`. Catches ``RuntimeError`` (which a
-        release step such as :meth:`_release_cuda_graphs` or
-        ``ModelLoader.cleanup`` may raise) and ``AttributeError`` (typical
-        on partially-initialized engines torn down during interpreter
-        shutdown when module references have already been cleared); both
-        are logged and swallowed because destructors cannot reliably
-        surface exceptions.
+    def cleanup(self, *, collective: bool = False) -> None:
+        """Release model resources.
 
-        This is the only production caller of :meth:`cleanup` -- see the
-        note there on why ``PyExecutor.shutdown`` must not call it.
+        By default this is the rank-local cleanup that Python finalizers run:
+        the model loader, then graph captures, then the model references. With
+        ``collective``, it first releases local graph captures on every rank,
+        then passes that local result into the load-balancer's collective
+        preflight, and only then drops rank-local model state; worker-owned
+        terminal cleanup is responsible for those collective resources.
         """
+        if self._cleanup_done:
+            return
+
+        if not collective:
+            self._release_model_loader()
+            # Destruction timing is not rank-symmetric; only explicit shutdown
+            # releases NCCL window owners.
+            self.prepare_cleanup(release_nccl_window_owners=False)
+            moe_load_balancer = getattr(self, "moe_load_balancer", None)
+            if moe_load_balancer is not None and not getattr(
+                moe_load_balancer, "shutdown_on_finalize", False
+            ):
+                logger.warning(
+                    "Skipping collective MoE load-balancer shutdown from Python finalization; "
+                    "terminal executor shutdown must release it explicitly"
+                )
+            self.finish_cleanup()
+            return
+
+        prepare_error = None
         try:
-            self.cleanup()
+            self.prepare_cleanup()
+        except BaseException as error:  # Preserve rank alignment before surfacing it.
+            prepare_error = error
+
+        manager_safe = self.shutdown_moe_load_balancer(local_safe=prepare_error is None)
+        if prepare_error is not None:
+            raise prepare_error
+        if not manager_safe:
+            raise RuntimeError("MoE load-balancer collective shutdown was not safe on every rank")
+        self.finish_cleanup()
+
+    def __del__(self) -> None:
+        """Best-effort rank-local cleanup during garbage collection."""
+        try:
+            self.cleanup(collective=False)
         except (RuntimeError, AttributeError) as e:
-            logger.warning("ModelEngine cleanup failed during destruction: %s",
-                           e)
+            logger.warning("ModelEngine cleanup failed during destruction: %s", e)
 
     def _init_max_seq_len(self):
         # Allow user to override the inferred max_seq_len with a warning.
-        allow_long_max_model_len = os.getenv(
-            "TLLM_ALLOW_LONG_MAX_MODEL_LEN",
-            "0").lower() in ["1", "true", "yes", "y"]
+        allow_long_max_model_len = os.getenv("TLLM_ALLOW_LONG_MAX_MODEL_LEN", "0").lower() in [
+            "1",
+            "true",
+            "yes",
+            "y",
+        ]
 
         # Vision encoders may expose their own sequence-length inference.
-        if hasattr(self.model, 'infer_max_seq_len'):
+        if hasattr(self.model, "infer_max_seq_len"):
             inferred_max_seq_len = self.model.infer_max_seq_len()
         else:
             inferred_max_seq_len = self._infer_max_seq_len_from_config()
@@ -1129,35 +1254,30 @@ class ModelEngine:
                 self.max_seq_len = inferred_max_seq_len
 
     def _infer_max_seq_len_from_config(self) -> int:
-
-        if hasattr(self.model, 'model_config') and self.model.model_config:
+        if hasattr(self.model, "model_config") and self.model.model_config:
             model_config = self.model.model_config.pretrained_config
-            rope_scaling = getattr(model_config, 'rope_scaling', None)
+            rope_scaling = getattr(model_config, "rope_scaling", None)
             rope_factor = 1
             if rope_scaling is not None:
-                rope_type = rope_scaling.get('type',
-                                             rope_scaling.get('rope_type'))
+                rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
                 if rope_type not in ("su", "longrope", "llama3", "yarn"):
-                    rope_factor = rope_scaling.get('factor', 1.0)
+                    rope_factor = rope_scaling.get("factor", 1.0)
 
             # Step 1: Find the upper bound of max_seq_len
             inferred_max_seq_len = 2048
-            max_position_embeddings = getattr(model_config,
-                                              'max_position_embeddings', None)
-            if max_position_embeddings is None and hasattr(
-                    model_config, 'text_config'):
-                max_position_embeddings = getattr(model_config.text_config,
-                                                  'max_position_embeddings',
-                                                  None)
+            max_position_embeddings = getattr(model_config, "max_position_embeddings", None)
+            if max_position_embeddings is None and hasattr(model_config, "text_config"):
+                max_position_embeddings = getattr(
+                    model_config.text_config, "max_position_embeddings", None
+                )
             if max_position_embeddings is not None:
                 inferred_max_seq_len = max_position_embeddings
 
             # Step 2: Scale max_seq_len with rotary scaling
             if rope_factor != 1:
-                inferred_max_seq_len = int(
-                    math.ceil(inferred_max_seq_len * rope_factor))
+                inferred_max_seq_len = int(math.ceil(inferred_max_seq_len * rope_factor))
                 logger.warning(
-                    f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+                    f"max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}"
                 )
 
             return inferred_max_seq_len
@@ -1192,11 +1312,9 @@ class ModelEngine:
         model = getattr(self, "model", None)
         if model is not None:
             for module in model.modules():
-                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph",
-                                             None)
+                clear_blocks_graph = getattr(module, "clear_blocks_cuda_graph", None)
                 if clear_blocks_graph is not None:
-                    clear_blocks_graph(
-                        release_nccl_window_owners=release_nccl_window_owners)
+                    clear_blocks_graph(release_nccl_window_owners=release_nccl_window_owners)
 
     def _release_cuda_graphs(
         self,
@@ -1204,14 +1322,13 @@ class ModelEngine:
         release_nccl_window_owners: bool = True,
     ) -> None:
         if self._runner is not None:
-            self._runner.release_graphs(
-                release_nccl_window_owners=release_nccl_window_owners)
+            self._runner.release_graphs(release_nccl_window_owners=release_nccl_window_owners)
         if self._torch_compile_backend is not None:
             self._torch_compile_backend.clear_piecewise_cuda_graphs(
-                release_nccl_window_owners=release_nccl_window_owners)
+                release_nccl_window_owners=release_nccl_window_owners
+            )
 
-    def release_executor_resources(self, *,
-                                   release_model_owned_graphs: bool) -> None:
+    def release_executor_resources(self, *, release_model_owned_graphs: bool) -> None:
         """Release CUDA graphs and attention metadata bound to the executor's
         resource managers, before those managers shut down.
 
@@ -1233,22 +1350,22 @@ class ModelEngine:
 
     def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
         """Compile the eager model scope."""
-        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
-                                          None)
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile", None)
         if isinstance(self.model, DecoderModelForCausalLM):
             eager_model = self._eager_decoder_scope()
-            compiled_model = torch.compile(eager_model,
-                                           backend=backend,
-                                           fullgraph=fullgraph)
+            compiled_model = torch.compile(eager_model, backend=backend, fullgraph=fullgraph)
             self._torch_compile_prefill_only = (
-                self.llm_args.prefill_cuda_graph_backend
-                == PrefillCudaGraphBackend.PIECEWISE
-                and (self.llm_args.torch_compile_config.
-                     compile_only_piecewise_graphs
-                     or not self.model.use_fx_for_pcg_fallback))
-            self.model.model = (PrefillCompiledModel(
-                eager_model, compiled_model) if self._torch_compile_prefill_only
-                                else compiled_model)
+                self.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+                and (
+                    self.llm_args.torch_compile_config.compile_only_piecewise_graphs
+                    or not self.model.use_fx_for_pcg_fallback
+                )
+            )
+            self.model.model = (
+                PrefillCompiledModel(eager_model, compiled_model)
+                if self._torch_compile_prefill_only
+                else compiled_model
+            )
         elif callable(apply_llm_torch_compile):
             # Avoid nesting a new wrapper around the previous compile.
             llm = getattr(self.model, "llm", None)
@@ -1260,17 +1377,14 @@ class ModelEngine:
             apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
         else:
             eager_model = getattr(self.model, "_orig_mod", self.model)
-            self.model = torch.compile(eager_model,
-                                       backend=backend,
-                                       fullgraph=fullgraph)
+            self.model = torch.compile(eager_model, backend=backend, fullgraph=fullgraph)
 
     def _remove_torch_compile(self) -> None:
         """Restore the eager model scope."""
         if isinstance(self.model, DecoderModelForCausalLM):
             self.model.model = self._eager_decoder_scope()
             return
-        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile",
-                                          None)
+        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile", None)
         if callable(apply_llm_torch_compile):
             llm = getattr(self.model, "llm", None)
             compiled_model = getattr(llm, "model", None)
@@ -1307,8 +1421,7 @@ class ModelEngine:
         torch.cuda.synchronize()
         self._remove_torch_compile()
 
-    def restore_compiled_model_after_refit(
-            self, resource_manager: ResourceManager) -> None:
+    def restore_compiled_model_after_refit(self, resource_manager: ResourceManager) -> None:
         """Re-install the torch.compile wrapper after refit.
 
         Gated on torch.compile, not on PWCG -- see
@@ -1343,8 +1456,8 @@ class ModelEngine:
             return
         with self.warmup_scope():
             self._apply_torch_compile(
-                self._torch_compile_backend,
-                self.llm_args.torch_compile_config.enable_fullgraph)
+                self._torch_compile_backend, self.llm_args.torch_compile_config.enable_fullgraph
+            )
 
     # Back-compat aliases. Callers probe these names with getattr() and fall
     # back to doing nothing, so removing them would silently skip the unwrap
@@ -1354,30 +1467,35 @@ class ModelEngine:
 
     def get_max_num_sequences(self) -> int:
         """
-        Return the maximum number of sequences that the model supports. PyExecutor needs this to compute max_num_active_requests
+        Return the maximum number of sequences that the model supports.
+        PyExecutor needs this to compute max_num_active_requests
         """
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
-    def forward(self,
-                batch: Union[ScheduledRequests, PackedInputs],
-                resource_manager: Optional[ResourceManager] = None,
-                new_tensors_device: Optional[SampleStateTensors] = None,
-                cache_indirection_buffer: Optional[torch.Tensor] = None,
-                *,
-                enable_spec_decode: bool = False,
-                runtime_draft_len: int = 0):
+    def forward(
+        self,
+        batch: ScheduledRequests | PackedInputs,
+        resource_manager: ResourceManager | None = None,
+        new_tensors_device: SampleStateTensors | None = None,
+        cache_indirection_buffer: torch.Tensor | None = None,
+        *,
+        enable_spec_decode: bool = False,
+        runtime_draft_len: int = 0,
+    ):
         if isinstance(batch, PackedInputs):
             assert isinstance(self._runner, PackedModelRunner), (
-                "a packed batch requires a packed-batch runner")
+                "a packed batch requires a packed-batch runner"
+            )
             return self._runner.forward(batch)
-        assert resource_manager is not None, (
-            "scheduled execution requires a resource manager")
-        inputs = make_scheduled_inputs(batch,
-                                       new_tensors_device,
-                                       cache_indirection_buffer,
-                                       enable_spec_decode=enable_spec_decode,
-                                       runtime_draft_len=runtime_draft_len)
+        assert resource_manager is not None, "scheduled execution requires a resource manager"
+        inputs = make_scheduled_inputs(
+            batch,
+            new_tensors_device,
+            cache_indirection_buffer,
+            enable_spec_decode=enable_spec_decode,
+            runtime_draft_len=runtime_draft_len,
+        )
         # Only a warmup scope makes the pass dummy; padding requests in a
         # serving batch do not.
         return self._forward_scheduled(
@@ -1394,7 +1512,8 @@ class ModelEngine:
         is_dummy: bool = False,
     ) -> Any:
         assert isinstance(self._runner, ScheduledModelRunner), (
-            "scheduled execution requires a scheduled runner")
+            "scheduled execution requires a scheduled runner"
+        )
         return self._runner.forward(
             inputs,
             resource_manager=resource_manager,
@@ -1414,7 +1533,8 @@ class ModelEngine:
         if mpi_disabled():
             logger.info(
                 "Disabling userbuffers: its bootstrap requires MPI, which is "
-                "disabled under this orchestrator.")
+                "disabled under this orchestrator."
+            )
             return False
 
         # Disable UB for unsupported platforms
@@ -1425,12 +1545,14 @@ class ModelEngine:
         if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
             # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        ub.initialize_userbuffers_manager(
+            self.mapping.tp_size,
+            self.mapping.pp_size,
+            self.mapping.cp_size,
+            self.mapping.rank,
+            self.mapping.gpus_per_node,
+            hidden_size * self.max_num_tokens * 2,
+        )
 
         return True
 

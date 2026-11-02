@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from ...speculative.interface import SpecMetadata
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
+    from .fmha.gqa_decode import KvAppendPlan
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -36,6 +37,7 @@ from ...pyexecutor.kv_cache.mamba_cache_manager import BaseMambaCacheManager
 from ...pyexecutor.resource_manager import KVCacheManager
 from ...pyexecutor.trace_log_utils import log_tensor_size
 from ...utils import get_model_extra_attrs
+from .cpp_schema import cpp_field
 from .sparse.params import (SparseBackendForwardArgs, SparseMetadataParams,
                             SparseRuntimeParams)
 
@@ -1004,48 +1006,32 @@ AttentionMask = Union[PredefinedAttentionMask, CustomAttentionMask]
 class AttentionForwardArgs:
     """Per-forward optional arguments for attention backends."""
 
+    # Caller-facing output buffer, allocated here when absent. Native kernels
+    # consume the per-phase slice in ``FmhaParams.output``, not this full buffer.
     output: Optional[torch.Tensor] = None
     output_sf: Optional[torch.Tensor] = None
-
-    out_scale: Optional[torch.Tensor] = None
-    out_scale_sf: Optional[torch.Tensor] = None
-    kv_scale_orig_quant: Optional[torch.Tensor] = None
-    kv_scale_quant_orig: Optional[torch.Tensor] = None
-
-    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
-    attention_input_type: AttentionInputType = AttentionInputType.mixed
-    attention_window_size: Optional[int] = None
-    attention_mask_data: Optional[torch.Tensor] = None
-    attention_sinks: Optional[torch.Tensor] = None
-    relative_attention_bias: Optional[torch.Tensor] = None
-    relative_attention_max_distance: int = 0
-    cross_kv: Optional[torch.Tensor] = None
-
+    kv_scale_orig_quant: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    kv_scale_quant_orig: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    out_scale_sf: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     latent_cache: Optional[torch.Tensor] = None
     q_pe: Optional[torch.Tensor] = None
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    mrope_position_deltas: Optional[torch.Tensor] = None
-
+    mrope_position_deltas: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     softmax_stats_tensor: Optional[torch.Tensor] = None
-    chunked_prefill_buffer_batch_size: int = 1
-
-    cu_q_seqlens: Optional[torch.Tensor] = None
-    cu_kv_seqlens: Optional[torch.Tensor] = None
-    fmha_scheduler_counter: Optional[torch.Tensor] = None
-    # Testing only: skip the RoPE step of MLA generation (the standalone harness
-    # feeds a pre-RoPE'd fused_q). The TRTLLM backend then appends the new latent
-    # and inits the trtllm-gen scheduler buffers itself.
-    skip_mla_rope_generation: bool = False
-
-    mla_bmm1_scale: Optional[torch.Tensor] = None
-    mla_bmm2_scale: Optional[torch.Tensor] = None
+    attention_sinks: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    cu_q_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    cu_kv_seqlens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    fmha_scheduler_counter: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.uint32)
+    mla_bmm1_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    mla_bmm2_scale: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
     quant_q_buffer: Optional[torch.Tensor] = None
-    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
-    # When non-None alongside `quant_q_buffer`, the C++ op skips
-    # `quantizeCopyInputToFp8Kernel`.
-    quant_scale_qkv: Optional[torch.Tensor] = None
-
-    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    cross_kv: Optional[torch.Tensor] = None
+    relative_attention_bias: Optional[torch.Tensor] = None
+    quant_scale_qkv: Optional[torch.Tensor] = cpp_field(dtype=torch.float32)
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = cpp_field(
+        dtype=torch.float32)
     enable_dsv4_epilogue_fusion: bool = False
 
     # Fused kv_a_layernorm, DSv4 sparse context path. When set, `latent_cache` is the
@@ -1054,6 +1040,13 @@ class AttentionForwardArgs:
     kv_norm_weight: Optional[torch.Tensor] = None
     kv_norm_eps: float = 1e-6
 
+    attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL
+    attention_input_type: AttentionInputType = AttentionInputType.mixed
+    attention_window_size: Optional[int] = None
+    attention_mask_data: Optional[torch.Tensor] = cpp_field(dtype=torch.bool)
+    relative_attention_max_distance: int = 0
+    chunked_prefill_buffer_batch_size: int = 1
+    skip_mla_rope_generation: bool = False
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
@@ -1073,8 +1066,14 @@ class AttentionForwardArgs:
     # Packed QKV for non-MLA attention. MLA always passes a separate query.
     is_fused_qkv: bool = False
     update_kv_cache: bool = True
+    # Attention output gate [num_tokens, ...] offered to the FMHA library: one that multiplies sigmoid(gate) into
+    # the output sets output_gate_applied, and the caller applies the gate otherwise.
+    output_gate: Optional[torch.Tensor] = None
+    output_gate_applied: bool = False
+    # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
+    kv_append: Optional["KvAppendPlan"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
-    timestep: Optional[torch.Tensor] = None
+    timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse
     # algorithm, resolved on the host by the caller. When set, backends use it
     # instead of reading ``timestep``, which CUDA Graph capture cannot do.
@@ -1086,8 +1085,7 @@ class AttentionForwardArgs:
 
     @property
     def mask_type(self) -> int:
-        """Integer mask type accepted by the C++ attention op
-        (``causal`` or ``padding``)."""
+        """Return the mask type this forward pass asks the native attention op for."""
         if self.attention_mask == PredefinedAttentionMask.CAUSAL:
             return int(AttentionMaskType.causal)
         if self.attention_mask == PredefinedAttentionMask.FULL:
@@ -1110,23 +1108,19 @@ _ATTENTION_FORWARD_ARGS_FIELDS = frozenset(
 
 
 def merge_attention_forward_args(
-    forward_args: Optional[AttentionForwardArgs],
-    kwargs: Dict[str, Any],
-) -> AttentionForwardArgs:
+        forward_args: Optional[AttentionForwardArgs],
+        kwargs: Dict[str, Any]) -> AttentionForwardArgs:
     """Merge legacy attention kwargs into explicit forward arguments."""
-
     unknown_kwargs = sorted(set(kwargs) - _ATTENTION_FORWARD_ARGS_FIELDS)
     if unknown_kwargs:
         raise ValueError(
             f"Unknown attention forward arguments: {unknown_kwargs}")
-
     if forward_args is not None:
         if kwargs:
             raise ValueError(
                 "Pass attention forward options either through forward_args "
                 f"or as legacy kwargs, not both: {sorted(kwargs)}")
         return forward_args
-
     return AttentionForwardArgs(**kwargs)
 
 

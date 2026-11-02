@@ -35,14 +35,17 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
     get_kimi_linear_num_attention_layers, get_qwen3_hybrid_num_attention_layers,
     is_glm5_next, is_kimi_linear, is_nemotron_hybrid, is_qwen3_hybrid,
     is_qwen4_exp, load_pretrained_config)
-from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
+from tensorrt_llm._utils import (get_sm_version, is_sm_100f, is_sm_120f,
                                  torch_dtype_to_binding)
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+# Callers import MoeLoadBalancerConfig from this module.
+from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig  # noqa: F401
 from tensorrt_llm.llmapi.llm_args import (CSA2SparseAttentionConfig,
                                           DeepSeekSparseAttentionConfig,
                                           DeepSeekV4SparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          KvCacheConfig,
+                                          MoeLoadBalancerConfigType,
                                           MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -103,6 +106,11 @@ _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 _KIMI_K3_ARCHITECTURES = {
     "KimiK3ForConditionalGeneration",
     "KimiLinearForCausalLM",
+}
+
+_GLM5_NEXT_ARCHITECTURES = {
+    "Glm5NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
 }
 
 _MINIMAX_M3_ARCHITECTURES = {
@@ -281,7 +289,7 @@ class ModelConfig(Generic[TConfig]):
     _moe_max_num_tokens_is_default: Optional[bool] = field(default=None,
                                                            repr=False,
                                                            compare=False)
-    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
+    moe_load_balancer: Optional[MoeLoadBalancerConfigType] = None
 
     attn_backend: str = 'TRTLLM'
     # Effective threshold requested for trtllm-gen MLA skip-correction. Zero
@@ -300,6 +308,13 @@ class ModelConfig(Generic[TConfig]):
         default_factory=lambda: ['cutlass', 'cublaslt', 'cutedsl', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
+    # Lossy: the model's two-shot MNNVL all-reduces fused with a residual
+    # RMSNorm exchange E4M3 (AllReduceParams.fp8_payload).
+    mnnvl_allreduce_fp8_payload: bool = False
+    # Every tensor-parallel rank holds the whole embedding table.
+    replicate_embedding: bool = False
+    # Batch sizes of the generation CUDA graphs (empty without them).
+    cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
     # If true, enable min-latency mode. Currently only used for Llama4.
     enable_min_latency: bool = False
@@ -569,6 +584,9 @@ class ModelConfig(Generic[TConfig]):
             if 100 <= sm_version < 120:
                 return "TRTLLM"
 
+        if architecture in _GLM5_NEXT_ARCHITECTURES and is_sm_100f():
+            return "TRTLLM"
+
         is_w4a16_nvfp4 = (quant_config is not None and quant_config.quant_algo
                           in (QuantAlgo.W4A16_NVFP4, "W4A16_NVFP4"))
         if is_w4a16_nvfp4:
@@ -576,7 +594,7 @@ class ModelConfig(Generic[TConfig]):
             # CuteDslB12xW4a16Nvfp4FusedMoE on SM120/121 (reached through the
             # CUTEDSL family), MarlinFusedMoE on Hopper. Any
             # other SM falls through to CUTLASS, which dequantizes on the fly.
-            if sm_version in (120, 121):
+            if is_sm_120f(sm_version):
                 return "CUTEDSL"
             if 90 <= sm_version < 100:
                 return "MARLIN"

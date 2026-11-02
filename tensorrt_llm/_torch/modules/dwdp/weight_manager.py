@@ -18,27 +18,30 @@
 The WeightManager is the runtime scheduler for DWDP expert weight prefetch.
 It runs INDEPENDENTLY per instance (no cross-instance sync at runtime) and
 manages:
-    - Async P2P copies from peer MNNVL handles into WeightBuffer's remote slices
-    - Bidirectional event sync (prefetch_events, consume_events) with zero CPU blocking
+    - Async P2P copies from peer MNNVL handles into WeightBuffer's remote slices,
+      in the order of a ``PrefetchSchedule`` over consecutive forward passes
+    - Per-slot event sync (prefetch_events, consume_events) with zero CPU blocking
     - param.data binding for MoE forward pass
 
 Design invariants:
-    - NEVER calls torch.cuda.synchronize() — all sync via stream.wait_event()
+    - Never calls torch.cuda.synchronize() in steady state — all sync via
+      stream.wait_event(); only a forward pass abandoned inside a MoE layer is
+      recovered with a device synchronization
     - NEVER allocates/frees memory during inference — all buffers pre-allocated
     - Only copies remote experts — local experts are zero-copy MNNVL
-    - Double buffer with bidirectional events prevents RAW and WAR hazards
+    - Per-slot prefetch/consume events prevent RAW and WAR hazards
 
-Timeline visualization:
-    compute_stream: [forward L3] --wait(prefetch[0])--> [forward L4] --wait(prefetch[1])--> [forward L5]
-    copy_stream:    --wait(consume[0])--> [P2P L4] --wait(consume[1])--> [P2P L5]
+Timeline visualization (two slots, MoE layers L3, L4, L5, L6):
+    compute_stream: --wait(prefetch[0])--> [MoE L3] rec(consume[0]) [attention]
+                    --wait(prefetch[1])--> [MoE L4] rec(consume[1]) [attention] ...
+    copy_stream:    --wait(consume[0])--> [P2P L5] --wait(consume[1])--> [P2P L6]
 """
 
 from __future__ import annotations
 
-import bisect
 import logging
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -49,6 +52,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 from . import fabric_gather
+from .prefetch_schedule import PrefetchSchedule, ScheduleStep
 from .specs import PeerRanges, lookup_owner
 from .weight_buffer import WeightBuffer
 
@@ -74,8 +78,15 @@ class DWDPWeightManager:
     """Runtime P2P copy orchestrator for DWDP expert weight prefetch.
 
     Manages async P2P copies from peer MNNVL handles into WeightBuffer's
-    remote slices using a double-buffered event protocol. All synchronization
-    is done via CUDA events and stream.wait_event() — the CPU is never blocked.
+    remote slices.  A ``PrefetchSchedule`` decides when each copy is issued;
+    every slot has a prefetch (RAW) and a consume (WAR) event.  All
+    synchronization is done via CUDA events and stream.wait_event() — the CPU
+    is never blocked.
+
+    Runtime protocol: ``start_forward`` before a forward pass, then per MoE
+    layer ``wait_and_bind`` before its MoE and ``finish_layer`` right after
+    the MoE is enqueued; ``invalidate_prefetch`` after the source expert
+    weights changed.
 
     Attributes:
         weight_buffer: WeightBuffer with composite VA layout for all MoE layers.
@@ -101,6 +112,9 @@ class DWDPWeightManager:
         "_batched_copy_plans",
         "_use_gather",
         "_gather_plans",
+        "_layer_order",
+        "_schedule",
+        "_reported_restarts",
         "_released",
     )
 
@@ -114,12 +128,13 @@ class DWDPWeightManager:
         dwdp_rank: int,
         dwdp_size: int,
         contention_opt: bool = False,
+        repeated_layer_indices: Sequence[int] = (),
     ) -> None:
         """Initialize the DWDPWeightManager.
 
-        Creates a dedicated copy stream and pre-allocates all CUDA events for
-        the double-buffer protocol. Both consume_events are recorded immediately
-        so the first prefetch does not stall waiting for a never-recorded event.
+        Creates a dedicated copy stream and pre-allocates the CUDA events of
+        every buffer slot. The consume_events are recorded immediately so the
+        first prefetch does not stall waiting for a never-recorded event.
 
         Args:
             weight_buffer: WeightBuffer with composite VA layout for all MoE layers.
@@ -144,9 +159,13 @@ class DWDPWeightManager:
                 to reduce single-NVLink-link contention.  Plans are cached
                 per layer since peer ``data_ptr()`` and destination
                 ``data_ptr()`` are stable after initialization.
+            repeated_layer_indices: MoE layers that run several times in a row
+                within a forward pass; their repeats bind the copy still in
+                the slot (see ``PrefetchSchedule``).
 
         Raises:
-            ValueError: If dwdp_rank is out of range or dwdp_size is invalid.
+            ValueError: If dwdp_rank is out of range, dwdp_size is invalid,
+                there are no MoE layers or a repeated layer is not one of them.
         """
         if dwdp_size <= 0:
             raise ValueError(f"dwdp_size must be positive, got {dwdp_size}")
@@ -173,13 +192,30 @@ class DWDPWeightManager:
         device = torch.device("cuda", weight_buffer.device_id)
         self._copy_stream = torch.cuda.Stream(device=device)
 
-        # Double-buffer events: one per buffer slot (0 and 1).
+        num_slots = weight_buffer.num_slots
+        self._layer_order = {layer: order for order, layer in enumerate(self._moe_layer_indices)}
+        # The weight buffer owns the slot mapping; the schedule and the event
+        # indices below both read it from there.
+        unknown = set(repeated_layer_indices) - self._moe_layer_set
+        if unknown:
+            raise ValueError(f"repeated layers {sorted(unknown)} are not DWDP MoE layers")
+        self._schedule = PrefetchSchedule(
+            [weight_buffer.buffer_index_for_layer(layer) for layer in self._moe_layer_indices],
+            repeated_orders=[self._layer_order[layer] for layer in repeated_layer_indices],
+        )
+        self._reported_restarts = 0
+
+        # Buffer-slot events: one pair per slot.
         # prefetch_events[i]: recorded on copy_stream after P2P copy into slot i.
         #   Waited on by compute_stream (RAW — must finish copy before read).
-        # consume_events[i]: recorded on compute_stream after forward using slot i.
+        # consume_events[i]: recorded on compute_stream after the MoE using slot i.
         #   Waited on by copy_stream (WAR — must finish read before overwrite).
-        self._prefetch_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
-        self._consume_events: List[torch.cuda.Event] = [torch.cuda.Event() for _ in range(2)]
+        self._prefetch_events: List[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(num_slots)
+        ]
+        self._consume_events: List[torch.cuda.Event] = [
+            torch.cuda.Event() for _ in range(num_slots)
+        ]
         self._transport = None
 
         # Initialize consume_events as "already signaled" so the first prefetch
@@ -202,11 +238,11 @@ class DWDPWeightManager:
         # engine (see ``fabric_gather``).  Opt-in; off if the op is not registered.
         # Layers whose descriptors are not 16-byte aligned cache None and fall back
         # to the copy engine.
-        self._use_gather = fabric_gather.is_enabled() and fabric_gather.gather_op() is not None
+        self._use_gather = fabric_gather.available()
         if self._use_gather:
-            # Reserve the gather's SMs in the persistent CuTeDSL grids, pin the dense
-            # GEMM to the CLC scheduler and turn off cooperative MoE routing unless the
-            # user set them explicitly.  Runs during setup, before the first forward.
+            # Pin the dense GEMM to the CLC scheduler and turn off cooperative MoE
+            # routing unless the user set them explicitly.  Runs during setup, before
+            # the first forward.  The persistent grids' SM reserve is set by DwdpManager.
             fabric_gather.apply_compute_side_defaults()
         if fabric_gather.is_enabled() and not self._use_gather:
             logger.warning(
@@ -250,43 +286,12 @@ class DWDPWeightManager:
         """
         return layer_idx in self._moe_layer_set
 
-    def next_moe_layer(self, layer_idx: int) -> Optional[int]:
-        """Return the next MoE layer index after layer_idx.
-
-        Uses binary search for O(log n) lookup.
-
-        Args:
-            layer_idx: Current layer index.
-
-        Returns:
-            The next MoE layer index strictly greater than layer_idx,
-            or None if layer_idx is at or past the last MoE layer.
-        """
-        if not self._moe_layer_indices:
-            return None
-        pos = bisect.bisect_right(self._moe_layer_indices, layer_idx)
-        if pos < len(self._moe_layer_indices):
-            return self._moe_layer_indices[pos]
-        return None
-
-    def first_moe_layer(self) -> int:
-        """Return the first MoE layer index.
-
-        Returns:
-            The smallest MoE layer index.
-
-        Raises:
-            IndexError: If there are no MoE layers.
-        """
-        if not self._moe_layer_indices:
-            raise IndexError("No MoE layers configured")
-        return self._moe_layer_indices[0]
-
     def prefetch_layer(self, layer_idx: int) -> None:
         """Kick off async P2P copies for all remote expert slices of a layer.
 
-        Switches to the copy_stream, waits for the consume_event on the target
-        buffer slot (WAR hazard — ensures compute has finished reading the slot),
+        Called for the copies the prefetch schedule issues. Switches to the
+        copy_stream, waits for the consume_event on the target buffer slot
+        (WAR hazard — ensures compute has finished reading the slot),
         then issues P2P copies from peer MNNVL views into the WeightBuffer's
         remote slices. Finally, records a prefetch_event so the compute stream
         can wait for the copy to complete.
@@ -311,7 +316,7 @@ class DWDPWeightManager:
                 f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
             )
 
-        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        buf_idx = self._schedule.slot(self._order_of(layer_idx))
 
         with torch.cuda.stream(self._copy_stream):
             # WAR hazard: wait until compute finishes reading this buffer slot
@@ -522,15 +527,25 @@ class DWDPWeightManager:
             dst_ptrs, src_ptrs, lines, row_starts, blocks, fabric_gather.THREADS
         )
 
+    def start_forward(self) -> None:
+        """Prefetch the first MoE layers of the coming forward pass.
+
+        Enqueues nothing when the previous forward pass already prefetched
+        them.
+        """
+        self._apply(self._schedule.start_forward())
+
     def wait_and_bind(self, backend_module: torch.nn.Module, layer_idx: int) -> None:
         """Wait for prefetch completion and bind weight tensors to the module.
 
-        On the compute stream:
+        Issues the layer's copy first if nothing did (a forward pass without
+        ``start_forward``, or one that restarts the prefetch sequence). Then,
+        on the compute stream:
             1. Wait for prefetch_events[buf_idx] (RAW — copy must finish before read).
             2. Bind each weight's full tensor (local zero-copy + remote P2P data)
                as the param.data of the backend module's corresponding attribute.
 
-        The matching WAR signal is deliberately recorded by ``record_compute``
+        The matching WAR signal is deliberately recorded by ``finish_layer``
         after the MoE kernel has been enqueued. Recording it here would place the
         event before the kernel on the compute stream and could let the copy
         stream overwrite a slot while that kernel is still reading it.
@@ -545,18 +560,18 @@ class DWDPWeightManager:
             KeyError: If layer_idx is not a valid MoE layer.
             AttributeError: If backend_module lacks a required weight attribute.
         """
-        if layer_idx not in self._moe_layer_set:
-            raise KeyError(
-                f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
-            )
+        order = self._order_of(layer_idx)
+        self._apply(self._schedule.bind(order))
 
-        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
+        buf_idx = self._schedule.slot(order)
         compute_stream = torch.cuda.current_stream(
             torch.device("cuda", self._weight_buffer.device_id)
         )
 
         # RAW hazard: wait until P2P copy into this slot is complete
-        # before the forward pass reads the data.
+        # before the forward pass reads the data.  The schedule issues no
+        # other copy into the slot until this layer finishes, so the last
+        # recorded prefetch event of the slot is this layer's.
         compute_stream.wait_event(self._prefetch_events[buf_idx])
 
         # Bind full [num_experts, ...] tensors to the backend module's parameters.
@@ -569,29 +584,65 @@ class DWDPWeightManager:
 
         logger.debug(f"[DWDPWeightManager] Bound weights: layer={layer_idx}, buf_slot={buf_idx}")
 
-    def record_compute(self, layer_idx: int) -> None:
-        """Record that the current layer has finished consuming its buffer slot.
+    def finish_layer(self, layer_idx: int) -> None:
+        """Release the layer's buffer slot and issue the copies this unblocks.
 
         This method must be called after the layer's MoE kernel is enqueued on
         the current compute stream. CUDA stream ordering then guarantees that
         the consume event cannot complete until the kernel has stopped reading
-        the slot. The copy stream waits on this event before reusing the slot
-        for the layer two positions ahead in the MoE sequence.
+        the slot. The copy stream waits on this event before reusing the slot;
+        the last MoE layers of a forward pass issue the copies of the first
+        layers of the next one.
 
         Args:
             layer_idx: MoE layer whose compute was just enqueued.
+
+        Raises:
+            KeyError: If layer_idx is not a valid MoE layer.
+            RuntimeError: If layer_idx is not the bound layer.
         """
-        if layer_idx not in self._moe_layer_set:
+        self._apply(self._schedule.finish(self._order_of(layer_idx)))
+
+    def invalidate_prefetch(self) -> None:
+        """Drop the copies issued ahead of the next forward pass.
+
+        Call after the source expert weights changed; the next forward pass
+        gathers its first layers again.
+        """
+        self._apply(self._schedule.invalidate())
+
+    def _order_of(self, layer_idx: int) -> int:
+        order = self._layer_order.get(layer_idx)
+        if order is None:
             raise KeyError(
                 f"Layer {layer_idx} is not a MoE layer. Valid layers: {self._moe_layer_indices}"
             )
+        return order
 
-        buf_idx = self._weight_buffer.buffer_index_for_layer(layer_idx)
-        compute_stream = torch.cuda.current_stream(
-            torch.device("cuda", self._weight_buffer.device_id)
-        )
-        self._consume_events[buf_idx].record(compute_stream)
-        logger.debug(f"[DWDPWeightManager] Compute recorded: layer={layer_idx}, buf_slot={buf_idx}")
+    def _apply(self, step: ScheduleStep) -> None:
+        """Enqueue one schedule step: device sync if needed, slot release, then copies."""
+        if step.synchronize:
+            logger.warning(
+                "[DWDPWeightManager] Prefetch sequence restarted after an unfinished forward "
+                "pass; synchronizing the device before reusing its buffer slots"
+            )
+            torch.cuda.synchronize(self._weight_buffer.device_id)
+        if step.release is not None:
+            compute_stream = torch.cuda.current_stream(
+                torch.device("cuda", self._weight_buffer.device_id)
+            )
+            self._consume_events[step.release].record(compute_stream)
+        restarts = self._schedule.num_restarts
+        if restarts != self._reported_restarts:
+            self._reported_restarts = restarts
+            # Power-of-two counts only: a model that keeps breaking the sequence still shows up.
+            if restarts & (restarts - 1) == 0:
+                logger.warning(
+                    f"[DWDPWeightManager] Prefetch sequence restarted ({restarts} restart(s) so "
+                    f"far): a forward pass did not run the MoE layers in order"
+                )
+        for order in step.prefetch:
+            self.prefetch_layer(self._moe_layer_indices[order])
 
     def release(self) -> None:
         """Synchronize outstanding work and release all owned VMM resources."""

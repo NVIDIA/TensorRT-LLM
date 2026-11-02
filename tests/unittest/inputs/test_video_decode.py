@@ -9,7 +9,7 @@ import asyncio
 import base64
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -76,6 +76,119 @@ def test_np_format_hits_hf_video_processor_fast_path(sample_video_path: str) -> 
 
     assert len(batched) == 1
     assert np.shares_memory(video.frames, batched[0])
+
+
+@pytest.mark.parametrize(("format", "peak_bytes_per_value"), [("np", 2), ("pil", 2), ("pt", 9)])
+def test_decode_limit_is_checked_before_frame_stack_allocation(
+    sample_video_path: str, format: str, peak_bytes_per_value: int
+) -> None:
+    peak_bytes = 10 * 64 * 64 * 3 * peak_bytes_per_value
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty") as allocate:
+        with pytest.raises(ValueError, match=f"require {peak_bytes} bytes"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format=format,
+                max_decoded_frame_bytes=peak_bytes - 1,
+            )
+
+    allocate.assert_not_called()
+
+
+def test_pt_decode_reserves_peak_then_commits_retained_bytes(sample_video_path: str) -> None:
+    class _Reservation:
+        committed = None
+        released = False
+
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            self.committed = retained_bytes
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+    reserved = []
+
+    def reserve(peak_bytes: int, retained_bytes: int) -> _Reservation:
+        reserved.append((peak_bytes, retained_bytes))
+        return reservation
+
+    _load_video_by_cv2(
+        sample_video_path,
+        num_frames=10,
+        fps=-1,
+        format="pt",
+        decoded_memory_reserver=reserve,
+    )
+
+    assert reserved == [(10 * 64 * 64 * 3 * 9, 10 * 64 * 64 * 3 * 4)]
+    assert reservation.committed == 10 * 64 * 64 * 3 * 4
+    assert reservation.released is False
+
+
+def test_decode_releases_reservation_after_allocation_failure(sample_video_path: str) -> None:
+    class _Reservation:
+        released = False
+
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            raise AssertionError("failed decode must not commit")
+
+        def release(self) -> None:
+            self.released = True
+
+    reservation = _Reservation()
+
+    with patch("tensorrt_llm.inputs.media_io.np.empty", side_effect=MemoryError("allocation")):
+        with pytest.raises(MemoryError, match="allocation"):
+            _load_video_by_cv2(
+                sample_video_path,
+                num_frames=10,
+                fps=-1,
+                format="np",
+                decoded_memory_reserver=lambda _peak_bytes, _retained_bytes: reservation,
+            )
+
+    assert reservation.released is True
+
+
+def test_truncated_numpy_video_owns_only_the_counted_frames(sample_video_path: str) -> None:
+    capture = cv2.VideoCapture(sample_video_path)
+    get = capture.get
+    committed = []
+
+    class _Reservation:
+        def check_cancelled(self) -> None:
+            pass
+
+        def commit(self, retained_bytes: int) -> None:
+            committed.append(retained_bytes)
+
+        def release(self) -> None:
+            pass
+
+    # Container metadata overstates the number of frames that actually decode.
+    truncated = Mock(wraps=capture)
+    truncated.get.side_effect = lambda key: 50 if key == cv2.CAP_PROP_FRAME_COUNT else get(key)
+    with patch.object(cv2, "VideoCapture", return_value=truncated):
+        video = _load_video_by_cv2(
+            sample_video_path,
+            num_frames=10,
+            fps=-1,
+            format="np",
+            decoded_memory_reserver=lambda _peak, _retained: _Reservation(),
+        )
+
+    assert 0 < len(video.frames) < 10
+    assert video.frames.base is None
+    assert committed == [video.frames.nbytes]
 
 
 @pytest.mark.parametrize("input_kind", ["path", "file_uri", "data_uri"])

@@ -302,7 +302,6 @@ class EncoderMixin:
                 max_cuda_graph_num_tokens=config.max_cuda_graph_num_tokens,
                 max_num_tokens=self._config.max_num_tokens,
                 max_seq_len=self._config.max_seq_len,
-                cuda_graph_mem_pool=None,
                 is_encoder_decoder=config.is_encoder_decoder,
                 use_fixed_sequence_slots=config.use_fixed_sequence_slots,
                 feature_shape=config.feature_shape,
@@ -1048,7 +1047,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
     ) -> dict[str, Any]:
         forward = partial(
             self._forward_step,
-            gather_ids=prepared.gather_ids,
             gather_context_logits=gather_context_logits,
         )
         graph_runner = self._encoder_cuda_graph_runner
@@ -1086,7 +1084,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         self,
         inputs: dict[str, Any],
         *,
-        gather_ids: torch.Tensor | None,
         gather_context_logits: bool,
     ) -> dict[str, Any]:
         metadata = inputs.get("attn_metadata")
@@ -1095,17 +1092,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
         outputs = self._model_caller(
             **inputs,
-            return_context_logits=(gather_ids is not None or gather_context_logits),
+            return_context_logits=gather_context_logits,
         )
         if self._config.without_logits:
             return outputs
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits")
-            if logits is None:
-                return outputs
-        else:
-            logits = outputs
-            outputs = {"logits": logits}
-        if gather_ids is not None:
-            outputs["logits"] = logits[gather_ids]
+        if not isinstance(outputs, dict):
+            outputs = {"logits": outputs}
         return outputs
