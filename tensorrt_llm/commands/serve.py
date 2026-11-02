@@ -32,7 +32,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from types import FrameType
 from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
-                    Sequence, Set)
+                    Sequence, Set, Tuple)
 
 import click
 import torch
@@ -71,8 +71,12 @@ from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.mapping import CpType
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 from tensorrt_llm.serve._frontend_processes import (
-    _init_multi_frontend_mode, _signal_frontend_ready,
-    _spawn_attached_frontends, _terminate_attached_frontends)
+    _frontend_affinity_sockets, _init_multi_frontend_mode,
+    _signal_frontend_ready, _spawn_attached_frontends,
+    _terminate_attached_frontends, _watch_attached_frontends)
+from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
+                                               LAUNCHER_UDS_NAME,
+                                               MultiFrontendServing)
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
@@ -484,6 +488,34 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _reserve_multi_frontend_port(host: str, port: int,
+                                 family: socket.AddressFamily) -> socket.socket:
+    """Refuse a port another server uses; return a lock to hold while serving.
+
+    SO_REUSEPORT would let a second server of the same user join the port. A
+    plain bind catches any listener (SO_REUSEADDR ignores TIME_WAIT), and an
+    abstract Unix socket named after the port catches a launcher that has not
+    started listening yet.
+    """
+    lock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        lock.bind(f"\0trtllm-serve-{os.geteuid()}-{port}")
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(f"Port {port} is already reserved by another "
+                           f"multi-frontend trtllm-serve: {e}") from e
+    try:
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind((host, port))
+    except OSError as e:
+        lock.close()
+        raise RuntimeError(
+            f"Failed to bind socket to {host}:{port}: {e}. "
+            f"Port holder(s): {_diagnose_port_in_use(port)}") from e
+    return lock
+
+
 @contextlib.contextmanager
 def _provision_kv_cache_pool(llm_args: dict,
                              owns_engine: bool = True) -> Iterator[None]:
@@ -517,6 +549,75 @@ def _provision_kv_cache_pool(llm_args: dict,
         yield
 
 
+def _bind_launcher_uds(llm) -> Tuple[socket.socket, str]:
+    """Bind the Unix socket attached frontends forward launcher-owned routes to.
+
+    It lives in the multi-frontend ipc dir, which is private to the user and
+    removed, socket file included, when the executor proxy shuts down.
+    """
+    # Only the classic IPC proxy has the attribute.
+    ipc_dir = getattr(llm._executor, "_multi_frontend_ipc_dir", None)
+    if not ipc_dir:
+        raise ValueError(
+            "num_serve_frontends > 1 requires the classic IPC executor "
+            "proxy in multi-frontend mode")
+    path = os.path.join(ipc_dir, LAUNCHER_UDS_NAME)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(path)
+    except OSError:
+        sock.close()
+        raise
+    return sock, path
+
+
+def _share_prometheus_multiproc_dir(llm, ipc_dir: str) -> None:
+    """Give every frontend one PROMETHEUS_MULTIPROC_DIR before spawning them.
+
+    Not via set_prometheus_multiproc_dir(): it keeps only its latest
+    TemporaryDirectory alive, so OpenAIServer's later call would delete this one.
+    """
+    if os.environ.get("PROMETHEUS_MULTIPROC_DIR"):
+        return
+    if llm.args.return_perf_metrics or llm.args.perf_metrics_output_dir:
+        path = tempfile.mkdtemp(prefix="prometheus_", dir=ipc_dir)
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = path
+        logger.info(
+            f"Shared PROMETHEUS_MULTIPROC_DIR for all frontends: {path}")
+
+
+def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
+                                         port: int, grpc: bool,
+                                         report_addr: Optional[str],
+                                         enable_sleep_mode: bool) -> None:
+    """Fall back to one frontend where the default count cannot run.
+
+    An explicit count (CLI, --config YAML or --set) is left alone, so the
+    guard that owns the conflict still rejects it.
+    """
+    num_frontends = llm_args.get("num_serve_frontends", 1)
+    if requested or num_frontends <= 1:
+        return
+    if grpc:
+        # OpenEngine supports several frontends, but only when asked to.
+        reason = "--grpc"
+    elif port == 0 or report_addr:
+        reason = "--port 0 / --report_addr"
+    elif llm_args.get("orchestrator_type") is not None:
+        reason = f"orchestrator_type={llm_args['orchestrator_type']!r}"
+    elif llm_args.get("enable_resource_governor"):
+        reason = "enable_resource_governor"
+    elif enable_sleep_mode:
+        reason = "--enable_sleep_mode"
+    else:
+        return
+    logger.info(
+        f"num_serve_frontends defaults to {num_frontends} for the OpenAI HTTP "
+        f"server only; running 1 frontend because of {reason}. Pass "
+        "--num_serve_frontends explicitly to override.")
+    llm_args["num_serve_frontends"] = 1
+
+
 def launch_server(
         host: str,
         port: int,
@@ -548,6 +649,16 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    # An attached frontend gets the launcher's socket from its spawn env; the
+    # launcher is its parent.
+    multi_frontend_serving = None
+    if multi_frontend.is_attached_frontend:
+        attached_launcher_uds = os.environ.pop(LAUNCHER_UDS_ENV, None)
+        if attached_launcher_uds is not None:
+            multi_frontend_serving = MultiFrontendServing(
+                launcher_uds=attached_launcher_uds,
+                is_launcher=False,
+                launcher_pid=os.getppid())
     if enable_runtime_control_endpoints and multi_frontend.num_frontends > 1:
         raise click.BadParameter(
             "Runtime control endpoints require num_serve_frontends=1 because "
@@ -571,14 +682,17 @@ def launch_server(
             logger.warning(
                 "num_serve_frontends > 1: stateful Responses API storage "
                 "(store/previous_response_id) is disabled; the per-frontend "
-                "in-memory store cannot be shared across frontends.")
+                "in-memory store cannot be shared across frontends. Pass "
+                "--num_serve_frontends 1 to keep it.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
-    with socket.socket(address_family, socket.SOCK_STREAM) as s:
+    port_lock = (_reserve_multi_frontend_port(host, port, address_family)
+                 if multi_frontend.is_launcher else contextlib.nullcontext())
+    with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
         # port == 0 lets the kernel pick the port; the caller then needs a way
         # to learn it, either by service discovery or by report_addr.
         assert port > 0 or disagg_cluster_config is not None or report_addr, (
@@ -610,8 +724,16 @@ def launch_server(
         # until uvicorn takes it over, so no one can steal the port in between.
         _publish_bound_address(report_addr, host, port)
 
-        with _provision_kv_cache_pool(
-                llm_args, owns_engine=not multi_frontend.is_attached_frontend):
+        # The affinity ports are bound before the LLM is created, so the
+        # executor's outgoing connections cannot take one of them.
+        with (_frontend_affinity_sockets(
+                host, port, address_family, multi_frontend,
+                llm_args.get("serve_frontend_affinity_port_stride"),
+                _diagnose_port_in_use) as
+              (affinity_socket, attached_affinity_sockets),
+              _provision_kv_cache_pool(
+                  llm_args,
+                  owns_engine=not multi_frontend.is_attached_frontend)):
             if backend == 'pytorch':
                 llm_args.pop("build_config", None)
                 llm = PyTorchLLM(**llm_args)
@@ -625,12 +747,28 @@ def launch_server(
             # server construction, middleware registration, and runtime, or a
             # failure in between leaks the child processes.
             frontend_children = []
+            stop_watching_frontends = None
+            sockets = [s]
+            if affinity_socket is not None:
+                sockets.append(affinity_socket)
+            launcher_uds_sock = None
             try:
                 if multi_frontend.is_launcher:
+                    launcher_uds_sock, launcher_uds_path = _bind_launcher_uds(
+                        llm)
+                    _share_prometheus_multiproc_dir(
+                        llm, os.path.dirname(launcher_uds_path))
                     frontend_children = _spawn_attached_frontends(
                         llm,
                         multi_frontend.num_frontends,
-                        report_failure=_report_observed_child_failure)
+                        extra_env={LAUNCHER_UDS_ENV: launcher_uds_path},
+                        report_failure=_report_observed_child_failure,
+                        affinity_sockets=attached_affinity_sockets)
+                    stop_watching_frontends = _watch_attached_frontends(
+                        frontend_children)
+                    multi_frontend_serving = MultiFrontendServing(
+                        launcher_uds=launcher_uds_path, is_launcher=True)
+                    sockets.append(launcher_uds_sock)
 
                 server = OpenAIServer(
                     generator=llm,
@@ -647,7 +785,8 @@ def launch_server(
                     internal_disagg_auth_key=internal_disagg_auth_key,
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
-                    runtime_control_api_key=runtime_control_api_key)
+                    runtime_control_api_key=runtime_control_api_key,
+                    multi_frontend_serving=multi_frontend_serving)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -655,10 +794,15 @@ def launch_server(
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
-                uvloop.run(server(host, port, sockets=[s]))
+                uvloop.run(server(host, port, sockets=sockets))
             finally:
+                if stop_watching_frontends is not None:
+                    stop_watching_frontends.set()
                 if frontend_children:
                     _terminate_attached_frontends(frontend_children)
+                if launcher_uds_sock is not None:
+                    # Its file goes with the ipc dir (see _bind_launcher_uds).
+                    launcher_uds_sock.close()
 
 
 def launch_mm_encoder_server(
@@ -1041,11 +1185,14 @@ def launch_visual_gen_server(
 @stability_option(
     "--num_serve_frontends",
     type=click.IntRange(min=1, max=MAX_NUM_FRONTENDS),
-    default=1,
+    # LlmArgs keeps 1: only trtllm-serve spawns frontends.
+    default=8,
     help="Number of HTTP or OpenEngine frontend processes serving one "
     "executor; values > 1 share the serving port via "
-    "SO_REUSEPORT (classic IPC executor path only).",
-    status="prototype")
+    "SO_REUSEPORT (classic IPC executor path only). Without an explicit "
+    "value, --grpc and configurations that support a single frontend only "
+    "use 1 and log why.",
+    status="beta")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1203,6 +1350,19 @@ def launch_visual_gen_server(
                   help="Protocol used when --grpc is enabled.",
                   status="prototype")
 @stability_option(
+    "--openengine-metrics-port",
+    type=click.IntRange(1, 65535),
+    default=None,
+    help="OpenEngine Prometheus HTTP port (default: 8001). "
+    "Enabled by return_perf_metrics or perf_metrics_output_dir in the engine configuration.",
+    status="prototype")
+@stability_option(
+    "--openengine-metrics-host",
+    type=str,
+    default=None,
+    help="Bind address for OpenEngine Prometheus (default: --host).",
+    status="prototype")
+@stability_option(
     "--openengine-enable-load-metrics",
     is_flag=True,
     default=False,
@@ -1310,6 +1470,8 @@ def serve(
     grpc: bool,
     grpc_protocol: str,
     openengine_enable_load_metrics: bool,
+    openengine_metrics_port: Optional[int],
+    openengine_metrics_host: Optional[str],
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1342,6 +1504,20 @@ def serve(
         raise click.UsageError(
             "--openengine-enable-load-metrics requires --grpc --grpc-protocol openengine"
         )
+    if openengine_metrics_port is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-port requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_host is not None and (not grpc or grpc_protocol
+                                                != "openengine"):
+        raise click.UsageError(
+            "--openengine-metrics-host requires --grpc --grpc-protocol openengine"
+        )
+    if openengine_metrics_port is not None and openengine_metrics_port == port:
+        raise click.UsageError(
+            "--openengine-metrics-port must differ from --port")
+
     if moe_cluster_parallel_size is not None:
         logger.warning(
             "--moe_cluster_parallel_size / --cluster_size is deprecated and "
@@ -1486,6 +1662,15 @@ def serve(
         if enable_sleep_mode and llm_args.get("sleep_config") is None:
             llm_args["sleep_config"] = SleepConfig()
 
+        _resolve_default_num_serve_frontends(
+            llm_args,
+            requested=("num_serve_frontends" in explicit_cli_keys
+                       or "num_serve_frontends" in llm_args_extra_dict),
+            port=port,
+            grpc=grpc,
+            report_addr=report_addr,
+            enable_sleep_mode=enable_sleep_mode)
+
         _apply_effective_telemetry_config(llm_args, telemetry=telemetry)
         # Preserve requested settings for failures before entering the LLM constructor.
         try:
@@ -1601,6 +1786,9 @@ def serve(
                         served_model_name=served_model_name,
                         report_failure=_report_observed_child_failure,
                         enable_load_metrics=openengine_enable_load_metrics,
+                        metrics_host=openengine_metrics_host,
+                        metrics_port=8001 if openengine_metrics_port is None
+                        else openengine_metrics_port,
                         subagent_affinity_auth_key=internal_disagg_auth_key)
         else:
             # Default: launch OpenAI HTTP server
@@ -2329,7 +2517,8 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
             role,
             request_timeout,
             max_retries,
-            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key)
+            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
+            frontend_affinity=disagg_cfg.ctx_frontend_affinity)
 
     coordinator = DisaggCoordinatorService(
         disagg_cfg,
@@ -2533,6 +2722,16 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
         config_file,
         telemetry=telemetry,
     )
+    disagg_cfg = parse_disagg_config_file(config_file)
+    # The servers launched here run a single frontend each, so they bind no
+    # affinity ports for the disaggregated server to send conversations to.
+    if disagg_cfg.ctx_frontend_affinity is not None:
+        raise ValueError(
+            "disaggregated_mpi_worker runs one serving frontend per server; "
+            "remove num_serve_frontends and serve_frontend_affinity_port_stride "
+            "from context_servers, or launch the context servers with trtllm-serve."
+        )
+
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2542,8 +2741,6 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
 
     from tensorrt_llm._utils import global_mpi_rank, set_mpi_comm
     from tensorrt_llm.llmapi.disagg_utils import split_world_comm
-
-    disagg_cfg = parse_disagg_config_file(config_file)
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
     if os.environ.get(DisaggLauncherEnvs.

@@ -22,7 +22,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 pytestmark = pytest.mark.cpu_only
@@ -75,13 +75,13 @@ class _FakeSelf:
 def test_setup_helix_mappings_precondition_validation():
     setup = _get_setup_method()
 
-    # enable_attention_dp raises
+    # enable_attention_dp at tp_size > 1 raises: helix_a2a needs tp_size == 1
     mapping = _make_helix_mapping(tp_size=4, cp_size=2, enable_attention_dp=True)
     model_config = _make_model_config(mapping)
     cfg = _make_cfg(num_attention_heads=96, kda_num_heads=96)
     obj = _FakeSelf()
     with patch.object(type(mapping), "has_cp_helix", return_value=True):
-        with pytest.raises(ValueError, match="enable_attention_dp"):
+        with pytest.raises(NotImplementedError, match="requires tp_size=1"):
             setup(obj, model_config, cfg, None)
 
     # a non-DSpark spec_config raises: helix now supports DSpark, so the
@@ -143,6 +143,45 @@ def test_setup_helix_mappings_precondition_validation():
     setup(obj, model_config, cfg, None)
     assert obj.mapping_with_cp is None
     assert obj._repurposed_tp_mapping is None
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_lm_head_layout_under_helix_attention_dp(tied):
+    # helix + attention DP at tp 1 with enable_lm_head_tp_in_adp: an untied LM
+    # head goes vocab-parallel over the CP group, a tied one keeps the
+    # embedding's layout so the shared weight has a single layout.
+    from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+    from tensorrt_llm._torch.modules.embedding import Embedding
+    from tensorrt_llm._torch.modules.linear import TensorParallelMode
+
+    mapping = Mapping(
+        world_size=2,
+        rank=0,
+        tp_size=1,
+        cp_size=2,
+        cp_config={"cp_type": CpType.HELIX},
+        enable_attention_dp=True,
+        enable_lm_head_tp_in_adp=True,
+    ).repurpose_helix_cp_to_tp()
+    pretrained = SimpleNamespace(tie_word_embeddings=tied, torch_dtype=torch.bfloat16)
+    config = _make_model_config(mapping, pretrained_config=pretrained)
+    model = torch.nn.Module()
+    model.embed_tokens = Embedding(
+        64,
+        32,
+        dtype=torch.bfloat16,
+        mapping=mapping,
+        tensor_parallel_mode=TensorParallelMode.COLUMN,
+        gather_output=True,
+    )
+
+    lm = DecoderModelForCausalLM(model, config=config, hidden_size=32, vocab_size=64)
+
+    if tied:
+        assert lm.lm_head.tp_mode == model.embed_tokens.tp_mode
+        assert lm.lm_head.weight is model.embed_tokens.weight
+    else:
+        assert lm.lm_head.tp_size == 2
 
 
 def test_setup_helix_mappings_dual_mapping_swap_restore():

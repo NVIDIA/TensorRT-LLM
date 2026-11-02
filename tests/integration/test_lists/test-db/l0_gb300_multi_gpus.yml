@@ -15,6 +15,9 @@ l0_gb300_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4/comm
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/comm
   # One ordered sequence in one job: the cases share module-global rank state.
   - unittest/_torch/modeling_v2/comm
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_identity_vs_mtp3[dep4]
@@ -28,21 +31,21 @@ l0_gb300_multi_gpus:
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k[dep4_moetp4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[tp4_ep4]
   - accuracy/modeling_v2/test_deepseek_v3.py::TestModelingV2DeepseekR10528Nvfp4Sm10xDefault::test_gsm8k_chunked_prefill[dep4]
-  # Covers tests/unittest/_torch/attention/. Two sub-trees moved in here from elsewhere
-  # under tests/unittest/_torch/ and have no entry of their own on any list, so this entry
-  # is what picks them up:
-  #   kernels/    fused attention kernels (ex thop/ and custom_ops/)
-  #   multi_gpu/  helix tests -- each case spawns a 2-rank MPIPoolExecutor pinned to GPU 0/1
-  #               by absolute index, and they gate on >= 2 GPUs plus Blackwell. They also
-  #               rebind mpi4py's serializer at import time, which applies process-wide on
-  #               every stage that collects them, including where the tests themselves skip.
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_gsm8k
+  - accuracy/modeling_v2/test_minimax_m3.py::TestModelingV2MiniMaxM3Nvfp4Sm103Tp4::test_eagle3_gsm8k_and_acceptance
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on GB300, kernels/ and
+  # multi_gpu/ included; its cpu_only cases run on CPU (l0_cpu). The GPU cases of
+  # kernels/parallel_hw_agnostic/ run here too, although l0_b200 and l0_b300 ignore that
+  # directory: an --ignore would change this entry's text, which agg_unit_mem_df.csv
+  # matches to set its parallelism. This post_merge stage is the only Blackwell stage that
+  # runs them.
   - unittest/_torch/attention TIMEOUT (120)
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel
   - unittest/_torch/visual_gen/kernels/parallel
   - unittest/_torch/moe/kernels/serial
   - unittest/_torch/kernels/serial
-  - unittest/_torch/executor
+  - unittest/_torch/pyexecutor
   - unittest/_torch/disaggregation
   # GLM-5.3-Flash: ADP/MTP/FP8-KV and non-speculative prefix reuse.
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_attention_dp_mtp_and_fp8_kv[adp-mtp3-fp8-kv] TIMEOUT (60)
@@ -55,9 +58,15 @@ l0_gb300_multi_gpus:
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
+  # DWDP expert prefetch on real streams and copies, incl. the gather from
+  # peer GPUs.
+  - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py
+  # MNNVL all-reduce + residual RMSNorm kernels (slot / two-shot / MoE fold / GEMM) and the LL TP exchanges.
+  - unittest/_torch/multi_gpu/test_mnnvl_fused_allreduce_norm.py
+  - unittest/_torch/multi_gpu/test_ll_exchange.py
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
@@ -68,11 +77,17 @@ l0_gb300_multi_gpus:
   # Kimi K3 MoE routing shape on the TRTLLM backend (random weights, no
   # checkpoint; the case moved out of the skipped TestMoeFp4 class).
   - unittest/_torch/moe/test_moe_backend.py -k "kimi_k3_shape"
+  # Vocab-parallel token selection over TP2/TP4 vocab shards, MNNVL and
+  # default all-reduce.
+  - unittest/_torch/multi_gpu/test_vocab_parallel_selection.py
   # Kimi K3 truncated-model (first 4 layers) e2e SA spec-dec logits parity;
   # resolves <LLM_MODELS_ROOT>/Kimi-K3 and FAILS if the checkpoint is not
   # staged (deliberate: a skipped post-merge entry is indistinguishable
   # from a pass, so a vanished checkpoint must be a visible regression).
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (40)
+  # TP2 DSpark MLA drafter (split context projection, fused all-reduce + norm)
+  # vs the single-GPU drafter.
+  - unittest/_torch/multi_gpu/test_dspark_drafter_tp_fusion.py
   - unittest/_torch/multi_gpu_modeling -k "deepseek"
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp2pp2-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=True]
@@ -89,6 +104,7 @@ l0_gb300_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_trtllm_eagle3] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_mtp3_gdn_replay_tep4
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[tp4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_4gpus[ep4-mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=True]
@@ -107,3 +123,7 @@ l0_gb300_multi_gpus:
   # DeepSeek-V4-Pro NVFP4 export with the embedded DSpark drafter on MegaMoE
   # CuTe DSL, DEP4 on one node: GSM8K plus an acceptance-length gate.
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_dep4_megamoe_cutedsl TIMEOUT (30)
+  # DeepSeek-V4 DP4 on 4x GB300 (288 GB/GPU); Pro needs 288 GB-class GPUs for 4 ranks.
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Flash::test_mixed_breakable_cuda_graph[dp4] TIMEOUT (120)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4Pro::test_gsm8k_full_accuracy[dp4] TIMEOUT (240)
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV4ProDSpark::test_gsm8k_megamoe_deepgemm[dp4] TIMEOUT (240)

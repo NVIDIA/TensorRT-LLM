@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from tensorrt_llm._device_copy import DeviceCopyBuffer
+from tensorrt_llm._torch.modules.fla.cached_replay import CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 from tensorrt_llm._torch.modules.mamba import mamba2_metadata
 from tensorrt_llm._torch.modules.mamba.cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
@@ -46,6 +47,10 @@ skip_no_cuda = pytest.mark.skipif(
 
 class _GdnReplayCacheManager:
     use_gdn_cached_replay_all_layer_commit = True
+
+    @staticmethod
+    def gdn_replay_partitioned(num_decodes):
+        return num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
 
     def __init__(self, prev_num_accepted_tokens, cache_buf_idx):
         self.prev_num_accepted_tokens = prev_num_accepted_tokens
@@ -495,6 +500,26 @@ class TestMamba2Metadata:
         )
         torch.testing.assert_close(metadata.replay_work_items[:num_decodes], expected_items)
         torch.testing.assert_close(metadata.replay_n_writes, expected_n_writes)
+
+    def test_prepare_replay_work_items_skips_flashinfer_ring_replay(self):
+        """Ring replay folds in-kernel, so no work items are built at any batch size."""
+        num_decodes = 40
+        prev_num_accepted_tokens = torch.full((num_decodes,), 13, dtype=torch.int32, device="cuda")
+        manager = _GdnReplayCacheManager(
+            prev_num_accepted_tokens, torch.zeros_like(prev_num_accepted_tokens)
+        )
+        manager.use_gdn_cached_replay_all_layer_commit = False
+        manager.use_gdn_flashinfer_ring_replay = True
+        metadata = Mamba2Metadata(max_batch_size=num_decodes, chunk_size=8)
+        metadata.state_indices.copy_(torch.arange(num_decodes, dtype=torch.int32, device="cuda"))
+        metadata.replay_work_items.fill_(-7)
+        metadata.replay_n_writes.fill_(-7)
+
+        metadata._prepare_replay_work_items(manager, num_decodes, 0)
+
+        assert metadata.replay_num_decodes == num_decodes
+        assert (metadata.replay_work_items == -7).all()
+        assert (metadata.replay_n_writes == -7).all()
 
     def test_single_sequence_unaligned(self):
         """Test with a single sequence that doesn't align with chunk size."""

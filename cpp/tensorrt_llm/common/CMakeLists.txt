@@ -76,8 +76,8 @@ set_target_properties(tllm_common_environment
 
 add_library(
   common_src OBJECT
-  attentionOp.cpp
   cublasMMWrapper.cpp
+  cudaArchitectures.cpp
   cudaFp8Utils.cu
   cudaProfilerUtils.cpp
   mcastDevMemUtils.cpp
@@ -85,6 +85,17 @@ add_library(
   opUtils.cpp
   safetensors.cpp
   sageQuant.cu)
+
+list(JOIN CMAKE_CUDA_ARCHITECTURES_ORIG "," TRTLLM_BUILT_CUDA_ARCHITECTURES)
+list(JOIN CMAKE_CUDA_ARCHITECTURES_WITH_KERNELS ","
+     TRTLLM_SUPPORTED_CUDA_ARCHITECTURES)
+set_source_files_properties(
+  cudaArchitectures.cpp
+  PROPERTIES
+    COMPILE_DEFINITIONS
+    "TRTLLM_BUILT_CUDA_ARCHITECTURES=${TRTLLM_BUILT_CUDA_ARCHITECTURES};TRTLLM_SUPPORTED_CUDA_ARCHITECTURES=${TRTLLM_SUPPORTED_CUDA_ARCHITECTURES}"
+)
+
 add_cuda_architectures(common_src 89)
 set_property(TARGET common_src PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET common_src PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
