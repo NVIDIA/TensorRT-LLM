@@ -1923,7 +1923,8 @@ def test_cpp_hybrid_replay_bookkeeping_is_fused_into_conv_promotion(
 @skip_no_cuda
 def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
     """The one-launch promotion leaves the conv states and replay bookkeeping of the
-    per-step reference (_advance_replay_state, then per-layer promotion)."""
+    per-step reference (_advance_replay_state, then per-layer promotion). The bookkeeping
+    lives in PRIVATE rows addressed by replay slots other than the state slots."""
     from tensorrt_llm._torch.modules.fla import cache_manager as fla_cache_manager
 
     num_layers, batch_size = 3, 4
@@ -1943,6 +1944,9 @@ def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
         for conv in mgr.all_conv_states:
             conv.normal_()
         slots = torch.tensor([1, 3, 0, 2], dtype=torch.int32, device="cuda")
+        assert mgr.replay_layer_group_id is not None
+        replay_slots = torch.tensor([5, 2, 7, 0], dtype=torch.int32, device="cuda")
+        assert int(replay_slots.max()) < state.prev_num_accepted_tokens.shape[0]
         state.prev_num_accepted_tokens.copy_(
             torch.randint(0, state.replay_history_size, state.prev_num_accepted_tokens.shape)
         )
@@ -1958,7 +1962,7 @@ def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
             state.replay_history_size,
         )
         fla_cache_manager._advance_replay_state(
-            ref_meta, slots, num_accepted, mgr._dummy_request_mask[:batch_size].clone()
+            ref_meta, replay_slots, num_accepted, mgr._dummy_request_mask[:batch_size].clone()
         )
         for layer, dst in enumerate(ref_conv):
             for g in range(batch_size):
@@ -1966,7 +1970,11 @@ def test_v2_hybrid_fused_replay_promotion_matches_unfused_path():
 
         state.commit_all_layers = MagicMock()
         mgr.update_mamba_states(
-            SimpleNamespace(num_seqs=batch_size, num_contexts=0),
+            SimpleNamespace(
+                num_seqs=batch_size,
+                num_contexts=0,
+                mamba_metadata=SimpleNamespace(replay_state_indices=replay_slots),
+            ),
             num_accepted,
             state_indices=slots,
         )
