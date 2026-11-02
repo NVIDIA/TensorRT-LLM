@@ -222,6 +222,12 @@ def test_swa_window_all_full_attention_layer_types():
     assert dspark_layer_window_size(True, 512, mixed, 1) == (-1, -1)
     assert dspark_layer_window_size(True, 512, mixed, 2) == (511, 511)
 
+    # Layer types built in Python can be named objects; they are classified the
+    # way the attention mask classifies them.
+    named = [SimpleNamespace(name="SLIDING_ATTENTION"), "full_attention"]
+    assert dspark_layer_window_size(True, 512, named, 0) == (511, 511)
+    assert dspark_layer_window_size(True, 512, named, 1) == (-1, -1)
+
 
 # ---------------------------------------------------------------------------
 # Tiny end-to-end drafter: config parsing, weight loading, block-decode

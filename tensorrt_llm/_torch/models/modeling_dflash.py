@@ -62,22 +62,22 @@ def dspark_layer_window_size(
     (nearby) draft block. Full-attention layers and drafters that do not enable
     the window keep flash-attn's default ``(-1, -1)`` (no window).
 
-    A drafter that sets `use_swa` but declares no `sliding_attention` layer is
-    windowed on every layer: some DFlash 2 drafters are exported with all
-    `full_attention` layer types and the window only in `dflash_config`, and
-    other serving stacks window every layer of such a drafter. The per-layer
-    filter applies only when the layer types tell sliding layers from full
-    ones.
+    A drafter that sets `use_swa` but declares no sliding layer is windowed on
+    every layer: some DFlash 2 drafters are exported with all `full_attention`
+    layer types and the window only in `dflash_config`, and other serving
+    stacks window every layer of such a drafter. The per-layer filter applies
+    only when the layer types tell sliding layers from full ones, and it reads
+    them with `_is_sliding_attention_layer`, as the attention mask does.
     """
     if not use_swa:
         return (-1, -1)
     any_sliding = layer_types is not None and any(
-        str(layer_type) == "sliding_attention" for layer_type in layer_types
+        _is_sliding_attention_layer(layer_type) for layer_type in layer_types
     )
     if (
         any_sliding
         and layer_idx < len(layer_types)
-        and layer_types[layer_idx] != "sliding_attention"
+        and not _is_sliding_attention_layer(layer_types[layer_idx])
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
