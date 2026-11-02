@@ -67,6 +67,7 @@ from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
 from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -81,6 +82,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -878,6 +880,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        # /health, /version and /v1/models for every role. The health
+        # probe stays here, with its private accesses, until the public
+        # health API exists.
+        self.app.state.ops_serving_system = SystemServing(
+            model=self.model, health_probe=self._health_probe)
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+        # Runs before the role dispatch for now. It moves after the dispatch
+        # once the serving objects attach_router checks for are built per
+        # role.
+
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
@@ -1194,12 +1206,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return True
 
     def register_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
                                methods=["GET"])
@@ -1344,9 +1353,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -1451,9 +1457,6 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def register_embedding_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/embeddings",
                                self.openai_embedding,
                                methods=["POST"])
@@ -1558,10 +1561,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
-        # Health and info endpoints
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
@@ -1677,6 +1676,28 @@ class OpenAIServer(_VideoRoutesMixin):
         if not executor.doing_shutdown:
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+
+    def _health_probe(self) -> bool:
+        if self._check_health():
+            return True
+        else:
+            # If the engine has a fatal error, trigger server shutdown so the
+            # pod doesn't linger as a zombie that accepts connections but never
+            # produces tokens.  Uses SIGINT (not SIGTERM) to match the
+            # existing CppExecutorError handlers and let uvicorn perform
+            # its graceful shutdown sequence.  The doing_shutdown guard
+            # ensures we only send SIGINT once — repeated health probes
+            # won't stack signals during an in-progress teardown.
+            executor = getattr(self.generator, '_executor', None)
+            if executor is not None and getattr(executor, '_fatal_error',
+                                                None) is not None:
+                if not getattr(executor, 'doing_shutdown', True):
+                    logger.error(
+                        "Health check detected fatal engine error, initiating "
+                        f"server shutdown: {executor._fatal_error}")
+                    _record_generator_termination(self.generator)
+                    signal.raise_signal(signal.SIGINT)
+            return False
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""

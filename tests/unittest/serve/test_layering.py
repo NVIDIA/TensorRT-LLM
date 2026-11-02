@@ -19,6 +19,7 @@ contract here. A contract forbids imports by module prefix; a baseline allowance
 records the imports that existed when the contract was written and only shrinks.
 """
 
+import ast
 import textwrap
 from pathlib import Path
 
@@ -82,6 +83,25 @@ CONTRACTS = (
             "allowance when its import goes away."
         ),
     ),
+    Contract(
+        name="serve/_base/ does not import serve/api/",
+        importers=("tensorrt_llm.serve._base",),
+        forbidden=("tensorrt_llm.serve.api",),
+        fix=(
+            "serve/_base/ is shared infrastructure and must not depend on endpoint "
+            "packages; pass what it needs in from the composition root."
+        ),
+    ),
+    Contract(
+        name="serve/api/ and serve/_base/ do not import the composition root",
+        importers=("tensorrt_llm.serve.api", "tensorrt_llm.serve._base"),
+        forbidden=("tensorrt_llm.serve.openai_server", "tensorrt_llm.serve.app"),
+        fix=(
+            "Endpoint packages and serve/_base/ must not import the composition root "
+            "(serve/openai_server.py or serve/app.py); the root imports them and injects "
+            "what they need. Move the shared helper to serve/_base/ instead."
+        ),
+    ),
 )
 
 
@@ -96,6 +116,49 @@ def test_contracts_hold(edges):
 
 def test_no_stale_allowances(edges):
     assert stale_allowances(edges, CONTRACTS) == []
+
+
+_API_PREFIX = "tensorrt_llm.serve.api"
+
+
+def _api_package_of(module: str):
+    """The endpoint package of a module under ``tensorrt_llm.serve.api``.
+
+    The package is the first two components below ``api`` for ``openai`` and
+    ``ops`` (``openai.chat``, ``ops.system``) and the first one otherwise
+    (``anthropic``, ``visual_gen``).
+    """
+    below = module.split(".")[3:]
+    if below and below[0] in ("openai", "ops"):
+        return tuple(below[:2])
+    return tuple(below[:1])
+
+
+def _under_api(module: str) -> bool:
+    return module == _API_PREFIX or module.startswith(_API_PREFIX + ".")
+
+
+def test_api_packages_do_not_import_each_other(edges):
+    problems = [
+        f"serve/api/ packages do not import each other: {edge.importer} (line {edge.lineno}) "
+        f"imports `{edge.imported}`. Share code through serve/_base/ or inject it from the "
+        "composition root."
+        for edge in edges
+        if _under_api(edge.importer)
+        and _under_api(edge.imported)
+        and not edge.type_checking
+        and _api_package_of(edge.importer) != _api_package_of(edge.imported)
+    ]
+    assert problems == []
+
+
+def test_api_init_imports_nothing():
+    tree = ast.parse((REPO_ROOT / "tensorrt_llm" / "serve" / "api" / "__init__.py").read_text())
+    imports = [node for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom))]
+    assert imports == [], (
+        "serve/api/__init__.py imports nothing: attach_routers imports routers by role; an "
+        "import here would load them for every role and break the VisualGen CI selection."
+    )
 
 
 # ---------------------------------------------------------------------------
