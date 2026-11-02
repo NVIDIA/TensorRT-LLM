@@ -363,9 +363,13 @@ _FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
 
 
 KIMI_K3_ATTN_RES_TOPOLOGY_ENV = "KIMI_K3_ATTN_RES_TOPOLOGY"
-"""``1`` runs the attention-residual mixes (+ RMSNorm) above the decode kernel's token range on
-the persistent kernel (one CTA per SM looping over tokens; H == 7168 and 2 <= N <= 9). The
-default, ``per_token``, leaves them unfused. See ``_attn_res_kernel``.
+"""``1`` (or its alias ``split``) runs the attention-residual mixes (+ RMSNorm) above the decode
+kernel's token range on the persistent kernel (one CTA per SM looping over tokens; H == 7168 and
+2 <= N <= 9). The default, ``per_token``, leaves them unfused. See ``_attn_res_kernel``.
+
+The decode kernel serves every shape up to its token limit, so ``split`` is the only topology:
+``persistent`` (the persistent kernel at every shape) is not accepted, and the per-token ceiling
+is the decode kernel's limit (``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` is not read).
 
 Off by default because the persistent kernel measures as no-regression on
 NVFP4 but as a 2.98x context-phase regression on W4A8_MXFP4_MXFP8, through a
@@ -374,14 +378,28 @@ downstream interaction with the TRTLLM-gen MoE rather than through this kernel.
 Read at import, so CUDA-graph capture and replay cannot disagree about it.
 """
 
+_UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
+
 
 def _read_persistent_attn_res() -> bool:
     raw = os.environ.get(KIMI_K3_ATTN_RES_TOPOLOGY_ENV, "per_token")
-    if raw not in ("per_token", "1"):
+    if raw == "persistent":
+        raise ValueError(
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV}=persistent is no longer supported: the decode kernel "
+            "serves the shapes up to its token limit; use '1' (persistent above it) or 'per_token'"
+        )
+    if raw not in ("per_token", "1", "split"):
         # Loudly: a mistyped A/B arm that silently fell back to the default would
         # measure one side twice and report no difference.
-        raise ValueError(f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be 'per_token' or '1', got {raw!r}")
-    return raw == "1"
+        raise ValueError(
+            f"{KIMI_K3_ATTN_RES_TOPOLOGY_ENV} must be 'per_token', '1' or 'split', got {raw!r}"
+        )
+    if _UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV in os.environ:
+        logger.warning(
+            f"{_UNREAD_FUSED_ATTN_RES_MAX_TOKENS_ENV} is ignored: the per-token attention-residual "
+            "kernel serves the shapes up to its own token limit"
+        )
+    return raw != "per_token"
 
 
 _PERSISTENT_ATTN_RES_ENABLED = _read_persistent_attn_res()

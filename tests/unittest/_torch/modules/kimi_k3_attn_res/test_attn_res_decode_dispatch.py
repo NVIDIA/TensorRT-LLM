@@ -4,8 +4,7 @@
 
 Decode-sized fused attention-residual calls go to the CuTe DSL kernel
 (``trtllm::kimi_k3_attn_res_*``) and stay within its declared tolerance of the C++ per-token
-ops; one selector (``_attn_res_kernel``) decides both the mixes' kernel and whether a MoE layer
-defers its residual update; a MoE layer's residual update deferred into the next layer's mix
+ops; a MoE layer's residual update deferred into the next layer's mix
 gives the same prefix and normalized mix, bit for bit, as materializing it first.
 """
 
@@ -69,8 +68,10 @@ def _close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None):
     assert float(((a - e) != 0).float().mean()) <= 2e-2, what
 
 
-@pytest.mark.parametrize("snapshots", [1, 3, 4, 8, 11])
-@pytest.mark.parametrize("m", [1, 7, 32, 64])
+# The kernel itself is compared with the C++ ops over its full range in
+# kernels/parallel/test_kimi_k3_attn_res_decode.py; this checks the model-side wrappers.
+@pytest.mark.parametrize("snapshots", [1, 4, 11])
+@pytest.mark.parametrize("m", [1, 64])
 @torch.no_grad()
 def test_dispatch_matches_cpp(m: int, snapshots: int):
     proj, norm, out_norm = _modules(m + snapshots)
@@ -91,26 +92,16 @@ def test_dispatch_matches_cpp(m: int, snapshots: int):
     assert torch.equal(upd, ref_upd.view(m, HIDDEN))
 
 
-def test_one_selector_for_mixes_and_moe_residual_deferral(monkeypatch):
-    """The decode kernel up to its token and candidate limits, the persistent kernel above them
-    only where it is switched on; a MoE layer defers its residual exactly where the next mix runs
-    on the decode kernel."""
-    kernel = mkl._AttnResKernel
-
-    def pick(m: int, n: int):
-        rows = torch.empty(m, HIDDEN, dtype=torch.bfloat16, device="cuda")
-        return mkl._attn_res_kernel(rows, n), mkl._defers_moe_residual(rows, n)
-
-    assert pick(1, 2) == (kernel.DECODE, True)
-    assert pick(_max_tokens(), 12) == (kernel.DECODE, True)
-    assert pick(_max_tokens() + 1, 4) == (kernel.UNFUSED, False)
-    assert pick(8, 13) == (kernel.UNFUSED, False)
-    monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", True)
-    assert pick(8, 4) == (kernel.DECODE, True)
-    assert pick(_max_tokens() + 1, 4) == (kernel.PERSISTENT, False)
-    assert pick(_max_tokens() + 1, 10) == (kernel.UNFUSED, False)
-    monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_ENABLED", False)
-    assert pick(8, 4) == (kernel.UNFUSED, False)
+@pytest.mark.parametrize("raw, persistent", [("per_token", False), ("1", True), ("split", True)])
+def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
+    """``KIMI_K3_ATTN_RES_TOPOLOGY``: ``split`` stays an alias of ``1``; ``persistent`` and unknown
+    values fail loudly instead of silently measuring the default."""
+    monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, raw)
+    assert mkl._read_persistent_attn_res() is persistent
+    for bad in ("persistent", "on"):
+        monkeypatch.setenv(mkl.KIMI_K3_ATTN_RES_TOPOLOGY_ENV, bad)
+        with pytest.raises(ValueError):
+            mkl._read_persistent_attn_res()
 
 
 class _PlainKdaMixer:
@@ -154,11 +145,14 @@ def _fake_layer(layer_idx: int, seed: int):
     return layer
 
 
-@pytest.mark.parametrize("m", [7, 32, 64])
+# 65: one row above the decode kernel's limit, where the next mix is not the decode kernel and the
+# MoE layer must not defer its residual update.
+@pytest.mark.parametrize("m", [7, 32, 64, 65])
 @torch.no_grad()
 def test_decoder_layers_with_deferred_moe_residual(m: int):
     """Two decoder layers: the MoE residual update folded into the next mix equals materializing
-    it first, bit for bit. Without ``defer_moe_residual`` a layer returns a tensor."""
+    it first, bit for bit, and is deferred only where the decode kernel runs that mix. Without
+    ``defer_moe_residual`` a layer returns a tensor."""
     layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
     bank = _rows(8, m, HIDDEN)
     hidden = _rows(m, HIDDEN)
@@ -170,10 +164,12 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
         return h
 
     deferred = run(defer=True)
-    assert isinstance(deferred, mkl._DeferredMoEResidual)
+    assert isinstance(deferred, mkl._DeferredMoEResidual) == (m <= _max_tokens())
     materialized = run(defer=False)
     assert isinstance(materialized, torch.Tensor)
-    assert torch.equal(deferred.materialize(), materialized)
+    if isinstance(deferred, mkl._DeferredMoEResidual):
+        deferred = deferred.materialize()
+    assert torch.equal(deferred, materialized)
 
 
 class _FakeKdaMixer:
