@@ -2259,6 +2259,7 @@ HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& 
     if (auto const* host = std::get_if<HostCacheTierConfig>(&tierConfig))
     {
         options.allowRemoteNumaFallback = host->allowRemoteNumaFallback;
+        options.numaNode = host->numaNode;
     }
     return options;
 }
