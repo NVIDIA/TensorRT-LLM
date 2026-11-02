@@ -68,13 +68,7 @@ from .engine.runners.encoder_decoder import (
     EncoderDecoderRunnerConfig,
     EncoderStageConfig,
 )
-from .engine.runners.interface import (
-    ModelRunner,
-    PackedInputs,
-    PackedModelRunner,
-    ScheduledInputs,
-    ScheduledModelRunner,
-)
+from .engine.runners.interface import ModelRunner, ScheduledInputs, ScheduledModelRunner
 from .engine.runners.no_kv_cache import NoKVCacheRunner, NoKVCacheRunnerConfig
 from .engine.runners.pooling import PoolingRunner
 from .guided_decoder import CapturableGuidedDecoder
@@ -893,9 +887,6 @@ class ModelEngine:
         Orchestrates the warmup process by calling specialized warmup methods for
         torch.compile, the autotuner, and CUDA graphs.
         """
-        if isinstance(self._runner, PackedModelRunner):
-            self._runner.warmup()
-            return
         assert resource_manager is not None, "scheduled warmup requires a resource manager"
         assert isinstance(self._runner, ScheduledModelRunner)
         self._runner.warmup(resource_manager)
@@ -1174,7 +1165,7 @@ class ModelEngine:
 
     def forward(
         self,
-        batch: ScheduledRequests | PackedInputs,
+        batch: ScheduledRequests,
         resource_manager: ResourceManager | None = None,
         new_tensors_device: SampleStateTensors | None = None,
         cache_indirection_buffer: torch.Tensor | None = None,
@@ -1182,11 +1173,6 @@ class ModelEngine:
         enable_spec_decode: bool = False,
         runtime_draft_len: int = 0,
     ):
-        if isinstance(batch, PackedInputs):
-            assert isinstance(self._runner, PackedModelRunner), (
-                "a packed batch requires a packed-batch runner"
-            )
-            return self._runner.forward(batch)
         assert resource_manager is not None, "scheduled execution requires a resource manager"
         inputs = make_scheduled_inputs(
             batch,
