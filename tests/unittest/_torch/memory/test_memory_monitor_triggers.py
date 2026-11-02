@@ -66,6 +66,7 @@ def _clean_registry():
     uninstall_oom_reporter()
 
 
+@pytest.mark.cpu_only
 class TestRegistry:
     def test_registered_provider_is_collected(self):
         manager = _FakeManager(_stats(100, 40, 10))
@@ -99,6 +100,7 @@ class TestRegistry:
         assert physical[0].size_bytes == 200 * MB
 
 
+@pytest.mark.cpu_only
 class TestProviderDoesNotPinThePool:
     """The pool is the largest allocation in the process."""
 
@@ -124,6 +126,7 @@ class TestProviderDoesNotPinThePool:
 
 
 class TestReportNow:
+    @pytest.mark.cpu_only
     def test_returns_none_when_disabled(self, monkeypatch):
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         assert report_now(tag="t", rank=0) is None
@@ -154,6 +157,7 @@ class TestReportNow:
 
 
 class TestOomReporter:
+    @pytest.mark.cpu_only
     def test_not_installed_when_disabled(self, monkeypatch):
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         assert install_oom_reporter(rank=0) is False
@@ -172,6 +176,7 @@ class TestOomReporter:
         # print every report twice.
         assert len(attaches) == 1
 
+    @pytest.mark.cpu_only
     def test_repeated_ooms_collapse_within_the_interval(self, monkeypatch):
         # Exercise the callback directly: the attach flag deliberately never
         # resets, so a test cannot rely on capturing it from a second install.
@@ -190,6 +195,7 @@ class TestOomReporter:
         # A retry loop must not bury the first report under identical copies.
         assert len(emitted) == 1
 
+    @pytest.mark.cpu_only
     def test_a_later_oom_is_still_reported(self, monkeypatch):
         # A once-per-process budget would leave an OOM hours into serving
         # unreported because something earlier used it up.
@@ -207,6 +213,7 @@ class TestOomReporter:
         mod._on_out_of_memory(0, 1 << 30, 1 << 30, 1 << 30)
         assert len(emitted) == 2
 
+    @pytest.mark.cpu_only
     def test_interval_is_configurable(self, monkeypatch):
         import tensorrt_llm._torch.memory.monitor.triggers as mod
 
@@ -220,6 +227,7 @@ class TestOomReporter:
             mod._on_out_of_memory(0, 1 << 30, 1 << 30, 1 << 30)
         assert len(emitted) == 3
 
+    @pytest.mark.cpu_only
     def test_inert_once_uninstalled(self, monkeypatch):
         import tensorrt_llm._torch.memory.monitor.triggers as mod
 
@@ -233,6 +241,7 @@ class TestOomReporter:
         mod._on_out_of_memory(0, 1 << 30, 1 << 30, 1 << 30)
         assert emitted == []
 
+    @pytest.mark.cpu_only
     def test_a_failing_report_does_not_mask_the_oom(self, monkeypatch):
         import tensorrt_llm._torch.memory.monitor.triggers as mod
 
@@ -287,6 +296,7 @@ class TestTraceLogHook:
 
 
 class TestRank:
+    @pytest.mark.cpu_only
     def test_rank_filter_applies_without_an_explicit_rank(self, monkeypatch):
         from tensorrt_llm._torch.memory import monitor
 
@@ -299,6 +309,7 @@ class TestRank:
         monkeypatch.setattr(monitor, "current_rank", lambda: 0)
         assert monitor.enabled() is True
 
+    @pytest.mark.cpu_only
     def test_unknown_rank_does_not_silently_skip(self, monkeypatch):
         from tensorrt_llm._torch.memory import monitor
 
@@ -318,6 +329,7 @@ class TestRank:
         assert "rank=5" in text, "interleaved multi-rank logs must be separable"
 
 
+@pytest.mark.cpu_only
 class TestStartupOutcome:
     def test_failed_startup_is_labelled(self, monkeypatch):
         from tensorrt_llm._torch.memory.monitor import tagging
@@ -417,6 +429,7 @@ class TestBaselineAcrossReports:
         assert texts and "since warmup" not in texts[0]
 
 
+@pytest.mark.cpu_only
 class TestOomOutsideTorch:
     """OOMs from C++, cuBLAS and NCCL never reach torch's observer."""
 

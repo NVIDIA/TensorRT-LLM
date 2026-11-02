@@ -37,6 +37,7 @@ def _clean(monkeypatch):
     tagging.set_frozen_map(tagging.TagSnapshot(supported=False))
 
 
+@pytest.mark.cpu_only
 class TestSiteNames:
     def test_innermost_tensorrt_llm_frame_wins(self):
         frames = [
@@ -86,6 +87,7 @@ class TestSiteNames:
         assert stacks.site_of(frames) == "modules/linear.py:forward"
 
 
+@pytest.mark.cpu_only
 class TestOffByDefault:
     def test_disabled_without_the_variable(self, monkeypatch):
         monkeypatch.delenv(stacks.ENV_VAR, raising=False)

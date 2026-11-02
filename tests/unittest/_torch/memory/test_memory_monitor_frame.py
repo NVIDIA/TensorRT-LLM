@@ -36,6 +36,8 @@ from tensorrt_llm._torch.memory.monitor.frame import (
 from tensorrt_llm._torch.memory.monitor.report import UNAVAILABLE, render, summarize_by_category
 from tensorrt_llm._torch.memory.monitor.schema import Basis, Category, Entry, Placement, Source
 
+pytestmark = pytest.mark.cpu_only
+
 GIB = 1 << 30
 
 

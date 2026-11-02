@@ -114,6 +114,7 @@ class TestSleepReleasedKvCache:
         def get_kv_cache_stats(self):
             return types.SimpleNamespace(allocated_bytes=512 * MB)
 
+    @pytest.mark.cpu_only
     def test_released_pool_is_listed_not_counted(self):
         from tensorrt_llm._torch.memory.monitor.providers.kv_cache import KvCacheProvider
 
@@ -154,6 +155,7 @@ class TestSleepReleasedKvCache:
             del held, proxy
 
 
+@pytest.mark.cpu_only
 class TestStartupState:
     @pytest.fixture
     def window(self, monkeypatch):
@@ -200,6 +202,7 @@ class TestStartupState:
         assert sum(parts.values()) == 1300 * MB
 
 
+@pytest.mark.cpu_only
 class TestNvmlReason:
     def _fake_nvml(self, monkeypatch, pid):
         from tensorrt_llm import profiler
@@ -226,6 +229,7 @@ class TestNvmlReason:
         assert mon._nvml_process_lookup(0) == (7 * MB, "")
 
 
+@pytest.mark.cpu_only
 def test_warmup_report_never_raises(monkeypatch):
     from tensorrt_llm._torch.pyexecutor import trace_log_utils
 
@@ -236,6 +240,7 @@ def test_warmup_report_never_raises(monkeypatch):
     trace_log_utils._maybe_log_monitor_report("warmup")
 
 
+@pytest.mark.cpu_only
 def test_wrapped_startup_history_is_reported(monkeypatch):
     warnings = []
     monkeypatch.setattr(tagging, "tagging_supported", lambda: True)
@@ -270,6 +275,7 @@ def test_an_unwritable_directory_does_not_lose_the_report(monkeypatch, tmp_path)
     assert triggers.report_now(tag="unit") is not None
 
 
+@pytest.mark.cpu_only
 def test_another_process_holding_the_gpu_is_named():
     from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
     from tensorrt_llm._torch.memory.monitor.summary import render_summary
@@ -281,6 +287,7 @@ def test_another_process_holding_the_gpu_is_named():
     assert "other processes on this GPU hold 175.50 GiB" in text
 
 
+@pytest.mark.cpu_only
 def test_share_column_never_runs_into_the_size():
     from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
     from tensorrt_llm._torch.memory.monitor.summary import render_summary
@@ -293,6 +300,7 @@ def test_share_column_never_runs_into_the_size():
         assert "GiB-" not in line and not __import__("re").search(r"GiB\d", line)
 
 
+@pytest.mark.cpu_only
 def test_released_note_uses_readable_merged_names():
     from tensorrt_llm._torch.memory.monitor.frame import DeviceReading, TorchReading, build_frame
     from tensorrt_llm._torch.memory.monitor.pools import PoolUsage
