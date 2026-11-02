@@ -6,6 +6,7 @@
 import ast
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import zipfile
@@ -56,6 +57,14 @@ def test_native_uses_cmake_detection_and_falls_back_like_cmake(tmp_path):
     detector.unlink()
     assert builder.resolve_requested_architectures("native", tmp_path) == "all"
     assert builder.resolve_requested_architectures("100", tmp_path) == "100"
+
+
+@pytest.mark.parametrize(("requested", "configured"), [("90", "103"), ("103", "90")])
+def test_final_cmake_architecture_overrides_cli(tmp_path, requested, configured):
+    (tmp_path / "CMakeCache.txt").write_text(
+        f"CMAKE_CUDA_ARCHITECTURES:STRING={configured}\n"
+    )
+    assert builder.resolve_requested_architectures(requested, tmp_path) == configured
 
 
 def test_cli_skips_non_blackwell_without_nvcc(tmp_path):
@@ -141,6 +150,74 @@ def main():
     assert not user_cache.exists()
 
 
+@pytest.mark.skipif(not os.environ.get("MSA_WARMUP_SCRIPT"), reason="patched MSA source not staged")
+def test_real_warmup_handles_spaces_in_all_build_paths(tmp_path, monkeypatch):
+    root = tmp_path / "build path $with: spaces"
+    package = root / "fmha_sm100"
+    csrc = package / "csrc"
+    (csrc / "include").mkdir(parents=True)
+    cutlass = package / "cutlass/include"
+    cutlass.mkdir(parents=True)
+    cutlass_util = package / "cutlass/tools/util/include"
+    cutlass_util.mkdir(parents=True)
+    ffi_include = root / "ffi include"
+    ffi_include.mkdir()
+    for name in ("fmha_sm100_params.h", "tvm_ffi_utils.h", "gmem_bounds_check.h",
+                 "fmha_sm100_plan.cu", "sparse_topk_select.cu", "fmha_sm100_reduction.cu"):
+        (csrc / name).write_text("fixture\n")
+    (csrc / "include/sparse_topk_select.cuh").write_text("fixture\n")
+    for name in ("fmha_sm100_inst.jinja", "fmha_sm100_variant_run.cu.jinja"):
+        (csrc / name).write_text("// {{ variant_name }}\n")
+    (package / "jit.py").write_text(f'''
+import os
+from pathlib import Path
+CACHE_BASE = Path(os.environ["MINFER_FMHA_CACHE_DIR"]) / "fingerprint"
+_FMHA_VARLEN_DIR = Path({str(csrc)!r})
+_CUTLASS_INCLUDE = Path({str(cutlass)!r})
+_CUTLASS_UTIL_INCLUDE = Path({str(cutlass_util)!r})
+_FMHA_SM100_DISPATCH = [("only", [("value", {{}})])]
+def _FMHA_SM100_IMPOSSIBLE(params): return False
+def _aot_variant_names(): return ["0"]
+def _aot_source_digest(): return "sourcehash"
+def _aot_ffi_version(): return "ffi-version"
+def _get_tvm_ffi_include(): return {str(ffi_include)!r}
+def _get_cuda_home(): return os.environ["CUDA_HOME"]
+class FMHAVariantManager: pass
+def _get_nvcc_flags(cache, fmha=True):
+    return "-gencode=arch=compute_103a,code=sm_103a " + " ".join(
+        "-I" + str(p) for p in (_FMHA_VARLEN_DIR / "include", _CUTLASS_INCLUDE,
+                                _CUTLASS_UTIL_INCLUDE, _get_tvm_ffi_include(), cache))
+''')
+    nvcc = root / "cuda toolkit/bin/nvcc"
+    nvcc.parent.mkdir(parents=True)
+    nvcc.write_text(f'''#!/usr/bin/env python3
+import subprocess,sys
+args = sys.argv[1:]
+if "--list-gpu-code" in args:
+    print("sm_103a")
+    raise SystemExit
+out = args[args.index("-o") + 1]
+if "-c" in args:
+    assert {('-I' + str(csrc / 'include'))!r} in args, args
+    subprocess.run(["cc", "-x", "c", "-c", "-o", out, "-"], input="", text=True, check=True)
+else:
+    symbols = {{"all_variants.so": "run_0", "fmha_sm100_plan.so": "plan",
+               "sparse_topk_select.so": "sparse_topk_select", "fmha_sm100_reduction.so": "reduction"}}
+    name = out.rsplit("/", 1)[-1]
+    source = "void __tvm_ffi_" + symbols[name] + "(void) {{}}"
+    subprocess.run(["cc", "-shared", "-fPIC", "-x", "c", "-o", out, "-"], input=source, text=True, check=True)
+''')
+    nvcc.chmod(0o755)
+    temp = root / "private temp"
+    temp.mkdir()
+    monkeypatch.setenv("TMPDIR", str(temp))
+    monkeypatch.setattr(builder.tempfile, "tempdir", None)
+
+    builder.build(package, Path(os.environ["MSA_WARMUP_SCRIPT"]), "103", nvcc, jobs=2)
+
+    assert (package / "_aot/sourcehash/manifest.json").is_file()
+
+
 def test_wheel_contains_staged_fmha_artifacts(tmp_path):
     """Exercise the real setup.py package-data patterns with setuptools."""
     setup_path = _SCRIPT.parents[1] / "setup.py"
@@ -155,6 +232,11 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
     artifacts = package / "_aot/sourcehash"
     artifacts.mkdir(parents=True)
     (package / "__init__.py").write_text("")
+    (package / "csrc/include").mkdir(parents=True)
+    (package / "csrc/kernel.cu").write_text("kernel fixture")
+    (package / "csrc/include/kernel.h").write_text("header fixture")
+    (package / "cutlass/include/cutlass").mkdir(parents=True)
+    (package / "cutlass/include/cutlass/cutlass.h").write_text("cutlass fixture")
     for name in ("manifest.json", "all_variants.so", "plan.so", "sparse_topk.so", "reduction.so"):
         (artifacts / name).write_text("fixture")
     (tmp_path / "setup.py").write_text(
@@ -166,5 +248,8 @@ def test_wheel_contains_staged_fmha_artifacts(tmp_path):
                    capture_output=True, text=True)
     with zipfile.ZipFile(next((tmp_path / "dist").glob("*.whl"))) as archive:
         entries = set(archive.namelist())
+    assert "fmha_sm100/csrc/kernel.cu" in entries
+    assert "fmha_sm100/csrc/include/kernel.h" in entries
+    assert "fmha_sm100/cutlass/include/cutlass/cutlass.h" in entries
     for name in ("manifest.json", "all_variants.so", "plan.so", "sparse_topk.so", "reduction.so"):
         assert f"fmha_sm100/_aot/sourcehash/{name}" in entries

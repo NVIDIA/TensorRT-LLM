@@ -10,6 +10,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,11 @@ from pathlib import Path
 
 
 def resolve_requested_architectures(requested, build_dir):
+    cache = Path(build_dir) / "CMakeCache.txt"
+    if cache.is_file():
+        match = re.search(r"(?m)^CMAKE_CUDA_ARCHITECTURES:[A-Z_]+=(.*)$", cache.read_text())
+        if match:
+            requested = match.group(1).strip() or "all"
     if requested != "native":
         return requested
     try:
@@ -95,8 +101,14 @@ def _worker(package, warmup, architectures, jobs):
     def selected_flags(*args, **kwargs):
         original = flags(*args, **kwargs)
         original = re.sub(r"-gencode=arch=compute_\w+,code=sm_\w+", "", original)
+        if "-I" in original:
+            include_dirs = (jit._FMHA_VARLEN_DIR / "include", jit._CUTLASS_INCLUDE,
+                            jit._CUTLASS_UTIL_INCLUDE, jit._get_tvm_ffi_include(), args[0])
+            directories = sorted(map(str, include_dirs), key=len, reverse=True)
+            pattern = "-I(?:" + "|".join(map(re.escape, directories)) + ")"
+            original = re.sub(pattern, lambda match: shlex.quote(match.group()), original)
         targets = [f"-gencode=arch=compute_{arch[3:]},code={arch}" for arch in architectures]
-        return " ".join([original, *targets])
+        return " ".join([original, *targets]).replace("$", "$$")
 
     jit._get_nvcc_flags = selected_flags
     compile_script = _load_module("msa_warmup_for_wheel", warmup)

@@ -5147,3 +5147,88 @@ diff --git a/python/fmha_sm100/csrc/gmem_bounds_check.h b/python/fmha_sm100/csrc
 +#define KV_BLOCK_INDEX_LOAD(ptr, idx, sz) __ldg(&(ptr)[(idx)])
  
  #endif  // FMHA_GMEM_BOUNDS_CHECK
+diff --git a/scripts/warmup_fmha_sm100.py b/scripts/warmup_fmha_sm100.py
+index c44156f..4d290ff 100644
+--- a/scripts/warmup_fmha_sm100.py
++++ b/scripts/warmup_fmha_sm100.py
+@@ -14,6 +14,7 @@ import argparse
+ import glob
+ import itertools
+ import os
++import shlex
+ import shutil
+ import subprocess
+ import sys
+@@ -24,6 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
+ 
+ from fmha_sm100.jit import _FMHA_SM100_DISPATCH, _FMHA_SM100_IMPOSSIBLE, _get_nvcc_flags
+ 
++def _ninja_path(path):
++    return str(path).replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
++
+ def enumerate_all_variants():
+ 
+     dims = _FMHA_SM100_DISPATCH
+@@ -180,7 +184,7 @@ def main():
+ 
+     ninja_lines = [
+         f"ninja_required_version = 1.5\n",
+-        f"nvcc = {nvcc}\n",
++        f"nvcc = {shlex.quote(nvcc).replace('$', '$$')}\n",
+         f"nvcc_flags = {_get_nvcc_flags(build_dir)}\n",
+         "rule nvcc_compile\n",
+         "  command = $nvcc $nvcc_flags -c $in -o $out\n",
+@@ -207,16 +211,16 @@ def main():
+         run_o = build_dir / f"run_{vname}.o"
+         all_variant_objs.extend([inst_o, run_o])
+ 
+-        ninja_lines.append(f"build {inst_o}: nvcc_compile {inst_cu}\n")
+-        ninja_lines.append(f"build {run_o}: nvcc_compile {run_cu}\n")
++        ninja_lines.append(f"build {_ninja_path(inst_o)}: nvcc_compile {_ninja_path(inst_cu)}\n")
++        ninja_lines.append(f"build {_ninja_path(run_o)}: nvcc_compile {_ninja_path(run_cu)}\n")
+ 
+     # Link all variants into one .so
+     all_so_dir = CACHE_BASE / "_all_variants"
+     all_so_dir.mkdir(parents=True, exist_ok=True)
+     all_so_path = all_so_dir / "all_variants.so"
+     if all_variant_objs:
+-        objs_str = " ".join(str(o) for o in all_variant_objs)
+-        ninja_lines.append(f"build {all_so_path}: nvcc_link {objs_str}\n\n")
++        objs_str = " ".join(_ninja_path(o) for o in all_variant_objs)
++        ninja_lines.append(f"build {_ninja_path(all_so_path)}: nvcc_link {objs_str}\n\n")
+ 
+     # Plan kernel
+     if need_plan:
+@@ -229,8 +233,8 @@ def main():
+         plan_o = build_dir / "fmha_sm100_plan.o"
+         plan_so = plan_dir / "fmha_sm100_plan.so"
+ 
+-        ninja_lines.append(f"build {plan_o}: nvcc_compile_other {plan_cu}\n")
+-        ninja_lines.append(f"build {plan_so}: nvcc_link {plan_o}\n\n")
++        ninja_lines.append(f"build {_ninja_path(plan_o)}: nvcc_compile_other {_ninja_path(plan_cu)}\n")
++        ninja_lines.append(f"build {_ninja_path(plan_so)}: nvcc_link {_ninja_path(plan_o)}\n\n")
+ 
+     # Sparse topk kernel
+     if need_sparse_topk:
+@@ -247,8 +251,8 @@ def main():
+                          topk_dir / "tvm_ffi_utils.h")
+             topk_o = build_dir / "sparse_topk_select.o"
+             topk_so = topk_dir / "sparse_topk_select.so"
+-            ninja_lines.append(f"build {topk_o}: nvcc_compile_other {topk_cu}\n")
+-            ninja_lines.append(f"build {topk_so}: nvcc_link {topk_o}\n\n")
++            ninja_lines.append(f"build {_ninja_path(topk_o)}: nvcc_compile_other {_ninja_path(topk_cu)}\n")
++            ninja_lines.append(f"build {_ninja_path(topk_so)}: nvcc_link {_ninja_path(topk_o)}\n\n")
+ 
+     # Split-KV reduction kernel
+     if need_reduction:
+@@ -260,8 +264,8 @@ def main():
+             shutil.copy2(red_cu_src, red_cu)
+             red_o = build_dir / "fmha_sm100_reduction.o"
+             red_so = red_dir / "fmha_sm100_reduction.so"
+-            ninja_lines.append(f"build {red_o}: nvcc_compile_other {red_cu}\n")
+-            ninja_lines.append(f"build {red_so}: nvcc_link {red_o}\n\n")
++            ninja_lines.append(f"build {_ninja_path(red_o)}: nvcc_compile_other {_ninja_path(red_cu)}\n")
++            ninja_lines.append(f"build {_ninja_path(red_so)}: nvcc_link {_ninja_path(red_o)}\n\n")
+ 
+     (build_dir / "build.ninja").write_text("".join(ninja_lines))
+ 
