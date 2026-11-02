@@ -32,6 +32,7 @@ from tensorrt_llm.serve.responses_utils import (
     ResponsesStreamingProcessor,
     StreamedItem,
     _create_output_content,
+    _parse_output_message_harmony,
     _whole_text_tool_calls,
     create_response_non_store,
 )
@@ -426,3 +427,26 @@ def test_non_streaming_items_are_completed_too():
         ("reasoning", "completed"),
         ("function_call", "completed"),
     ]
+
+
+@pytest.mark.parametrize(
+    "channel, recipient, item_type",
+    [
+        ("analysis", None, "reasoning"),
+        ("commentary", "functions.get_weather", "function_call"),
+        ("commentary", "python", "reasoning"),
+    ],
+    ids=["analysis", "function_call", "python_commentary"],
+)
+def test_harmony_reasoning_and_function_call_items_are_completed(channel, recipient, item_type):
+    openai_harmony = pytest.importorskip("openai_harmony")
+    message = openai_harmony.Message.from_role_and_content(
+        openai_harmony.Role.ASSISTANT, '{"city": "Rome"}'
+    ).with_channel(channel)
+    if recipient is not None:
+        message = message.with_recipient(recipient)
+
+    (item,) = _parse_output_message_harmony(message)
+
+    assert item.type == item_type
+    assert item.status == "completed"
