@@ -828,9 +828,7 @@ def launchReleaseCheck(pipeline, globalVars)
 
         // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-        if (env.alternativeTRT ||
-            isOfficialPostMergeJob ||
-            runMode == "nightly_release") {
+        if (isOfficialPostMergeJob || runMode == "nightly_release") {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
@@ -866,7 +864,7 @@ def launchReleaseCheck(pipeline, globalVars)
         // Step 3: Run pre-commit checks
         // Post-merge CI runs on all files; pre-merge CI runs only on changed files.
         def precommitArgs = "-a"
-        if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || env.alternativeTRT)) {
+        if (!isOfficialPostMergeJob) {
             // Use GitLab/GitHub API to get the exact list of changed files in this MR.
             // This avoids git history depth issues with shallow clones.
             def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -1223,7 +1221,6 @@ def requireMultiGpuApprovalLabel(pipeline, globalVars, String arch) {
 def getMergeRequestChangedFileList(pipeline, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
-        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file list to empty list.")
@@ -1253,7 +1250,6 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
     // If there is an error to get the changed file diff, skip merging the waive list.
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if ((params.InfraDryRun?.toString()?.toBoolean() ?: false) ||
-        env.alternativeTRT ||
         isOfficialPostMergeJob ||
         runMode == "nightly_release") {
         pipeline.echo("Force set changed file diff to empty string.")
@@ -1268,7 +1264,7 @@ def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
 def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
     def autoTriggerTagList = []
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
+    if (isOfficialPostMergeJob) {
         pipeline.echo("Force set auto trigger tags to empty list.")
         return autoTriggerTagList
     }
@@ -1342,8 +1338,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
     }
 
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
+    if (isOfficialPostMergeJob) {
+        pipeline.echo("CBTS: deferring — post-merge job")
         return null
     }
 
@@ -1844,7 +1840,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         pipeline.echo("Force not run multi-GPU testing.")
         return false
     }
-    if (env.alternativeTRT || testFilter[(ADD_MULTI_GPU_TEST)] || testFilter[(ONLY_MULTI_GPU_TEST)] || testFilter[(IS_POST_MERGE)]) {
+    if (testFilter[(ADD_MULTI_GPU_TEST)] || testFilter[(ONLY_MULTI_GPU_TEST)] || testFilter[(IS_POST_MERGE)]) {
         pipeline.echo("Force run multi-GPU testing.")
         return true
     }
@@ -2016,7 +2012,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
 
 def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
+    if (isOfficialPostMergeJob) {
         pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
         return ""
     }
@@ -2469,7 +2465,7 @@ def findCachedPLCSourceScanResult(commit) {
     return [result: buildInfo.result, url: buildInfo.url]
 }
 
-def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:]) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
@@ -2481,18 +2477,6 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
         'enableFailFast': enableFailFast,
         'globalVars': globalVarsJson,
     ] + additionalParameters
-
-    if (env.alternativeTRT && platform == "x86_64") {
-        parameters += [
-            'alternativeTRT': env.alternativeTRT,
-        ]
-    }
-
-    if (env.alternativeTrtSBSA && platform == "SBSA") {
-        parameters += [
-            'alternativeTRT': env.alternativeTrtSBSA,
-        ]
-    }
 
     // Preserve an explicit empty phase override from the dry-run helper.
     if (!additionalParameters.containsKey('testPhase2StageName') && env.testPhase2StageName) {
@@ -2540,7 +2524,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, platfor
     return buildStatus
 }
 
-def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, imageParameters)
+def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, imageParameters)
 {
     String testFilterJson = writeJSON returnText: true, json: testFilter
     def additionalParameters = [
@@ -2549,7 +2533,7 @@ def launchInfraDryRunTestJob(pipeline, arch, testFilter, globalVars, platform, i
         'testPhase2StageName': '',
     ] + imageParameters
     stage("[Test-${arch}-Single-GPU] Remote Run") {
-        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, platform, additionalParameters)
+        launchJob(pipeline, "L0_Test-${arch}-Single-GPU", false, false, globalVars, additionalParameters)
     }
 }
 
@@ -2694,7 +2678,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
                     // build failure (see runBranchesWithInfraDefer in Build.groovy).
-                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, additionalParameters)
                     buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
@@ -2712,7 +2696,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
-                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, "x86_64", imageParameters)
+                    launchInfraDryRunTestJob(pipeline, "x86_64", testFilter, globalVars, imageParameters)
                     return
                 }
 
@@ -2750,7 +2734,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                         // launchJob returns UNSTABLE (without throwing) when the single-GPU
                         // sub-job was infra-incomplete: only infra aborts, no real failure.
-                        def singleGpuStatus = launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, additionalParameters)
                         singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
                     } catch (InterruptedException e) {
                         throw e
@@ -2839,7 +2823,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -2880,7 +2864,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     // launchJob returns UNSTABLE (without throwing) when the build
                     // sub-job was infra-incomplete: only infra aborts, no genuine
                     // build failure (see runBranchesWithInfraDefer in Build.groovy).
-                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    def buildStatus = launchJob(pipeline, "/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, additionalParameters)
                     buildInfraIncomplete = (buildStatus == "UNSTABLE")
                 }
 
@@ -2898,7 +2882,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                     ]
-                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, "SBSA", imageParameters)
+                    launchInfraDryRunTestJob(pipeline, "SBSA", testFilter, globalVars, imageParameters)
                     return
                 }
 
@@ -2933,7 +2917,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 // both writers on the same object.
                                 'boltPublishCanonical': "false",
                             ]
-                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, "SBSA", additionalParameters)
+                            launchJob(pipeline, "/LLM/helpers/BoltProfileGen", false, false, globalVars, additionalParameters)
                         }
                     }
                 }
@@ -2971,7 +2955,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 
                         // launchJob returns UNSTABLE (without throwing) when the single-GPU
                         // sub-job was infra-incomplete: only infra aborts, no real failure.
-                        def singleGpuStatus = launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        def singleGpuStatus = launchJob(pipeline, "L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, additionalParameters)
                         singleGpuInfraIncomplete = (singleGpuStatus == "UNSTABLE")
                     } catch (InterruptedException e) {
                         throw e
@@ -3057,7 +3041,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImage': globalVars["LLM_SBSA_WHEEL_DOCKER_IMAGE"],
                         ]
 
-                        launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -3149,7 +3133,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
