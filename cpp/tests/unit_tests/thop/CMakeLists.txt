@@ -44,5 +44,5 @@ if(${BUILD_PYT})
     LINK_LIBRARIES
     tllm::torch_utils
     LABELS
-    "unit;runtime;thop;host")
+    "unit;runtime;thop;gpu")
 endif()
