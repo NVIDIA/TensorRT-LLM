@@ -31,7 +31,9 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import KeyType
+from tensorrt_llm._torch.pyexecutor.engine import model_setup
 from tensorrt_llm._torch.pyexecutor.engine.model_call import ModelCaller
+from tensorrt_llm._torch.pyexecutor.engine.model_setup import apply_torch_compile
 from tensorrt_llm._torch.pyexecutor.engine.multimodal import is_multimodal
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder import DecoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import DecoderCudaGraphs
@@ -660,22 +662,28 @@ class ModelEngineTestCase(unittest.TestCase):
         for compile_enabled in (True, False):
             with self.subTest(compile_enabled=compile_enabled):
                 resource_manager = Mock()
+                model = Mock()
                 model_engine = SimpleNamespace(
+                    model=model,
                     warmup_scope=nullcontext,
                     _torch_compile_backend=Mock() if compile_enabled else None,
                     llm_args=SimpleNamespace(
                         torch_compile_config=SimpleNamespace(enable_fullgraph=False)
                     ),
-                    _apply_torch_compile=Mock(),
                 )
-                with patch("gc.collect") as collect, patch("torch.compiler.reset") as reset:
+                with (
+                    patch("gc.collect") as collect,
+                    patch("torch.compiler.reset") as reset,
+                    patch(
+                        "tensorrt_llm._torch.pyexecutor.model_engine.apply_torch_compile",
+                        return_value=(model, False),
+                    ) as apply_compile,
+                ):
                     ModelEngine.restore_compiled_model_after_refit(model_engine, resource_manager)
                 resource_manager.get_resource_manager.assert_not_called()
                 collect.assert_not_called()
                 reset.assert_not_called()
-                self.assertEqual(
-                    model_engine._apply_torch_compile.call_count, 1 if compile_enabled else 0
-                )
+                self.assertEqual(apply_compile.call_count, 1 if compile_enabled else 0)
 
     def test_decoder_buffers_are_allocated_only_for_decoder_runner(self) -> None:
         llm_args = TorchLlmArgs(
@@ -1011,7 +1019,7 @@ def test_pcg_fx_fallback_policy_is_model_specific(
     monkeypatch.setattr(ModelEngine, "__del__", lambda self: None)
     backend_factory = Mock()
     backend_factory.Streams = list
-    monkeypatch.setattr(model_engine_module, "Backend", backend_factory)
+    monkeypatch.setattr(model_setup, "Backend", backend_factory)
     compiled = torch.nn.Identity()
     compile_model = Mock(return_value=compiled)
     monkeypatch.setattr(torch, "compile", compile_model)
@@ -1319,7 +1327,9 @@ def test_refit_updates_compiled_weights_without_invalidating_graphs(
         ),
     ):
         if compile_enabled:
-            engine._apply_torch_compile("eager", False)
+            engine.model, engine._torch_compile_prefill_only = apply_torch_compile(
+                engine.model, "eager", llm_args=engine.llm_args, fullgraph=False
+            )
         for value, unwrap, restore in (
             (
                 2.0,

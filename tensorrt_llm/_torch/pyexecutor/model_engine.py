@@ -9,20 +9,17 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
-import torch._dynamo.config
 
-import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
 from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
 from tensorrt_llm._torch.pyexecutor.warmup_timer import _WarmupTimer
-from tensorrt_llm._utils import mpi_disabled, release_gc
+from tensorrt_llm._utils import release_gc
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor, create_input_processor
 from tensorrt_llm.llmapi.llm_args import (
     DecodingBaseConfig,
     EncodeCudaGraphConfig,
     PrefillCudaGraphBackend,
-    TorchCompileConfig,
     TorchLlmArgs,
 )
 
@@ -35,24 +32,26 @@ from ..attention.backends.utils import get_attention_backend
 from ..compilation.backend import Backend
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
-from ..distributed.ops import MNNVLAllReduce
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import BaseMoeLoadBalancer
-from ..nccl_window_tensor_scope import install_eager_nccl_window_tensor_scopes
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..tensor_lru_cache import TensorLRUCache
-from ..utils import set_torch_compiling
 from .config_utils import is_hybrid_linear
 from .cuda_graph_runner import CUDAGraphRunner
 from .engine.cuda_graph import plan_cuda_graphs
 from .engine.lora import resolve_lora_owner
-from .engine.model_call import ModelCaller
-from .engine.model_setup import resolve_max_num_tokens, resolve_max_seq_len
+from .engine.model_setup import (
+    apply_torch_compile,
+    compile_model,
+    remove_torch_compile,
+    resolve_max_num_tokens,
+    resolve_max_seq_len,
+)
 from .engine.multimodal import (
     MultimodalItemScheduler,
     is_multimodal,
@@ -64,7 +63,6 @@ from .engine.multimodal import (
 from .engine.runners import resolve_runner_type
 from .engine.runners.common import make_scheduled_inputs, resolve_mrope_position_deltas_cache
 from .engine.runners.decoder import DecoderRunner, DecoderRunnerConfig
-from .engine.runners.decoder.runner import PrefillCompiledModel
 from .engine.runners.encoder import EncoderRunner, EncoderRunnerConfig
 from .engine.runners.encoder_decoder import (
     EncoderDecoderRunner,
@@ -453,124 +451,27 @@ class ModelEngine:
         self._prefill_cuda_graph_num_tokens = plan.prefill_num_tokens
 
     def _compile_model(self, configured_encoder_max_num_tokens: int | None) -> None:
-        """Compile the model, or install the eager NCCL window tensor scopes,
-        capture the local multimodal encoders' CUDA graphs, and wrap the result
-        in the model caller."""
-        torch_compile_config = self.llm_args.torch_compile_config
-        prefill_cuda_graph_backend = self.llm_args.prefill_cuda_graph_backend
-        torch_compile_enabled = bool(torch_compile_config is not None)
-        torch_compile_fullgraph = (
-            torch_compile_config.enable_fullgraph
-            if torch_compile_config is not None
-            else TorchCompileConfig.model_fields["enable_fullgraph"].default
-        )
-        compile_only_piecewise_graphs = (
-            torch_compile_config.compile_only_piecewise_graphs
-            if torch_compile_config is not None
-            else TorchCompileConfig.model_fields["compile_only_piecewise_graphs"].default
-        )
-        torch_compile_inductor_enabled = (
-            torch_compile_config.enable_inductor
-            if torch_compile_config is not None
-            else TorchCompileConfig.model_fields["enable_inductor"].default
-        )
-        torch_compile_piecewise_cuda_graph = (
-            prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
-        )
-        torch_compile_enable_userbuffers = (
-            torch_compile_config.enable_userbuffers
-            if torch_compile_config is not None
-            else TorchCompileConfig.model_fields["enable_userbuffers"].default
-        )
-        torch_compile_max_num_streams = (
-            torch_compile_config.max_num_streams
-            if torch_compile_config is not None
-            else TorchCompileConfig.model_fields["max_num_streams"].default
-        )
-
-        self._torch_compile_prefill_only = False
-
-        backend_num_streams = None
-        try:
-            if torch_compile_enabled:
-                set_torch_compiling(True)
-                if mpi_disabled() and self.mapping.world_size > 1:
-                    # Resolve the device-mesh dims the compiled forward reads
-                    # (mapping.tp_group & friends) while still eager: the
-                    # DeviceMesh resolver is compiler-disabled and must never
-                    # run under tracing; once memoized these reads trace as
-                    # constants.
-                    _ = self.mapping.tp_group
-                    _ = self.mapping.pp_group
-                    _ = self.mapping.cp_group
-                    if self.mapping.moe_ep_size > 1:
-                        _ = self.mapping.moe_tp_group
-                        _ = self.mapping.moe_ep_group
-                # torch.compile traces AllReduce.forward, whose lazy MNNVL
-                # workspace rescale cannot allocate inside the traced region -
-                # grow the workspaces to the engine maximum up front.
-                num_mnnvl_allreduces = 0
-                for module in self.model.modules():
-                    if isinstance(module, MNNVLAllReduce):
-                        module.prescale_workspace(
-                            self.max_num_tokens, self.model.config.hidden_size
-                        )
-                        num_mnnvl_allreduces += 1
-                if num_mnnvl_allreduces:
-                    logger.info(
-                        f"Pre-scaled the MNNVL allreduce workspace for "
-                        f"{num_mnnvl_allreduces} modules to cover "
-                        f"max_num_tokens={self.max_num_tokens} before "
-                        "torch.compile."
-                    )
-                use_ub = torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size
-                )
-                backend_num_streams = Backend.Streams(
-                    [torch.cuda.Stream() for _ in range(torch_compile_max_num_streams - 1)]
-                )
-                self._torch_compile_backend = Backend(
-                    torch_compile_inductor_enabled,
-                    enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=(torch_compile_piecewise_cuda_graph),
-                    capture_num_tokens=self._prefill_cuda_graph_num_tokens,
-                    max_num_streams=torch_compile_max_num_streams,
-                    mapping=self.mapping,
-                )
-                if compile_only_piecewise_graphs and not isinstance(
-                    self.model, DecoderModelForCausalLM
-                ):
-                    raise ValueError(
-                        "TorchCompileConfig."
-                        "compile_only_piecewise_graphs=True is "
-                        "only supported for DecoderModelForCausalLM models."
-                    )
-
-                self._apply_torch_compile(self._torch_compile_backend, torch_compile_fullgraph)
-                torch._dynamo.config.cache_size_limit = 16
-            else:
-                set_torch_compiling(False)
-                install_eager_nccl_window_tensor_scopes(self.model)
-
-            # Capture local encoders after their metadata is sized and before
-            # KV-cache estimation, so graph memory is included in the profile.
-            mm_config = self.llm_args.multimodal_config
-            setup_mm_encoder_cuda_graphs(
-                self.model,
-                mm_config.encoder_cuda_graph if mm_config is not None else None,
-                max_num_tokens=configured_encoder_max_num_tokens,
-            )
-        except Exception as e:
-            import traceback
-
-            traceback.print_exception(Exception, e, e.__traceback__)
-            raise e
-        self._model_caller = ModelCaller(
+        """Compile the model, capture the local multimodal encoders' CUDA
+        graphs, and keep the model caller."""
+        compiled = compile_model(
             self.model,
-            compile_backend=self._torch_compile_backend,
-            aux_streams=backend_num_streams,
-            prefill_compile_only=self._torch_compile_prefill_only,
+            llm_args=self.llm_args,
+            mapping=self.mapping,
+            max_num_tokens=self.max_num_tokens,
+            prefill_capture_num_tokens=self._prefill_cuda_graph_num_tokens,
         )
+        self.model = compiled.model
+        self._torch_compile_backend = compiled.backend
+        self._torch_compile_prefill_only = compiled.prefill_only
+        # Capture local encoders after their metadata is sized and before
+        # KV-cache estimation, so graph memory is included in the profile.
+        mm_config = self.llm_args.multimodal_config
+        setup_mm_encoder_cuda_graphs(
+            self.model,
+            mm_config.encoder_cuda_graph if mm_config is not None else None,
+            max_num_tokens=configured_encoder_max_num_tokens,
+        )
+        self._model_caller = compiled.caller
 
     def _init_execution_services(self) -> None:
         """Build the attention backend, update the speculation config from the
@@ -1261,58 +1162,6 @@ class ModelEngine:
         if isinstance(self._runner, DecoderRunner):
             self._runner.attn_metadata = None
 
-    def _eager_decoder_scope(self) -> torch.nn.Module:
-        """Return the eager decoder scope under any compile or prefill wrapper."""
-        scope = self.model.model
-        if isinstance(scope, PrefillCompiledModel):
-            scope = scope.eager_model
-        return getattr(scope, "_orig_mod", scope)
-
-    def _apply_torch_compile(self, backend: Backend, fullgraph: bool) -> None:
-        """Compile the eager model scope."""
-        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile", None)
-        if isinstance(self.model, DecoderModelForCausalLM):
-            eager_model = self._eager_decoder_scope()
-            compiled_model = torch.compile(eager_model, backend=backend, fullgraph=fullgraph)
-            self._torch_compile_prefill_only = (
-                self.llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
-                and (
-                    self.llm_args.torch_compile_config.compile_only_piecewise_graphs
-                    or not self.model.use_fx_for_pcg_fallback
-                )
-            )
-            self.model.model = (
-                PrefillCompiledModel(eager_model, compiled_model)
-                if self._torch_compile_prefill_only
-                else compiled_model
-            )
-        elif callable(apply_llm_torch_compile):
-            # Avoid nesting a new wrapper around the previous compile.
-            llm = getattr(self.model, "llm", None)
-            compiled_model = getattr(llm, "model", None)
-            if hasattr(compiled_model, "_orig_mod"):
-                llm.model = compiled_model._orig_mod
-            # TODO: Move this contract to MultimodalModelMixin once
-            # multimodal models consistently expose their LLM compile scope.
-            apply_llm_torch_compile(backend=backend, fullgraph=fullgraph)
-        else:
-            eager_model = getattr(self.model, "_orig_mod", self.model)
-            self.model = torch.compile(eager_model, backend=backend, fullgraph=fullgraph)
-
-    def _remove_torch_compile(self) -> None:
-        """Restore the eager model scope."""
-        if isinstance(self.model, DecoderModelForCausalLM):
-            self.model.model = self._eager_decoder_scope()
-            return
-        apply_llm_torch_compile = getattr(self.model, "apply_llm_torch_compile", None)
-        if callable(apply_llm_torch_compile):
-            llm = getattr(self.model, "llm", None)
-            compiled_model = getattr(llm, "model", None)
-            if hasattr(compiled_model, "_orig_mod"):
-                llm.model = compiled_model._orig_mod
-            return
-        self.model = getattr(self.model, "_orig_mod", self.model)
-
     def unwrap_compiled_model_for_refit(self) -> None:
         """Release compiled state before refit.
 
@@ -1339,7 +1188,7 @@ class ModelEngine:
         # be reading them. In the original code this sat *after* the PWCG-gated
         # early return, so a compile-without-PWCG engine skipped it entirely.
         torch.cuda.synchronize()
-        self._remove_torch_compile()
+        self.model = remove_torch_compile(self.model)
 
     def restore_compiled_model_after_refit(self, resource_manager: ResourceManager) -> None:
         """Re-install the torch.compile wrapper after refit.
@@ -1375,8 +1224,11 @@ class ModelEngine:
         if self._torch_compile_backend is None:
             return
         with self.warmup_scope():
-            self._apply_torch_compile(
-                self._torch_compile_backend, self.llm_args.torch_compile_config.enable_fullgraph
+            self.model, self._torch_compile_prefill_only = apply_torch_compile(
+                self.model,
+                self._torch_compile_backend,
+                llm_args=self.llm_args,
+                fullgraph=self.llm_args.torch_compile_config.enable_fullgraph,
             )
 
     # Back-compat aliases. Callers probe these names with getattr() and fall
@@ -1439,42 +1291,6 @@ class ModelEngine:
             resource_manager=resource_manager,
             is_dummy=is_dummy,
         )
-
-    def _init_userbuffers(self, hidden_size):
-        if self.mapping.tp_size <= 1 or self.mapping.pp_size > 1:
-            return False
-
-        # The userbuffers bootstrap exchanges CUDA memory handles over raw
-        # MPI_COMM_WORLD collectives (userbuffers-host.cpp). Under non-MPI
-        # orchestrators (Ray sets TLLM_DISABLE_MPI) every worker holds a
-        # 1-rank MPI world, so importer ranks would receive uninitialized
-        # bytes instead of peer handles and crash in
-        # cuMemImportFromShareableHandle with 'operation not supported'.
-        if mpi_disabled():
-            logger.info(
-                "Disabling userbuffers: its bootstrap requires MPI, which is "
-                "disabled under this orchestrator."
-            )
-            return False
-
-        # Disable UB for unsupported platforms
-        if not ub.ub_supported():
-            return False
-        # NCCL_SYMMETRIC strategy no longer requires UserBuffer allocator initialization.
-        # It uses NCCLWindowAllocator from ncclUtils directly.
-        if self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC":
-            # Skip UB initialization for NCCL_SYMMETRIC - it uses NCCLWindowAllocator directly
-            return False
-        ub.initialize_userbuffers_manager(
-            self.mapping.tp_size,
-            self.mapping.pp_size,
-            self.mapping.cp_size,
-            self.mapping.rank,
-            self.mapping.gpus_per_node,
-            hidden_size * self.max_num_tokens * 2,
-        )
-
-        return True
 
     def wait_for_input_copy(self) -> None:
         """
