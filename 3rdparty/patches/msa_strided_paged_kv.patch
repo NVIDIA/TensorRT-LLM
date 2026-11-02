@@ -4085,7 +4085,7 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..958a336 100644
+index fa63a02..c6771a1 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -4208,7 +4208,7 @@ index fa63a02..958a336 100644
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,9 +118,34 @@ def _compute_cache_base():
+@@ -35,9 +118,35 @@ def _compute_cache_base():
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -4236,6 +4236,7 @@ index fa63a02..958a336 100644
 +    except importlib.metadata.PackageNotFoundError:
 +        ffi_version = "unavailable"
 +    digest.update(b"\0tvm-ffi\0" + ffi_version.encode())
++    digest.update(b"\0host-arch\0" + platform.machine().encode())
 +    cache_base = base / ("sources_sha256_" + digest.hexdigest())
 +    logger.info(
 +        "Using FMHA cache %s (source/build fingerprint; changed sources or "
@@ -4245,7 +4246,7 @@ index fa63a02..958a336 100644
  
  
  CACHE_BASE = _compute_cache_base()
-@@ -55,13 +163,6 @@ def _release_file_lock(fd):
+@@ -55,13 +164,6 @@ def _release_file_lock(fd):
      os.close(fd)
  
  
@@ -4259,7 +4260,7 @@ index fa63a02..958a336 100644
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -109,6 +210,18 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
+@@ -109,6 +211,18 @@ _FMHA_SM100_IMPOSSIBLE = lambda p: (
  )
  
  
@@ -4278,7 +4279,7 @@ index fa63a02..958a336 100644
  def _dlpack_dtype_code(torch_dtype):
      """Encode a torch dtype as a DLPack int64 code."""
      import torch
-@@ -199,6 +312,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -199,6 +313,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -4288,7 +4289,7 @@ index fa63a02..958a336 100644
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -257,9 +373,10 @@ class FMHAVariantManager:
+@@ -257,9 +374,10 @@ class FMHAVariantManager:
      def _ensure_all_module(self):
          if not self._all_module_checked:
              self._all_module_checked = True
@@ -4301,7 +4302,7 @@ index fa63a02..958a336 100644
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
-@@ -455,6 +572,10 @@ def _compile_plan_only():
+@@ -455,6 +573,10 @@ def _compile_plan_only():
  
  def _compile_plan_module():
      """Compile and load plan kernel."""
@@ -4312,7 +4313,7 @@ index fa63a02..958a336 100644
      lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
      try:
          _do_compile_plan()
-@@ -553,6 +674,11 @@ def get_sparse_topk_module():
+@@ -553,6 +675,11 @@ def get_sparse_topk_module():
      with _sparse_topk_lock:
          if _sparse_topk_module is not None:
              return _sparse_topk_module
@@ -4324,7 +4325,7 @@ index fa63a02..958a336 100644
          lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
          try:
              _do_compile_sparse_topk()
-@@ -638,6 +764,11 @@ def get_reduction_module():
+@@ -638,6 +765,11 @@ def get_reduction_module():
      with _reduction_lock:
          if _reduction_module is not None:
              return _reduction_module

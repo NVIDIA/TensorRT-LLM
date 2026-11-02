@@ -167,6 +167,14 @@ def test_jit_fallback_cache_tracks_ffi_version(jit_package, monkeypatch):
     assert jit._compute_cache_base() != original
 
 
+def test_jit_fallback_cache_isolated_by_host_architecture(jit_package, monkeypatch):
+    jit, _, _, _ = jit_package
+    monkeypatch.setattr(jit.platform, "machine", lambda: "x86_64")
+    original = jit._compute_cache_base()
+    monkeypatch.setattr(jit.platform, "machine", lambda: "aarch64")
+    assert jit._compute_cache_base() != original
+
+
 def test_source_install_without_artifacts_retains_jit_fallback(jit_package, monkeypatch):
     jit, _, cache, loaded = jit_package
     manager = jit.FMHAVariantManager()
