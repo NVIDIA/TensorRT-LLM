@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 0.0.1
+l0_dgx_b300_efa_multi_nodes:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 2
+        lte: 2
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  - perf/test_efa_disaggregated.py::test_kv_cache_v2_efa[disagg-e2e-b300_qwen3_0.6b_efa_functional] TIMEOUT (20)
