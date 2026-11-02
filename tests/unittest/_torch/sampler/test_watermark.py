@@ -611,7 +611,7 @@ class TestHandler:
         _, handler = self._handler()
         tokens = [1, 2, 3, 4, 5, 6, 1]  # prompt [1, 2, 3], four tokens generated elsewhere
         request = _request(1, 0, tokens)
-        request.py_orig_prompt_len = 3
+        request.orig_prompt_len = 3
         handler.observe([request], _can_sample)
         flags = []
         for token in (2, 3, 9):
@@ -622,14 +622,20 @@ class TestHandler:
         assert flags == [True, True, False]
 
     @pytest.mark.parametrize("dedupe", ["none", "single_turn", "all"])
-    def test_speculative_windows_match_plain_decoding(self, dedupe):
+    @pytest.mark.parametrize("history", [None, 8])
+    def test_speculative_windows_match_plain_decoding(self, dedupe, history):
         # Whatever the draft quality, the seeds of the committed positions and the final state
-        # must equal those of one-token-at-a-time decoding of the same output.
+        # must equal those of one-token-at-a-time decoding of the same output, also when the
+        # repeat history is bounded and entries expire within a window.
         rng = np.random.default_rng(1)
         prompt = [3, 1, 4]
         output = [int(t) for t in rng.integers(0, 6, size=40)]  # small vocab forces repeats
-        config, plain = self._handler(deduplicate_contexts=dedupe)
-        _, spec = self._handler(deduplicate_contexts=dedupe)
+        config, plain = self._handler(
+            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history
+        )
+        _, spec = self._handler(
+            deduplicate_contexts=dedupe, deduplicate_contexts_max_history=history
+        )
         plain.observe([_request(1, 0, prompt)], _can_sample)
         spec.observe([_request(1, 0, prompt)], _can_sample)
         plain_seeds, plain_active = [], []
