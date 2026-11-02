@@ -73,10 +73,10 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
     ### ending import of torch models classes
     "tensorrt_llm.bindings.executor": [
-        "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
+        "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
-        "ExtendedRuntimePerfKnobConfig", "Response", "Result", "FinishReason",
-        "KvCacheConfig", "KvCacheTransferMode", "KvCacheRetentionConfig",
+        "Response", "Result", "FinishReason", "KvCacheConfig",
+        "KvCacheTransferMode", "KvCacheRetentionConfig",
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
@@ -99,7 +99,8 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
         "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
-        "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
+        "KvCacheConfig", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig",
+        "MoeLoadBalancerConfig", "MoePerLayerDynamicLoadBalancerConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.tokenizer": ["TransformersTokenizer"],

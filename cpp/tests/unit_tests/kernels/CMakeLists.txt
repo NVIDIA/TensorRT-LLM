@@ -13,7 +13,17 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_tllm_gtest(
+  logitsBitmaskTest
+  OWNER
+  kernel
+  SOURCES
+  logitsBitmaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_logits
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;logits;gpu")
 add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
 add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 
@@ -39,18 +49,78 @@ if(USING_OSS_CUTLASS_MOE_GEMM)
                             USING_OSS_CUTLASS_MOE_GEMM)
 endif()
 
-add_gtest(ropeTest ropeTest.cu)
-add_gtest(shiftKCacheKernelTest shiftKCacheKernelTest.cu)
+add_tllm_gtest(
+  ropeTest
+  OWNER
+  kernel
+  SOURCES
+  ropeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu")
+add_tllm_gtest(
+  shiftKCacheKernelTest
+  OWNER
+  kernel
+  SOURCES
+  shiftKCacheKernelTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;gpu")
 add_gtest(smoothQuantKernelTest smoothQuant/smoothQuantKernelTest.cpp)
 add_gtest(weightOnlyKernelTest weightOnly/weightOnlyKernelTest.cpp)
-add_gtest(mlaPreprocessTest mlaPreprocessTest.cu)
-add_gtest(sparseAttentionKernelsTest sparseAttentionKernelsTest.cpp)
+add_tllm_gtest(
+  mlaPreprocessTest
+  OWNER
+  kernel
+  SOURCES
+  mlaPreprocessTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla;gpu")
+add_tllm_gtest(
+  sparseAttentionKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  sparseAttentionKernelsTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_sparse_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;sparse-attention;gpu")
 
 add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
 
-add_gtest(mlaChunkedPrefillTest mlaChunkedPrefillTest.cu)
+add_tllm_gtest(
+  mlaChunkedPrefillTest
+  OWNER
+  kernel
+  SOURCES
+  mlaChunkedPrefillTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_mla_chunked_prefill
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;mla-chunked-prefill;gpu")
 
-add_gtest(fusedMoeCommKernelTest moe/fusedMoeCommKernelTest.cpp)
+add_tllm_gtest(
+  fusedMoeCommKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/fusedMoeCommKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_communication
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-communication;gpu")
 
 add_gtest(
   gemmSwigluRunnerTest
@@ -90,38 +160,83 @@ target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
 add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
 
-add_gtest(moeLoadBalanceKernelTest moe/moeLoadBalanceKernelTest.cpp)
+add_tllm_gtest(
+  moeLoadBalanceKernelTest
+  OWNER
+  kernel
+  SOURCES
+  moe/moeLoadBalanceKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_load_balance
+  Threads::Threads
+  LABELS
+  "unit;kernels;moe-load-balance;gpu")
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
-  add_gtest(moeLoraPointerExpandTest moe/moeLoraPointerExpandTest.cu)
-  add_gtest(moeLoraProblemBuilderTest moe/moeLoraProblemBuilderTest.cu)
-  add_gtest(moeLoraSlotExpandTest moe/moeLoraSlotExpandTest.cu)
+  add_tllm_gtest(
+    moeLoraPointerExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraPointerExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
+  add_tllm_gtest(
+    moeLoraProblemBuilderTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraProblemBuilderTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
+  add_tllm_gtest(
+    moeLoraSlotExpandTest
+    OWNER
+    kernel
+    SOURCES
+    moe/moeLoraSlotExpandTest.cu
+    LINK_LIBRARIES
+    tllm::kernel_moe_lora
+    LABELS
+    "unit;kernels;moe-lora;gpu")
 endif()
 
-add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)
-add_gtest(prepareCustomMaskTest prepareCustomMaskTest.cpp)
+add_tllm_gtest(
+  sparseKvCacheTest
+  OWNER
+  kernel
+  SOURCES
+  sparseKvCacheTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_unfused_attention
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;rope;sparse-kv-cache;gpu")
+add_tllm_gtest(
+  prepareCustomMaskTest
+  OWNER
+  kernel
+  SOURCES
+  prepareCustomMaskTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_attention_mask
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;attention-mask;gpu")
 add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
 
-set(NVFP4_COLD_PAGE_KERNEL_TEST_SRC
-    nvfp4ColdPageKernelsTest.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/kernels/nvfp4ColdPageKernels.cu
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMem.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/hostMemBacking.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/runtime/moeLoadBalancer/topologyDetector.cpp
-    # ~HostMem reports a failed cleanup through the poison latch, so this target
-    # needs the latch itself: NO_TLLM_LINKAGE means nothing else supplies it.
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager/kv_cache_manager_v2/utils/poison.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/assert.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/envUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/logger.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/stringUtils.cpp
-    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/tllmException.cpp)
-add_gtest(nvfp4ColdPageKernelsTest "${NVFP4_COLD_PAGE_KERNEL_TEST_SRC}"
-          NO_TLLM_LINKAGE)
-target_include_directories(
+add_tllm_gtest(
   nvfp4ColdPageKernelsTest
-  PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
-# numa: the backing places pages with mbind and the topology detector reads the
-# node layout through libnuma.
-target_link_libraries(nvfp4ColdPageKernelsTest PRIVATE CUDA::cudart
-                                                       CUDA::cuda_driver numa)
+  OWNER
+  kernel
+  SOURCES
+  nvfp4ColdPageKernelsTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_nvfp4_cold_page
+  tllm::kv_cache_host_memory
+  LABELS
+  "unit;kernels;nvfp4-cold-page;gpu")

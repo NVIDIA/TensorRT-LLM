@@ -133,8 +133,8 @@ TEST_P(HostMemNumaTest, MmapPagesLandOnTheGpusNode)
     constexpr size_t kSize = size_t{8} << 20;
     HostMemBackingOptions options;
     options.allowRemoteNumaFallback = allowRemoteFallback;
-    HostMemBacking backing{options};
-    MemAddress const base = backing.reserve(kSize);
+    HostMemBacking backing{kSize, options};
+    MemAddress const base = backing.address();
     ASSERT_NE(base, 0U);
 
     // The flag picks between a strict binding and a preference. Both place the
@@ -144,7 +144,7 @@ TEST_P(HostMemNumaTest, MmapPagesLandOnTheGpusNode)
     ASSERT_EQ(::get_mempolicy(&mode, nullptr, 0, reinterpret_cast<void*>(base), MPOL_F_ADDR), 0);
     EXPECT_EQ(mode, allowRemoteFallback ? MPOL_PREFERRED : MPOL_BIND);
 
-    backing.commit(0, kSize);
+    backing.resizeTo(kSize);
     stamp(base, 0, kSize, 0);
 
     auto const nodes = pageNodes(base, kSize, size_t{2} << 20);

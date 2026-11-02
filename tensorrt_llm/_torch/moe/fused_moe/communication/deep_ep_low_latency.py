@@ -27,7 +27,7 @@ import torch
 
 from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import is_sm_120f
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -127,7 +127,7 @@ class DeepEPLowLatency(Communication):
         if not deep_ep_installed:
             return False
         # SM120/121 (RTX PRO 6000 Blackwell): no NVSwitch -> NVSHMEM-LL deadlocks.
-        if get_sm_version() in (120, 121):
+        if is_sm_120f():
             return False
         # Native NVSHMEM/IBGDA bootstrap aborts instead of raising on split
         # H100/H200 NVL systems. Disabling P2P does not avoid the abort: this
