@@ -269,7 +269,7 @@ ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
 LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.10-py3"
 
 MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
