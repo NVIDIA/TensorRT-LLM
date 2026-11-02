@@ -349,6 +349,7 @@ def test_uniform_generation_lengths_fuse_the_packed_plan(monkeypatch) -> None:
             generation_lengths_num_seqs=-1,
             generation_lengths_num_contexts=-1,
             generation_lengths_capture_recorded=False,
+            generation_lengths_serial=0,
             packed_plan_key=None,
         ),
     )
