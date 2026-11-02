@@ -103,7 +103,7 @@ def web_search_tool_spec(tools: Optional[Sequence[Any]]) -> Optional[WebSearchTo
 
 
 def web_search_rejection_reason(tools: Optional[Sequence[Any]]) -> Optional[str]:
-    """Why this request's web_search tool cannot be honoured, or None.
+    """The reason to reject this request's web_search tool, or None.
 
     web_search is a server tool: the client hands over the definition and
     expects this server to run the query and fold the results into the same
