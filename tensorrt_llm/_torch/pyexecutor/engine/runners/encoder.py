@@ -220,40 +220,6 @@ class EncoderConfig(RunnerConfig):
         )
 
 
-@dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfig):
-    """Configuration for the EncoderOnly model runner."""
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        model: nn.Module,
-        mapping: Mapping,
-        graph_config: EncodeCudaGraphConfig | None,
-        max_batch_size: int,
-        max_num_tokens: int,
-        max_seq_len: int,
-        max_beam_width: int,
-        without_logits: bool,
-        attention_backend: type[AttentionBackend],
-        enable_autotuner: bool,
-    ) -> Self:
-        return super().create(
-            model=model,
-            mapping=mapping,
-            graph_config=graph_config,
-            max_batch_size=max_batch_size,
-            max_num_tokens=max_num_tokens,
-            max_seq_len=max_seq_len,
-            max_beam_width=max_beam_width,
-            without_logits=without_logits,
-            attention_backend=attention_backend,
-            enable_autotuner=enable_autotuner,
-            is_encoder_decoder=False,
-        )
-
-
 @dataclass(frozen=True, kw_only=True)
 class EncoderPreparedInputs(PreparedInputs):
     """Model arguments, original lengths, and graph selected during preparation."""
@@ -572,7 +538,7 @@ class EncoderRunner(EncoderMixin, ModelRunner):
     def __init__(
         self,
         model: nn.Module,
-        config: EncoderRunnerConfig,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -624,7 +590,7 @@ class EncoderRunner(EncoderMixin, ModelRunner):
         encoder-decoder models.
         """
         graph_config = llm_args.cuda_graph_config
-        config = EncoderRunnerConfig.create(
+        config = EncoderConfig.create(
             model=model,
             mapping=mapping,
             graph_config=graph_config if isinstance(graph_config, EncodeCudaGraphConfig) else None,
@@ -635,6 +601,7 @@ class EncoderRunner(EncoderMixin, ModelRunner):
             without_logits=False,
             attention_backend=attention_backend,
             enable_autotuner=llm_args.enable_autotuner,
+            is_encoder_decoder=False,
         )
         return cls(
             model,

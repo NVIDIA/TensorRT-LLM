@@ -23,7 +23,6 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
-    EncoderRunnerConfig,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderStage,
@@ -63,7 +62,7 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderStageConfig if encoder_decoder else EncoderRunnerConfig
+    config_type = EncoderStageConfig if encoder_decoder else EncoderConfig
     kwargs = dict(
         model=_Model(),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -75,9 +74,8 @@ def _encoder_config(
         without_logits=False,
         attention_backend=TrtllmAttention,
         enable_autotuner=False,
+        is_encoder_decoder=encoder_decoder,
     )
-    if encoder_decoder:
-        kwargs["is_encoder_decoder"] = True
     return config_type.create(**kwargs), feature_spec
 
 
@@ -112,7 +110,7 @@ def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
     runner_config = object()
 
     with (
-        patch.object(EncoderRunnerConfig, "create", return_value=runner_config) as create_config,
+        patch.object(EncoderConfig, "create", return_value=runner_config) as create_config,
         patch.object(EncoderRunner, "__init__", return_value=None) as init,
     ):
         runner = EncoderRunner.create(
