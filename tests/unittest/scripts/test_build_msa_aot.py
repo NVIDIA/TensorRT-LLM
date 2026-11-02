@@ -156,7 +156,8 @@ def main():
         subprocess.run(["cc", "-shared", "-fPIC", str(source), "-o", str(target)], check=True)
 ''')
     nvcc = tmp_path / "nvcc"
-    nvcc.write_text("#!/bin/sh\nprintf 'sm_100a\\nsm_103a\\n'\n")
+    nvcc.write_text("#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'CUDA release 12.9\\n'; "
+                    "else printf 'sm_100a\\nsm_103a\\n'; fi\n")
     nvcc.chmod(0o755)
     user_cache = tmp_path / "user-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(user_cache))
@@ -168,6 +169,7 @@ def main():
     manifest = json.loads(manifest_path.read_text())
     assert manifest["variants"] == ["0_0", "0_1"]
     assert manifest["cuda_architectures"] == ["sm_100a"]
+    assert manifest["cuda_toolkit_version"] == "CUDA release 12.9"
     assert all((manifest_path.parent / name).is_file() for name in manifest["files"].values())
     assert not user_cache.exists()
 
@@ -217,6 +219,9 @@ import subprocess,sys
 args = sys.argv[1:]
 if "--list-gpu-code" in args:
     print("sm_103a")
+    raise SystemExit
+if "--version" in args:
+    print("CUDA release 12.9")
     raise SystemExit
 out = args[args.index("-o") + 1]
 if "-c" in args:

@@ -138,6 +138,7 @@ def _worker(package, warmup, architectures, jobs):
         "source_sha256": digest,
         "tvm_ffi_version": jit._aot_ffi_version(),
         "host_arch": platform.machine(),
+        "cuda_toolkit_version": os.environ["TRTLLM_MSA_BUILD_CUDA_VERSION"],
         "cuda_architectures": architectures,
         "variants": variants,
         "files": packaged_files,
@@ -152,6 +153,10 @@ def build(package, warmup, requested, nvcc, jobs):
     architectures = select_cuda_architectures(requested, output.split())
     if not architectures:
         return
+    version = subprocess.run([str(nvcc), "--version"], check=True,
+                             capture_output=True, text=True).stdout.strip()
+    if not version:
+        raise ValueError("nvcc did not report a CUDA toolkit version")
     with tempfile.TemporaryDirectory(prefix="trtllm-msa-aot-") as directory:
         cache = Path(directory) / "cache"
         temporary = cache / "tmp"
@@ -160,7 +165,7 @@ def build(package, warmup, requested, nvcc, jobs):
         for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
             env.pop(name, None)
         env.update(MINFER_FMHA_CACHE_DIR=str(cache), TMPDIR=str(temporary),
-                   CUDA_HOME=str(nvcc.parent.parent))
+                   CUDA_HOME=str(nvcc.parent.parent), TRTLLM_MSA_BUILD_CUDA_VERSION=version)
         stub_dir = nvcc.parent.parent / "lib64/stubs"
         if stub_dir.is_dir():
             env["LIBRARY_PATH"] = str(stub_dir) + os.pathsep + env.get("LIBRARY_PATH", "")
