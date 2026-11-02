@@ -162,8 +162,19 @@ class PeerRegistrar:
                 f"peer={peer_ri.bounded_replay_on_generation})."
             )
 
+    def validate_mixed_precision_compatible(self, peer_ri: RankInfo) -> None:
+        """Require the same mixed-precision KV layout on both peers."""
+        if self._ri.mixed_precision_kv != peer_ri.mixed_precision_kv:
+            # Different layouts name or hold different mixed-precision high pages.
+            raise ValueError(
+                "PeerRegistrar: mixed-precision KV [low dtype, high dtype, first_n, last_n] "
+                f"must match between peers (local={self._ri.mixed_precision_kv}, "
+                f"peer={peer_ri.mixed_precision_kv})."
+            )
+
     def _check_peer_compatible(self, peer_ri: RankInfo) -> bool:
         self.validate_bounded_replay_compatible(peer_ri)
+        self.validate_mixed_precision_compatible(peer_ri)
         if not self._get_policy(CacheKind.PAGED).check_peer_compatible(peer_ri):
             return False
 

@@ -813,6 +813,10 @@ def _derive_v2_layer_type_attention_windows(
         return None
     pool_ratio = kv_cache_config.pool_ratio
     num_layer_groups = len(set(derived_windows))
+    if (kv_cache_config.mixed_precision_kv is not None
+            and max_seq_len in derived_windows):
+        # The full-attention layers' mixed-precision high layers form one more group.
+        num_layer_groups += 1
     if pool_ratio is not None and len(pool_ratio) != num_layer_groups:
         logger.warning_once(
             f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, but the "
@@ -3739,6 +3743,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # Mixed-precision KV tells the drafter layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -3797,6 +3804,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # Mixed-precision KV tells the drafter layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):

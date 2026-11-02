@@ -378,11 +378,26 @@ class AttentionMetadata:
         mixed_precision_high_layers = getattr(draft,
                                               "mixed_precision_high_layers",
                                               None)
-        if isinstance(mixed_precision_high_layers,
-                      dict) and mixed_precision_high_layers:
+        # A draft view runs on the draft manager itself and has no draft of its own.
+        if (draft is not self.kv_cache_manager
+                and isinstance(mixed_precision_high_layers, dict)
+                and mixed_precision_high_layers):
             self.draft_mixed_precision_staging = self._refresh_mixed_precision_kv(
                 self.draft_mixed_precision_staging, draft, "draft_mixed",
                 layout, tokens_per_block)
+
+    def sync_draft_mixed_precision_staging(
+            self) -> "MixedPrecisionKVStaging | None":
+        """Give the draft staging copy the target's lengths at the start of a draft forward.
+
+        A mixed MTP draft manager holds the same tokens as the target manager, and overlap
+        speculation may have corrected the target's lengths on the device since prepare().
+        """
+        draft, target = self.draft_mixed_precision_staging, self.mixed_precision_staging
+        if (draft is not None and target is not None and target is not draft
+                and target.lengths is not None):
+            draft.lengths.copy_(target.lengths)
+        return draft
 
     def _refresh_mixed_precision_kv(
             self, view: "MixedPrecisionKVStaging | None",

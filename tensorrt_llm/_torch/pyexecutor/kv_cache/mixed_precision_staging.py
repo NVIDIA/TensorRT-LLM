@@ -59,7 +59,16 @@ class MixedPrecisionKVStaging:
                 self.max_page_bytes, math.prod(shape[1:]) * high.element_size()
             )
         self.staging_bytes = self.page_starts[-1] * self.max_page_bytes
-        storage = buffers.get_buffer([self.staging_bytes], torch.uint8, f"{name}_kv_staging", True)
+        try:
+            storage = buffers.get_buffer(
+                [self.staging_bytes], torch.uint8, f"{name}_kv_staging", True
+            )
+        except torch.OutOfMemoryError as error:
+            raise RuntimeError(
+                f"Mixed-precision KV needs a {self.staging_bytes / (1 << 30):.1f} GiB staging copy "
+                f"on this rank ({rows} requests x {self.max_seq_len} tokens); lower max_batch_size "
+                "or max_seq_len."
+            ) from error
         # Zero once: the per-batch gather only writes real tokens, and attention
         # may load the padding of a request's last page before masking it.
         storage.zero_()
@@ -67,16 +76,12 @@ class MixedPrecisionKVStaging:
             layer_idx: (Buffers._view_as(storage, shape, high.dtype), low, high)
             for layer_idx, (shape, low, high) in pools.items()
         }
-        # Layers that draw from the same two pools have identical page tables, so
-        # each batch builds one table per pool pair and every layer shares it.
+        # Layers whose two pools share layer groups and page-index scales have identical page
+        # tables, so each batch builds one table per such pair and every layer shares it.
         self.table_owner: Dict[int, int] = {}
-        owners: Dict[Tuple[int, int], int] = {}
+        owners: Dict[tuple, int] = {}
         for layer_idx in self.pools:
-            local = manager.layer_offsets[layer_idx]
-            key = tuple(
-                int(manager.impl.get_layer_group_id(layer))
-                for layer in (local, manager.mixed_precision_high_layers[local])
-            )
+            key = manager.mixed_precision_page_table_key(layer_idx)
             self.table_owner[layer_idx] = owners.setdefault(key, layer_idx)
         # Cache manager interface read by the attention backends.
         self.layer_offsets = {layer: layer for layer in self.pools}

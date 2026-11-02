@@ -483,6 +483,7 @@ class DSACacheManagerV2(KVCacheManagerV2):
             max_num_tokens=max_num_tokens,
             model_config=model_config,
             max_beam_width=max_beam_width,
+            pretrained_config=pretrained_config,
             **kwargs,
         )
         if self.num_local_layers == 0:

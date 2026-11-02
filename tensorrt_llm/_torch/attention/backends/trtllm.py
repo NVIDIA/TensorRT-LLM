@@ -931,10 +931,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Prepare backend state shared by draft-forward execution paths."""
-        if self.draft_mixed_precision_staging is not None:
+        draft = self.sync_draft_mixed_precision_staging()
+        if draft is not None:
             # MTP layers of a mixed draft manager run on its own staging copy.
-            self.swap_for_draft("mixed_precision_staging",
-                                self.draft_mixed_precision_staging)
+            self.swap_for_draft("mixed_precision_staging", draft)
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
@@ -1273,7 +1273,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_flash_mla and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
-                and not self._has_mixed_precision_kv()
+                and not self._has_mixed_precision_staging()
                 and not self.kv_cache_params.use_full_generation_page_table)
 
     def key_prepared_block_offsets(self) -> None:

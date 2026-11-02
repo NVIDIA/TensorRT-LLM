@@ -665,8 +665,33 @@ def test_mixed_precision_public_options():
         ),
         ({"max_beam_width": 2}, ValueError, "single-beam"),
         ({"sparse_attention_config": {"algorithm": "rocket"}}, ValueError, "sparse attention"),
+        ({"sleep_config": {}}, ValueError, "sleep_config"),
+        (
+            {
+                "speculative_config": {
+                    "decoding_type": "Eagle3",
+                    "max_draft_len": 2,
+                    "speculative_model": "/tmp/mixed-precision-nonexistent-draft",
+                    "use_dynamic_tree": True,
+                    "dynamic_tree_max_topK": 2,
+                }
+            },
+            ValueError,
+            "dynamic-tree",
+        ),
     ],
-    ids=("v1", "auto_v2", "backend", "connector", "dynamic_tree", "compression", "beam", "sparse"),
+    ids=(
+        "v1",
+        "auto_v2",
+        "backend",
+        "connector",
+        "dynamic_tree",
+        "compression",
+        "beam",
+        "sparse",
+        "sleep",
+        "eagle3_dynamic_tree",
+    ),
 )
 @pytest.mark.cpu_only
 def test_mixed_precision_llm_args_validation(overrides, error, match):
@@ -680,6 +705,41 @@ def test_mixed_precision_llm_args_validation(overrides, error, match):
     kwargs.update(overrides)
     with pytest.raises(error, match=match):
         TorchLlmArgs(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sparse_attention_config": {"algorithm": "dsa", "index_head_dim": 128}},
+        {
+            "sparse_attention_config": {
+                "algorithm": "deepseek_v4",
+                "index_head_dim": 128,
+                "window_size": 128,
+                "compress_ratios": [1, 4],
+            }
+        },
+        {"speculative_config": {"decoding_type": "MTP", "num_nextn_predict_layers": 1}},
+        {
+            "speculative_config": {
+                "decoding_type": "Eagle3",
+                "max_draft_len": 1,
+                "speculative_model": "/tmp/mixed-precision-nonexistent-draft",
+            }
+        },
+    ],
+    ids=("dsa", "deepseek_v4", "mtp", "eagle3"),
+)
+@pytest.mark.cpu_only
+def test_mixed_precision_llm_args_accept_supported_features(overrides):
+    """The sparse algorithms and drafters mixed-precision KV supports pass validation."""
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+    TorchLlmArgs(
+        model="/tmp/mixed-precision-nonexistent-model",
+        kv_cache_config=KvCacheConfig(dtype="mixed_nvfp4_fp8", use_kv_cache_manager_v2=True),
+        **overrides,
+    )
 
 
 @pytest.mark.parametrize("is_mtp", [True, False])
@@ -809,7 +869,12 @@ def test_draft_forward_swaps_in_draft_staging():
     """A mixed MTP draft manager's layers run on its own staging copy during the draft forward."""
     meta = Mock()
     meta.draft_replay_swapped_attrs = {}
-    for helper in ("record_draft_swap", "swap_for_draft", "restore_draft_swaps"):
+    for helper in (
+        "record_draft_swap",
+        "swap_for_draft",
+        "restore_draft_swaps",
+        "sync_draft_mixed_precision_staging",
+    ):
         setattr(meta, helper, partial(getattr(TrtllmAttentionMetadata, helper), meta))
     target, draft = Mock(name="target_staging"), Mock(name="draft_staging")
     meta.mixed_precision_staging = target
@@ -1036,6 +1101,27 @@ def test_mixed_precision_high_dtype_must_match_model_dtype():
 
 
 @pytest.mark.cpu_only
+def test_gqa_decode_skips_the_kv_append_plan_of_a_mixed_layer():
+    """A mixed-precision layer appends into its staging copy, not through a GQA-decode plan."""
+    from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import GqaDecodeFmha
+    from tensorrt_llm.quantization.mode import QuantAlgo, QuantMode
+
+    attn = SimpleNamespace(
+        head_dim=128,
+        layer_idx=3,
+        quant_mode=int(QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.FP8)),
+    )
+    fmha = object.__new__(GqaDecodeFmha)
+    fmha._attn_ref = lambda: attn
+    metadata = Mock()
+    metadata.get_mixed_precision_kv_view.side_effect = lambda layer_idx: (
+        object() if layer_idx == 3 else None
+    )
+    assert fmha.kv_append_plan(metadata, num_tokens=4) is None
+    metadata.get_mixed_precision_kv_view.assert_called_with(3)
+
+
+@pytest.mark.cpu_only
 def test_mixed_precision_llm_args_accept_lowercase_backend():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
@@ -1140,24 +1226,15 @@ def test_staging_allocation_follows_rank_geometry(tp_size, attention_dp, heads_p
         manager.shutdown()
 
 
-@pytest.mark.parametrize(
-    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
-)
-def test_staging_lengths_follow_corrected_kv_lens(backend):
-    """Overlap speculation corrects KV lengths on the device after prepare(); staging follows."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
-        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
-    block, cached = 128, 32
-    mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    manager = KVCacheManagerV2(
-        KvCacheConfig(
-            max_tokens=65536,
-            enable_block_reuse=True,
-            dtype="mixed_nvfp4_bfloat16",
-            mixed_precision_first_n=block,
-            mixed_precision_last_n=block,
-            pool_ratio=[0.75, 0.25],
-        ),
+def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16"):
+    """A one-layer BF16 cache; mixed precision keeps one page at each end in the high pool."""
+    mixed = (
+        dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
+        if dtype.startswith("mixed_")
+        else {}
+    )
+    return KVCacheManagerV2(
+        KvCacheConfig(max_tokens=65536, enable_block_reuse=True, dtype=dtype, **mixed),
         CacheType.SELF,
         num_layers=1,
         num_kv_heads=2,
@@ -1168,22 +1245,121 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         mapping=mapping,
         dtype=DataType.BF16,
     )
+
+
+def test_staging_page_tables_follow_each_layer_page_scale():
+    """Mixed layers with different KV head counts get page tables in their own pools' page space."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    import numpy as np
+
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_staging import (
+        MixedPrecisionKVStaging,
+    )
+
+    block = 32
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            max_tokens=4096,
+            enable_block_reuse=False,
+            dtype="mixed_nvfp4_bfloat16",
+            mixed_precision_first_n=block,
+            mixed_precision_last_n=block,
+        ),
+        CacheType.SELF,
+        num_layers=3,
+        num_kv_heads=[8, 8, 4],
+        head_dim=64,
+        tokens_per_block=block,
+        max_seq_len=512,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        dtype=DataType.BF16,
+    )
+    try:
+        manager.add_dummy_requests([0], [4 * block], is_gen=False)
+        view = MixedPrecisionKVStaging(
+            manager, Buffers(), rows=2, layout="HND", pool_layout="HND", tokens_per_block=block
+        )
+        view.update([0], [0], [4 * block], capture_graph=False)
+        for layer in range(3):
+            expected = np.full(tuple(view.page_tables[layer].shape), -1, dtype=np.int32)
+            manager.fill_mixed_precision_page_tables([0], layer, expected)
+            assert view.page_tables[layer].cpu().numpy().tolist() == expected.tolist()
+    finally:
+        manager.shutdown()
+
+
+def test_staging_out_of_memory_names_the_size():
+    """A staging copy too large for the device fails with its size and the knobs to lower."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mixed_precision_staging import (
+        MixedPrecisionKVStaging,
+    )
+
+    manager = _small_manager(128, Mapping(world_size=1, rank=0, tp_size=1))
+    buffers = Mock()
+    buffers.get_buffer.side_effect = torch.OutOfMemoryError("CUDA out of memory")
+    try:
+        with pytest.raises(RuntimeError, match="lower max_batch_size or max_seq_len"):
+            MixedPrecisionKVStaging(
+                manager, buffers, rows=2, layout="NHD", pool_layout="NHD", tokens_per_block=128
+            )
+    finally:
+        manager.shutdown()
+
+
+def _small_metadata(backend, manager, mapping: Mapping, block: int, cached: int, draft=None):
+    return backend.Metadata(
+        seq_lens=torch.tensor([block], dtype=torch.int32),
+        num_contexts=1,
+        kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
+        max_num_requests=2,
+        max_num_tokens=block,
+        max_num_sequences=2,
+        kv_cache_manager=manager,
+        draft_kv_cache_manager=draft,
+        request_ids=[0],
+        prompt_lens=[cached + block],
+        kv_layout="NHD",
+        mapping=mapping,
+        runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
+    )
+
+
+@pytest.mark.parametrize("dtype", ["auto", "mixed_nvfp4_bfloat16"])
+def test_steady_decode_step_skips_mixed_precision(dtype):
+    """The steady MTP decode shortcut stands in for prepare() only without mixed precision."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager = _small_manager(block, mapping, dtype)
     try:
         manager.add_dummy_requests([0], [cached + block], is_gen=False)
-        metadata = backend.Metadata(
-            seq_lens=torch.tensor([block], dtype=torch.int32),
-            num_contexts=1,
-            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[cached]),
-            max_num_requests=2,
-            max_num_tokens=block,
-            max_num_sequences=2,
-            kv_cache_manager=manager,
-            request_ids=[0],
-            prompt_lens=[cached + block],
-            kv_layout="NHD",
-            mapping=mapping,
-            runtime_features=AttentionRuntimeFeatures(chunked_prefill=True, cache_reuse=True),
-        )
+        metadata = _small_metadata(TrtllmAttention, manager, mapping, block, cached)
+        metadata.prepare()
+        assert metadata.supports_steady_decode_step == (dtype == "auto")
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.parametrize(
+    "backend", (TrtllmAttention, FlashInferAttention), ids=("trtllm", "flashinfer")
+)
+def test_staging_lengths_follow_corrected_kv_lens(backend):
+    """Overlap speculation corrects KV lengths on the device after prepare(); staging follows."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
+        pytest.skip("Mixed-precision NVFP4 KV requires Blackwell")
+    block, cached = 128, 32
+    mapping = Mapping(world_size=1, rank=0, tp_size=1)
+    manager, draft = (_small_manager(block, mapping) for _ in range(2))
+    try:
+        for kv_cache in (manager, draft):
+            kv_cache.add_dummy_requests([0], [cached + block], is_gen=False)
+        # A separate MTP draft manager holding the same tokens.
+        metadata = _small_metadata(backend, manager, mapping, block, cached, draft=draft)
         metadata.prepare()
         view = metadata.mixed_precision_staging
         assert view.lengths.tolist() == [[cached], [cached + block]]
@@ -1200,7 +1376,29 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
                 )
 
         correct()
-        assert view.lengths.tolist() == [[cached - 2], [cached + block - 2]]
+        corrected = [[cached - 2], [cached + block - 2]]
+        assert view.lengths.tolist() == corrected
+        # The draft forward runs on the draft staging copy with the corrected lengths.
+        if backend is TrtllmAttention:
+            metadata.prepare_for_draft_forward()
+            assert metadata.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert metadata.mixed_precision_staging.lengths.tolist() == corrected
+            metadata.restore_draft_swaps()
+            assert metadata.mixed_precision_staging is view
+        else:
+            # The first draft view sync follows the correction; later syncs precede it.
+            draft_view = metadata.get_draft_metadata(draft)
+            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
+            metadata.prepare()
+            correct()
+            assert view.lengths.tolist() == corrected
+            # Every draft forward starts here; the view reuses the same staging copy and
+            # builds none of its own.
+            assert metadata.get_draft_metadata(draft) is draft_view
+            assert draft_view.mixed_precision_staging is metadata.draft_mixed_precision_staging
+            assert draft_view.draft_mixed_precision_staging is None
+            assert draft_view.mixed_precision_staging.lengths.tolist() == corrected
         # Draft layers run on another manager through this metadata: the view is
         # hidden and the staging lengths are left alone.
         metadata.kv_cache_manager = object()
@@ -1211,3 +1409,4 @@ def test_staging_lengths_follow_corrected_kv_lens(backend):
         assert metadata.get_mixed_precision_kv_view(0) is view
     finally:
         manager.shutdown()
+        draft.shutdown()

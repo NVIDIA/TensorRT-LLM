@@ -449,6 +449,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
 
         # For indexer k cache
         self.prepare_for_indexer_k_cache()
+        self._fill_mixed_precision_high_block_tables()
 
         # For spec decode
         self.prepare_for_spec_decode(kv_lens)
@@ -2138,7 +2139,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.block_table[: self.num_seqs, :max_blocks_used].copy_(
             host_block_table, non_blocking=True
         )
-        self._fill_mixed_precision_high_block_tables()
 
     def prepare_for_skip_indexer(self, kv_lens: torch.Tensor):
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens

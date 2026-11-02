@@ -106,7 +106,8 @@ layers get `max_seq_len`, and the two window sizes form two layer groups whose
 pools are sized independently. The derived list is logged at startup. Set
 `max_attention_window` explicitly to override the derivation; a single entry
 restores one full-context pool for every layer. With derived windows,
-`pool_ratio` must carry one entry per layer group (two for such a model). If a
+`pool_ratio` must carry one entry per layer group (two for such a model, three
+with mixed-precision KV, whose mixed-precision high group comes last). If a
 configured `pool_ratio` does not match the derived group count, the manager
 logs a warning and keeps the single-window default, so existing configurations
 continue to run.

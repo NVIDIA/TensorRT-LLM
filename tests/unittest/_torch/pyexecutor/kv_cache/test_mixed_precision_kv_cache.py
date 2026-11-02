@@ -260,11 +260,14 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
     from tensorrt_llm._torch.disaggregation.native.transfer import Sender
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import global_layer_ids
 
     manager = make_manager()
     rank = RankInfo.from_kv_cache_manager("mixed", manager, device_id=0)
     table = rank.page_table
     assert [group.local_layers[0].global_layer_id for group in table.layer_groups] == [0, 1]
+    # KV cache sharing names the layers the same way.
+    assert global_layer_ids(manager, [0, 1]) == [0, 1]
     assert [len(group.pool_views) for group in table.layer_groups] == [1, 1]
     registrar = PeerRegistrar(rank, KVRegionExtractorV1(table))
     peer = RankInfo.from_bytes(rank.to_bytes())
@@ -275,6 +278,164 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     )
     assert source.tolist() == [4, 7]
     assert destination.tolist() == [2, 6]
+
+
+def test_disagg_ids_do_not_depend_on_mixed_layers_of_a_rank(make_manager):
+    """A pipeline rank without mixed-precision layers still names model layer L as 2L."""
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+    # Sliding-window layers stay native, so this rank holds no mixed-precision layer.
+    manager = make_manager(
+        config=mixed_config(pool_ratio=None, max_attention_window=[64]), num_layers=2
+    )
+    assert manager.mixed_precision_high_layers == {}
+    table = RankInfo.from_kv_cache_manager("mixed", manager, device_id=0).page_table
+    ids = [layer.global_layer_id for group in table.layer_groups for layer in group.local_layers]
+    assert sorted(ids) == [0, 2]
+
+
+@pytest.mark.parametrize(
+    "peer",
+    [
+        (lambda: KvCacheConfig(max_tokens=65536, enable_block_reuse=True), DataType.BF16),
+        (lambda: mixed_config(mixed_precision_last_n=129), DataType.BF16),
+        (lambda: mixed_config(mixed_precision_first_n=0), DataType.BF16),
+        (lambda: mixed_config(DataType.FP8), DataType.FP8),
+    ],
+    ids=["plain", "last_n", "first_n", "high_dtype"],
+)
+def test_disagg_rejects_a_peer_with_other_mixed_precision_settings(make_manager, peer):
+    """Peers must agree on the mixed-precision dtypes and first/last token counts."""
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+    from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+
+    def rank_info(config, dtype=DataType.BF16):
+        manager = make_manager(config=config, dtype=dtype)
+        info = RankInfo.from_kv_cache_manager("decode", manager, device_id=0)
+        return RankInfo.from_bytes(info.to_bytes())
+
+    local = rank_info(mixed_config())
+    registrar = PeerRegistrar(local, KVRegionExtractorV1(local.page_table))
+    registrar.register("decode", 0, rank_info(mixed_config()))
+    config, dtype = peer
+    with pytest.raises(ValueError, match="mixed-precision KV"):
+        registrar.register("decode", 1, rank_info(config(), dtype))
+
+
+@pytest.mark.cpu_only
+def test_mixed_precision_support_of_each_manager():
+    """Managers of supported models opt in; others refuse mixed-precision KV at construction."""
+    from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaKVCacheManagerV2
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
+        Glm5NextCacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
+        MiniMaxM3KVCacheManagerV2,
+    )
+    from tensorrt_llm._torch.modules.fla.cache_manager import Qwen35HybridCacheManager
+    from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
+    from tensorrt_llm._torch.modules.mamba.cache_manager import NemotronHybridCacheManager
+    from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import Qwen4ExpHybridCacheManager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+        MambaHybridCacheManagerV2,
+    )
+
+    supported = {
+        KVCacheManagerV2,
+        MambaHybridCacheManagerV2,
+        Qwen35HybridCacheManager,
+        KimiK3HybridCacheManager,
+        NemotronHybridCacheManager,
+        DSACacheManagerV2,
+        DeepseekV4CacheManager,
+    }
+    unsupported = {
+        Qwen4ExpHybridCacheManager,
+        Glm5NextCacheManager,
+        CSA2CacheManager,
+        MiniMaxM3KVCacheManagerV2,
+        Fp4MlaKVCacheManagerV2,
+    }
+    for cls in supported | unsupported:
+        assert object.__new__(cls)._mixed_precision_kv_supported() == (cls in supported), cls
+
+
+@pytest.mark.parametrize("high_dtype", [DataType.FP8, DataType.BF16])
+@pytest.mark.cpu_only
+def test_mixed_precision_cost_is_the_nvfp4_history(high_dtype):
+    """Per token a mixed-precision cache costs its NVFP4 history; first/last tokens are per request.
+
+    The target/draft budget split weighs these costs; pricing the history at the high dtype starves
+    a separate drafter's pool.
+    """
+    from transformers import LlamaConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    model = ModelConfig(
+        pretrained_config=LlamaConfig(
+            hidden_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            num_hidden_layers=2,
+            torch_dtype=torch.bfloat16,
+        ),
+        quant_config=QuantConfig(),
+    )
+    validate_and_set_kv_cache_quant(model, _MIXED_DTYPE[high_dtype])
+
+    def cost(kv_cache_config):
+        return KVCacheManagerV2.get_cache_size_per_token(
+            model,
+            Mapping(),
+            tokens_per_block=64,
+            kv_cache_config=kv_cache_config,
+            max_seq_len=4096,
+            max_batch_size=4,
+            max_num_tokens=256,
+        )
+
+    plain_slope, plain_fixed = cost(KvCacheConfig(max_tokens=65536, enable_block_reuse=False))
+    mixed_slope, mixed_fixed = cost(mixed_config(high_dtype, enable_block_reuse=False))
+    # K and V of 2 heads x 64 dims per layer: 256 values, NVFP4 packs 2 per byte plus one FP8
+    # scale per 16 values.
+    assert mixed_slope == 2 * (256 // 2 + 256 // 16)
+    assert plain_slope == 2 * 256 * (1 if high_dtype == DataType.FP8 else 2)
+    assert mixed_fixed > plain_fixed
+
+
+@pytest.mark.cpu_only
+def test_derived_windows_count_the_mixed_precision_high_group():
+    """With derived sliding/full windows, mixed precision adds the high group to pool_ratio."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.pyexecutor._util import _derive_v2_layer_type_attention_windows
+
+    model = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            architectures=["GptOssForCausalLM"],
+            layer_types=["sliding_attention", "full_attention"],
+            sliding_window=128,
+            num_hidden_layers=2,
+        )
+    )
+
+    def derive(pool_ratio):
+        return _derive_v2_layer_type_attention_windows(
+            mixed_config(pool_ratio=pool_ratio), KVCacheManagerV2, model, 4096
+        )
+
+    assert derive([0.5, 0.3, 0.2]) == [128, 4096]
+    assert derive([0.5, 0.5]) is None
 
 
 def test_mixed_precision_rejects_custom_managers():
@@ -383,6 +544,44 @@ def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, high_dtype):
         manager.shutdown()
 
 
+@pytest.mark.parametrize("backend", ["dense", "dsa"])
+def test_target_manager_beside_a_separate_eagle3_drafter_builds(backend):
+    """With a separate draft manager the target manager holds only model layers, all mixed."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    options = dict(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
+        layer_mask=[True, True],
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    if backend == "dsa":
+        manager = DSACacheManagerV2(
+            kv_cache_type=CacheType.SELFKONLY,
+            sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+            dtype=DataType.NVFP4,
+            **options,
+        )
+    else:
+        manager = KVCacheManagerV2(kv_cache_type=CacheType.SELF, dtype=DataType.FP8, **options)
+    try:
+        assert manager.pp_layers == [0, 1]
+        assert sorted(manager.mixed_precision_high_layers) == [0, 1]
+    finally:
+        manager.shutdown()
+
+
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):
     """A separate MTP draft manager adds mixed-precision high layers like the target."""
     from types import SimpleNamespace
@@ -474,17 +673,14 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
     from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
         DeepseekV4CacheManager,
     )
-    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
-        DeepseekV4AttentionType,
-    )
     from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
     from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
+    from tensorrt_llm._torch.pyexecutor.kv_cache.sharing._layout import global_layer_ids
     from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
 
     ratios = [1, 4, 128, 4]
-    manager = DeepseekV4CacheManager(
-        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+    options = dict(
         kv_cache_type=CacheType.SELFKONLY,
         num_layers=4,
         num_kv_heads=1,
@@ -502,24 +698,38 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         ),
         pretrained_config=SimpleNamespace(num_hidden_layers=4),
     )
-    try:
-        # Each compressed layer has a mixed-precision high layer, registered as
-        # MIXED_PRECISION_HIGH.
-        assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
-        mixed_high = DeepseekV4AttentionType.MIXED_PRECISION_HIGH
-        for local, high_layer in manager.mixed_precision_high_layers.items():
-            assert (
-                manager._layer_attn_to_layer_id[manager.pp_layers[local], mixed_high] == high_layer
-            )
-        rank = RankInfo.from_kv_cache_manager("dsv4_mixed", manager, device_id=0)
-        ids = [
-            layer.global_layer_id
-            for group in rank.page_table.layer_groups
-            for layer in group.local_layers
+    plain = DeepseekV4CacheManager(
+        kv_cache_config=KvCacheConfig(max_tokens=65536, enable_block_reuse=False), **options
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
+        **options,
+    )
+
+    def transfer_ids(kv_cache):
+        table = RankInfo.from_kv_cache_manager("dsv4", kv_cache, device_id=0).page_table
+        return [
+            layer.global_layer_id for group in table.layer_groups for layer in group.local_layers
         ]
+
+    try:
+        # Each compressed layer has a mixed-precision high layer.
+        assert sorted(manager.mixed_precision_high_layers) == [1, 2, 3]
+        rank = RankInfo.from_kv_cache_manager("dsv4_mixed", manager, device_id=0)
+        ids = transfer_ids(manager)
         assert len(ids) == len(set(ids))
-        num_types = max(member.value for member in DeepseekV4AttentionType) + 1
-        assert {layer * num_types + mixed_high.value for layer in (1, 2, 3)} <= set(ids)
+        # Main's ids, doubled, and 2L + 1 for the high layer of model layer L.
+        high_ids = {2 * layer + 1 for layer in (1, 2, 3)}
+        assert high_ids <= set(ids)
+        assert {i // 2 for i in set(ids) - high_ids} == set(transfer_ids(plain))
+        # KV cache sharing applies the same rule to its own names.
+
+        def sharing_ids(kv_cache):
+            internal = [int(i) for group in kv_cache.impl.layer_grouping for i in group]
+            return global_layer_ids(kv_cache, internal)
+
+        assert high_ids <= set(sharing_ids(manager))
+        assert {i // 2 for i in set(sharing_ids(manager)) - high_ids} == set(sharing_ids(plain))
         # A peer with the same layout pairs every pool, mixed-precision high pools included.
         registrar = PeerRegistrar(rank, KVRegionExtractorV1(rank.page_table))
         peer = RankInfo.from_bytes(rank.to_bytes())
@@ -533,6 +743,7 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
         assert high_layer_groups <= {group for group, _ in mapping}
     finally:
         manager.shutdown()
+        plain.shutdown()
 
 
 def test_deepseek_v4_mtp_layer_stays_native():

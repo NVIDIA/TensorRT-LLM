@@ -3098,6 +3098,7 @@ class Receiver(ReceiverBase):
             # fail, and cached so later requests fail fast.
             try:
                 self._registrar.validate_bounded_replay_compatible(sender_info)
+                self._registrar.validate_mixed_precision_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(
                     self._registrar.self_rank_info,
                     sender_info,
