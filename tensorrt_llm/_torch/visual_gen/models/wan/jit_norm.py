@@ -16,9 +16,9 @@ from dataclasses import dataclass, field
 
 import torch
 
-_THREADS = 256
-_WARPS = _THREADS // 32
-_VEC = 8  # 16-byte vectors of 16-bit elements
+BLOCK_THREADS = 256  # threads per block of the norm kernel
+_WARPS = BLOCK_THREADS // 32
+_VEC = 8  # bf16 / fp16 channels per 16-byte vector
 
 MID_NONE, MID_NORM, MID_NORM_SILU = 0, 1, 2
 OUT_WINOGRAD, OUT_ROWS = 0, 1
@@ -116,6 +116,15 @@ def row_layout(channels: int, fold_single: bool = True) -> tuple[int, int]:
 
 @dataclass(frozen=True, kw_only=True)
 class Variant:
+    """Compile-time parameters of one norm kernel build.
+
+    ``order``: temporal Winograd order (1 for plain rows). ``lanes`` x ``k``: lanes per position
+    and 16-byte vectors per lane (:func:`row_layout`). ``in_wino``: the input is the Winograd
+    products rather than x. ``mid``: one of the ``MID_*`` stages; ``out``: ``OUT_WINOGRAD`` or
+    ``OUT_ROWS``. ``padded``: the row output appends zero rows and columns. ``in_map`` /
+    ``out_map``: the products / outputs sit in frames with halo lines (:class:`FrameGeometry`);
+    ``halo``: the output's border lines are pushed to the neighbours as well."""
+
     fp16_winograd: bool
     order: int
     lanes: int
@@ -136,9 +145,16 @@ class Variant:
     def positions_per_block(self) -> int:
         return (32 // self.lanes) * _WARPS
 
+    @property
+    def ring_slots(self) -> int:
+        """Normalized frames each position keeps in shared memory for the Winograd output."""
+        return self.order + 1
+
     def shared_bytes(self, channels: int) -> int:
+        """Shared memory of one block: three fp32 per-channel tables, plus the bf16 frame ring
+        of every position for the Winograd output."""
         ring = (
-            (self.order + 1) * self.positions_per_block * channels * 2
+            self.ring_slots * self.positions_per_block * channels * 2
             if self.out == OUT_WINOGRAD
             else 0
         )
@@ -149,29 +165,29 @@ def _addr(t: torch.Tensor | None) -> int:
     return 0 if t is None else t.data_ptr()
 
 
-def _halo_args(push: HaloPush | None, channels: int) -> tuple:
-    """The kernel's halo-push arguments: per side the destination's address, positions per
-    frame, positions between line positions and elements between components, then the axis."""
-    if push is None:
-        return (0, 0, 0, 0, 0, 0, 0, 0, 0)
-    ptrs, frames, comps, steps = [], [], [], []
-    for side in (push.left, push.right):
-        if side is None:
-            ptrs.append(0)
-            frames.append(0)
-            comps.append(0)
-            steps.append(0)
-            continue
-        if side.shape[3] != channels:
-            raise ValueError("the halo destination does not match the channel count")
-        for d in (0, 1, 2):
-            if side.stride(d) % channels:
-                raise ValueError("the halo destination strides must be whole positions")
-        ptrs.append(side.data_ptr())
-        frames.append(side.stride(1) // channels)
-        comps.append(side.stride(0))
-        steps.append(side.stride(2) // channels)
-    return (*ptrs, *frames, *comps, *steps, push.axis)
+def _halo_args(push: HaloPush | None, channels: int) -> dict:
+    """The kernel's halo-push arguments: per side (``_l`` / ``_r``) the destination's address,
+    positions per frame, vectors between components and positions between line positions;
+    then the axis. All zero without a push or a neighbour on that side."""
+    sides = (None, None) if push is None else (push.left, push.right)
+    args = {"halo_axis": 0 if push is None else push.axis}
+    for name, side in zip(("l", "r"), sides):
+        ptr = frame = comp = step = 0
+        if side is not None:
+            if side.shape[3] != channels:
+                raise ValueError("the halo destination does not match the channel count")
+            for d in (0, 1, 2):
+                if side.stride(d) % channels:
+                    raise ValueError("the halo destination strides must be whole positions")
+            ptr = side.data_ptr()
+            frame = side.stride(1) // channels
+            comp = side.stride(0) // _VEC
+            step = side.stride(2) // channels
+        args[f"halo_{name}"] = ptr
+        args[f"halo_frame_{name}"] = frame
+        args[f"halo_comp_{name}"] = comp
+        args[f"halo_step_{name}"] = step
+    return args
 
 
 def _launch(
@@ -203,9 +219,8 @@ def _launch(
     in_geo: FrameGeometry | None = None,
     out_geo: FrameGeometry | None = None,
 ) -> None:
-    from cuda.bindings import driver as cuda
-
     from .kernels import norm as norm_kernel
+    from .kernels.common import current_stream
 
     out_positions = (height + pad_h) * (width + pad_w) if variant.padded else positions
     if out_positions <= 0:
@@ -230,15 +245,7 @@ def _launch(
             sum=_addr(out_sum),
             y_tail=_addr(y_tail),
             y=_addr(y),
-            halo_l=halo[0],
-            halo_r=halo[1],
-            halo_frame_l=halo[2],
-            halo_frame_r=halo[3],
-            halo_comp_l=halo[4] // _VEC,
-            halo_comp_r=halo[5] // _VEC,
-            halo_step_l=halo[6],
-            halo_step_r=halo[7],
-            halo_axis=halo[8],
+            **halo,
             comp_vecs=comp_stride // _VEC,
             in_comp_vecs=in_comp_stride // _VEC,
             in_frame=in_map[0],
@@ -257,14 +264,15 @@ def _launch(
             scale=float(scale),
             eps=1e-12,
         ),
-        cuda.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        current_stream(device),
     )
 
 
 def _stacked_products(m: list[torch.Tensor], winograd_dtype: torch.dtype) -> tuple[int, int]:
     """(base pointer, component stride in elements) of the products, which the kernel reads as
-    one stacked buffer [comps, groups, P, C]: consecutive slices of the previous norm's Winograd input
-    buffer in the model; anything else is stacked here (a copy)."""
+    one stacked buffer [comps, groups, P, C]: consecutive slices of the previous norm's
+    Winograd input buffer in the model; anything else is stacked here (a copy, and ``m`` is
+    replaced by views of it)."""
     comps = len(m)
     numel = m[0].numel()
     base = m[0].data_ptr()
@@ -532,8 +540,8 @@ def add_bias_and_residual(
     """``frames + bias + residual`` as bf16 frames ``[T, (H+pad_h)*(W+pad_w), C]`` with zero
     rows/columns appended, every add rounded like the eager chain. The frames are ``x``, or the
     temporal Winograd products ``m`` turned into frames first (the output transform A^T along
-    time: frame ``g*order + j`` is ``sum_k AT[j][k] m_k[g]``). ``products_geometry``: the products carry halo rows /
-    columns around their ``height`` x ``width`` logical positions."""
+    time: frame ``g*order + j`` is ``sum_k AT[j][k] m_k[g]``). ``products_geometry``: the
+    products carry halo rows / columns around their ``height`` x ``width`` logical positions."""
     if (x is None) == (m is None):
         raise ValueError("exactly one of x and m")
     if products_geometry is not None and products_geometry.identity:

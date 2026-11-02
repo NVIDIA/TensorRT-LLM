@@ -15,9 +15,15 @@ Three compile-time stages make it every norm-side kernel of WinoVae:
           to ``y_tail`` for the next chunk; or plain rows to ``y`` (``[T, P', C]``, ``P'`` the
           padded position count when the downsampler's zero row and column are appended).
 
-Numerics: fp32 throughout, one rounding per output unless ``reference`` (the eager bf16
-rounding after every add, normalize, multiply and bias). The operation order is the one the
-outputs are defined by: the sum of squares accumulates element by element with fma, the
+Numerics: fp32 arithmetic with these bf16 roundings. Pass 1 (input stage) leaves the pre-norm
+row rounded to bf16: that is what ``sum`` holds and what pass 2 normalizes. Row output and
+``reference`` also round after the transform + deferred bias and after the residual; the
+Winograd output otherwise rounds the row only at that one point, so its sum of squares
+accumulates the unrounded fp32 values while pass 2 normalizes the rounded ones. Pass 2 rounds
+each normalized value to bf16 (the output rows and the frames the Winograd inputs are built
+from), and each Winograd input once more to its 16-bit type. ``reference`` reproduces the
+eager bf16 rounding after every add of the output transform and after every normalize,
+multiply and bias step. The sum of squares accumulates element by element with fma; the
 Winograd sums run in table index order.
 """
 
@@ -32,21 +38,25 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir_helpers.op import dsl_user_op
 
-from ..jit_norm import MID_NONE, MID_NORM_SILU, OUT_ROWS, OUT_WINOGRAD, Variant
+from ..jit_norm import BLOCK_THREADS, MID_NONE, MID_NORM_SILU, OUT_ROWS, OUT_WINOGRAD, Variant
 from .common import (
     CHANNELS_PER_VECTOR,
+    WORDS_PER_VECTOR,
     bf16_hi,
     bf16_lo,
     compile_cached,
+    current_stream,
     load_words,
     pack2,
+    round_pair_bf16,
     store_words,
     u32_view,
+    unpack_bf16,
     vec_view,
 )
 
-THREADS = 256
-WARPS = THREADS // 32
+# The three per-channel tables in shared memory, in this order.
+_GAMMA, _BIAS, _IN_BIAS = 0, 1, 2
 
 
 @dsl_user_op
@@ -75,6 +85,8 @@ def _opaque(x: Int32, *, loc=None, ip=None) -> Int32:
 def _tables(order: int) -> tuple[list[list[float]], list[list[float]]]:
     from ..wino_vae_kernels import TEMPORAL_WINO
 
+    # Order 1 (plain row input and output) has no temporal transform and never reads the
+    # tables; it gets the order-2 ones so the plan's table-derived fields stay defined.
     w = TEMPORAL_WINO[max(order, 2)]
     return w["BT"], w["AT"]
 
@@ -83,13 +95,14 @@ def _blocks_per_sm(v: Variant) -> int:
     """Resident blocks per SM the register budget is sized for (256 threads: 4 blocks give 64
     registers, 3 give 80, 2 give 128).
 
-    Row output: 4 blocks up to two vectors per lane, 3 above; the order-4 output transform at
-    160 and 320 channels holds five products per slice and spills at 80 registers, so it runs
-    2 blocks; the 160-channel row walk of plain input is latency-bound at 3 and runs 4.
-    Winograd output: 2 blocks for order 4 or four and more vectors per lane (the order-4 input
-    producer emits six inputs per frame), except the order-4 producer from plain rows at two
-    vectors per lane, which fits 80 registers and hides more load latency at 3; otherwise 4
-    for plain rows at up to two vectors per lane and 3 for products."""
+    Row output: 2 blocks for products at four or more vectors per lane on at most 8 lanes
+    (160 and 320 channels; the order-4 output transform holds five products per slice and
+    spills at 80 registers); 4 for plain input at four or more vectors per lane on 4 lanes
+    (160 channels, latency-bound at 3); otherwise 4 up to two vectors per lane and 3 above.
+    Winograd output: 3 for the order-4 producer from plain rows at up to two vectors per lane
+    (fits 80 registers and hides more load latency); otherwise 2 for order 4 (six inputs per
+    frame) or four and more vectors per lane; otherwise 4 for plain rows at up to two vectors
+    per lane and 3 for products or three vectors per lane."""
     if v.out == OUT_ROWS:
         if v.in_wino and v.k >= 4 and v.lanes <= 8:
             return 2
@@ -105,9 +118,10 @@ def _blocks_per_sm(v: Variant) -> int:
 
 def _slice_depth(v: Variant) -> int:
     """Vector slices in flight ahead of the one being processed: three for four or more
-    vectors per lane, except where two measured faster: the 640-channel output transform, and
-    the 1024-channel row norm with a residual (two slices plus the cross-frame prefetch of the
-    next frame's first two slices hide the doubled loads better)."""
+    vectors per lane, two otherwise, except where two measured faster at four or more: the
+    output transform of products into rows on 16 or more lanes (640 channels, and 1024 and
+    up), and the 1024-channel row norm of plain input with a residual (two slices plus the
+    cross-frame prefetch of the next frame's first two slices hide the doubled loads better)."""
     if v.out == OUT_ROWS and v.in_wino and v.k >= 4 and v.lanes >= 16:
         return 2
     if (
@@ -122,16 +136,17 @@ def _slice_depth(v: Variant) -> int:
     return 3 if v.k >= 4 else 2
 
 
-def _cross_frame_slices(v: Variant, depth: int) -> int:
-    """Vector slices of the next frame loaded while this frame is normalized. Two for the row
-    walks of plain input at slice depth 2. The products of a Winograd output kernel hold up to
-    five vectors per slice, so they are not prefetched across frames, except at 1024 channels
-    in order 2 (three products per slice, 128 registers): there two slices measured faster."""
+def _cross_frame_prefetch(v: Variant, depth: int) -> bool:
+    """Whether the next frame's first two slices are loaded while this frame is normalized.
+    Never at one vector per lane (whole frames are prefetched there). Plain input: at slice
+    depth 2. Products: their slices hold up to five vectors each, so only the order-2
+    Winograd output at 1024 channels (three products per slice, 128 registers) does it, where
+    it measured faster."""
     if v.k == 1:
-        return 0
+        return False
     if v.in_wino:
-        return 2 if v.out == OUT_WINOGRAD and v.order == 2 and v.k == 4 and v.lanes == 32 else 0
-    return 2 if depth == 2 else 0
+        return v.out == OUT_WINOGRAD and v.order == 2 and v.k == 4 and v.lanes == 32
+    return depth == 2
 
 
 class _Plan:
@@ -140,42 +155,46 @@ class _Plan:
     def __init__(self, v: Variant, has_sum: bool) -> None:
         self.v = v
         self.has_sum = has_sum
-        self.R = v.order
-        self.L = v.lanes
-        self.K = v.k
-        self.C = v.lanes * v.k * CHANNELS_PER_VECTOR
-        self.NV = self.C // CHANNELS_PER_VECTOR
-        self.T = BFloat16
-        self.TD = Float16 if v.fp16_winograd else BFloat16
-        self.TIN = self.TD if v.in_wino else self.T
-        self.bt, self.at = _tables(self.R)
-        self.comps = self.R + 2
+        self.order = v.order
+        self.lanes = v.lanes
+        self.vecs_per_lane = v.k
+        self.row_vecs = v.lanes * v.k
+        self.channels = self.row_vecs * CHANNELS_PER_VECTOR
+        self.row_dtype = BFloat16
+        self.winograd_dtype = Float16 if v.fp16_winograd else BFloat16
+        self.in_dtype = self.winograd_dtype if v.in_wino else self.row_dtype
+        self.bt, self.at = _tables(self.order)
+        self.components = self.order + 2
+        # Nonzero terms of each AT row: the products frame j of a group is built from.
         self.terms = [
-            [kk for kk in range(self.comps) if self.at[j][kk] != 0] for j in range(max(self.R, 1))
+            [i for i in range(self.components) if self.at[j][i] != 0] for j in range(self.order)
         ]
-        self.num_in = max(len(t) for t in self.terms) if v.in_wino else 1
+        self.max_terms = max(len(t) for t in self.terms) if v.in_wino else 1
+        # Winograd input s is complete once frame last_frame[s] of the group is normalized.
         self.last_frame = [
-            max(i for i in range(self.comps) if self.bt[s][i] != 0) for s in range(self.comps)
+            max(i for i in range(self.components) if self.bt[s][i] != 0)
+            for s in range(self.components)
         ]
         self.winograd_out = v.out == OUT_WINOGRAD
-        self.act = v.mid == MID_NORM_SILU
-        self.round1 = v.reference or v.out == OUT_ROWS
-        # One vector per lane: whole frames are prefetched and the per-channel constants stay
-        # in registers. Otherwise slices are pipelined ``depth`` deep, and ``xf`` slices of the
-        # next frame are loaded while this one is normalized.
-        self.frame_pf = self.K == 1
-        self.const_regs = self.K == 1
-        self.depth = _slice_depth(v)
-        self.xf = _cross_frame_slices(v, self.depth)
-        self.xf_pf = self.xf > 0
-        self.xf_two = self.xf > 1 and self.K > 1
-        self.pf = self.frame_pf or self.xf_pf  # the next frame's first slices are prefetched
-        self.shuffles = [1 << b for b in reversed(range(self.L.bit_length() - 1))]
-        self.ppw = 32 // self.L
-        self.ppb = self.ppw * WARPS
-        self.slots = self.R + 1
+        self.silu = v.mid == MID_NORM_SILU
+        # Round the pre-norm row to bf16 after the transform + bias and after the residual.
+        self.round_each_add = v.reference or v.out == OUT_ROWS
+        # One vector per lane: whole frames are prefetched and the per-channel tables stay in
+        # registers. Otherwise slices are pipelined ``slice_depth`` deep.
+        self.one_vector_per_lane = v.k == 1
+        self.slice_depth = _slice_depth(v)
+        self.cross_frame_prefetch = _cross_frame_prefetch(v, self.slice_depth)
+        self.next_frame_prefetched = self.one_vector_per_lane or self.cross_frame_prefetch
+        self.xor_offsets = [1 << b for b in reversed(range(self.lanes.bit_length() - 1))]
+        self.positions_per_warp = 32 // self.lanes
+        self.positions_per_block = v.positions_per_block
+        self.ring_slots = v.ring_slots
         self.blocks_per_sm = _blocks_per_sm(v)
-        self.smem = v.shared_bytes(self.C)
+        self.smem_bytes = v.shared_bytes(self.channels)
+
+
+class _Ctx:
+    """Trace-time bundle of the kernel's views, scalars and register buffers."""
 
 
 class VaeNormKernel:
@@ -188,13 +207,13 @@ class VaeNormKernel:
         x_ptr: cute.Pointer,
         m_ptr: cute.Pointer,
         d_ptr: cute.Pointer,
-        res_ptr: cute.Pointer,
-        inb_ptr: cute.Pointer,
+        residual_ptr: cute.Pointer,
+        in_bias_ptr: cute.Pointer,
         cache_ptr: cute.Pointer,
         gamma_ptr: cute.Pointer,
         bias_ptr: cute.Pointer,
         sum_ptr: cute.Pointer,
-        tail_ptr: cute.Pointer,
+        y_tail_ptr: cute.Pointer,
         y_ptr: cute.Pointer,
         halo_l_ptr: cute.Pointer,
         halo_r_ptr: cute.Pointer,
@@ -231,13 +250,13 @@ class VaeNormKernel:
             x_ptr,
             m_ptr,
             d_ptr,
-            res_ptr,
-            inb_ptr,
+            residual_ptr,
+            in_bias_ptr,
             cache_ptr,
             gamma_ptr,
             bias_ptr,
             sum_ptr,
-            tail_ptr,
+            y_tail_ptr,
             y_ptr,
             halo_l_ptr,
             halo_r_ptr,
@@ -269,8 +288,8 @@ class VaeNormKernel:
             eps,
         ).launch(
             grid=[blocks, 1, 1],
-            block=[THREADS, 1, 1],
-            smem=self.p.smem,
+            block=[BLOCK_THREADS, 1, 1],
+            smem=self.p.smem_bytes,
             stream=stream,
             min_blocks_per_mp=self.p.blocks_per_sm,
         )
@@ -281,13 +300,13 @@ class VaeNormKernel:
         x_ptr: cute.Pointer,
         m_ptr: cute.Pointer,
         d_ptr: cute.Pointer,
-        res_ptr: cute.Pointer,
-        inb_ptr: cute.Pointer,
+        residual_ptr: cute.Pointer,
+        in_bias_ptr: cute.Pointer,
         cache_ptr: cute.Pointer,
         gamma_ptr: cute.Pointer,
         bias_ptr: cute.Pointer,
         sum_ptr: cute.Pointer,
-        tail_ptr: cute.Pointer,
+        y_tail_ptr: cute.Pointer,
         y_ptr: cute.Pointer,
         halo_l_ptr: cute.Pointer,
         halo_r_ptr: cute.Pointer,
@@ -320,32 +339,30 @@ class VaeNormKernel:
     ):
         p = self.p
         v = p.v
-        R, K, C, NV = p.R, p.K, p.C, p.NV
-        HALO = v.halo
-        WOUT = p.winograd_out
 
         c = _Ctx()
         c.gx = vec_view(x_ptr)
         c.gm = vec_view(m_ptr)
-        c.gres = vec_view(res_ptr)
+        c.gres = vec_view(residual_ptr)
         c.ud = u32_view(d_ptr)
         c.ucache = u32_view(cache_ptr)
         c.usum = u32_view(sum_ptr)
-        c.utail = u32_view(tail_ptr)
+        c.utail = u32_view(y_tail_ptr)
         c.uy = u32_view(y_ptr)
         c.uhl = u32_view(halo_l_ptr)
         c.uhr = u32_view(halo_r_ptr)
-        g_gamma = cute.make_tensor(gamma_ptr, cute.make_layout((C,)))
-        g_bias = cute.make_tensor(bias_ptr, cute.make_layout((C,)))
-        g_inb = cute.make_tensor(inb_ptr, cute.make_layout((C,)))
+        g_gamma = cute.make_tensor(gamma_ptr, cute.make_layout((p.channels,)))
+        g_bias = cute.make_tensor(bias_ptr, cute.make_layout((p.channels,)))
+        g_in_bias = cute.make_tensor(in_bias_ptr, cute.make_layout((p.channels,)))
 
         smem_f = cute.arch.get_dyn_smem(Float32, alignment=16)
-        # Per-channel tables, the 8 floats of vector vi split into two 16-byte quarters in
-        # separate planes ((q * NV + vi) * 4 + e): a warp reads each quarter at a 16-byte lane
-        # stride, free of bank conflicts.
-        s_tab = cute.make_tensor(smem_f, cute.make_layout((3 * C,)))
-        c.s_quads = cute.make_tensor(smem_f, cute.make_layout((4, 6 * NV), stride=(1, 4)))
-        c.uhist = u32_view(cute.recast_ptr(smem_f + 3 * C, dtype=p.T))
+        # Per-channel tables, the 8 floats of vector vi split into two 16-byte halves in
+        # separate planes: float e of half q of table t sits at ((2 * t + q) * NV + vi) * 4 + e
+        # (NV vectors per row). A warp reads each half at a 16-byte lane stride, free of bank
+        # conflicts.
+        s_tab = cute.make_tensor(smem_f, cute.make_layout((3 * p.channels,)))
+        c.s_quads = cute.make_tensor(smem_f, cute.make_layout((4, 6 * p.row_vecs), stride=(1, 4)))
+        c.uhist = u32_view(cute.recast_ptr(smem_f + 3 * p.channels, dtype=p.row_dtype))
 
         tid, _, _ = cute.arch.thread_idx()
         bid, _, _ = cute.arch.block_idx()
@@ -353,290 +370,142 @@ class VaeNormKernel:
         tid = Int32(tid)
         lane = tid % 32
         warp = tid // 32
-        group = lane // p.L
-        c.lig = lane - group * p.L
-        c.pos_in_block = warp * p.ppw + group
+        group = lane // p.lanes
+        c.lane_in_group = lane - group * p.lanes
+        c.pos_in_block = warp * p.positions_per_warp + group
 
-        # The table fill is unrolled (the channel count is a compile-time constant) so every
-        # thread's loads are issued together.
-        for it in cutlass.range_constexpr((C + THREADS - 1) // THREADS):
-            ch = tid + it * THREADS
-            in_range = cutlass.Boolean(True)
-            if cutlass.const_expr((it + 1) * THREADS > C):
-                in_range = ch < C
-            if in_range:
-                idx = (
-                    ((ch % CHANNELS_PER_VECTOR) // 4) * NV + ch // CHANNELS_PER_VECTOR
-                ) * 4 + ch % 4
-                g = Float32(0.0)
-                if cutlass.const_expr(v.mid != MID_NONE):
-                    g = Float32(g_gamma[ch])
-                    if cutlass.const_expr(not v.reference):
-                        g = g * (Float32(0.5) * scale if p.act else scale)
-                b_ = Float32(0.0)
-                if cutlass.const_expr(v.has_bias):
-                    b_ = Float32(g_bias[ch])
-                ib_ = Float32(0.0)
-                if cutlass.const_expr(v.has_in_bias):
-                    ib_ = Float32(g_inb[ch])
-                s_tab[idx] = g
-                s_tab[C + idx] = b_
-                s_tab[2 * C + idx] = ib_
+        self._fill_tables(s_tab, g_gamma, g_bias, g_in_bias, tid, scale)
         cute.arch.sync_threads()
 
         c.regs = None
-        if cutlass.const_expr(p.const_regs):
-            c.regs = [self._table_vec(c, t, 0, c.lig) for t in range(3)]
+        if cutlass.const_expr(p.one_vector_per_lane):
+            c.regs = [
+                self._table_vec(c, table, 0, c.lane_in_group) for table in (_GAMMA, _BIAS, _IN_BIAS)
+            ]
 
-        P = positions
-        c.P = P
+        c.positions = positions
+        c.frames = frames
         c.height = height
         c.width = width
-        c.out_wp = width + pad_w
+        c.out_row_width = width + pad_w
         c.in_w = in_w
         c.in_off = in_off
         c.out_w = out_w
         c.out_off = out_off
         c.scale = scale
+        c.comp_vecs = comp_vecs
         c.in_comp_vecs = in_comp_vecs
-        POut = P
+        c.halo_frame_l = halo_frame_l
+        c.halo_frame_r = halo_frame_r
+        c.halo_comp_l = halo_comp_l
+        c.halo_comp_r = halo_comp_r
+        c.halo_step_l = halo_step_l
+        c.halo_step_r = halo_step_r
+        c.halo_axis = halo_axis
+        c.has_l = has_l
+        c.has_r = has_r
+        positions_out = positions
         if cutlass.const_expr(v.padded):
-            POut = (height + pad_h) * c.out_wp
-        c.in_frame_pos = Int64(P)
+            positions_out = (height + pad_h) * c.out_row_width
+        c.positions_out = positions_out
+        c.in_frame_pos = Int64(positions)
         if cutlass.const_expr(v.in_map):
             c.in_frame_pos = in_frame
-        out_frame_pos = Int64(POut)
+        out_frame_pos = Int64(positions_out)
         if cutlass.const_expr(v.out_map):
             out_frame_pos = out_frame
-        grid_pos = Int32(gdim) * p.ppb
-        T_ = frames
+        c.out_frame_pos = out_frame_pos
+        position_stride = Int32(gdim) * p.positions_per_block
+        c.position_stride = position_stride
 
         # Register buffers: three input slices (inputs x terms) and their residual slices. The
         # row being normalized travels between the passes as packed bf16 pairs.
-        c.in_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR, p.num_in), p.TIN) for _ in range(3)]
-        c.res_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), p.T) for _ in range(3)]
+        c.in_buf = [
+            cute.make_rmem_tensor((CHANNELS_PER_VECTOR, p.max_terms), p.in_dtype) for _ in range(3)
+        ]
+        c.res_buf = [cute.make_rmem_tensor((CHANNELS_PER_VECTOR,), p.row_dtype) for _ in range(3)]
 
         prefetched = cutlass.Boolean(False)
         src_in = Int64(0)
         src_res = Int64(0)
 
-        opos = Int32(bid) * p.ppb + c.pos_in_block
-        while opos < POut:
-            pos = self._source_pos(c, opos)
+        out_pos = Int32(bid) * p.positions_per_block + c.pos_in_block
+        while out_pos < positions_out:
+            pos = self._source_pos(c, out_pos)
             pos_src = self._in_index(c, pos)
-            pos_out = self._out_index(c, opos)
-
-            use_l = cutlass.Boolean(False)
-            use_r = cutlass.Boolean(False)
-            row_l = Int64(0)
-            row_r = Int64(0)
-            if cutlass.const_expr(HALO):
-                hi = pos // width
-                hj = pos - hi * width
-                across = hi
-                along = hj
-                n_across = height
-                if halo_axis != 0:
-                    across = hj
-                    along = hi
-                    n_across = width
-                if across == 0 and has_l != 0:
-                    use_l = cutlass.Boolean(True)
-                    row_l = Int64(along) * halo_step_l
-                if across == n_across - 1 and has_r != 0:
-                    use_r = cutlass.Boolean(True)
-                    row_r = Int64(along) * halo_step_r
+            pos_out = self._out_index(c, out_pos)
+            halo = self._halo_targets(c, pos)
 
             is_pad = cutlass.Boolean(False)
             if cutlass.const_expr(v.padded):
                 is_pad = pos < 0
             if is_pad:
-                # A pad position: zero rows for every frame, nothing to read.
-                for t in cutlass.range(T_):
-                    for kk in cutlass.range_constexpr(K):
-                        store_words(c.uy, self._vrow(c, Int64(t) * POut + opos, kk), self._zeros())
+                self._store_pad_rows(c, out_pos)
                 prefetched = cutlass.Boolean(False)
             else:
-                if cutlass.const_expr(WOUT):
-                    # Cached frames -2 and -1 into ring slots 0 and 1 (zeros where the cache
-                    # is shorter).
-                    for h in cutlass.range_constexpr(2):
-                        cache_idx = cache_frames - 2 + h
-                        if cache_idx >= 0:
-                            for kk in cutlass.range_constexpr(K):
-                                store_words(
-                                    c.uhist,
-                                    self._slot_vec(c, h, kk),
-                                    load_words(
-                                        c.ucache, self._vrow(c, Int64(cache_idx) * P + pos, kk)
-                                    ),
-                                )
-                        else:
-                            for kk in cutlass.range_constexpr(K):
-                                store_words(c.uhist, self._slot_vec(c, h, kk), self._zeros())
+                if cutlass.const_expr(p.winograd_out):
+                    self._load_cache_into_ring(c, pos, cache_frames)
 
+                # An empty then-branch instead of ``if not prefetched``: ``not`` on a dynamic
+                # Boolean emits an extra negation in front of the branch.
                 if prefetched:
                     pass
                 else:
-                    src_in, src_res = self._src_of(c, Int32(0), pos, pos_src)
-                    if cutlass.const_expr(p.pf):
-                        self._load_slice(c, 0, 0, src_in, src_res, 0)
-                    if cutlass.const_expr(p.xf_two):
-                        self._load_slice(c, 0, 1, src_in, src_res, 1)
+                    src_in, src_res = self._input_rows(c, Int32(0), pos, pos_src)
+                    if cutlass.const_expr(p.next_frame_prefetched):
+                        self._load_frame_start(c, 0, 0, src_in, src_res)
                 prefetched = cutlass.Boolean(False)
 
-                for t0 in cutlass.range(0, T_, R):
-                    for J in cutlass.range_constexpr(R):
-                        JN = (J + 1) % R
-                        t = t0 + J
-                        lig_f = _opaque(c.lig)
-                        next_in_pos = t + 1 < T_
-                        next_pos = pos
-                        has_next = cutlass.Boolean(True)
-                        next_pos_src = pos_src
-                        next_t = t + 1
-                        if next_in_pos:
-                            pass
-                        else:
-                            next_pos = self._source_pos(c, opos + grid_pos)
-                            has_next = opos + grid_pos < POut and next_pos >= 0
-                            next_pos_src = self._in_index(c, next_pos)
-                            next_t = Int32(0)
-                        nx_in = Int64(0)
-                        nx_res = Int64(0)
+                for t0 in cutlass.range(0, frames, p.order):
+                    for j in cutlass.range_constexpr(p.order):
+                        t = t0 + j
+                        lane_opaque = _opaque(c.lane_in_group)
+                        nxt = self._next_position(c, t, pos, pos_src, out_pos)
+                        next_in_pos, has_next = nxt[0], nxt[1]
+                        next_src_in = Int64(0)
+                        next_src_res = Int64(0)
 
-                        if cutlass.const_expr(p.frame_pf):
+                        if cutlass.const_expr(p.one_vector_per_lane):
                             # The next frame's single slice goes to buffer 1 and moves to
                             # buffer 0 once this frame is done.
-                            if has_next:
-                                nx_in, nx_res = self._src_of(c, next_t, next_pos, next_pos_src)
-                                if next_in_pos:
-                                    self._load_slice(c, JN, 1, nx_in, nx_res, 0)
-                                else:
-                                    self._load_slice(c, 0, 1, nx_in, nx_res, 0)
-                        elif cutlass.const_expr(not p.xf_pf):
-                            self._load_slice(c, J, 0, src_in, src_res, 0)
+                            next_src_in, next_src_res = self._prefetch_next_frame(
+                                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
+                            )
+                        elif cutlass.const_expr(not p.cross_frame_prefetch):
+                            self._load_slice(c, j, 0, src_in, src_res, 0)
 
-                        # Pass 1: output transform, deferred bias, residual; the bf16 row stays in
-                        # registers (``yw``, packed pairs per slice) and goes to ``sum``; the sum
-                        # of squares on the way.
-                        ss = Float32(0.0)
-                        yw = {}
+                        sum_sq = Float32(0.0)
                         orow = Int64(t) * out_frame_pos + pos_out
-                        srow = Int64(t) * P + pos
-                        if cutlass.const_expr(p.frame_pf):
-                            ss, yw[0] = self._slice(c, J, 0, 0, ss, orow, srow, lig_f)
-                        elif cutlass.const_expr(p.depth == 2):
-                            for kk in cutlass.range_constexpr(0, K, 2):
-                                if cutlass.const_expr(kk + 1 < K and not (p.xf_two and kk == 0)):
-                                    self._load_slice(c, J, 1, src_in, src_res, kk + 1)
-                                ss, yw[kk] = self._slice(c, J, 0, kk, ss, orow, srow, lig_f)
-                                if cutlass.const_expr(kk + 1 < K):
-                                    if cutlass.const_expr(kk + 2 < K):
-                                        self._load_slice(c, J, 0, src_in, src_res, kk + 2)
-                                    ss, yw[kk + 1] = self._slice(
-                                        c, J, 1, kk + 1, ss, orow, srow, lig_f
-                                    )
-                        else:
-                            if cutlass.const_expr(1 < K and not p.xf_two):
-                                self._load_slice(c, J, 1, src_in, src_res, 1)
-                            for kk in cutlass.range_constexpr(0, K, 3):
-                                if cutlass.const_expr(kk + 2 < K):
-                                    self._load_slice(c, J, 2, src_in, src_res, kk + 2)
-                                ss, yw[kk] = self._slice(c, J, 0, kk, ss, orow, srow, lig_f)
-                                if cutlass.const_expr(kk + 1 < K):
-                                    if cutlass.const_expr(kk + 3 < K):
-                                        self._load_slice(c, J, 0, src_in, src_res, kk + 3)
-                                    ss, yw[kk + 1] = self._slice(
-                                        c, J, 1, kk + 1, ss, orow, srow, lig_f
-                                    )
-                                if cutlass.const_expr(kk + 2 < K):
-                                    if cutlass.const_expr(kk + 4 < K):
-                                        self._load_slice(c, J, 1, src_in, src_res, kk + 4)
-                                    ss, yw[kk + 2] = self._slice(
-                                        c, J, 2, kk + 2, ss, orow, srow, lig_f
-                                    )
+                        srow = Int64(t) * positions + pos
+                        sum_sq, row_words = self._pass1_frame(
+                            c, j, src_in, src_res, sum_sq, orow, srow, lane_opaque
+                        )
 
-                        if cutlass.const_expr(p.xf_pf):
-                            if has_next:
-                                nx_in, nx_res = self._src_of(c, next_t, next_pos, next_pos_src)
-                                if next_in_pos:
-                                    self._load_slice(c, JN, 0, nx_in, nx_res, 0)
-                                    if cutlass.const_expr(p.xf_two):
-                                        self._load_slice(c, JN, 1, nx_in, nx_res, 1)
-                                else:
-                                    self._load_slice(c, 0, 0, nx_in, nx_res, 0)
-                                    if cutlass.const_expr(p.xf_two):
-                                        self._load_slice(c, 0, 1, nx_in, nx_res, 1)
+                        if cutlass.const_expr(p.cross_frame_prefetch):
+                            next_src_in, next_src_res = self._prefetch_next_frame(
+                                c, (j + 1) % p.order, nxt, next_src_in, next_src_res
+                            )
 
                         if cutlass.const_expr(v.mid != MID_NONE):
-                            for i in cutlass.range_constexpr(len(p.shuffles)):
-                                ss = ss + cute.arch.shuffle_sync_bfly(ss, p.shuffles[i])
-                            denom = Float32(0.0)
-                            inv_denom = Float32(0.0)
-                            if cutlass.const_expr(v.reference):
-                                denom = cute.arch.fmax(cute.math.sqrt(ss), eps)
-                            else:
-                                inv_denom = cute.math.rsqrt(cute.arch.fmax(ss, eps * eps))
+                            denom, inv_denom = self._rms_scale(sum_sq, eps)
+                            self._pass2_frame(
+                                c,
+                                j,
+                                t,
+                                t0,
+                                pos_out,
+                                orow,
+                                row_words,
+                                denom,
+                                inv_denom,
+                                lane_opaque,
+                                halo,
+                            )
 
-                            # Pass 2: normalize from registers into the ring slot (emitting the
-                            # Winograd inputs this frame completes: input s reads the group's
-                            # frames f_0 .. f_{J+1} from the ring and f_{J+2}, this frame, from
-                            # registers) or into the output row.
-                            drow = Int64(t // R) * out_frame_pos + pos_out
-                            for kk in cutlass.range_constexpr(K):
-                                yo = self._normalize(c, kk, yw[kk], denom, inv_denom, lig_f)
-                                if cutlass.const_expr(WOUT):
-                                    store_words(
-                                        c.uhist, self._slot_vec(c, (t + 2) % p.slots, kk), yo
-                                    )
-                                    cur = [f for w in yo for f in (bf16_lo(w), bf16_hi(w))]
-                                    for s in cutlass.range_constexpr(p.comps):
-                                        if cutlass.const_expr(p.last_frame[s] == J + 2):
-                                            o = self._winograd_input(c, s, J, t0, kk, cur)
-                                            store_words(
-                                                c.ud, self._vrow(c, drow, kk) + s * comp_vecs, o
-                                            )
-                                            if cutlass.const_expr(HALO):
-                                                g_row = Int64(t // R)
-                                                if use_l:
-                                                    store_words(
-                                                        c.uhl,
-                                                        self._vrow(
-                                                            c, g_row * halo_frame_l + row_l, kk
-                                                        )
-                                                        + s * halo_comp_l,
-                                                        o,
-                                                    )
-                                                if use_r:
-                                                    store_words(
-                                                        c.uhr,
-                                                        self._vrow(
-                                                            c, g_row * halo_frame_r + row_r, kk
-                                                        )
-                                                        + s * halo_comp_r,
-                                                        o,
-                                                    )
-                                else:
-                                    store_words(c.uy, self._vrow(c, orow, kk), yo)
-                                    if cutlass.const_expr(HALO):
-                                        if use_l:
-                                            store_words(
-                                                c.uhl,
-                                                self._vrow(c, Int64(t) * halo_frame_l + row_l, kk),
-                                                yo,
-                                            )
-                                        if use_r:
-                                            store_words(
-                                                c.uhr,
-                                                self._vrow(c, Int64(t) * halo_frame_r + row_r, kk),
-                                                yo,
-                                            )
-
-                        if cutlass.const_expr(p.pf):
-                            src_in = nx_in
-                            src_res = nx_res
-                            if cutlass.const_expr(p.frame_pf):
+                        if cutlass.const_expr(p.next_frame_prefetched):
+                            src_in = next_src_in
+                            src_res = next_src_res
+                            if cutlass.const_expr(p.one_vector_per_lane):
                                 if has_next:
                                     c.in_buf[0].store(c.in_buf[1].load())
                                     if cutlass.const_expr(v.has_residual):
@@ -647,49 +516,184 @@ class VaeNormKernel:
                                 prefetched = has_next
                         else:
                             if next_in_pos:
-                                src_in, src_res = self._src_of(c, t + 1, pos, pos_src)
+                                src_in, src_res = self._input_rows(c, t + 1, pos, pos_src)
 
-                if cutlass.const_expr(WOUT):
-                    # The last two normalized frames are the next chunk's cache.
-                    for kk in cutlass.range_constexpr(K):
-                        store_words(
-                            c.utail,
-                            self._vrow(c, Int64(pos), kk),
-                            load_words(c.uhist, self._slot_vec(c, T_ % p.slots, kk)),
-                        )
-                        store_words(
-                            c.utail,
-                            self._vrow(c, Int64(P) + pos, kk),
-                            load_words(c.uhist, self._slot_vec(c, (T_ + 1) % p.slots, kk)),
-                        )
-            opos = opos + grid_pos
+                if cutlass.const_expr(p.winograd_out):
+                    self._store_cache_tail(c, pos)
+            out_pos = out_pos + position_stride
 
     # ------------------------------------------------------------------ trace-time helpers
-    # Plain methods: everything they read comes in through ``c`` (a staged loop may not
-    # capture the kernel's locals), and every branch in them is a compile-time one.
+    # Everything a helper reads comes in through ``c`` or its arguments (a staged loop may not
+    # capture the kernel's locals). The ``@cute.jit`` helpers hold the dynamic branches and
+    # loops; the plain methods have only compile-time branches and Python loops.
+
+    @cute.jit
+    def _fill_tables(self, s_tab, g_gamma, g_bias, g_in_bias, tid, scale):
+        """The per-channel tables into shared memory. The fill is unrolled (the channel count
+        is a compile-time constant) so every thread's loads are issued together; with
+        ``reference`` off gamma is pre-multiplied by ``scale`` (by ``0.5 * scale`` with SiLU)."""
+        p = self.p
+        v = p.v
+        channels = p.channels
+        for it in cutlass.range_constexpr((channels + BLOCK_THREADS - 1) // BLOCK_THREADS):
+            ch = tid + it * BLOCK_THREADS
+            in_range = cutlass.Boolean(True)
+            if cutlass.const_expr((it + 1) * BLOCK_THREADS > channels):
+                in_range = ch < channels
+            if in_range:
+                idx = (
+                    ((ch % CHANNELS_PER_VECTOR) // 4) * p.row_vecs + ch // CHANNELS_PER_VECTOR
+                ) * 4 + ch % 4
+                gamma_v = Float32(0.0)
+                if cutlass.const_expr(v.mid != MID_NONE):
+                    gamma_v = Float32(g_gamma[ch])
+                    if cutlass.const_expr(not v.reference):
+                        gamma_v = gamma_v * (Float32(0.5) * scale if p.silu else scale)
+                bias_v = Float32(0.0)
+                if cutlass.const_expr(v.has_bias):
+                    bias_v = Float32(g_bias[ch])
+                in_bias_v = Float32(0.0)
+                if cutlass.const_expr(v.has_in_bias):
+                    in_bias_v = Float32(g_in_bias[ch])
+                s_tab[idx] = gamma_v
+                s_tab[_BIAS * channels + idx] = bias_v
+                s_tab[_IN_BIAS * channels + idx] = in_bias_v
+
+    @cute.jit
+    def _halo_targets(self, c, pos):
+        """``(use_l, use_r, row_l, row_r)``: whether position ``pos`` lies on the first / last
+        line of the split axis with a neighbour on that side, and the line row it goes to in
+        that neighbour's halo buffer."""
+        use_l = cutlass.Boolean(False)
+        use_r = cutlass.Boolean(False)
+        row_l = Int64(0)
+        row_r = Int64(0)
+        if cutlass.const_expr(self.p.v.halo):
+            hi = pos // c.width
+            hj = pos - hi * c.width
+            across = hi
+            along = hj
+            n_across = c.height
+            if c.halo_axis != 0:
+                across = hj
+                along = hi
+                n_across = c.width
+            if across == 0 and c.has_l != 0:
+                use_l = cutlass.Boolean(True)
+                row_l = Int64(along) * c.halo_step_l
+            if across == n_across - 1 and c.has_r != 0:
+                use_r = cutlass.Boolean(True)
+                row_r = Int64(along) * c.halo_step_r
+        return use_l, use_r, row_l, row_r
+
+    @cute.jit
+    def _store_pad_rows(self, c, out_pos):
+        """A pad position: zero rows for every frame, nothing to read."""
+        for t in cutlass.range(c.frames):
+            for kk in cutlass.range_constexpr(self.p.vecs_per_lane):
+                store_words(
+                    c.uy, self._vrow(c, Int64(t) * c.positions_out + out_pos, kk), self._zeros()
+                )
+
+    @cute.jit
+    def _load_cache_into_ring(self, c, pos, cache_frames):
+        """Cached frames -2 and -1 into ring slots 0 and 1 (zeros where the cache is
+        shorter)."""
+        for h in cutlass.range_constexpr(2):
+            cache_idx = cache_frames - 2 + h
+            if cache_idx >= 0:
+                for kk in cutlass.range_constexpr(self.p.vecs_per_lane):
+                    ring_vec = self._slot_vec(c, h, kk)
+                    cache_row = Int64(cache_idx) * c.positions + pos
+                    store_words(
+                        c.uhist, ring_vec, load_words(c.ucache, self._vrow(c, cache_row, kk))
+                    )
+            else:
+                for kk in cutlass.range_constexpr(self.p.vecs_per_lane):
+                    store_words(c.uhist, self._slot_vec(c, h, kk), self._zeros())
+
+    @cute.jit
+    def _next_position(self, c, t, pos, pos_src, out_pos):
+        """Where the frame after ``t`` comes from: ``(next_in_pos, has_next, next_t, next_pos,
+        next_pos_src)``. Frame ``t + 1`` of this position, or frame 0 of the next position this
+        group walks (``has_next`` false past the end or on a pad position)."""
+        next_in_pos = t + 1 < c.frames
+        next_pos = pos
+        has_next = cutlass.Boolean(True)
+        next_pos_src = pos_src
+        next_t = t + 1
+        if next_in_pos:
+            pass
+        else:
+            next_pos = self._source_pos(c, out_pos + c.position_stride)
+            has_next = out_pos + c.position_stride < c.positions_out and next_pos >= 0
+            next_pos_src = self._in_index(c, next_pos)
+            next_t = Int32(0)
+        return next_in_pos, has_next, next_t, next_pos, next_pos_src
+
+    @cute.jit
+    def _prefetch_next_frame(self, c, next_j: cutlass.Constexpr, nxt, next_src_in, next_src_res):
+        """The next frame's first slices (see :meth:`_load_frame_start`), ``next_j`` being its
+        index in the group when it belongs to this position; returns its input rows."""
+        next_in_pos, has_next, next_t, next_pos, next_pos_src = nxt
+        if has_next:
+            next_src_in, next_src_res = self._input_rows(c, next_t, next_pos, next_pos_src)
+            if next_in_pos:
+                self._load_frame_start(
+                    c, next_j, self._next_frame_buffer(), next_src_in, next_src_res
+                )
+            else:
+                self._load_frame_start(c, 0, self._next_frame_buffer(), next_src_in, next_src_res)
+        return next_src_in, next_src_res
+
+    @cute.jit
+    def _push_halo(self, c, halo, frame, kk: cutlass.Constexpr, s: cutlass.Constexpr, words):
+        """Store slice ``kk`` of an output line position into the neighbours' halo buffers as
+        well. ``s``: the Winograd input index (``frame`` is then the group's Int64 row), or None
+        for row output (``frame`` is the frame index)."""
+        use_l, use_r, row_l, row_r = halo
+        if use_l:
+            store_words(
+                c.uhl, self._halo_vec(c, frame, row_l, c.halo_frame_l, c.halo_comp_l, kk, s), words
+            )
+        if use_r:
+            store_words(
+                c.uhr, self._halo_vec(c, frame, row_r, c.halo_frame_r, c.halo_comp_r, kk, s), words
+            )
+
+    def _halo_vec(self, c, frame, line_row, frame_stride, comp_stride, kk: int, s):
+        if s is None:
+            return self._vrow(c, Int64(frame) * frame_stride + line_row, kk)
+        return self._vrow(c, frame * frame_stride + line_row, kk) + s * comp_stride
 
     def _vrow(self, c, row, kk: int):
         """Vector index of slice ``kk`` of this lane in row ``row`` of a [rows, C] buffer."""
-        return Int64(row) * self.p.NV + c.lig + kk * self.p.L
+        return Int64(row) * self.p.row_vecs + c.lane_in_group + kk * self.p.lanes
 
-    def _slot_vec(self, c, slot, kk: int):
+    def _slot_vec(self, c, slot, kk: int, lane=None):
+        """Vector index of slice ``kk`` of this lane (``lane``, default the lane in the group)
+        for this position in ring slot ``slot``."""
         p = self.p
-        return Int64((slot * p.ppb + c.pos_in_block) * p.NV + c.lig + kk * p.L)
+        if lane is None:
+            lane = c.lane_in_group
+        return Int64(
+            (slot * p.positions_per_block + c.pos_in_block) * p.row_vecs + lane + kk * p.lanes
+        )
 
-    def _table_vec(self, c, t: int, kk: int, lig) -> list:
+    def _table_vec(self, c, table: int, kk: int, lane) -> list:
         p = self.p
-        vi = lig + kk * p.L
+        vi = lane + kk * p.lanes
         out = []
         for q in range(2):
-            quad = c.s_quads[(None, t * 2 * p.NV + q * p.NV + vi)].load()
+            quad = c.s_quads[(None, table * 2 * p.row_vecs + q * p.row_vecs + vi)].load()
             for e in range(4):
                 out.append(quad[e])
         return out
 
-    def _const_at(self, c, t: int, kk: int, lig_f) -> list:
-        if self.p.const_regs:
-            return c.regs[t]
-        return self._table_vec(c, t, kk, lig_f)
+    def _const_at(self, c, table: int, kk: int, lane_opaque) -> list:
+        if self.p.one_vector_per_lane:
+            return c.regs[table]
+        return self._table_vec(c, table, kk, lane_opaque)
 
     def _in_index(self, c, pos):
         if self.p.v.in_map:
@@ -703,144 +707,245 @@ class VaeNormKernel:
             return Int64(i) * c.out_w + (pos - i * c.width) + c.out_off
         return Int64(pos)
 
-    def _source_pos(self, c, opos):
+    def _source_pos(self, c, out_pos):
         """Source position of an output position (the row output may be padded); -1 for a
         pad."""
         if not self.p.v.padded:
-            return opos
-        oi = opos // c.out_wp
-        oj = opos - oi * c.out_wp
+            return out_pos
+        oi = out_pos // c.out_row_width
+        oj = out_pos - oi * c.out_row_width
         sp = Int32(cutlass.select_(oj < c.width, oi * c.width + oj, Int32(-1)))
         return Int32(cutlass.select_(oi < c.height, sp, Int32(-1)))
 
-    def _src_of(self, c, t, spos, spos_src):
+    def _input_rows(self, c, t, spos, spos_src):
         """Rows of frame ``t``'s inputs: the x row, or the row inside component 0 of the
         products (component k sits ``k * in_comp_vecs`` vectors further); the residual row."""
-        s_res = Int64(t) * c.P + spos
+        s_res = Int64(t) * c.positions + spos
         if self.p.v.in_wino:
-            return Int64(t // self.p.R) * c.in_frame_pos + spos_src, s_res
+            return Int64(t // self.p.order) * c.in_frame_pos + spos_src, s_res
         return s_res, s_res
 
-    def _load_slice(self, c, j: int, b: int, s_in, s_res, kk: int) -> None:
-        """Slice ``kk`` of frame ``j``'s inputs into buffer ``b``: the x row, or the products of
-        the nonzero terms of AT row ``j``."""
+    def _load_slice(self, c, j: int, buf: int, src_in, src_res, kk: int) -> None:
+        """Slice ``kk`` of the inputs of frame ``j`` of the group into buffer ``buf``: the x
+        row, or the products of the nonzero terms of AT row ``j``."""
         p = self.p
         if p.v.in_wino:
             for q in range(len(p.terms[j])):
-                c.in_buf[b][(None, q)].store(
-                    c.gm[(None, self._vrow(c, s_in, kk) + p.terms[j][q] * c.in_comp_vecs)].load()
+                c.in_buf[buf][(None, q)].store(
+                    c.gm[(None, self._vrow(c, src_in, kk) + p.terms[j][q] * c.in_comp_vecs)].load()
                 )
         else:
-            c.in_buf[b][(None, 0)].store(c.gx[(None, self._vrow(c, s_in, kk))].load())
+            c.in_buf[buf][(None, 0)].store(c.gx[(None, self._vrow(c, src_in, kk))].load())
         if p.v.has_residual:
-            c.res_buf[b].store(c.gres[(None, self._vrow(c, s_res, kk))].load())
+            c.res_buf[buf].store(c.gres[(None, self._vrow(c, src_res, kk))].load())
+
+    def _next_frame_buffer(self) -> int:
+        # One vector per lane: buffer 0 still holds this frame's slice when the next one loads.
+        return 1 if self.p.one_vector_per_lane else 0
+
+    def _load_frame_start(self, c, j: int, first_buf: int, src_in, src_res) -> None:
+        """The slices of frame ``j`` loaded ahead of its pass 1: slice 0 into buffer
+        ``first_buf`` and, with the cross-frame prefetch, slice 1 into buffer 1."""
+        self._load_slice(c, j, first_buf, src_in, src_res, 0)
+        if self.p.cross_frame_prefetch:
+            self._load_slice(c, j, 1, src_in, src_res, 1)
+
+    def _load_ahead(self, c, j: int, n: int, src_in, src_res) -> None:
+        """Slice ``n`` into buffer ``n % slice_depth``, unless the row has no slice ``n`` or the
+        cross-frame prefetch already loaded it (slices 0 and 1)."""
+        p = self.p
+        if n < p.vecs_per_lane and not (p.cross_frame_prefetch and n < 2):
+            self._load_slice(c, j, n % p.slice_depth, src_in, src_res, n)
 
     def _zeros(self) -> list:
         return [Int32(0)] * 4
 
     def _round(self, x):
         """``x`` rounded to bf16 and back (one packed convert of the duplicated value)."""
-        return bf16_lo(pack2(x, x, False))
+        return bf16_lo(pack2(x, x))
 
-    def _slice(self, c, J: int, b: int, kk: int, ss, orow, srow, lig_f):
-        """Pass 1 on slice ``kk`` from buffer ``b``: output transform (in index order; the products are
-        exact, so the reference rounding is one rounding per add), deferred bias, residual.
-        Returns the updated sum of squares and the bf16 slice as four packed pairs, which also
-        go to ``sum`` (or, for the add_bias_and_residual kernel, to ``y``)."""
+    def _pass1_frame(self, c, j: int, src_in, src_res, sum_sq, orow, srow, lane_opaque):
+        """Pass 1 over the slices of frame ``j`` of the group: output transform, deferred
+        bias, residual. Slice 0 (and with the cross-frame prefetch slice 1) is already loaded;
+        the next ``slice_depth - 1`` slices are kept in flight in rotating buffers. Returns the
+        updated sum of squares and the bf16 row as packed pairs per slice; the row also goes
+        to ``sum`` (or, for the add_bias_and_residual kernel, to ``y``)."""
+        p = self.p
+        depth = p.slice_depth
+        row_words = {}
+        for n in range(1, depth - 1):
+            self._load_ahead(c, j, n, src_in, src_res)
+        for kk in range(p.vecs_per_lane):
+            self._load_ahead(c, j, kk + depth - 1, src_in, src_res)
+            sum_sq, row_words[kk] = self._pass1_slice(
+                c, j, kk % depth, kk, sum_sq, orow, srow, lane_opaque
+            )
+        return sum_sq, row_words
+
+    def _pass1_slice(self, c, j: int, buf: int, kk: int, sum_sq, orow, srow, lane_opaque):
+        """Pass 1 on slice ``kk`` from buffer ``buf``. Returns the updated sum of squares and
+        the bf16 slice as four packed pairs."""
         p = self.p
         v = p.v
-        ref = v.reference
-        ib = self._const_at(c, 2, kk, lig_f)
-        n_in = len(p.terms[J]) if v.in_wino else 1
-        ins = [c.in_buf[b][(None, q)].load().to(Float32) for q in range(n_in)]
-        res = c.res_buf[b].load().to(Float32) if v.has_residual else None
+        in_bias_v = self._const_at(c, _IN_BIAS, kk, lane_opaque)
+        n_in = len(p.terms[j]) if v.in_wino else 1
+        ins = [c.in_buf[buf][(None, q)].load().to(Float32) for q in range(n_in)]
+        res = c.res_buf[buf].load().to(Float32) if v.has_residual else None
         words = []
-        for i in range(CHANNELS_PER_VECTOR // 2):
-            pair = []
-            for e in (2 * i, 2 * i + 1):
-                val = ins[0][e]
-                if v.in_wino:
-                    val = val * Float32(p.at[J][p.terms[J][0]])
-                    for q in range(1, n_in):
-                        val = val + Float32(p.at[J][p.terms[J][q]]) * ins[q][e]
-                        if ref:
-                            val = self._round(val)
-                if v.has_in_bias:
-                    val = val + ib[e]
-                pair.append(val)
-            if p.round1:
-                w = pack2(pair[0], pair[1], False)
-                pair = [bf16_lo(w), bf16_hi(w)]
+        for i in range(WORDS_PER_VECTOR):
+            pair = [self._combine_input(j, ins, in_bias_v, e) for e in (2 * i, 2 * i + 1)]
+            if p.round_each_add:
+                _, lo, hi = round_pair_bf16(pair[0], pair[1])
+                pair = [lo, hi]
             if v.has_residual:
                 pair = [pair[0] + res[2 * i], pair[1] + res[2 * i + 1]]
-                if p.round1:
-                    w = pack2(pair[0], pair[1], False)
-                    pair = [bf16_lo(w), bf16_hi(w)]
+                if p.round_each_add:
+                    _, lo, hi = round_pair_bf16(pair[0], pair[1])
+                    pair = [lo, hi]
             if v.mid != MID_NONE:
-                ss = cute.math.fma(pair[0], pair[0], ss)
-                ss = cute.math.fma(pair[1], pair[1], ss)
-            words.append(pack2(pair[0], pair[1], False))
+                sum_sq = cute.math.fma(pair[0], pair[0], sum_sq)
+                sum_sq = cute.math.fma(pair[1], pair[1], sum_sq)
+            words.append(pack2(pair[0], pair[1]))
         if v.mid == MID_NONE:
             store_words(c.uy, self._vrow(c, orow, kk), words)
         elif p.has_sum:
             store_words(c.usum, self._vrow(c, srow, kk), words)
-        return ss, words
+        return sum_sq, words
 
-    def _normalize(self, c, kk: int, words: list, denom, inv_denom, lig_f) -> list:
+    def _combine_input(self, j: int, ins: list, in_bias_v: list, e: int):
+        """Channel ``e`` of the slice before rounding: the x value, or the output transform of
+        the products (in index order; the products are exact, so the reference rounding is
+        one rounding per add), plus the deferred bias."""
+        p = self.p
+        v = p.v
+        val = ins[0][e]
+        if v.in_wino:
+            terms = p.terms[j]
+            val = val * Float32(p.at[j][terms[0]])
+            for q in range(1, len(ins)):
+                val = val + Float32(p.at[j][terms[q]]) * ins[q][e]
+                if v.reference:
+                    val = self._round(val)
+        if v.has_in_bias:
+            val = val + in_bias_v[e]
+        return val
+
+    def _rms_scale(self, sum_sq, eps):
+        """``(denom, inv_denom)`` of the row from this lane's partial sum of squares: the
+        divisor in the reference mode, the reciprocal otherwise (the other one is zero)."""
+        p = self.p
+        for offset in p.xor_offsets:
+            sum_sq = sum_sq + cute.arch.shuffle_sync_bfly(sum_sq, offset)
+        denom = Float32(0.0)
+        inv_denom = Float32(0.0)
+        if p.v.reference:
+            denom = cute.arch.fmax(cute.math.sqrt(sum_sq), eps)
+        else:
+            inv_denom = cute.math.rsqrt(cute.arch.fmax(sum_sq, eps * eps))
+        return denom, inv_denom
+
+    def _pass2_frame(
+        self, c, j: int, t, t0, pos_out, orow, row_words, denom, inv_denom, lane_opaque, halo
+    ):
+        """Pass 2: normalize frame ``t`` (frame ``j`` of the group starting at ``t0``) from
+        registers into its ring slot, emitting the Winograd inputs it completes, or into the
+        output row."""
+        p = self.p
+        group_row = Int64(t // p.order)
+        drow = group_row * c.out_frame_pos + pos_out
+        for kk in range(p.vecs_per_lane):
+            yo = self._normalize(c, kk, row_words[kk], denom, inv_denom, lane_opaque)
+            if p.winograd_out:
+                self._store_winograd_inputs(c, j, t, t0, kk, yo, drow, group_row, halo)
+            else:
+                store_words(c.uy, self._vrow(c, orow, kk), yo)
+                if p.v.halo:
+                    self._push_halo(c, halo, t, kk, None, yo)
+
+    def _store_winograd_inputs(self, c, j: int, t, t0, kk: int, yo, drow, group_row, halo):
+        """Slice ``kk`` of the normalized frame into its ring slot, then the Winograd inputs it
+        completes: input s reads the group's frames f_0 .. f_{j+1} from the ring and f_{j+2},
+        this frame, from registers."""
+        p = self.p
+        store_words(c.uhist, self._slot_vec(c, (t + 2) % p.ring_slots, kk), yo)
+        cur = unpack_bf16(yo)
+        for s in range(p.components):
+            if p.last_frame[s] == j + 2:
+                o = self._winograd_input(c, s, j, t0, kk, cur)
+                store_words(c.ud, self._vrow(c, drow, kk) + s * c.comp_vecs, o)
+                if p.v.halo:
+                    self._push_halo(c, halo, group_row, kk, s, o)
+
+    def _store_cache_tail(self, c, pos):
+        """The last two normalized frames, the next chunk's cache, into ``y_tail``."""
+        p = self.p
+        for kk in range(p.vecs_per_lane):
+            store_words(
+                c.utail,
+                self._vrow(c, Int64(pos), kk),
+                load_words(c.uhist, self._slot_vec(c, c.frames % p.ring_slots, kk)),
+            )
+            store_words(
+                c.utail,
+                self._vrow(c, Int64(c.positions) + pos, kk),
+                load_words(c.uhist, self._slot_vec(c, (c.frames + 1) % p.ring_slots, kk)),
+            )
+
+    def _normalize(self, c, kk: int, words: list, denom, inv_denom, lane_opaque) -> list:
         """Pass 2 on slice ``kk`` (the bf16 row as packed pairs): RMSNorm (+ SiLU), returned as
         packed pairs. The reference mode reproduces the eager rounding sequence; otherwise
         gamma arrives pre-multiplied by scale (by 0.5 * scale with SiLU, which is then
         h * (1 + tanh(h)) with h = r / 2)."""
         p = self.p
         v = p.v
-        gmv = self._const_at(c, 0, kk, lig_f)
-        bsv = self._const_at(c, 1, kk, lig_f)
+        gamma_v = self._const_at(c, _GAMMA, kk, lane_opaque)
+        bias_v = self._const_at(c, _BIAS, kk, lane_opaque)
         out = []
-        for i in range(CHANNELS_PER_VECTOR // 2):
+        for i in range(WORDS_PER_VECTOR):
             pair = []
             for e, x in ((2 * i, bf16_lo(words[i])), (2 * i + 1, bf16_hi(words[i]))):
                 if v.reference:
                     r = self._round(self._round(x / denom) * c.scale)
-                    r = self._round(r * gmv[e])
+                    r = self._round(r * gamma_v[e])
                     if v.has_bias:
-                        r = self._round(r + bsv[e])
-                    if p.act:
+                        r = self._round(r + bias_v[e])
+                    if p.silu:
                         r = r / (Float32(1.0) + cute.math.exp(-r))
                 else:
-                    r = x * inv_denom * gmv[e]
-                    if p.act:
+                    r = x * inv_denom * gamma_v[e]
+                    if p.silu:
                         if v.has_bias:
-                            r = r + Float32(0.5) * bsv[e]
+                            r = r + Float32(0.5) * bias_v[e]
                         r = cute.math.fma(r, cute.math.tanh(r, approx=True), r)
                     elif v.has_bias:
-                        r = r + bsv[e]
+                        r = r + bias_v[e]
                 pair.append(r)
-            out.append(pack2(pair[0], pair[1], False))
+            out.append(pack2(pair[0], pair[1]))
         return out
 
-    def _winograd_input(self, c, s: int, J: int, t0, kk: int, cur: list) -> list:
+    def _winograd_input(self, c, s: int, j: int, t0, kk: int, cur: list) -> list:
         """Winograd input ``s`` of the group starting at frame ``t0``, slice ``kk``, as packed
-        pairs: frames f_0 .. f_{J+1} from the ring, f_{J+2} (``cur``, this frame's 8 values)
+        pairs: frames f_0 .. f_{j+1} from the ring, f_{j+2} (``cur``, this frame's 8 values)
         from registers. Products of 16-bit values and multiples of 1/2 are exact in fp32; the
         input rounds once."""
         p = self.p
-        lig = _opaque(c.lig)
-        hs = {}
-        for fi in range(J + 2):
+        lane = _opaque(c.lane_in_group)
+        ring_frames = {}
+        for fi in range(j + 2):
             if p.bt[s][fi] != 0:
-                slot = (t0 + fi) % p.slots
-                vi = Int64((slot * p.ppb + c.pos_in_block) * p.NV + lig + kk * p.L)
-                ws = load_words(c.uhist, vi)
-                hs[fi] = [f for w in ws for f in (bf16_lo(w), bf16_hi(w))]
+                slot = (t0 + fi) % p.ring_slots
+                ring_frames[fi] = unpack_bf16(
+                    load_words(c.uhist, self._slot_vec(c, slot, kk, lane))
+                )
         out = []
-        for i in range(CHANNELS_PER_VECTOR // 2):
+        for i in range(WORDS_PER_VECTOR):
             pair = []
             for e in (2 * i, 2 * i + 1):
                 acc = None
-                for fi in range(J + 3):
+                for fi in range(j + 3):
                     coef = p.bt[s][fi]
                     if coef != 0:
-                        fv = cur[e] if fi == J + 2 else hs[fi][e]
+                        fv = cur[e] if fi == j + 2 else ring_frames[fi][e]
                         acc = (
                             Float32(coef) * fv
                             if acc is None
@@ -849,10 +954,6 @@ class VaeNormKernel:
                 pair.append(acc)
             out.append(pack2(pair[0], pair[1], p.v.fp16_winograd))
         return out
-
-
-class _Ctx:
-    """Trace-time bundle of the kernel's views, scalars and register buffers."""
 
 
 _POINTER_ARGS = (
@@ -900,14 +1001,13 @@ _INT32_ARGS = (
 )
 _FLOAT_ARGS = ("scale", "eps")
 
-_compiled: dict = {}
 
-
-def _pointer_dtypes(v: Variant) -> tuple:
-    t = BFloat16
-    td = Float16 if v.fp16_winograd else BFloat16
-    halo = t if v.out == OUT_ROWS else td
-    return (t, td, td, t, t, t, t, t, t, t, t, halo, halo)
+def _pointer_dtypes(p: _Plan) -> dict:
+    """Element type of each pointer argument, keyed by its name in :data:`_POINTER_ARGS`."""
+    halo = p.row_dtype if p.v.out == OUT_ROWS else p.winograd_dtype
+    dtypes = dict.fromkeys(_POINTER_ARGS, p.row_dtype)
+    dtypes.update(m=p.winograd_dtype, d=p.winograd_dtype, halo_l=halo, halo_r=halo)
+    return dtypes
 
 
 def _kernel_name(v: Variant, has_sum: bool) -> str:
@@ -915,17 +1015,20 @@ def _kernel_name(v: Variant, has_sum: bool) -> str:
     return f"vae_norm[{fields},has_sum={has_sum}]"
 
 
-def _compile(variant: Variant, has_sum: bool, stream):
-    """Compile the variant (TVM-FFI calling convention: raw addresses and Python scalars),
-    through the on-disk CuTe DSL kernel cache when flashinfer provides it."""
+@functools.lru_cache(maxsize=None)
+def _compile(device: int, variant: Variant, has_sum: bool):
+    """The compiled variant (TVM-FFI calling convention: raw addresses and Python scalars) and
+    its resident blocks per SM, through the on-disk CuTe DSL kernel cache when flashinfer
+    provides it."""
     from cutlass.cute.runtime import make_ptr
 
     kernel = VaeNormKernel(variant, has_sum)
 
     def compile_fn():
+        dtypes = _pointer_dtypes(kernel.p)
         ptrs = [
-            make_ptr(dt, 16, cute.AddressSpace.gmem, assumed_align=16)
-            for dt in _pointer_dtypes(variant)
+            make_ptr(dtypes[name], 16, cute.AddressSpace.gmem, assumed_align=16)
+            for name in _POINTER_ARGS
         ]
         scalars = (
             [Int64(0)] * len(_INT64_ARGS)
@@ -933,7 +1036,9 @@ def _compile(variant: Variant, has_sum: bool, stream):
             + [Float32(0.0)] * len(_FLOAT_ARGS)
             + [Int32(1)]
         )
-        return cute.compile(kernel.wrapper, *ptrs, *scalars, stream, options="--enable-tvm-ffi")
+        return cute.compile(
+            kernel.wrapper, *ptrs, *scalars, current_stream(device), options="--enable-tvm-ffi"
+        )
 
     from .. import jit_norm, wino_vae_kernels
 
@@ -949,18 +1054,13 @@ def launch(
     and scalars of ``jit_norm._launch`` (a null address for an operand the variant does not
     read); ``steps`` thread blocks cover the output positions, the persistent grid is capped
     at the resident blocks of ``sm_count`` SMs."""
-    key = (device, variant, has_sum)
-    entry = _compiled.get(key)
-    if entry is None:
-        entry = _compile(variant, has_sum, stream)
-        _compiled[key] = entry
-    fn, bps = entry
+    fn, blocks_per_sm = _compile(device, variant, has_sum)
     args = dict(args, has_l=int(bool(args["halo_l"])), has_r=int(bool(args["halo_r"])))
     fn(
         *(args[k] for k in _POINTER_ARGS),
         *(int(args[k]) for k in _INT64_ARGS),
         *(int(args[k]) for k in _INT32_ARGS),
         *(float(args[k]) for k in _FLOAT_ARGS),
-        int(min(steps, sm_count * bps)),
+        int(min(steps, sm_count * blocks_per_sm)),
         stream,
     )
