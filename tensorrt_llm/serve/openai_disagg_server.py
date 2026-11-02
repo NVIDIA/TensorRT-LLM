@@ -20,6 +20,7 @@ import signal
 import socket
 import traceback
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
@@ -67,10 +68,11 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_UPSTREAM_ERROR, ClosingStreamingResponse,
+    ResponsesStreamingProcessor, ServerArrivalTimeMiddleware,
+    get_steady_clock_now_in_seconds, guard_responses_stream,
+    keep_responses_stream_alive, relay_after_opening, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -80,6 +82,17 @@ _LOG_CONTROL_CHARACTERS = {
     code: f"\\x{code:02x}"
     for code in (*range(32), 127)
 }
+
+# Seconds a streamed /v1/responses request waits for its pipeline before the
+# response starts. The pipeline has a stream to return only once its context
+# phase is done, and until the response starts the client receives nothing,
+# not even the status line, which clients and proxies take for a dead
+# connection after a while. A pipeline that answers within the wait is relayed
+# or, if it failed, answered with its error status. For one still running, the
+# stream starts at once with response.created and response.in_progress, and
+# response.in_progress is sent again whenever the stream is silent, as an
+# aggregated server does.
+_RESPONSES_STREAM_START_WAIT_S = 1.0
 
 # Most round trips to spend estimating one ctx/gen server's steady-clock
 # offset. Only the least-delayed sample is kept; see `_sync_server_clock`.
@@ -182,6 +195,30 @@ class RawRequestResponseHooks(ResponseHooks):
                 self.gen_metrics,
                 disagg_request_id=self.disagg_request_id,
             ))
+
+
+class _ResponsesStreamingResponse(ClosingStreamingResponse):
+    """Cancel the pipeline even when a disconnect precedes body iteration."""
+
+    def __init__(self, pipeline: asyncio.Future,
+                 content: AsyncIterator[str]) -> None:
+        super().__init__(content=content, media_type="text/event-stream")
+        self._pipeline = pipeline
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._pipeline.cancel()
+
+
+def _error_response_message(response: Response) -> str:
+    """The message of an error response, for a stream to report it."""
+    try:
+        payload = json.loads(response.body)
+        return str(payload.get("message") or payload.get("detail") or payload)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return "Internal server error"
 
 
 def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
@@ -348,7 +385,7 @@ class OpenAIDisaggServer:
         self.app.add_api_route("/v1/chat/completions", self._wrap_entry_point(self._service.openai_chat_completion, ChatCompletionRequest), methods=["POST"])
         self.app.add_api_route("/v1/messages", self.anthropic_messages, methods=["POST"])
         self.app.add_api_route("/v1/messages/count_tokens", self.anthropic_count_tokens, methods=["POST"])
-        self.app.add_api_route("/v1/responses", self._wrap_entry_point(self._service.openai_responses, ResponsesRequest), methods=["POST"])
+        self.app.add_api_route("/v1/responses", self.openai_responses, methods=["POST"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/cluster_info", self.cluster_info, methods=["GET"])
@@ -459,6 +496,85 @@ class OpenAIDisaggServer:
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    async def openai_responses(self, request: ResponsesRequest,
+                               raw_request: Request) -> Response:
+        """Serve Responses through the disaggregated pipeline.
+
+        A streamed request whose pipeline is still running after
+        _RESPONSES_STREAM_START_WAIT_S is answered from here at once; see
+        _responses_stream_when_done.
+        """
+        responses = self._wrap_entry_point(self._service.openai_responses)
+        if not request.stream:
+            return await responses(request, raw_request)
+        # The workers name their response after request_id, which is forwarded
+        # only if set. Assigning it marks it set, so that the workers answer
+        # under the id that an opening sent from here names.
+        request.request_id = request.request_id
+        pipeline = asyncio.ensure_future(responses(request, raw_request))
+        try:
+            await asyncio.wait((pipeline, ),
+                               timeout=_RESPONSES_STREAM_START_WAIT_S)
+        except asyncio.CancelledError:
+            # Cancelling the request cancels its pipeline.
+            pipeline.cancel()
+            raise
+        if pipeline.done():
+            return pipeline.result()
+        try:
+            processor = ResponsesStreamingProcessor(
+                request=request,
+                sampling_params=request.to_sampling_params(),
+                model_name=request.model)
+            opening = processor.get_initial_responses()
+        except ValueError:
+            # The opening is built from the request alone; a request it cannot
+            # be built from is answered when its pipeline answers.
+            return await pipeline
+        # keep_responses_stream_alive repeats response.in_progress whenever the
+        # stream is silent, as it is while the pipeline runs.
+        return _ResponsesStreamingResponse(
+            pipeline=pipeline,
+            content=keep_responses_stream_alive(
+                self._responses_stream_when_done(processor, opening,
+                                                 pipeline)))
+
+    async def _responses_stream_when_done(
+            self, processor: ResponsesStreamingProcessor, opening: list[str],
+            pipeline: asyncio.Future) -> AsyncIterator[str]:
+        """The stream of a Responses request whose pipeline outlasted the start wait.
+
+        ``opening`` is the request's response.created and response.in_progress,
+        and the pipeline's stream follows it without the worker's own opening
+        (relay_after_opening). The status line is already out, so a pipeline
+        that fails ends the stream with error and response.failed, which carry
+        the message of its error response. A stream abandoned before the
+        pipeline answers, as when the client disconnects, cancels the pipeline.
+        """
+        try:
+            for frame in opening:
+                yield frame
+            try:
+                answer = await pipeline
+            except HTTPException as e:
+                failure = str(e.detail)
+            else:
+                failure = (None if isinstance(answer, StreamingResponse) else
+                           _error_response_message(answer))
+        finally:
+            pipeline.cancel()
+        if failure is not None:
+            for frame in processor.get_stream_failed_events(
+                    STREAM_TERMINATION_UPSTREAM_ERROR, failure, len(opening)):
+                yield frame
+            return
+        frames = relay_after_opening(answer.body_iterator, len(opening))
+        try:
+            async for frame in frames:
+                yield frame
+        finally:
+            await frames.aclose()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:

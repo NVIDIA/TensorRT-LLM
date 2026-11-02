@@ -20,17 +20,28 @@ that completions and chat carry on ``choices[0]`` sits at its top level.
 
 import asyncio
 import base64
+import contextlib
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
+import msgspec
 import numpy as np
 import pytest
-from fastapi import HTTPException
-from openai.types.responses import ResponseCreatedEvent
+from fastapi import FastAPI, HTTPException, Request
+from openai.types.responses import (
+    ResponseCompletedEvent,
+    ResponseCreatedEvent,
+    ResponseTextDeltaEvent,
+)
 from pydantic import ValidationError
 
+from tensorrt_llm.executor.utils import context_length_exceeded_message
+from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
+from tensorrt_llm.serve import openai_disagg_server, responses_utils
+from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.openai_client import _encode_request_body
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService,
@@ -49,10 +60,13 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.responses_utils import (
+    ResponsesStreamingProcessor,
+    ServerArrivalTimeMiddleware,
     create_response_non_store,
     finish_reason_mapping,
     responses_done_generator,
 )
+from tensorrt_llm.serve.router import Router
 
 pytestmark = pytest.mark.cpu_only
 
@@ -602,3 +616,613 @@ def test_a_models_failure_is_an_error_response(client, servers, status):
     response = asyncio.run(server.get_model())
     assert response.status_code == status
     assert json.loads(response.body)["code"] == status
+
+
+# ---------------------------------------------------------------------------
+# Streamed requests: a slow context phase must not leave the client silent
+# ---------------------------------------------------------------------------
+
+_MODEL = "test-model"
+_SCHEDULE_STYLES = ["context_first", "generation_first"]
+_OVER_LENGTH = context_length_exceeded_message(8, 9)
+
+
+def _as_received(request: ResponsesRequest) -> ResponsesRequest:
+    """``request`` as a worker parses it from the body the service forwards."""
+    return ResponsesRequest(**msgspec.msgpack.decode(_encode_request_body(request)))
+
+
+def _response(request: ResponsesRequest, status: str) -> ResponsesResponse:
+    """A worker's response to ``request``, without output."""
+    return ResponsesResponse.from_request(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=_MODEL,
+        created_time=0,
+        output=[],
+        status=status,
+    )
+
+
+def _sse(event) -> str:
+    return f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
+
+
+def _generation_frames(request: ResponsesRequest) -> list[str]:
+    """A generation worker's stream for ``request``: its opening, "hello", the completion."""
+    opening = ResponsesStreamingProcessor(
+        request, request.to_sampling_params(), model_name=_MODEL
+    ).get_initial_responses()
+    delta = ResponseTextDeltaEvent(
+        type="response.output_text.delta",
+        sequence_number=2,
+        item_id="msg_1",
+        output_index=0,
+        content_index=0,
+        delta="hello",
+        logprobs=[],
+    )
+    completed = ResponseCompletedEvent(
+        type="response.completed",
+        sequence_number=3,
+        response=_response(request, "completed").model_dump(by_alias=True),
+    )
+    return opening + [_sse(delta), _sse(completed)]
+
+
+def _worker_rejection(status: int, message: str) -> aiohttp.ClientResponseError:
+    """A worker's error response, as the HTTP client raises it."""
+    body = json.dumps({"object": "error", "message": message, "code": status})
+    return aiohttp.ClientResponseError(
+        Mock(real_url="http://ctx:8001/v1/responses"),
+        (),
+        status=status,
+        message=f"Error: {body}",
+    )
+
+
+class _Workers:
+    """A context and a generation worker behind the disaggregated service, without a network.
+
+    Each parses its request from the body the service forwards. The context phase runs
+    ``context_phase`` and then answers with the KV-cache handoff. The generation worker
+    answers once the context phase has succeeded, as it does once it has the KV cache, and
+    streams its answer in pieces cut anywhere, as the transport delivers it.
+    """
+
+    def __init__(self, context_phase):
+        self.context_phase = context_phase
+        self.context_done = asyncio.Event()
+        self.context_cancelled = asyncio.Event()
+        self.generation_cancelled = asyncio.Event()
+        self.generation_requests = []
+        # What the generation worker answered: a response, or the frames of a stream.
+        self.response = None
+        self.frames = None
+
+    async def send_context_request(self, request, server=None, hooks=None, req_id=None):
+        received = _as_received(request)
+        try:
+            await self.context_phase()
+        except asyncio.CancelledError:
+            self.context_cancelled.set()
+            raise
+        self.context_done.set()
+        response = _response(received, "incomplete")
+        response.finish_reason = "length"
+        response.prompt_token_ids = [1, 2, 3]
+        disagg_request_id = received.disaggregated_params.disagg_request_id
+        response.disaggregated_params = DisaggregatedParams(
+            request_type="context_only",
+            disagg_request_id=disagg_request_id,
+            ctx_request_id=disagg_request_id,
+        )
+        return response
+
+    async def send_generation_request(self, request, server=None, hooks=None, req_id=None):
+        received = _as_received(request)
+        self.generation_requests.append(received)
+        if not received.stream:
+            await self.context_done.wait()
+            self.response = _response(received, "completed")
+            return self.response
+
+        async def stream():
+            try:
+                await self.context_done.wait()
+                self.frames = _generation_frames(received)
+                data = "".join(self.frames).encode()
+                for start in range(0, len(data), 61):
+                    yield data[start : start + 61]
+            except asyncio.CancelledError:
+                self.generation_cancelled.set()
+                raise
+
+        return stream()
+
+
+def _responses_server(schedule_style: str, workers: _Workers) -> OpenAIDisaggServer:
+    """A disaggregated server in front of ``workers``, with its routes."""
+    config = DisaggServerConfig(server_configs=[], schedule_style=schedule_style)
+    coordinator = DisaggCoordinatorService(config, client_factory=Mock())
+    service = OpenAIDisaggregatedService(config, coordinator, client_factory=Mock())
+    service.is_ready = AsyncMock(return_value=True)
+    service._ctx_router = AsyncMock(spec=Router)
+    service._ctx_router.get_next_server.return_value = ("ctx:8001", {})
+    service._gen_router = AsyncMock(spec=Router)
+    service._gen_router.get_next_server.return_value = ("gen:8002", {})
+    service._ctx_client = SimpleNamespace(send_request=workers.send_context_request)
+    service._gen_client = SimpleNamespace(send_request=workers.send_generation_request)
+
+    server = OpenAIDisaggServer.__new__(OpenAIDisaggServer)
+    server._config = config
+    server._coordinator = coordinator
+    server._disagg_cluster_storage = None
+    server._service = service
+    server._perf_metrics_collector = Mock()
+    server._allow_request_chat_template = False
+    server._collect_perf_metrics = False
+    server.app = FastAPI()
+    server.app.add_middleware(ServerArrivalTimeMiddleware)
+    with patch("prometheus_client.multiprocess.MultiProcessCollector"):
+        server.register_routes()
+    return server
+
+
+def _responses_route(server: OpenAIDisaggServer):
+    """The handler ``server`` routes /v1/responses to."""
+    (route,) = [
+        route for route in server.app.routes if getattr(route, "path", "") == "/v1/responses"
+    ]
+    return route.endpoint
+
+
+async def _post_responses(app: FastAPI, *, stream=True, on_send=None, leave=None, **fields):
+    """Send one /v1/responses request to ``app`` as a client and return the messages sent back.
+
+    ``on_send`` sees each message as it is sent. The client disconnects once
+    ``leave`` is set.
+    """
+    body = {"model": _MODEL, "input": "hi", "stream": stream, **fields}
+    requested = False
+
+    async def receive():
+        nonlocal requested
+        if not requested:
+            requested = True
+            return {"type": "http.request", "body": json.dumps(body).encode(), "more_body": False}
+        await (leave or asyncio.Event()).wait()
+        return {"type": "http.disconnect"}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        if on_send is not None:
+            on_send(message)
+
+    scope = {
+        "type": "http",
+        # As uvicorn declares it: a disconnect cancels a streaming response.
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json")],
+        "client": ("127.0.0.1", 40000),
+        "server": ("127.0.0.1", 8000),
+    }
+    await asyncio.wait_for(app(scope, receive, send), timeout=10)
+    return sent
+
+
+def _status(sent: list[dict]) -> int:
+    return next(message["status"] for message in sent if message["type"] == "http.response.start")
+
+
+def _body(sent: list[dict]) -> str:
+    return b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    ).decode()
+
+
+def _sse_events(sent: list[dict]) -> list[tuple[str, dict]]:
+    """The (event, data) pairs of a streamed response."""
+    events = []
+    for frame in _body(sent).split("\n\n"):
+        if frame:
+            fields = dict(line.split(": ", 1) for line in frame.splitlines())
+            events.append((fields["event"], json.loads(fields["data"])))
+    return events
+
+
+def _without_number(data: dict) -> dict:
+    return {key: value for key, value in data.items() if key != "sequence_number"}
+
+
+def _short_waits(monkeypatch):
+    monkeypatch.setattr(openai_disagg_server, "_RESPONSES_STREAM_START_WAIT_S", 0.05)
+    monkeypatch.setattr(responses_utils, "RESPONSES_STREAM_KEEPALIVE_INTERVAL_S", 0.05)
+
+
+def _waits_for(event: asyncio.Event):
+    """A context phase that lasts until ``event`` is set, or five seconds without it."""
+
+    async def context_phase():
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(event.wait(), 5)
+
+    return context_phase
+
+
+def _on_keepalive(event: asyncio.Event):
+    """An ``on_send`` that sets ``event`` once response.in_progress has gone out again."""
+    in_progress = 0
+
+    def on_send(message):
+        nonlocal in_progress
+        if message.get("body", b"").startswith(b"event: response.in_progress\n"):
+            in_progress += 1
+            if in_progress == 2:
+                event.set()
+
+    return on_send
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_responses_stream_opens_and_keeps_alive_while_the_context_phase_runs(
+    monkeypatch, schedule_style
+):
+    _short_waits(monkeypatch)
+    kept_alive = asyncio.Event()
+    workers = _Workers(_waits_for(kept_alive))
+    keepalive = _on_keepalive(kept_alive)
+    started_during_context_phase = []
+
+    def on_send(message):
+        if message["type"] == "http.response.start":
+            started_during_context_phase.append(not workers.context_done.is_set())
+        keepalive(message)
+
+    sent = await _post_responses(_responses_server(schedule_style, workers).app, on_send=on_send)
+
+    assert _status(sent) == 200
+    assert started_during_context_phase == [True]
+    events = _sse_events(sent)
+    types = [event for event, _ in events]
+    first_output = types.index("response.output_text.delta")
+    # The opening, kept alive while the context phase ran, then the generation
+    # worker's events without its own opening.
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert first_output > 2
+    assert set(types[2:first_output]) == {"response.in_progress"}
+    relayed = [data for event, data in events[first_output:] if event != "response.in_progress"]
+    answered = [json.loads(frame.split("data: ", 1)[1]) for frame in workers.frames[2:]]
+    assert [_without_number(data) for data in relayed] == [
+        _without_number(data) for data in answered
+    ]
+    # One sequence, for one response: the one the generation worker was asked for.
+    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+    (generation_request,) = workers.generation_requests
+    assert {data["response"]["id"] for _, data in events if "response" in data} == {
+        generation_request.request_id
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_responses_stream_after_a_fast_context_phase_is_the_generation_stream(
+    schedule_style,
+):
+    async def context_phase():
+        pass
+
+    workers = _Workers(context_phase)
+    sent = await _post_responses(_responses_server(schedule_style, workers).app)
+
+    assert _status(sent) == 200
+    assert [event for event, _ in _sse_events(sent)] == [
+        "response.created",
+        "response.in_progress",
+        "response.output_text.delta",
+        "response.completed",
+    ]
+    assert _body(sent) == "".join(workers.frames)
+
+
+_CONTEXT_FAILURES = [
+    pytest.param(400, _OVER_LENGTH, id="over_length_400"),
+    pytest.param(503, "no capacity left", id="503"),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("status, worker_message", _CONTEXT_FAILURES)
+async def test_responses_stream_with_a_fast_context_failure_is_an_http_error(
+    schedule_style, status, worker_message
+):
+    async def context_phase():
+        raise _worker_rejection(status, worker_message)
+
+    streamed = await _post_responses(_responses_server(schedule_style, _Workers(context_phase)).app)
+    not_streamed = await _post_responses(
+        _responses_server(schedule_style, _Workers(context_phase)).app, stream=False
+    )
+
+    assert _status(streamed) == status
+    assert worker_message in _body(streamed)
+    # The error response of the same failure without a stream.
+    assert _status(not_streamed) == status
+    assert json.loads(_body(streamed)) == json.loads(_body(not_streamed))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("status, worker_message", _CONTEXT_FAILURES)
+async def test_responses_stream_with_a_late_context_failure_ends_with_response_failed(
+    monkeypatch, schedule_style, status, worker_message
+):
+    _short_waits(monkeypatch)
+    kept_alive = asyncio.Event()
+    wait = _waits_for(kept_alive)
+
+    async def context_phase():
+        await wait()
+        raise _worker_rejection(status, worker_message)
+
+    streamed = await _post_responses(
+        _responses_server(schedule_style, _Workers(context_phase)).app,
+        on_send=_on_keepalive(kept_alive),
+    )
+    kept_alive.set()
+    not_streamed = await _post_responses(
+        _responses_server(schedule_style, _Workers(context_phase)).app, stream=False
+    )
+
+    assert _status(streamed) == 200
+    # The stream ends after its events, as any stream does.
+    assert streamed[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+    events = _sse_events(streamed)
+    types = [event for event, _ in events]
+    assert types[:2] == ["response.created", "response.in_progress"]
+    assert set(types[2:-2]) == {"response.in_progress"}
+    assert types[-2:] == ["error", "response.failed"]
+    assert [data["sequence_number"] for _, data in events] == list(range(len(events)))
+    # error and response.failed, as a stream reports any failure, with the
+    # message of the error response of the same failure without a stream.
+    error_response = json.loads(_body(not_streamed))
+    message = error_response.get("detail") or error_response["message"]
+    assert worker_message in message
+    assert (events[-2][1]["code"], events[-2][1]["message"]) == ("upstream_error", message)
+    failed = events[-1][1]["response"]
+    assert failed["id"] == events[0][1]["response"]["id"]
+    assert failed["status"] == "failed"
+    assert (failed["error"]["code"], failed["error"]["message"]) == ("server_error", message)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_a_non_streamed_response_still_waits_for_the_whole_pipeline(
+    monkeypatch, schedule_style
+):
+    _short_waits(monkeypatch)
+
+    async def context_phase():
+        # Outlasts the start wait.
+        await asyncio.sleep(0.2)
+
+    workers = _Workers(context_phase)
+    sent = await _post_responses(_responses_server(schedule_style, workers).app, stream=False)
+
+    assert _status(sent) == 200
+    assert json.loads(_body(sent)) == workers.response.model_dump(mode="json", by_alias=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_a_request_no_opening_can_be_built_for_is_answered_by_its_pipeline(
+    monkeypatch, schedule_style
+):
+    """The opening is built from the request; one it cannot be built from waits as before."""
+    _short_waits(monkeypatch)
+    rejection = "require 0 <= top_p <= 1, got top_p=2.0"
+
+    async def context_phase():
+        # Outlasts the start wait.
+        await asyncio.sleep(0.2)
+        raise _worker_rejection(400, rejection)
+
+    sent = await _post_responses(
+        _responses_server(schedule_style, _Workers(context_phase)).app, top_p=2.0
+    )
+
+    assert _status(sent) == 400
+    assert json.loads(_body(sent)) == {"detail": rejection}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_client_leaving_after_the_responses_stream_starts_cancels_the_context_phase(
+    monkeypatch, schedule_style
+):
+    _short_waits(monkeypatch)
+    workers = _Workers(_waits_for(asyncio.Event()))
+    left = asyncio.Event()
+
+    def on_send(message):
+        if message["type"] == "http.response.start":
+            left.set()
+
+    await _post_responses(
+        _responses_server(schedule_style, workers).app, on_send=on_send, leave=left
+    )
+
+    await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+
+
+def _raw_request() -> Request:
+    raw_request = Request({"type": "http", "headers": []})
+    raw_request.state.server_arrival_time = 0
+    return raw_request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+async def test_cancelling_the_responses_handler_during_its_wait_cancels_the_context_phase(
+    monkeypatch, schedule_style
+):
+    monkeypatch.setattr(openai_disagg_server, "_RESPONSES_STREAM_START_WAIT_S", 60)
+    context_started = asyncio.Event()
+    release_context = asyncio.Event()
+
+    async def context_phase():
+        context_started.set()
+        await release_context.wait()
+
+    workers = _Workers(context_phase)
+    handler = _responses_route(_responses_server(schedule_style, workers))
+    request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
+    pending = asyncio.create_task(handler(request, _raw_request()))
+    try:
+        await asyncio.wait_for(context_started.wait(), 2)
+        assert not pending.done()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        assert not workers.context_done.is_set()
+    finally:
+        release_context.set()
+        pending.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await pending
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", _SCHEDULE_STYLES)
+@pytest.mark.parametrize("asgi_version", ["2.3", "2.4"])
+async def test_disconnect_before_the_responses_body_starts_cancels_the_context_phase(
+    monkeypatch, schedule_style, asgi_version
+):
+    """The pipeline is cancelled even if the body is never iterated."""
+    from starlette.requests import ClientDisconnect
+
+    _short_waits(monkeypatch)
+    release_context = asyncio.Event()
+    workers = _Workers(_waits_for(release_context))
+    handler = _responses_route(_responses_server(schedule_style, workers))
+    request = ResponsesRequest(model=_MODEL, input="hi", stream=True)
+    response = await asyncio.wait_for(handler(request, _raw_request()), 2)
+    response_started = asyncio.Event()
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+        response_started.set()
+        if asgi_version == "2.4":
+            raise OSError("client disconnected")
+        await asyncio.Event().wait()
+
+    async def receive():
+        await response_started.wait()
+        return {"type": "http.disconnect"}
+
+    try:
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": asgi_version}}
+        if asgi_version == "2.4":
+            with pytest.raises(ClientDisconnect):
+                await response(scope, receive, send)
+        else:
+            await response(scope, receive, send)
+        assert [message["type"] for message in sent] == ["http.response.start"]
+        await asyncio.wait_for(workers.context_cancelled.wait(), 2)
+        if schedule_style == "generation_first":
+            await asyncio.wait_for(workers.generation_cancelled.wait(), 2)
+        assert not workers.context_done.is_set()
+    finally:
+        release_context.set()
+
+
+def _frame(event_type: str, sequence_number: int, **fields) -> str:
+    data = {"type": event_type, "sequence_number": sequence_number, **fields}
+    return f"event: {event_type}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+async def _transport(data: str, piece: int):
+    """``data`` as a relayed stream delivers it, in pieces of ``piece`` bytes."""
+    encoded = data.encode()
+    for start in range(0, len(encoded), piece):
+        yield encoded[start : start + piece]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("piece", [1, 7, 4096])
+async def test_the_relay_drops_the_worker_opening_and_numbers_the_rest_to_follow(piece):
+    worker = "".join(
+        [
+            _frame("response.created", 0),
+            _frame("response.in_progress", 1),
+            # Kept alive before its first output.
+            _frame("response.in_progress", 2),
+            _frame("response.output_text.delta", 3, delta="hi"),
+            # Kept alive after it.
+            _frame("response.in_progress", 4),
+            _frame("response.completed", 5),
+        ]
+    )
+
+    relayed = responses_utils.relay_after_opening(_transport(worker, piece), 2)
+
+    assert [frame async for frame in relayed] == [
+        _frame("response.output_text.delta", 2, delta="hi"),
+        _frame("response.in_progress", 3),
+        _frame("response.completed", 4),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_relay_numbers_a_failure_the_worker_reported_before_its_opening():
+    worker = _frame("error", 0, code="upstream_error", message="ClientResponseError")
+
+    relayed = responses_utils.relay_after_opening(_transport(worker, 4096), 3)
+
+    assert [frame async for frame in relayed] == [
+        _frame("error", 3, code="upstream_error", message="ClientResponseError")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_relay_passes_on_an_event_its_stream_stopped_inside():
+    cut = 'event: response.output_text.delta\ndata: {"type":"response.out'
+    worker = _frame("response.output_text.delta", 2, delta="hi") + cut
+
+    relayed = responses_utils.relay_after_opening(_transport(worker, 7), 2)
+
+    assert [frame async for frame in relayed] == [
+        _frame("response.output_text.delta", 2, delta="hi"),
+        cut,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_relay_closes_its_stream_when_it_stops_early():
+    closed = asyncio.Event()
+
+    async def worker():
+        try:
+            yield _frame("response.output_text.delta", 2, delta="hi").encode()
+            yield _frame("response.completed", 3).encode()
+        finally:
+            closed.set()
+
+    relayed = responses_utils.relay_after_opening(worker(), 2)
+    await relayed.__anext__()
+    await relayed.aclose()
+
+    assert closed.is_set()

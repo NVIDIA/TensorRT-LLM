@@ -3475,6 +3475,45 @@ async def keep_responses_stream_alive(
         await items.aclose()
 
 
+_OPENING_FRAME_STARTS = ("event: response.created\n", _IN_PROGRESS_FRAME_START)
+
+
+async def relay_after_opening(stream: AsyncGenerator[Union[str, bytes], None],
+                              events_sent: int) -> AsyncGenerator[str, None]:
+    """Relay a worker's Responses stream to a client that already has its opening.
+
+    The client holds ``events_sent`` events, ``response.created`` and
+    ``response.in_progress`` among them, so the worker's own opening events,
+    and any repeats of them before its first other event, are dropped. Every
+    other event is numbered to follow on, and is yielded whole, one per item
+    as ``keep_responses_stream_alive`` takes them, wherever ``stream`` splits
+    it. ``stream`` is closed when the relay ends.
+    """
+    delimiter = _SSE_EVENT_DELIMITER.encode()
+    pending = b""
+    opening = True
+    try:
+        async for chunk in stream:
+            if isinstance(chunk, str):
+                chunk = chunk.encode()
+            *events, pending = (pending + chunk).split(delimiter)
+            for event in events:
+                frame = event.decode(errors="replace") + _SSE_EVENT_DELIMITER
+                if not event or (opening
+                                 and frame.startswith(_OPENING_FRAME_STARTS)):
+                    continue
+                opening = False
+                yield _stamp_sequence_number(frame, events_sent)
+                events_sent += 1
+        if pending:
+            # The stream stopped inside an event.
+            yield pending.decode(errors="replace")
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 class ServerArrivalTimeMiddleware:
     """
     Custom ASGI middleware to track server arrival time.
