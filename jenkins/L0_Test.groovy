@@ -5207,13 +5207,24 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
     def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
+    // ${llmSrc} comes from the build artifact, so with reuse_build its test_rerun.py can
+    // be older than this pipeline and not accept --stage-name. Pass it only when the
+    // script does; an older script then applies its own built-in rerun rules.
+    def stageNameSupported = sh(
+        script: "python3 ${llmSrc}/jenkins/scripts/test_rerun.py generate_rerun_tests_list --help 2>/dev/null | grep -q -- '--stage-name'",
+        returnStatus: true
+    ) == 0
+    if (!stageNameSupported) {
+        echo "test_rerun.py in ${llmSrc} does not support --stage-name; generating rerun lists without the stage's rerun policy"
+    }
+    def stageNameArg = stageNameSupported ? "--stage-name='${stageName}'" : ""
     sh(label: "Generate rerun test lists (${testType})", script: """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures='${failSignaturesList}' \
-        --stage-name='${stageName}' \
+        ${stageNameArg} \
         ${testListArg} \
         ${unfinishedTestArg}
     """)
