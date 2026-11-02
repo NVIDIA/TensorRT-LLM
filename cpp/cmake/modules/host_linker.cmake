@@ -29,6 +29,18 @@ if(USE_LLD)
     )
   endif()
 
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    if(CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+      message(
+        FATAL_ERROR
+          "USE_LLD with GCC does not support LTO; disable CMAKE_INTERPROCEDURAL_OPTIMIZATION or USE_LLD"
+      )
+    endif()
+    # lld cannot consume GCC LTO objects. Defining this variable also prevents
+    # pybind11_add_module from enabling its own automatic LTO flags.
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+  endif()
+
   # CMake uses the host compiler for the final link of CUDA targets. Device
   # linking and static archives use their configured tools.
   add_link_options("$<HOST_LINK:-fuse-ld=lld>")

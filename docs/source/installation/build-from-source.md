@@ -102,6 +102,11 @@ with `-fuse-ld=lld`. The option applies to host linking for executables, shared
 libraries, and Python extension modules; CUDA device linking continues to use
 nvlink. The `--use_lld` flag remains available to explicitly enable lld.
 
+With GCC, lld builds disable automatic link-time optimization (LTO), including
+pybind11's default LTO for release extensions, because lld cannot read GCC LTO
+objects. Explicitly enabling `CMAKE_INTERPROCEDURAL_OPTIMIZATION` with GCC and
+lld is rejected; use `--no_lld` for GCC LTO builds. Clang LTO is unaffected.
+
 ### Building from a checkout on a network filesystem
 
 Network filesystems (Lustre, NFS, GPFS) handle large streaming I/O well but are slow for metadata-heavy workloads. A full build creates a very large number of small files (CMake state, object files, downloaded dependencies, the build virtual environment, wheel staging), so keeping that state in the checkout makes builds on such filesystems far slower than necessary.
