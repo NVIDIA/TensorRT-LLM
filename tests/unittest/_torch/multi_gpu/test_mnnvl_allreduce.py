@@ -33,7 +33,9 @@ from tensorrt_llm._torch.distributed.ops import (
     MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     discard_nccl_window_tensor_outputs
-from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
+from tensorrt_llm.bindings.internal.runtime import (McastGPUBuffer,
+                                                    MnnvlTransport,
+                                                    MnnvlWorkspace)
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
@@ -490,14 +492,28 @@ def mnnvl_checkpoint_rejects_wrong_membership(world_size: int,
                 os.environ.pop(name, None)
 
 
-def mnnvl_rejects_shifted_workspace(tensor_parallel_size: int,
-                                    tensor_parallel_rank: int) -> bool:
+def mnnvl_rejects_shifted_workspace(
+        tensor_parallel_size: int,
+        tensor_parallel_rank: int,
+        use_qualified_workspace: bool = False) -> bool:
     rank = tensorrt_llm.mpi_rank()
     assert rank == tensor_parallel_rank
     torch.cuda.set_device(rank)
-    buffer = McastGPUBuffer(256, tensor_parallel_size, rank, rank, True,
-                            MPI.COMM_WORLD.py2f())
+    if use_qualified_workspace:
+        buffer = MnnvlWorkspace(256, MnnvlTransport.FABRIC, rank,
+                                MPI.COMM_WORLD.py2f())
+        assert buffer.is_available, buffer.reason
+    else:
+        buffer = McastGPUBuffer(256, tensor_parallel_size, rank, rank, True,
+                                MPI.COMM_WORLD.py2f())
     base = buffer.get_uc_buffer(rank, (64, ), torch.float32, 0)
+    multicast = buffer.get_mc_buffer((64, ), torch.float32, 0)
+    assert multicast.shape == base.shape
+    assert multicast.dtype == base.dtype
+    if use_qualified_workspace:
+        assert buffer.get_local_buffer().data_ptr() == base.data_ptr()
+    for peer in range(tensor_parallel_size):
+        assert buffer.get_uc_buffer(peer, (1, ), torch.float32, 0).numel() == 1
     sliced = base[4:]
     shifted_storage = buffer.get_uc_buffer(rank, (60, ), torch.float32, 4)
     assert sliced.storage_offset() == 4
@@ -982,12 +998,16 @@ def test_mnnvl_workspace_growth_keeps_captured_graphs(
     reason="requires at least two GB200 GPUs with fabric-backed MNNVL",
 )
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
-def test_mnnvl_rejects_shifted_workspace(mpi_pool_executor) -> None:
+@pytest.mark.parametrize("use_qualified_workspace", [False, True],
+                         ids=["raw-buffer", "qualified-workspace"])
+def test_mnnvl_rejects_shifted_workspace(mpi_pool_executor,
+                                         use_qualified_workspace) -> None:
     tensor_parallel_size = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(
         mnnvl_rejects_shifted_workspace,
         [tensor_parallel_size] * tensor_parallel_size,
         range(tensor_parallel_size),
+        [use_qualified_workspace] * tensor_parallel_size,
     )
     assert all(results)
 
