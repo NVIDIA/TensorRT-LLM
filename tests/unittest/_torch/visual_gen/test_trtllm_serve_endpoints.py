@@ -3540,10 +3540,19 @@ async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_refer
             order += ["image:1", "audio:1", "video:1"]
         extra_params = {"reference_order": order}
         body["extra_params"] = extra_params if transport == "json" else json.dumps(extra_params)
-    async with _create_async_client(omni_generator, model_name=omni_generator._model) as client:
-        resp = await client.post(endpoint, **kwargs)
-        assert resp.status_code == (202 if endpoint == "/v1/videos" else 200), resp.text
-        if endpoint == "/v1/videos":
+    if endpoint == "/v1/videos/sync":
+        # FileResponse uses AnyIO threads; this client closes its request portal
+        # and joins those threads before the call-phase leak check runs.
+        client = _create_server(omni_generator, model_name=omni_generator._model)
+        try:
+            resp = client.post(endpoint, **kwargs)
+            assert resp.status_code == 200, resp.text
+        finally:
+            client.close()
+    else:
+        async with _create_async_client(omni_generator, model_name=omni_generator._model) as client:
+            resp = await client.post(endpoint, **kwargs)
+            assert resp.status_code == 202, resp.text
             assert await _adrive_job_to_completion(client, resp.json()["id"]) == "completed"
     assert omni_generator.last_inputs == prompt
     assert omni_generator.last_ref_bytes == expected
