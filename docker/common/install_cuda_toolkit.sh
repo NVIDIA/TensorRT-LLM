@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -ex
 
 # Reinstall CUDA from the run file on the base images that do not already ship CUDA_VER. On
@@ -8,7 +22,7 @@ set -ex
 # and this script replaces their CUDA with CUDA_VER. Bump CUDA_VER with the NGC PyTorch image:
 # the check below skips the reinstall once the base image already ships it, which is what keeps
 # this a no-op on NGC PyTorch.
-CUDA_VER="13.4.1"
+CUDA_VER="${CUDA_TOOLKIT_VERSION:?CUDA_TOOLKIT_VERSION must be set}"
 
 # The aarch64 run file carries an _sbsa suffix.
 case "$(uname -m)" in
