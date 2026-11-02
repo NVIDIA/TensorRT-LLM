@@ -73,6 +73,8 @@ from ..disaggregation.orchestration.pp_termination import \
 from ..disaggregation.orchestration.transfer_manager import AsyncTransferManager
 from ..distributed import Distributed
 from ..distributed.communicator import ReduceOp
+from ..memory.monitor import requested as monitor_requested
+from ..memory.monitor.ranks import RankReporter as MemoryReportRanks
 from ..memory.monitor.triggers import notify_error as monitor_notify_error
 from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
@@ -1613,6 +1615,9 @@ class PyExecutor:
         # calls Dup() (a collective) on the main thread.
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread: Optional[threading.Thread] = None
+        # Gathers GPU memory reports from every rank for rank 0; set up in
+        # start_worker() when the memory monitor is on and ranks span MPI.
+        self._memory_report_ranks = None
         # Serialises concurrent sleep/wakeup calls so that the control_action
         # + _sleep_wakeup_comm send/recv sequence is never interleaved.  Without
         # this, two concurrent RPC calls could both pass control_request_barrier
@@ -2188,6 +2193,14 @@ class PyExecutor:
                             name="sleep_wakeup_listener_thread",
                         )
                         self._sleep_wakeup_listener_thread.start()
+                # A report request reaches rank 0 only; rank 0 asks the
+                # others over their own communicator. Dup() is collective, so
+                # the condition must not depend on the rank.
+                if (self.dist.world_size > 1 and not self._disable_mpi
+                        and monitor_requested()):
+                    self._memory_report_ranks = MemoryReportRanks(
+                        mpi_comm().Dup(), self.dist.rank, self.dist.world_size,
+                        self.device_id)
                 if self.dist.pp_size > 1 and not self._disable_mpi:
                     self._start_mpi_progress_thread()
                 self.worker_thread = threading.Thread(
@@ -2239,6 +2252,15 @@ class PyExecutor:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
+
+    def gather_memory_reports(self) -> list[str]:
+        """GPU memory reports of ranks 1..N-1, gathered by rank 0.
+
+        Empty unless the memory monitor is on and ranks span MPI.
+        """
+        if self._memory_report_ranks is None:
+            return []
+        return self._memory_report_ranks.gather()
 
     def _shutdown_sleep_wakeup_listeners(self) -> None:
         """Signal sleep/wakeup listener threads to exit and drain bounded ACKs."""
@@ -2509,6 +2531,7 @@ class PyExecutor:
         self.hang_detector = None
         self._sleep_wakeup_comm = None
         self._sleep_wakeup_listener_thread = None
+        self._memory_report_ranks = None
         self.request_broadcaster = None
         self._disagg_coordinator = None
         self._disagg_pp_termination_handler = None
@@ -2619,6 +2642,8 @@ class PyExecutor:
         # executor loops have already processed the shutdown broadcast and are
         # no longer driving NCCL, so the send cannot deadlock.
         self._shutdown_sleep_wakeup_listeners()
+        if self._memory_report_ranks is not None:
+            self._memory_report_ranks.stop()
         encoder_launch_executor = getattr(self, "encoder_launch_executor", None)
         if encoder_launch_executor is not None:
             encoder_launch_executor.shutdown(wait=True)

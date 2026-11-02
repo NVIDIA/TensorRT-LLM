@@ -2014,15 +2014,17 @@ class _TorchLLM(BaseLLM):
         With ``TLLM_MEM_MONITOR=1`` set for the run, reports also break down
         startup step by step and compare against the state after warmup.
 
-        With the Ray executor every worker answers. With the default MPI
-        executor only rank 0 does; set ``TLLM_MEM_MONITOR_INTERVAL`` and
-        ``TLLM_MEM_MONITOR_DIR`` to collect every rank's reports.
+        Every rank reports with the Ray executor. With the default MPI
+        executor, every rank reports while ``TLLM_MEM_MONITOR=1`` is set for
+        the run, and only rank 0 otherwise.
 
         Returns:
-            list[str]: One report per answering worker.
+            list[str]: One report per rank that answered, rank 0 first.
         """
         replies = self._collective_rpc("get_memory_report")
-        return [reply for reply in replies if reply]
+        return [
+            report for reply in replies if reply for report in reply if report
+        ]
 
     @set_api_status("prototype")
     def get_memory_status(self) -> RuntimeMemoryStatus:

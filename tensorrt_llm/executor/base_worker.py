@@ -962,12 +962,13 @@ class BaseWorker(GenerationExecutor):
         self._check_sleep_wakeup_preconditions("get_memory_status")
         return self.engine.get_memory_status()
 
-    def get_memory_report(self) -> str | None:
-        """Explain where this worker's GPU memory is going, as readable text.
+    def get_memory_report(self) -> list[str]:
+        """Explain where GPU memory is going, as readable reports.
 
-        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``)
-        from this process; works whether or not ``TLLM_MEM_MONITOR`` is set.
-        ``None`` if it could not be built.
+        Built by the GPU memory monitor (``tensorrt_llm._torch.memory.monitor``);
+        works whether or not ``TLLM_MEM_MONITOR`` is set. This worker's own
+        report comes first. Under the MPI executor only rank 0 is asked, and
+        with the monitor on it adds the other ranks' reports.
         """
         from tensorrt_llm._torch.memory.monitor.triggers import report_now
 
@@ -975,9 +976,15 @@ class BaseWorker(GenerationExecutor):
         # the one this worker serves on.
         device = getattr(self.engine, "device_id", None)
         if device is None:
-            return report_now(tag="on_demand", force=True)
-        with torch.cuda.device(device):
-            return report_now(tag="on_demand", force=True)
+            own = report_now(tag="on_demand", force=True)
+        else:
+            with torch.cuda.device(device):
+                own = report_now(tag="on_demand", force=True)
+        reports = [own] if own else []
+        gather = getattr(self.engine, "gather_memory_reports", None)
+        if gather is not None:
+            reports.extend(gather())
+        return reports
 
     def _prepare_sleep_tags(
         self,

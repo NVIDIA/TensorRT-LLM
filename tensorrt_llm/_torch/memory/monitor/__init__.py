@@ -104,6 +104,15 @@ def current_rank() -> int | None:
         return None
 
 
+def requested() -> bool:
+    """Whether ``TLLM_MEM_MONITOR=1`` is set, regardless of the rank filter.
+
+    For setup every rank must agree on, such as a collective communicator
+    duplication; :func:`enabled` can differ between ranks.
+    """
+    return os.environ.get(ENV_VAR, "") == "1"
+
+
 def enabled(rank: int | None = None) -> bool:
     """Whether the monitor should run in this process.
 

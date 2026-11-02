@@ -129,16 +129,18 @@ class TestOnRequest:
         monkeypatch.delenv("TLLM_MEM_MONITOR", raising=False)
         worker = object.__new__(BaseWorker)
         worker.engine = SimpleNamespace(device_id=torch.cuda.current_device())
-        text = worker.get_memory_report()
-        assert text and "This process uses" in text
+        (text,) = worker.get_memory_report()
+        assert "This process uses" in text
 
     @pytest.mark.cpu_only
     def test_llm_returns_each_workers_report(self):
         from tensorrt_llm import LLM
 
         llm = object.__new__(LLM)
-        llm._collective_rpc = MagicMock(return_value=["rank 0 report", None])
-        assert llm.get_memory_report() == ["rank 0 report"]
+        # Rank 0's worker answers for every rank under MPI; Ray workers each
+        # answer for themselves. Either way one flat list comes back.
+        llm._collective_rpc = MagicMock(return_value=[["rank 0", "rank 1"], None, ["rank 2"]])
+        assert llm.get_memory_report() == ["rank 0", "rank 1", "rank 2"]
         llm._collective_rpc.assert_called_once_with("get_memory_report")
 
     @pytest.mark.cpu_only
@@ -179,3 +181,64 @@ def test_worker_thread_allocation_is_named_after_the_running_step(monkeypatch):
 def test_nested_windows_resolve_to_the_innermost():
     lookup = tagging._window_lookup([(0, 100, "outer"), (40, 60, "inner")])
     assert [lookup(t) for t in (10, 50, 70, 150)] == ["outer", "inner", "outer", None]
+
+
+class _FakeComm:
+    """Point-to-point messages between in-process ranks, mpi4py-shaped."""
+
+    def __init__(self, rank, mailbox, lock):
+        self.rank, self._box, self._lock = rank, mailbox, lock
+
+    def send(self, obj, dest, tag):
+        with self._lock:
+            self._box.setdefault((self.rank, dest, tag), []).append(obj)
+
+    def Iprobe(self, source, tag):
+        with self._lock:
+            return bool(self._box.get((source, self.rank, tag)))
+
+    def recv(self, source, tag):
+        with self._lock:
+            return self._box[(source, self.rank, tag)].pop(0)
+
+
+@pytest.mark.cpu_only
+class TestEveryRank:
+    def _ranks(self, monkeypatch, world, listening):
+        from tensorrt_llm._torch.memory.monitor import ranks
+
+        monkeypatch.setattr(
+            triggers, "report_now", lambda tag, rank=None, **_: f"report of rank {rank}"
+        )
+        box, lock = {}, threading.Lock()
+        reporters = [
+            ranks.RankReporter(_FakeComm(r, box, lock), r, world, None)
+            for r in range(world)
+            if r == 0 or r in listening
+        ]
+        return reporters, box, lock
+
+    def test_rank_zero_gathers_the_others_in_order(self, monkeypatch):
+        reporters, _, _ = self._ranks(monkeypatch, 3, {1, 2})
+        try:
+            assert reporters[0].gather(timeout=10) == ["report of rank 1", "report of rank 2"]
+        finally:
+            for r in reporters:
+                r.stop()
+
+    def test_a_silent_rank_does_not_hold_up_the_rest(self, monkeypatch):
+        reporters, _, _ = self._ranks(monkeypatch, 3, {1})
+        try:
+            got = reporters[0].gather(timeout=1)
+            assert got == ["report of rank 1", "rank 2: no report within 1 s"]
+        finally:
+            for r in reporters:
+                r.stop()
+
+    def test_a_late_answer_to_an_earlier_request_is_dropped(self, monkeypatch):
+        reporters, box, lock = self._ranks(monkeypatch, 2, set())
+        from tensorrt_llm._torch.memory.monitor import ranks
+
+        with lock:  # rank 1's answer to request 0, which timed out long ago
+            box.setdefault((1, 0, ranks._REPLY_TAG), []).append((0, "stale"))
+        assert reporters[0].gather(timeout=0.5) == ["rank 1: no report within 0.5 s"]

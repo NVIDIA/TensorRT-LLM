@@ -52,8 +52,10 @@ level.
 
 ## Asking for a report
 
-`LLM.get_memory_report()` (also on `AsyncLLM`) returns one report per worker,
-whether or not `TLLM_MEM_MONITOR` is set:
+`LLM.get_memory_report()` (also on `AsyncLLM`) returns one report per rank,
+rank 0 first, whether or not `TLLM_MEM_MONITOR` is set. Under the default MPI
+executor the other ranks answer only while the monitor is on; with it off,
+only rank 0 reports.
 
 ```python
 from tensorrt_llm import LLM
