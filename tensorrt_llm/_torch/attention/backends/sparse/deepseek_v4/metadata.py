@@ -309,7 +309,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         }
         # One twin page table per compression ratio; -1 = not retained.
         manager = self.kv_cache_manager
-        if getattr(manager, "high_layers", None):
+        if manager.high_layers:
             self._retained_table_layers = {}
             for local in manager.high_layers:
                 layer_idx = manager.pp_layers[local]

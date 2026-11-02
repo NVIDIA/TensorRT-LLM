@@ -1793,7 +1793,7 @@ class KVCacheManagerV2(BaseResourceManager):
     # _init_mixed_precision assigns fresh per-instance values.
     low_precision_dtype: Optional[DataType] = None
     high_layers: dict[int, int] = {}
-    high_precision_dtype: Optional[DataType] = None
+    high_precision_dtype: DataType | None = None
     # Inherited by per-model subclasses; the base's own applies to the base only.
     _supports_mixed_precision_kv = True
     # True when the manager's own pool already holds the history in the low-precision format;
@@ -1909,7 +1909,7 @@ class KVCacheManagerV2(BaseResourceManager):
             self.num_layers = max(num_layers, max(self.pp_layers, default=-1) + 1)
         # MTP layers are target attention layers and go mixed like them; the layers of
         # a drafter with its own architecture (Eagle3, DFlash, ...) keep a plain cache.
-        self._first_spec_layer_id: Optional[int] = None
+        self._first_spec_layer_id: int | None = None
         if (
             spec_config is not None
             and self.low_precision_dtype is not None
@@ -3983,7 +3983,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Local layer id -> layer id of its retained-token (high-precision) twin.
         self.high_layers: dict[int, int] = {}
         self.low_precision_dtype: Optional[DataType] = None
-        self.high_precision_dtype: Optional[DataType] = None
+        self.high_precision_dtype: DataType | None = None
         self.first_n = self.last_n = 0
         # The engine's sequence capacity. KV estimation lowers self.max_seq_len
         # to fit the temporary cache; the attention staging copy is sized from
@@ -4157,7 +4157,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for role, layer in enumerate((local, self.high_layers[local])):
             self._fill_page_table(layer, request_ids, out[role])
 
-    def _fill_page_table(self, layer: int, request_ids: List[int], out: np.ndarray) -> None:
+    def _fill_page_table(self, layer: int, request_ids: list[int], out: np.ndarray) -> None:
         """Write the ``(batch, pages)`` page table of one manager layer into ``out``."""
         pool_id = int(self.impl.get_layer_group_id(layer))
         scale = int(self.impl.get_page_index_converter(layer, Role.KEY).scale)
@@ -4181,7 +4181,7 @@ class KVCacheManagerV2(BaseResourceManager):
         np.copyto(out[:, :width], pages, where=np.arange(width) < counts[:, None])
 
     def fill_high_precision_page_table(
-        self, request_ids: List[int], layer_idx: int, out: np.ndarray
+        self, request_ids: list[int], layer_idx: int, out: np.ndarray
     ) -> None:
         """Write the ``(batch, pages)`` page table of ``layer_idx``'s high-precision twin."""
         self._fill_page_table(self.high_layers[self.layer_offsets[layer_idx]], request_ids, out)

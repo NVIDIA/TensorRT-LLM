@@ -7,11 +7,18 @@ after the backend's top-k gather, the rows the twin still holds replace the dequ
 rows in its FP8 scratch. Twin page table: page >= 0 means retained.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 import triton
 import triton.language as tl
+
+if TYPE_CHECKING:
+    from ..trtllm import TrtllmAttention
+    from .deepseek_v4.compressor import Compressor
+    from .dsa.metadata import DSAtrtllmAttentionMetadata
+
+    RetainedRowsOwner = TrtllmAttention | Compressor
 
 
 @triton.jit
@@ -191,15 +198,19 @@ def _copy_recorded_rows_kernel(
     )
 
 
-def _retained_block_table(metadata, owner) -> Optional[torch.Tensor]:
+def _retained_block_table(
+    metadata: "DSAtrtllmAttentionMetadata", owner: "RetainedRowsOwner"
+) -> torch.Tensor | None:
     """Retained page table ``owner`` uses (one per compression ratio on DeepSeek-V4)."""
-    table = getattr(metadata, "retained_block_table", None)
+    table = metadata.retained_block_table
     if isinstance(table, dict):
-        table = table.get(getattr(owner, "compress_ratio", None))
+        table = table.get(owner.compress_ratio)
     return table
 
 
-def _retained_kv_cache(metadata, owner) -> Optional[torch.Tensor]:
+def _retained_kv_cache(
+    metadata: "DSAtrtllmAttentionMetadata", owner: "RetainedRowsOwner"
+) -> torch.Tensor | None:
     """``[num_blocks, tokens_per_block, row]`` view of ``owner``'s retained pool, else None."""
     if _retained_block_table(metadata, owner) is None:
         return None
@@ -218,18 +229,19 @@ def _block_size(row_width: int) -> int:
 
 
 def store_retained_rows(
-    metadata,
-    owner,
+    metadata: "DSAtrtllmAttentionMetadata",
+    owner: "RetainedRowsOwner",
     rows: torch.Tensor,
     requests: torch.Tensor,
     positions: torch.Tensor,
-    scale: Optional[torch.Tensor] = None,
-    rotary_cos_sin: Optional[torch.Tensor] = None,
+    scale: torch.Tensor | None = None,
+    rotary_cos_sin: torch.Tensor | None = None,
     rope_dim: int = 0,
 ) -> None:
-    """Store ``rows`` in ``owner``'s retained pool (FP8 pool: ``row * scale``).
+    """Store ``rows`` ``[num_tokens, row_width]`` in ``owner``'s retained pool (FP8: ``row * scale``).
 
-    With ``rotary_cos_sin`` the trailing ``rope_dim`` of every row is rotated at its position first.
+    ``requests`` and ``positions`` are ``[num_tokens]`` int32. With ``rotary_cos_sin``
+    (``[positions, rope_dim, 2]`` float32) the trailing ``rope_dim`` of every row is rotated first.
     """
     kv_cache = _retained_kv_cache(metadata, owner)
     if kv_cache is None:
@@ -273,7 +285,10 @@ def store_retained_rows(
 
 
 def store_retained_context_rows(
-    attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
+    attention: "TrtllmAttention",
+    metadata: "DSAtrtllmAttentionMetadata",
+    latent_cache: torch.Tensor,
+    position_ids: torch.Tensor,
 ) -> None:
     """Context phase: the append kernel wrote the rotated k_pe back into ``latent_cache``."""
     num_ctx = metadata.num_ctx_tokens
@@ -291,7 +306,10 @@ def store_retained_context_rows(
 
 
 def store_retained_generation_rows(
-    attention, metadata, latent_cache: torch.Tensor, position_ids: torch.Tensor
+    attention: "TrtllmAttention",
+    metadata: "DSAtrtllmAttentionMetadata",
+    latent_cache: torch.Tensor,
+    position_ids: torch.Tensor,
 ) -> None:
     """Generation: the fused kernel rotates k_pe in-kernel only, so the store rotates it as well."""
     num_rows = latent_cache.shape[0]
@@ -389,8 +407,8 @@ def _retained_compressed_row_mask(
 
 
 def store_retained_compressed_rows(
-    compressor,
-    metadata,
+    compressor: "Compressor",
+    metadata: "DSAtrtllmAttentionMetadata",
     kv_comp: torch.Tensor,
     position_ids: torch.Tensor,
     num_comp_tokens: torch.Tensor,
@@ -449,10 +467,10 @@ def store_retained_compressed_rows(
 
 _OVERLAY_BLOCK_K = 64
 # Per-device scratch-row records for context overlays, and the epoch of the last overlay.
-_overlay_claims = {}
+_overlay_claims: dict[torch.device, tuple[torch.Tensor, int]] = {}
 
 
-def _overlay_claim(device: torch.device, rows: int):
+def _overlay_claim(device: torch.device, rows: int) -> tuple[torch.Tensor, int]:
     """Per-row records covering ``rows`` scratch rows and a fresh epoch (no per-call clearing)."""
     claims, epoch = _overlay_claims.get(device, (None, 0))
     epoch += 1
@@ -464,18 +482,18 @@ def _overlay_claim(device: torch.device, rows: int):
 
 
 def overlay_retained_rows(
-    attention,
-    metadata,
+    attention: "TrtllmAttention",
+    metadata: "DSAtrtllmAttentionMetadata",
     topk_indices: torch.Tensor,
     requests: torch.Tensor,
     compact_indices: torch.Tensor,
     scratch: torch.Tensor,
     shared_rows: bool = False,
 ) -> None:
-    """After the gather: copy the retained rows over the dequantized scratch rows.
+    """After the gather: copy the retained rows over the dequantized FP8 ``scratch`` rows.
 
-    ``topk_indices``: selected positions per query row (-1 = none); ``requests``: that row's
-    request; ``compact_indices``: the scratch row the gather used for each pair (-1 = none).
+    ``topk_indices`` / ``compact_indices``: ``[num_rows, topk]`` int32 selected positions and the
+    scratch row the gather used (-1 = none); ``requests``: ``[num_rows]`` int32 batch rows.
     ``shared_rows``: the context gather deduplicates, so many pairs point at one scratch row.
     """
     kv_cache = _retained_kv_cache(metadata, attention)

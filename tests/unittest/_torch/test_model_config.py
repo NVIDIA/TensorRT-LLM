@@ -496,33 +496,3 @@ def test_validate_encoder_decoder_kv_cache_config_accepts_v2_enc_dec():
         model_config,
         _make_kv_cache_config(use_kv_cache_manager_v2=True, cross_kv_cache_fraction=0.5),
     )
-
-
-@pytest.mark.parametrize(
-    "sparse,dtype,expected",
-    [
-        # dsa keeps the history in its own NVFP4 pool, whatever the retained dtype.
-        (True, "mixed_nvfp4_fp8", QuantAlgo.NVFP4),
-        (True, "mixed_nvfp4_bfloat16", QuantAlgo.NVFP4),
-        # A dense manager keeps its pool in the retained dtype.
-        (False, "mixed_nvfp4_fp8", QuantAlgo.FP8),
-        (False, "mixed_nvfp4_bfloat16", None),
-    ],
-)
-def test_mixed_kv_drafter_inherits_target_kv_dtype(sparse, dtype, expected):
-    """A drafter's KV dtype is the target's: the dtype of the pool its layers land in."""
-    from tensorrt_llm._torch.models.modeling_speculative import _set_draft_kv_cache_quant_algo
-    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-
-    model_config = ModelConfig(
-        pretrained_config=types.SimpleNamespace(torch_dtype=torch.bfloat16),
-        quant_config=QuantConfig(),
-        sparse_attention_config=(
-            DeepSeekSparseAttentionConfig(index_head_dim=128) if sparse else None
-        ),
-    )
-    validate_and_set_kv_cache_quant(model_config, dtype)
-    draft_config = ModelConfig(quant_config=QuantConfig())
-    _set_draft_kv_cache_quant_algo(draft_config, model_config)
-    assert model_config.quant_config.kv_cache_quant_algo == expected
-    assert draft_config.quant_config.kv_cache_quant_algo == expected

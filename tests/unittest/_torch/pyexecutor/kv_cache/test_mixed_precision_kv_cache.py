@@ -311,25 +311,75 @@ def test_mixed_precision_rejects_custom_managers():
     assert native.high_precision_dtype == DataType.BF16
 
 
+@pytest.mark.parametrize("retained", [DataType.FP8, DataType.BF16])
 @pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
-def test_appended_draft_layers(make_manager, drafter):
-    """MTP layers appended to the target manager go mixed; an Eagle3 draft layer keeps a plain cache."""
+@pytest.mark.parametrize("backend", ["dense", "dsa"])
+def test_drafter_writes_the_dtype_of_its_pages(backend, drafter, retained):
+    """A drafter sharing the target manager writes its pages in their own dtype.
+
+    The model side gives the drafter a KV dtype; the manager side places its layer in a pool.
+    Both come from one config here. MTP layers run the target's attention and go mixed like
+    the target layers; other drafters keep a plain layer.
+    """
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_speculative import _set_draft_kv_cache_quant_algo
+    from tensorrt_llm._torch.pyexecutor.model_loader import validate_and_set_kv_cache_quant
     from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    def kv_dtype(quant_config):
+        # How the executor turns a model's KV quantization into a pool dtype.
+        if quant_config.quant_mode.has_fp8_kv_cache():
+            return DataType.FP8
+        if quant_config.quant_mode.has_fp4_kv_cache():
+            return DataType.NVFP4
+        return DataType.BF16
+
+    sparse_config = DeepSeekSparseAttentionConfig(index_head_dim=128) if backend == "dsa" else None
+    target = ModelConfig(
+        pretrained_config=SimpleNamespace(torch_dtype=torch.bfloat16),
+        quant_config=QuantConfig(),
+        sparse_attention_config=sparse_config,
+    )
+    validate_and_set_kv_cache_quant(target, _MIXED_DTYPE[retained])
+    draft = ModelConfig(quant_config=QuantConfig())
+    _set_draft_kv_cache_quant_algo(draft, target)
 
     spec_config = (
         MTPDecodingConfig(num_nextn_predict_layers=1)
         if drafter == "mtp"
         else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
     )
-    manager = make_manager(
-        config=mixed_config(pool_ratio=None), num_layers=2, spec_config=spec_config
+    options = dict(
+        kv_cache_config=mixed_config(retained, pool_ratio=None, enable_block_reuse=False),
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=kv_dtype(target.quant_config),
+        spec_config=spec_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
     )
-    assert manager.pp_layers == [0, 1, 2]
-    if drafter == "mtp":
-        assert manager.high_layers == {0: 3, 1: 4, 2: 5}
+    if backend == "dsa":
+        manager = DSACacheManagerV2(
+            kv_cache_type=CacheType.SELFKONLY, sparse_attention_config=sparse_config, **options
+        )
     else:
-        assert manager.high_layers == {0: 3, 1: 4}
-        assert manager.get_buffers(2).dtype == torch.bfloat16
+        manager = KVCacheManagerV2(kv_cache_type=CacheType.SELF, **options)
+    try:
+        drafter_layer = 2
+        assert manager.pp_layers == [0, 1, drafter_layer]
+        assert (drafter_layer in manager.high_layers) == (drafter == "mtp")
+        assert manager._get_layer_dtype_by_local_id(drafter_layer) == kv_dtype(draft.quant_config)
+    finally:
+        manager.shutdown()
 
 
 def test_separate_mtp_draft_manager_goes_mixed(make_manager):
@@ -354,14 +404,14 @@ def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
     """A target pool_ratio sizes the target; the mixed MTP draft manager still builds."""
     from types import SimpleNamespace
 
-    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
+    from tensorrt_llm._torch.pyexecutor._util import _drop_mixed_draft_pool_ratio
     from tensorrt_llm.llmapi import MTPDecodingConfig
 
     config = mixed_config(pool_ratio=[0.75, 0.25], max_tokens=None, max_gpu_total_bytes=128 << 20)
     target = make_manager(config=config, num_layers=2)
     assert target.kv_cache_manager_py_config.initial_pool_ratio == pytest.approx([0.75, 0.25])
     draft_config = config.model_copy()
-    _fit_draft_pool_ratio(draft_config)
+    _drop_mixed_draft_pool_ratio(draft_config)
     draft = make_manager(
         config=draft_config,
         num_layers=1,
@@ -476,47 +526,6 @@ def test_deepseek_v4_mixed_disagg_names_every_layer():
             int(manager.impl.get_layer_group_id(t)) for t in manager.high_layers.values()
         }
         assert twin_groups <= {group for group, _ in mapping}
-    finally:
-        manager.shutdown()
-
-
-@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
-def test_dsa_drafter_layer_in_target_manager(drafter):
-    """Drafter layers in the DSA manager: MTP gets a twin, Eagle3 keeps the native NVFP4 page.
-
-    The drafter's model inherits the target's NVFP4 KV dtype, so an Eagle3 layer must stay a
-    plain NVFP4 layer for its writes to match its pages.
-    """
-    from types import SimpleNamespace
-
-    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
-    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
-    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
-
-    spec_config = (
-        MTPDecodingConfig(num_nextn_predict_layers=1)
-        if drafter == "mtp"
-        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
-    )
-    manager = DSACacheManagerV2(
-        kv_cache_config=mixed_config(DataType.FP8, pool_ratio=None, enable_block_reuse=False),
-        kv_cache_type=CacheType.SELFKONLY,
-        num_layers=2,
-        num_kv_heads=1,
-        head_dim=576,
-        tokens_per_block=64,
-        max_seq_len=1024,
-        max_batch_size=2,
-        mapping=Mapping(),
-        dtype=DataType.NVFP4,
-        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
-        spec_config=spec_config,
-        pretrained_config=SimpleNamespace(num_hidden_layers=2),
-    )
-    try:
-        assert manager.pp_layers == [0, 1, 2]
-        assert sorted(manager.high_layers) == ([0, 1, 2] if drafter == "mtp" else [0, 1])
-        assert manager._get_layer_dtype_by_local_id(2) == DataType.NVFP4
     finally:
         manager.shutdown()
 
