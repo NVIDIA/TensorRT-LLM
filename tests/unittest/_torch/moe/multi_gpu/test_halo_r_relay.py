@@ -1126,6 +1126,7 @@ def _case_trap(layers: _Layers, kind: str) -> dict:
 # case: (case function, layers, auxiliary SMs, helper-slot mode)
 _CASES = {
     "reference": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
+    "reference_aux12": (_case_reference, 1, 12, "shared_banks"),
     "reference_aux16": (_case_reference, 1, 16, "shared_banks"),
     "reference_production_bundle": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
     "balanced_and_empty": (_case_balanced_and_empty, 1, _AUXILIARY_SMS, "shared_banks"),
