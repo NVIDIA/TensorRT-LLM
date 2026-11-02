@@ -184,6 +184,7 @@ def _expected_rows(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_config_fields_default_to_the_existing_behavior() -> None:
     config = DSparkDecodingConfig(max_draft_len=3)
     assert config.rejection_sample_method == "standard"
@@ -204,6 +205,7 @@ def test_config_fields_default_to_the_existing_behavior() -> None:
     [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
     ids=["block", "temperature_only"],
 )
+@pytest.mark.cpu_only
 def test_rejection_options_require_rejection_sampling(options: dict) -> None:
     off = types.SimpleNamespace(speculative_config=DSparkDecodingConfig(max_draft_len=3, **options))
     with pytest.raises(ValueError, match="use_rejection_sampling=True"):
@@ -221,6 +223,7 @@ def test_rejection_options_require_rejection_sampling(options: dict) -> None:
     [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
     ids=["block", "temperature_only"],
 )
+@pytest.mark.cpu_only
 def test_rejection_options_are_rejected_with_the_dynamic_tree(options: dict) -> None:
     # The dynamic tree drafts from a softmax top-k of the raw draft logits and
     # verifies token by token, so neither option would take effect there.
@@ -246,6 +249,7 @@ def test_rejection_options_are_rejected_with_the_dynamic_tree(options: dict) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
     generator = torch.Generator().manual_seed(1)
     drafter = _drafter(generator)
@@ -271,6 +275,7 @@ def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
     assert tokens.dtype == torch.long and tokens.shape == (B, K)
 
 
+@pytest.mark.cpu_only
 def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
     generator = torch.Generator().manual_seed(2)
     drafter = _drafter(generator)
@@ -290,6 +295,7 @@ def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_head() -> None:
     generator = torch.Generator().manual_seed(3)
     worker = _worker()
@@ -304,6 +310,7 @@ def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_he
 
 
 @pytest.mark.parametrize("num_contexts", [0, 2])
+@pytest.mark.cpu_only
 def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_contexts: int) -> None:
     generator = torch.Generator().manual_seed(4)
     worker = _worker()
@@ -327,6 +334,7 @@ def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_con
 
 
 @pytest.mark.parametrize("temperature_only", [False, True])
+@pytest.mark.cpu_only
 def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only: bool) -> None:
     generator = torch.Generator().manual_seed(5)
     worker = _worker()
@@ -352,6 +360,7 @@ def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only: bo
         assert torch.equal(call["offset"], expected_offset)
 
 
+@pytest.mark.cpu_only
 def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
     meta = _metadata(B, temperature=0.6, top_k=20, top_p=0.9, min_p=0.1, temperature_only=True)
     temps, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
@@ -459,6 +468,7 @@ def _token_level(
 
 
 @pytest.mark.parametrize("verify", ["block", "token"])
+@pytest.mark.cpu_only
 def test_sampled_drafts_verify_losslessly(verify: str) -> None:
     generator = torch.Generator().manual_seed(21 if verify == "block" else 22)
     num = 100_000
@@ -486,6 +496,7 @@ def test_sampled_drafts_verify_losslessly(verify: str) -> None:
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
 
 
+@pytest.mark.cpu_only
 def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> None:
     """Target = the drafter's own Markov chain. Drawing ancestrally proposes exactly
     the target, so every draft is accepted; the old proposal (independent draws from

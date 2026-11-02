@@ -183,6 +183,7 @@ def _random_case(
 
 @pytest.mark.parametrize("num_drafts", [1, 3, 7])
 @pytest.mark.parametrize("temperature", [1.0, 0.6])
+@pytest.mark.cpu_only
 def test_block_verify_matches_vllm_given_identical_uniforms(
     num_drafts: int, temperature: float
 ) -> None:
@@ -220,6 +221,7 @@ def test_block_verify_matches_vllm_given_identical_uniforms(
         assert len(lengths) > 2, "the case generator should exercise several accept lengths"
 
 
+@pytest.mark.cpu_only
 def test_residual_distribution_matches_vllm() -> None:
     """The emitted token's distribution, not just one draw from it, is vLLM's."""
     generator = torch.Generator().manual_seed(7)
@@ -249,6 +251,7 @@ def test_residual_distribution_matches_vllm() -> None:
         torch.testing.assert_close(histogram, ref_resample, atol=2.0 / resample_draws, rtol=0)
 
 
+@pytest.mark.cpu_only
 def test_sample_emitted_hook_receives_the_residual() -> None:
     """A caller-supplied sampler sees exactly the residual vLLM resamples from."""
     generator = torch.Generator().manual_seed(8)
@@ -284,6 +287,7 @@ def test_sample_emitted_hook_receives_the_residual() -> None:
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
+@pytest.mark.cpu_only
 def test_single_draft_block_equals_token_level(seed: int) -> None:
     generator = torch.Generator().manual_seed(seed)
     batch, vocab = 512, 32
@@ -408,6 +412,7 @@ def _block(
 
 @pytest.mark.parametrize("verify_name", ["block", "token"])
 @pytest.mark.parametrize("zero_frac", [0.0, 0.3])
+@pytest.mark.cpu_only
 def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
     generator = torch.Generator().manual_seed(11 if zero_frac else 12)
     target = _PrefixModel(generator, zero_frac=zero_frac, sharpness=1.5)
@@ -422,6 +427,7 @@ def test_verification_is_lossless(verify_name: str, zero_frac: float) -> None:
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
 
 
+@pytest.mark.cpu_only
 def test_block_accepts_at_least_as_much_as_token_level() -> None:
     generator = torch.Generator().manual_seed(5)
     target = _PrefixModel(generator, sharpness=1.5)
@@ -437,6 +443,7 @@ def test_block_accepts_at_least_as_much_as_token_level() -> None:
     assert block_mean > token_mean - 3 * 1.5 * math.sqrt(2 / num_samples)
 
 
+@pytest.mark.cpu_only
 def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() -> None:
     """Guard for the test itself: storing a q the drafts were not drawn from must fail it."""
     generator = torch.Generator().manual_seed(3)
@@ -463,6 +470,7 @@ def test_regression_independent_draws_from_mismatched_rows_are_not_lossless() ->
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
 def test_output_layout_and_identical_draft_and_target() -> None:
     """q == p: everything is accepted and the bonus comes from the last row."""
     generator = torch.Generator().manual_seed(9)
@@ -482,6 +490,7 @@ def test_output_layout_and_identical_draft_and_target() -> None:
     assert torch.equal(tokens[:, num_drafts].long(), bonus)
 
 
+@pytest.mark.cpu_only
 def test_rejected_block_pads_with_minus_one_and_never_emits_a_filtered_token() -> None:
     batch, num_drafts, vocab = 4, 3, 6
     target = torch.zeros(batch, num_drafts + 1, vocab)
@@ -498,6 +507,7 @@ def test_rejected_block_pads_with_minus_one_and_never_emits_a_filtered_token() -
     assert (tokens[:, 1:] == -1).all()
 
 
+@pytest.mark.cpu_only
 def test_a_draft_its_proposal_gives_no_mass_is_rejected() -> None:
     """A row whose stored q misses the draft (stale/padding rows) must not accept it."""
     vocab = 5
@@ -514,6 +524,7 @@ def test_a_draft_its_proposal_gives_no_mass_is_rejected() -> None:
     assert int(num_accepted) == 1
 
 
+@pytest.mark.cpu_only
 def test_nan_rows_stay_in_vocab() -> None:
     """CUDA-graph padding rows can carry NaN; their output must still be a valid id."""
     batch, num_drafts, vocab = 3, 4, 7
@@ -530,6 +541,7 @@ def test_nan_rows_stay_in_vocab() -> None:
     assert ((emitted >= 0) & (emitted < vocab)).all()
 
 
+@pytest.mark.cpu_only
 def test_counter_uniforms_are_keyed_and_uniform() -> None:
     rows = 4096
     seed = torch.full((rows,), 42, dtype=torch.int64)
