@@ -2110,7 +2110,9 @@ class DFlashWorker(SpecWorkerBase):
         """
         return gen_logits
 
-    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+    def _samples_block_ancestrally(
+        self, draft_model: nn.Module, spec_metadata: SpecMetadata
+    ) -> bool:
         """Whether this step's drafts come from :meth:`_sample_block_ancestrally`.
 
         Plain DFlash positions are independent given the block forward, so
@@ -2121,10 +2123,10 @@ class DFlashWorker(SpecWorkerBase):
 
     def _sample_block_ancestrally(
         self,
-        draft_model,
+        draft_model: nn.Module,
         gen_logits: torch.Tensor,
         inputs: dict,
-        spec_metadata,
+        spec_metadata: SpecMetadata,
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:

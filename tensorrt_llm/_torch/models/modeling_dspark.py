@@ -2713,7 +2713,9 @@ class _DSparkHeadMixin:
         markov_w1, markov_w2 = self.markov_w1, self.markov_w2
         has_head = self.has_markov_head
 
-        def _step_bias(prev_tokens, step_hidden):
+        def _step_bias(
+            prev_tokens: torch.Tensor, step_hidden: Optional[torch.Tensor]
+        ) -> torch.Tensor:
             del step_hidden
             if not has_head:
                 return torch.zeros((), dtype=base_logits.dtype, device=base_logits.device)

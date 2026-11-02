@@ -25,6 +25,7 @@ graph capture with the real sampler kernels.
 
 import math
 import types
+from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import pytest
@@ -48,19 +49,21 @@ INT32_MAX = torch.iinfo(torch.int32).max
 class _MarkovDrafter(_DSparkHeadMixin):
     """The DSpark head set alone: the worker's sampled path needs nothing else."""
 
-    def __init__(self, markov_w1, markov_w2):
+    def __init__(self, markov_w1: torch.Tensor, markov_w2: torch.Tensor) -> None:
         self._dspark_markov_rank = markov_w1.shape[1]
         self.markov_w1 = markov_w1
         self.markov_w2 = markov_w2
 
 
-def _drafter(generator, vocab=V, scale=1.0, device="cpu"):
+def _drafter(
+    generator: torch.Generator, vocab: int = V, scale: float = 1.0, device: str = "cpu"
+) -> _MarkovDrafter:
     w1 = scale * torch.randn(vocab, RANK, generator=generator)
     w2 = torch.randn(vocab, RANK, generator=generator)
     return _MarkovDrafter(w1.to(device), w2.to(device))
 
 
-def _worker():
+def _worker() -> DSparkWorker:
     worker = DSparkWorker.__new__(DSparkWorker)
     torch.nn.Module.__init__(worker)
     worker.mapping = None
@@ -70,21 +73,21 @@ def _worker():
 
 
 def _metadata(
-    num_gens,
+    num_gens: int,
     *,
-    num_contexts=0,
-    num_slots=None,
-    vocab=V,
-    draft_len=K,
-    temperature=1.0,
-    top_k=INT32_MAX,
-    top_p=1.0,
-    min_p=0.0,
-    temperature_only=False,
-    method="standard",
-    mode=None,
-    device="cpu",
-):
+    num_contexts: int = 0,
+    num_slots: Optional[int] = None,
+    vocab: int = V,
+    draft_len: int = K,
+    temperature: float = 1.0,
+    top_k: int = INT32_MAX,
+    top_p: float = 1.0,
+    min_p: float = 0.0,
+    temperature_only: bool = False,
+    method: str = "standard",
+    mode: Optional[AdvancedSamplingMode] = None,
+    device: str = "cpu",
+) -> types.SimpleNamespace:
     batch = num_contexts + num_gens
     num_slots = num_slots or batch + 1
     return types.SimpleNamespace(
@@ -114,10 +117,22 @@ def _metadata(
     )
 
 
-def _cpu_sampler(generator, calls=None):
+def _cpu_sampler(
+    generator: torch.Generator, calls: Optional[list] = None
+) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
     """Stand-in for the seeded sampler: temperature only, returns what it drew from."""
 
-    def sample(mode, logits, temperatures, top_ks, top_ps, min_ps, *, seed, offset):
+    def sample(
+        mode: Optional[AdvancedSamplingMode],
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        *,
+        seed: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if calls is not None:
             calls.append(
                 dict(
@@ -134,7 +149,15 @@ def _cpu_sampler(generator, calls=None):
     return sample
 
 
-def _sample_with(sampler, worker, drafter, base, anchors, meta, num_contexts=0):
+def _sample_with(
+    sampler: Callable[..., tuple[torch.Tensor, torch.Tensor]],
+    worker: DSparkWorker,
+    drafter: _MarkovDrafter,
+    base: torch.Tensor,
+    anchors: torch.Tensor,
+    meta: types.SimpleNamespace,
+    num_contexts: int = 0,
+) -> tuple[torch.Tensor, int]:
     inputs = {"first_prev_tokens": anchors}
     with patch.object(SpecWorkerBase, "_sample_from_logits_with_probs", staticmethod(sampler)):
         return worker._sample_block_ancestrally(
@@ -142,7 +165,13 @@ def _sample_with(sampler, worker, drafter, base, anchors, meta, num_contexts=0):
         )
 
 
-def _expected_rows(drafter, base, anchors, tokens, temperature):
+def _expected_rows(
+    drafter: _MarkovDrafter,
+    base: torch.Tensor,
+    anchors: torch.Tensor,
+    tokens: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
     """softmax((base_k + bias(drawn k-1)) / T) for every position."""
     prev = torch.cat([anchors.view(-1, 1), tokens[:, :-1].long()], dim=1)
     bias = dspark_markov_step_bias(prev.reshape(-1), drafter.markov_w1, drafter.markov_w2)
@@ -155,7 +184,7 @@ def _expected_rows(drafter, base, anchors, tokens, temperature):
 # ---------------------------------------------------------------------------
 
 
-def test_config_fields_default_to_the_existing_behavior():
+def test_config_fields_default_to_the_existing_behavior() -> None:
     config = DSparkDecodingConfig(max_draft_len=3)
     assert config.rejection_sample_method == "standard"
     assert config.draft_temperature_only is False
@@ -175,7 +204,7 @@ def test_config_fields_default_to_the_existing_behavior():
     [dict(rejection_sample_method="block"), dict(draft_temperature_only=True)],
     ids=["block", "temperature_only"],
 )
-def test_rejection_options_require_rejection_sampling(options):
+def test_rejection_options_require_rejection_sampling(options: dict) -> None:
     off = types.SimpleNamespace(speculative_config=DSparkDecodingConfig(max_draft_len=3, **options))
     with pytest.raises(ValueError, match="use_rejection_sampling=True"):
         TorchLlmArgs._validate_rejection_sampling_options(off)
@@ -192,18 +221,20 @@ def test_rejection_options_require_rejection_sampling(options):
 # ---------------------------------------------------------------------------
 
 
-def test_ancestral_chain_conditions_each_position_on_the_drawn_token():
+def test_ancestral_chain_conditions_each_position_on_the_drawn_token() -> None:
     generator = torch.Generator().manual_seed(1)
     drafter = _drafter(generator)
     base = torch.randn(B, K, V, generator=generator)
     anchors = torch.randint(V, (B,), generator=generator)
     rows = []
 
-    def argmin_step(step, step_logits):  # deliberately not the argmax walk
+    def argmin_step(
+        step: int, step_logits: torch.Tensor
+    ) -> torch.Tensor:  # deliberately not the argmax walk
         rows.append((step, step_logits))
         return step_logits.argmin(-1)
 
-    def step_bias(prev, hidden):
+    def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
         return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
 
     tokens = dspark_markov_chain_ancestral(base, anchors, step_bias, argmin_step)
@@ -215,13 +246,13 @@ def test_ancestral_chain_conditions_each_position_on_the_drawn_token():
     assert tokens.dtype == torch.long and tokens.shape == (B, K)
 
 
-def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain():
+def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain() -> None:
     generator = torch.Generator().manual_seed(2)
     drafter = _drafter(generator)
     base = torch.randn(B, K, V, generator=generator)
     anchors = torch.randint(V, (B,), generator=generator)
 
-    def step_bias(prev, hidden):
+    def step_bias(prev: torch.Tensor, hidden: Optional[torch.Tensor]) -> torch.Tensor:
         return dspark_markov_step_bias(prev, drafter.markov_w1, drafter.markov_w2)
 
     tokens = drafter.sample_markov_chain(base, anchors, lambda step, logits: logits.argmax(-1))
@@ -234,7 +265,7 @@ def test_ancestral_chain_with_argmax_draws_is_the_greedy_chain():
 # ---------------------------------------------------------------------------
 
 
-def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_head():
+def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_head() -> None:
     generator = torch.Generator().manual_seed(3)
     worker = _worker()
     drafter = _drafter(generator)
@@ -248,7 +279,7 @@ def test_routing_takes_the_sampled_path_only_for_sampled_drafts_with_a_markov_he
 
 
 @pytest.mark.parametrize("num_contexts", [0, 2])
-def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_contexts):
+def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_contexts: int) -> None:
     generator = torch.Generator().manual_seed(4)
     worker = _worker()
     drafter = _drafter(generator)
@@ -271,7 +302,7 @@ def test_sampled_block_stores_the_distribution_each_draft_was_drawn_from(num_con
 
 
 @pytest.mark.parametrize("temperature_only", [False, True])
-def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only):
+def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only: bool) -> None:
     generator = torch.Generator().manual_seed(5)
     worker = _worker()
     drafter = _drafter(generator)
@@ -296,7 +327,7 @@ def test_sampled_block_passes_the_draft_sampling_parameters(temperature_only):
         assert torch.equal(call["offset"], expected_offset)
 
 
-def test_draft_sampling_params_temperature_only_keeps_the_temperature():
+def test_draft_sampling_params_temperature_only_keeps_the_temperature() -> None:
     meta = _metadata(B, temperature=0.6, top_k=20, top_p=0.9, min_p=0.1, temperature_only=True)
     temps, top_ks, top_ps, min_ps = SpecWorkerBase._draft_sampling_params(meta, 1, B, repeat=2)
     torch.testing.assert_close(temps, torch.full((2 * (B - 1),), 0.6))
@@ -315,14 +346,14 @@ def test_draft_sampling_params_temperature_only_keeps_the_temperature():
 _TOY_VOCAB = 4
 
 
-def _target_table(generator):
+def _target_table(generator: torch.Generator) -> torch.Tensor:
     """Target next-token distributions for every prefix of length 0..K (base-V ids)."""
     num_prefixes = sum(_TOY_VOCAB**m for m in range(K + 1))
     logits = 1.5 * torch.randn(num_prefixes, _TOY_VOCAB, generator=generator)
     return torch.softmax(logits.double(), -1)
 
 
-def _prefix_ids(tokens):
+def _prefix_ids(tokens: torch.Tensor) -> torch.Tensor:
     length = tokens.shape[1]
     ids = torch.zeros(tokens.shape[0], dtype=torch.int64)
     for m in range(length):
@@ -330,7 +361,12 @@ def _prefix_ids(tokens):
     return ids + sum(_TOY_VOCAB**m for m in range(length))
 
 
-def _complete_and_count(table, accepted_tokens, num_accepted, generator):
+def _complete_and_count(
+    table: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    num_accepted: torch.Tensor,
+    generator: torch.Generator,
+) -> torch.Tensor:
     """Emitted tokens, completed by sampling the target, as base-V sequence ids."""
     num = accepted_tokens.shape[0]
     sequences = torch.zeros(num, K + 1, dtype=torch.int64)
@@ -344,7 +380,7 @@ def _complete_and_count(table, accepted_tokens, num_accepted, generator):
     return torch.bincount(ids, minlength=_TOY_VOCAB ** (K + 1))
 
 
-def _exact_sequence_probs(table):
+def _exact_sequence_probs(table: torch.Tensor) -> torch.Tensor:
     grid = torch.cartesian_prod(*[torch.arange(_TOY_VOCAB)] * (K + 1))
     prob = torch.ones(grid.shape[0], dtype=torch.float64)
     for m in range(K + 1):
@@ -352,7 +388,7 @@ def _exact_sequence_probs(table):
     return prob
 
 
-def _chi_square(counts, probs):
+def _chi_square(counts: torch.Tensor, probs: torch.Tensor) -> tuple[float, float]:
     total = counts.sum().item()
     expected = probs * total
     big = expected >= 5
@@ -365,7 +401,13 @@ def _chi_square(counts, probs):
     return stat, dof * (1 - 2 / (9 * dof) + z * math.sqrt(2 / (9 * dof))) ** 3
 
 
-def _token_level(draft_tokens, draft_probs, target_probs, uniforms, resample_uniforms):
+def _token_level(
+    draft_tokens: torch.Tensor,
+    draft_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    uniforms: torch.Tensor,
+    resample_uniforms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Token-level rejection sampling with the same uniforms layout as block_verify."""
     num, num_drafts = draft_tokens.shape
     tokens_x = draft_tokens.long().unsqueeze(-1)
@@ -392,7 +434,7 @@ def _token_level(draft_tokens, draft_probs, target_probs, uniforms, resample_uni
 
 
 @pytest.mark.parametrize("verify", ["block", "token"])
-def test_sampled_drafts_verify_losslessly(verify):
+def test_sampled_drafts_verify_losslessly(verify: str) -> None:
     generator = torch.Generator().manual_seed(21 if verify == "block" else 22)
     num = 100_000
     worker = _worker()
@@ -419,7 +461,7 @@ def test_sampled_drafts_verify_losslessly(verify):
     assert stat < critical, f"chi-square {stat:.1f} >= {critical:.1f}"
 
 
-def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not():
+def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not() -> None:
     """Target = the drafter's own Markov chain. Drawing ancestrally proposes exactly
     the target, so every draft is accepted; the old proposal (independent draws from
     rows biased by the argmax chain) is conditioned on tokens the block does not
@@ -431,12 +473,12 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not():
     base = torch.randn(1, K, _TOY_VOCAB, generator=generator).expand(num, -1, -1).contiguous()
     anchors = torch.zeros(num, dtype=torch.int64)
 
-    def target_rows(drafts):
+    def target_rows(drafts: torch.Tensor) -> torch.Tensor:
         rows = _expected_rows(drafter, base, anchors, drafts, temperature=1.0)
         bonus = torch.full((num, 1, _TOY_VOCAB), 1.0 / _TOY_VOCAB)
         return torch.cat([rows, bonus], dim=1)
 
-    def accepted_lengths(drafts, draft_probs):
+    def accepted_lengths(drafts: torch.Tensor, draft_probs: torch.Tensor) -> torch.Tensor:
         uniforms = torch.rand(num, K, generator=generator, dtype=torch.float64)
         resample = torch.rand(num, generator=generator, dtype=torch.float64)
         _, accepted = block_verify(drafts, draft_probs, target_rows(drafts), uniforms, resample)
@@ -465,7 +507,7 @@ def test_ancestral_proposal_is_exact_where_the_greedy_chained_one_is_not():
 _needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
 
-def _capture(fn):
+def _capture(fn: Callable[[], Any]) -> tuple[torch.cuda.CUDAGraph, Any]:
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -479,7 +521,7 @@ def _capture(fn):
 
 @_needs_cuda
 @pytest.mark.parametrize("temperature_only", [True, False])
-def test_sampled_block_captures_in_a_cuda_graph(temperature_only):
+def test_sampled_block_captures_in_a_cuda_graph(temperature_only: bool) -> None:
     generator = torch.Generator().manual_seed(31)
     vocab, num_gens = 4096, 6
     worker = _worker()
@@ -530,7 +572,7 @@ def test_sampled_block_captures_in_a_cuda_graph(temperature_only):
 
 @_needs_cuda
 @pytest.mark.parametrize("method", ["standard", "block"])
-def test_rejection_acceptance_routes_and_captures(method):
+def test_rejection_acceptance_routes_and_captures(method: str) -> None:
     generator = torch.Generator().manual_seed(41)
     vocab, num_gens = 2048, 5
     worker = _worker()
@@ -556,7 +598,7 @@ def test_rejection_acceptance_routes_and_captures(method):
     draft_probs = torch.softmax(draft_logits, -1)
     draft_tokens = torch.multinomial(draft_probs.view(-1, vocab), 1).view(num_gens, K).int()
 
-    def accept():
+    def accept() -> tuple[torch.Tensor, torch.Tensor]:
         return worker._sample_and_accept_draft_tokens_rejection(
             logits, draft_tokens, draft_probs, 0, num_gens, meta
         )
@@ -581,7 +623,7 @@ def test_rejection_acceptance_routes_and_captures(method):
         offset = meta.request_offsets + meta.rng_accept_slot * _RNG_SLOT_SPAN
         drawn = {}
 
-        def record(weights):
+        def record(weights: torch.Tensor) -> torch.Tensor:
             drawn["weights"] = weights
             return eager_tokens[torch.arange(num_gens), eager_accepted.long() - 1]
 
@@ -603,7 +645,7 @@ def test_rejection_acceptance_routes_and_captures(method):
 
 @_needs_cuda
 @pytest.mark.parametrize("case", ["all_rejected", "all_accepted"])
-def test_block_verify_emitted_token_follows_the_residual(case):
+def test_block_verify_emitted_token_follows_the_residual(case: str) -> None:
     """The seeded sampler draws the emitted token from the normalized residual.
 
     Each case pins the accepted length regardless of the uniforms, so thousands

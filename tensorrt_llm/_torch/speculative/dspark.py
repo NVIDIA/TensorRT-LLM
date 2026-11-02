@@ -1280,7 +1280,9 @@ class DSparkWorker(DFlashWorker):
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
-    def _samples_block_ancestrally(self, draft_model, spec_metadata) -> bool:
+    def _samples_block_ancestrally(
+        self, draft_model: torch.nn.Module, spec_metadata: SpecMetadata
+    ) -> bool:
         """Sampled drafts walk the Markov head ancestrally.
 
         The head biases position k by the token at position k-1 and is trained on
@@ -1296,10 +1298,10 @@ class DSparkWorker(DFlashWorker):
 
     def _sample_block_ancestrally(
         self,
-        draft_model,
+        draft_model: torch.nn.Module,
         gen_logits: torch.Tensor,
         inputs: dict,
-        spec_metadata,
+        spec_metadata: SpecMetadata,
         num_contexts: int,
         batch_size: int,
     ) -> tuple[torch.Tensor, int]:

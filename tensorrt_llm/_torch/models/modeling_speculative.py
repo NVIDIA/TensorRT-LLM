@@ -5,7 +5,7 @@ import copy
 import inspect
 import os
 from dataclasses import replace
-from typing import Dict, Generic, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Generic, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -278,8 +278,9 @@ def dspark_markov_chain(
 def dspark_markov_chain_ancestral(
     base_logits: torch.Tensor,
     first_prev_tokens: torch.Tensor,
-    step_bias_fn,
-    sample_step,
+    step_bias_fn: Callable[[torch.Tensor, Optional[torch.Tensor]],
+                           torch.Tensor],
+    sample_step: Callable[[int, torch.Tensor], torch.Tensor],
     *,
     hidden_states: Optional[torch.Tensor] = None,
     cast_bias_to_logits: bool = False,
