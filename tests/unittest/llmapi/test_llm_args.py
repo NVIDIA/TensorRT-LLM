@@ -4726,7 +4726,7 @@ def test_kv_cache_compression_config_dispatches_by_algorithm():
                      "decoding_type": "MTP",
                      "num_nextn_predict_layers": 1
                  })
-    with pytest.raises(NotImplementedError, match="dynamic-tree"):
+    with pytest.raises(ValueError, match="dynamic-tree"):
         TorchLlmArgs(
             model="/tmp/dummy_model",
             kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True),

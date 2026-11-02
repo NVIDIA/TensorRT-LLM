@@ -4122,19 +4122,22 @@ def test_v2_hybrid_mixed_precision_appends_retained_group():
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
     reason="Mixed-precision NVFP4 KV requires Blackwell",
 )
-def test_v2_hybrid_mixed_precision_mixes_appended_mtp_layer():
-    """An MTP layer appended to the hybrid manager's mask goes mixed like the target layers."""
+def test_v2_hybrid_mixed_precision_disagg_names_twins():
+    """Disaggregated transfer gives a hybrid manager's twins collision-free layer ids."""
     mgr = _build_v2_hybrid_with_mamba_layer(
         dtype=DataType.HALF,
         kv_cache_config=_mixed_precision_kv_cache_config(),
-        spec_config=MTPDecodingConfig(max_draft_len=1),
-        num_draft_layers=1,
-        pretrained_config=SimpleNamespace(num_hidden_layers=2),
     )
     try:
-        # Layers 0 (recurrent), 1 (attention), 2 (MTP): both attention layers get a twin.
-        assert mgr._first_spec_layer_id is None
-        assert mgr.high_layers == {1: 3, 2: 4}
+        assert mgr.high_layers == {1: 2}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        # Model layers L -> 2L, the twin of layer L -> 2L + 1.
+        assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()
 
