@@ -2613,13 +2613,23 @@ class Glm5NextMTP(nn.Module):
         del position_ids, kwargs  # NoPE
         if all_rank_num_tokens is None:
             all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        inputs_embeds = self.enorm(embed_tokens(input_ids))
-        hidden_states = self.hnorm(hidden_states)
-        hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
         mapping = self.model_config.mapping
         if mapping.tp_size > 1 and not mapping.enable_attention_dp:
-            # Row-parallel eh_proj: each rank consumes its own input chunk.
-            hidden_states = torch.chunk(hidden_states, mapping.tp_size, dim=-1)[mapping.tp_rank]
+            # Row-parallel eh_proj: each rank consumes its own chunk of [enorm(embed) | hnorm(hidden)], so it builds
+            # only the half (or the halves) its chunk covers.
+            hidden = hidden_states.shape[-1]
+            width = 2 * hidden // mapping.tp_size
+            lo = mapping.tp_rank * width
+            hi = lo + width
+            parts = []
+            if lo < hidden:
+                parts.append(self.enorm(embed_tokens(input_ids))[:, lo : min(hi, hidden)])
+            if hi > hidden:
+                parts.append(self.hnorm(hidden_states)[:, max(lo - hidden, 0) : hi - hidden])
+            hidden_states = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        else:
+            inputs_embeds = self.enorm(embed_tokens(input_ids))
+            hidden_states = torch.cat([inputs_embeds, self.hnorm(hidden_states)], dim=-1)
         hidden_states = self.eh_proj(hidden_states)
 
         runtime_ctx = build_glm5_next_runtime_context(attn_metadata)
