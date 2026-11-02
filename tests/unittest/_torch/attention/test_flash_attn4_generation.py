@@ -51,9 +51,13 @@ def _case(num_heads, num_kv_heads, head_dim, q_len, rows, seed, massive=False, t
         tables.append(perm[nxt : nxt + b])
         nxt += b
     width = max(blocks)
-    page_table = torch.tensor([t + [0] * (width - len(t)) for t in tables], dtype=torch.int32, device=device)
+    page_table = torch.tensor(
+        [t + [0] * (width - len(t)) for t in tables], dtype=torch.int32, device=device
+    )
     dgen = torch.Generator(device=device).manual_seed(seed)
-    pool = (0.7 * torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, generator=dgen, device=device)).bfloat16()
+    pool = (
+        0.7 * torch.randn(num_pages, 2, num_kv_heads, tpb, head_dim, generator=dgen, device=device)
+    ).bfloat16()
     ntok = rows * q_len
     q = torch.randn(ntok, num_heads, head_dim, generator=dgen, device=device).bfloat16()
     k = torch.randn(ntok, num_kv_heads, head_dim, generator=dgen, device=device).bfloat16()
@@ -62,7 +66,9 @@ def _case(num_heads, num_kv_heads, head_dim, q_len, rows, seed, massive=False, t
         # Qwen2.5-7B-like magnitudes: keys ~600x, queries ~80x, odd heads with every logit hugely negative.
         pool[:, 0] = (pool[:, 0].float().abs() * 600.0).bfloat16()
         k = (k.float().abs() * 600.0).bfloat16()
-        sign = torch.where(torch.arange(num_heads, device=device) % 2 == 1, -1.0, 1.0)[None, :, None]
+        sign = torch.where(torch.arange(num_heads, device=device) % 2 == 1, -1.0, 1.0)[
+            None, :, None
+        ]
         q = (q.float().abs() * 80.0 * sign).bfloat16()
     return dict(
         pool=pool, q=q, k=k, v=v, tables=tables, page_table=page_table, cached=cached,
@@ -78,13 +84,19 @@ def _reference(case, num_heads, num_kv_heads, head_dim, q_len):
     for r in range(case["rows"]):
         cached = case["cached"][r]
         pages = case["tables"][r]
-        kv = pool[pages].permute(1, 2, 0, 3, 4).reshape(2, num_kv_heads, -1, head_dim)[:, :, :cached]
+        kv = (
+            pool[pages].permute(1, 2, 0, 3, 4).reshape(2, num_kv_heads, -1, head_dim)[:, :, :cached]
+        )
         for t in range(q_len):
             keys = torch.cat([kv[0], k[r * q_len : r * q_len + t + 1].double().permute(1, 0, 2)], 1)
             vals = torch.cat([kv[1], v[r * q_len : r * q_len + t + 1].double().permute(1, 0, 2)], 1)
             qh = q[r * q_len + t].double().view(num_kv_heads, gs, head_dim)
-            probs = torch.softmax(torch.einsum("hgd,htd->hgt", qh, keys) / math.sqrt(head_dim), dim=-1)
-            ref[r * q_len + t] = torch.einsum("hgt,htd->hgd", probs, vals).reshape(num_heads, head_dim)
+            probs = torch.softmax(
+                torch.einsum("hgd,htd->hgt", qh, keys) / math.sqrt(head_dim), dim=-1
+            )
+            ref[r * q_len + t] = torch.einsum("hgt,htd->hgd", probs, vals).reshape(
+                num_heads, head_dim
+            )
     return ref
 
 
@@ -101,7 +113,9 @@ def _reference(case, num_heads, num_kv_heads, head_dim, q_len):
         (28, 4, 128, 4, True),
     ],
 )
-def test_fa4_paged_generation_matches_dense_and_writes_kv(num_heads, num_kv_heads, head_dim, q_len, massive):
+def test_fa4_paged_generation_matches_dense_and_writes_kv(
+    num_heads, num_kv_heads, head_dim, q_len, massive
+):
     """The step's tokens attend the row's cache and each other causally; their K/V land at
     kv_len - q_len + j (page crossings, page tables a page longer than needed); no zero heads
     under massive activations."""

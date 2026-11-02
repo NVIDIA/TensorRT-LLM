@@ -1311,7 +1311,18 @@ def _make_ctx(case, num_heads, head_dim, q_len, kind="ctx"):
 
 
 def _run_fused_spec(
-    case, num_heads, head_dim, q_len, pool, q, k, v, out, workspace, group_grid=None, ctx=None,
+    case,
+    num_heads,
+    head_dim,
+    q_len,
+    pool,
+    q,
+    k,
+    v,
+    out,
+    workspace,
+    group_grid=None,
+    ctx=None,
     tail_splits=1,
 ):
     from tensorrt_llm._torch.attention.backends.fmha.sampling_shared_prefix_fused import (
@@ -1406,7 +1417,12 @@ def test_fused_spec_attention_matches_dense_and_writes_kv(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,prefix_kernel",
-    [(28, 4, 128, 2, "triton"), (28, 4, 128, 2, "ctx"), (28, 4, 128, 4, "fa4"), (28, 4, 128, 9, "fa4")],
+    [
+        (28, 4, 128, 2, "triton"),
+        (28, 4, 128, 2, "ctx"),
+        (28, 4, 128, 4, "fa4"),
+        (28, 4, 128, 9, "fa4"),
+    ],
 )
 def test_fused_attention_with_massive_activations(
     num_heads, num_kv_heads, head_dim, q_len, prefix_kernel
@@ -1449,7 +1465,11 @@ def test_fused_attention_with_massive_activations(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,head_dim,q_len,shuffled,placeholder_rows,overshoot",
-    [(28, 4, 128, 4, True, 2, True), (28, 4, 128, 9, True, 2, True), (20, 20, 128, 4, False, 0, False)],
+    [
+        (28, 4, 128, 4, True, 2, True),
+        (28, 4, 128, 9, True, 2, True),
+        (20, 20, 128, 4, False, 0, False),
+    ],
 )
 @pytest.mark.parametrize("tail_splits", [1, 3, 8])
 def test_fused_spec_attention_with_fa4_prefix_matches_dense_and_writes_kv(
@@ -1621,6 +1641,8 @@ def test_eagle3_n_sampling_with_fused_library_keeps_acceptance_e2e():
             "TLLM_SAMPLING_SHARED_PREFIX_MIN_SHARED_TOKENS": "0",
             "TLLM_SAMPLING_SHARED_PREFIX_SPEC_MIN_SHARED_TOKENS": "0",
             "TLLM_SAMPLING_SHARED_PREFIX_MIN_GROUP": "2",
+            # 16 rows: below the default speculative row minimum, which would keep the library off.
+            "TLLM_SAMPLING_SHARED_PREFIX_SPEC_MIN_ROWS": "1",
         }
     )
     assert off is not None and on is not None, "no speculative-decoding stats reported"
