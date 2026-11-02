@@ -44,6 +44,7 @@ _INDEXER_LOGITS_DTYPE = torch.float32
 _MAX_RADIX_BLOCKS_PER_ROW = 10
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 
@@ -389,7 +390,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """Mixed-precision KV is on: twin layers hold the retained tokens' rows for this backend."""
         return self.retained_block_table is not None
 
-    def _fill_retained_block_table(self, manager, layer_idx: int, high_table) -> None:
+    def _fill_retained_block_table(
+        self, manager: "KVCacheManagerV2", layer_idx: int, high_table: torch.Tensor
+    ) -> None:
         """Refresh a twin page table over its full width; the rest stay -1.
 
         The MTP draft loop writes past this step's kv lengths, so every column a request
