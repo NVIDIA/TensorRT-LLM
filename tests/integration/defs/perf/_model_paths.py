@@ -85,14 +85,14 @@ MODEL_PATH_DICT = {
     # DSpark draft stages are embedded in this checkpoint, so it is also the
     # `speculative_model` of the DSpark perf-sanity cases.
     "deepseek_v41_flash": "DeepSeek-V4.1-Flash",
+    # GLM-5.3 FP8 (MoE)
+    "glm_5.3_fp8": "GLM-5.3",
     "deepseek_v41_flash_nvfp4": "DeepSeek-V4.1-Flash-NVFP4",
     "deepseek_v41_flash_nvfp4_dspark": "DeepSeek-V4.1-Flash-NVFP4",
     # GLM-5 FP8 (MoE)
     "glm_5_fp8": "GLM-5-FP8",
     # GLM-5.2 NVFP4 (MoE, MLA + DSA on the DeepSeek-V3.2 code path)
     "glm_5.2_fp4": "GLM-5.2-NVFP4",
-    # GLM-5.3 base checkpoints contain FP8 weights (no -FP8 suffix).
-    "glm_5.3_fp8": "GLM-5.3",
     "glm_5.3_flash_fp8": "GLM-5.3-Flash",
     "glm_5.3_flash_fp8_mtp": "GLM-5.3-Flash",
     "glm_5.3_flash_nvfp4": "GLM-5.3-Flash-NVFP4",

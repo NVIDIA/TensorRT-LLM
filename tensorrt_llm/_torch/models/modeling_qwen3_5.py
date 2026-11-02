@@ -744,6 +744,8 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     """
 
     supports_encoder_cache = True
+    # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
+    model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
 
     @classmethod
     def get_model_defaults(cls, llm_args):
@@ -783,6 +785,15 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_ids",
             "mrope_config.mrope_position_deltas",
         ]
+
+    def prepare_mrope_config(
+        self, multimodal_params, num_generation_requests, position_ids, **kwargs
+    ):
+        # No packed mrope cos/sin table (position_ids None skips only that): the decoder's attention applies RoPE
+        # itself (rope_fusion off) and never reads it. The position deltas are still kept.
+        return super().prepare_mrope_config(
+            multimodal_params, num_generation_requests, None, **kwargs
+        )
 
     def load_weights(
         self,

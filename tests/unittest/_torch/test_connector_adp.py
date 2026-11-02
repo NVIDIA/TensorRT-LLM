@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests,
     KvCacheConnectorManager,
@@ -80,7 +81,24 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
-    executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
+    executor._closed = False
+    executor._resources_released = False
+    executor.worker_started = True
+    executor.dist = MagicMock(
+        spec_set=Distributed,
+        tp_size=1,
+        cp_size=1,
+        pp_size=1,
+        tp_rank=0,
+        rank=0,
+        cp_rank=0,
+        has_cp_helix=False,
+        has_pp=False,
+        cp_config={},
+    )
+    executor.dist.tp_cp_allgather_int64.side_effect = partial(
+        Distributed.tp_cp_allgather_int64, executor.dist
+    )
     executor.enable_attention_dp = True
     executor.enable_early_first_token_response = False
     executor.kv_connector_manager = None
@@ -414,6 +432,7 @@ def test_batch_start_combines_readiness_with_status(batch_sizes: tuple[int, int]
         _configure_recovery_controls(executor)
         executor.kv_connector_manager = _manager(rank)
         executor.dist.tp_size = 2
+        executor.dist.tp_rank = executor.dist.rank = rank
         executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
         executors.append(executor)
 

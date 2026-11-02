@@ -419,6 +419,21 @@ class KvCacheTransceiver(ABC):
         """Return True when in-flight transfers can be cancelled safely."""
         return False
 
+    def supports_idle_request_cancellation(self,
+                                           req: Optional[LlmRequest] = None
+                                           ) -> bool:
+        """Whether cancellation may progress before a model batch.
+
+        Args:
+            req: An executor-selected model-idle request, or None to query
+                support for removing queued, not-yet-activated requests.
+
+        Returns:
+            Eligibility only, not retirement proof. For activated requests,
+            cancel_request must still confirm that resources can be released.
+        """
+        return False
+
     def has_poisoned_transfer_buffer(self) -> bool:
         """Return True when a cancelled transfer may have corrupted a shared buffer."""
         return False
@@ -443,6 +458,9 @@ class KvCacheTransceiver(ABC):
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
+    def set_gen_deferred_receives(self, count: int) -> None:
+        """Report how many admitted receives the caller has not started yet. No-op by default."""
 
     def get_data_transceiver_state(self) -> bytes:
         """Get the serialized DataTransceiverState (CacheState + CommState)."""

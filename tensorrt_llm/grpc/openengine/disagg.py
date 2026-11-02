@@ -43,7 +43,12 @@ _EXTRA_REQUEST_TYPES = _DISAGG_REQUEST_TYPES - {"generation_only"}
 
 
 def _struct_to_dict(struct: struct_pb2.Struct) -> dict[str, Any]:
-    return MessageToDict(struct)
+    # Prepared media metadata is decoded separately, not as KV rendezvous state.
+    return {
+        key: MessageToDict(value)
+        for key, value in struct.fields.items()
+        if key != "trtllm_decode_preparation"
+    }
 
 
 def _endpoint_to_str(endpoints: Sequence[Any]) -> Optional[str]:
@@ -224,6 +229,7 @@ def prefill_ready_response(
     disaggregated_params: Any,
     transfer_backend: str,
     usage: Optional[generation_pb2.Usage] = None,
+    decode_preparation: Optional[str] = None,
 ) -> generation_pb2.GenerateResponse:
     """Build the PrefillReady event a context worker returns after prefill.
 
@@ -245,6 +251,8 @@ def prefill_ready_response(
         dp_rank=disaggregated_params.ctx_dp_rank or 0,
     )
     attributes: dict[str, Any] = {}
+    if decode_preparation is not None:
+        attributes["trtllm_decode_preparation"] = decode_preparation
     endpoint = disaggregated_params.ctx_info_endpoint
     if endpoint:
         # Carried verbatim as well as split: the generation worker connects a
