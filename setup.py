@@ -713,6 +713,8 @@ setup(
             'cutlass/include/**/*',
             'cutlass/tools/util/include/**/*',
             'cutlass/LICENSE.txt',
+            '_aot/*/*.so',
+            '_aot/*/*.json',
         ],
         **nccl_extensions_package_data,
     },

@@ -141,6 +141,27 @@ def test_copy_mode_is_unchanged(extract_from_precompiled, build_tree, tmp_path):
 
 
 @pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
+def test_precompiled_preserves_fmha_binary_artifacts(
+    extract_from_precompiled, build_tree, tmp_path, source_kind
+):
+    import zipfile
+
+    relative = "_aot/sourcehash/all_variants.so"
+    source = build_tree
+    if source_kind == "wheel":
+        source = tmp_path / "precompiled.whl"
+        with zipfile.ZipFile(source, "w") as archive:
+            archive.writestr("fmha_sm100/__init__.py", "")
+            archive.writestr("fmha_sm100/" + relative, "compiled")
+    else:
+        artifact = build_tree / "3rdparty/fmha_sm100" / relative
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text("compiled")
+    _run(extract_from_precompiled, source, tmp_path, link=source_kind == "link")
+    assert (Path("3rdparty/fmha_sm100") / relative).read_text() == "compiled"
+
+
+@pytest.mark.parametrize("source_kind", ["wheel", "copy", "link"])
 def test_precompiled_preserves_source_schemas(
     extract_from_precompiled, build_tree, tmp_path, monkeypatch, source_kind
 ):
