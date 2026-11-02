@@ -75,7 +75,7 @@ Set `TRTLLM_NIXL_KVCACHE_BACKEND=LIBFABRIC` to select the NIXL LIBFABRIC backend
 **hwloc**
 - The source build requires the `pkg-config` command to discover hwloc. Ubuntu container base setup installs the `pkg-config` package; standalone builds must provide it as well.
 - NIXL's LIBFABRIC build requires development files for hwloc 2.3 or later.
-- NGC PyTorch 26.09 builds reuse HPC-X hwloc 2.7.1 under `/usr/local/mpi`, with `/usr/local/mpi/lib/pkgconfig` prepended to `PKG_CONFIG_PATH`. Non-NGC SBSA Ubuntu 24.04 builds reuse system hwloc 2.10.0. Neither configuration rebuilds hwloc when these development files are present.
+- NGC PyTorch 26.10 builds reuse HPC-X hwloc 2.7.1 under `/usr/local/mpi`, with `/usr/local/mpi/lib/pkgconfig` prepended to `PKG_CONFIG_PATH`. Non-NGC SBSA Ubuntu 24.04 builds reuse system hwloc 2.10.0. Neither configuration rebuilds hwloc when these development files are present.
 - If `pkg-config` cannot find a suitable version, the installer builds and retains hwloc 2.12.2 under `/opt/nvidia/nixl-deps/hwloc`, exposing it to the NIXL build through `PKG_CONFIG_PATH`. This applies to Rocky 8's older hwloc 2.2.0. The fallback does not change the system hwloc installation or global runtime library search configuration. Running the NIXL LIBFABRIC backend requires a compatible hwloc runtime supplied separately.
 - Custom installations must provide compatible development and runtime libraries and expose `hwloc.pc` through `PKG_CONFIG_PATH`.
 
